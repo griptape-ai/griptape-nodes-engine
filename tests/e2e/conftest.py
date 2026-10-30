@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -187,3 +187,65 @@ def connect(engine: Engine) -> Callable[..., None]:
         assert isinstance(result, CreateConnectionResultSuccess), result
 
     return _connect
+
+
+@pytest.fixture
+def record_published(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Callable[..., list[Any]]:
+    """Return a helper that taps the event bus and records every published payload of a type.
+
+    What the editor shows comes off this stream, so a claim about what the artist saw is a claim
+    about published events, not about the engine's internal state. Each call returns its own list,
+    filled as matching payloads are published; `extract` picks what to keep from each one.
+
+    Both spellings are tapped, because which one an event takes is an implementation detail of the
+    code that emits it: the scheduler's error path is async and uses `aput_event`, the flow
+    manager's cleanup is not and uses `put_event`. A tap on one of them silently records half the
+    stream.
+    """
+    event_manager = engine.event_manager
+    taps: list[Callable[[object], None]] = []
+    real_put_event = event_manager.put_event
+    real_aput_event = event_manager.aput_event
+
+    def _note(event: object) -> None:
+        for tap in taps:
+            tap(event)
+
+    def _collect(event: object) -> None:
+        _note(event)
+        real_put_event(event)
+
+    async def _acollect(event: object) -> None:
+        _note(event)
+        await real_aput_event(event)
+
+    monkeypatch.setattr(event_manager, "put_event", _collect)
+    monkeypatch.setattr(event_manager, "aput_event", _acollect)
+
+    def _record(payload_type: type, extract: Callable[[Any], Any] = lambda payload: payload) -> list[Any]:
+        recorded: list[Any] = []
+
+        def _tap(event: object) -> None:
+            payload = getattr(getattr(event, "wrapped_event", None), "payload", event)
+            if isinstance(payload, payload_type):
+                recorded.append(extract(payload))
+
+        taps.append(_tap)
+        return recorded
+
+    return _record
+
+
+@pytest.fixture(params=["sequential", "parallel"])
+def execution_mode(request: pytest.FixtureRequest, engine: Engine) -> Iterator[str]:
+    """Run a test under both schedulers, restoring the engine's configuration afterwards."""
+    config_manager = engine.config_manager
+    previous_mode = config_manager.get_config_value("workflow_execution_mode")
+    previous_max = config_manager.get_config_value("max_nodes_in_parallel")
+    config_manager.set_config_value("workflow_execution_mode", request.param)
+    config_manager.set_config_value("max_nodes_in_parallel", 4)
+    try:
+        yield request.param
+    finally:
+        config_manager.set_config_value("workflow_execution_mode", previous_mode)
+        config_manager.set_config_value("max_nodes_in_parallel", previous_max)
