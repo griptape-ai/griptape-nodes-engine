@@ -15,6 +15,7 @@ from griptape_nodes.bootstrap.workflow_executors.local_session_workflow_executor
 )
 from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import LocalExecutorError
 from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     EventResultSuccess,
@@ -282,3 +283,24 @@ class TestExecutionEventsAreSentOnce:
             if sent.args[0] == "execution_event"
         ]
         assert sent_execution_events == ["NodeStartProcessEvent", "ControlFlowResolvedEvent"]
+
+
+class TestUsageReportsOnExit:
+    """A node group run in its own process exits after its run, which would drop queued usage reports."""
+
+    @pytest.mark.asyncio
+    async def test_exiting_waits_for_queued_usage_reports(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the exit is under test; app startup and the websocket are not.
+        monkeypatch.setattr(engine.event_manager, "abroadcast_app_event", AsyncMock())
+        flush_reports = MagicMock(return_value=0)
+        monkeypatch.setattr(engine.budget_manager, "flush_reports", flush_reports)
+        executor = LocalSessionWorkflowExecutor(session_id="session")
+        executor._start_websocket_connection = AsyncMock()  # type: ignore[method-assign]
+        executor._stop_websocket_connection = AsyncMock()  # type: ignore[method-assign]
+
+        async with executor:
+            flush_reports.assert_not_called()
+
+        flush_reports.assert_called_once_with()
