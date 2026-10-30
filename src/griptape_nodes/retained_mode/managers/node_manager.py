@@ -5369,6 +5369,10 @@ class NodeManager(EngineScoped):
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
         effective_value = node._get_raw_parameter_value(parameter.name)
+        if isinstance(parameter, ParameterList) and node._has_connected_whole_list_value(parameter):
+            # The node reads a connected list as the connected items, then its rows' items. The rows are
+            # saved on their own, so saving what the node reads would add them again on every load.
+            effective_value = node.parameter_values[parameter.name]
         # Save the value if it was explicitly set OR if it equals the default value.
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.

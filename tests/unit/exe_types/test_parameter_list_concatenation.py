@@ -114,3 +114,8 @@ class TestConcatenation:
         node.set_parameter_value(row.name, ["b", "c"])
 
         assert node.get_parameter_value("groups") == [["b", "c"]]
+
+
+class TestRulesSentToTheEditor:
+    def test_an_empty_list_reports_what_its_rows_accept(self, node: MockNode) -> None:
+        assert _refs(node).to_dict()["row_input_types"] == ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
