@@ -81,6 +81,8 @@ The situation name is not displayed on the parameter's value, but it does appear
 
 Users override the situation per-node via the cog button on the parameter, which spawns a `FileOutputSettings` node pre-filled with your declared situation. When that node is connected, `build_file()` returns *its* `FileDestination` and your `situation` argument is bypassed. Choose the situation that honestly describes your node's operation and let users redirect from there.
 
+`build_file()` reads the connected settings node with `GetConnectedFileDestinationRequest`, which is answered where the settings node lives, so it works when your node runs in a worker too. If your node reads a connected settings node without going through `ProjectFileParameter`, send that request yourself and rebuild the destination with `file_destination_from_spec` from `griptape_nodes.files.project_file`. Don't look the settings node up by name: a worker doesn't have it. `ProjectDirectoryParameter` and `ProjectFileSequenceParameter` use `GetConnectedDirectoryDestinationRequest` and `GetConnectedFileSequenceDestinationRequest` the same way.
+
 **❌ Common Mistake: Not Capturing write_bytes() Return Value**
 
 ```python

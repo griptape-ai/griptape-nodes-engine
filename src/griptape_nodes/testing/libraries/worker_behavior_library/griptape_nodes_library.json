@@ -276,6 +276,24 @@
         "description": "A node group with no subflow",
         "display_name": "PlainGroupNode"
       }
+    },
+    {
+      "class_name": "OutputSettingsNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Supplies file, directory and file sequence destinations",
+        "display_name": "OutputSettingsNode"
+      }
+    },
+    {
+      "class_name": "SavesThroughOutputParametersNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Saves through the project output parameters",
+        "display_name": "SavesThroughOutputParametersNode"
+      }
     }
   ]
 }

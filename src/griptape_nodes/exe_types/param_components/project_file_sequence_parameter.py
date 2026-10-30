@@ -10,7 +10,7 @@ from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types import core_types, node_types
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import file_sequence, path_utils, situation_resolver
-from griptape_nodes.retained_mode.events import os_events, project_events
+from griptape_nodes.retained_mode.events import destination_events, os_events, project_events
 
 _FALLBACK_SEQUENCE_MACRO = "{outputs}/{sub_dirs?:/}{file_name_base}_v{###}/{file_name_base}.####.{file_extension}"
 
@@ -82,8 +82,8 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
     def build_sequence(self, **extra_vars: str | int) -> file_sequence.FileSequenceDestination:
         """Build a FileSequenceDestination from the parameter's current value.
 
-        If an upstream node implements ``FileSequenceDestinationProvider``, its
-        ``FileSequenceDestination`` is retrieved directly. Otherwise the parameter's
+        If a node implementing ``FileSequenceDestinationProvider`` is connected to this
+        parameter, its ``FileSequenceDestination`` is used. Otherwise the parameter's
         string value (filename or #### pattern) is parsed and combined with the
         situation macro.
 
@@ -94,13 +94,15 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
             FileSequenceDestination with a versioned MacroPath and baked-in policy.
 
         Raises:
-            ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None.
+            ValueError: If the connected settings node can't be read or has no destination set.
             FileSequenceError: If no available version index can be found.
         """
         upstream = self._get_upstream_destination(
-            file_sequence.FileSequenceDestinationProvider,
-            lambda provider: provider.file_sequence_destination,
-            "FileSequenceDestination",
+            destination_events.GetConnectedFileSequenceDestinationRequest(
+                node_name=self._node.name, parameter_name=self._name
+            ),
+            destination_events.GetConnectedFileSequenceDestinationResultSuccess,
+            file_sequence.FileSequenceDestination.from_spec,
         )
         if upstream is not None:
             return upstream
