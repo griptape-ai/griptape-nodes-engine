@@ -21,11 +21,33 @@ from griptape_nodes.retained_mode.events.config_events import (
 )
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
+from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
+from griptape_nodes.retained_mode.events.variable_events import (
+    CreateVariableRequest,
+    CreateVariableResultFailure,
+    CreateVariableResultSuccess,
+    DeleteVariableRequest,
+    GetVariableDetailsRequest,
+    GetVariableRequest,
+    GetVariablesRequest,
+    GetVariableTypeRequest,
+    GetVariableValueRequest,
+    HasVariableRequest,
+    ListSubstitutablesRequest,
+    ListVariablesRequest,
+    RenameVariableRequest,
+    ResolveSubstitutionRequest,
+    SetVariablesRequest,
+    SetVariableTypeRequest,
+    SetVariableValueRequest,
+)
 from griptape_nodes.retained_mode.events.workflow_events import (
+    GetVariableSubstitutionEnabledRequest,
     ListAllWorkflowInfoRequest,
     ListAllWorkflowsRequest,
     ListCallableWorkflowsRequest,
+    SetVariableSubstitutionEnabledRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
@@ -383,3 +405,78 @@ class TestRequestsARuntimeSends:
 
         assert isinstance(result, WorkflowNotOpenResultFailure)
         assert calls.workflows == []
+
+
+# Requests whose handlers act on the workflow the envelope names.
+_OBJECT_AND_VARIABLE_REQUESTS: list[type[RequestPayload]] = [
+    RenameObjectRequest,
+    CreateVariableRequest,
+    GetVariableRequest,
+    GetVariableValueRequest,
+    SetVariableValueRequest,
+    GetVariableTypeRequest,
+    SetVariableTypeRequest,
+    DeleteVariableRequest,
+    RenameVariableRequest,
+    HasVariableRequest,
+    ListVariablesRequest,
+    ListSubstitutablesRequest,
+    GetVariablesRequest,
+    ResolveSubstitutionRequest,
+    SetVariablesRequest,
+    GetVariableDetailsRequest,
+    GetVariableSubstitutionEnabledRequest,
+    SetVariableSubstitutionEnabledRequest,
+]
+
+
+class TestObjectAndVariableRequests:
+    @pytest.mark.parametrize("request_type", _OBJECT_AND_VARIABLE_REQUESTS)
+    def test_is_registered_with_workflow_scope(self, engine: Engine, request_type: type[RequestPayload]) -> None:
+        assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.WORKFLOW
+
+    def test_a_variable_is_created_in_the_workflow_the_envelope_names(self, engine: Engine) -> None:
+        a, b = _open_two(engine)
+
+        result = engine.event_manager.handle_request(
+            CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"),
+            result_context=ResultContext(open_workflow_id=b.workflow_id),
+        ).result
+
+        assert isinstance(result, CreateVariableResultSuccess)
+        assert b.variables.global_layer.has("greeting")
+        assert not a.variables.global_layer.has("greeting")
+
+    def test_a_variable_request_for_a_workflow_that_is_not_open_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+
+        result = engine.event_manager.handle_request(
+            CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"),
+            result_context=ResultContext(open_workflow_id=NOT_OPEN_ID),
+        ).result
+
+        assert isinstance(result, WorkflowNotOpenResultFailure)
+        assert not workflow.variables.global_layer.has("greeting")
+
+    def test_naming_no_workflow_while_several_are_open_fails_with_the_requests_own_failure(
+        self, engine: Engine
+    ) -> None:
+        """The editor undoes an optimistic edit on the request's own failure type."""
+        a, b = _open_two(engine)
+
+        result = engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
+
+        assert isinstance(result, CreateVariableResultFailure)
+        assert "2 workflows are open" in str(result.result_details)
+        assert not a.variables.global_layer.has("greeting")
+        assert not b.variables.global_layer.has("greeting")
+
+    def test_naming_no_workflow_fails_generically_for_a_request_with_no_failure_type(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        result = engine.handle_request(_ScopeProbeRequest())
+
+        assert isinstance(result, GenericResultFailure)
+        assert "none is open" in str(result.result_details)

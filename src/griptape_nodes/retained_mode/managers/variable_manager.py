@@ -55,7 +55,8 @@ from griptape_nodes.retained_mode.events.variable_events import (
     VariableDetails,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.project_manager import ProjectVariableResolver
@@ -137,44 +138,20 @@ class VariablesManager(EngineScoped):
         if event_manager is not None:
             event_manager.register_request_handlers(self)
 
-    def _find_flow_layer(self, flow_name: str) -> VariableLayer | None:
-        """The current workflow's variables for this flow, or None when it has none or no workflow is open."""
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return None
+    @staticmethod
+    def _find_flow_layer(workflow: WorkflowRuntime, flow_name: str) -> VariableLayer | None:
+        """The workflow's variables for this flow, or None when it has none."""
         return workflow.variables.flow_layers.get(flow_name)
 
-    def _list_flow_layers(self) -> list[VariableLayer]:
-        """The current workflow's flow variables, one layer per flow. Empty when no workflow is open."""
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return []
+    @staticmethod
+    def _list_flow_layers(workflow: WorkflowRuntime) -> list[VariableLayer]:
+        """The workflow's flow variables, one layer per flow."""
         return list(workflow.variables.flow_layers.values())
 
-    def _find_global_layer(self) -> VariableLayer | None:
-        """The current workflow's global variables, or None when no workflow is open."""
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return None
-        return workflow.variables.global_layer
-
-    def _find_global_variable(self, variable_name: str) -> FlowVariable | None:
-        """The current workflow's global variable with this name, or None when it has none or no workflow is open."""
-        global_layer = self._find_global_layer()
-        if global_layer is None:
-            return None
-        return global_layer.get(variable_name)
-
-    def _list_global_variables(self) -> list[FlowVariable]:
-        """The current workflow's global variables. Empty when no workflow is open."""
-        global_layer = self._find_global_layer()
-        if global_layer is None:
-            return []
-        return global_layer.list()
-
-    def _get_or_create_flow_layer(self, flow_name: str) -> VariableLayer:
+    @staticmethod
+    def _get_or_create_flow_layer(workflow: WorkflowRuntime, flow_name: str) -> VariableLayer:
         """Return the flow's VariableLayer, lazily creating an empty one on first touch."""
-        flow_layers = self.engine.current_workflow().variables.flow_layers
+        flow_layers = workflow.variables.flow_layers
         layer = flow_layers.get(flow_name)
         if layer is None:
             layer = VariableLayer()
@@ -182,7 +159,12 @@ class VariablesManager(EngineScoped):
         return layer
 
     def _writable_storage_layer(
-        self, variable: FlowVariable, found_layer: VariableLayerKind | None, *, project_id: str | None = None
+        self,
+        workflow: WorkflowRuntime,
+        variable: FlowVariable,
+        found_layer: VariableLayerKind | None,
+        *,
+        project_id: str | None = None,
     ) -> VariableLayer | None:
         """Return the storage layer a resolved variable lives in, for delete/rename.
 
@@ -198,9 +180,11 @@ class VariablesManager(EngineScoped):
         """
         match found_layer:
             case VariableLayerKind.GLOBAL:
-                return self._find_global_layer()
+                return workflow.variables.global_layer
             case VariableLayerKind.FLOW:
-                return self._find_flow_layer(variable.owning_flow_name) if variable.owning_flow_name else None
+                if variable.owning_flow_name is None:
+                    return None
+                return self._find_flow_layer(workflow, variable.owning_flow_name)
             case VariableLayerKind.PROJECT:
                 effective = self._effective_project_id(project_id)
                 if effective is None:
@@ -248,9 +232,11 @@ class VariablesManager(EngineScoped):
 
         return hierarchy
 
-    def _find_variable_in_flow(self, flow_name: str, variable_name: str) -> FlowVariable | None:
+    def _find_variable_in_flow(
+        self, workflow: WorkflowRuntime, flow_name: str, variable_name: str
+    ) -> FlowVariable | None:
         """Find a variable in a specific flow."""
-        layer = self._find_flow_layer(flow_name)
+        layer = self._find_flow_layer(workflow, flow_name)
         if layer is None:
             return None
         return layer.get(variable_name)
@@ -438,12 +424,17 @@ class VariablesManager(EngineScoped):
         return collected
 
     def _find_variable_hierarchical(  # noqa: C901, PLR0911, PLR0912
-        self, starting_flow: str, variable_name: str, lookup_scope: VariableScope, project_id: str | None
+        self,
+        workflow: WorkflowRuntime,
+        starting_flow: str,
+        variable_name: str,
+        lookup_scope: VariableScope,
+        project_id: str | None,
     ) -> VariableLookupResult:
         """Find a variable using the requested layering strategy."""
         match lookup_scope:
             case VariableScope.CURRENT_FLOW_ONLY:
-                variable = self._find_variable_in_flow(starting_flow, variable_name)
+                variable = self._find_variable_in_flow(workflow, starting_flow, variable_name)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -459,7 +450,7 @@ class VariablesManager(EngineScoped):
                 )
 
             case VariableScope.GLOBAL_ONLY:
-                variable = self._find_global_variable(variable_name)
+                variable = workflow.variables.global_layer.get(variable_name)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -469,7 +460,7 @@ class VariablesManager(EngineScoped):
             case VariableScope.HIERARCHICAL:
                 # Flow chain → project layer → global.
                 for flow_name in self._get_flow_hierarchy(starting_flow):
-                    variable = self._find_variable_in_flow(flow_name, variable_name)
+                    variable = self._find_variable_in_flow(workflow, flow_name, variable_name)
                     if variable:
                         found_scope = (
                             VariableScope.CURRENT_FLOW_ONLY
@@ -486,7 +477,7 @@ class VariablesManager(EngineScoped):
                         variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
                     )
 
-                variable = self._find_global_variable(variable_name)
+                variable = workflow.variables.global_layer.get(variable_name)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -500,7 +491,7 @@ class VariablesManager(EngineScoped):
                         variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
                     )
 
-                variable = self._find_global_variable(variable_name)
+                variable = workflow.variables.global_layer.get(variable_name)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -509,7 +500,7 @@ class VariablesManager(EngineScoped):
 
             case VariableScope.ALL:
                 # ALL is primarily an enumeration scope. For single-name lookup, treat it as CURRENT_FLOW_ONLY.
-                variable = self._find_variable_in_flow(starting_flow, variable_name)
+                variable = self._find_variable_in_flow(workflow, starting_flow, variable_name)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -543,20 +534,20 @@ class VariablesManager(EngineScoped):
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
-    @handles(CreateVariableRequest)
-    def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:
+    @handles(CreateVariableRequest, scope=RequestScope.WORKFLOW)
+    def on_create_variable_request(self, request: CreateVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Create a new variable.
 
         Load-replay (initial_setup=True) failures are logged before returning: workflow
         load re-executes captured creates and discards the results, so without the log a
         failed recreate would be silent data loss from the user's point of view.
         """
-        result = self._create_variable(request)
+        result = self._create_variable(request, workflow)
         if request.initial_setup and isinstance(result, CreateVariableResultFailure):
             logger.warning("Workflow load could not recreate variable '%s': %s", request.name, result.result_details)
         return result
 
-    def _create_variable(self, request: CreateVariableRequest) -> ResultPayload:  # noqa: PLR0911
+    def _create_variable(self, request: CreateVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: PLR0911
         """Validate and store a new variable (the body of on_create_variable_request)."""
         # Fail fast on a blank name before any layer/collision logic.
         if not request.name or not request.name.strip():
@@ -582,7 +573,7 @@ class VariablesManager(EngineScoped):
             )
 
         if request.is_global:
-            global_layer = self.engine.current_workflow().variables.global_layer
+            global_layer = workflow.variables.global_layer
             # Check for name collision in global variables
             if global_layer.has(request.name):
                 return CreateVariableResultFailure(
@@ -608,7 +599,7 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to create variable '{request.name}'. Failed to determine target flow: {e}"
             )
 
-        flow_layer = self._get_or_create_flow_layer(target_flow)
+        flow_layer = self._get_or_create_flow_layer(workflow, target_flow)
 
         # Check for name collision in target flow
         if flow_layer.has(request.name):
@@ -629,8 +620,8 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully created variable '{request.name}' in flow '{target_flow}'."
         )
 
-    @handles(GetVariableRequest)
-    def on_get_variable_request(self, request: GetVariableRequest) -> ResultPayload:
+    @handles(GetVariableRequest, scope=RequestScope.WORKFLOW)
+    def on_get_variable_request(self, request: GetVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Get a full variable by name."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -639,7 +630,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to get variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return GetVariableResultFailure(
@@ -650,8 +643,10 @@ class VariablesManager(EngineScoped):
             variable=result.variable, result_details=f"Successfully retrieved variable '{request.name}'."
         )
 
-    @handles(GetVariableValueRequest)
-    def on_get_variable_value_request(self, request: GetVariableValueRequest) -> ResultPayload:
+    @handles(GetVariableValueRequest, scope=RequestScope.WORKFLOW)
+    def on_get_variable_value_request(
+        self, request: GetVariableValueRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         """Get the value of a variable."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -660,7 +655,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to get value for variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return GetVariableValueResultFailure(
@@ -671,8 +668,10 @@ class VariablesManager(EngineScoped):
             value=result.variable.value, result_details=f"Successfully retrieved value for variable '{request.name}'."
         )
 
-    @handles(SetVariableValueRequest)
-    def on_set_variable_value_request(self, request: SetVariableValueRequest) -> ResultPayload:
+    @handles(SetVariableValueRequest, scope=RequestScope.WORKFLOW)
+    def on_set_variable_value_request(
+        self, request: SetVariableValueRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         """Set the value of an existing variable.
 
         Refuses writes to READ_ONLY variables (project builtins, template directories).
@@ -684,7 +683,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to set value for variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return SetVariableValueResultFailure(
@@ -715,11 +716,11 @@ class VariablesManager(EngineScoped):
             self._persist_project_variables(project_id=request.project_id)
         else:
             result.variable.value = request.value
-        self._unresolve_nodes_referencing_variables([request.name])
+        self._unresolve_nodes_referencing_variables(workflow, [request.name])
         return SetVariableValueResultSuccess(result_details=f"Successfully set value for variable '{request.name}'.")
 
-    @handles(GetVariableTypeRequest)
-    def on_get_variable_type_request(self, request: GetVariableTypeRequest) -> ResultPayload:
+    @handles(GetVariableTypeRequest, scope=RequestScope.WORKFLOW)
+    def on_get_variable_type_request(self, request: GetVariableTypeRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Get the type of a variable."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -728,7 +729,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to get type for variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return GetVariableTypeResultFailure(
@@ -739,8 +742,8 @@ class VariablesManager(EngineScoped):
             type=result.variable.type, result_details=f"Successfully retrieved type for variable '{request.name}'."
         )
 
-    @handles(SetVariableTypeRequest)
-    def on_set_variable_type_request(self, request: SetVariableTypeRequest) -> ResultPayload:
+    @handles(SetVariableTypeRequest, scope=RequestScope.WORKFLOW)
+    def on_set_variable_type_request(self, request: SetVariableTypeRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Set the type of an existing variable.
 
         Refuses type changes on READ_ONLY variables.
@@ -752,7 +755,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to set type for variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return SetVariableTypeResultFailure(
@@ -785,8 +790,8 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully set type for variable '{request.name}' to '{request.type}'."
         )
 
-    @handles(DeleteVariableRequest)
-    def on_delete_variable_request(self, request: DeleteVariableRequest) -> ResultPayload:
+    @handles(DeleteVariableRequest, scope=RequestScope.WORKFLOW)
+    def on_delete_variable_request(self, request: DeleteVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Delete a variable.
 
         Refuses deletion of READ_ONLY variables.
@@ -798,7 +803,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to delete variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return DeleteVariableResultFailure(
@@ -813,7 +820,9 @@ class VariablesManager(EngineScoped):
 
         # Route by real layer provenance (found_layer), not owning_flow_name — _refuse_write
         # above already bounced READ_ONLY, so this is a FLOW, GLOBAL, or writable PROJECT variable.
-        storage_layer = self._writable_storage_layer(variable, result.found_layer, project_id=request.project_id)
+        storage_layer = self._writable_storage_layer(
+            workflow, variable, result.found_layer, project_id=request.project_id
+        )
         if storage_layer is None or not storage_layer.has(variable.name):
             # Unreachable: a resolved writable variable always maps to a storage layer that
             # contains it. Guard anyway so a broken invariant fails loudly instead of returning a
@@ -827,8 +836,8 @@ class VariablesManager(EngineScoped):
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
-    @handles(RenameVariableRequest)
-    def on_rename_variable_request(self, request: RenameVariableRequest) -> ResultPayload:  # noqa: PLR0911
+    @handles(RenameVariableRequest, scope=RequestScope.WORKFLOW)
+    def on_rename_variable_request(self, request: RenameVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: PLR0911
         """Rename a variable.
 
         Refuses renaming of READ_ONLY variables.
@@ -846,7 +855,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to rename variable '{request.name}' to an empty name. Failed because a variable name is required."
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return RenameVariableResultFailure(
@@ -887,7 +898,9 @@ class VariablesManager(EngineScoped):
         # check is same-layer only, mirroring create's own-flow duplicate check. Route by real
         # layer provenance (found_layer), not owning_flow_name — a project var also has
         # owning_flow_name=None.
-        storage_layer = self._writable_storage_layer(variable, result.found_layer, project_id=request.project_id)
+        storage_layer = self._writable_storage_layer(
+            workflow, variable, result.found_layer, project_id=request.project_id
+        )
         if storage_layer is None:
             # Unreachable: _refuse_write bounced READ_ONLY, so a writable variable always maps
             # to a storage layer. Guard anyway so a broken invariant fails loudly instead of
@@ -910,8 +923,8 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
         )
 
-    @handles(HasVariableRequest)
-    def on_has_variable_request(self, request: HasVariableRequest) -> ResultPayload:
+    @handles(HasVariableRequest, scope=RequestScope.WORKFLOW)
+    def on_has_variable_request(self, request: HasVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Check if a variable exists."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -920,7 +933,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to check existence of variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
         exists = result.variable is not None
 
         return HasVariableResultSuccess(
@@ -930,13 +945,13 @@ class VariablesManager(EngineScoped):
         )
 
     def _get_variables_by_scope(  # noqa: PLR0911
-        self, starting_flow: str, lookup_scope: VariableScope, project_id: str | None
+        self, workflow: WorkflowRuntime, starting_flow: str, lookup_scope: VariableScope, project_id: str | None
     ) -> list[ResolvedVariable]:
         """Get variables for the specified scope, each tagged with the layer it came from."""
         match lookup_scope:
             case VariableScope.CURRENT_FLOW_ONLY:
                 # Just this flow's own layer — no ancestors, project, or global.
-                layer = self._find_flow_layer(starting_flow)
+                layer = self._find_flow_layer(workflow, starting_flow)
                 if layer is None:
                     return []
                 return [ResolvedVariable(variable=v, layer=VariableLayerKind.FLOW) for v in layer.list()]
@@ -948,12 +963,13 @@ class VariablesManager(EngineScoped):
             case VariableScope.GLOBAL_ONLY:
                 # Just the global layer.
                 return [
-                    ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in self._list_global_variables()
+                    ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL)
+                    for v in workflow.variables.global_layer.list()
                 ]
 
             case VariableScope.HIERARCHICAL:
                 # Full chain: flow ancestry → project → global, with shadowing.
-                return self._get_hierarchical_variables(starting_flow, project_id)
+                return self._get_hierarchical_variables(workflow, starting_flow, project_id)
 
             case VariableScope.HIERARCHICAL_FROM_PROJECT:
                 # Project → global (skips flows). `seen` tracks names already claimed by
@@ -964,20 +980,22 @@ class VariablesManager(EngineScoped):
                 result = self._collect_resolvable_project_variables(seen, project_id=project_id)
                 result.extend(
                     ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL)
-                    for v in self._list_global_variables()
+                    for v in workflow.variables.global_layer.list()
                     if v.name not in seen
                 )
                 return result
 
             case VariableScope.ALL:
                 # Every layer, no shadowing — for GUI enumeration.
-                return self._get_all_variables(project_id)
+                return self._get_all_variables(workflow, project_id)
 
             case _:
                 msg = f"Attempted to get variables from starting flow '{starting_flow}', but encountered an unknown/unexpected variable scope '{lookup_scope.value}'"
                 raise ValueError(msg)
 
-    def _get_hierarchical_variables(self, starting_flow: str, project_id: str | None) -> list[ResolvedVariable]:
+    def _get_hierarchical_variables(
+        self, workflow: WorkflowRuntime, starting_flow: str, project_id: str | None
+    ) -> list[ResolvedVariable]:
         """Get variables using hierarchical lookup with shadowing.
 
         Variable shadowing precedence (innermost wins):
@@ -991,7 +1009,7 @@ class VariablesManager(EngineScoped):
 
         # Flow ancestry (innermost first)
         for flow_name in hierarchy:
-            flow_layer = self._find_flow_layer(flow_name)
+            flow_layer = self._find_flow_layer(workflow, flow_name)
             if flow_layer is None:
                 continue
             for var in flow_layer.list():
@@ -1005,13 +1023,13 @@ class VariablesManager(EngineScoped):
         # Global layer (lowest priority)
         variables.extend(
             ResolvedVariable(variable=var, layer=VariableLayerKind.GLOBAL)
-            for var in self._list_global_variables()
+            for var in workflow.variables.global_layer.list()
             if var.name not in seen_names
         )
 
         return variables
 
-    def _get_all_variables(self, project_id: str | None) -> list[ResolvedVariable]:
+    def _get_all_variables(self, workflow: WorkflowRuntime, project_id: str | None) -> list[ResolvedVariable]:
         """Get all variables from every layer for GUI enumeration.
 
         Note: This returns ALL variables without shadowing - variables with the same
@@ -1020,20 +1038,20 @@ class VariablesManager(EngineScoped):
         """
         variables: list[ResolvedVariable] = []
 
-        for flow_layer in self._list_flow_layers():
+        for flow_layer in self._list_flow_layers(workflow):
             variables.extend(ResolvedVariable(variable=v, layer=VariableLayerKind.FLOW) for v in flow_layer.list())
 
         # Project layer entries — silent-skip resolution failures for enumeration.
         variables.extend(self._collect_resolvable_project_variables(set(), project_id=project_id))
 
         variables.extend(
-            ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in self._list_global_variables()
+            ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in workflow.variables.global_layer.list()
         )
 
         return variables
 
-    @handles(ListVariablesRequest)
-    def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
+    @handles(ListVariablesRequest, scope=RequestScope.WORKFLOW)
+    def on_list_variables_request(self, request: ListVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -1042,7 +1060,7 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to list variables. Failed to determine starting flow: {e}"
             )
 
-        resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
+        resolved = self._get_variables_by_scope(workflow, starting_flow, request.lookup_scope, request.project_id)
 
         # Sort by name for consistent output. Sort the (variable, layer) pairs together
         # so the parallel layers list stays aligned with variables.
@@ -1053,8 +1071,10 @@ class VariablesManager(EngineScoped):
             variables=variables, layers=layers, result_details=f"Successfully listed {len(variables)} variables."
         )
 
-    @handles(ListSubstitutablesRequest)
-    def on_list_substitutables_request(self, request: ListSubstitutablesRequest) -> ResultPayload:
+    @handles(ListSubstitutablesRequest, scope=RequestScope.WORKFLOW)
+    def on_list_substitutables_request(
+        self, request: ListSubstitutablesRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         """DEPRECATED shim: list all values available for {VAR} substitution.
 
         Kept wire-identical for GUI versions that still send ListSubstitutablesRequest;
@@ -1074,7 +1094,7 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to list substitutables. Failed to determine starting flow: {e}"
             )
 
-        resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
+        resolved = self._get_variables_by_scope(workflow, starting_flow, request.lookup_scope, request.project_id)
 
         # Only str/int/float/bool/dict/list values can substitute into {VAR} tokens. Everything but
         # str and int is listed as its rendered string.
@@ -1102,8 +1122,8 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully listed {len(substitutables)} substitutable(s).",
         )
 
-    @handles(GetVariablesRequest)
-    def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
+    @handles(GetVariablesRequest, scope=RequestScope.WORKFLOW)
+    def on_get_variables_request(self, request: GetVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Probe specific names in scope; report which resolved and which didn't.
 
         The named companion to ListVariables: same layered walk (lookup_scope /
@@ -1128,7 +1148,9 @@ class VariablesManager(EngineScoped):
         resolved: dict[str, Any] = {}
         unresolved: list[str] = []
         for name in request.names:
-            lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope, request.project_id)
+            lookup = self._find_variable_hierarchical(
+                workflow, starting_flow, name, request.lookup_scope, request.project_id
+            )
             if lookup.variable is None:
                 unresolved.append(name)
             else:
@@ -1140,8 +1162,10 @@ class VariablesManager(EngineScoped):
             result_details=f"Probed {len(request.names)} variable name(s): {len(resolved)} resolved, {len(unresolved)} unresolved.",
         )
 
-    @handles(ResolveSubstitutionRequest)
-    def on_resolve_substitution_request(self, request: ResolveSubstitutionRequest) -> ResultPayload:
+    @handles(ResolveSubstitutionRequest, scope=RequestScope.WORKFLOW)
+    def on_resolve_substitution_request(
+        self, request: ResolveSubstitutionRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         """DEPRECATED shim: resolve every {VAR}-substitutable value visible from the starting flow.
 
         No engine-internal callers remain — kept wire-identical for out-of-tree scripts.
@@ -1160,7 +1184,9 @@ class VariablesManager(EngineScoped):
             result: dict[str, Any] = {}
             missing: set[str] = set()
             for name in request.names:
-                lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope, request.project_id)
+                lookup = self._find_variable_hierarchical(
+                    workflow, starting_flow, name, request.lookup_scope, request.project_id
+                )
                 if lookup.variable is None:
                     missing.add(name)
                     continue
@@ -1177,14 +1203,14 @@ class VariablesManager(EngineScoped):
                 variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
             )
 
-        resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
+        resolved = self._get_variables_by_scope(workflow, starting_flow, request.lookup_scope, request.project_id)
         all_vars: dict[str, Any] = {r.variable.name: r.variable.value for r in resolved}
         return ResolveSubstitutionResultSuccess(
             variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
 
-    @handles(SetVariablesRequest)
-    def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
+    @handles(SetVariablesRequest, scope=RequestScope.WORKFLOW)
+    def on_set_variables_request(self, request: SetVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """DEPRECATED shim: set multiple variable values atomically (all-or-nothing).
 
         No known senders — kept frozen at its pre-#5142 behavior for out-of-tree scripts:
@@ -1205,7 +1231,9 @@ class VariablesManager(EngineScoped):
         missing: list[str] = []
         not_writable: list[str] = []
         for name in request.variables:
-            lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope, request.project_id)
+            lookup = self._find_variable_hierarchical(
+                workflow, starting_flow, name, request.lookup_scope, request.project_id
+            )
             if lookup.variable is None:
                 missing.append(name)
                 continue
@@ -1234,11 +1262,13 @@ class VariablesManager(EngineScoped):
         for name, value in request.variables.items():
             found[name].value = value
 
-        self._unresolve_nodes_referencing_variables(list(request.variables.keys()))
+        self._unresolve_nodes_referencing_variables(workflow, list(request.variables.keys()))
         return SetVariablesResultSuccess(result_details=f"Successfully set {len(request.variables)} variable(s).")
 
-    @handles(GetVariableDetailsRequest)
-    def on_get_variable_details_request(self, request: GetVariableDetailsRequest) -> ResultPayload:
+    @handles(GetVariableDetailsRequest, scope=RequestScope.WORKFLOW)
+    def on_get_variable_details_request(
+        self, request: GetVariableDetailsRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         """Get variable details (metadata only, no heavy values)."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -1247,7 +1277,9 @@ class VariablesManager(EngineScoped):
                 result_details=f"Attempted to get details for variable '{request.name}'. Failed to determine starting flow: {e}"
             )
 
-        result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
+        result = self._find_variable_hierarchical(
+            workflow, starting_flow, request.name, request.lookup_scope, request.project_id
+        )
 
         if not result.variable:
             return GetVariableDetailsResultFailure(
@@ -1270,7 +1302,7 @@ class VariablesManager(EngineScoped):
             details=details, result_details=f"Successfully retrieved details for variable '{request.name}'."
         )
 
-    def _unresolve_nodes_referencing_variables(self, variable_names: list[str]) -> None:
+    def _unresolve_nodes_referencing_variables(self, workflow: WorkflowRuntime, variable_names: list[str]) -> None:
         # Lazy imports to avoid circular dependency between retained_mode and exe_types.
         from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
         from griptape_nodes.exe_types.variable_resolver import VariableResolver
@@ -1282,7 +1314,7 @@ class VariablesManager(EngineScoped):
 
         connections = flow_manager.get_connections()
 
-        for obj in self.engine.object_manager.get_filtered_subset(type=BaseNode).values():
+        for obj in workflow.objects.get_filtered_subset(type=BaseNode).values():
             if obj.state not in (NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING):
                 continue
             for param in obj.parameters:
@@ -1298,13 +1330,3 @@ class VariablesManager(EngineScoped):
                     )
                     connections.unresolve_future_nodes(obj)
                     break
-
-    def _find_variable_by_name(self, name: str) -> FlowVariable | None:
-        """Find a variable by name in current flow context (legacy compatibility)."""
-        try:
-            starting_flow = self._get_starting_flow(None)
-        except ValueError:
-            return None
-
-        result = self._find_variable_hierarchical(starting_flow, name, VariableScope.HIERARCHICAL, None)
-        return result.variable
