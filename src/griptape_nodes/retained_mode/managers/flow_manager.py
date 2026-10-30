@@ -2445,15 +2445,22 @@ class FlowManager(EngineScoped):
         self._global_flow_queue.queue.clear()
 
         # Request cancellation on all nodes and wait for them to complete
+        machine = self._global_control_flow_machine
         run_seconds = None
-        if self._global_control_flow_machine is not None:
-            await self._global_control_flow_machine.cancel_flow()
+        if machine is not None:
+            await machine.cancel_flow()
             # Read before the reset below clears the run's start time.
-            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
+            run_seconds = machine.context.seconds_since_run_started()
 
-        # Reset control flow machine
-        if self._global_control_flow_machine is not None:
-            self._global_control_flow_machine.reset_machine(cancel=True)
+        # The run may have ended while its nodes were stopping, and the next run started on a machine
+        # of its own. The shared DAG builder, the single-node flag and the editor's involved nodes are
+        # that run's now, and the editor reads a cancelled event as that run stopping, so a cancel
+        # whose machine has been replaced leaves all of it alone.
+        if machine is not self._global_control_flow_machine:
+            logger.debug("Flow run ended before its cancel finished; leaving the next run's state alone")
+            return
+        if machine is not None:
+            machine.reset_machine(cancel=True)
         self._global_single_node_resolution = False
         self._global_dag_builder.clear()
         logger.debug("Cancelling flow run")
