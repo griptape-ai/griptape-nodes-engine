@@ -2,7 +2,7 @@
 
 `check_count` backs `MaxCount`; `limit_error` builds the `NodeError`, with its link to the provider's
 limits page, that every check in this package returns; `input_subject` starts the message naming the
-input. The checks on media files are in `_media_checks`.
+input. Checks for a particular kind of value live beside the validators that use them.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ def check_count(
         count: How many inputs are connected.
         maximum: The most the provider accepts.
         parameter: The parameter's name as the UI shows it.
-        noun: The plural of what is counted, such as "images".
+        noun: The plural of what is counted, such as "prompts".
         docs_url: The provider's page documenting the limit.
     """
     if count <= maximum:
@@ -38,11 +38,11 @@ def limit_error(message: str, docs_url: str | None) -> NodeError:
 
 
 def input_subject(parameter: str, *, noun: str, position: int | None = None) -> str:
-    """The start of a message naming one input, such as "Image 2 in 'reference images'".
+    """The start of a message naming one input, such as "Prompt 2 in 'prompts'".
 
     Args:
         parameter: The parameter's name as the UI shows it.
-        noun: What the input is, such as "image" or "video".
+        noun: What the input is, such as "prompt".
         position: The input's 1-based position in a list parameter, or None for a single input.
     """
     if position is None:

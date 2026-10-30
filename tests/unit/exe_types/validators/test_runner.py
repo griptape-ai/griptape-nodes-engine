@@ -37,7 +37,7 @@ from griptape_nodes.exe_types.validators._runner import (
     validate_inputs,
     validate_node,
 )
-from griptape_nodes.exe_types.validators.base import PreRunValidator, reads
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -48,6 +48,7 @@ from griptape_nodes.exe_types.validators.media import (
     MaxFileSize,
     SideRange,
 )
+from griptape_nodes.exe_types.validators.media_validator import reads
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,

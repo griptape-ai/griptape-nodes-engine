@@ -26,7 +26,7 @@ from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
 from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, changed_trait_states
-from griptape_nodes.exe_types.validators.base import require_validators_fit
+from griptape_nodes.exe_types.validators.media_validator import require_validators_fit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence

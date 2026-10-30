@@ -1,4 +1,4 @@
-"""Validators that aren't about one file: a list's length, and limits picked by another parameter."""
+"""Validators for any kind of value: a list's length, and limits picked by another parameter."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class MaxCount(PreRunValidator):
 
     Args:
         maximum: The most items accepted.
-        noun: The plural of what is counted, such as "images", for the message.
+        noun: The plural of what is counted, such as "prompts", for the message.
     """
 
     checks_whole_list = True
@@ -42,18 +42,13 @@ class IfParameter(PreRunValidator):
 
     At the node's turn, the validators listed for the other parameter's current value apply, or
     `default` for a value not listed. A list can hold another `IfParameter`, for limits that depend
-    on two settings; it picks in turn. This is how a limit depends on a setting; a limit that
-    depends on the file itself uses `MediaValidator.when` or `unless`.
+    on two settings; it picks in turn. The validators it picks can be of any kind.
 
     ```python
-    IfParameter(
-        "model",
-        {"pro": [SideRange(min=300), MaxFileSize(10 * MB)]},
-        default=[SideRange(min=512)],
-    )
+    IfParameter("model", {"pro": [MaxCount(4)]}, default=[MaxCount(1)])
     # A switch, and whether a list has items:
-    IfParameter("upscale", {True: []}, default=[SideRange(min=512)])
-    IfParameter("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
+    IfParameter("strict", {True: [MaxCount(1)]}, default=[MaxCount(3)])
+    IfParameter("examples", {False: [MaxCount(1)]}, key=bool)
     ```
 
     Args:

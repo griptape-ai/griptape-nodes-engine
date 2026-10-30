@@ -42,7 +42,7 @@ from griptape_nodes.exe_types.validators._media_checks import (
     check_size,
     check_video_codec,
 )
-from griptape_nodes.exe_types.validators.base import MediaValidator
+from griptape_nodes.exe_types.validators.media_validator import MediaValidator
 from griptape_nodes.utils.media_probe import MediaInfo, MediaNeed
 
 if TYPE_CHECKING:

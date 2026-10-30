@@ -1,7 +1,7 @@
 """Running a node's pre-run checks at its turn, before it runs.
 
 The resolution machine calls `validate_node`, in a worker thread, which runs the node's declared
-validators and then its `validate_before_node_run` inside one `reading_once`, and returns
+validators and then its `validate_before_node_run` while each input is read at most once, and returns
 both methods' errors together.
 """
 
@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import ParameterList
 from griptape_nodes.exe_types.validators._checks import input_subject
-from griptape_nodes.exe_types.validators.base import holds_list, media_kind_of, needs_for_kind, run_check
-from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, read_media, reading_once
+from griptape_nodes.exe_types.validators.base import holds_list
+from griptape_nodes.exe_types.validators.media_validator import files_read_once, input_noun, run_validators
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,22 +21,17 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_error import NodeError
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.exe_types.validators.base import PreRunValidator
-    from griptape_nodes.utils.media_values import MediaKind
 
 __all__ = ["validate_inputs", "validate_node"]
-
-# What an input is called in a message, by the kind of media its parameter holds.
-_NOUN_FOR_KIND: dict[MediaKind, str] = {"image": "image", "video": "video", "audio": "audio clip"}
-_DEFAULT_NOUN = "input"
 
 
 def validate_node(node: BaseNode) -> list[Exception]:
     """Run a node's declared validators, then its `validate_before_node_run`, and return their errors.
 
-    Both run inside one `reading_once`, so each input is read once for the validators and
-    the node's own checks together.
+    Both share one read of each input, so the validators and the node's own checks never read a file
+    twice.
     """
-    with reading_once():
+    with files_read_once():
         errors: list[Exception] = [*validate_inputs(node)]
         errors.extend(node.validate_before_node_run() or [])
     return errors
@@ -75,26 +70,23 @@ def _check_parameter(
     errors: list[NodeError],
 ) -> None:
     """Run one parameter's validators, appending their errors."""
-    kind = media_kind_of(parameter)
     shown_name = parameter.display_name or parameter.name
-    noun = _noun(kind)
+    noun = input_noun(parameter)
     if not holds_list(parameter):
         value = _value_here(node, parameter.name)
         if value is None:
             return
-        info = _read(value, validators, kind)
         subject = input_subject(shown_name, noun=noun)
-        errors.extend(_collect(validators, value, subject=subject, media=info, docs_url=docs_url))
+        errors.extend(run_validators(validators, value, parameter, subject=subject, docs_url=docs_url))
         return
 
     items = _list_items(node, parameter)
     whole_list = [validator for validator in validators if validator.checks_whole_list]
     per_item = [validator for validator in validators if not validator.checks_whole_list]
-    errors.extend(_collect(whole_list, items, subject=shown_name, media=EMPTY_MEDIA, docs_url=docs_url))
+    errors.extend(run_validators(whole_list, items, parameter, subject=shown_name, docs_url=docs_url, whole_list=True))
     for position, item in enumerate(items, start=1):
-        info = _read(item, per_item, kind)
         subject = input_subject(shown_name, noun=noun, position=position)
-        errors.extend(_collect(per_item, item, subject=subject, media=info, docs_url=docs_url, position=position))
+        errors.extend(run_validators(per_item, item, parameter, subject=subject, docs_url=docs_url, position=position))
 
 
 def _selected_validators(node: BaseNode, parameter: Parameter) -> list[PreRunValidator]:
@@ -103,32 +95,6 @@ def _selected_validators(node: BaseNode, parameter: Parameter) -> list[PreRunVal
     for declared in parameter.pre_run_validators:
         validators.extend(declared.selected(node))
     return validators
-
-
-def _read(value: Any, validators: Sequence[PreRunValidator], kind: MediaKind | None) -> MediaInfo:
-    """One read of a value, for every reading these validators need together."""
-    needs = needs_for_kind(validators, kind)
-    if kind is None or not needs:
-        return EMPTY_MEDIA
-    return read_media(value, needs, kind=kind)
-
-
-def _collect(  # noqa: PLR0913
-    validators: Sequence[PreRunValidator],
-    value: Any,
-    *,
-    subject: str,
-    media: MediaInfo,
-    docs_url: str | None,
-    position: int | None = None,
-) -> list[NodeError]:
-    """Each error these validators report for one value."""
-    errors: list[NodeError] = []
-    for validator in validators:
-        error = run_check(validator, value, media, subject=subject, docs_url=docs_url, position=position)
-        if error is not None:
-            errors.append(error)
-    return errors
 
 
 def _value_here(node: BaseNode, name: str) -> Any:
@@ -154,10 +120,3 @@ def _list_items(node: BaseNode, parameter: Parameter) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [item for item in value if item is not None]
-
-
-def _noun(kind: MediaKind | None) -> str:
-    """What an input is called in a message, by the kind of media its parameter holds."""
-    if kind is None:
-        return _DEFAULT_NOUN
-    return _NOUN_FOR_KIND[kind]

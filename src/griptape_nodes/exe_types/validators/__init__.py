@@ -6,24 +6,19 @@ Import them from here:
 from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, MaxFileSize
 ```
 
-- `base`: what a validator is. `PreRunValidator` is a limit on any value; `MediaValidator` is the
-  family for image, video and audio files, judged on readings the engine takes once (`MediaNeed`
-  names one, `MediaInfo` holds them, both from `griptape_nodes.utils.media_probe`). `reads` marks
-  what a `Condition` for `MediaValidator.when` or `unless` reads.
-- `media`: limits on an image, video or audio file, such as `MaxFileSize` or `MaxDuration`.
+- `base`: `PreRunValidator`, a limit on any value.
 - `common`: `MaxCount` for a list's length, and `IfParameter` for limits that depend on another
   parameter's value.
+- `media_validator`: `MediaValidator`, the family for image, video and audio files, judged on
+  readings the engine takes once (`MediaNeed` names one, `MediaInfo` holds them, both from
+  `griptape_nodes.utils.media_probe`), and `reads` to mark what a `Condition` for
+  `MediaValidator.when` or `unless` reads.
+- `media`: the built-in media limits, such as `MaxFileSize` or `MaxDuration`.
 """
 
 from __future__ import annotations
 
-from griptape_nodes.exe_types.validators.base import (
-    LIMITS_LINK_LABEL,
-    Condition,
-    MediaValidator,
-    PreRunValidator,
-    reads,
-)
+from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL, PreRunValidator
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
@@ -39,6 +34,7 @@ from griptape_nodes.exe_types.validators.media import (
     SideRange,
     VideoCodecs,
 )
+from griptape_nodes.exe_types.validators.media_validator import Condition, MediaValidator, reads
 from griptape_nodes.utils.media_probe import MediaInfo, MediaNeed
 
 __all__ = [

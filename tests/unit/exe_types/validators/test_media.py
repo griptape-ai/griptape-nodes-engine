@@ -46,7 +46,7 @@ from tests.unit.exe_types.validators.media_files import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from griptape_nodes.exe_types.validators.base import MediaValidator
+    from griptape_nodes.exe_types.validators.media_validator import MediaValidator
 
 SUBJECT = "Image 2 in 'reference images'"
 DOCS = "https://example.com/limits"
