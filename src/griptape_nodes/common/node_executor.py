@@ -420,6 +420,7 @@ class NodeExecutor(EngineScoped):
                     workflow_name=workflow_context.name,
                     workflow_file_path=workflow_context.file_path,
                     workflow_working_directory=workflow_context.working_directory,
+                    run_id=self.engine.flow_manager.current_run_id,
                     # The failure is raised below and reported by whoever started the run.
                     failure_log_level=logging.DEBUG,
                 )
