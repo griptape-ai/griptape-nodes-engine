@@ -108,7 +108,7 @@ def _add[NodeT: BaseNode](engine: Engine, node: NodeT, flow_name: str) -> NodeT:
     """Register a hand-built node the way CreateNodeRequest does, with no library to create it from."""
     engine.flow_manager.get_flow_by_name(flow_name).add_node(node)
     engine.object_manager.add_object_by_name(node.name, node)
-    engine.node_manager._name_to_parent_flow_name[node.name] = flow_name
+    engine.current_workflow().nodes.name_to_parent_flow_name[node.name] = flow_name
     return node
 
 

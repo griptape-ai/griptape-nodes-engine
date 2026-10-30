@@ -539,7 +539,7 @@ class TestNodesAndFlowsOnTheRuntime:
         worker_manager = MagicMock()
         worker_manager.route_to_worker = AsyncMock(side_effect=close_while_running)
         result = await engine.node_manager._execute_node_via_worker(
-            ExecuteNodeRequest(node_name="node", parameter_values={}), worker_manager, ("worker", "topic")
+            runtime, ExecuteNodeRequest(node_name="node", parameter_values={}), worker_manager, ("worker", "topic")
         )
 
         assert isinstance(result, ExecuteNodeResultFailure)

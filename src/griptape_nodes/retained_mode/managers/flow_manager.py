@@ -1109,7 +1109,7 @@ class FlowManager(EngineScoped):
                 name_to_parent_name[flow_name] = new_name
 
         # Let the Node Manager know about the change, too.
-        self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
+        self.engine.node_manager.handle_flow_rename(workflow, old_name=old_name, new_name=new_name)
 
     def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
         """Connect two parameters in the open workflow, outside dispatch.
@@ -1141,7 +1141,7 @@ class FlowManager(EngineScoped):
             source_node_name = source_node.name
         if source_node is None:
             try:
-                source_node = self.engine.node_manager.get_node_by_name(source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError as err:
                 details = f'Connection failed: "{source_node_name}" does not exist. Error: {err}.'
 
@@ -1160,7 +1160,7 @@ class FlowManager(EngineScoped):
             target_node_name = target_node.name
         if target_node is None:
             try:
-                target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                target_node = self.engine.node_manager.get_node_by_name_in(workflow, target_node_name)
             except ValueError as err:
                 details = f'Connection failed: "{target_node_name}" does not exist. Error: {err}.'
                 return CreateConnectionResultFailure(result_details=details)
@@ -1169,7 +1169,7 @@ class FlowManager(EngineScoped):
         # Get the parent flows.
         source_flow_name = None
         try:
-            source_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(source_node_name)
+            source_flow_name = workflow.nodes.parent_flow_name(source_node_name)
             self.get_flow_by_name_in(workflow, source_flow_name)
         except KeyError as err:
             details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" failed: {err}.'
@@ -1177,7 +1177,7 @@ class FlowManager(EngineScoped):
 
         target_flow_name = None
         try:
-            target_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(target_node_name)
+            target_flow_name = workflow.nodes.parent_flow_name(target_node_name)
             self.get_flow_by_name_in(workflow, target_flow_name)
         except KeyError as err:
             details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" failed: {err}.'
@@ -1505,7 +1505,7 @@ class FlowManager(EngineScoped):
             source_node_name = source_node.name
         if source_node is None:
             try:
-                source_node = self.engine.node_manager.get_node_by_name(source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError as err:
                 details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1523,7 +1523,7 @@ class FlowManager(EngineScoped):
             target_node_name = target_node.name
         if target_node is None:
             try:
-                target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                target_node = self.engine.node_manager.get_node_by_name_in(workflow, target_node_name)
             except ValueError as err:
                 details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1533,7 +1533,7 @@ class FlowManager(EngineScoped):
         # Get the parent flows.
         source_flow_name = None
         try:
-            source_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(source_node_name)
+            source_flow_name = workflow.nodes.parent_flow_name(source_node_name)
             self.get_flow_by_name_in(workflow, source_flow_name)
         except KeyError as err:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
@@ -1542,7 +1542,7 @@ class FlowManager(EngineScoped):
 
         target_flow_name = None
         try:
-            target_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(target_node_name)
+            target_flow_name = workflow.nodes.parent_flow_name(target_node_name)
             self.get_flow_by_name_in(workflow, target_flow_name)
         except KeyError as err:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
@@ -1685,7 +1685,7 @@ class FlowManager(EngineScoped):
     def on_package_nodes_as_serialized_flow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         request: PackageNodesAsSerializedFlowRequest,
-        workflow: WorkflowRuntime,  # noqa: ARG002 (packaging reads the nodes through NodeManager)
+        workflow: WorkflowRuntime,
     ) -> ResultPayload:
         """Handle request to package multiple nodes as a serialized flow.
 
@@ -1710,14 +1710,14 @@ class FlowManager(EngineScoped):
             return library_version
 
         # Step 3: Validate all nodes exist
-        validation_result = self._validate_multi_node_request(request)
+        validation_result = self._validate_multi_node_request(workflow, request)
         if validation_result is not None:
             return validation_result
 
         # Get the actual node objects for processing
         nodes_to_package = []
         for node_name in request.node_names:
-            node = self.engine.node_manager.get_node_by_name(node_name)
+            node = self.engine.node_manager.get_node_by_name_in(workflow, node_name)
             nodes_to_package.append(node)
 
         # Step 4: Initialize tracking variables and mappings (moved up so package node serialization can use them)
@@ -1731,6 +1731,7 @@ class FlowManager(EngineScoped):
 
         # Step 5: Serialize nodes with local execution environment to prevent recursive loops
         serialized_package_nodes = self._serialize_package_nodes_for_local_execution(
+            workflow,
             nodes_to_package=nodes_to_package,
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -1750,7 +1751,7 @@ class FlowManager(EngineScoped):
         self._inject_output_mode_for_property_parameters(nodes_to_package, serialized_package_nodes)
 
         # Step 7: Analyze external connections (connections from/to nodes outside our selection)
-        node_connections_dict = self._analyze_multi_node_external_connections(package_nodes=nodes_to_package)
+        node_connections_dict = self._analyze_multi_node_external_connections(workflow, package_nodes=nodes_to_package)
         if isinstance(node_connections_dict, PackageNodesAsSerializedFlowResultFailure):
             return node_connections_dict
 
@@ -1758,7 +1759,7 @@ class FlowManager(EngineScoped):
         node_group_node: SubflowNodeGroup | None = None
         if request.node_group_name:
             try:
-                node = self.engine.node_manager.get_node_by_name(request.node_group_name)
+                node = self.engine.node_manager.get_node_by_name_in(workflow, request.node_group_name)
                 if isinstance(node, SubflowNodeGroup):
                     node_group_node = node
             except Exception as e:
@@ -1766,6 +1767,7 @@ class FlowManager(EngineScoped):
 
         # Step 9: Create start node with parameters for external incoming connections
         start_node_result = self._create_multi_node_start_node_with_connections(
+            workflow,
             request=request,
             library_version=library_version,
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
@@ -1921,14 +1923,14 @@ class FlowManager(EngineScoped):
         return start_end_library_metadata.library_version
 
     def _validate_multi_node_request(
-        self, request: PackageNodesAsSerializedFlowRequest
+        self, workflow: WorkflowRuntime, request: PackageNodesAsSerializedFlowRequest
     ) -> PackageNodesAsSerializedFlowResultFailure | None:
         """Validate that all requested nodes exist and control flow configuration is valid."""
         # Validate all nodes exist
         missing_nodes = []
         for node_name in request.node_names:
             try:
-                self.engine.node_manager.get_node_by_name(node_name)
+                self.engine.node_manager.get_node_by_name_in(workflow, node_name)
             except Exception:
                 missing_nodes.append(node_name)
 
@@ -1953,6 +1955,7 @@ class FlowManager(EngineScoped):
 
     def _serialize_package_nodes_for_local_execution(  # noqa: C901, PLR0913, PLR0917
         self,
+        workflow: WorkflowRuntime,
         nodes_to_package: list[BaseNode],
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
@@ -1965,6 +1968,7 @@ class FlowManager(EngineScoped):
         """Serialize package nodes while temporarily setting execution environment to local to prevent recursive loops.
 
         Args:
+            workflow: The workflow the nodes are in
             nodes_to_package: List of nodes to serialize
             unique_parameter_uuid_to_values: Shared dictionary for deduplicating parameter values across all nodes
             serialized_parameter_value_tracker: Tracker for serialized parameter values
@@ -1986,9 +1990,9 @@ class FlowManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 include_existing_subflow_in_group=True,
-                values_supplied_by_connections=self._package_parameters_fed_by_connections(node),
+                values_supplied_by_connections=self._package_parameters_fed_by_connections(workflow, node),
             )
-            serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request)
+            serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request, workflow)
 
             if not isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
                 return PackageNodesAsSerializedFlowResultFailure(
@@ -2035,6 +2039,7 @@ class FlowManager(EngineScoped):
 
         # Get connections from the connection manager
         connections_result = self._get_internal_connections_for_package(
+            workflow,
             nodes_to_package=nodes_to_package,
             package_node_names_set=package_node_names_set,
             node_name_to_uuid=node_name_to_uuid,
@@ -2047,7 +2052,7 @@ class FlowManager(EngineScoped):
         serialized_node_commands.extend(serialized_node_group_commands)
         return serialized_node_commands
 
-    def _package_parameters_fed_by_connections(self, node: BaseNode) -> set[str]:
+    def _package_parameters_fed_by_connections(self, workflow: WorkflowRuntime, node: BaseNode) -> set[str]:
         """Names of the node's parameters whose values the packaged flow's connections will supply.
 
         A connected input gets its value inside the rebuilt flow before its node runs: from the Start
@@ -2062,10 +2067,11 @@ class FlowManager(EngineScoped):
         """
         if node.lock:
             return set()
-        return set(self.get_connections().incoming_index.get(node.name, {}))
+        return set(workflow.flows.connections.incoming_index.get(node.name, {}))
 
     def _get_internal_connections_for_package(
         self,
+        workflow: WorkflowRuntime,
         nodes_to_package: list[BaseNode],
         package_node_names_set: set[str],
         node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
@@ -2075,6 +2081,7 @@ class FlowManager(EngineScoped):
         Queries connections from the connection manager for all nodes being packaged.
 
         Args:
+            workflow: The workflow the nodes are in
             nodes_to_package: List of nodes being packaged
             package_node_names_set: Set of node names in the package for O(1) lookup
             node_name_to_uuid: Mapping of node names to their UUIDs in the serialization
@@ -2087,7 +2094,7 @@ class FlowManager(EngineScoped):
         for node in nodes_to_package:
             list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
             list_connections_result = self.engine.node_manager.on_list_connections_for_node_request(
-                list_connections_request
+                list_connections_request, workflow
             )
 
             if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -2161,7 +2168,7 @@ class FlowManager(EngineScoped):
                 serialized_node.element_modification_commands.extend(package_alter_parameter_commands)
 
     def _analyze_multi_node_external_connections(
-        self, package_nodes: list[BaseNode]
+        self, workflow: WorkflowRuntime, package_nodes: list[BaseNode]
     ) -> dict[str, ConnectionAnalysis] | PackageNodesAsSerializedFlowResultFailure:
         """Analyze external connections for each package node using filtered single-node analysis.
 
@@ -2176,6 +2183,7 @@ class FlowManager(EngineScoped):
         the set of package node names to the single-node analysis method.
 
         Args:
+            workflow: The workflow the nodes are in
             package_nodes: List of nodes being packaged together
 
         Returns:
@@ -2188,6 +2196,7 @@ class FlowManager(EngineScoped):
         for package_node in package_nodes:
             # Perform a single node analysis, filtering out internal connections
             connection_analysis = self._analyze_package_node_connections(
+                workflow,
                 package_node=package_node,
                 node_name=package_node.name,
                 package_node_names=package_node_names_set,
@@ -2201,6 +2210,7 @@ class FlowManager(EngineScoped):
 
     def _analyze_package_node_connections(
         self,
+        workflow: WorkflowRuntime,
         package_node: BaseNode,
         node_name: str,
         package_node_names: set[str] | None = None,
@@ -2208,6 +2218,7 @@ class FlowManager(EngineScoped):
         """Analyze package node connections and separate control from data connections.
 
         Args:
+            workflow: The workflow the node is in
             package_node: The node being analyzed
             node_name: Name of the node
             package_node_names: Set of node names in the package for filtering internal connections
@@ -2216,7 +2227,7 @@ class FlowManager(EngineScoped):
         # Get connection details using the standard approach
         list_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
         list_connections_result = self.engine.node_manager.on_list_connections_for_node_request(
-            list_connections_request
+            list_connections_request, workflow
         )
 
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -2561,6 +2572,7 @@ class FlowManager(EngineScoped):
 
     def _create_multi_node_start_node_with_connections(  # noqa: PLR0913, PLR0917
         self,
+        workflow: WorkflowRuntime,
         request: PackageNodesAsSerializedFlowRequest,
         library_version: str,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
@@ -2608,6 +2620,7 @@ class FlowManager(EngineScoped):
         #  4. Create a connection from the Start Node to the package node
         for target_node_name, connection_analysis in external_connections_dict.items():
             result = self._create_start_node_parameters_and_connections_for_incoming_data(
+                workflow,
                 target_node_name=target_node_name,
                 incoming_data_connections=connection_analysis.incoming_data_connections,
                 output_parameter_prefix=request.output_parameter_prefix,
@@ -2634,6 +2647,7 @@ class FlowManager(EngineScoped):
 
         # Create all control connections
         control_connections = self._create_start_node_control_connections(
+            workflow,
             request=request,
             start_node_uuid=start_node_uuid,
             node_name_to_uuid=node_name_to_uuid,
@@ -2786,6 +2800,7 @@ class FlowManager(EngineScoped):
 
     def _create_start_node_parameters_and_connections_for_incoming_data(  # noqa: PLR0913, PLR0917
         self,
+        workflow: WorkflowRuntime,
         target_node_name: str,
         incoming_data_connections: list[IncomingConnection],
         output_parameter_prefix: str,
@@ -2819,7 +2834,7 @@ class FlowManager(EngineScoped):
 
             # Get the source node to determine parameter type (from the external connection)
             try:
-                source_node = self.engine.node_manager.get_node_by_name(connection.source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, connection.source_node_name)
             except ValueError as err:
                 details = f"Attempted to package nodes as serialized flow. Failed because source node '{connection.source_node_name}' from incoming connection could not be found. Error: {err}."
                 return PackageNodesAsSerializedFlowResultFailure(result_details=details)
@@ -2889,6 +2904,7 @@ class FlowManager(EngineScoped):
 
     def _create_start_node_control_connections(
         self,
+        workflow: WorkflowRuntime,
         request: PackageNodesAsSerializedFlowRequest,
         start_node_uuid: SerializedNodeCommands.NodeUUID,
         node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
@@ -2896,6 +2912,7 @@ class FlowManager(EngineScoped):
         """Create control connection from start node to entry control node.
 
         Args:
+            workflow: The workflow the packaged nodes are in
             request: The packaging request with control flow configuration
             start_node_uuid: UUID of the start node
             node_name_to_uuid: Mapping of node names to UUIDs for lookup
@@ -2908,7 +2925,7 @@ class FlowManager(EngineScoped):
         # Connect start node to specified entry control node (if specified)
         if request.entry_control_node_name:
             # Get the entry node (already validated to exist)
-            entry_node = self.engine.node_manager.get_node_by_name(request.entry_control_node_name)
+            entry_node = self.engine.node_manager.get_node_by_name_in(workflow, request.entry_control_node_name)
             entry_node_uuid = node_name_to_uuid[request.entry_control_node_name]
 
             # Connect start node to specified entry control node
@@ -3138,7 +3155,7 @@ class FlowManager(EngineScoped):
         flow_name = request.flow_name
         if not flow_name:
             try:
-                flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
+                flow_name = workflow.nodes.parent_flow_name(node_name)
             except KeyError as err:
                 details = f"Could not derive parent flow for node '{node_name}': {err}"
                 return StartFlowFromNodeResultFailure(validation_exceptions=[err], result_details=details)
@@ -3324,7 +3341,7 @@ class FlowManager(EngineScoped):
             return start_nodes[0]
 
         try:
-            return self.engine.node_manager.get_node_by_name(start_node_name)
+            return self.engine.node_manager.get_node_by_name_in(workflow, start_node_name)
         except ValueError as err:
             details = f"Cannot start subflow '{flow_name}'. Start node '{start_node_name}' not found: {err}"
             return StartLocalSubflowResultFailure(result_details=details)
@@ -5339,12 +5356,12 @@ class FlowManager(EngineScoped):
             return False
         return self._flow_is_running(flows)
 
-    def running_flow_is_stopping_after_failure(self) -> bool:
-        """True while the running flow has failed and is waiting for its other nodes to finish."""
-        flows = self._current_flows_or_none()
-        if flows is None or flows.global_control_flow_machine is None:
+    def running_flow_is_stopping_after_failure(self, workflow: WorkflowRuntime) -> bool:
+        """True while the workflow's running flow has failed and is waiting for its other nodes to finish."""
+        machine = workflow.flows.global_control_flow_machine
+        if machine is None:
             return False
-        return flows.global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+        return machine.context.resolution_machine.is_stopping_after_failure()
 
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
@@ -5480,9 +5497,21 @@ class FlowManager(EngineScoped):
         return queue_item.node
 
     def clear_execution_queue(self, flow: ControlFlow) -> None:
-        """Clear all nodes from the global execution queue."""
-        if self._global_control_flow_machine and self._global_control_flow_machine.context.flow_name == flow.name:
-            self._global_flow_queue.queue.clear()
+        """Clear all nodes from the global execution queue, nothing when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `clear_execution_queue_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return
+        self.clear_execution_queue_in(workflow, flow)
+
+    def clear_execution_queue_in(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
+        """Clear all nodes from the workflow's execution queue when `flow` is the one it is running."""
+        flows = workflow.flows
+        machine = flows.global_control_flow_machine
+        if machine and machine.context.flow_name == flow.name:
+            flows.global_flow_queue.queue.clear()
 
     def has_connection(
         self,
@@ -5531,15 +5560,10 @@ class FlowManager(EngineScoped):
             if machine is not None:
                 await machine.start_flow(start_node, debug_mode=debug_mode)
 
-    async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
-        """Run one node of the open workflow, joining the run in progress if there is one.
-
-        Edge method for code not handed a workflow.
-
-        Raises:
-            OpenWorkflowError: No workflow is open, or more than one is.
-        """
-        workflow = self.engine.current_workflow()
+    async def resolve_singular_node(
+        self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False
+    ) -> None:
+        """Run one node of the workflow, joining the run in progress if there is one."""
         flows = workflow.flows
         # We are now going to have different behavior depending on how the node is behaving.
         if self._flow_is_running(flows):
@@ -6141,35 +6165,50 @@ class FlowManager(EngineScoped):
 
         return boundary_nodes
 
-    def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:
+    def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:  # noqa: ARG002
+        """The node and its upstream nodes, only the node when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `get_node_dependencies_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return [node]
+        return self.get_node_dependencies_in(workflow, node)
+
+    def get_node_dependencies_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode]:
         """Get all upstream nodes that the given node depends on.
 
         This method performs a breadth-first search starting from the given node and working backwards through its non-control input connections to identify all nodes that must run before this node can be resolved.
         It ignores control connections, since we're only focusing on node dependencies.
 
-        Edge method for code not handed a workflow.
-
         Args:
-            flow (ControlFlow): The flow containing the node
+            workflow (WorkflowRuntime): The workflow whose connections are followed
             node (BaseNode): The node to find dependencies for
 
         Returns:
             list[BaseNode]: A list of all nodes that the given node depends on, including the node itself (as the first element)
         """
+        connections = workflow.flows.connections
         node_list = [node]
         node_queue = Queue()
         node_queue.put(node)
         while not node_queue.empty():
             curr_node = node_queue.get()
-            input_connections = self.get_connected_input_from_node(flow, curr_node)
-            if input_connections:
-                for input_node, input_parameter in input_connections:
-                    if (
-                        ParameterTypeBuiltin.CONTROL_TYPE.value != input_parameter.output_type
-                        and input_node not in node_list
-                    ):
-                        node_list.append(input_node)
-                        node_queue.put(input_node)
+            input_connection_ids = [
+                connection_id
+                for connection_ids in connections.incoming_index.get(curr_node.name, {}).values()
+                for connection_id in connection_ids
+            ]
+            for connection_id in input_connection_ids:
+                connection = connections.connections[connection_id]
+                input_node = connection.source_node
+                input_parameter = connection.source_parameter
+                if (
+                    ParameterTypeBuiltin.CONTROL_TYPE.value != input_parameter.output_type
+                    and input_node not in node_list
+                ):
+                    node_list.append(input_node)
+                    node_queue.put(input_node)
         return node_list
 
     @staticmethod
