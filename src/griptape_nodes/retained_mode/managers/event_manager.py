@@ -985,6 +985,20 @@ class EventManager(EngineScoped):
                 owner=cast("Callable[[RequestPayload, RequestSender], str | None] | None", owner),
             )
 
+    def replace_manager_for_request_type(self, request_type: type[RP], callback: Callable[..., Any]) -> None:
+        """Swap in a callback that wraps the registered handler, keeping its scope and sender rule.
+
+        Dispatch calls the new callback as it called the old one, so a wrapper passes any keyword
+        arguments it receives (the `workflow` its scope passes) through to the handler it wraps.
+
+        Raises:
+            ValueError: The request type has no handler to replace.
+        """
+        if request_type not in self._request_type_to_manager:
+            msg = f"Attempted to replace the handler for {request_type.__name__}. Failed because it has none."
+            raise ValueError(msg)
+        self._request_type_to_manager[request_type] = callback
+
     def register_request_handlers(self, owner: object) -> None:
         """Assign each `@handles` method on `owner`. An unmarked override keeps its parent's marks."""
         marks: dict[str, tuple[type[RequestPayload], ...]] = {}
