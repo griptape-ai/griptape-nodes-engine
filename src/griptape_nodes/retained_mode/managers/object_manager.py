@@ -129,16 +129,17 @@ class ObjectManager(EngineScoped):
         except Exception as e:
             logger.warning("Could not cancel the running workflow before clearing it. Continuing anyway: %s", e)
 
-        try:
-            # Eliminate all execution references before deletion
-            self.engine.flow_manager.reset_global_execution_state()
-        except Exception as e:
-            details = f"Attempted to reset global execution state. Failed with exception: {e}"
-            return ClearAllObjectStateResultFailure(result_details=details)
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is not None:
+            try:
+                # Eliminate all execution references before deletion
+                self.engine.flow_manager.reset_global_execution_state()
+            except Exception as e:
+                details = f"Attempted to reset global execution state. Failed with exception: {e}"
+                return ClearAllObjectStateResultFailure(result_details=details)
 
         # Tear down each active workflow: cancel its running flows, delete its child
         # flows, drain its context substack, pop it. Stack depth is typically 1.
-        workflow = self.engine.current_workflow_or_none()
         try:
             context_mgr = self.engine.context_manager
             while context_mgr.has_current_workflow():
