@@ -254,12 +254,9 @@ _NO_FLOW_INSTRUCTION = "No flow is open yet. Call GriptapeNodes_EnsureWorkflowAn
 _NODE_TYPES_NOT_LISTED_INSTRUCTION = (
     "The node types are not listed here. To get them, call GriptapeNodes_ListRegisteredLibrariesRequest, then "
     "put one GriptapeNodes_ListNodeTypesInLibraryRequest per library, with include_metadata set, in a single "
-    "GriptapeNodes_EventRequestBatch call."
+    "GriptapeNodes_EventRequestBatch call. GriptapeNodes_ListRegisteredLibrariesRequest answers once libraries "
+    "finish loading."
 )
-
-# How long a run waits for libraries that are still loading before it starts without the node types.
-# Loading normally finishes within seconds of startup; installing a library's dependencies can take minutes.
-_LIBRARY_LOADING_WAIT_SECONDS = 20.0
 
 # Long enough for a node's one-line purpose, short enough that the node type list stays a few tokens per node.
 _MAX_NODE_DESCRIPTION_LENGTH = 160
@@ -889,7 +886,7 @@ class AgentManager(EngineScoped):
             model_name=model_name,
         )
         attribution_headers = await self._attribution_headers(provider_name)
-        workflow_context = await self._workflow_context(active.cancel_event)
+        workflow_context = await self._workflow_context()
 
         event_manager = self.engine.event_manager
 
@@ -921,7 +918,7 @@ class AgentManager(EngineScoped):
                 deferred_tool_results=deferred_tool_results,
             )
 
-    async def _workflow_context(self, cancel_event: asyncio.Event) -> _WorkflowContext:
+    async def _workflow_context(self) -> _WorkflowContext:
         """The available node types and the current flow, rendered for one run's instructions.
 
         Read fresh every run rather than cached, so a library loaded or a node added
@@ -929,11 +926,16 @@ class AgentManager(EngineScoped):
         are not broadcast, and a failure costs the run some context rather than
         showing the user an error.
         """
-        node_types, flow = await asyncio.gather(self._node_types_context(cancel_event), self._flow_context())
+        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context())
         return _WorkflowContext(node_types=node_types, flow=flow)
 
-    async def _node_types_context(self, cancel_event: asyncio.Event) -> str:
-        if not await self._wait_for_libraries(cancel_event):
+    async def _node_types_context(self) -> str:
+        # Never wait for libraries that are still loading: no timeout fits both a normal startup and a
+        # library installing its dependencies. The instruction says how to get the node types, and
+        # ListRegisteredLibrariesRequest itself waits for loading to finish, so the agent's own call
+        # returns once they are ready.
+        if not self.engine.library_manager._libraries_loading_complete.is_set():
+            logger.info("Left the node types out of the chat's instructions because libraries are still loading.")
             return _NODE_TYPES_NOT_LISTED_INSTRUCTION
         registered = await self.engine.ahandle_request(
             ListRegisteredLibrariesRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
@@ -961,25 +963,6 @@ class AgentManager(EngineScoped):
                 continue
             libraries[library_name] = result.node_metadata
         return _render_node_types(libraries)
-
-    async def _wait_for_libraries(self, cancel_event: asyncio.Event) -> bool:
-        """Wait for libraries that are still loading, so the run's instructions list every node type.
-
-        Gives up after ``_LIBRARY_LOADING_WAIT_SECONDS`` or as soon as the user cancels the
-        run, so a slow load cannot hold up the turn. Returns whether loading has finished.
-        """
-        loading_complete = self.engine.library_manager._libraries_loading_complete
-        if loading_complete.is_set():
-            return True
-        waits = [asyncio.ensure_future(loading_complete.wait()), asyncio.ensure_future(cancel_event.wait())]
-        try:
-            await asyncio.wait(waits, timeout=_LIBRARY_LOADING_WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for wait in waits:
-                wait.cancel()
-        if not loading_complete.is_set():
-            logger.info("Left the node types out of the chat's instructions because libraries are still loading.")
-        return loading_complete.is_set()
 
     async def _flow_context(self) -> str:
         if not self.engine.context_manager.has_current_flow():

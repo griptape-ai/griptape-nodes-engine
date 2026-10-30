@@ -192,43 +192,33 @@ class TestWorkflowContext:
     async def test_no_flow_open_gives_the_node_types_and_says_there_is_no_flow(
         self, chat_manager: AgentManager
     ) -> None:
-        context = await chat_manager._workflow_context(asyncio.Event())
+        context = await chat_manager._workflow_context()
 
         assert f"Library '{_LIBRARY_NAME}':\n  text:\n    - _ContextNode: Holds a prompt" in context.node_types
         assert context.flow == _NO_FLOW_INSTRUCTION
 
     @pytest.mark.asyncio
-    async def test_waits_for_libraries_that_are_still_loading(self, engine: Engine, chat_manager: AgentManager) -> None:
-        loading_complete = engine.library_manager._libraries_loading_complete
-        loading_complete.clear()
-        asyncio.get_running_loop().call_later(0.05, loading_complete.set)
-
-        context = await chat_manager._workflow_context(asyncio.Event())
-
-        assert f"Library '{_LIBRARY_NAME}':" in context.node_types
-
-    @pytest.mark.asyncio
-    async def test_says_how_to_get_the_node_types_when_libraries_take_too_long(
-        self, engine: Engine, chat_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        engine.library_manager._libraries_loading_complete.clear()
-        monkeypatch.setattr(f"{AgentManager.__module__}._LIBRARY_LOADING_WAIT_SECONDS", 0.01)
-
-        context = await chat_manager._workflow_context(asyncio.Event())
-
-        assert context.node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
-
-    @pytest.mark.asyncio
-    async def test_stops_waiting_for_libraries_when_the_run_is_cancelled(
+    async def test_libraries_still_loading_says_how_to_get_the_node_types_without_waiting(
         self, engine: Engine, chat_manager: AgentManager
     ) -> None:
         engine.library_manager._libraries_loading_complete.clear()
-        cancel_event = asyncio.Event()
-        cancel_event.set()
 
-        context = await asyncio.wait_for(chat_manager._workflow_context(cancel_event), timeout=1)
+        # Loading never finishes in this test, so a wait of any length would time out here.
+        context = await asyncio.wait_for(chat_manager._workflow_context(), timeout=1)
 
         assert context.node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        assert "answers once libraries finish loading" in context.node_types
+
+    @pytest.mark.asyncio
+    async def test_node_types_are_listed_once_libraries_have_loaded(
+        self, engine: Engine, chat_manager: AgentManager
+    ) -> None:
+        engine.library_manager._libraries_loading_complete.clear()
+        assert (await chat_manager._workflow_context()).node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
+
+        engine.library_manager._libraries_loading_complete.set()
+
+        assert f"Library '{_LIBRARY_NAME}':" in (await chat_manager._workflow_context()).node_types
 
     @pytest.mark.asyncio
     async def test_open_flow_gives_its_summary(self, engine: Engine, chat_manager: AgentManager) -> None:
@@ -240,7 +230,7 @@ class TestWorkflowContext:
         created = engine.handle_request(CreateNodeRequest(node_type="_ContextNode", node_name="writer"))
         assert isinstance(created, CreateNodeResultSuccess), created
 
-        context = await chat_manager._workflow_context(asyncio.Event())
+        context = await chat_manager._workflow_context()
 
         assert context.flow.startswith("Current flow: 'main',")
         assert f"  - writer (_ContextNode from '{_LIBRARY_NAME}')" in context.flow
@@ -261,6 +251,6 @@ class TestWorkflowContext:
 
         monkeypatch.setattr(f"{AgentManager.__module__}._render_flow", unrenderable)
 
-        context = await chat_manager._workflow_context(asyncio.Event())
+        context = await chat_manager._workflow_context()
 
         assert context.flow == ""
