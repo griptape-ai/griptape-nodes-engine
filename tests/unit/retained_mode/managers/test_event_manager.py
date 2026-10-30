@@ -6,7 +6,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -1625,7 +1625,7 @@ class TestPostDispatchHooks:
         engine = Engine()
         event_manager = engine.event_manager
         event_manager.initialize_queue(asyncio.Queue())
-        workflow = WorkflowRuntime("bound")
+        workflow = WorkflowRuntime("bound", MagicMock())
 
         async def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok")

@@ -59,6 +59,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import RequestScope
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -109,6 +110,30 @@ class TestRemoteHandlerScopeGate:
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "local:m1"
         assert call_count["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_passes_the_workflow_through(self) -> None:
+        event_manager = EventManager()
+        workflow = object()
+        seen: dict[str, object] = {}
+
+        async def original(request: _ProbeRequest, workflow: object) -> _ProbeResult:
+            seen["workflow"] = workflow
+            return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
+
+        handler = RemoteHandler(original=original, event_manager=event_manager)
+
+        await handler(_ProbeRequest(marker="m1"), workflow=workflow)
+
+        assert seen["workflow"] is workflow
+
+    def test_forwards_now_only_while_a_node_runs(self) -> None:
+        event_manager = EventManager()
+        handler = RemoteHandler(original=MagicMock(), event_manager=event_manager)
+
+        assert not handler.forwards_now()
+        with event_manager.node_execution_scope():
+            assert handler.forwards_now()
 
     @pytest.mark.asyncio
     async def test_in_scope_forwards_to_orchestrator(self) -> None:
@@ -166,6 +191,20 @@ class _StubResult(ResultPayloadSuccess):
 
 class TestInstallRemoteHandlersSwap:
     """register_remote_handlers forwards everything except the local-only exclusions."""
+
+    def test_swap_keeps_the_registered_scope(self) -> None:
+        """The wrapper declares no scope: dispatch keeps calling it as it called the handler it replaced."""
+        event_manager = EventManager()
+
+        async def original(_request: RequestPayload, workflow: object) -> _StubResult:  # noqa: ARG001
+            return _StubResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(CreateNodeRequest, original, scope=RequestScope.WORKFLOW)
+
+        register_remote_handlers(event_manager)
+
+        assert isinstance(event_manager.get_manager_for_request_type(CreateNodeRequest), RemoteHandler)
+        assert event_manager.get_scope_for_request_type(CreateNodeRequest) is RequestScope.WORKFLOW
 
     def test_swap_replaces_every_registered_handler(self) -> None:
         event_manager = EventManager()

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import RequestDispatcher
 
 
 class OpenWorkflowError(Exception):
@@ -20,13 +25,15 @@ class OpenWorkflowSet:
     `Engine.open_workflow` and `Engine.close_workflow` are the operations that open and close one.
     """
 
-    def __init__(self, *, allow_several_open: bool = False) -> None:
+    def __init__(self, dispatcher: RequestDispatcher, *, allow_several_open: bool = False) -> None:
         """Make an empty set.
 
         Args:
+            dispatcher: The engine's request dispatch, handed to each runtime for the requests it sends.
             allow_several_open: Test seam that lets a workflow open beside another. The engine never
                 sets it: it opens one workflow at a time.
         """
+        self._dispatcher = dispatcher
         self._by_id: dict[str, WorkflowRuntime] = {}
         self._allow_several_open = allow_several_open
 
@@ -47,7 +54,7 @@ class OpenWorkflowSet:
             )
             raise OpenWorkflowError(msg)
 
-        workflow = WorkflowRuntime(workflow_id)
+        workflow = WorkflowRuntime(workflow_id, self._dispatcher)
         self._by_id[workflow_id] = workflow
         return workflow
 

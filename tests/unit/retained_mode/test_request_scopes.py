@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from griptape_nodes.app.worker_routing import RemoteHandler
+from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
@@ -20,11 +23,33 @@ from griptape_nodes.retained_mode.events.config_events import (
 )
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
+from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest, RenameObjectResultFailure
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
+from griptape_nodes.retained_mode.events.variable_events import (
+    CreateVariableRequest,
+    CreateVariableResultFailure,
+    CreateVariableResultSuccess,
+    DeleteVariableRequest,
+    GetVariableDetailsRequest,
+    GetVariableRequest,
+    GetVariablesRequest,
+    GetVariableTypeRequest,
+    GetVariableValueRequest,
+    HasVariableRequest,
+    ListSubstitutablesRequest,
+    ListVariablesRequest,
+    RenameVariableRequest,
+    ResolveSubstitutionRequest,
+    SetVariablesRequest,
+    SetVariableTypeRequest,
+    SetVariableValueRequest,
+)
 from griptape_nodes.retained_mode.events.workflow_events import (
+    GetVariableSubstitutionEnabledRequest,
     ListAllWorkflowInfoRequest,
     ListAllWorkflowsRequest,
     ListCallableWorkflowsRequest,
+    SetVariableSubstitutionEnabledRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
@@ -106,7 +131,7 @@ def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntim
 
 def _open_two(engine: Engine) -> list[WorkflowRuntime]:
     """Two workflows open at once, through the test seam that allows it."""
-    engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
     opened = []
     for display_name in ("A", "B"):
         workflow = engine.workflow_registry.register_unsaved(display_name, listed=False)
@@ -146,6 +171,22 @@ class TestScopesThatTakeAWorkflow:
         assert isinstance(result_event.result, WorkflowNotOpenResultFailure)
         assert result_event.open_workflow_id == NOT_OPEN_ID
         assert calls.workflows == []
+
+    @pytest.mark.asyncio
+    async def test_an_addressing_failure_logs_at_the_request_s_failure_log_level(
+        self, engine: Engine, calls: _Calls, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A caller that expects the miss can quiet it, as for any failure its handler returns."""
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            result_event = await engine.event_manager.ahandle_request(
+                _ScopeProbeRequest(failure_log_level=logging.DEBUG)
+            )
+
+        assert isinstance(result_event.result, GenericResultFailure)
+        records = [record for record in caplog.records if "none is open" in record.getMessage()]
+        assert [record.levelno for record in records] == [logging.DEBUG]
 
     @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
     def test_no_envelope_id_takes_the_callers_binding(self, engine: Engine, calls: _Calls, scope: RequestScope) -> None:
@@ -346,3 +387,234 @@ class TestHostReads:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.current_workflow_id == workflow.workflow_id
+
+    def test_a_model_access_query_is_a_host_request(self, engine: Engine) -> None:
+        """It asks about a node type and the host's license, not a node in a workflow."""
+        assert engine.event_manager.get_scope_for_request_type(QueryModelAccessForNodeRequest) is RequestScope.HOST
+
+
+class TestRequestsARuntimeSends:
+    """A runtime's requests act on that runtime's workflow, whatever its caller has bound."""
+
+    @pytest.mark.asyncio
+    async def test_they_act_on_the_runtimes_workflow(self, engine: Engine, calls: _Calls) -> None:
+        a, b = _open_two(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        with engine.bind_workflow(a):
+            sync_result = b.handle_request(_ScopeProbeRequest())
+            async_result = await b.ahandle_request(_ScopeProbeRequest())
+
+        assert sync_result.succeeded()
+        assert async_result.succeeded()
+        assert calls.workflows == [b, b]
+        assert calls.current == [b, b]
+
+    @pytest.mark.asyncio
+    async def test_a_closed_runtimes_requests_are_refused_not_sent_to_the_open_one(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        closed = _open_workflow(engine, "closed")
+        engine.close_workflow(closed)
+        _open_workflow(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        result = await closed.ahandle_request(_ScopeProbeRequest())
+
+        assert isinstance(result, WorkflowNotOpenResultFailure)
+        assert calls.workflows == []
+
+
+# Requests whose handlers act on the workflow the envelope names.
+_OBJECT_AND_VARIABLE_REQUESTS: list[type[RequestPayload]] = [
+    RenameObjectRequest,
+    CreateVariableRequest,
+    GetVariableRequest,
+    GetVariableValueRequest,
+    SetVariableValueRequest,
+    GetVariableTypeRequest,
+    SetVariableTypeRequest,
+    DeleteVariableRequest,
+    RenameVariableRequest,
+    HasVariableRequest,
+    ListVariablesRequest,
+    ListSubstitutablesRequest,
+    GetVariablesRequest,
+    ResolveSubstitutionRequest,
+    SetVariablesRequest,
+    GetVariableDetailsRequest,
+    GetVariableSubstitutionEnabledRequest,
+    SetVariableSubstitutionEnabledRequest,
+]
+
+
+class TestObjectAndVariableRequests:
+    @pytest.mark.parametrize("request_type", _OBJECT_AND_VARIABLE_REQUESTS)
+    def test_is_registered_with_workflow_scope(self, engine: Engine, request_type: type[RequestPayload]) -> None:
+        assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.WORKFLOW
+
+    def test_a_variable_is_created_in_the_workflow_the_envelope_names(self, engine: Engine) -> None:
+        a, b = _open_two(engine)
+
+        result = engine.event_manager.handle_request(
+            CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"),
+            result_context=ResultContext(open_workflow_id=b.workflow_id),
+        ).result
+
+        assert isinstance(result, CreateVariableResultSuccess)
+        assert b.variables.global_layer.has("greeting")
+        assert not a.variables.global_layer.has("greeting")
+
+    def test_a_variable_request_for_a_workflow_that_is_not_open_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+
+        result = engine.event_manager.handle_request(
+            CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"),
+            result_context=ResultContext(open_workflow_id=NOT_OPEN_ID),
+        ).result
+
+        assert isinstance(result, WorkflowNotOpenResultFailure)
+        assert not workflow.variables.global_layer.has("greeting")
+
+    def test_naming_no_workflow_while_several_are_open_fails_with_the_requests_own_failure(
+        self, engine: Engine
+    ) -> None:
+        """The editor undoes an optimistic edit on the request's own failure type."""
+        a, b = _open_two(engine)
+
+        result = engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
+
+        assert isinstance(result, CreateVariableResultFailure)
+        assert "2 workflows are open" in str(result.result_details)
+        assert not a.variables.global_layer.has("greeting")
+        assert not b.variables.global_layer.has("greeting")
+
+    def test_a_rename_that_names_no_workflow_fails_with_its_own_failure(self, engine: Engine) -> None:
+        result = engine.handle_request(RenameObjectRequest(object_name="Flow_1", requested_name="Flow_2"))
+
+        assert isinstance(result, RenameObjectResultFailure)
+        assert result.next_available_name is None
+
+    def test_naming_no_workflow_fails_generically_for_a_request_with_no_failure_type(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        result = engine.handle_request(_ScopeProbeRequest())
+
+        assert isinstance(result, GenericResultFailure)
+        assert "none is open" in str(result.result_details)
+
+
+class _FlippingRemoteHandler(RemoteHandler):
+    """Answers `forwards_now` differently each time, as the process-wide counter it reads can between two reads.
+
+    Dispatch must ask once and act on that answer, so it never calls `__call__`, which would ask again.
+    """
+
+    def __init__(self, original: Any, engine: Engine, *, forwards_first: bool) -> None:
+        super().__init__(original=original, event_manager=engine.event_manager)
+        self.forwards_first = forwards_first
+        self.forwards_now_calls = 0
+        self.forwarded: list[RequestPayload] = []
+
+    async def __call__(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:  # noqa: ARG002
+        msg = "Dispatch decides once whether to forward, so it calls forward or handle_locally."
+        raise AssertionError(msg)
+
+    def forwards_now(self) -> bool:
+        self.forwards_now_calls += 1
+        if self.forwards_now_calls == 1:
+            return self.forwards_first
+        return not self.forwards_first
+
+    async def forward(self, request: RequestPayload) -> ResultPayload:
+        self.forwarded.append(request)
+        return _ScopeProbeResult(result_details="forwarded")
+
+
+class TestForwardingDecidedOnce:
+    """Dispatch asks a worker's forwarding handler once whether it forwards, then acts on that answer alone."""
+
+    @staticmethod
+    def _install(engine: Engine, calls: _Calls, *, forwards_first: bool) -> _FlippingRemoteHandler:
+        event_manager = engine.event_manager
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+        original = event_manager.get_manager_for_request_type(_ScopeProbeRequest)
+        handler = _FlippingRemoteHandler(original, engine, forwards_first=forwards_first)
+        event_manager.replace_manager_for_request_type(_ScopeProbeRequest, handler)
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_a_forwarded_request_resolves_no_workflow_here(self, engine: Engine, calls: _Calls) -> None:
+        """A worker opens no workflow, so resolving one here would fail a request the orchestrator can answer."""
+        handler = self._install(engine, calls, forwards_first=True)
+
+        result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        assert result_event.succeeded()
+        assert len(handler.forwarded) == 1
+        assert handler.forwards_now_calls == 1
+        assert calls.workflows == []
+
+    @pytest.mark.asyncio
+    async def test_a_local_request_gets_its_workflow(self, engine: Engine, calls: _Calls) -> None:
+        workflow = _open_workflow(engine)
+        handler = self._install(engine, calls, forwards_first=False)
+
+        result_event = await engine.event_manager.ahandle_request(
+            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+        )
+
+        assert result_event.succeeded()
+        assert handler.forwarded == []
+        assert handler.forwards_now_calls == 1
+        assert calls.workflows == [workflow]
+
+    def test_the_sync_path_decides_once_too(self, engine: Engine, calls: _Calls) -> None:
+        handler = self._install(engine, calls, forwards_first=True)
+
+        result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+
+        assert result_event.succeeded()
+        assert len(handler.forwarded) == 1
+        assert handler.forwards_now_calls == 1
+        assert calls.workflows == []
+
+
+class TestAddressingFailures:
+    def test_post_dispatch_hooks_see_an_addressing_failure(self, engine: Engine, calls: _Calls) -> None:
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+        seen: list[ResultPayload] = []
+
+        def hook(request: RequestPayload, result: ResultPayload) -> None:  # noqa: ARG001
+            seen.append(result)
+
+        engine.event_manager.add_post_dispatch_hook(_ScopeProbeRequest, hook)
+        try:
+            result_event = engine.event_manager.handle_request(
+                _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=NOT_OPEN_ID)
+            )
+        finally:
+            engine.event_manager.remove_post_dispatch_hook(_ScopeProbeRequest, hook)
+
+        assert seen == [result_event.result]
+        assert isinstance(result_event.result, WorkflowNotOpenResultFailure)
+
+
+class TestRemoteHandlerOutOfNodeExecution:
+    def test_on_its_sync_local_path_it_passes_the_workflow_through(self, engine: Engine, calls: _Calls) -> None:
+        event_manager = engine.event_manager
+        workflow = _open_workflow(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+        original = event_manager.get_manager_for_request_type(_ScopeProbeRequest)
+        event_manager.replace_manager_for_request_type(
+            _ScopeProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
+        )
+
+        result_event = event_manager.handle_request(
+            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+        )
+
+        assert result_event.succeeded()
+        assert calls.workflows == [workflow]

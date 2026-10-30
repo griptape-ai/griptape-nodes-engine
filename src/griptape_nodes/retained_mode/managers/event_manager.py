@@ -5,11 +5,12 @@ import contextvars
 import functools
 import inspect
 import logging
+import sys
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
 from asyncio_thread_runner import ThreadRunner
@@ -249,6 +250,18 @@ class _RequestWorkflow:
     rebinds: bool
     binding: WorkflowRuntime | NoWorkflow | None
     workflow: WorkflowRuntime | None
+
+
+@dataclass(frozen=True)
+class _HandlerCall:
+    """What dispatch calls for one request, and the workflow it binds around the call."""
+
+    function: Callable[..., Any]
+    request_workflow: _RequestWorkflow
+
+
+# A call a worker forwards resolves no workflow here, so its caller's binding stays for the forward to name.
+_KEEP_CALLER_BINDING = _RequestWorkflow(rebinds=False, binding=None, workflow=None)
 
 
 @dataclass(frozen=True)
@@ -985,6 +998,20 @@ class EventManager(EngineScoped):
                 owner=cast("Callable[[RequestPayload, RequestSender], str | None] | None", owner),
             )
 
+    def replace_manager_for_request_type(self, request_type: type[RP], callback: Callable[..., Any]) -> None:
+        """Swap in a callback that wraps the registered handler, keeping its scope and sender rule.
+
+        Dispatch calls the new callback as it called the old one, so a wrapper passes any keyword
+        arguments it receives (the `workflow` its scope passes) through to the handler it wraps.
+
+        Raises:
+            ValueError: The request type has no handler to replace.
+        """
+        if request_type not in self._request_type_to_manager:
+            msg = f"Attempted to replace the handler for {request_type.__name__}. Failed because it has none."
+            raise ValueError(msg)
+        self._request_type_to_manager[request_type] = callback
+
     def register_request_handlers(self, owner: object) -> None:
         """Assign each `@handles` method on `owner`. An unmarked override keeps its parent's marks."""
         marks: dict[str, tuple[type[RequestPayload], ...]] = {}
@@ -1255,6 +1282,15 @@ class EventManager(EngineScoped):
                 exc_info = None
 
     @staticmethod
+    def _is_crash(result: ResultPayload) -> bool:
+        """Whether `result` is a failure dispatch built from an exception a handler or hook raised.
+
+        A `GenericResultFailure` without an exception is not one: dispatch also builds those for a
+        request that names no workflow it can act on, which is the caller's routine miss.
+        """
+        return isinstance(result, GenericResultFailure) and result.exception is not None
+
+    @staticmethod
     def _exception_for_logging(result: ResultPayload) -> Exception | None:
         """The exception to attach as `exc_info`, or None to log the message alone.
 
@@ -1289,13 +1325,13 @@ class EventManager(EngineScoped):
             if workflow_mgr.should_squelch_workflow_altered():
                 callback_result.altered_workflow_state = False
 
-            # Override failure log level if requested, except for a synthesized failure:
-            # `failure_log_level` silences failures its caller EXPECTS, so honoring it for an
-            # unhandled exception would hide a crash behind a level chosen for a routine miss.
+            # Override failure log level if requested, except for a crash: `failure_log_level`
+            # silences failures its caller EXPECTS, so honoring it for an exception a handler or
+            # hook raised would hide a crash behind a level chosen for a routine miss.
             if (
                 callback_result.failed()
                 and request.failure_log_level is not None
-                and not isinstance(callback_result, GenericResultFailure)
+                and not self._is_crash(callback_result)
             ):
                 self._override_result_log_level(callback_result, request.failure_log_level)
 
@@ -1350,6 +1386,37 @@ class EventManager(EngineScoped):
             request,
             GenericResultFailure(exception=exception, result_details=result_details),
             context=context,
+        )
+
+    def _handler_call(self, callback: Callable, request: RequestPayload, result_context: ResultContext) -> _HandlerCall:
+        """What to call for `request`. A worker's forwarding handler is asked here, once, whether it forwards.
+
+        Asking once keeps the answer from changing between deciding and calling: it comes from a
+        process-wide counter, and on the sync path the call runs later on the websocket loop. A
+        forwarded call resolves no workflow here; the forward names the caller's.
+
+        Raises:
+            _RequestWorkflowError: The call stays here and names no workflow its handler can act on
+                (see `_request_workflow`).
+        """
+        # Lazy import: worker_routing imports ResultContext from this module at
+        # runtime, so a top-level import here would cycle through event_manager
+        # -> worker_routing -> event_manager during module load.
+        from griptape_nodes.app.worker_routing import RemoteHandler
+
+        local_callback = callback
+        if isinstance(callback, RemoteHandler):
+            if callback.forwards_now():
+                return _HandlerCall(function=callback.forward, request_workflow=_KEEP_CALLER_BINDING)
+            local_callback = callback.handle_locally
+
+        scope = self._request_scopes.get(type(request))
+        request_workflow = self._request_workflow(
+            request, scope, result_context.get("open_workflow_id"), result_context.get("sender")
+        )
+        return _HandlerCall(
+            function=self._handler_with_workflow(local_callback, scope, request_workflow),
+            request_workflow=request_workflow,
         )
 
     def _request_workflow(
@@ -1465,6 +1532,9 @@ class EventManager(EngineScoped):
     ) -> WorkflowRuntime:
         """The workflow a WORKFLOW request acts on: the one it names, else the only open one.
 
+        A request that names none it can act on fails with its own failure type where it can (see
+        `_addressing_failure`).
+
         Raises:
             _RequestWorkflowError: The request names no workflow, or names nothing while none or
                 several are open.
@@ -1472,7 +1542,7 @@ class EventManager(EngineScoped):
         request_name = type(request).__name__
         if named is NO_WORKFLOW:
             msg = f"Attempted to run {request_name}. Failed because the request names no workflow."
-            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._addressing_failure(request, msg))
         if named is not None:
             return named
 
@@ -1482,14 +1552,33 @@ class EventManager(EngineScoped):
                 f"Attempted to run {request_name}. Failed because the request names no workflow and none is open. "
                 "Open a workflow, or name one on the request envelope."
             )
-            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._addressing_failure(request, msg))
         if len(open_workflows) > 1:
             msg = (
                 f"Attempted to run {request_name}. Failed because {len(open_workflows)} workflows are open and "
                 "the request did not name one. Name one on the request envelope."
             )
-            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._addressing_failure(request, msg))
         return open_workflows[0]
+
+    @staticmethod
+    def _addressing_failure(request: RequestPayload, details: str) -> ResultPayloadFailure:
+        """The failure for a request that names no workflow it can act on.
+
+        The request's own `<Name>ResultFailure` when its module defines one that needs nothing but
+        `result_details`, since callers such as the editor undo an optimistic edit on that type.
+        Otherwise a `GenericResultFailure`.
+        """
+        request_type = type(request)
+        failure_name = request_type.__name__.removesuffix("Request") + "ResultFailure"
+        failure_type = getattr(sys.modules.get(request_type.__module__), failure_name, None)
+        if not isinstance(failure_type, type) or not issubclass(failure_type, ResultPayloadFailure):
+            return GenericResultFailure(result_details=details)
+        for field in fields(failure_type):
+            needs_value = field.init and field.default is MISSING and field.default_factory is MISSING
+            if needs_value and field.name != "result_details":
+                return GenericResultFailure(result_details=details)
+        return failure_type(result_details=details)
 
     @staticmethod
     def _handler_with_workflow(
@@ -1540,14 +1629,10 @@ class EventManager(EngineScoped):
         if refusal is not None:
             return self._handle_request_core(request, refusal, context=result_context)
 
-        scope = self._request_scopes.get(request_type)
         try:
-            request_workflow = self._request_workflow(
-                request, scope, result_context.get("open_workflow_id"), result_context.get("sender")
-            )
+            handler_call = self._handler_call(callback, request, result_context)
         except _RequestWorkflowError as err:
             return self._handle_request_core(request, err.failure, context=result_context)
-        handler = self._handler_with_workflow(callback, scope, request_workflow)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
@@ -1564,11 +1649,11 @@ class EventManager(EngineScoped):
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
         # Act on the workflow the request names, in the handler and every task it spawns.
-        binding_token = self._bind_request_workflow(request_workflow)
+        binding_token = self._bind_request_workflow(handler_call.request_workflow)
         try:
             try:
                 # Actually make the handler callback (support both sync and async):
-                result_payload: ResultPayload = await call_function(handler, request)
+                result_payload: ResultPayload = await call_function(handler_call.function, request)
 
                 # Queue flush request for async context (unless result type should skip flush)
                 with operation_depth_mgr:
@@ -1656,14 +1741,10 @@ class EventManager(EngineScoped):
         if refusal is not None:
             return self._handle_request_core(request, refusal, context=result_context)
 
-        scope = self._request_scopes.get(request_type)
         try:
-            request_workflow = self._request_workflow(
-                request, scope, result_context.get("open_workflow_id"), result_context.get("sender")
-            )
+            handler_call = self._handler_call(callback, request, result_context)
         except _RequestWorkflowError as err:
             return self._handle_request_core(request, err.failure, context=result_context)
-        handler = self._handler_with_workflow(callback, scope, request_workflow)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
@@ -1680,10 +1761,10 @@ class EventManager(EngineScoped):
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
         # Act on the workflow the request names, in the handler and every task it spawns.
-        binding_token = self._bind_request_workflow(request_workflow)
+        binding_token = self._bind_request_workflow(handler_call.request_workflow)
         try:
             try:
-                result_payload = self._invoke_handler_from_sync(handler, request)
+                result_payload = self._invoke_handler_from_sync(callback, handler_call.function, request)
 
                 # Queue flush request for sync context (unless result type should skip flush)
                 with operation_depth_mgr:
@@ -1704,8 +1785,14 @@ class EventManager(EngineScoped):
             if binding_token is not None:
                 bound_workflow.reset(binding_token)
 
-    def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:
-        """Call a request handler from sync code, bridging async handlers onto a loop."""
+    def _invoke_handler_from_sync(
+        self, registered: Callable, callback: Callable, request: RequestPayload
+    ) -> ResultPayload:
+        """Call a request handler from sync code, bridging async handlers onto a loop.
+
+        `callback` is what dispatch calls; `registered` is the handler it came from, which decides
+        whether the call hops onto the websocket loop.
+        """
         # Worker-side RemoteHandler callbacks are async but safe to invoke from any
         # running loop except the WS loop itself: forward_to_orchestrator dispatches onto
         # the WS loop via run_coroutine_threadsafe, which then runs on a different thread
@@ -1719,7 +1806,7 @@ class EventManager(EngineScoped):
         # -> worker_routing -> event_manager during module load.
         from griptape_nodes.app.worker_routing import RemoteHandler
 
-        if isinstance(callback, RemoteHandler):
+        if isinstance(registered, RemoteHandler):
             running_loop = _running_loop()
             if running_loop is None:
                 return asyncio.run(callback(request))

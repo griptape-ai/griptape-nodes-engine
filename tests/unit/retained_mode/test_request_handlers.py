@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -223,3 +224,25 @@ class TestRegistrationChecksTheWorkflowParameter:
         event_manager.remove_manager_from_request_type(_PingRequest)
 
         assert event_manager.get_scope_for_request_type(_PingRequest) is None
+
+
+class TestReplaceManagerForRequestType:
+    def test_keeps_the_registered_scope(self) -> None:
+        event_manager = EventManager()
+
+        def on_ping(request: _PingRequest, workflow: object) -> ResultPayload:  # noqa: ARG001
+            return GenericResultFailure(result_details="unused")
+
+        def wrapper(request: _PingRequest, **kwargs: object) -> ResultPayload:
+            return on_ping(request, **kwargs)
+
+        event_manager.assign_manager_to_request_type(_PingRequest, on_ping, scope=RequestScope.WORKFLOW)
+
+        event_manager.replace_manager_for_request_type(_PingRequest, wrapper)
+
+        assert event_manager.get_manager_for_request_type(_PingRequest) is wrapper
+        assert event_manager.get_scope_for_request_type(_PingRequest) is RequestScope.WORKFLOW
+
+    def test_needs_a_registered_handler(self) -> None:
+        with pytest.raises(ValueError, match="has none"):
+            EventManager().replace_manager_for_request_type(_PingRequest, MagicMock())

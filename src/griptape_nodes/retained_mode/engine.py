@@ -247,9 +247,9 @@ class Engine:
         # Workflow ids live only as long as this engine, so clients compare this to notice a
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
-        self._open_workflows = OpenWorkflowSet()
+        self._open_workflows = OpenWorkflowSet(self)
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
-        self._worker_workflows = WorkerWorkflowSet()
+        self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)

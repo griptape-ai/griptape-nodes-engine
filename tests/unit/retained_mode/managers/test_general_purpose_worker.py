@@ -130,7 +130,7 @@ class TestSpawn:
 
         manager._spawn_general_purpose_worker_when_session_ready = spawn  # type: ignore[method-assign]
         manager._settle_when_worker_exits_early = settle  # type: ignore[method-assign]
-        token = bound_workflow.set(WorkflowRuntime("the-requests-workflow"))
+        token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
         try:
             await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
             with patch("asyncio.create_subprocess_exec", return_value=_managed_proc()):
@@ -343,7 +343,7 @@ class TestRestartWhenLibrariesChange:
     async def test_the_restart_acts_on_no_workflow(self) -> None:
         """It outlives the request whose library change started it."""
         manager, _worker_manager = await self._running_worker()
-        token = bound_workflow.set(WorkflowRuntime("the-requests-workflow"))
+        token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
         try:
             manager.workers.note_library_set_changed()
         finally:
