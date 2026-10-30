@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     AutoLayoutFlowRequest,
     CreateFlowRequest,
     DeleteFlowRequest,
+    GetFlowSummaryRequest,
     ListFlowsInCurrentContextRequest,
     ListNodesInFlowRequest,
 )
@@ -132,6 +133,7 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "CreateNodeRequest": CreateNodeRequest,
     "DeleteNodeRequest": DeleteNodeRequest,
     "ListNodesInFlowRequest": ListNodesInFlowRequest,
+    "GetFlowSummaryRequest": GetFlowSummaryRequest,
     "AutoLayoutFlowRequest": AutoLayoutFlowRequest,
     "GetNodeResolutionStateRequest": GetNodeResolutionStateRequest,
     "GetNodeMetadataRequest": GetNodeMetadataRequest,

@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from huggingface_hub import constants as hf_constants
 from huggingface_hub import list_models, scan_cache_dir, snapshot_download
 from huggingface_hub import model_info as hf_model_info
+from huggingface_hub.utils._paths import filter_repo_objects
 from huggingface_hub.utils.tqdm import tqdm
 
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -120,11 +122,70 @@ _STATUS_READ_TORN_ATTEMPTS = 2  # a torn read clears on the next try; a file mal
 _STATUS_READ_RETRY_DELAY = 0.05  # seconds to wait out that writer between tries
 
 
-def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
+def _bytes_already_downloaded(params: DownloadParams) -> int:
+    """Sum the sizes of the files a download will skip because they finished on an earlier attempt.
+
+    `snapshot_download` gives a finished file no progress bar, so it counts toward neither the
+    bytes downloaded nor the total. Without this, a restarted download reads as starting over.
+
+    Args:
+        params: Download parameters, resolved against the same cache `snapshot_download` uses.
+
+    Returns:
+        int: Bytes of finished files, or 0 if none are found or the files can't be read.
+            The count only drives progress, so it never fails the download.
+    """
+    try:
+        root = _finished_files_root(params)
+        if not root.is_dir():
+            return 0
+        # Snapshot entries are symlinks into blobs/, so is_file() and stat() follow them to the
+        # finished file. A local_dir keeps its partial downloads and metadata under .cache/.
+        files = {
+            path.relative_to(root).as_posix(): path
+            for path in root.rglob("*")
+            if path.is_file() and path.relative_to(root).parts[0] != ".cache"
+        }
+        wanted = filter_repo_objects(
+            items=files,
+            allow_patterns=params.allow_patterns,
+            ignore_patterns=params.ignore_patterns,
+        )
+        return sum(files[relative_path].stat().st_size for relative_path in wanted)
+    except (OSError, ValueError) as e:
+        # ValueError covers a refs file that isn't UTF-8 and a null byte in the ID or revision.
+        logger.debug("Could not size the finished files of '%s': %s", params.model_id, e)
+        return 0
+
+
+def _finished_files_root(params: DownloadParams) -> Path:
+    """Return the directory holding the files a download has already finished.
+
+    Args:
+        params: Download parameters.
+
+    Returns:
+        Path: The local_dir if one is set, otherwise the revision's snapshot in the HF cache.
+    """
+    if params.local_dir:
+        return Path(params.local_dir)
+    repo_dir = Path(hf_constants.HF_HUB_CACHE) / f"models--{params.model_id.replace('/', '--')}"
+    revision = params.revision or "main"
+    # A branch or tag resolves through refs/; a commit hash names the snapshot directly.
+    try:
+        commit_hash = (repo_dir / "refs" / revision).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        commit_hash = revision
+    return repo_dir / "snapshots" / commit_hash
+
+
+def _create_progress_tracker(model_id: str, already_downloaded: int = 0) -> type[tqdm]:  # noqa: C901
     """Create a tqdm class with model_id pre-configured.
 
     Args:
         model_id: The model ID to track progress for
+        already_downloaded: Bytes of files finished on an earlier attempt, counted as done
+            and added to the total of every byte-level bar
 
     Returns:
         A tqdm class that will track progress for the given model
@@ -158,6 +219,11 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
                     desc,
                 )
                 return
+
+            # snapshot_download adds each file's size to this total as that file starts.
+            self.total = (self.total or 0) + already_downloaded
+            self.n += already_downloaded
+            self._cumulative_bytes = already_downloaded
 
             logger.debug(
                 "ModelDownloadTracker instantiated for tracking - model_id: %s, total: %s, unit: %s, desc: '%s'",
@@ -424,12 +490,22 @@ class ModelManager(EngineScoped):
         Raises:
             Exception: If download fails
         """
+        already_downloaded = _bytes_already_downloaded(
+            DownloadParams(
+                model_id=model_id,
+                local_dir=local_dir,
+                revision=revision,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+            )
+        )
+
         # Build download kwargs with progress tracking
         download_kwargs = {
             "repo_id": model_id,
             "repo_type": "model",
             "revision": revision,
-            "tqdm_class": _create_progress_tracker(model_id),
+            "tqdm_class": _create_progress_tracker(model_id, already_downloaded),
         }
 
         # Add optional parameters

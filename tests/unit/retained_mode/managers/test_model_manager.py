@@ -62,6 +62,7 @@ from griptape_nodes.retained_mode.managers.model_manager import (
     _STATUS_READ_TORN_ATTEMPTS,
     DownloadParams,
     ModelManager,
+    _bytes_already_downloaded,
     _create_progress_tracker,
     _load_status_file,
 )
@@ -606,6 +607,90 @@ class TestProgressTrackerInPipeMode:
         bar.close()
 
         assert bar._should_track is False
+
+
+# ---------------------------------------------------------------------------
+# Restarted downloads count the files an earlier attempt finished
+# ---------------------------------------------------------------------------
+
+_COMMIT_HASH = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.fixture
+def hf_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the Hugging Face cache at an empty temp directory."""
+    cache = tmp_path / "hub"
+    monkeypatch.setattr("griptape_nodes.retained_mode.managers.model_manager.hf_constants.HF_HUB_CACHE", str(cache))
+    return cache
+
+
+def _write_snapshot(cache: Path, files: dict[str, int]) -> None:
+    repo_dir = cache / "models--org--model"
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(_COMMIT_HASH)
+    for name, size in files.items():
+        path = repo_dir / "snapshots" / _COMMIT_HASH / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+    # A partial download lives in blobs/ and never appears in the snapshot.
+    (repo_dir / "blobs").mkdir()
+    (repo_dir / "blobs" / "abc.incomplete").write_bytes(b"x" * 1000)
+
+
+class TestBytesAlreadyDownloaded:
+    def test_counts_the_finished_files_of_the_revision(self, hf_cache: Path) -> None:
+        _write_snapshot(hf_cache, {"config.json": 20, "transformer/model.safetensors": 30})
+
+        assert _bytes_already_downloaded(DownloadParams(model_id="org/model", revision="main")) == 50  # noqa: PLR2004
+
+    def test_a_commit_hash_revision_names_the_snapshot(self, hf_cache: Path) -> None:
+        _write_snapshot(hf_cache, {"config.json": 20})
+
+        assert _bytes_already_downloaded(DownloadParams(model_id="org/model", revision=_COMMIT_HASH)) == 20  # noqa: PLR2004
+
+    def test_files_outside_the_patterns_are_not_counted(self, hf_cache: Path) -> None:
+        _write_snapshot(hf_cache, {"config.json": 20, "model.safetensors": 30})
+
+        params = DownloadParams(model_id="org/model", revision="main", ignore_patterns=["*.safetensors"])
+        assert _bytes_already_downloaded(params) == 20  # noqa: PLR2004
+
+    def test_nothing_downloaded_yet_counts_zero(self, hf_cache: Path) -> None:  # noqa: ARG002
+        assert _bytes_already_downloaded(DownloadParams(model_id="org/model", revision="main")) == 0
+
+    def test_a_local_dir_skips_its_partial_downloads(self, tmp_path: Path) -> None:
+        (tmp_path / "model.safetensors").write_bytes(b"x" * 30)
+        partial = tmp_path / ".cache" / "huggingface" / "download" / "other.safetensors.incomplete"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"x" * 1000)
+
+        params = DownloadParams(model_id="org/model", local_dir=str(tmp_path), revision="main")
+        assert _bytes_already_downloaded(params) == 30  # noqa: PLR2004
+
+
+class TestRestartedDownloadProgress:
+    def test_finished_files_count_as_downloaded_and_toward_the_total(
+        self, hf_cache: Path, model_manager: ModelManager
+    ) -> None:
+        """Mirrors how snapshot_download drives the bar: created at 0, grown per file still to fetch."""
+        _write_snapshot(hf_cache, {"finished.safetensors": 60})
+        bars: list[Any] = []
+
+        def fake_snapshot_download(**kwargs: Any) -> str:
+            bar = kwargs["tqdm_class"](total=0, unit="B", desc="Downloading bytes", file=io.StringIO())
+            bars.append(bar)
+            bar.total += 40  # the one file left to download
+            bar.update(40)
+            bar.close()
+            return str(hf_cache)
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            model_manager.download_model("org/model")
+
+        assert bars[0]._cumulative_bytes == 100  # noqa: PLR2004
+        assert bars[0].total == 100  # noqa: PLR2004
 
 
 # ---------------------------------------------------------------------------
