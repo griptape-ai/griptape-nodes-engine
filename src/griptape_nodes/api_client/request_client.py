@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How many requests a client remembers having stopped waiting for, so it drops their late replies
+# rather than leaving them to the filters after it, which would take them for unasked results.
+_ABANDONED_REQUESTS_REMEMBERED = 1000
+
 
 @dataclass
 class _PendingRequest:
@@ -84,6 +88,9 @@ class RequestClient:
 
         # Track subscribed response topics
         self._subscribed_response_topics: set[str] = set()
+
+        # Requests this client stopped waiting for, discarded or failed, oldest first. Guarded by self._lock.
+        self._abandoned_request_ids: dict[str, None] = {}
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: register response filter on Client."""
@@ -370,6 +377,7 @@ class RequestClient:
             to_fail = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
             for rid in to_fail:
                 entry = self._pending_requests.pop(rid)
+                self._remember_abandoned_unlocked(rid)
                 RequestClient._settle(lambda entry=entry: entry.future.set_exception(error))
                 logger.debug("Failed request %s (tag=%s): %s", rid, tag, error)
 
@@ -386,8 +394,15 @@ class RequestClient:
                 logger.debug("Request already completed or unknown: %s", request_id)
                 return
 
+            self._remember_abandoned_unlocked(request_id)
             RequestClient._settle(entry.future.cancel)
             logger.debug("Cancelled request: %s", request_id)
+
+    def _remember_abandoned_unlocked(self, request_id: str) -> None:
+        """Remember a request this client stopped waiting for, forgetting the oldest past the cap. Caller must hold self._lock."""
+        self._abandoned_request_ids[request_id] = None
+        if len(self._abandoned_request_ids) > _ABANDONED_REQUESTS_REMEMBERED:
+            del self._abandoned_request_ids[next(iter(self._abandoned_request_ids))]
 
     async def _track_request(
         self,
@@ -511,8 +526,9 @@ class RequestClient:
         """Attempt to match an incoming message to a pending request.
 
         Registered as a Client message filter so response messages are claimed
-        before reaching the client's message queue. Messages not matched to a
-        pending request return False and are left for queue consumers.
+        before reaching the client's message queue. A late reply to a request this
+        client stopped waiting for is claimed and dropped. Other messages not matched
+        to a pending request return False and are left for queue consumers.
 
         Expects worker/event-bus response format:
           payload["event_type"] in ("EventResultSuccess", "EventResultFailure")
@@ -529,6 +545,10 @@ class RequestClient:
 
         request_id = payload.get("request_id") or ""
         with self._lock:
+            if request_id and request_id in self._abandoned_request_ids:
+                del self._abandoned_request_ids[request_id]
+                logger.debug("Dropping a late reply to request %s, which this client stopped waiting for.", request_id)
+                return True
             if not request_id or request_id not in self._pending_requests:
                 return False
 

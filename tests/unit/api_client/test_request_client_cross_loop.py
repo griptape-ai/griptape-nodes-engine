@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from griptape_nodes.api_client import request_client
 from griptape_nodes.api_client.request_client import RequestClient
 
 # Generous enough that a loaded CI box does not flake, far below the multi-second stall the bug
@@ -228,3 +229,45 @@ class TestSettlingAnAlreadyFinishedRequest:
 
         with pytest.raises(ValueError, match="Request ID already exists"):
             await client.track_request("dup-1")
+
+
+def _reply(request_id: str) -> dict[str, Any]:
+    return {"payload": {"event_type": "EventResultSuccess", "request_id": request_id, "result": {}}}
+
+
+class TestLateRepliesToAbandonedRequests:
+    """A reply to a request the client stopped waiting for is dropped, not left for the filters after it."""
+
+    @pytest.mark.asyncio
+    async def test_a_late_reply_to_a_discarded_request_is_claimed_once(self) -> None:
+        client = _client()
+        await client.track_request("gave-up")
+        client.discard_request("gave-up")
+
+        assert await client._try_match(_reply("gave-up")) is True
+        assert await client._try_match(_reply("gave-up")) is False
+
+    @pytest.mark.asyncio
+    async def test_a_late_reply_to_a_request_failed_by_tag_is_claimed(self) -> None:
+        client = _client()
+        await client.track_request("worker-gone", tag="worker-a")
+        await client.fail_requests_by_tag("worker-a", RuntimeError("gone"))
+
+        assert await client._try_match(_reply("worker-gone")) is True
+
+    @pytest.mark.asyncio
+    async def test_a_reply_to_a_request_this_client_never_sent_is_left_alone(self) -> None:
+        assert await _client()._try_match(_reply("someone-else-s")) is False
+
+    @pytest.mark.asyncio
+    async def test_only_the_most_recent_abandoned_requests_are_remembered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(request_client, "_ABANDONED_REQUESTS_REMEMBERED", 2)
+        client = _client()
+        for request_id in ("first", "second", "third"):
+            await client.track_request(request_id)
+            client.discard_request(request_id)
+
+        assert await client._try_match(_reply("first")) is False
+        assert await client._try_match(_reply("third")) is True

@@ -142,7 +142,7 @@ from griptape_nodes.retained_mode.managers.event_manager import current_request_
 from griptape_nodes.retained_mode.managers.flow.packaging import FlowPackaging
 from griptape_nodes.retained_mode.managers.flow.serialization import FlowSerialization
 from griptape_nodes.retained_mode.managers.flow.summary import FlowSummarizer
-from griptape_nodes.retained_mode.managers.run_queue import Run, RunQueue, RunState
+from griptape_nodes.retained_mode.managers.run_queue import Run, RunQueue, RunSpec, RunState
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.request_handlers import handles
 
@@ -152,7 +152,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -163,8 +162,13 @@ _current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=N
 _CANCELLED_BEFORE_STARTING = "The run did not start: it was cancelled."
 
 
+def current_run_id() -> str | None:
+    """The run the code executing now belongs to, or None outside any run."""
+    return _current_run_id.get()
+
+
 @dataclass(frozen=True)
-class StartFlowSpec:
+class StartFlowSpec(RunSpec):
     """A run of a whole flow, from a `StartFlowRequest`."""
 
     request: StartFlowRequest
@@ -184,7 +188,7 @@ class StartFlowSpec:
 
 
 @dataclass(frozen=True)
-class StartFlowFromNodeSpec:
+class StartFlowFromNodeSpec(RunSpec):
     """A run of a flow from one of its nodes, from a `StartFlowFromNodeRequest`."""
 
     request: StartFlowFromNodeRequest
@@ -1829,12 +1833,14 @@ class FlowManager(EngineScoped):
         runs: list[RunInfo] = []
         in_progress = self._run_in_progress
         if in_progress is not None:
+            # Waiting for another engine, which reported its place in that engine's line.
+            state = RunState.QUEUED if in_progress.position else in_progress.state
             runs.append(
                 RunInfo(
                     run_id=in_progress.run_id,
                     flow_name=in_progress.flow_name,
-                    state=in_progress.state,
-                    position=0,
+                    state=state,
+                    position=in_progress.position,
                     request_id=in_progress.request_id,
                 )
             )
@@ -2172,6 +2178,7 @@ class FlowManager(EngineScoped):
             queued_at=datetime.now(tz=UTC),
             state=RunState.QUEUED,
             outcome=asyncio.get_running_loop().create_future(),
+            ended=asyncio.get_running_loop().create_future(),
             context=copy_context(),
             request_id=current_request_id(),
         )
@@ -2210,6 +2217,24 @@ class FlowManager(EngineScoped):
         # Runs submitted while the cancel awaited were held, so they go too.
         self._turn_away(self._run_queue.snapshot(), "it was cancelled.")
 
+    def current_run(self) -> Run | None:
+        """The run in progress, if the code executing now belongs to it, or None."""
+        if not self._is_inside_run_in_progress():
+            return None
+        return self._run_in_progress
+
+    def report_run_waiting_for_engine(self, run_id: str, position: int) -> None:
+        """Report that the run in progress waits at `position` for another engine, or no longer waits at 0.
+
+        Its node there waits while another run has that engine, so it is reported, and listed, as a run
+        waiting here would be.
+        """
+        run = self._run_in_progress
+        if run is None or run.run_id != run_id or run.position == position:
+            return
+        run.position = position
+        self._put_run_queued_event(run, position)
+
     def _turn_away(self, runs: list[Run], reason: str) -> None:
         """Take waiting runs out of the line without executing them; each one's request returns `reason`."""
         for run in runs:
@@ -2217,9 +2242,17 @@ class FlowManager(EngineScoped):
                 continue
             run.state = RunState.CANCELLED
             self._leave_line(run)
-            failure = self._of_run(run.spec.failure(f"The run did not start: {reason}"), run.run_id)
-            self._on_run_loop(run, run.outcome.set_result, failure)
+            self._on_run_loop(run, self._end_without_executing, run, f"The run did not start: {reason}")
         self._report_places_in_line()
+
+    def _end_without_executing(self, run: Run, details: str) -> None:
+        """End a run that left the line without executing; its request returns `details`."""
+        self._fail_unexecuted(run, details)
+        run.ended.set_result(None)
+
+    def _fail_unexecuted(self, run: Run, details: str) -> None:
+        run.spec.on_turned_away(details)
+        run.outcome.set_result(self._of_run(run.spec.failure(details), run.run_id))
 
     def _raise_if_run_cancelled(self) -> None:
         """Stop a run cancelled before its flow started, just before it would start it.
@@ -2258,7 +2291,7 @@ class FlowManager(EngineScoped):
         # run.context is the submitter's context copied, so this marks only the run's own tasks.
         _current_run_id.set(run.run_id)
         if run.state is RunState.CANCELLED:
-            run.outcome.set_result(self._of_run(run.spec.failure(_CANCELLED_BEFORE_STARTING), run.run_id))
+            self._fail_unexecuted(run, _CANCELLED_BEFORE_STARTING)
             self._driving = False
             self._finish_run(run)
             return
@@ -2309,6 +2342,7 @@ class FlowManager(EngineScoped):
         if self._run_in_progress is not run:
             return
         self._run_in_progress = None
+        self._on_run_loop(run, run.ended.set_result, None)
         self._start_next_run_if_idle()
         self._report_places_in_line()
 
@@ -2342,13 +2376,17 @@ class FlowManager(EngineScoped):
                 self._report_place_in_line(run)
 
     def _report_place_in_line(self, run: Run) -> None:
+        self._put_run_queued_event(run, run.position)
+        self._on_run_loop(run, run.spec.on_place_in_line, run)
+
+    def _put_run_queued_event(self, run: Run, position: int) -> None:
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(
                     payload=RunQueuedEvent(
                         run_id=run.run_id,
                         flow_name=run.flow_name,
-                        position=run.position,
+                        position=position,
                         request_id=run.request_id,
                     )
                 )

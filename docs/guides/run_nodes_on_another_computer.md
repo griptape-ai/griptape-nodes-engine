@@ -103,11 +103,41 @@ Then run your workflow as you normally would. The library's nodes run on the rem
 
 A change to `distributed_execution.library_engines` takes effect the next time that library's worker starts, for example after you reload the library.
 
+## Sharing one remote computer between people
+
+Several people can send their libraries to the same remote computer. It runs one person's run at a time, so two people's nodes never share its GPU at once.
+
+- **Runs take turns, in the order they asked.** When your run's first node arrives while someone else's run has the remote computer, your node waits. Meanwhile the run toolbar in your editor shows your run as queued, with its place in line.
+- **A run keeps the remote computer until it ends.** Once your run has it, your run's later nodes there start right away, even while someone else waits. It passes to the next run when yours ends, including when you cancel it. A paused run keeps the remote computer until you continue it to the end or cancel it. If your engine stops or loses its connection to the remote computer, the remote computer passes to the next run.
+- **Don't send libraries both ways between two computers.** If computer A sends a library to B and B sends one to A, a run on each can wait for the other forever: each holds its own computer while it waits for the other's. Cancel one run to free both. The remote computer's log names the other engine when this happens.
+- **The previous person's models are freed first.** When the remote computer passes from one person's run to another's, it frees models the way its `distributed_execution.release` setting says:
+
+| Setting         | Value                      | What happens                                                                                                                    |
+| --------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `release.which` | `others` (the default)     | Frees everyone's workers except those of the person whose run is starting, so your models stay loaded between your own runs.    |
+| `release.which` | `all`                      | Frees everyone's workers, yours included.                                                                                       |
+| `release.which` | `none`                     | Frees nothing. For a remote computer that runs one pipeline.                                                                    |
+| `release.how`   | `drop_cache` (the default) | Each worker drops what its libraries keep between runs, such as a loaded model. Values a later node of the same run needs stay. |
+| `release.how`   | `recycle`                  | Stops each worker. It starts again before that library's next node, which takes as long as loading the library.                 |
+
+With `recycle`, a stopped worker also loses what your nodes left in it that couldn't be sent back to your workstation, such as a loaded pipeline passed from one node to the next. If your next run reuses such a value without running the node that made it, the node that reads it fails, saying to run that node again. Run it again, and the run continues.
+
+To limit how many workers the remote computer runs at once, set `distributed_execution.max_workers` on it. A start beyond the limit is refused, and the node that needed it says so. Your next node from that library asks again. For example, on the **remote computer**:
+
+```json
+{
+  "distributed_execution": {
+    "max_workers": 4,
+    "release": { "which": "others", "how": "drop_cache" }
+  }
+}
+```
+
 ## Good to know
 
 - **Only some libraries can run elsewhere.** A library can run on another computer only if its nodes run in a worker, which is up to the library's author. Libraries with heavy dependencies, such as machine learning models, usually do. If you list one that doesn't, nothing fails: its nodes keep running on your workstation.
-- **One person per remote engine, for now.** Sharing one remote engine between several people isn't supported yet. If two people send work to the same engine, their nodes run there at the same time.
 - **Secrets come from your workstation.** When a node asks for a secret by name, such as a provider API key, it gets your workstation's value.
+- **Only use a remote computer you trust.** Your nodes running there act for your workstation: they can read your secrets and your workspace files, and work as your engine does. So you're trusting the remote computer, anyone who can connect to its Griptape Nodes port, and anyone whose nodes run on it, such as other people sharing it. Keep it on a network only your team reaches.
 - **If the remote computer moves to a new address**, restart Griptape Nodes on your workstation so it looks the remote engine up again.
 - **You can share one config file between computers.** A library listed with an engine's own ID runs on that engine. So computers that share a workspace can share its `griptape_nodes_config.json`: the remote computer runs its libraries itself, and your workstation sends them there.
 
@@ -128,3 +158,4 @@ Each message below is how the error starts, or a part of it you'll find in the n
 | Failed to connect                                                                   | Check that `advertise_url` names an address your workstation can reach, and that the remote computer's firewall allows the port.                                                     |
 | did not answer within ... seconds                                                   | Check that the remote engine is running and reachable. If the message adds that both engines must connect as the same identity, use the same Griptape Cloud API key on both engines. |
 | stopped while starting up                                                           | The remote engine's log has the details, often a dependency that failed to install.                                                                                                  |
+| the most its distributed_execution.max_workers setting allows                       | Raise `distributed_execution.max_workers` on the remote computer, or wait until fewer people use it.                                                                                 |

@@ -1856,8 +1856,13 @@ class TestTheRequestSender:
         [
             (RequiredSender.ENGINE, {}, False),
             (RequiredSender.ENGINE, {"sender": RequestSender(engine_id="artist")}, True),
+            (RequiredSender.ANY_SESSION, {}, False),
+            (RequiredSender.ANY_SESSION, {"sender": RequestSender(engine_id="artist")}, False),
+            (RequiredSender.ANY_SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+            (RequiredSender.SESSION, {}, False),
             (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist")}, False),
             (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="unknown")}, False),
         ],
     )
     @pytest.mark.asyncio
@@ -1874,11 +1879,30 @@ class TestTheRequestSender:
 
         event_manager = EventManager()
         event_manager.register_request_handlers(_Owner())
+        event_manager.recognize_sessions(lambda sender: sender.session_id == "s1")
 
         result = await event_manager.ahandle_request(_ProbeRequest(), result_context=context)
 
         assert bool(handled) == runs
         assert result.succeeded() == runs
+
+    @pytest.mark.asyncio
+    async def test_a_session_request_is_refused_while_nothing_recognizes_sessions(self) -> None:
+        event_manager = self._manager_recording_senders([], sender=RequiredSender.SESSION)
+
+        result = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist", session_id="s1")}
+        )
+
+        assert not result.succeeded()
+        assert "has not registered with this engine" in str(result.result.result_details)
+
+    def test_only_one_manager_may_recognize_sessions(self) -> None:
+        event_manager = EventManager()
+        event_manager.recognize_sessions(lambda _sender: True)
+
+        with pytest.raises(ValueError, match="already has one"):
+            event_manager.recognize_sessions(lambda _sender: True)
 
     @pytest.mark.asyncio
     async def test_a_request_no_engine_sent_has_no_sender(self) -> None:

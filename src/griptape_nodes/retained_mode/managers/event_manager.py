@@ -236,19 +236,25 @@ def _why_local_request_is_refused(rule: _AssignedSenderRule | None) -> str | Non
     """Why a request no other engine sent must not run its handler, or None if it may."""
     if rule is None:
         return None
-    if rule.required is RequiredSender.SESSION:
+    if rule.required in (RequiredSender.ANY_SESSION, RequiredSender.SESSION):
         return "it did not come from another engine's session"
     return "it did not come from another engine"
 
 
 def _why_engine_request_is_refused(
-    rule: _AssignedSenderRule | None, request: RequestPayload, sender: RequestSender
+    rule: _AssignedSenderRule | None,
+    request: RequestPayload,
+    sender: RequestSender,
+    is_registered_session: Callable[[RequestSender], bool] | None,
 ) -> str | None:
     """Why a request another engine sent must not run its handler, or None if it may."""
     if rule is None:
         return "another engine may not send it"
-    if rule.required is RequiredSender.SESSION and sender.session_id is None:
+    needs_session = rule.required in (RequiredSender.ANY_SESSION, RequiredSender.SESSION)
+    if needs_session and sender.session_id is None:
         return "it did not come from one of that engine's sessions"
+    if rule.required is RequiredSender.SESSION and (is_registered_session is None or not is_registered_session(sender)):
+        return "the session it came from has not registered with this engine"
     owner_id = None
     if rule.owner is not None:
         owner_id = rule.owner(request, sender)
@@ -264,6 +270,8 @@ class EventManager(EngineScoped):
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # The request types another engine may send, and which engines. Any other is refused. See `@handles`.
         self._sender_rules: dict[type[RequestPayload], _AssignedSenderRule] = {}
+        # Tells whether a sender's session registered with this engine. Until one is given, no session has.
+        self._is_registered_session: Callable[[RequestSender], bool] | None = None
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
         # Libraries subscribe while they load, which runs in asyncio.to_thread, while a broadcast
@@ -959,6 +967,19 @@ class EventManager(EngineScoped):
                     request_type, getattr(owner, name), sender=rule.required, owner=owner_of
                 )
 
+    def recognize_sessions(self, is_registered_session: Callable[[RequestSender], bool]) -> None:
+        """Tell whether a sender's session registered with this engine, which `RequiredSender.SESSION` requests need.
+
+        The manager that registers sessions gives it, once.
+
+        Raises:
+            ValueError: Another manager already gave one.
+        """
+        if self._is_registered_session is not None:
+            msg = "Attempted to give the engine a way to recognize sessions. Failed because it already has one."
+            raise ValueError(msg)
+        self._is_registered_session = is_registered_session
+
     def configure_worker_forwarding(
         self,
         *,
@@ -1132,7 +1153,7 @@ class EventManager(EngineScoped):
             reason = _why_local_request_is_refused(rule)
             attempted = f"Attempted to handle a {type(request).__name__}."
         else:
-            reason = _why_engine_request_is_refused(rule, request, sender)
+            reason = _why_engine_request_is_refused(rule, request, sender, self._is_registered_session)
             attempted = f"Attempted to handle a {type(request).__name__} from engine {sender.engine_id}."
         if reason is None:
             return None

@@ -190,12 +190,15 @@ class StartWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
     """The engine did not start the worker.
 
     Args:
-        session_unknown: The session that asked has not registered with this engine, as after this
-            engine restarts, or registered without naming the library, as after its settings
-            changed. It may register and ask again.
+        session_unknown: The session that asked registered without naming the library, as after its
+            settings changed. It may register and ask again. A session that never registered is
+            refused before the request is handled.
+        at_capacity: This engine already runs as many workers for other engines as it allows. It may
+            ask again later.
     """
 
     session_unknown: bool = False
+    at_capacity: bool = False
 
 
 @dataclass
@@ -331,3 +334,139 @@ class ReportWorkerExitedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class ReportWorkerExitedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The exit was reported by an engine other than the one running the worker."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AdmitNodeRequest(RequestPayload):
+    """Sent by the artist's engine to the engine whose worker will run a node, before sending the node.
+
+    That engine runs one run at a time, its own and other engines' alike, in the order they asked. It
+    answers once the node may run: at once while it is free or already running the node's run,
+    otherwise when the runs ahead end. While the node waits, it reports the run's place in line with
+    `ReportPlaceInLineRequest`.
+
+    Args:
+        admission_id: Names this admission, in `ReportNodeExecutionEndedRequest` and `ReportPlaceInLineRequest`.
+        run_id: The run the node belongs to, or None for a node run on its own.
+        node_name: The node, named in that engine's log.
+    """
+
+    admission_id: str
+    run_id: str | None
+    node_name: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class AdmitNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The node may run."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AdmitNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The node will not run on that engine."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportPlaceInLineRequest(RequestPayload):
+    """Sent by an engine to the artist's engine while one of its nodes waits there, each time its run's place changes.
+
+    Sent once more with position 0 when the run stops waiting.
+
+    Args:
+        admission_id: The `admission_id` of the waiting node's `AdmitNodeRequest`.
+        position: The run's place in line, 1 being next, or 0 once it no longer waits.
+    """
+
+    admission_id: str
+    position: int
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportPlaceInLineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The artist's engine passed the place in line on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The place in line came from an engine other than the one the node waits on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportNodeExecutionEndedRequest(RequestPayload):
+    """Sent by the artist's engine when a node another engine admitted ends, however it ends.
+
+    Args:
+        admission_id: The `admission_id` of the node's `AdmitNodeRequest`.
+    """
+
+    admission_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportNodeExecutionEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine recorded the node as ended."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportNodeExecutionEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine could not record the node as ended."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportRunEndedRequest(RequestPayload):
+    """Sent by the artist's engine to every engine a run used, once the run ends, so they serve the next run.
+
+    Args:
+        run_id: The run that ended.
+    """
+
+    run_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportRunEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine no longer holds itself for the run."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportRunEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine could not end the run."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent to a worker to release what its libraries keep between runs, such as a loaded model.
+
+    Sent by an engine that runs nodes for other engines, as it passes from one engine's run to another's,
+    so the incoming run has the GPU to itself. Values the engine parked for a node's parameters stay: a
+    later node of the same run may still need them, and nothing could rebuild them.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The worker released what its libraries kept between runs."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The worker failed while releasing what its libraries kept between runs."""
