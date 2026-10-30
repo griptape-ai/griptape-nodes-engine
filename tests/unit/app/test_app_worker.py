@@ -2627,10 +2627,27 @@ class TestStartingAWorkerOnAnotherEngine:
         assert list(worker_manager._remote_starts) == [_started_worker_id(links)]
 
     @pytest.mark.asyncio
+    async def test_a_worker_is_known_to_run_on_its_engine_before_its_start_is_answered(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """The worker can register, and need its traffic carried, before the start's answer arrives."""
+        links = _host_engine(worker_manager)
+        links.blocked["StartWorkerForEngineRequest"] = asyncio.Event()
+        links.arrived["StartWorkerForEngineRequest"] = asyncio.Event()
+        with patch.object(worker_manager, "_orchestrator_static_server_base_url", new=AsyncMock(return_value=None)):
+            await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
+            await links.arrived["StartWorkerForEngineRequest"].wait()
+
+            assert worker_manager.worker_host(_started_worker_id(links)) == _HOST_ENGINE
+
+            links.blocked["StartWorkerForEngineRequest"].set()
+            await worker_manager._requested_spawns[_LIBRARY]
+
+    @pytest.mark.asyncio
     async def test_a_refused_start_makes_the_library_unavailable_and_forgets_the_worker(
         self, worker_manager: WorkerManager
     ) -> None:
-        _host_engine(worker_manager, refuse={"StartWorkerForEngineRequest": "no room"})
+        links = _host_engine(worker_manager, refuse={"StartWorkerForEngineRequest": "no room"})
 
         await _start_on_host_engine(worker_manager)
 
@@ -2638,6 +2655,7 @@ class TestStartingAWorkerOnAnotherEngine:
         assert reason is not None
         assert "no room" in reason
         assert worker_manager._remote_starts == {}
+        assert worker_manager.worker_host(_started_worker_id(links)) is None
         assert not worker_manager.is_worker_running_or_starting(_LIBRARY)
 
     @pytest.mark.asyncio
@@ -2825,6 +2843,7 @@ class TestARemoteWorkerRegisters:
 
         assert isinstance(result, worker_events.RegisterWorkerResultSuccess), result.result_details
         assert worker_manager._workers[worker_engine_id].host_engine_id == _HOST_ENGINE
+        assert worker_manager.worker_host(worker_engine_id) == _HOST_ENGINE
         assert worker_manager._remote_starts == {}
         worker_manager._tx.subscribe_to_topic.assert_awaited_once_with(  # type: ignore[union-attr]
             f"sessions/{_SESSION}/workers/{worker_engine_id}/response"
@@ -2843,6 +2862,7 @@ class TestARemoteWorkerRegisters:
         assert isinstance(result, worker_events.RegisterWorkerResultFailure)
         assert _HOST_ENGINE in str(result.result_details)
         assert worker_manager._workers == {}
+        assert worker_manager.worker_host("stranger") is None
 
     @pytest.mark.asyncio
     async def test_a_worker_registering_for_another_library_than_it_was_started_for_is_refused(

@@ -470,7 +470,9 @@ class FlowManager(EngineScoped):
         """Check if a connection exists."""
         connected_outputs = self.get_connected_output_parameters(source_node, source_parameter)
         for connected_node, connected_param in connected_outputs:
-            if connected_node is target_node and connected_param is target_parameter:
+            # By name, as the connection indexes are: a node can replace a connected parameter with
+            # a same-named one, and the connection still holds the one it replaced.
+            if connected_node is target_node and connected_param.name == target_parameter.name:
                 return True
         return False
 
@@ -1418,14 +1420,26 @@ class FlowManager(EngineScoped):
 
         # Cross-flow connections are now supported via global connection storage
 
-        # Now validate the parameters.
+        # Now validate the parameters. A node can remove a connected parameter without a request, which
+        # leaves the connection holding the only reference to it; that connection must still be deletable,
+        # or neither node nor their flow can be deleted.
+        stored_connection = self._connections.find_connection(
+            source_node=source_node_name,
+            source_parameter=request.source_parameter_name,
+            target_node=target_node_name,
+            target_parameter=request.target_parameter_name,
+        )
         source_param = source_node.get_parameter_by_name(request.source_parameter_name)
+        if source_param is None and stored_connection is not None:
+            source_param = stored_connection.source_parameter
         if source_param is None:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" Not found.'
 
             return DeleteConnectionResultFailure(result_details=details)
 
         target_param = target_node.get_parameter_by_name(request.target_parameter_name)
+        if target_param is None and stored_connection is not None:
+            target_param = stored_connection.target_parameter
         if target_param is None:
             details = f'Connection not deleted "{target_node_name}.{request.target_parameter_name}" Not found.'
 
@@ -1441,22 +1455,6 @@ class FlowManager(EngineScoped):
             details = f'Connection does not exist: "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}"'
 
             return DeleteConnectionResultFailure(result_details=details)
-
-        # Check if either node is in a NodeGroup and untrack connections BEFORE removing connection
-
-        # Find the connection before it's deleted
-        if (
-            source_node.name in self._connections.outgoing_index
-            and source_param.name in self._connections.outgoing_index[source_node.name]
-        ):
-            connection_ids = self._connections.outgoing_index[source_node.name][source_param.name]
-            for candidate_id in connection_ids:
-                candidate = self._connections.connections[candidate_id]
-                if (
-                    candidate.target_node.name == target_node.name
-                    and candidate.target_parameter.name == target_param.name
-                ):
-                    break
 
         # Remove the connection.
         if not self._connections.remove_connection(

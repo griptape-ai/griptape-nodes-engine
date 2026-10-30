@@ -51,5 +51,8 @@ class EngineTransports(Protocol):
         ...
 
     def on_engine_lost(self, callback: Callable[[str], Awaitable[None]]) -> None:
-        """Call `callback` with an engine's ID once the connection to it has been down longer than the heartbeat timeout."""
+        """Call `callback` with an engine's ID once the connection to it is lost.
+
+        A registered remote worker is not settled by this: heartbeats decide whether it is alive, as for a local one.
+        """
         ...

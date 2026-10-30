@@ -597,6 +597,13 @@ class Engine:
             raise EngineNotFoundError(msg)
         return self._engine_transports.hosted_worker_environment(engine_id)
 
+    def worker_host(self, worker_engine_id: str) -> str | None:
+        """The engine that runs the worker `worker_engine_id` for this one, or None for a local or unknown worker.
+
+        The transports ask this to carry a worker's traffic to the engine that runs it.
+        """
+        return self._worker_manager.worker_host(worker_engine_id)
+
     def clear_current_workflow_data(self) -> None:
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
 
