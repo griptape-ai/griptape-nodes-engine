@@ -3123,7 +3123,7 @@ class ProjectManager(EngineScoped):
             current_id = self._reduce_parent_link_to_id(template, anchor, file_path_to_id)
         return chain
 
-    @handles(SetCurrentProjectRequest)
+    @handles(SetCurrentProjectRequest, scope=RequestScope.HOST)
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:

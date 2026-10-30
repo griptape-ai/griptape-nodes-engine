@@ -19,6 +19,8 @@ def _object_manager_with_an_open_workflow() -> ObjectManager:
     workflow = WorkflowRuntime("wf")
     engine.current_workflow.return_value = workflow
     engine.current_workflow_or_none.return_value = workflow
+    engine.open_workflows.all_open.return_value = [workflow]
+    engine.worker_workflows.all_kept.return_value = []
     return ObjectManager(MagicMock(), engine=engine)
 
 

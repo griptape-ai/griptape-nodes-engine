@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
+from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionContext
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayloadSuccess
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -261,14 +262,68 @@ class TestObjectsOnTheRuntime:
         assert objects.has("renamed")
         assert not objects.has("canvas")
 
-    def test_popping_the_last_entry_drops_objects_left_in_it(self, engine: Engine) -> None:
+    def test_popping_the_workflow_deletes_its_flows_before_closing_it(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        closed = engine.current_workflow()
 
         engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name="next")
 
+        assert len(closed.objects) == 0
+        assert closed.flows.name_to_parent_name == {}
         assert not engine.object_manager.has_object_with_name("canvas")
+
+    def test_a_teardown_that_fails_leaves_the_workflow_open(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        workflow = engine.current_workflow()
+
+        with (
+            patch.object(engine, "_delete_workflow_flows", side_effect=RuntimeError("delete blew up")),
+            pytest.raises(RuntimeError, match="delete blew up"),
+        ):
+            engine.context_manager.pop_workflow()
+
+        assert engine.open_workflows.all_open() == [workflow]
+
+    def test_a_closed_workflows_queued_ui_changes_go_with_it(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="outer")
+        node = MockNode(name="node")
+        parameter = Parameter(name="text", tooltip="Text", type="str")
+        node.add_parameter(parameter)
+        engine.object_manager.add_object_by_name("node", node)
+        parameter.track_change("tooltip", "Changed")
+        # Closing refuses a workflow that still holds objects once its flows are deleted.
+        engine.current_workflow().objects.remove("node")
+
+        engine.context_manager.pop_workflow()
+        engine.context_manager.push_workflow(workflow_name="next")
+
+        assert engine.object_manager.take_nodes_with_queued_changes() == []
+
+    def test_queued_ui_changes_are_taken_from_the_bound_workflow_or_every_open_one(self, engine: Engine) -> None:
+        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine.context_manager.push_workflow(workflow_name="first")
+        first = engine.current_workflow()
+        second = engine.open_workflows.open(
+            engine.workflow_registry.register_unsaved("second", listed=False).workflow_id
+        )
+        nodes = {}
+        for workflow in (first, second):
+            node = MockNode(name="node")
+            parameter = Parameter(name="text", tooltip="Text", type="str")
+            node.add_parameter(parameter)
+            with engine.bind_workflow(workflow):
+                engine.object_manager.add_object_by_name("node", node)
+            parameter.track_change("tooltip", "Changed")
+            nodes[workflow] = node
+
+        with engine.bind_workflow(second):
+            taken_bound = engine.object_manager.take_nodes_with_queued_changes()
+        taken_unbound = engine.object_manager.take_nodes_with_queued_changes()
+
+        assert taken_bound == [nodes[second]]
+        assert taken_unbound == [nodes[first]]
 
 
 class TestVariablesOnTheRuntime:
@@ -540,7 +595,6 @@ class TestNodesAndFlowsOnTheRuntime:
     ) -> None:
         engine.context_manager.push_workflow(workflow_name="first")
         first = engine.current_workflow()
-        first.flows.global_single_node_resolution = True
         graph = DirectedGraph()
         graph.add_node("other")
         first.flows.global_dag_builder.graphs["network"] = graph
@@ -550,6 +604,8 @@ class TestNodesAndFlowsOnTheRuntime:
         engine.context_manager.pop_workflow()
         if next_workflow_opens:
             engine.context_manager.push_workflow(workflow_name="second")
+        # Closing reset the run's state; the run sets its own rule, not the current workflow's.
+        first.flows.global_single_node_resolution = True
 
         # A single-node run stops after its node, whichever workflow is current when it resumes.
         assert ExecuteDagState._should_skip_control_flow(context, MockNode(name="node"), "network")
