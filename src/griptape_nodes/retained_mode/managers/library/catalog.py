@@ -355,7 +355,12 @@ class LibraryCatalog(EngineScoped):
 
         # A request that leaves something out is for planning, so it is served from the cache. One
         # with everything included is read fresh, for dropdowns built from the machine it runs on.
-        includes_everything = request.include_metadata and request.include_tooltips and request.include_ui_options
+        includes_everything = (
+            request.include_metadata
+            and request.include_tooltips
+            and request.include_ui_options
+            and request.include_exec_pins
+        )
         if includes_everything:
             parameters = self._fresh_parameters(resolved)
         else:
@@ -366,16 +371,19 @@ class LibraryCatalog(EngineScoped):
         metadata = None
         if request.include_metadata:
             metadata = resolved.metadata
+        trimmed = trim_parameters(
+            parameters,
+            include_tooltips=request.include_tooltips,
+            include_ui_options=request.include_ui_options,
+            include_exec_pins=request.include_exec_pins,
+        )
         details = f"Successfully described node type '{request.node_type}' in Library '{resolved.library_name}'."
         return DescribeNodeTypeResultSuccess(
             library=resolved.library_name,
             node_type=request.node_type,
             metadata=metadata,
-            parameters=trim_parameters(
-                parameters,
-                include_tooltips=request.include_tooltips,
-                include_ui_options=request.include_ui_options,
-            ),
+            parameters=trimmed.parameters,
+            exec_pins=trimmed.exec_pins,
             result_details=details,
         )
 

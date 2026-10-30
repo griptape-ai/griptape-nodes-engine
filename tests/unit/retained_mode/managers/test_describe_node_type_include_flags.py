@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, StartNode, SuccessFailureNode
 from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
     LibraryMetadata,
@@ -19,6 +20,7 @@ from griptape_nodes.node_library.library_registry import (
     NodeDeprecationMetadata,
     NodeMetadata,
 )
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
@@ -189,7 +191,7 @@ def _register_library(
 
 
 # What a client planning a workflow asks for: everything but names, types, modes, defaults and options.
-PLAN = {"include_metadata": False, "include_tooltips": False, "include_ui_options": False}
+PLAN = {"include_metadata": False, "include_tooltips": False, "include_ui_options": False, "include_exec_pins": False}
 
 
 def _describe_result(
@@ -203,6 +205,7 @@ def _describe_result(
             include_metadata=flags["include_metadata"],
             include_tooltips=flags["include_tooltips"],
             include_ui_options=flags["include_ui_options"],
+            include_exec_pins=flags["include_exec_pins"],
         )
     )
     assert isinstance(result, (DescribeNodeTypeResultSuccess, DescribeNodeTypeResultFailure))
@@ -344,6 +347,98 @@ class TestDescribeNodeTypeIncludeFlags:
             _describe_full(engine, _CompactProbe.__name__)
 
         assert _CompactProbe.constructed == 3  # noqa: PLR2004
+
+
+class TestDescribeNodeTypeExecPins:
+    """include_exec_pins=False leaves out the standard exec_in/exec_out pair and reports `exec_pins` instead."""
+
+    def test_control_node_reports_exec_pins_instead_of_listing_them(self, engine: Engine) -> None:
+        class _ControlProbe(ControlNode):
+            def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+                super().__init__(name=name, metadata=metadata)
+                self.add_parameter(Parameter(name="prompt", type="str", tooltip="Prompt"))
+
+        _register_library(node_class=_ControlProbe)
+
+        trimmed = _describe(engine, _ControlProbe.__name__)
+        full = _describe_full(engine, _ControlProbe.__name__)
+
+        assert trimmed.exec_pins is True
+        assert _parameter_names(trimmed) == ["prompt"]
+        assert full.exec_pins is None
+        assert _parameter_names(full) == ["exec_in", "exec_out", "prompt"]
+
+    def test_failure_branch_stays_listed(self, engine: Engine) -> None:
+        class _BranchingProbe(SuccessFailureNode):
+            pass
+
+        _register_library(node_class=_BranchingProbe)
+
+        result = _describe(engine, _BranchingProbe.__name__)
+
+        assert result.exec_pins is True
+        assert _parameter_names(result) == ["failure"]
+
+    def test_lone_standard_pin_stays_listed(self, engine: Engine) -> None:
+        """Without both standard pins, `exec_pins` would misdescribe the node, so the one it has is listed."""
+
+        class _StartProbe(StartNode):
+            pass
+
+        _register_library(node_class=_StartProbe)
+
+        result = _describe(engine, _StartProbe.__name__)
+
+        assert result.exec_pins is False
+        assert _parameter_names(result) == ["exec_out"]
+
+
+class TestDescribeNodeTypeWire:
+    """A request that leaves anything out leaves null fields out on the wire; a full request sends them as null."""
+
+    def test_trimmed_request_leaves_null_fields_out(self, engine: Engine) -> None:
+        _register_library()
+
+        wire = json.loads(converters.client.dumps(_describe(engine, _CompactProbe.__name__)))
+        by_name = {param["name"]: param for param in wire["parameters"]}
+
+        assert by_name["style"] == {
+            "name": "style",
+            "type": "str",
+            "input_types": ["str"],
+            "output_type": "str",
+            "default_value": "photo",
+            "mode_allowed_input": False,
+            "mode_allowed_property": True,
+            "mode_allowed_output": False,
+            "settable": True,
+            "options": ["photo", "sketch", "anime"],
+        }
+        for param in wire["parameters"]:
+            assert "tooltip" not in param
+            assert "ui_options" not in param
+            assert "omit_null_fields" not in param
+
+    def test_full_request_sends_every_field(self, engine: Engine) -> None:
+        _register_library()
+
+        wire = json.loads(converters.client.dumps(_describe_full(engine, _CompactProbe.__name__)))
+        output = {param["name"]: param for param in wire["parameters"]}["output"]
+
+        assert output["options"] is None
+        assert output["parent_container_name"] is None
+        assert "tooltip_as_input" in output
+        assert "omit_null_fields" not in output
+
+    def test_trimmed_description_reads_back_with_its_nulls(self, engine: Engine) -> None:
+        _register_library()
+
+        style = _by_name(_describe(engine, _CompactProbe.__name__))["style"]
+        read_back = converters.client.structure(converters.client.unstructure(style), ParameterDescription)
+
+        assert read_back == style
+        assert read_back.tooltip is None
+        assert read_back.ui_options is None
 
 
 class TestDescribeNodeTypeIncludeFlagFailures:

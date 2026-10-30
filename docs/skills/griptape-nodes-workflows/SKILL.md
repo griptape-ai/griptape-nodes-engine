@@ -240,7 +240,7 @@ usually kept out of the build batch so its long timeout does not gate the rest:
      DescribeNodeTypeRequest("TextInput",   **PLAN),
      DescribeNodeTypeRequest("Agent",       **PLAN),
      DescribeNodeTypeRequest("DisplayText", **PLAN),
-   ])   # PLAN = include_metadata=False, include_tooltips=False, include_ui_options=False
+   ])   # PLAN = include_metadata, include_tooltips, include_ui_options, include_exec_pins all False
 3. EventRequestBatch([                                  (1 call, runs sequentially)
      CreateNodeRequest(node_type="TextInput",   node_name="TextInput_1"),
      CreateNodeRequest(node_type="Agent",       node_name="Agent_1"),
@@ -256,11 +256,13 @@ usually kept out of the build batch so its long timeout does not gate the rest:
    + GetParameterValueRequest("DisplayText_1", "text")            (2 calls)
 ```
 
-With those three flags off, each parameter still has its name, types, modes, default and
-dropdown `options`, which is all wiring and setting values needs; `metadata`, tooltips and
-`ui_options` come back as `null`. Listing the node types with `ListNodeTypesInLibraryRequest`
-and `include_metadata` already gives the metadata. A request that leaves anything out is cached
-until libraries change, so describing a whole library is fast after the first time.
+With those flags off, each parameter still has its name, types, modes, default and dropdown
+`options`, which is all wiring and setting values needs. Null fields are left out, so read a
+missing field as null. `exec_pins: true` means the node has the standard `exec_in` and
+`exec_out` control parameters, which are left out but connections still name; other control
+parameters stay listed. Listing the node types with `ListNodeTypesInLibraryRequest` and
+`include_metadata` already gives the metadata. A request that leaves anything out is cached until
+libraries change, so describing a whole library is fast after the first time.
 
 Four round trips instead of thirteen. Walk the result arrays after each batch and
 verify every slot returned `ok: true` before moving on; per-slot failures don't
@@ -466,7 +468,7 @@ Total: 13 MCP calls from empty engine to rendered output.
 ### Same pipeline, batched (4 round trips)
 
 1. `EnsureWorkflowAndFlowRequest()`
-1. `EventRequestBatch([DescribeNodeTypeRequest(include_metadata=False, include_tooltips=False, include_ui_options=False) × 3])`
+1. `EventRequestBatch([DescribeNodeTypeRequest(include_metadata=False, include_tooltips=False, include_ui_options=False, include_exec_pins=False) × 3])`
 1. `EventRequestBatch([CreateNodeRequest × 3 (with explicit node_name), SetParameterValueRequest, CreateConnectionRequest × 2, AutoLayoutFlowRequest])`
 1. `StartFlowRequest()` then `GetParameterValueRequest("DisplayText_1", "text")`
 

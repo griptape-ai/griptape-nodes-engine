@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.library_events import ParameterDescription
+
+
+# The standard control parameters nearly every node has. A request can leave them out and report
+# `exec_pins` instead; other control parameters (loop signals, branches, failure) stay listed.
+EXEC_IN_NAME = "exec_in"
+EXEC_OUT_NAME = "exec_out"
 
 
 class NodeTypeSpecCache:
@@ -54,15 +62,56 @@ class NodeTypeSpecCache:
         self._generation = current_generation
 
 
+@dataclass
+class TrimmedParameters:
+    """What a DescribeNodeTypeRequest returns about a node type's parameters.
+
+    Args:
+        parameters: The descriptions, with the parts the request left out set to None
+        exec_pins: Whether the standard exec_in/exec_out pair was there and left out. None when the
+            request included them.
+    """
+
+    parameters: list[ParameterDescription]
+    exec_pins: bool | None
+
+
 def trim_parameters(
-    parameters: list[ParameterDescription], *, include_tooltips: bool, include_ui_options: bool
-) -> list[ParameterDescription]:
-    """The descriptions with the parts a request left out set to None. `options` is always kept."""
-    blanked: dict[str, None] = {}
+    parameters: list[ParameterDescription],
+    *,
+    include_tooltips: bool,
+    include_ui_options: bool,
+    include_exec_pins: bool,
+) -> TrimmedParameters:
+    """Apply a request's include_* flags to a node type's descriptions. `options` is always kept.
+
+    A request that leaves anything out gets descriptions that leave their null fields out on the wire.
+    """
+    if include_tooltips and include_ui_options and include_exec_pins:
+        return TrimmedParameters(parameters=parameters, exec_pins=None)
+
+    blanked: dict[str, Any] = {"omit_null_fields": True}
     if not include_tooltips:
         blanked.update(tooltip=None, tooltip_as_input=None, tooltip_as_property=None, tooltip_as_output=None)
     if not include_ui_options:
         blanked["ui_options"] = None
-    if not blanked:
-        return parameters
-    return [dataclasses.replace(param, **blanked) for param in parameters]
+
+    exec_pins = None
+    if not include_exec_pins:
+        exec_pins = _has_standard_exec_pins(parameters)
+    kept = [
+        dataclasses.replace(param, **blanked)
+        for param in parameters
+        if not (exec_pins and _is_standard_exec_pin(param))
+    ]
+    return TrimmedParameters(parameters=kept, exec_pins=exec_pins)
+
+
+def _has_standard_exec_pins(parameters: list[ParameterDescription]) -> bool:
+    """Whether both standard control parameters are there. With only one, it stays listed."""
+    names = {param.name for param in parameters if _is_standard_exec_pin(param)}
+    return names == {EXEC_IN_NAME, EXEC_OUT_NAME}
+
+
+def _is_standard_exec_pin(param: ParameterDescription) -> bool:
+    return param.type == ParameterTypeBuiltin.CONTROL_TYPE.value and param.name in (EXEC_IN_NAME, EXEC_OUT_NAME)
