@@ -1074,6 +1074,9 @@ class FlowSerialization(EngineScoped):
                 msg = f"Failed because the sub-flow used an unknown creation command: {type(flow_initialization_command).__name__}."
                 raise FlowDeserializationError(msg)
 
+        msg = "Failed to create flow during deserialization due to an unexpected control flow path."
+        raise FlowDeserializationError(msg)
+
     def _deserialize_connections_for_flow_and_subflows(
         self,
         serialized_flow_commands: SerializedFlowCommands,
