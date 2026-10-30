@@ -121,6 +121,8 @@ Several people can send their libraries to the same remote computer. It runs one
 | `release.how`   | `drop_cache` (the default) | Each worker drops what its libraries keep between runs, such as a loaded model. Values a later node of the same run needs stay. |
 | `release.how`   | `recycle`                  | Stops each worker. It starts again before that library's next node, which takes as long as loading the library.                 |
 
+With `recycle`, a stopped worker also loses what your nodes left in it that couldn't be sent back to your workstation, such as a loaded pipeline passed from one node to the next. If your next run reuses such a value without running the node that made it, the node that reads it fails, saying to run that node again. Run it again, and the run continues.
+
 To limit how many workers the remote computer runs at once, set `distributed_execution.max_workers` on it. A start beyond the limit is refused, and the node that needed it says so. Your next node from that library asks again. For example, on the **remote computer**:
 
 ```json
