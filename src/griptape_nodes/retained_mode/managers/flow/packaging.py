@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeNodes
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -123,7 +124,9 @@ class FlowPackaging(EngineScoped):
 
     @handles(PackageNodesAsSerializedFlowRequest)
     def on_package_nodes_as_serialized_flow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
-        self, request: PackageNodesAsSerializedFlowRequest
+        self,
+        request: PackageNodesAsSerializedFlowRequest,
+        workflow: WorkflowRuntime,  # noqa: ARG002 (packaging reads the nodes through NodeManager)
     ) -> ResultPayload:
         """Handle request to package multiple nodes as a serialized flow.
 

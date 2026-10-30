@@ -96,9 +96,7 @@ class RunSubflowNode(ControlNode):
     async def aprocess(self) -> None:
         subflow = self.metadata["subflow_name"]
         end_node_name = self.metadata["end_node_name"]
-        result = await GriptapeNodes.FlowManager().on_start_local_subflow_request(
-            StartLocalSubflowRequest(flow_name=subflow)
-        )
+        result = await GriptapeNodes.FlowManager().start_local_subflow(StartLocalSubflowRequest(flow_name=subflow))
         if isinstance(result, StartLocalSubflowResultFailure):
             self.parameter_output_values["collected_value"] = f"START_FAIL: {result.result_details}"
             return

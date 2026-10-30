@@ -6,9 +6,12 @@ these errors as `ContextManager.WorkflowContextError` and `ContextManager.EmptyS
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.exe_types.core_types import BaseNodeElement
     from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -48,6 +51,32 @@ class WorkflowContextStack:
         flow_context = self._flow_stack.pop()
         return flow_context._flow
 
+    @contextmanager
+    def flow(self, flow: ControlFlow) -> Iterator[ControlFlow]:
+        """Enter `flow` for the length of a `with` block."""
+        self.push_flow(flow)
+        try:
+            yield flow
+        finally:
+            self.pop_flow()
+
+    @contextmanager
+    def node(self, node: BaseNode) -> Iterator[BaseNode]:
+        """Enter `node` in the current flow for the length of a `with` block.
+
+        Raises:
+            EmptyStackError: No flow is entered.
+        """
+        if not self._flow_stack:
+            msg = f"Cannot enter Node '{node.name}': no active Flow in Workflow"
+            raise EmptyStackError(msg)
+        flow_context = self._flow_stack[-1]
+        flow_context.push_node(node)
+        try:
+            yield node
+        finally:
+            flow_context.pop_node()
+
     def has_current_flow(self) -> bool:
         """Check if this workflow has an active flow."""
         return len(self._flow_stack) > 0
@@ -60,6 +89,19 @@ class WorkflowContextStack:
 
         flow_context = self._flow_stack[-1]
         return flow_context._flow
+
+    def has_current_node(self) -> bool:
+        """Check if the current flow in this workflow has an active node."""
+        if not self._flow_stack:
+            return False
+        return self._flow_stack[-1].has_current_node()
+
+    def get_current_node(self) -> BaseNode:
+        """Get the current node in the current flow of this workflow."""
+        if not self._flow_stack:
+            msg = "No active Flow in Workflow"
+            raise EmptyStackError(msg)
+        return self._flow_stack[-1].get_current_node()
 
 
 class FlowContextState:

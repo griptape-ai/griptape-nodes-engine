@@ -5708,8 +5708,8 @@ class TestReferencedWorkflowTagging:
 
         flow_x = flow_manager.get_flow_by_name(flow_x_name)
         flow_y = flow_manager.get_flow_by_name(flow_y_name)
-        assert flow_manager.get_referenced_workflow_name(flow_x) == "workflow_x"
-        assert flow_manager.get_referenced_workflow_name(flow_y) == "workflow_y"
+        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_x) == "workflow_x"
+        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_y) == "workflow_y"
 
     def test_imports_in_one_engine_do_not_leak_into_another(self, engine: Engine) -> None:
         """An import running in one engine does not tag flows created in another engine."""
@@ -5726,7 +5726,10 @@ class TestReferencedWorkflowTagging:
             )
             assert isinstance(result, CreateFlowResultSuccess)
             other_flow = other_engine.flow_manager.get_flow_by_name(result.flow_name)
-            assert other_engine.flow_manager.get_referenced_workflow_name(other_flow) is None
+            assert (
+                other_engine.flow_manager.get_referenced_workflow_name(other_engine.current_workflow(), other_flow)
+                is None
+            )
 
     def test_leaving_an_import_removes_the_variable_from_the_context(self, engine: Engine) -> None:
         """Leaving an import clears the stack and drops the variable from the Context."""
