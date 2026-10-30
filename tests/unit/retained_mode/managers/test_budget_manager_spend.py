@@ -722,5 +722,7 @@ class TestReportQueue:
 class TestWiring:
     def test_the_engine_routes_both_requests_to_the_budget_manager(self, engine: Any) -> None:
         manager = engine.budget_manager
-        assert engine._event_manager._request_type_to_manager[BudgetAccessRequest] == manager.on_budget_access_request
-        assert engine._event_manager._request_type_to_manager[ReportUsageRequest] == manager.on_report_usage_request
+        assert (
+            engine._event_manager.get_manager_for_request_type(BudgetAccessRequest) == manager.on_budget_access_request
+        )
+        assert engine._event_manager.get_manager_for_request_type(ReportUsageRequest) == manager.on_report_usage_request
