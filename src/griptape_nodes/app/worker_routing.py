@@ -451,7 +451,6 @@ class RemoteHandler:
         return self.event_manager.in_node_execution()
 
     async def forward(self, request: RequestPayload) -> ResultPayload:
-        """Send `request` to the orchestrator and return its result."""
         event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
         return cast("ResultPayload", event_result.result)
 
