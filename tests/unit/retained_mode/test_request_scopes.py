@@ -23,7 +23,7 @@ from griptape_nodes.retained_mode.events.config_events import (
 )
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
-from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest
+from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest, RenameObjectResultFailure
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
@@ -488,6 +488,12 @@ class TestObjectAndVariableRequests:
         assert "2 workflows are open" in str(result.result_details)
         assert not a.variables.global_layer.has("greeting")
         assert not b.variables.global_layer.has("greeting")
+
+    def test_a_rename_that_names_no_workflow_fails_with_its_own_failure(self, engine: Engine) -> None:
+        result = engine.handle_request(RenameObjectRequest(object_name="Flow_1", requested_name="Flow_2"))
+
+        assert isinstance(result, RenameObjectResultFailure)
+        assert result.next_available_name is None
 
     def test_naming_no_workflow_fails_generically_for_a_request_with_no_failure_type(
         self, engine: Engine, calls: _Calls
