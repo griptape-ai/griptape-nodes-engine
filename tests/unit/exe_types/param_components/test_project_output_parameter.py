@@ -98,6 +98,14 @@ class TestGetUpstreamDestination:
         with pytest.raises(ValueError, match="UpstreamNode"):
             _get(param)
 
+    def test_raises_when_the_request_answers_with_another_result_type(self) -> None:
+        param = _make_param(
+            destination_events.GetConnectedFileDestinationResultSuccess(destination=None, result_details="ok")
+        )
+
+        with pytest.raises(TypeError, match="GetConnectedFileDestinationResultSuccess"):
+            _get(param)
+
     def test_never_reads_the_local_object_store(self) -> None:
         param = _make_param(
             destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=_SPEC, result_details="ok")
