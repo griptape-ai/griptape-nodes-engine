@@ -10,6 +10,7 @@ Covers:
 - `_load_status_file` — status file reads survive a concurrent status file write
 - `on_handle_pause_model_download_request` / `on_handle_resume_model_download_request` — a paused
   download keeps its status until resumed with the parameters it started with
+- `on_handle_delete_model_request` — deleting a model clears its download record
 """
 
 import asyncio
@@ -34,6 +35,8 @@ from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
     DeclareModelInvocationResultSuccess,
+    DeleteModelRequest,
+    DeleteModelResultSuccess,
     DownloadModelRequest,
     DownloadModelResultFailure,
     DownloadModelResultSuccess,
@@ -1162,3 +1165,27 @@ class TestPauseAndResume:
         )
 
         assert isinstance(result, ResumeModelDownloadResultFailure)
+
+
+# ---------------------------------------------------------------------------
+# on_handle_delete_model_request
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteModelClearsDownloadRecord:
+    """A paused or failed record left behind would mark a later copy of the model incomplete."""
+
+    @pytest.mark.asyncio
+    async def test_the_download_record_goes_with_the_files(self, model_manager: ModelManager, tmp_path: Path) -> None:
+        record = {"model_id": "org/model", "status": "paused", "started_at": "s", "updated_at": "u"}
+        status_file = tmp_path / "org--model.json"
+        status_file.write_text(json.dumps(record), encoding="utf-8")
+
+        with (
+            patch.object(model_manager, "_get_status_directory", return_value=tmp_path),
+            patch.object(model_manager, "_delete_model", return_value="/cache/org--model"),
+        ):
+            result = await model_manager.on_handle_delete_model_request(DeleteModelRequest(model_id="org/model"))
+
+        assert isinstance(result, DeleteModelResultSuccess)
+        assert not status_file.exists()

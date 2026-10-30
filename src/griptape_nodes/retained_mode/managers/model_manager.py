@@ -876,6 +876,14 @@ class ModelManager(EngineScoped):
                 exception=e,
             )
 
+        # A leftover paused or failed record would keep nodes treating a later copy of the model as
+        # incomplete, so it goes with the files.
+        try:
+            await asyncio.to_thread(self._delete_model_download_status, model_id)
+            deleted_items.append("download record")
+        except FileNotFoundError:
+            logger.debug("No download record found for '%s'", model_id)
+
         if not deleted_items:
             error_msg = f"Model '{model_id}' not found (no cached files or download records)"
             return DeleteModelResultFailure(
