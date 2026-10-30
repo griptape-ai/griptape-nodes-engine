@@ -2505,8 +2505,8 @@ class TestWorkflowManager:
                 f"Unexpected top-level statement of type {type(node).__name__} in shape-free workflow"
             )
 
-    def test_generate_workflow_file_content_prereq_lives_inside_build_workflow(self, engine: Engine) -> None:
-        """Prerequisite code (context_manager setup) must live inside build_workflow, not at module scope."""
+    def test_generated_build_workflow_opens_no_workflow(self, engine: Engine) -> None:
+        """build_workflow builds into the workflow its caller opened; it never opens one itself."""
         content = self._generate(engine)
         module = ast.parse(content)
 
@@ -2514,8 +2514,7 @@ class TestWorkflowManager:
             node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "build_workflow"
         )
         body_src = "\n".join(ast.unparse(stmt) for stmt in build_workflow.body)
-        assert "context_manager = GriptapeNodes.ContextManager()" in body_src
-        assert "context_manager.push_workflow(file_path=__file__)" in body_src
+        assert "push_workflow" not in body_src
 
     def test_generate_workflow_file_content_registers_declared_libraries_in_build_workflow(
         self, engine: Engine
@@ -2643,6 +2642,7 @@ class TestWorkflowManager:
             dispatched.append(request)
             return await original_ahandle(request)  # type: ignore[arg-type]
 
+        engine.context_manager.push_workflow(file_path="runtime_order_test.py")
         exec_globals: dict[str, object] = {"__file__": "runtime_order_test.py"}
         exec(compile(script_source, "<runtime_order_test>", "exec"), exec_globals)  # noqa: S102
         # The generated source calls the facade, which resolves to this engine, so stubbing the
@@ -2714,14 +2714,10 @@ class TestWorkflowManager:
             for node in ast.walk(stmt)
         ), ast.unparse(aexecute)
 
-        first_stmt = async_with.body[0]
-        # Expected shape: `await build_workflow()`
-        assert isinstance(first_stmt, ast.Expr)
-        assert isinstance(first_stmt.value, ast.Await)
-        call = first_stmt.value.value
-        assert isinstance(call, ast.Call)
-        assert isinstance(call.func, ast.Name)
-        assert call.func.id == "build_workflow"
+        # Expected shape: open the file as the workflow, then `await build_workflow()`.
+        open_stmt, build_stmt = async_with.body[:2]
+        assert ast.unparse(open_stmt) == "GriptapeNodes.ContextManager().push_workflow(file_path=__file__)"
+        assert ast.unparse(build_stmt) == "await build_workflow()"
 
     def test_generate_workflow_file_content_ensure_context_is_async(self, engine: Engine) -> None:
         """_ensure_workflow_context is now async and must await ahandle_request."""
@@ -3062,6 +3058,7 @@ class TestWorkflowVariablePersistence:
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
         engine.clear_current_workflow_data()
+        engine.context_manager.push_workflow(file_path="test_workflow.py")
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
         exec(compile(script_source, "<round_trip_test>", "exec"), exec_globals)  # noqa: S102
@@ -3533,13 +3530,32 @@ class TestRunWorkflowWithCurrentStateRequest:
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
         context_manager.has_current_flow.return_value = False
+        context_manager.has_current_workflow.return_value = True
 
         await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
             RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
         )
 
-        # Getting past the guard is the behaviour under test; what the run then does is mocked away.
-        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE)
+        # It builds into the open workflow rather than opening the file as another.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, opens_workflow=False)
+
+    @pytest.mark.asyncio
+    async def test_opens_the_file_when_no_workflow_is_open(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        context_manager.has_current_flow.return_value = False
+        context_manager.has_current_workflow.return_value = False
+
+        await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, opens_workflow=True)
 
 
 class TestWorkflowsLoadingGate:
@@ -6175,12 +6191,20 @@ class TestRepairPathShapedDisplayName:
 class TestNodeLibraryDelegates:
     """Node libraries call these on `GriptapeNodes.WorkflowManager()`; they must reach the parts."""
 
-    def test_run_workflow_delegates_to_runner(self, engine: Engine) -> None:
+    def test_run_workflow_opens_the_file_when_no_workflow_is_open(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
-        run_mock.assert_awaited_once_with("flow.py")
+        run_mock.assert_awaited_once_with("flow.py", opens_workflow=True)
+
+    def test_run_workflow_builds_into_the_open_workflow(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
+        engine.context_manager.push_workflow(workflow_name="open")
+        result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+        with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
+            assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
+        run_mock.assert_awaited_once_with("flow.py", opens_workflow=False)
 
     def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager

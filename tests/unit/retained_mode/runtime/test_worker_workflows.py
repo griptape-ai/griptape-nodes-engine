@@ -60,6 +60,11 @@ class TestWorkerWorkflows:
         assert engine._get_current_workflow_info()["current_workflow_id"] is None
         with engine.run_in_worker_workflow(workflow):
             assert engine.context_manager.get_current_workflow_id() == PEER_ID
+            # The workflow manager reads the same current workflow as the context manager.
+            with engine.workflow_manager.referenced_workflow("library_workflow"):
+                assert workflow.loading.referenced_workflow_stack == ["library_workflow"]
+            with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
+                engine.context_manager.push_workflow(workflow_name="local")
 
         engine.close_worker_workflow(workflow)
         assert not engine.context_manager.has_current_workflow()
@@ -75,6 +80,18 @@ class TestWorkerWorkflows:
             assert workflow.closed
             with pytest.raises(WorkflowNotOpenError, match="was closed"):
                 engine.current_workflow_or_none()
+
+    def test_popping_a_workers_runtime_is_refused_and_keeps_it(self, engine: Engine) -> None:
+        workflow = engine.context_manager.adopt_orchestrator_workflow(PEER_ID, None, None, None)
+
+        with (
+            engine.run_in_worker_workflow(workflow),
+            pytest.raises(engine.context_manager.WorkerWorkflowNotClosableError, match="that engine closes it"),
+        ):
+            engine.context_manager.pop_workflow()
+
+        assert engine.worker_workflows.find(PEER_ID) is workflow
+        assert engine.workflow_registry.is_open(PEER_ID)
 
     def test_each_runtime_has_a_context_of_its_own(self, engine: Engine) -> None:
         first = engine.context_manager.adopt_orchestrator_workflow(PEER_ID, None, None, None)
