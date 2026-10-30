@@ -73,7 +73,7 @@ await GriptapeNodes.ahandle_request(
 
 - If your node knows its cost but has no token counts, send `declared_cost_micro_usd` (in millionths of a US dollar) instead. Send one or the other, never both.
 
-- The report is sent in the background and returns at once. It is retried briefly, then dropped with a line in the engine log.
+- The report is sent in the background and returns at once. It is retried briefly, then dropped with a line in the engine log. An engine that runs one workflow and exits, such as a node group run in its own process, waits up to 30 seconds for its reports before exiting, and logs any it could not send.
 
 - **Never fail a node over its report.** Ignore the result. A report with neither token counts nor a declared cost, or with both, comes back as a failure with the reason. Griptape Cloud checks everything else, such as the model or the cache counts, and a report it rejects is logged and dropped. Either way the node carries on.
 

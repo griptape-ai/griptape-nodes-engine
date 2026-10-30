@@ -70,6 +70,10 @@ SPEND_PATH = "/api/spend"
 CHECK_TIMEOUT_SECONDS = 5.0
 REPORT_TIMEOUT_SECONDS = 10.0
 REPORT_MAX_ATTEMPTS = 3
+# How long a one-off engine process waits for its queued reports before exiting, shared by all of
+# them. Sized to REPORT_MAX_ATTEMPTS request timeouts; reports still retrying when it runs out are
+# logged and lost.
+REPORT_FLUSH_TIMEOUT_SECONDS = REPORT_TIMEOUT_SECONDS * REPORT_MAX_ATTEMPTS
 
 # Cloud's length caps on the free-text descriptors. A value over its cap is left out rather than
 # sent, so one long name cannot get the whole report rejected.
@@ -119,9 +123,10 @@ class BudgetManager(EngineScoped):
             engine: The owning Engine, used to resolve peer managers.
         """
         super().__init__(engine)
-        # A daemon thread, so engine exit never waits on queued reports. Not an asyncio task: a
-        # sync `handle_request` runs the handler on a short-lived loop that would cancel it.
-        self._reports: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
+        # Not an asyncio task: a sync `handle_request` runs the handler on a short-lived loop that
+        # would cancel it. A daemon thread, so a long-running engine never hangs at exit; an engine
+        # process that runs one workflow and exits waits for its reports with `flush_reports`.
+        self._reports: queue.Queue[dict[str, Any]] = queue.Queue()
         threading.Thread(target=self._post_reports, name="budget-report", daemon=True).start()
         event_manager.register_request_handlers(self)
 
@@ -274,6 +279,28 @@ class BudgetManager(EngineScoped):
             result_details=f"Queued a usage report for {_describe_call(request.model)}.",
         )
 
+    def flush_reports(self, timeout: float = REPORT_FLUSH_TIMEOUT_SECONDS) -> int:
+        """Wait for queued usage reports to be sent or given up on, for at most `timeout` seconds.
+
+        For an engine process about to exit: the report thread is a daemon, so exiting with
+        reports still queued loses them, and Cloud never counts that spend. Returns how many
+        reports were still unsent when the wait ended, and logs them, so a short wait is visible.
+        """
+        all_done = self._reports.all_tasks_done
+        with all_done:
+            # unfinished_tasks counts reports queued and not yet sent or dropped; task_done in the
+            # report thread notifies all_done as each one finishes.
+            all_done.wait_for(lambda: self._reports.unfinished_tasks == 0, timeout=timeout)
+            unsent = self._reports.unfinished_tasks
+        if unsent:
+            logger.warning(
+                "Exiting with %s usage report(s) not yet sent to Griptape Cloud after waiting %ss; "
+                "that spend will not count against budgets.",
+                unsent,
+                timeout,
+            )
+        return unsent
+
     def _resolve_project_chain(self) -> list[str] | None:
         """Resolve the current project's ancestry as ids, leaf-first.
 
@@ -331,6 +358,8 @@ class BudgetManager(EngineScoped):
                 self._send_report(body)
             except Exception:
                 logger.exception("A usage report failed unexpectedly and was dropped.")
+            finally:
+                self._reports.task_done()
 
     def _send_report(self, body: dict[str, Any]) -> None:
         """Post a usage report with bounded retries; log and drop it if Cloud cannot take it."""
