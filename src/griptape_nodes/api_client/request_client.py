@@ -224,7 +224,7 @@ class RequestClient:
             await self.client.subscribe(worker_response_topic)
             self._subscribed_response_topics.add(worker_response_topic)
 
-        logger.debug("Forwarding request %s to orchestrator on %s", request_id, orchestrator_request_topic)
+        logger.debug("Forwarding request %s on %s", request_id, orchestrator_request_topic)
 
         try:
             await self.client.publish("EventRequest", payload_dict, orchestrator_request_topic)
