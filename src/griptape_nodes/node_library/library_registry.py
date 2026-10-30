@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, get_args
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -126,6 +126,12 @@ class ResourceRequirements(BaseModel):
         return converted
 
 
+# Derived from the union so adding or removing a declaration type cannot drift from this set.
+_KNOWN_LIBRARY_DECLARATION_TYPES = {
+    member.model_fields["type"].default for member in get_args(get_args(LibraryDeclaration)[0])
+}
+
+
 class LibraryMetadata(BaseModel):
     """Metadata that explains details about the library, including versioning and search details."""
 
@@ -142,6 +148,21 @@ class LibraryMetadata(BaseModel):
     # Declarative properties / capabilities for this library. Applies to all nodes in the library.
     # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[LibraryDeclaration] = Field(default_factory=list)
+
+    @field_validator("declarations", mode="before")
+    @classmethod
+    def _drop_unknown_declarations(cls, v: Any) -> Any:
+        """Drop declaration dicts whose `type` this engine does not define, so the library still loads.
+
+        A known `type` with a bad payload still reaches the discriminated union and raises.
+        """
+        if not isinstance(v, list):
+            return v
+        return [
+            entry
+            for entry in v
+            if not (isinstance(entry, dict) and entry.get("type") not in _KNOWN_LIBRARY_DECLARATION_TYPES)
+        ]
 
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:

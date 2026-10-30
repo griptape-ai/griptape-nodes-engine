@@ -19,10 +19,6 @@ from griptape_nodes.node_library.library_declarations import (
     ModelProvider,
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
-    SuggestedWorkerMode,
-    WorkerCompatibility,
-    WorkerMode,
-    WorkerModeCompatibility,
     iter_catalog_models,
     resolve_node_models,
 )
@@ -121,7 +117,44 @@ class TestDeclarationDiscriminator:
                 }
             )
 
-    def test_unknown_library_type_discriminator_is_rejected(self) -> None:
+    def test_unknown_library_type_discriminator_is_dropped(self) -> None:
+        # Unlike the node-level union above, an unknown library-level declaration is
+        # dropped rather than rejected: a manifest predating a removed declaration (or
+        # written for a future one) must keep loading.
+        metadata = LibraryMetadata.model_validate(
+            {
+                "author": "t",
+                "description": "t",
+                "library_version": "1.0.0",
+                "engine_version": "1.0.0",
+                "tags": [],
+                "declarations": [
+                    {"type": "not_a_real_type"},
+                    {"type": "lifecycle_stage", "stage": "STABLE"},
+                ],
+            }
+        )
+
+        assert len(metadata.declarations) == 1
+        assert isinstance(metadata.declarations[0], LifecycleStageLibraryProperty)
+
+    def test_unknown_library_type_with_bad_payload_is_still_dropped(self) -> None:
+        # Dropping is keyed on `type` alone -- an unrecognized type's payload is never
+        # inspected, since nothing will ever try to build it.
+        metadata = LibraryMetadata.model_validate(
+            {
+                "author": "t",
+                "description": "t",
+                "library_version": "1.0.0",
+                "engine_version": "1.0.0",
+                "tags": [],
+                "declarations": [{"type": "not_a_real_type", "whatever": object()}],
+            }
+        )
+
+        assert metadata.declarations == []
+
+    def test_known_library_type_with_bad_payload_still_raises(self) -> None:
         with pytest.raises(ValidationError):
             LibraryMetadata.model_validate(
                 {
@@ -130,7 +163,7 @@ class TestDeclarationDiscriminator:
                     "library_version": "1.0.0",
                     "engine_version": "1.0.0",
                     "tags": [],
-                    "declarations": [{"type": "not_a_real_type"}],
+                    "declarations": [{"type": "lifecycle_stage", "stage": "NOT_A_REAL_STAGE"}],
                 }
             )
 
@@ -224,101 +257,17 @@ class TestArbitraryPythonExecutionNodeProperty:
         assert decl.executes_arbitrary_python is True
 
 
-# ---------- WorkerModeCompatibility ----------
+# ---------- Removed worker-mode declarations ----------
 
 
-class TestWorkerModeCompatibility:
-    @pytest.mark.parametrize("compatibility", list(WorkerCompatibility))
-    def test_round_trips_each_value(self, compatibility: WorkerCompatibility) -> None:
-        decl = WorkerModeCompatibility(compatibility=compatibility)
+class TestRemovedWorkerModeDeclarationsAreDropped:
+    """Manifests written against the removed worker-mode declarations still load.
 
-        rebuilt = WorkerModeCompatibility.model_validate(json.loads(decl.model_dump_json()))
-
-        assert rebuilt.compatibility is compatibility
-
-    def test_compatibility_is_required(self) -> None:
-        # Single-value declarations require their value to be set explicitly;
-        # absence of the entire declaration is the only meaningful "default."
-        with pytest.raises(ValidationError):
-            WorkerModeCompatibility()  # type: ignore[call-arg]
-
-    def test_rejects_unknown_compatibility_value(self) -> None:
-        with pytest.raises(ValidationError):
-            WorkerModeCompatibility.model_validate(
-                {"type": "worker_mode_compatibility", "compatibility": "BOGUS"},
-            )
-
-    def test_library_metadata_round_trips_declaration(self) -> None:
-        metadata = _make_library_metadata(
-            declarations=[WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE)],
-        )
-
-        rebuilt = LibraryMetadata.model_validate(metadata.model_dump())
-
-        decl = rebuilt.declarations[0]
-        assert isinstance(decl, WorkerModeCompatibility)
-        assert decl.compatibility is WorkerCompatibility.INCOMPATIBLE
-
-
-# ---------- SuggestedWorkerMode ----------
-
-
-class TestSuggestedWorkerMode:
-    @pytest.mark.parametrize("mode", list(WorkerMode))
-    def test_round_trips_each_value(self, mode: WorkerMode) -> None:
-        decl = SuggestedWorkerMode(mode=mode)
-
-        rebuilt = SuggestedWorkerMode.model_validate(json.loads(decl.model_dump_json()))
-
-        assert rebuilt.mode is mode
-
-    def test_mode_is_required(self) -> None:
-        with pytest.raises(ValidationError):
-            SuggestedWorkerMode()  # type: ignore[call-arg]
-
-    def test_rejects_unknown_mode_value(self) -> None:
-        with pytest.raises(ValidationError):
-            SuggestedWorkerMode.model_validate({"type": "suggested_worker_mode", "mode": "BOGUS"})
-
-    def test_library_metadata_round_trips_declaration(self) -> None:
-        metadata = _make_library_metadata(
-            declarations=[SuggestedWorkerMode(mode=WorkerMode.WORKER)],
-        )
-
-        rebuilt = LibraryMetadata.model_validate(metadata.model_dump())
-
-        decl = rebuilt.declarations[0]
-        assert isinstance(decl, SuggestedWorkerMode)
-        assert decl.mode is WorkerMode.WORKER
-
-
-# ---------- LibraryMetadata worker declaration pairs ----------
-
-
-class TestLibraryMetadataWorkerDeclarations:
-    """Every pairing of the two worker declarations parses.
-
-    Neither one decides where a library's nodes execute any more, so there is no
-    contradiction left for a cross-declaration validator to reject. A manifest written
-    against either rule must keep loading.
+    `worker_mode_compatibility` and `suggested_worker_mode` no longer have Python
+    classes; a manifest carrying either loses the entries and keeps everything else.
     """
 
-    def test_allows_incompatible_with_suggested_worker(self) -> None:
-        # Once rejected as self-contradictory. Both declarations are inert now, so the
-        # pairing has to parse rather than fail the library.
-        metadata = _make_library_metadata(
-            declarations=[
-                WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE),
-                SuggestedWorkerMode(mode=WorkerMode.WORKER),
-            ],
-        )
-
-        assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
-        assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
-
-    def test_the_same_pairing_parses_from_the_wire(self) -> None:
-        # ``model_validate`` is the wire-format entry point, and a manifest on disk
-        # arrives through it rather than through the constructor.
+    def test_both_removed_declarations_are_dropped_alongside_a_valid_one(self) -> None:
         metadata = LibraryMetadata.model_validate(
             {
                 "author": "t",
@@ -327,36 +276,16 @@ class TestLibraryMetadataWorkerDeclarations:
                 "engine_version": "1.0.0",
                 "tags": [],
                 "declarations": [
-                    {"type": "worker_mode_compatibility", "compatibility": "INCOMPATIBLE"},
                     {"type": "suggested_worker_mode", "mode": "WORKER"},
+                    {"type": "worker_mode_compatibility", "compatibility": "INCOMPATIBLE"},
+                    {"type": "lifecycle_stage", "stage": "STABLE"},
                 ],
             }
         )
 
-        assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
-        assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
-
-    def test_allows_incompatible_with_suggested_orchestrator(self) -> None:
-        metadata = _make_library_metadata(
-            declarations=[
-                WorkerModeCompatibility(compatibility=WorkerCompatibility.INCOMPATIBLE),
-                SuggestedWorkerMode(mode=WorkerMode.ORCHESTRATOR),
-            ],
-        )
-
-        assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
-        assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
-
-    def test_allows_compatible_with_either_suggested_mode(self) -> None:
-        for suggested in (WorkerMode.ORCHESTRATOR, WorkerMode.WORKER):
-            metadata = _make_library_metadata(
-                declarations=[
-                    WorkerModeCompatibility(compatibility=WorkerCompatibility.COMPATIBLE),
-                    SuggestedWorkerMode(mode=suggested),
-                ],
-            )
-            assert isinstance(metadata.declarations[0], WorkerModeCompatibility)
-            assert isinstance(metadata.declarations[1], SuggestedWorkerMode)
+        assert len(metadata.declarations) == 1
+        assert isinstance(metadata.declarations[0], LifecycleStageLibraryProperty)
+        assert metadata.declarations[0].stage is LifecycleStage.STABLE
 
 
 # ---------- Schema version ----------

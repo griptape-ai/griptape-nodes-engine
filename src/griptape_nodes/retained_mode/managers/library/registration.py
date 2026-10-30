@@ -361,12 +361,6 @@ class LibraryRegistrar(EngineScoped):
 
                 # Update or create LibraryInfo
                 executes_in_worker = resolve_executes_in_worker(metadata=metadata_result.library_schema.metadata)
-                self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
-                    library_name=library_name,
-                    registered_path=lib_info.registered_path if lib_info else None,
-                    declarations=metadata_result.library_schema.metadata.declarations,
-                    executes_in_worker=executes_in_worker,
-                )
                 if lib_info:
                     lib_info.library_name = library_name
                     lib_info.library_version = metadata_result.library_schema.metadata.library_version
@@ -500,12 +494,6 @@ class LibraryRegistrar(EngineScoped):
                     library_info.library_version = metadata_result.library_schema.metadata.library_version
                     library_info.executes_in_worker = resolve_executes_in_worker(
                         metadata=metadata_result.library_schema.metadata,
-                    )
-                    self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
-                        library_name=metadata_result.library_schema.name,
-                        registered_path=library_info.registered_path,
-                        declarations=metadata_result.library_schema.metadata.declarations,
-                        executes_in_worker=library_info.executes_in_worker,
                     )
                     library_info.lifecycle_state = LibraryLifecycleState.METADATA_LOADED
 

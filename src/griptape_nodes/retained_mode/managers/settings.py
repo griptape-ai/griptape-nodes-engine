@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, Valida
 from pydantic import Field as PydanticField
 
 from griptape_nodes.common.project_templates import PerPlatformProjectPath
-from griptape_nodes.node_library.library_declarations import WorkerMode
 from griptape_nodes.retained_mode.beta_features import BETA_FEATURES_KEY, LIBRARY_BETA_FEATURES_KEY
 
 LIBRARIES_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.libraries_to_register"
@@ -250,19 +249,14 @@ class LibraryRegistration(BaseModel):
     version-pinned remote sources are declared separately in `libraries_to_download`.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # Entries written by another engine version can carry keys this one does not define;
+    # ignoring them keeps the library registering.
+    model_config = ConfigDict(extra="ignore")
 
     path: str = Field(description="Path to a griptape_nodes_library.json file or a directory scanned recursively.")
     enabled: bool = Field(
         default=True,
         description="When False, the library remains in config but is not loaded on startup.",
-    )
-    worker_mode_override: WorkerMode | None = Field(
-        default=None,
-        description=(
-            "Accepted for backward compatibility; no longer affects where a library runs. "
-            "A library's nodes execute in a worker when it declares pip_dependencies_exec."
-        ),
     )
 
 

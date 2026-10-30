@@ -109,10 +109,9 @@ The schema:
 [`Dependencies`](https://github.com/griptape-ai/griptape-nodes/blob/main/src/griptape_nodes/node_library/library_registry.py)
 in `library_registry.py`.
 
-The older `worker_mode_compatibility` and `suggested_worker_mode`
-declarations still parse, so no manifest in the wild fails to load, but
-neither one affects where a library's nodes execute. Remove them when
-convenient.
+A manifest still carrying the older `worker_mode_compatibility` or
+`suggested_worker_mode` declarations keeps loading; the engine ignores
+them. Remove them when convenient.
 
 ## What the orchestrator still does for your library
 

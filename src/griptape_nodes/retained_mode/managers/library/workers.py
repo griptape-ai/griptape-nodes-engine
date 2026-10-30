@@ -4,10 +4,6 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from griptape_nodes.node_library.library_declarations import (
-    SuggestedWorkerMode,
-    WorkerMode,
-)
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -24,17 +20,11 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     IncompatibleRequirementsProblem,
 )
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
-from griptape_nodes.retained_mode.managers.settings import (
-    LIBRARIES_TO_REGISTER_KEY,
-    LibraryRegistration,
-)
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.utils.library_utils import extract_library_path
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable
 
-    from griptape_nodes.node_library.library_declarations import LibraryDeclaration
     from griptape_nodes.node_library.library_registry import LibraryMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -145,72 +135,6 @@ class LibraryWorkers(EngineScoped):
                 f"the orchestrator keeps its own fitness verdict."
             )
         )
-
-    def log_legacy_worker_mode_advisory(
-        self,
-        *,
-        library_name: str,
-        registered_path: str | None,
-        declarations: Sequence[LibraryDeclaration],
-        executes_in_worker: bool,
-    ) -> None:
-        """Note that a legacy worker-mode request no longer routes this library to a worker.
-
-        INFO rather than a warning: the library loads and runs correctly, so there is
-        nothing for the author to chase unless its dependencies genuinely conflict. Called
-        wherever a record first reaches METADATA_LOADED, so it is one line per library per
-        load rather than one per registration attempt.
-
-        Silent on a worker, which discovers every configured library and would otherwise
-        repeat the advice once per worker while being the process already executing those
-        nodes. Silent too once the library declares execution dependencies, so taking the
-        advice is what stops it rather than deleting a declaration the engine still accepts.
-
-        An explicit `worker_mode_override: ORCHESTRATOR` outranked the manifest under legacy
-        worker mode too, so that library already ran in-process and nothing about it changed.
-        """
-        if executes_in_worker or self.engine.library_manager.is_worker:
-            return
-        config_override = self._config_worker_mode_override(registered_path)
-        if config_override is WorkerMode.ORCHESTRATOR:
-            return
-        declares_worker = any(
-            isinstance(declaration, SuggestedWorkerMode) and declaration.mode is WorkerMode.WORKER
-            for declaration in declarations
-        )
-        if not declares_worker and config_override is not WorkerMode.WORKER:
-            return
-        logger.info(
-            "Library '%s' asks for a dedicated worker process (legacy worker mode). Where a library's nodes "
-            "execute is now decided by its dependencies: declare pip_dependencies_exec to run them in a "
-            "worker, which isolates those packages rather than the whole library.",
-            library_name,
-        )
-
-    def _config_worker_mode_override(self, registered_path: str | None) -> WorkerMode | None:
-        """This library's `worker_mode_override` from `libraries_to_register`, if it sets one.
-
-        Keyed by the user's verbatim path, mirroring how `enabled` is read, because the
-        engine's path resolution can diverge between sides (workspace-relative,
-        `~`-expansion, symlink-following).
-        """
-        if not registered_path:
-            return None
-        entries = self.engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY) or []
-        target_path_lower = registered_path.lower()
-        for entry in entries:
-            entry_path = extract_library_path(entry)
-            if not entry_path or entry_path.lower() != target_path_lower:
-                continue
-            if isinstance(entry, LibraryRegistration):
-                return entry.worker_mode_override
-            if isinstance(entry, dict):
-                # Compared rather than constructed: this runs on the registration path, and an
-                # unrecognized value must not be what stops a library from loading.
-                override = entry.get("worker_mode_override")
-                return next((mode for mode in WorkerMode if override == mode), None)
-            return None
-        return None
 
     def get_worker_for_library(self, library_name: str | None) -> tuple[str, str] | None:
         """Return (worker_engine_id, worker_request_topic) for the worker serving library_name, or None.

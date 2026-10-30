@@ -34,10 +34,9 @@ resolved over both sets. A node module must stay importable without the executio
 those packages inside `process`. See
 [How to declare execution dependencies](docs/development/custom_nodes/node_isolation_with_workers.md#how-to-declare-execution-dependencies).
 
-`WorkerModeCompatibility`, `SuggestedWorkerMode`, and the `worker_mode_override` key in
-`libraries_to_register` still parse, so neither old manifests nor old config files fail to load.
-They have no effect. While a library still asks for a worker and declares no
-`pip_dependencies_exec`, loading it logs one INFO line saying so.
+The `WorkerModeCompatibility` and `SuggestedWorkerMode` Python classes are removed, and so is
+`worker_mode_override` on `LibraryRegistration`. A manifest or config file written against any of
+them still loads: the keys are ignored, and nothing is logged.
 
 **Also removed:**
 

@@ -65,23 +65,6 @@ class KeySupport(StrEnum):
     NO_KEY_REQUIRED = "NO_KEY_REQUIRED"
 
 
-class WorkerCompatibility(StrEnum):
-    """Accepted for backward compatibility; no longer affects where a library runs."""
-
-    COMPATIBLE = "COMPATIBLE"
-    INCOMPATIBLE = "INCOMPATIBLE"
-
-
-class WorkerMode(StrEnum):
-    """Accepted for backward compatibility; no longer affects where a library runs.
-
-    Still the type of ``LibraryRegistration.worker_mode_override``.
-    """
-
-    ORCHESTRATOR = "ORCHESTRATOR"
-    WORKER = "WORKER"
-
-
 # ---------- Library-level declarations ----------
 
 
@@ -94,29 +77,6 @@ class LifecycleStageLibraryProperty(BaseModel):
 
     type: Literal["lifecycle_stage"] = "lifecycle_stage"
     stage: LifecycleStage
-
-
-class WorkerModeCompatibility(BaseModel):
-    """Accepted for backward compatibility; no longer affects where a library runs.
-
-    A library's nodes execute in a worker when it declares
-    ``pip_dependencies_exec``.
-    """
-
-    type: Literal["worker_mode_compatibility"] = "worker_mode_compatibility"
-    compatibility: WorkerCompatibility
-
-
-class SuggestedWorkerMode(BaseModel):
-    """Accepted for backward compatibility; no longer affects where a library runs.
-
-    A library's nodes execute in a worker when it declares
-    ``pip_dependencies_exec``. A manifest declaring ``mode=WORKER`` loads and
-    runs in-process, and says so once at load time.
-    """
-
-    type: Literal["suggested_worker_mode"] = "suggested_worker_mode"
-    mode: WorkerMode
 
 
 # ---------- Model catalog (provider -> model) ----------
@@ -216,14 +176,12 @@ class LibraryDependencyDeclaration(BaseModel):
 #   - `Field(discriminator="type")` tells Pydantic: "look at the `type` attribute of each
 #     incoming dict to decide which class to build." Each union member must have a
 #     `type: Literal[...]` attribute with a distinct string. Unknown `type` values raise
-#     ValidationError (strict validation).
+#     ValidationError (strict validation) when validated directly against this union.
+#     `LibraryMetadata.declarations` instead drops entries with an unknown `type` before
+#     this validation runs, so a manifest written against a future declaration still loads.
 # This is the canonical Pydantic v2 way to round-trip "one of several shapes" through JSON.
 LibraryDeclaration = Annotated[
-    LifecycleStageLibraryProperty
-    | WorkerModeCompatibility
-    | SuggestedWorkerMode
-    | ModelCatalogLibraryProperty
-    | LibraryDependencyDeclaration,
+    LifecycleStageLibraryProperty | ModelCatalogLibraryProperty | LibraryDependencyDeclaration,
     Field(discriminator="type"),
 ]
 

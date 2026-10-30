@@ -24,15 +24,15 @@ class TestLibraryRegistration:
 
         assert config.libraries_to_register == ["griptape_nodes_library.json"]
 
-    def test_path_with_worker_mode_override_is_valid(self) -> None:
-        """A config in the wild still carries this key, and `extra="forbid"` would reject an unknown one.
-
-        It no longer decides anything; the field exists so the entry parses.
-        """
-        registration = LibraryRegistration.model_validate({"path": "../shared/lib", "worker_mode_override": "WORKER"})
+    @pytest.mark.parametrize("worker_mode_override", ["WORKER", None])
+    def test_path_with_removed_worker_mode_override_is_valid(self, worker_mode_override: str | None) -> None:
+        """A config in the wild still carries this key; `extra="ignore"` drops it instead of rejecting the entry."""
+        registration = LibraryRegistration.model_validate(
+            {"path": "../shared/lib", "worker_mode_override": worker_mode_override}
+        )
 
         assert registration.path == "../shared/lib"
-        assert registration.worker_mode_override == "WORKER"
+        assert not hasattr(registration, "worker_mode_override")
 
     def test_git_fields_are_rejected(self) -> None:
         # git_url/version/name moved to LibraryDownload; extra="forbid" now rejects them here.

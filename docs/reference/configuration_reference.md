@@ -163,11 +163,10 @@ A library entry in libraries_to_download that the engine provisions to a version
 
 A library entry in libraries_to_register with optional metadata.
 
-| Field                  | Type                            | Default  | Description                                                                                                                                                |
-| ---------------------- | ------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `path`                 | string                          | required | Path to a griptape_nodes_library.json file or a directory scanned recursively.                                                                             |
-| `enabled`              | boolean                         | `true`   | When False, the library remains in config but is not loaded on startup.                                                                                    |
-| `worker_mode_override` | one of `ORCHESTRATOR`, `WORKER` | `null`   | Accepted for backward compatibility; no longer affects where a library runs. A library's nodes execute in a worker when it declares pip_dependencies_exec. |
+| Field     | Type    | Default  | Description                                                                    |
+| --------- | ------- | -------- | ------------------------------------------------------------------------------ |
+| `path`    | string  | required | Path to a griptape_nodes_library.json file or a directory scanned recursively. |
+| `enabled` | boolean | `true`   | When False, the library remains in config but is not loaded on startup.        |
 
 ### PerPlatformProjectPath
 

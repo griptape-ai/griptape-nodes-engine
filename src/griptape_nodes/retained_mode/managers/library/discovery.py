@@ -801,13 +801,6 @@ class LibraryDiscovery(EngineScoped):
             library_version = metadata_result.library_schema.metadata.library_version
             executes_in_worker = resolve_executes_in_worker(metadata=metadata_result.library_schema.metadata)
             lifecycle_state = LibraryLifecycleState.METADATA_LOADED
-            if enabled:
-                self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
-                    library_name=library_name,
-                    registered_path=registered_path,
-                    declarations=metadata_result.library_schema.metadata.declarations,
-                    executes_in_worker=executes_in_worker,
-                )
 
         if not enabled:
             lifecycle_state = LibraryLifecycleState.DISABLED
