@@ -3,8 +3,8 @@
 These cover two concerns without spinning up a real MCP server:
 
 * config -> transport mapping in :func:`mcp_server_from_config`, and
-* the combinator composition (optional blocklist filter -> name prefix ->
-  approval gate) in :func:`_compose`.
+* the combinator composition (optional blocklist filter -> name prefix) in
+  :func:`_compose`, and which builders add the approval gate on top.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from griptape_nodes.agents.pydantic_ai.mcp_servers import (
     _compose,
     disconnect_transport,
     mcp_server_from_config,
+    require_user_tool_approval,
     streamable_http_local,
 )
 
@@ -132,30 +133,19 @@ def test_default_transport_is_stdio() -> None:
     assert isinstance(_built("svc", {"command": "run"}).transport, StdioTransport)
 
 
-def _always(_ctx: Any, _tool_def: Any, _tool_args: Any) -> bool:
-    return True
-
-
-def test_compose_applies_name_prefix_under_the_approval_gate() -> None:
-    """`_compose` exposes tools under the server name prefix, gated on the prefixed names."""
-    composed = _compose(
-        "Svc", MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3), requires_approval=_always
-    )
-    assert isinstance(composed, ApprovalRequiredToolset)
-    assert composed.approval_required_func is _always
-    assert isinstance(composed.wrapped, PrefixedToolset)
-    assert composed.wrapped.prefix == "Svc"
-    assert isinstance(composed.wrapped.wrapped, MCPToolset)
+def test_compose_applies_name_prefix() -> None:
+    """`_compose` exposes tools under the server name prefix."""
+    composed = _compose("Svc", MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3))
+    assert isinstance(composed, PrefixedToolset)
+    assert composed.prefix == "Svc"
+    assert isinstance(composed.wrapped, MCPToolset)
 
 
 def test_compose_without_blocklist_skips_filter() -> None:
     """No blocklist means no filter layer is inserted."""
-    composed = _compose(
-        "Svc", MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3), requires_approval=_always
-    )
-    assert isinstance(composed, ApprovalRequiredToolset)
-    assert isinstance(composed.wrapped, PrefixedToolset)
-    assert not isinstance(composed.wrapped.wrapped, FilteredToolset)
+    composed = _compose("Svc", MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3))
+    assert isinstance(composed, PrefixedToolset)
+    assert not isinstance(composed.wrapped, FilteredToolset)
 
 
 def test_compose_with_blocklist_inserts_filter_under_prefix() -> None:
@@ -163,13 +153,11 @@ def test_compose_with_blocklist_inserts_filter_under_prefix() -> None:
     composed = _compose(
         "Svc",
         MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3),
-        requires_approval=_always,
         tool_blocklist=frozenset({"danger"}),
     )
-    assert isinstance(composed, ApprovalRequiredToolset)
-    assert isinstance(composed.wrapped, PrefixedToolset)
-    assert isinstance(composed.wrapped.wrapped, FilteredToolset)
-    assert isinstance(composed.wrapped.wrapped.wrapped, MCPToolset)
+    assert isinstance(composed, PrefixedToolset)
+    assert isinstance(composed.wrapped, FilteredToolset)
+    assert isinstance(composed.wrapped.wrapped, MCPToolset)
 
 
 def test_empty_blocklist_is_not_applied() -> None:
@@ -177,16 +165,37 @@ def test_empty_blocklist_is_not_applied() -> None:
     composed = _compose(
         "Svc",
         MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3),
-        requires_approval=_always,
         tool_blocklist=frozenset(),
     )
-    assert isinstance(composed, ApprovalRequiredToolset)
-    assert isinstance(composed.wrapped, PrefixedToolset)
-    assert not isinstance(composed.wrapped.wrapped, FilteredToolset)
+    assert isinstance(composed, PrefixedToolset)
+    assert not isinstance(composed.wrapped, FilteredToolset)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"transport": "stdio", "command": "run"},
+        {"transport": "streamable_http", "url": "http://h/mcp/"},
+        {"transport": "sse", "url": "http://h/sse"},
+    ],
+)
+def test_a_server_built_from_config_has_no_approval_gate(config: dict[str, Any]) -> None:
+    """Node libraries build agents from this, and a node run carries no approval state to gate on."""
+    toolset = _built("svc", config).toolset
+    assert isinstance(toolset, PrefixedToolset)
+    assert not isinstance(toolset, ApprovalRequiredToolset)
+
+
+def test_require_user_tool_approval_gates_on_the_prefixed_toolset() -> None:
+    """The sidebar's gate goes on top of the prefix, where grant keys are built from."""
+    built = _built("svc", {"transport": "stdio", "command": "run"})
+    gated = require_user_tool_approval(built.toolset)
+    assert isinstance(gated, ApprovalRequiredToolset)
+    assert gated.wrapped is built.toolset
 
 
 def test_streamable_http_local_prefixes_with_default_name() -> None:
-    """The engine's own server uses the `GriptapeNodes` prefix over streamable HTTP."""
+    """The engine's own server uses the `GriptapeNodes` prefix over streamable HTTP, gated."""
     composed = streamable_http_local("http://localhost:9/mcp/")
     assert isinstance(composed, ApprovalRequiredToolset)
     assert isinstance(composed.wrapped, PrefixedToolset)

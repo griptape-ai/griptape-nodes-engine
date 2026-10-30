@@ -176,6 +176,18 @@ changes none of your tool's, so your tool decides what the worker's environment 
 Keep the prefix free of quoted arguments if Windows machines use it: some shells on Windows drop
 double quotes inside arguments.
 
+## Adding import folders without shadowing the engine
+
+Python searches `PYTHONPATH` folders before the engine's own packages, so a different copy of a
+package the engine uses, such as `pydantic`, can stop the engine from starting. To make modules
+importable from nodes without that risk, list their folders in `GTN_APPEND_PYTHONPATH` instead.
+The engine adds them to the end of the search path, after its own packages and each library's.
+Separate folders the way your system separates `PATH` entries:
+
+```bash
+export GTN_APPEND_PYTHONPATH="/opt/pipeline/python:/opt/tools/python"
+```
+
 ## Example launcher
 
 A launcher only needs to set the variables and start the engine inside the prepared environment:

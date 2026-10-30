@@ -353,12 +353,17 @@ class LibraryRegistry:
         del cls._libraries[library_name]
 
     @classmethod
-    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:
+    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:  # noqa: C901
         """Remove everything the engine registered on the library's behalf at load time."""
         if library._registered_app_event_listeners:
             for event_type, listener in library._registered_app_event_listeners:
                 event_manager.remove_listener_for_app_event(event_type, listener)
             library._registered_app_event_listeners.clear()
+
+        if library._registered_execution_event_listeners:
+            for event_type, listener in library._registered_execution_event_listeners:
+                event_manager.remove_listener_for_execution_event(event_type, listener)
+            library._registered_execution_event_listeners.clear()
 
         if library._registered_pre_dispatch_hooks:
             for hook in library._registered_pre_dispatch_hooks:
@@ -611,6 +616,7 @@ class Library:
     # Tracks handlers registered on behalf of this library so they can be
     # deregistered automatically when the library is unloaded.
     _registered_app_event_listeners: list[tuple[type, Callable]]
+    _registered_execution_event_listeners: list[tuple[type, Callable]]
     _registered_pre_dispatch_hooks: list[Callable]
     _registered_post_dispatch_hooks: list[tuple[type, Callable]]
     _registered_request_handler_types: list[type]
@@ -635,6 +641,7 @@ class Library:
         self._beta_features = None
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
+        self._registered_execution_event_listeners = []
         self._registered_pre_dispatch_hooks = []
         self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
@@ -649,6 +656,9 @@ class Library:
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)
+
+    def get_registered_execution_event_listeners(self) -> list[tuple[type, Callable]]:
+        return list(self._registered_execution_event_listeners)
 
     def get_registered_pre_dispatch_hooks(self) -> list[Callable]:
         return list(self._registered_pre_dispatch_hooks)

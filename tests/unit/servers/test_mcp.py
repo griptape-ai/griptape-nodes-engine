@@ -283,6 +283,15 @@ class TestListTools:
         assert "ValidateFlowDependenciesRequest" in names
 
     @pytest.mark.asyncio
+    async def test_list_node_types_tool_offers_optional_include_metadata(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        tools_by_name = {tool.name: tool for tool in result.tools}
+        list_tool = tools_by_name["ListNodeTypesInLibraryRequest"]
+        assert "include_metadata" in list_tool.input_schema["properties"]
+        assert "include_metadata" not in list_tool.input_schema.get("required", [])
+
+    @pytest.mark.asyncio
     async def test_every_tool_carries_an_object_input_schema(self) -> None:
         result = await list_tools(_NO_CONTEXT, None)
 

@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import inspect
 import logging
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
 from asyncio_thread_runner import ThreadRunner
 from typing_extensions import TypedDict, TypeVar
 
+from griptape_nodes.common.strict_mode import STRICT_MODE
+from griptape_nodes.common.strict_mode_checks import RULES
+from griptape_nodes.exe_types.node_loading import loading_node_name
 from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
@@ -24,8 +28,10 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     ExecutionGriptapeNodeEvent,
     ExecutionPayload,
+    GraphAccessMixin,
     ProgressEvent,
     RequestPayload,
+    RequestSender,
     ResultDetails,
     ResultPayload,
     StrictModeViolationDetail,
@@ -37,12 +43,18 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointFailure,
 )
-from griptape_nodes.retained_mode.request_handlers import handled_request_types
+from griptape_nodes.retained_mode.request_handlers import (
+    RequiredSender,
+    SenderRule,
+    handled_request_types,
+    sender_rules,
+)
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
     import types
     from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Set as AbstractSet
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
@@ -61,10 +73,19 @@ _active_request_type: ContextVar[type[RequestPayload] | None] = ContextVar(
     "_event_manager_active_request_type", default=None
 )
 
-# The node the current logical chain is rebuilding from the values it was sent, if any. Per chain rather
-# than process-wide, unlike the node-execution refcount: another node's aprocess can run in this
-# process at the same time, and its requests are not part of the rebuild.
-_hydrating_node_name: ContextVar[str | None] = ContextVar("_event_manager_hydrating_node_name", default=None)
+_active_request_sender: ContextVar[RequestSender | None] = ContextVar(
+    "_event_manager_active_request_sender", default=None
+)
+
+_active_request_id: ContextVar[str | None] = ContextVar("_event_manager_active_request_id", default=None)
+
+# The node the current logical chain is rebuilding as a worker's copy, if any. Per chain rather than
+# process-wide, unlike the node-execution refcount: another node's aprocess can run in this process at the
+# same time, and its requests still go to the orchestrator while this chain's are answered here.
+_rebuilding_node_name: ContextVar[str | None] = ContextVar("_event_manager_rebuilding_node_name", default=None)
+
+# The fields a request names a node in.
+_NODE_NAME_FIELDS = ("node_name", "source_node_name", "target_node_name")
 
 # (request_type, callback) pairs for the post-dispatch hooks running above this point
 # in the current logical chain. A hook task is created with this marker set, and every
@@ -158,6 +179,30 @@ def current_request_type() -> type[RequestPayload] | None:
     return _active_request_type.get()
 
 
+def current_request_sender() -> RequestSender | None:
+    """Return the engine that sent the request being dispatched on this task, or None if no other engine did."""
+    return _active_request_sender.get()
+
+
+def current_request_id() -> str | None:
+    """Return the id the client gave the request being dispatched on this task, or None if it gave none."""
+    return _active_request_id.get()
+
+
+def require_request_sender() -> RequestSender:
+    """Return the engine that sent the request being dispatched, in a handler marked to require one.
+
+    Raises:
+        RuntimeError: No other engine sent the request, so the handler was not marked with
+            `@handles(..., sender=...)`.
+    """
+    sender = _active_request_sender.get()
+    if sender is None:
+        msg = "require_request_sender() was called for a request no other engine sent; mark its handler with @handles(..., sender=...)."
+        raise RuntimeError(msg)
+    return sender
+
+
 # Result types that should NOT trigger a flush request.
 #
 # Add result types to this set if they should never trigger a flush (typically because they ARE
@@ -176,6 +221,40 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 class ResultContext(TypedDict, total=False):
     response_topic: str | None
     request_id: str | None
+    sender: RequestSender | None
+
+
+@dataclass(frozen=True)
+class _AssignedSenderRule:
+    """A request type's `SenderRule`, with its owner lookup bound to the manager that handles it."""
+
+    required: RequiredSender
+    owner: Callable[[RequestPayload, RequestSender], str | None] | None
+
+
+def _why_local_request_is_refused(rule: _AssignedSenderRule | None) -> str | None:
+    """Why a request no other engine sent must not run its handler, or None if it may."""
+    if rule is None:
+        return None
+    if rule.required is RequiredSender.SESSION:
+        return "it did not come from another engine's session"
+    return "it did not come from another engine"
+
+
+def _why_engine_request_is_refused(
+    rule: _AssignedSenderRule | None, request: RequestPayload, sender: RequestSender
+) -> str | None:
+    """Why a request another engine sent must not run its handler, or None if it may."""
+    if rule is None:
+        return "another engine may not send it"
+    if rule.required is RequiredSender.SESSION and sender.session_id is None:
+        return "it did not come from one of that engine's sessions"
+    owner_id = None
+    if rule.owner is not None:
+        owner_id = rule.owner(request, sender)
+    if owner_id is None or owner_id == sender.engine_id:
+        return None
+    return f"what it names belongs to engine {owner_id}"
 
 
 class EventManager(EngineScoped):
@@ -183,8 +262,14 @@ class EventManager(EngineScoped):
         super().__init__(engine)
         # Dictionary to store the SPECIFIC manager for each request type
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
+        # The request types another engine may send, and which engines. Any other is refused. See `@handles`.
+        self._sender_rules: dict[type[RequestPayload], _AssignedSenderRule] = {}
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
+        # Libraries subscribe while they load, which runs in asyncio.to_thread, while a broadcast
+        # may be iterating a set on the loop's thread, so guard the dict and snapshot a set before
+        # iterating.
+        self._app_event_listeners_lock = threading.Lock()
         # Dictionary to store ALL SUBSCRIBERS to execution events (the live feed of
         # ExecutionPayloads emitted during a run, e.g. AgentStreamEvent). Lets a node
         # tap the feed while it runs and react (e.g. stream tokens to a parameter).
@@ -271,13 +356,19 @@ class EventManager(EngineScoped):
         attribute depending on the wrapper: request results expose it as ``result``, execution
         events as ``payload``, and both may arrive already wrapped in a ``GriptapeNodeEvent``.
 
+        Matching is by ``isinstance``, so a set may name a base class such as ``ResultPayload``.
+
         Suppression is scoped to the current context; see ``_suppressed_event_types``.
         """
         suppressed_types = _suppressed_event_types.get()
         if not suppressed_types:
             return False
 
-        return any(type(candidate) in suppressed_types for candidate in _suppression_candidates(event))
+        return any(
+            isinstance(candidate, suppressed_type)
+            for candidate in _suppression_candidates(event)
+            for suppressed_type in suppressed_types
+        )
 
     def clear_event_suppression(self) -> None:
         """Drop any suppression the current context has in effect.
@@ -337,6 +428,15 @@ class EventManager(EngineScoped):
         """
         if self._event_queue is None:
             return
+        # A worker building or discarding its copy of a node changes only its own graph, which no client
+        # knows about; publishing that would show clients flows and nodes that don't exist for them.
+        if _rebuilding_node_name.get() is not None:
+            return
+
+        # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
+        if self.should_suppress_event(event):
+            self._dispatch_to_execution_listeners(event)
+            return
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -360,6 +460,15 @@ class EventManager(EngineScoped):
             event: The event to publish to the queue
         """
         if self._event_queue is None:
+            return
+        # A worker building or discarding its copy of a node changes only its own graph, which no client
+        # knows about; publishing that would show clients flows and nodes that don't exist for them.
+        if _rebuilding_node_name.get() is not None:
+            return
+
+        # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
+        if self.should_suppress_event(event):
+            self._dispatch_to_execution_listeners(event)
             return
 
         if self._is_cross_thread_call() and self._event_loop is not None:
@@ -803,30 +912,52 @@ class EventManager(EngineScoped):
         self,
         request_type: type[RP],
         callback: Callable[[RP], ResultPayload] | Callable[[RP], Awaitable[ResultPayload]],
+        *,
+        sender: RequiredSender | None = None,
+        owner: Callable[[RP, RequestSender], str | None] | None = None,
     ) -> None:
         """Assign a manager to handle a request.
 
         Args:
             request_type: The type of request to assign the manager to
             callback: Function to be called when event occurs
+            sender: Which other engines may send the request, or None for none: only local clients.
+            owner: Given the request and its sender, the one engine allowed to send it, or None when
+                the request names nothing an engine owns. Only with `sender`.
         """
         existing_manager = self._request_type_to_manager.get(request_type)
         if existing_manager is not None:
             msg = f"Attempted to assign an event of type {request_type} to manager {callback.__name__}, but that request is already assigned to manager {existing_manager.__name__}."
             raise ValueError(msg)
         self._request_type_to_manager[request_type] = callback
+        if sender is not None:
+            self._sender_rules[request_type] = _AssignedSenderRule(
+                required=sender,
+                owner=cast("Callable[[RequestPayload, RequestSender], str | None] | None", owner),
+            )
 
     def register_request_handlers(self, owner: object) -> None:
         """Assign each `@handles` method on `owner`. An unmarked override keeps its parent's marks."""
         marks: dict[str, tuple[type[RequestPayload], ...]] = {}
+        rules: dict[str, dict[type[RequestPayload], SenderRule]] = {}
         for klass in reversed(type(owner).__mro__):
             for name, attr in vars(klass).items():
                 request_types = handled_request_types(attr)
                 if request_types:
                     marks[name] = request_types
+                    rules[name] = sender_rules(attr)
         for name, request_types in marks.items():
             for request_type in request_types:
-                self.assign_manager_to_request_type(request_type, getattr(owner, name))
+                rule = rules[name].get(request_type)
+                if rule is None:
+                    self.assign_manager_to_request_type(request_type, getattr(owner, name))
+                    continue
+                owner_of = None
+                if rule.owner is not None:
+                    owner_of = functools.partial(rule.owner, owner)
+                self.assign_manager_to_request_type(
+                    request_type, getattr(owner, name), sender=rule.required, owner=owner_of
+                )
 
     def configure_worker_forwarding(
         self,
@@ -894,22 +1025,21 @@ class EventManager(EngineScoped):
             return self._node_execution_depth > 0
 
     @contextmanager
-    def hydration_scope(self, node_name: str) -> Iterator[None]:
-        """Mark the current chain as rebuilding `node_name` from the values it was sent.
+    def rebuild_scope(self, node_name: str) -> Iterator[None]:
+        """Answer every request in the current chain here while a worker builds or discards its copy of a node.
 
-        Hydration replays each value through `set_parameter_value`, so a node's value hooks run as if a
-        user had edited it. On a worker the node is a copy, and the worker-side RemoteHandler reads this
-        to keep those hooks from repeating their edits on the orchestrator's node.
+        The copy is loaded into this process's own graph, so the requests that load it, and any its node's
+        code sends while loading, must reach that graph and never the orchestrator's.
         """
-        token = _hydrating_node_name.set(node_name)
+        token = _rebuilding_node_name.set(node_name)
         try:
             yield
         finally:
-            _hydrating_node_name.reset(token)
+            _rebuilding_node_name.reset(token)
 
-    def hydrating_node_name(self) -> str | None:
-        """The node the current chain is rebuilding, or None outside a hydration scope."""
-        return _hydrating_node_name.get()
+    def rebuilding_node_name(self) -> str | None:
+        """The node the current chain is rebuilding, or None outside a rebuild scope."""
+        return _rebuilding_node_name.get()
 
     def get_manager_for_request_type(self, request_type: type[RP]) -> Callable | None:
         """Return the currently-registered handler callback for a request type, or None."""
@@ -988,6 +1118,26 @@ class EventManager(EngineScoped):
             response_topic=result_context.get("response_topic"),
         )
 
+    def _refusal_for_sender(
+        self, request: RequestPayload, result_context: ResultContext
+    ) -> GenericResultFailure | None:
+        """The failure to answer with instead of running a request's handler, given who sent it, or None if it may run.
+
+        A request from another engine is refused unless its handler admits that engine; one from a
+        local client is refused only by a handler that admits other engines alone.
+        """
+        rule = self._sender_rules.get(type(request))
+        sender = result_context.get("sender")
+        if sender is None:
+            reason = _why_local_request_is_refused(rule)
+            attempted = f"Attempted to handle a {type(request).__name__}."
+        else:
+            reason = _why_engine_request_is_refused(rule, request, sender)
+            attempted = f"Attempted to handle a {type(request).__name__} from engine {sender.engine_id}."
+        if reason is None:
+            return None
+        return GenericResultFailure(result_details=f"{attempted} Failed because {reason}.")
+
     def remove_manager_from_request_type(self, request_type: type[RP]) -> None:
         """Unsubscribe the manager from the request of a specific type.
 
@@ -996,6 +1146,7 @@ class EventManager(EngineScoped):
         """
         if request_type in self._request_type_to_manager:
             del self._request_type_to_manager[request_type]
+        self._sender_rules.pop(request_type, None)
 
     def _override_result_log_level(self, result: ResultPayload, level: int) -> None:
         """Override the log level on all result details.
@@ -1148,10 +1299,15 @@ class EventManager(EngineScoped):
 
         # Notify the manager of the event type
         request_type = type(request)
-        callback = self._request_type_to_manager.get(request_type)
+        callback = self._handler_for(request_type)
         if not callback:
             msg = f"No manager found to handle request of type '{request_type.__name__}'."
             raise TypeError(msg)
+        self._report_graph_access_while_loading(request)
+
+        refusal = self._refusal_for_sender(request, result_context)
+        if refusal is not None:
+            return self._handle_request_core(request, refusal, context=result_context)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
@@ -1165,6 +1321,8 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
+        sender_token = _active_request_sender.set(result_context.get("sender"))
+        request_id_token = _active_request_id.set(result_context.get("request_id"))
         try:
             try:
                 # Actually make the handler callback (support both sync and async):
@@ -1183,7 +1341,45 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            _active_request_id.reset(request_id_token)
+            _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
+
+    @staticmethod
+    def _report_graph_access_while_loading(request: RequestPayload) -> None:
+        """Report a request a loading node sends about the graph around it (see ``GraphAccessMixin``).
+
+        A request naming any node but the one loading counts too. One naming no node acts on the current
+        context, which while a node loads is that node.
+        """
+        node_name = loading_node_name()
+        if node_name is None:
+            return
+        named = [getattr(request, field_name, None) for field_name in _NODE_NAME_FIELDS]
+        names_another_node = any(name is not None and name != node_name for name in named)
+        if not isinstance(request, GraphAccessMixin) and not names_another_node:
+            return
+        rule = RULES["graph-access-while-loading"]
+        STRICT_MODE.report(
+            rule_id=rule.rule_id,
+            message=rule.render(node_name=node_name, request_type=type(request).__name__),
+        )
+
+    def _handler_for(self, request_type: type[RequestPayload]) -> Callable | None:
+        """The handler that answers `request_type` in the current chain.
+
+        Inside a rebuild scope that is always this process's own handler: a worker replaces forwarded
+        types with a RemoteHandler, which would send the request to the orchestrator.
+        """
+        # Lazy import: worker_routing imports ResultContext from this module at
+        # runtime, so a top-level import here would cycle through event_manager
+        # -> worker_routing -> event_manager during module load.
+        from griptape_nodes.app.worker_routing import RemoteHandler
+
+        callback = self._request_type_to_manager.get(request_type)
+        if _rebuilding_node_name.get() is not None and isinstance(callback, RemoteHandler):
+            return callback.original
+        return callback
 
     def handle_request(
         self,
@@ -1203,10 +1399,15 @@ class EventManager(EngineScoped):
 
         # Notify the manager of the event type
         request_type = type(request)
-        callback = self._request_type_to_manager.get(request_type)
+        callback = self._handler_for(request_type)
         if not callback:
             msg = f"No manager found to handle request of type '{request_type.__name__}'."
             raise TypeError(msg)
+        self._report_graph_access_while_loading(request)
+
+        refusal = self._refusal_for_sender(request, result_context)
+        if refusal is not None:
+            return self._handle_request_core(request, refusal, context=result_context)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
@@ -1220,6 +1421,8 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
+        sender_token = _active_request_sender.set(result_context.get("sender"))
+        request_id_token = _active_request_id.set(result_context.get("request_id"))
         try:
             try:
                 result_payload = self._invoke_handler_from_sync(callback, request)
@@ -1237,6 +1440,8 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            _active_request_id.reset(request_id_token)
+            _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
 
     def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:
@@ -1299,12 +1504,13 @@ class EventManager(EngineScoped):
         lives in, and a peer's payload describes the peer, so acting on it would corrupt the
         receiver. A worker that has something to tell the orchestrator sends it a request.
         """
-        listener_set = self._app_event_listeners.get(app_event_type)
-        if listener_set is None:
-            listener_set = set()
-            self._app_event_listeners[app_event_type] = listener_set
+        with self._app_event_listeners_lock:
+            listener_set = self._app_event_listeners.get(app_event_type)
+            if listener_set is None:
+                listener_set = set()
+                self._app_event_listeners[app_event_type] = listener_set
 
-        listener_set.add(callback)
+            listener_set.add(callback)
 
     def add_listener_to_execution_event(self, execution_event_type: type[EP], callback: Callable[[EP], None]) -> None:
         """Subscribe to a type of execution event on the live event feed.
@@ -1333,6 +1539,12 @@ class EventManager(EngineScoped):
         ``remove_listener_for_execution_event``). The agent payloads are the exception:
         they carry the ``thread_id`` of their conversation, so a subscriber can filter
         on that instead.
+
+        A library should return its listeners from
+        ``AdvancedNodeLibrary.get_execution_event_listeners()`` instead of calling this, so the
+        engine removes them when the library unloads.
+
+        Nothing is delivered while the event queue has not been initialized.
         """
         callback_call = type(callback).__call__
         if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(callback_call):
@@ -1398,8 +1610,23 @@ class EventManager(EngineScoped):
     def remove_listener_for_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
-        listener_set = self._app_event_listeners[app_event_type]
-        listener_set.remove(callback)
+        """Unsubscribe a callback previously registered with ``add_listener_to_app_event``.
+
+        Removing a callback that is not subscribed does nothing, so a library that listed the same
+        listener twice still unloads cleanly.
+        """
+        with self._app_event_listeners_lock:
+            listener_set = self._app_event_listeners.get(app_event_type)
+            if listener_set is None:
+                return
+            listener_set.discard(callback)
+            if not listener_set:
+                del self._app_event_listeners[app_event_type]
+
+    def _app_event_listeners_for(self, app_event_type: type[AppPayload]) -> list[Callable]:
+        """A snapshot of the listeners for an app event type, safe to iterate while others subscribe."""
+        with self._app_event_listeners_lock:
+            return list(self._app_event_listeners.get(app_event_type, ()))
 
     def broadcast_app_event(self, app_event: AP) -> None:
         """Broadcast an app event to all registered listeners (sync version).
@@ -1407,17 +1634,15 @@ class EventManager(EngineScoped):
         Args:
             app_event: The app event to broadcast
         """
-        app_event_type = type(app_event)
-        if app_event_type in self._app_event_listeners:
-            listener_set = self._app_event_listeners[app_event_type]
-
+        listeners = self._app_event_listeners_for(type(app_event))
+        if listeners:
             # Support async callbacks for sync method. See the matching comment
             # in handle_request for the ThreadRunner rationale: listeners here
             # are user-supplied callbacks that do not share primitives with the
             # caller's loop, so the side-loop path is safe.
             async def _broadcast_async() -> None:
                 async with asyncio.TaskGroup() as tg:
-                    for listener_callback in listener_set:
+                    for listener_callback in listeners:
                         tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
             if _running_loop() is not None:
@@ -1432,12 +1657,10 @@ class EventManager(EngineScoped):
         Args:
             app_event: The app event to broadcast
         """
-        app_event_type = type(app_event)
-        if app_event_type in self._app_event_listeners:
-            listener_set = self._app_event_listeners[app_event_type]
-
+        listeners = self._app_event_listeners_for(type(app_event))
+        if listeners:
             async with asyncio.TaskGroup() as tg:
-                for listener_callback in listener_set:
+                for listener_callback in listeners:
                     tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
     async def _call_app_event_listener(
@@ -1490,9 +1713,9 @@ class EventSuppressionContext:
     permanently dark event stream desyncs the editor.
     """
 
-    events_to_suppress: set[type]
+    events_to_suppress: AbstractSet[type]
 
-    def __init__(self, manager: EventManager, events_to_suppress: set[type]):
+    def __init__(self, manager: EventManager, events_to_suppress: AbstractSet[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
         self._tokens: list[contextvars.Token[frozenset[type]]] = []

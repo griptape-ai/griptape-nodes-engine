@@ -11,7 +11,10 @@ across a process boundary:
 - converters, validators, and dynamic parameters, which run on the orchestrator's real class
 
 Run against the ``worker_behavior_library`` fixture, in both roles: the orchestrator (where
-nodes are instantiated and edited) and a worker (where ``process`` runs).
+nodes are instantiated and edited) and a worker (where ``process`` runs). The worker is a second
+engine in this process (``tests.simulated_worker``): the orchestrator's node is sent to it the way
+a real worker is sent one, it loads a copy into its own graph, and the requests the copy makes while
+it runs are forwarded back.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
+from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultSuccess,
@@ -38,6 +42,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, WriteFileRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     AddParameterToNodeResultSuccess,
@@ -47,11 +52,16 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
+from tests.simulated_worker import SimulatedWorker, simulated_worker
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from griptape_nodes.exe_types.node_types import BaseNode
+
+
+_CANVAS_FLOW_NAME = "worker_behavior_canvas"
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +69,13 @@ def _register_library(tmp_path: Path) -> None:
     library_json = materialize_worker_behavior_library(tmp_path)
     result = current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), getattr(result, "result_details", result)
+
+
+@pytest.fixture
+def worker() -> Iterator[SimulatedWorker]:
+    """A worker, with an engine of its own, that every node of the library this engine runs is sent to."""
+    with simulated_worker(current_engine(), WORKER_BEHAVIOR_LIBRARY_NAME) as simulated:
+        yield simulated
 
 
 def _make(node_type: str, name: str) -> BaseNode:
@@ -71,26 +88,29 @@ def _make(node_type: str, name: str) -> BaseNode:
 
 
 def _make_in_flow(node_type: str, name: str) -> BaseNode:
-    """Create a node inside a real flow.
+    """Create a node inside a real flow, the one canvas every node of a test shares.
 
     Editing a parameter unresolves downstream nodes, which needs a parent flow, so anything
     exercising value hooks has to go through the normal creation path.
     """
-    current_engine().context_manager.push_workflow(workflow_name=f"wf_{name}")
-    flow_result = current_engine().handle_request(
-        CreateFlowRequest(parent_flow_name=None, flow_name=f"flow_{name}", set_as_new_context=False)
-    )
-    assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
-    create_result = current_engine().handle_request(
+    engine = current_engine()
+    if not engine.context_manager.has_current_workflow():
+        engine.context_manager.push_workflow(workflow_name="worker_behavior_workflow")
+    if engine.object_manager.attempt_get_object_by_name(_CANVAS_FLOW_NAME) is None:
+        flow_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name=_CANVAS_FLOW_NAME, set_as_new_context=False)
+        )
+        assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+    create_result = engine.handle_request(
         CreateNodeRequest(
             node_type=node_type,
             specific_library_name=WORKER_BEHAVIOR_LIBRARY_NAME,
             node_name=name,
-            override_parent_flow_name=flow_result.flow_name,
+            override_parent_flow_name=_CANVAS_FLOW_NAME,
         )
     )
     assert isinstance(create_result, CreateNodeResultSuccess), getattr(create_result, "result_details", create_result)
-    return current_engine().node_manager.get_node_by_name(create_result.node_name)
+    return engine.node_manager.get_node_by_name(create_result.node_name)
 
 
 async def _execute(node_type: str, name: str, **parameter_values: object) -> ExecuteNodeResultSuccess:
@@ -211,6 +231,7 @@ class TestMediaFromAWorker:
         assert "Media.png" in url
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_media_bytes_are_written_from_inside_a_worker(self) -> None:
         """The same save, in the role that actually performs it.
 
@@ -219,8 +240,7 @@ class TestMediaFromAWorker:
         must not fire on that: a worker shares the workspace on disk, so the read is correct, and
         refusing it left every worker unable to write a single file.
         """
-        current_engine().library_manager._is_worker = True
-        _make("SaveMediaNode", "WorkerMedia")
+        _make_in_flow("SaveMediaNode", "WorkerMedia")
 
         result = await _execute("SaveMediaNode", "WorkerMedia")
 
@@ -229,21 +249,19 @@ class TestMediaFromAWorker:
 
 class TestStateAccessFromAWorker:
     @pytest.mark.asyncio
-    async def test_config_read_through_a_request_succeeds_in_a_worker(self) -> None:
-        """The request path resolves for a node marked as running in a worker.
+    async def test_config_read_through_a_request_succeeds_in_a_worker(self, worker: SimulatedWorker) -> None:
+        """The request path resolves for a node running in a worker, and the orchestrator answers it.
 
-        Scoped honestly: this process has no forwarding configured, so the request is answered
-        locally. What it pins is that the facade guard does not block the request path. That
-        forwarding itself works over the wire is covered by test_worker_forwarding_reentrancy.py
-        and by the real two-process verification.
+        The transport is stood in for; that forwarding works over the real wire is covered by
+        test_worker_forwarding_reentrancy.py and by the real two-process verification.
         """
-        current_engine().library_manager._is_worker = True
-        _make("ReadConfigNode", "Reader")
+        _make_in_flow("ReadConfigNode", "Reader")
 
         result = await _execute("ReadConfigNode", "Reader", config_key="workspace_directory")
 
         # A real value came back, which means the request resolved rather than being blocked.
         assert result.parameter_output_values["config_value"]
+        assert any(isinstance(request, GetConfigValueRequest) for request in worker.forwarded)
 
     def test_config_getter_forwards_from_a_worker(self) -> None:
         """Config and secrets must forward; file I/O must NOT.
@@ -298,9 +316,9 @@ class TestStreamingAndAsyncResult:
         assert result.parameter_output_values["stream"] == "alphabetagamma"
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_streaming_works_in_a_worker_too(self) -> None:
-        current_engine().library_manager._is_worker = True
-        _make("StreamingNode", "WorkerStreamer")
+        _make_in_flow("StreamingNode", "WorkerStreamer")
 
         result = await _execute("StreamingNode", "WorkerStreamer")
 
@@ -309,15 +327,15 @@ class TestStreamingAndAsyncResult:
 
 class TestMultiHopChain:
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_three_hops_of_serializable_values(self) -> None:
         """Each hop's value round-trips through the orchestrator, as per-node dispatch requires."""
-        current_engine().library_manager._is_worker = True
         for node_type, name in (
             ("ChainStartNode", "Start"),
             ("ChainMiddleNode", "Middle"),
             ("ChainEndNode", "End"),
         ):
-            _make(node_type, name)
+            _make_in_flow(node_type, name)
 
         start = await _execute("ChainStartNode", "Start")
         middle = await _execute("ChainMiddleNode", "Middle", in_value=start.parameter_output_values["out"])
@@ -336,49 +354,49 @@ class TestResultsReportedWithTheSetter:
     """
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_a_worker_ships_a_result_the_setter_stored(self) -> None:
-        current_engine().library_manager._is_worker = True
-        _make("ReportsWithSetterNode", "SetterReporter")
+        _make_in_flow("ReportsWithSetterNode", "SetterReporter")
 
         result = await _execute("ReportsWithSetterNode", "SetterReporter")
 
         assert result.parameter_output_values["status"] == "reported-readback"
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_a_worker_ships_a_result_on_a_parameter_the_editor_can_also_type_into(self) -> None:
         """Allowing PROPERTY as well does not stop the parameter publishing, so the result travels."""
-        current_engine().library_manager._is_worker = True
-        _make("ReportsWithSetterNode", "SetterDisplayReporter")
+        _make_in_flow("ReportsWithSetterNode", "SetterDisplayReporter")
 
         result = await _execute("ReportsWithSetterNode", "SetterDisplayReporter")
 
         assert result.parameter_output_values["on_display"] == "shown"
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_a_worker_ships_a_result_on_a_parameter_that_declared_no_modes(self) -> None:
         """The default is every mode, and that is most of the parameters a library declares."""
-        current_engine().library_manager._is_worker = True
-        _make("ReportsWithSetterNode", "SetterDefaultReporter")
+        _make_in_flow("ReportsWithSetterNode", "SetterDefaultReporter")
 
         result = await _execute("ReportsWithSetterNode", "SetterDefaultReporter")
 
         assert result.parameter_output_values["defaulted"] == "defaulted-result"
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_a_parameter_with_no_output_is_left_behind(self) -> None:
         """With no OUTPUT there is no port to publish on, so a run's write to it is scratch."""
-        current_engine().library_manager._is_worker = True
-        _make("ReportsWithSetterNode", "SetterScratchReporter")
+        _make_in_flow("ReportsWithSetterNode", "SetterScratchReporter")
 
         result = await _execute("ReportsWithSetterNode", "SetterScratchReporter")
 
         assert "scratch" not in result.parameter_output_values
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_the_node_reads_back_what_it_just_set(self) -> None:
         """A library that sets then reads through the same API has to see its own write."""
-        current_engine().library_manager._is_worker = True
-        _make("ReportsWithSetterNode", "SetterReadbackReporter")
+        _make_in_flow("ReportsWithSetterNode", "SetterReadbackReporter")
 
         result = await _execute("ReportsWithSetterNode", "SetterReadbackReporter")
 
@@ -405,9 +423,9 @@ class TestAnOutputListGrownWhileRunning:
     """
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_a_worker_ships_the_whole_list(self) -> None:
-        current_engine().library_manager._is_worker = True
-        _make("GrowsAnOutputListNode", "ListGrower")
+        _make_in_flow("GrowsAnOutputListNode", "ListGrower")
 
         result = await _execute("GrowsAnOutputListNode", "ListGrower")
 
@@ -424,14 +442,14 @@ class TestAnOutputListGrownWhileRunning:
 
 
 class TestAnInputListFilledInTheEditor:
-    """A list the artist filled row by row, then edited, as the executor dispatches it."""
+    """A list the artist filled row by row, then edited, run where its library runs."""
 
-    @pytest.mark.parametrize("is_worker", [False, True])
+    @pytest.mark.parametrize("in_a_worker", [False, True])
     @pytest.mark.asyncio
     async def test_the_node_reads_the_rows_it_has_now(
-        self, caplog: pytest.LogCaptureFixture, *, is_worker: bool
+        self, request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture, *, in_a_worker: bool
     ) -> None:
-        node = _make_in_flow("ReadsAnInputListNode", f"InputLister{is_worker}")
+        node = _make_in_flow("ReadsAnInputListNode", f"InputLister{in_a_worker}")
         rows = []
         for value in ("a", "b", "c"):
             added = current_engine().handle_request(
@@ -443,25 +461,27 @@ class TestAnInputListFilledInTheEditor:
             )
             rows.append(added.parameter_name)
         current_engine().handle_request(RemoveParameterFromNodeRequest(node_name=node.name, parameter_name=rows[1]))
-        current_engine().library_manager._is_worker = is_worker
+        if in_a_worker:
+            request.getfixturevalue("worker")
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = await _execute("ReadsAnInputListNode", node.name, **node._list_rows.values_for_dispatch())
+            result = await _execute("ReadsAnInputListNode", node.name)
 
         assert result.parameter_output_values["echo"] == ["a", "c"]
-        assert "does not exist on the executing copy" not in caplog.text
+        assert "which it does not have" not in caplog.text
 
-    @pytest.mark.parametrize("is_worker", [False, True])
+    @pytest.mark.parametrize("in_a_worker", [False, True])
     @pytest.mark.asyncio
-    async def test_a_list_set_whole_by_request(self, *, is_worker: bool) -> None:
+    async def test_a_list_set_whole_by_request(self, request: pytest.FixtureRequest, *, in_a_worker: bool) -> None:
         """How an MCP client or a script sets a list."""
-        node = _make_in_flow("ReadsAnInputListNode", f"WholeLister{is_worker}")
+        node = _make_in_flow("ReadsAnInputListNode", f"WholeLister{in_a_worker}")
         current_engine().handle_request(
             SetParameterValueRequest(node_name=node.name, parameter_name="items", value=["a", "b"])
         )
-        current_engine().library_manager._is_worker = is_worker
+        if in_a_worker:
+            request.getfixturevalue("worker")
 
-        result = await _execute("ReadsAnInputListNode", node.name, **node._list_rows.values_for_dispatch())
+        result = await _execute("ReadsAnInputListNode", node.name)
 
         assert result.parameter_output_values["echo"] == ["a", "b"]
 
@@ -509,24 +529,16 @@ class TestUnshippableOutputsAreKept:
     """A value the author declared unserializable stays in the worker and a reference travels."""
 
     @pytest.mark.asyncio
-    async def test_a_worker_keeps_an_unserializable_output_and_ships_a_reference(self) -> None:
-        current_engine().library_manager._is_worker = True
-        _make("UnshippableOutputNode", "Unshippable")
+    async def test_a_worker_keeps_an_unserializable_output_and_ships_a_reference(self, worker: SimulatedWorker) -> None:
+        _make_in_flow("UnshippableOutputNode", "Unshippable")
 
-        result = await current_engine().ahandle_request(
-            ExecuteNodeRequest(
-                node_name="Unshippable",
-                parameter_values={},
-                node_metadata={"node_type": "UnshippableOutputNode", "library": WORKER_BEHAVIOR_LIBRARY_NAME},
-            )
-        )
+        result = await _execute("UnshippableOutputNode", "Unshippable")
 
-        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         sent = result.parameter_output_values["live_handle"]
         assert is_reference(sent), sent
-        # The object itself never left. A fresh transient node runs the execution, so the entry belongs to
-        # that instance -- what matters is that this process is holding the object the reference names.
-        entry = current_engine().resource_manager.entry_for(sent["key"])
+        # The object itself never left the worker. Its copy of the node is gone after the run, so the
+        # entry is held under the identity the orchestrator's node lent it.
+        entry = worker.engine.resource_manager.entry_for(sent["key"])
         assert entry is not None
         assert not isinstance(entry.value, str)
 
@@ -547,6 +559,7 @@ class TestUnshippableOutputsAreKept:
 
 class TestSecretsFromAWorker:
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_secret_read_through_a_request_reaches_the_engine(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Almost every real node needs an API key, and this is the path it must take.
 
@@ -554,8 +567,7 @@ class TestSecretsFromAWorker:
         stale copy; the request is what reaches the process that owns the secret.
         """
         monkeypatch.setenv("GTN_WORKER_FIXTURE_SECRET", "fixture-secret-value")
-        current_engine().library_manager._is_worker = True
-        _make("ReadSecretNode", "SecretReader")
+        _make_in_flow("ReadSecretNode", "SecretReader")
 
         result = await _execute("ReadSecretNode", "SecretReader")
 
@@ -596,17 +608,14 @@ class TestProjectReadsStayLocalInAWorker:
 class TestBinaryFileWritesFromAWorker:
     """A node's file output must survive being written from a worker.
 
-    Scoped honestly: this suite flips `_is_worker` but never installs the RemoteHandlers, so
-    WriteFileRequest is answered locally whatever the routing says -- these do not guard the
-    routing decision. What they cover is that a node writing binary through `File` works at all,
-    in both roles, which the suite had no node for. The routing itself is guarded by the
-    membership and converter tests above and by tests/unit/app/test_worker_routing_filesystem.py.
+    The worker here has the RemoteHandlers a real worker installs, so a WriteFileRequest that
+    forwarded would be answered by the orchestrator's engine. The wire corruption itself is guarded
+    by the membership and converter tests above and by tests/unit/app/test_worker_routing_filesystem.py.
     """
 
     @pytest.mark.asyncio
-    async def test_binary_survives_a_write_from_a_worker(self) -> None:
-        current_engine().library_manager._is_worker = True
-        _make("WriteBytesNode", "WorkerBytes")
+    async def test_binary_survives_a_write_from_a_worker(self, worker: SimulatedWorker) -> None:
+        _make_in_flow("WriteBytesNode", "WorkerBytes")
 
         result = await _execute("WriteBytesNode", "WorkerBytes")
 
@@ -615,6 +624,7 @@ class TestBinaryFileWritesFromAWorker:
         # passing over two empty reads.
         assert result.parameter_output_values["bytes_survived"] is True
         assert result.parameter_output_values["byte_count"] > 0
+        assert not any(isinstance(request, WriteFileRequest | ReadFileRequest) for request in worker.forwarded)
 
     @pytest.mark.asyncio
     async def test_binary_survives_a_write_on_the_orchestrator(self) -> None:
@@ -626,109 +636,103 @@ class TestBinaryFileWritesFromAWorker:
         assert result.parameter_output_values["bytes_survived"] is True
 
     @pytest.mark.asyncio
-    async def test_a_request_added_parameter_lands_authoritatively_not_locally(self) -> None:
-        """Execute the request-pattern node in the worker role and pin both halves.
+    @pytest.mark.usefixtures("worker")
+    async def test_a_parameter_a_value_hook_added_by_request_reaches_the_worker_copy(self) -> None:
+        """EditorBehaviorNode's hook adds its dynamic parameter with AddParameterToNodeRequest as it is edited.
 
-        EditorBehaviorNode's hook adds its dynamic parameter via AddParameterToNodeRequest.
-        During worker hydration that hook fires on the fresh executing copy; the request
-        resolves against the AUTHORITATIVE node (looked up by name), so the parameter lands
-        there while the copy that is running process() never sees it. That asymmetry is the
-        documented contract -- the live harness proves it across a real process boundary;
-        this pins it in-repo.
+        The request lands on the orchestrator's node, and the worker's copy is loaded from that node's
+        structure, so the parameter exists on the copy that runs process() too.
         """
-        current_engine().library_manager._is_worker = True
-        registered = _make("EditorBehaviorNode", "RequestPathNode")
+        node = _make_in_flow("EditorBehaviorNode", "RequestPathNode")
+        current_engine().handle_request(
+            SetParameterValueRequest(node_name=node.name, parameter_name="mode", value="expand")
+        )
 
-        result = await _execute("EditorBehaviorNode", "RequestPathNode", mode="expand")
+        result = await _execute("EditorBehaviorNode", node.name)
 
-        assert result.parameter_output_values["dynamic_visible_in_process"] is False
-        assert registered.get_parameter_by_name("dynamic_extra") is not None
+        assert node.get_parameter_by_name("dynamic_extra") is not None
+        assert result.parameter_output_values["dynamic_visible_in_process"] is True
+        assert result.parameter_output_values["observed_mode"] == "EXPAND"
 
 
 class TestTheRebuildBeforeARun:
-    """A worker refuses graph edits while it rebuilds a node, so the rebuild must cover exactly the hooks.
+    """A worker loads its copy without running value hooks, and the rebuild ends before process() runs.
 
-    Covering too little lets a value hook that drops wires delete the orchestrator's connections.
-    Covering too much refuses the edits a node makes on purpose while it runs.
+    Requests made during the rebuild are answered by the worker's own graph, so running process() inside it
+    would answer the node's questions about connections and other nodes from a graph that has neither.
     """
 
     @pytest.mark.asyncio
-    async def test_value_hooks_run_inside_the_rebuild_and_process_outside_it(self) -> None:
-        current_engine().library_manager._is_worker = True
-        _make("ReportsHydrationNode", "Rebuilt")
+    @pytest.mark.usefixtures("worker")
+    async def test_loading_the_copy_runs_no_value_hook_and_process_runs_outside_the_rebuild(self) -> None:
+        node = _make_in_flow("ReportsHydrationNode", "Rebuilt")
+        current_engine().handle_request(
+            SetParameterValueRequest(node_name=node.name, parameter_name="trigger", value="set")
+        )
 
-        result = await _execute("ReportsHydrationNode", "Rebuilt", trigger="set")
+        result = await _execute("ReportsHydrationNode", node.name)
 
-        assert result.parameter_output_values["hook_saw_hydration"] is True
-        assert result.parameter_output_values["process_saw_hydration"] is False
+        assert result.parameter_output_values["hook_ran"] is False
+        assert result.parameter_output_values["process_saw_rebuild"] is False
 
 
-class TestStructureDerivesFromValues:
-    """The authoring contract: parameter structure is a deterministic function of values.
+class TestStructureDerivedFromValuesReachesTheWorker:
+    """A worker's copy has the structure the orchestrator's node has, however that structure was made.
 
-    A fresh worker-side copy starts with only its __init__ shape and receives values in dict
-    order, which promises nothing. If a value for a derived parameter arrives before the value
-    that derives it, hydration must wait for the derivation rather than fail -- and a value for
-    a parameter nothing derives must cost that one value, not the run.
+    The copy is loaded the way a saved workflow loads: created from its class, given the parameters and
+    alterations the node has beyond that, then given its values. No value hook runs on the copy, so a
+    parameter derived by a hook arrives as structure rather than being derived again.
     """
 
     @pytest.mark.asyncio
-    async def test_hydration_order_cannot_defeat_derivation(self) -> None:
-        """The derived parameter's value arrives FIRST, before the value that creates it.
+    @pytest.mark.usefixtures("worker")
+    async def test_a_parameter_derived_by_a_value_hook_reaches_the_copy_with_its_value(self) -> None:
+        node = _make_in_flow("DerivedStructureNode", "DerivedOnce")
+        for parameter_name, value in (("shape", "expanded"), ("derived_in", "payload")):
+            current_engine().handle_request(
+                SetParameterValueRequest(node_name=node.name, parameter_name=parameter_name, value=value)
+            )
 
-        Single-pass hydration failed the whole execution here: `derived_in` does not exist on
-        the fresh copy until the `shape` hook runs, and setting a value on a missing parameter
-        raises. The second pass applies it after the derivation.
-        """
-        current_engine().library_manager._is_worker = True
-        _make("DerivedStructureNode", "DerivedOrder")
-
-        result = await _execute("DerivedStructureNode", "DerivedOrder", derived_in="payload", shape="expanded")
+        result = await _execute("DerivedStructureNode", node.name)
 
         assert result.parameter_output_values["echo"] == "payload"
 
     @pytest.mark.asyncio
-    async def test_a_derivation_chain_hydrates_in_the_most_adversarial_order(self) -> None:
-        """Depth two, values ordered deepest-first: the fixpoint must chase the chain.
+    @pytest.mark.usefixtures("worker")
+    async def test_a_chain_of_derived_parameters_reaches_the_copy(self) -> None:
+        """`shape` derives `derived_in`, whose own hook derives `derived_deep`: both levels arrive."""
+        node = _make_in_flow("DerivedStructureNode", "DerivedChain")
+        for parameter_name, value in (("shape", "expanded"), ("derived_in", "deeper"), ("derived_deep", "bottom")):
+            current_engine().handle_request(
+                SetParameterValueRequest(node_name=node.name, parameter_name=parameter_name, value=value)
+            )
 
-        `shape` derives `derived_in`, whose own hook derives `derived_deep` -- the shape real
-        dynamic UIs take (provider creates model, model creates options). A fixed two-pass
-        hydration claims `derived_in` on its second pass but leaves `derived_deep` an orphan,
-        silently running the node with its default; the contract puts no depth bound on
-        derivation, so hydration must not either.
-        """
-        current_engine().library_manager._is_worker = True
-        _make("DerivedStructureNode", "DerivedChain")
-
-        result = await _execute(
-            "DerivedStructureNode",
-            "DerivedChain",
-            derived_deep="from the bottom",
-            derived_in="deeper",
-            shape="expanded",
-        )
+        result = await _execute("DerivedStructureNode", node.name)
 
         assert result.parameter_output_values["echo"] == "deeper"
-        assert result.parameter_output_values["deep_echo"] == "from the bottom"
+        assert result.parameter_output_values["deep_echo"] == "bottom"
 
     @pytest.mark.asyncio
-    async def test_a_value_nothing_derives_is_skipped_not_fatal(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A parameter added to the authoritative node by request does not exist here.
-
-        The canonical producer is a user adding a parameter in the editor: the orchestrator's
-        node has it, values ship at execute, and the fresh worker copy has no hook that
-        re-creates it. Failing hydration made every such parameter fatal to a worker-routed
-        node; the contract's answer is that the value goes unapplied, loudly.
-        """
-        current_engine().library_manager._is_worker = True
-        _make("DerivedStructureNode", "DerivedGhost")
+    @pytest.mark.usefixtures("worker")
+    async def test_a_parameter_the_user_added_reaches_the_copy_with_its_value(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A parameter added in the editor is part of the node's structure, so the copy has it too."""
+        node = _make_in_flow("DerivedStructureNode", "UserAdded")
+        added = current_engine().handle_request(
+            AddParameterToNodeRequest(
+                node_name=node.name, parameter_name="user_note", type="str", default_value="", tooltip="Added by hand"
+            )
+        )
+        assert isinstance(added, AddParameterToNodeResultSuccess), added
+        current_engine().handle_request(
+            SetParameterValueRequest(node_name=node.name, parameter_name="user_note", value="kept")
+        )
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = await _execute("DerivedStructureNode", "DerivedGhost", ghost="orphaned", shape="plain")
+            await _execute("DerivedStructureNode", node.name)
 
-        assert result.parameter_output_values["echo"] == ""
-        assert "ghost" in caplog.text
-        assert "derive" in caplog.text
+        assert "user_note" not in caplog.text
 
 
 class TestProjectSavesFromAWorker:
@@ -748,11 +752,11 @@ class TestProjectSavesFromAWorker:
     """
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("worker")
     async def test_project_save_works_and_stays_portable_in_a_worker(self) -> None:
         activation = current_engine().handle_request(ActivateWorkspaceProjectRequest())
         assert not isinstance(activation, ResultPayloadFailure), getattr(activation, "result_details", activation)
-        current_engine().library_manager._is_worker = True
-        _make("WriteProjectFileNode", "WorkerProjectSave")
+        _make_in_flow("WriteProjectFileNode", "WorkerProjectSave")
 
         result = await _execute("WriteProjectFileNode", "WorkerProjectSave")
 

@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path  # noqa: TC003 - read at runtime by the converter
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -145,15 +146,22 @@ class ListNodeTypesInLibraryRequest(RequestPayload):
     """List all node types available in a specific library.
 
     Use when: Discovering available nodes, building node creation UIs,
-    validating node types, exploring library contents.
+    validating node types, exploring library contents. Set include_metadata when choosing
+    which node types to create: it adds each type's category, display name, description,
+    and deprecation, read from the library's registered metadata, so no node code loads.
+    To survey every library in one round trip, send one request per library from
+    ListRegisteredLibrariesRequest in an EventRequestBatch. For a node type's parameters,
+    follow up with DescribeNodeTypeRequest.
 
     Args:
         library: Name of the library to list node types for
+        include_metadata: Also return each node type's metadata in node_metadata
 
     Results: ListNodeTypesInLibraryResultSuccess (with node types) | ListNodeTypesInLibraryResultFailure (library not found)
     """
 
     library: str
+    include_metadata: bool = False
 
 
 @dataclass
@@ -162,10 +170,13 @@ class ListNodeTypesInLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayload
     """Node types in library listed successfully.
 
     Args:
-        node_types: List of node type names available in the library
+        node_types: List of node type names available in the library, in registration order
+        node_metadata: Each node type's metadata, keyed by node type name, when the request
+            set include_metadata; otherwise None
     """
 
     node_types: list[str]
+    node_metadata: dict[str, NodeMetadata] | None = None
 
 
 @dataclass
@@ -227,6 +238,9 @@ class ParameterDescription:
         settable: Whether the parameter can be set directly by the user
         ui_options: UI configuration options (includes display_name when set)
         parent_container_name: Name of the parent ParameterGroup, if any
+        element_type: Element class name, e.g. "Parameter", "ParameterString", or "ParameterList".
+            "ParameterList" marks a multi-input that accepts several incoming connections, one per item.
+        max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
     """
 
     name: str
@@ -244,6 +258,8 @@ class ParameterDescription:
     settable: bool
     ui_options: dict | None
     parent_container_name: str | None
+    element_type: str
+    max_items: int | None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -253,6 +269,7 @@ class ParameterDescription:
         serialization used elsewhere (e.g. workflow shape extraction).
         """
         param_dict = param.to_dict()
+        max_items = param.max_items if isinstance(param, ParameterList) else None
 
         return cls(
             name=param_dict["name"],
@@ -270,6 +287,8 @@ class ParameterDescription:
             settable=param_dict["settable"],
             ui_options=param_dict["ui_options"],
             parent_container_name=param_dict["parent_container_name"],
+            element_type=param_dict["element_type"],
+            max_items=max_items,
         )
 
 
@@ -442,7 +461,9 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                          sees in their config. None for libraries registered through other
                          channels (e.g. sandbox, ad-hoc loads).
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
+                    Also None when the request set `include_git_info` to False.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
+                 Also None when the request set `include_git_info` to False.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
         is_registered: Whether a library of this name is in the LibraryRegistry right now.
                        Metadata is derived from config while the registry holds what actually
@@ -525,7 +546,14 @@ class LoadMetadataForAllLibrariesRequest(RequestPayload):
 
     Provides a lightweight way to discover all available libraries and their schemas
     without the overhead of importing Python modules or registering them in the system.
+
+    Args:
+        include_git_info: Whether to look up each library's `git_remote` and `git_ref`. The lookup
+                          costs several git subprocesses per library, so callers that only need
+                          the schemas should pass False; both fields are then None.
     """
+
+    include_git_info: bool = True
 
 
 @dataclass

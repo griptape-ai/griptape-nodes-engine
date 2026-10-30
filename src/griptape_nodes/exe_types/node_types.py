@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import threading
 import uuid
@@ -10,9 +12,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
-from griptape_nodes.common.strict_mode import STRICT_MODE
+from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
@@ -29,6 +31,7 @@ from griptape_nodes.exe_types.core_types import (
 )
 from griptape_nodes.exe_types.list_rows import ListRows, handle_container_parameter
 from griptape_nodes.exe_types.local_objects import LocalObjectScope
+from griptape_nodes.exe_types.node_loading import loading_node_name
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.parameter_mutation import _sanctioned_mutation
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
@@ -132,6 +135,23 @@ _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=F
 # records a result needs the identity as well: a running node can set a value on a *different*
 # node, and on that node the value is an ordinary authored one, not something it produced.
 _running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
+
+
+@functools.cache
+def _base_node_attribute_names() -> frozenset[str]:
+    """The attributes every node has from ``BaseNode`` itself, which is engine bookkeeping rather than node state."""
+
+    class _AttributeProbe(DataNode):
+        def process(self) -> None:
+            pass
+
+    # Lazy import: library_registry imports BaseNode from this module,
+    # so importing at module load creates a cycle.
+    from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+    with LibraryRegistry.constructing_node(throwaway=True):
+        probe = _AttributeProbe(name="attribute probe")
+    return frozenset(vars(probe))
 
 
 class _PreservedTemplate(NamedTuple):
@@ -313,6 +333,11 @@ def get_library_names_with_publish_handlers(engine: Engine) -> list[str]:
 
 
 class BaseNode(ABC):
+    # Attributes a node class keeps outside its parameters on purpose, set from its value or connection
+    # hooks, which the strict-mode rule state-outside-parameters then leaves alone. Only for attributes
+    # nothing that runs the node reads: a reopened workflow and a worker's copy never have them.
+    attributes_outside_parameters: ClassVar[frozenset[str]] = frozenset()
+
     # Owned by a flow
     name: str
     metadata: dict[Any, Any]
@@ -1150,7 +1175,8 @@ class BaseNode(ABC):
                 self._also_record_as_result(parameter, final_value)
 
                 # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
-                self.after_value_set(parameter=parameter, value=final_value)
+                with self._reporting_state_set_by("after_value_set"):
+                    self.after_value_set(parameter=parameter, value=final_value)
             if emit_change:
                 self._emit_parameter_lifecycle_event(parameter)
         else:
@@ -1425,6 +1451,11 @@ class BaseNode(ABC):
         execute in a worker is installed here with its edit-time dependencies only, and a value produced
         by a worker is held there and cannot be read from here.
 
+        It runs in a worker thread, not on the engine's event loop, so a slow check doesn't freeze the
+        editor or other flows; the node waits for it before running. Setting parameter values and
+        sending events from here is safe. Engine requests run on this thread too, so keep them to quick
+        lookups, and don't touch asyncio objects or await anything.
+
         For anything that needs the real thing -- a loaded model, a tensor an upstream node produced --
         use `validate_in_execution_environment`, which runs where the node runs.
         """
@@ -1475,13 +1506,27 @@ class BaseNode(ABC):
     """
     def validate_before_workflow_run(self) -> list[Exception] | None:
         exceptions = []
-        prompt_error = self.validate_empty_parameter(param="prompt", additional_msg="Please provide a prompt to generate an image.")
+        prompt_error = self.validate_empty_parameter(
+            param="prompt", additional_msg="Please provide a prompt to generate an image.", skip_if_connected=True
+        )
         if prompt_error:
             exceptions.append(prompt_error)
         return exceptions if exceptions else None
     """
 
-    def validate_empty_parameter(self, param: str, additional_msg: str = "") -> Exception | None:
+    def validate_empty_parameter(
+        self, param: str, additional_msg: str = "", *, skip_if_connected: bool = False
+    ) -> Exception | None:
+        """Report a text parameter that holds no text.
+
+        Pass ``skip_if_connected=True`` from ``validate_before_workflow_run``: it runs before any
+        connection has delivered a value, so a connected parameter may hold nothing yet. That is not a
+        blank; the upstream node provides the value when it runs, and a missing one is reported there.
+        Leave it off at run time, where the connection has already delivered and an empty value is a
+        real error.
+        """
+        if skip_if_connected and self._param_has_incoming_connection(param):
+            return None
         param_value = self.parameter_values.get(param, None)
         node_name = self.name
         if not isinstance(param_value, str) or not param_value.strip():
@@ -1893,6 +1938,11 @@ class BaseNode(ABC):
         if not isinstance(value, list):
             return False
 
+        # A save keeps a whole value only for a list a connection fed, or one equal to its default, which
+        # its rows also give. Mid-load the connection may not exist yet, so the stored value is taken as is.
+        if loading_node_name() == self.name:
+            return True
+
         if not self._param_has_incoming_connection(param_name):
             return False
 
@@ -1993,13 +2043,14 @@ class BaseNode(ABC):
         # One short-circuiting chain rather than a ladder of early returns, so the
         # cheap checks stay ordered ahead of the expensive ones. The connection
         # lookup is last: it costs a request round trip to the FlowManager, and the
-        # checks before it already rule out the common case.
+        # checks before it already rule out the common case. Mid-load the connection
+        # may not exist yet, so the template is kept, as for an unconnected parameter.
         substitution_would_have_applied = (
             ParameterMode.PROPERTY in parameter.allowed_modes
             and parameter.allow_variable_substitution
             and VariableResolver.contains_variable_macro(raw_value)
             and _differs(raw_value, output_value)
-            and not self._param_has_incoming_connection(parameter_name)
+            and (loading_node_name() == self.name or not self._param_has_incoming_connection(parameter_name))
         )
         return _PreservedTemplate(raw_value) if substitution_would_have_applied else None
 
@@ -2040,6 +2091,42 @@ class BaseNode(ABC):
         if template is None:
             return False
         return self._substitution_would_rewrite(template.value)
+
+    @contextmanager
+    def _reporting_state_set_by(self, hook_name: str) -> Iterator[None]:
+        """Report attributes `hook_name` adds or replaces on this node (strict-mode rule state-outside-parameters).
+
+        Wraps the engine's own calls to a value or connection hook, which don't run when a node loads.
+        Attributes are compared by identity, so a change made in place is not seen. With no strict-mode
+        scope active, as for an edit in the editor, one is opened for the hook.
+        """
+        before = {name: id(value) for name, value in vars(self).items()}
+        with contextlib.ExitStack() as stack:
+            if STRICT_MODE.current_scope() is None:
+                stack.enter_context(
+                    STRICT_MODE.open_scope(
+                        kind=StrictModeScopeKind.EDIT,
+                        subject=self.name,
+                        library_name=self.metadata.get("library"),
+                        is_worker=self.engine.library_manager.is_worker,
+                    )
+                )
+            yield
+            exempt = _base_node_attribute_names() | type(self).attributes_outside_parameters
+            changed = sorted(
+                name for name, value in vars(self).items() if name not in exempt and before.get(name) != id(value)
+            )
+            if not changed:
+                return
+            rule = RULES["state-outside-parameters"]
+            STRICT_MODE.report(
+                rule_id=rule.rule_id,
+                message=rule.render(
+                    node_name=self.name,
+                    attribute_names=", ".join(f"'{name}'" for name in changed),
+                    hook_name=hook_name,
+                ),
+            )
 
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
@@ -2305,10 +2392,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # receive resolved values without the node needing to know about variables.
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
-        if _in_aprocess.get():
-            parameter = self._node.get_parameter_by_name(key)
-            if parameter is None or parameter.allow_variable_substitution:
-                value = self._node._resolve_variables_in_value(value)
+        if _in_aprocess.get() and self._substitutes_on_write(key, value):
+            value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
@@ -2318,6 +2403,28 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # would keep showing the stale prior value.
         if not had_key or _values_differ(old_value, value):
             self._emit_parameter_change_event(key, value)
+
+    def _substitutes_on_write(self, key: str, value: Any) -> bool:
+        """Whether a value written to ``key`` during a run gets its variables resolved.
+
+        Mirrors the gate in ``get_parameter_value``: a parameter fed by a connection is not
+        substituted. Its value was resolved once already, by the node that produced it, or that
+        node opted out, which is a statement that the text is data rather than a template. A
+        node that copies a connected input onto its own output (the End node does this for
+        every parameter) would otherwise resolve it a second time, and a status such as
+        ``Saved to: {outputs}/a.mp4`` that the producer deliberately kept as a macro would be
+        written into the saved workflow as the absolute path.
+
+        Ordered cheap to expensive. The connection lookup is a request round trip, and this
+        runs on every output write, including each token a streaming node appends, so a value
+        with no macro in it must leave before reaching it.
+        """
+        if not VariableResolver.contains_variable_macro(value):
+            return False
+        parameter = self._node.get_parameter_by_name(key)
+        if parameter is not None and not parameter.allow_variable_substitution:
+            return False
+        return not self._node._param_has_incoming_connection(key)
 
     def __delitem__(self, key: str) -> None:
         if key in self:
@@ -2533,6 +2640,9 @@ class SuccessFailureNode(BaseNode):
             parameter_group_initially_collapsed=parameter_group_initially_collapsed,
             result_details_tooltip=result_details_tooltip,
             result_details_placeholder=result_details_placeholder,
+            # The node writes its own status, often naming a project path as a macro such as
+            # {outputs}/file.png. Substitution would expand it to the absolute path.
+            result_details_allow_variable_substitution=False,
         )
 
     def _clear_execution_status(self) -> None:
