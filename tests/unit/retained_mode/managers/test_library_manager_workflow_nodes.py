@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -298,9 +300,7 @@ class TestListWorkflowAtLoad:
             msg = "File path does not exist."
             raise ValueError(msg)
 
-        monkeypatch.setattr(
-            "griptape_nodes.retained_mode.managers.library.module_loading.ensure_workflow_registered", _vanished
-        )
+        monkeypatch.setattr(engine.workflow_registry, "refresh_file", _vanished)
         library = _library([_definition("demo_workflow.py")])
         library_info = _library_info()
 
@@ -379,9 +379,9 @@ class TestListWorkflowOnRegistryRefresh:
         other_workspace = tmp_path / "other_workspace"
         other_workspace.mkdir()
         engine.config_manager.workspace_path = other_workspace
-        engine.workflow_registry.clear_all_workflows()
+        engine.workflow_registry.reindex_workflows()
 
-        engine.library_manager.register_library_workflow_node_workflows()
+        engine.library_manager.register_library_workflow_node_workflows(found_workflow_ids=set())
 
         workflow = engine.workflow_registry.get_workflow_by_name(derive_registry_key(str(workflow_path)))
         assert workflow.metadata.is_griptape_provided is True
@@ -401,9 +401,9 @@ class TestListWorkflowOnRegistryRefresh:
         other_workspace = tmp_path / "other_workspace"
         other_workspace.mkdir()
         engine.config_manager.workspace_path = other_workspace
-        engine.workflow_registry.clear_all_workflows()
+        engine.workflow_registry.reindex_workflows()
 
-        engine.library_manager.register_library_workflow_node_workflows()
+        engine.library_manager.register_library_workflow_node_workflows(found_workflow_ids=set())
 
         assert derive_registry_key(str(workflow_path)) not in engine.workflow_registry.list_workflows()
 
@@ -421,9 +421,80 @@ class TestListWorkflowOnRegistryRefresh:
             _library_info(str(library_dir / "griptape_nodes_library.json"), is_sandbox=True),
         )
         monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_info.library_path, library_info)
-        engine.workflow_registry.clear_all_workflows()
+        engine.workflow_registry.reindex_workflows()
 
-        engine.library_manager.register_library_workflow_node_workflows()
+        engine.library_manager.register_library_workflow_node_workflows(found_workflow_ids=set())
 
         workflow = engine.workflow_registry.get_workflow_by_name(derive_registry_key(str(workflow_path)))
         assert workflow.metadata.is_griptape_provided is True
+
+
+class TestWorkflowIdAcrossALibraryReload:
+    """A library reload loads its node types again and refreshes the registry; their workflows keep their ids."""
+
+    def test_the_workflow_behind_a_workflow_node_keeps_its_id(
+        self, engine: Engine, workspace: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        library_dir = workspace / "libraries" / "demo-library"
+        library_dir.mkdir(parents=True)
+        workflow_path = _write_workflow(library_dir, shape=_SHAPE)
+        library_json = str(library_dir / "griptape_nodes_library.json")
+        _register(engine, library_dir, _library_info(library_json))
+        first = engine.workflow_registry.find_by_path(workflow_path)
+        assert first is not None
+
+        # The reload builds the node type again, with metadata of its own, then refreshes the registry.
+        reloaded_info = _register(engine, library_dir, _library_info(library_json))
+        monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_json, reloaded_info)
+        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=[])):
+            asyncio.run(engine.workflow_manager.refresh_workflow_registry())
+
+        again = engine.workflow_registry.find_by_path(workflow_path)
+        assert again is not None
+        assert again is first
+        assert again.workflow_id == first.workflow_id
+        assert again.metadata is reloaded_info.workflow_node_classes[0].workflow_metadata
+        assert again.metadata.is_griptape_provided is True
+
+    @pytest.mark.usefixtures("workspace")
+    def test_the_workflow_of_an_unloaded_library_drops_out_on_refresh(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Outside the workspace: once the library is gone, the workspace scan would list a file in it.
+        library_dir = tmp_path / "libraries" / "demo-library"
+        library_dir.mkdir(parents=True)
+        workflow_path = _write_workflow(library_dir, shape=_SHAPE)
+        library_json = str(library_dir / "griptape_nodes_library.json")
+        library_info = _register(engine, library_dir, _library_info(library_json))
+        monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_json, library_info)
+        first = engine.workflow_registry.find_by_path(workflow_path)
+        assert first is not None
+
+        monkeypatch.delitem(engine.library_manager._library_file_path_to_info, library_json)
+        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=[])):
+            asyncio.run(engine.workflow_manager.refresh_workflow_registry())
+
+        assert engine.workflow_registry.find_by_id(first.workflow_id) is None
+        assert engine.workflow_registry.find_by_path(workflow_path) is None
+
+    def test_a_workflow_the_library_also_lists_keeps_the_metadata_read_from_its_header(
+        self, engine: Engine, workspace: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The library's `workflows` list is scanned first in a refresh, and its read of the header stands."""
+        library_dir = workspace / "libraries" / "demo-library"
+        library_dir.mkdir(parents=True)
+        workflow_path = _write_workflow(library_dir, shape=_SHAPE)
+        library_json = str(library_dir / "griptape_nodes_library.json")
+        library_info = _register(engine, library_dir, _library_info(library_json))
+        monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_json, library_info)
+        node_metadata = library_info.workflow_node_classes[0].workflow_metadata
+
+        with patch.object(
+            engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=[str(workflow_path)])
+        ):
+            asyncio.run(engine.workflow_manager.refresh_workflow_registry())
+
+        workflow = engine.workflow_registry.find_by_path(workflow_path)
+        assert workflow is not None
+        assert workflow.metadata is not node_metadata
+        assert workflow.metadata.is_griptape_provided is False

@@ -297,7 +297,7 @@ class ContextManager(EngineScoped):
         # When no workflow_name is supplied, mint a fresh "unsaved:<uuid>" key here so the
         # engine owns the namespace. Callers doing "create a new workflow" should omit the
         # name and read the resolved key off the success result.
-        resolved_name = request.workflow_name or f"{self.engine.workflow_registry.UNSAVED_KEY_PREFIX}{uuid.uuid4()}"
+        resolved_name = request.workflow_name or f"{self.engine.workflow_registry.UNSAVED_KEY_PREFIX}{uuid.uuid4().hex}"
 
         # Auto-register an unsaved registry entry when the caller is activating an
         # "unsaved:<uuid>" key. This makes every workflow (saved or not) a first-class
