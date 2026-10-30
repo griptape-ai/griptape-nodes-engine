@@ -593,7 +593,7 @@ class ModelManager(EngineScoped):
         return lines
 
     async def _download_model_task(self, download_params: DownloadParams) -> None:
-        """Background task for downloading a model using CLI command.
+        """Background task for downloading a model in a child process.
 
         Owns the full status file lifecycle: writes initial status before launching the
         subprocess, streams JSON progress events from subprocess stdout and writes them
@@ -622,12 +622,10 @@ class ModelManager(EngineScoped):
         }
         await asyncio.to_thread(self._write_download_status, status_file, initial_data)
 
-        # Build CLI command
         cmd = [
             sys.executable,
             "-m",
-            "griptape_nodes.cli.commands.models",
-            "download",
+            "griptape_nodes.retained_mode.managers.model_download_process",
             download_params.model_id,
         ]
 

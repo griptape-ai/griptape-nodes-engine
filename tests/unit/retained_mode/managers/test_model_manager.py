@@ -546,8 +546,7 @@ class TestDownloadModelTaskSubprocess:
         spec = importlib.util.find_spec(spawned_module)
         assert spec is not None, f"spawned module '{spawned_module}' is not importable"
 
-        assert captured_cmd[3] == "download"
-        assert "org/model" in captured_cmd
+        assert captured_cmd[3] == "org/model"
 
 
 # ---------------------------------------------------------------------------
