@@ -125,6 +125,30 @@ class TestRequestHandlerRegistration:
         problem_types = [type(p) for p in library_info.problems]
         assert RequestHandlerRegistrationProblem in problem_types
 
+    def test_a_handler_with_a_workflow_parameter_registers_without_a_problem(self, engine: Engine) -> None:
+        """A library handler declares no scope, so its parameter names are its own."""
+
+        def handler_naming_workflow(request: _TestRequest, workflow: str = "mine") -> _TestResult:  # noqa: ARG001
+            return _TestResult(result_details=f"ok from {workflow}")
+
+        class WorkflowParamLib(AdvancedNodeLibrary):
+            def get_request_handlers(self) -> list:
+                return [(_TestRequest, handler_naming_workflow)]
+
+        library = _make_library(advanced_library=WorkflowParamLib())
+        library_info = _make_library_info()
+
+        engine.library_manager.module_loading.attempt_load_nodes_from_library(
+            library_data=library._library_data,
+            library=library,
+            base_dir=Path("/fake"),
+            library_info=library_info,
+        )
+
+        assert library_info.problems == []
+        assert engine.event_manager.get_manager_for_request_type(_TestRequest) is handler_naming_workflow
+        assert str(engine.handle_request(_TestRequest()).result_details) == "ok from mine"
+
     def test_no_advanced_library_does_nothing(self, engine: Engine) -> None:
         """A library with no advanced library should not touch EventManager at all."""
         library = _make_library(advanced_library=None)
