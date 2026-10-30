@@ -10,6 +10,7 @@ import asyncio
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
 
@@ -18,6 +19,8 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
     CancelFlowResultSuccess,
     ContinueExecutionStepRequest,
+    ControlFlowCancelledEvent,
+    InvolvedNodesEvent,
     ResolveNodeRequest,
     ResolveNodeResultSuccess,
     RunQueuedEvent,
@@ -30,6 +33,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 
 if TYPE_CHECKING:
@@ -265,3 +269,123 @@ async def test_a_debug_run_cancelled_while_a_step_checks_a_node_ends_when_the_st
     assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
     assert _state(engine, "Next") is NodeResolutionState.RESOLVED
     assert _state(engine, "Holder") is not NodeResolutionState.RESOLVED
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_slow_cancel_leaves_the_run_that_started_while_it_waited_alone(
+    engine: Engine, flow_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run ends on its own while its cancel waits, and the next run starts: the cancel leaves that run be."""
+    flow_manager = engine.flow_manager
+    next_gate = tmp_path / "gates" / "next.gate"
+    _set_parameter(engine, "Next", "gate_file", str(next_gate))
+
+    holding = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Holder")))
+    await _wait_for_state(engine, "Holder", NodeResolutionState.RESOLVING)
+    waiting = asyncio.create_task(engine.ahandle_request(StartFlowFromNodeRequest(node_name="Next")))
+    await asyncio.sleep(_WAITING_SECONDS)
+    assert not waiting.done(), waiting.result()
+
+    # Telling a worker to cancel its node is a send that can take a while; hold it until the next run starts.
+    sending, may_send = asyncio.Event(), asyncio.Event()
+
+    async def slow_send(node_name: str) -> None:  # noqa: ARG001
+        if sending.is_set():
+            return
+        sending.set()
+        await may_send.wait()
+
+    monkeypatch.setattr(engine.node_manager, "cancel_worker_execution", slow_send)
+    cancel = asyncio.create_task(engine.ahandle_request(CancelFlowRequest(flow_name=flow_name)))
+    await asyncio.wait_for(sending.wait(), timeout=_RUN_TIMEOUT_SECONDS)
+
+    _open_gate(tmp_path)
+    await _finish(holding)
+    await _wait_for_state(engine, "Next", NodeResolutionState.RESOLVING)
+    next_machine = flow_manager._global_control_flow_machine
+    sent: list[Any] = []
+    put_event = engine.event_manager.put_event
+
+    def record(event: Any) -> None:
+        sent.append(getattr(getattr(event, "wrapped_event", None), "payload", None))
+        put_event(event)
+
+    monkeypatch.setattr(engine.event_manager, "put_event", record)
+
+    may_send.set()
+    await _finish(cancel)
+
+    assert flow_manager._global_control_flow_machine is next_machine
+    assert flow_manager.check_for_existing_running_flow(), "the cancel stopped the next run's flow"
+    assert "Next" in flow_manager.global_dag_builder.node_to_reference, "the cancel cleared the next run's nodes"
+    told_stopped = [
+        type(payload).__name__
+        for payload in sent
+        if isinstance(payload, ControlFlowCancelledEvent)
+        or (isinstance(payload, InvolvedNodesEvent) and not payload.involved_nodes)
+    ]
+    assert told_stopped == [], f"the editor was told the next run stopped: {told_stopped}"
+    next_gate.parent.mkdir(parents=True, exist_ok=True)
+    next_gate.write_text("open")
+    assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
+    assert _state(engine, "Next") is NodeResolutionState.RESOLVED
+
+
+def _record_end_states(engine: Engine) -> list[str]:
+    """Record the state each run is in as the run queue ends it, which is how it says the run ended."""
+    flow_manager = engine.flow_manager
+    ended: list[str] = []
+    finish_run = flow_manager._finish_run
+
+    def recording_finish_run(run: Any) -> None:
+        if flow_manager._run_in_progress is run:
+            ended.append(run.state.value)
+        finish_run(run)
+
+    flow_manager._finish_run = recording_finish_run  # type: ignore[method-assign]
+    return ended
+
+
+@pytest.mark.parametrize(("fails", "state"), [(True, "failed"), (False, "finished")])
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_paused_debug_run_ends_saying_how_its_flow_stopped(
+    engine: Engine,
+    flow_name: str,
+    *,
+    fails: bool,
+    state: str,
+) -> None:
+    """A debug run pauses, then a continue runs it to the end; it ended failed if a node raised."""
+    _set_parameter(engine, "Holder", "gate_file", "")
+    if fails:
+
+        async def raise_instead() -> None:
+            msg = "Holder was set to fail."
+            raise RuntimeError(msg)
+
+        engine.node_manager.get_node_by_name("Holder").aprocess = raise_instead  # type: ignore[method-assign]
+    ended = _record_end_states(engine)
+
+    paused = await engine.ahandle_request(StartFlowFromNodeRequest(node_name="Holder", debug_mode=True))
+    assert isinstance(paused, StartFlowFromNodeResultSuccess), paused
+    assert ended == [], "the debug run ended instead of pausing"
+    await engine.ahandle_request(ContinueExecutionStepRequest(flow_name=flow_name))
+
+    assert ended == [state]
+
+
+@pytest.mark.usefixtures("parallel_mode", "flow_name")
+@pytest.mark.asyncio
+async def test_clearing_everything_ends_a_run_cancelled_even_when_stopping_it_fails(engine: Engine) -> None:
+    """Clear all tears the run down whatever its cancel does, so the run does not go on."""
+    _set_parameter(engine, "Holder", "gate_file", "")
+    ended = _record_end_states(engine)
+    paused = await engine.ahandle_request(StartFlowFromNodeRequest(node_name="Holder", debug_mode=True))
+    assert isinstance(paused, StartFlowFromNodeResultSuccess), paused
+
+    with patch.object(engine.flow_manager, "cancel_flow_run", side_effect=RuntimeError("worker gone")):
+        await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    assert ended == ["cancelled"]
