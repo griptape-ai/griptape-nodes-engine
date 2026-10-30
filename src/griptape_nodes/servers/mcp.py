@@ -4,7 +4,8 @@ import json
 import logging
 import os
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
@@ -12,17 +13,24 @@ from fastapi import FastAPI
 from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.exceptions import MCPError
 from mcp.types import (
+    INVALID_REQUEST,
     CallToolRequestParams,
     CallToolResult,
     ListToolsResult,
     PaginatedRequestParams,
     TextContent,
     Tool,
+    ToolAnnotations,
 )
 from pydantic import TypeAdapter
+from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
 
+from griptape_nodes.node_library.advanced_node_library import MCPTool
+from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.beta_features import library_config_slug
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
@@ -163,6 +171,26 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "GetLibrarySourceInfoRequest": GetLibrarySourceInfoRequest,
     "GetEngineSourceInfoRequest": GetEngineSourceInfoRequest,
 }
+ENGINE_TOOLS: dict[str, MCPTool] = {
+    name: MCPTool(request_type) for name, request_type in SUPPORTED_REQUEST_EVENTS.items()
+}
+
+# Libraries expose tools through AdvancedNodeLibrary.get_mcp_tools(). They are kept off the engine's
+# endpoint by default so a client only pays the context cost of the products it uses:
+#   /mcp/                        engine tools
+#   /mcp/?libraries=<slug>,...   engine tools plus the named libraries' tools
+#   /mcp/libraries/<slug>/       one library's tools only
+LIBRARIES_PATH_SEGMENT = "libraries"
+LIBRARIES_QUERY_PARAM = "libraries"
+
+
+@dataclass(frozen=True)
+class _ToolSelection:
+    """Which tools the endpoint a request arrived on serves."""
+
+    include_engine_tools: bool
+    library_slugs: frozenset[str]
+
 
 # Synthetic MCP tool name for the batch envelope. Not a request payload (and so not a member of
 # SUPPORTED_REQUEST_EVENTS); the call_tool dispatch special-cases it onto _dispatch_batch_to_engine.
@@ -249,7 +277,7 @@ def _trim_response(result: dict) -> dict:
     return trimmed
 
 
-def _event_request_batch_input_schema() -> dict[str, Any]:
+def _event_request_batch_input_schema(tool_names: list[str]) -> dict[str, Any]:
     """JSON schema for the synthetic EventRequestBatch tool.
 
     The `request` payload of each inner entry is left as a free-form object because JSON Schema
@@ -268,7 +296,7 @@ def _event_request_batch_input_schema() -> dict[str, Any]:
                     "properties": {
                         "request_type": {
                             "type": "string",
-                            "enum": sorted(SUPPORTED_REQUEST_EVENTS),
+                            "enum": tool_names,
                             "description": "Name of one of the supported single-request tools (e.g. CreateNodeRequest).",
                         },
                         "request": {
@@ -289,8 +317,8 @@ def _event_request_batch_input_schema() -> dict[str, Any]:
     }
 
 
-def _build_batch_pairs(raw_requests: object) -> list[tuple[str, dict[str, Any]]]:
-    """Validate the inner requests array and return (request_type, payload_dict) pairs.
+def _build_batch_requests(raw_requests: object, tools: dict[str, MCPTool]) -> list[RequestPayload]:
+    """Validate the inner requests array and build the request for each entry.
 
     Mirrors the single-request dispatch: each inner request is validated by instantiating the
     matching RequestPayload class so missing required fields and unknown kwargs fail fast,
@@ -303,13 +331,13 @@ def _build_batch_pairs(raw_requests: object) -> list[tuple[str, dict[str, Any]]]
         msg = "Attempted to dispatch EventRequestBatch. Failed because 'requests' was empty."
         raise ValueError(msg)
 
-    pairs: list[tuple[str, dict[str, Any]]] = []
+    requests: list[RequestPayload] = []
     for index, entry in enumerate(raw_requests):
         if not isinstance(entry, dict):
             msg = f"Attempted to dispatch EventRequestBatch entry {index}. Failed because the entry was not an object."
             raise TypeError(msg)
         request_type = entry.get("request_type")
-        if not isinstance(request_type, str) or request_type not in SUPPORTED_REQUEST_EVENTS:
+        if not isinstance(request_type, str) or request_type not in tools:
             msg = (
                 f"Attempted to dispatch EventRequestBatch entry {index}. "
                 f"Failed because request_type {request_type!r} is not a supported tool."
@@ -323,7 +351,7 @@ def _build_batch_pairs(raw_requests: object) -> list[tuple[str, dict[str, Any]]]
             )
             raise TypeError(msg)
 
-        payload_cls = SUPPORTED_REQUEST_EVENTS[request_type]
+        payload_cls = tools[request_type].request_type
         try:
             payload_obj = payload_cls(**inner)
         except TypeError as exc:
@@ -333,9 +361,9 @@ def _build_batch_pairs(raw_requests: object) -> list[tuple[str, dict[str, Any]]]
             )
             raise ValueError(msg) from exc
 
-        pairs.append((request_type, dict(payload_obj.__dict__)))
+        requests.append(payload_obj)
 
-    return pairs
+    return requests
 
 
 def _resolve_batch_timeout_ms(override: object, num_requests: int) -> int:
@@ -427,21 +455,26 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
     return await asyncio.shield(response_future)
 
 
-async def list_tools(_ctx: ServerRequestContext[Any], _params: PaginatedRequestParams | None) -> ListToolsResult:
-    """Advertise one tool per supported request event, plus the synthetic batch envelope."""
-    single_tools = [
-        Tool(name=event.__name__, description=event.__doc__, input_schema=TypeAdapter(event).json_schema())
-        for event in SUPPORTED_REQUEST_EVENTS.values()
-    ]
+async def list_tools(ctx: ServerRequestContext[Any], _params: PaginatedRequestParams | None) -> ListToolsResult:
+    """Advertise one tool per request the endpoint serves, plus the synthetic batch envelope.
+
+    A failure to work out the endpoint's tools is raised as an MCPError, so the client sees its
+    message rather than a generic internal error.
+    """
+    try:
+        tools = await _tools_for_request(ctx)
+    except ValueError as exc:
+        raise MCPError(INVALID_REQUEST, str(exc)) from exc
+    single_tools = [_tool_definition(tool) for tool in tools.values()]
     batch_tool = Tool(
         name=EVENT_REQUEST_BATCH_TOOL_NAME,
         description=EVENT_REQUEST_BATCH_DESCRIPTION,
-        input_schema=_event_request_batch_input_schema(),
+        input_schema=_event_request_batch_input_schema(sorted(tools)),
     )
     return ListToolsResult(tools=[*single_tools, batch_tool])
 
 
-async def call_tool(_ctx: ServerRequestContext[Any], params: CallToolRequestParams) -> CallToolResult:
+async def call_tool(ctx: ServerRequestContext[Any], params: CallToolRequestParams) -> CallToolResult:
     """Validate a tool call, dispatch it onto the engine loop, and return the trimmed response.
 
     Argument validation, unsupported tool names, and dispatch timeouts all raise, and every raise
@@ -449,41 +482,130 @@ async def call_tool(_ctx: ServerRequestContext[Any], params: CallToolRequestPara
     read the message and retry with corrected arguments, which a protocol error does not allow.
     """
     try:
-        payload = await _call_tool_payload(params.name, params.arguments or {})
+        tools = await _tools_for_request(ctx)
+        payload = await _call_tool_payload(params.name, params.arguments or {}, tools)
     except Exception as exc:
         return CallToolResult(content=[TextContent(text=str(exc))], is_error=True)
     return CallToolResult(content=[TextContent(text=payload)])
 
 
-async def _call_tool_payload(name: str, arguments: dict[str, Any]) -> str:
+async def _call_tool_payload(name: str, arguments: dict[str, Any], tools: dict[str, MCPTool]) -> str:
     """Dispatch one tool call and return its JSON text payload."""
     if name == EVENT_REQUEST_BATCH_TOOL_NAME:
-        pairs = _build_batch_pairs(arguments.get("requests"))
-        timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(pairs))
-        raw_results = await _dispatch_batch_to_engine(pairs, timeout_ms)
+        requests = _build_batch_requests(arguments.get("requests"), tools)
+        timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(requests))
+        raw_results = await _dispatch_batch_to_engine(requests, timeout_ms)
         mcp_server_logger.debug("Got %d batch results", len(raw_results))
         return json.dumps(_trim_batch_results(raw_results))
 
-    if name not in SUPPORTED_REQUEST_EVENTS:
+    if name not in tools:
         msg = f"Unsupported tool: {name}"
         raise ValueError(msg)
 
-    request_payload = SUPPORTED_REQUEST_EVENTS[name](**arguments)
+    request_payload = tools[name].request_type(**arguments)
     result = await _dispatch_to_engine(request_payload, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
     mcp_server_logger.debug("Got result: %s", result)
     return json.dumps(_trim_response(result))
 
 
-async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:
-    """Dispatch a batch of (request_type, payload) pairs concurrently onto the engine loop.
+async def _dispatch_batch_to_engine(requests: list[RequestPayload], timeout_ms: int) -> list[Any]:
+    """Dispatch a batch of requests concurrently onto the engine loop.
 
     Mirrors the single-request path but gathers the per-request futures. Failures are returned
     in their slot (return_exceptions semantics) so one bad inner request does not abort the rest;
     _trim_batch_results maps those exceptions to ok=false responses.
     """
-    coros = [_dispatch_to_engine(SUPPORTED_REQUEST_EVENTS[request_type](**payload)) for request_type, payload in pairs]
+    coros = [_dispatch_to_engine(request) for request in requests]
     gather = asyncio.gather(*coros, return_exceptions=True)
     return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
+
+
+async def _tools_for_request(ctx: ServerRequestContext[Any]) -> dict[str, MCPTool]:
+    """Return the tools, keyed by name, that the endpoint the request arrived on serves."""
+    selection = _tool_selection_for_request(ctx.request)
+    if not selection.library_slugs:
+        return dict(ENGINE_TOOLS)
+
+    library_tools = await _run_on_engine_loop(lambda: _collect_library_tools(selection.library_slugs))
+    if not selection.include_engine_tools:
+        if not library_tools:
+            slug = next(iter(selection.library_slugs))
+            msg = (
+                f"Attempted to list the MCP tools of library '{slug}'. Failed because no loaded library "
+                f"with that name exposes MCP tools. Check the library is loaded and the address uses its "
+                f"name in lowercase, with underscores for spaces."
+            )
+            raise ValueError(msg)
+        return library_tools
+
+    for name in library_tools.keys() & ENGINE_TOOLS.keys():
+        mcp_server_logger.warning(
+            "Library MCP tool '%s' has the same name as an engine tool; serving the engine's.", name
+        )
+    return {**library_tools, **ENGINE_TOOLS}
+
+
+def _tool_selection_for_request(request: object) -> _ToolSelection:
+    """Read which tools to serve from the request's path and query.
+
+    Anything other than an HTTP request (such as a test calling a handler directly) gets the
+    engine tools.
+    """
+    if not isinstance(request, Request):
+        return _ToolSelection(include_engine_tools=True, library_slugs=frozenset())
+
+    # The path relative to the /mcp mount, so "/mcp/libraries/nuke/" reads as ["libraries", "nuke"].
+    route_path = request.scope["path"].removeprefix(request.scope.get("root_path", ""))
+    segments = [segment for segment in route_path.split("/") if segment]
+    library_path_length = 2
+    if len(segments) == library_path_length and segments[0] == LIBRARIES_PATH_SEGMENT:
+        return _ToolSelection(include_engine_tools=False, library_slugs=frozenset({segments[1]}))
+
+    requested = request.query_params.get(LIBRARIES_QUERY_PARAM, "")
+    slugs = frozenset(slug.strip() for slug in requested.split(",") if slug.strip())
+    return _ToolSelection(include_engine_tools=True, library_slugs=slugs)
+
+
+def _collect_library_tools(slugs: frozenset[str]) -> dict[str, MCPTool]:
+    """Return the MCP tools of the loaded libraries whose slugs are given.
+
+    Must run on the engine loop: libraries load and unload there, and reading the registry from
+    another thread can catch it mid-change.
+    """
+    tools: dict[str, MCPTool] = {}
+    for library_name in LibraryRegistry.list_libraries():
+        if library_config_slug(library_name) not in slugs:
+            continue
+        for tool in LibraryRegistry.get_library(library_name).get_mcp_tools():
+            tools[tool.request_type.__name__] = tool
+    return tools
+
+
+def _tool_definition(tool: MCPTool) -> Tool:
+    """Describe a request type as an MCP tool."""
+    request_type = tool.request_type
+    annotations = None
+    if tool.read_only:
+        annotations = ToolAnnotations(read_only_hint=True)
+    return Tool(
+        name=request_type.__name__,
+        description=request_type.__doc__,
+        input_schema=TypeAdapter(request_type).json_schema(),
+        annotations=annotations,
+    )
+
+
+async def _run_on_engine_loop[T](func: Callable[[], T]) -> T:
+    """Run a synchronous function on the engine loop and await its result from the server's loop."""
+    engine_loop = GriptapeNodes.EventManager().event_loop
+    if engine_loop is None:
+        msg = "Attempted to read engine state for the MCP server. Failed because the engine is not running yet."
+        raise RuntimeError(msg)
+
+    async def run() -> T:
+        return func()
+
+    return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(run(), engine_loop))
 
 
 def start_mcp_server(sock: socket.socket) -> None:

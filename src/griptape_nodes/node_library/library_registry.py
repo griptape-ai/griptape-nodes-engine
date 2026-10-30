@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+    from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary, MCPTool
     from griptape_nodes.node_library.library_declarations import ResolvedModel
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
@@ -380,6 +380,8 @@ class LibraryRegistry:
                 event_manager.remove_manager_from_request_type(request_type)
             library._registered_request_handler_types.clear()
 
+        library._mcp_tools.clear()
+
     @classmethod
     def get_library(cls, name: str) -> Library:
         if name not in cls._libraries:
@@ -620,6 +622,8 @@ class Library:
     _registered_pre_dispatch_hooks: list[Callable]
     _registered_post_dispatch_hooks: list[tuple[type, Callable]]
     _registered_request_handler_types: list[type]
+    # Request types this library exposes on the engine's MCP server, read by servers/mcp.py.
+    _mcp_tools: list[MCPTool]
 
     def __init__(
         self,
@@ -645,6 +649,7 @@ class Library:
         self._registered_pre_dispatch_hooks = []
         self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
+        self._mcp_tools = []
 
     def get_beta_features(self) -> dict[str, BetaFeature]:
         """The valid beta features this library declares, keyed by id, including expired ones."""
@@ -684,6 +689,13 @@ class Library:
         Returns a copy; mutating the returned list has no effect.
         """
         return list(self._registered_request_handler_types)
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        """Return the request types this library exposes on the engine's MCP server.
+
+        Returns a copy; mutating the returned list has no effect.
+        """
+        return list(self._mcp_tools)
 
     def register_new_node_type(self, node_class: type[BaseNode], metadata: NodeMetadata) -> LibraryProblem | None:
         """Register a new node type in this library. Returns a LibraryProblem if registration fails, or None if all clear."""
