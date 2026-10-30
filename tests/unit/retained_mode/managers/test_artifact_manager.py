@@ -2004,7 +2004,7 @@ class TestProviderRegistrationConfigLogLevels:
         manager = ArtifactManager(engine=Mock())
         captured_requests: list[RequestPayload] = []
 
-        def capture_requests(request: RequestPayload) -> ResultPayload:
+        def capture_requests(request: RequestPayload, *, workflow_id: str | None = None) -> ResultPayload:  # noqa: ARG001
             captured_requests.append(request)
             return engine.handle_request(request)
 
@@ -2026,7 +2026,7 @@ class TestProviderRegistrationConfigLogLevels:
         manager = ArtifactManager(engine=Mock())
         captured_requests: list[RequestPayload] = []
 
-        def capture_requests(request: RequestPayload) -> ResultPayload:
+        def capture_requests(request: RequestPayload, *, workflow_id: str | None = None) -> ResultPayload:  # noqa: ARG001
             captured_requests.append(request)
             return engine.handle_request(request)
 

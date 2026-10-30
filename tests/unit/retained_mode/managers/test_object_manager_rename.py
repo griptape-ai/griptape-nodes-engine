@@ -9,7 +9,7 @@ from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntim
 class TestRenameToTakenName:
     def test_details_name_the_requested_name(self) -> None:
         engine = MagicMock()
-        workflow = WorkflowRuntime("wf")
+        workflow = WorkflowRuntime("wf", MagicMock())
         engine.current_workflow.return_value = workflow
         engine.current_workflow_or_none.return_value = workflow
         object_manager = ObjectManager(MagicMock(), engine=engine)
