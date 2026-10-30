@@ -174,7 +174,7 @@ class ModelDownloadStatus:
     """Model download status tracking byte-level progress."""
 
     model_id: str
-    status: str  # "downloading", "completed", "failed"
+    status: str  # "downloading", "paused", "completed", "failed"
     started_at: str
     updated_at: str
     total_bytes: int | None = None
@@ -241,6 +241,78 @@ class DeleteModelDownloadResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class DeleteModelDownloadResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Model download status deletion failed. Common causes: status not found, filesystem error, permission denied."""
+
+
+@dataclass
+@PayloadRegistry.register
+class PauseModelDownloadRequest(RequestPayload):
+    """Pause an in-progress model download, keeping the files it has finished.
+
+    Use when: Stopping a large download for now without losing its progress.
+    The download's status becomes "paused" and stays that way, across engine restarts,
+    until a ResumeModelDownloadRequest or DeleteModelDownloadRequest.
+
+    Args:
+        model_id: Model identifier whose download to pause
+
+    Results: PauseModelDownloadResultSuccess (download paused) | PauseModelDownloadResultFailure (not downloading)
+    """
+
+    model_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PauseModelDownloadResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Model download paused successfully.
+
+    Args:
+        model_id: The model ID whose download was paused
+    """
+
+    model_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PauseModelDownloadResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Model download pause failed. Common causes: no download in progress, download finished first."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ResumeModelDownloadRequest(RequestPayload):
+    """Resume a paused model download, skipping the files it had finished.
+
+    Use when: Continuing a download stopped with PauseModelDownloadRequest.
+    The file that was in progress when it paused downloads again from the start.
+    Completes when the download does, like DownloadModelRequest.
+
+    Args:
+        model_id: Model identifier whose download to resume
+
+    Results: ResumeModelDownloadResultSuccess (download completed) | ResumeModelDownloadResultFailure (not paused, download error)
+    """
+
+    model_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ResumeModelDownloadResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Resumed model download completed successfully.
+
+    Args:
+        model_id: The model ID that was downloaded
+    """
+
+    model_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ResumeModelDownloadResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Resumed model download failed. Common causes: download not paused, network error, paused again."""
 
 
 @dataclass

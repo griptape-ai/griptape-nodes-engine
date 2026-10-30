@@ -22,6 +22,7 @@ from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.node_library.library_registry import get_declared_models
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
@@ -46,7 +47,13 @@ from griptape_nodes.retained_mode.events.model_events import (
     ListModelsResultSuccess,
     ModelDownloadStatus,
     ModelInfo,
+    PauseModelDownloadRequest,
+    PauseModelDownloadResultFailure,
+    PauseModelDownloadResultSuccess,
     QueryInfo,
+    ResumeModelDownloadRequest,
+    ResumeModelDownloadResultFailure,
+    ResumeModelDownloadResultSuccess,
     SearchModelsRequest,
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
@@ -100,6 +107,10 @@ class DownloadParams:
     revision: str | None = None
     allow_patterns: list[str] | None = None
     ignore_patterns: list[str] | None = None
+
+
+class DownloadPausedError(Exception):
+    """Raised by a download task whose subprocess was stopped by a pause request."""
 
 
 _DOWNLOAD_PROGRESS_EMIT_INTERVAL = 1.0  # seconds between stdout progress events
@@ -379,6 +390,7 @@ class ModelManager(EngineScoped):
         super().__init__(engine)
         self._download_tasks = {}
         self._download_processes = {}
+        self._pausing_downloads: set[str] = set()
 
         if event_manager is not None:
             event_manager.register_request_handlers(self)
@@ -493,6 +505,13 @@ class ModelManager(EngineScoped):
             self._download_tasks[parsed_model_id] = task
 
             await task
+        except DownloadPausedError:
+            return DownloadModelResultFailure(
+                result_details=ResultDetails(
+                    message=f"Download of model '{parsed_model_id}' was paused before it finished.",
+                    level=logging.INFO,
+                ),
+            )
         except asyncio.CancelledError:
             # Handle task cancellation gracefully
             logger.info("Download request cancelled for model '%s'", parsed_model_id)
@@ -619,6 +638,9 @@ class ModelManager(EngineScoped):
             "total_bytes": 0,
             "downloaded_bytes": 0,
             "progress_percent": 0.0,
+            # Recorded so a resume downloads the same thing. Not part of ModelDownloadStatus.
+            "local_dir": download_params.local_dir,
+            "revision": download_params.revision,
         }
         await asyncio.to_thread(self._write_download_status, status_file, initial_data)
 
@@ -668,6 +690,19 @@ class ModelManager(EngineScoped):
                     "progress_percent": 100.0,
                 }
                 await asyncio.to_thread(self._write_download_status, status_file, final_data)
+            elif model_id in self._pausing_downloads:
+                # Finished files stay in the cache and the next download skips them. Hugging Face
+                # restarts the file that was in progress under a new temp name.
+                logger.info("Paused download of model '%s'", model_id)
+                paused_data = {
+                    **last_known,
+                    "status": "paused",
+                    "updated_at": current_time,
+                    "paused_at": current_time,
+                }
+                await asyncio.to_thread(self._write_download_status, status_file, paused_data)
+                msg = f"Download of model '{model_id}' was paused"
+                raise DownloadPausedError(msg)
             else:
                 # The child's structured event is the only thing here that describes the
                 # failure. Its stderr also carries progress frames and library warnings, so
@@ -697,8 +732,86 @@ class ModelManager(EngineScoped):
                 raise ValueError(error_msg)
 
         finally:
+            self._pausing_downloads.discard(model_id)
             if model_id in self._download_processes:
                 del self._download_processes[model_id]
+
+    @handles(PauseModelDownloadRequest)
+    async def on_handle_pause_model_download_request(self, request: PauseModelDownloadRequest) -> ResultPayload:
+        """Stop an in-progress download, keeping its finished files so a resume skips them.
+
+        The download task, not this handler, writes the "paused" status: it does so after the
+        subprocess's last progress event, which would otherwise overwrite it with "downloading".
+
+        Args:
+            request: The pause request containing model_id
+
+        Returns:
+            ResultPayload: Success once the download is paused, or failure if there was nothing to pause
+        """
+        model_id = request.model_id
+        process = self._download_processes.get(model_id)
+        task = self._download_tasks.get(model_id)
+        if process is None or task is None:
+            return PauseModelDownloadResultFailure(
+                result_details=f"Attempted to pause the download of model '{model_id}'. Failed because it is not downloading."
+            )
+
+        self._pausing_downloads.add(model_id)
+        await cancel_subprocess(process, f"download process for model '{model_id}'")
+        # Wait for the task to record the outcome. Its exception belongs to the download request awaiting it.
+        await asyncio.wait({task})
+
+        if task.cancelled():
+            return PauseModelDownloadResultFailure(
+                result_details=f"Attempted to pause the download of model '{model_id}'. Failed because the download was cancelled."
+            )
+        if not isinstance(task.exception(), DownloadPausedError):
+            return PauseModelDownloadResultFailure(
+                result_details=f"Attempted to pause the download of model '{model_id}'. Failed because the download finished first."
+            )
+
+        return PauseModelDownloadResultSuccess(
+            model_id=model_id,
+            result_details=f"Paused the download of model '{model_id}'",
+        )
+
+    @handles(ResumeModelDownloadRequest)
+    async def on_handle_resume_model_download_request(self, request: ResumeModelDownloadRequest) -> ResultPayload:
+        """Resume a paused download with the parameters it was started with.
+
+        Args:
+            request: The resume request containing model_id
+
+        Returns:
+            ResultPayload: Success once the download completes, or failure with error details
+        """
+        model_id = request.model_id
+        data = await asyncio.to_thread(_load_status_file, self._get_status_file_path(model_id))
+        if data is None or data.get("status") != "paused":
+            return ResumeModelDownloadResultFailure(
+                result_details=f"Attempted to resume the download of model '{model_id}'. Failed because it is not paused."
+            )
+        # Checked with no await before the download registers its task, so a second resume sees it.
+        if model_id in self._download_tasks:
+            return ResumeModelDownloadResultFailure(
+                result_details=f"Attempted to resume the download of model '{model_id}'. Failed because it is already downloading."
+            )
+
+        result = await self.on_handle_download_model_request(
+            DownloadModelRequest(
+                model_id=model_id,
+                local_dir=data.get("local_dir"),
+                revision=data.get("revision") or "main",
+            )
+        )
+        if isinstance(result, DownloadModelResultFailure):
+            return ResumeModelDownloadResultFailure(result_details=result.result_details, exception=result.exception)
+
+        return ResumeModelDownloadResultSuccess(
+            model_id=model_id,
+            result_details=f"Resumed and finished the download of model '{model_id}'",
+        )
 
     @handles(ListModelsRequest)
     async def on_handle_list_models_request(self, request: ListModelsRequest) -> ResultPayload:  # noqa: ARG002
@@ -1043,6 +1156,12 @@ class ModelManager(EngineScoped):
         # Find unfinished downloads to resume
         unfinished_models = await asyncio.to_thread(self._find_unfinished_downloads)
 
+        # A configured model the user paused waits for them to resume it
+        paused_models = await asyncio.to_thread(self._find_paused_downloads)
+        models_to_download = [
+            model_id for model_id in models_to_download if self._parse_model_id(model_id) not in paused_models
+        ]
+
         # Combine new downloads and unfinished ones, avoiding duplicates
         all_models = list(
             dict.fromkeys(
@@ -1179,6 +1298,10 @@ class ModelManager(EngineScoped):
                 unfinished_models.append(model_id)
 
         return unfinished_models
+
+    def _find_paused_downloads(self) -> set[str]:
+        """Find model IDs whose download the user paused."""
+        return {status.model_id for status in self._list_all_download_statuses() if status.status == "paused"}
 
     @staticmethod
     def _failure_is_worth_retrying(data: dict) -> bool:
