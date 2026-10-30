@@ -32,6 +32,9 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.worker_events import (
+    CheckLeaseRequest,
+    CheckLeaseResultFailure,
+    CheckLeaseResultSuccess,
     WorkerGoneError,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -144,6 +147,7 @@ def _make_node_manager(
     worker_manager = worker_manager or MagicMock()
     worker_manager.wait_until_executable = AsyncMock()
     worker_manager.acquire_lease = AsyncMock(return_value=None)
+    worker_manager.lease_refusal = AsyncMock(return_value=None)
     mock_engine.worker_manager = worker_manager
     return NodeManager(MagicMock(), engine=mock_engine)
 
@@ -759,6 +763,77 @@ def _create_echo_node(engine: Engine, flow_name: str) -> BaseNode:
     return engine.node_manager.get_node_by_name(result.node_name)
 
 
+class TestAWorkerAnotherEngineRuns:
+    """A worker another engine runs asks that engine, before each node, whether the node's lease holds it."""
+
+    @pytest.mark.asyncio
+    async def test_runs_the_node_once_that_engine_says_the_lease_holds_it(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        held = CheckLeaseResultSuccess(result_details="held")
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=held)
+        ) as ask:
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert ask.await_args is not None
+        engine_id, check = ask.await_args.args
+        assert engine_id == "gpu-01"
+        assert isinstance(check, CheckLeaseRequest)
+        assert check.lease_id == "lease-1"
+        assert check.worker_engine_id == worker_engine.get_engine_id()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_node_when_that_engine_says_the_lease_does_not_hold_it(
+        self, worker_engine: Engine
+    ) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        not_held = CheckLeaseResultFailure(result_details="that engine is not holding itself for your run now.")
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=not_held)
+        ):
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "not holding itself for your run" in str(result.result_details)
+        assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_node_sent_without_a_lease(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
+            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "without a lease" in str(result.result_details)
+        ask.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_node_when_that_engine_does_not_answer(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(side_effect=TimeoutError)
+        ):
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "did not answer" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_worker_on_this_machine_asks_no_engine(self, worker_engine: Engine) -> None:
+        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
+            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        ask.assert_not_awaited()
+
+
 class TestPreparingTheRequestForAWorker:
     """What the orchestrator puts in an ExecuteNodeRequest before it forwards it: what a save would write."""
 
@@ -919,13 +994,19 @@ class TestExecuteNodeWorkerRoute:
         node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
         calls: list[str] = []
         lease = EngineLease(lease_id="lease-1", host_engine_id="eng-2", run_id=None)
+        sent: list[str | None] = []
         success = {"result_type": ExecuteNodeResultSuccess.__name__, "result": {"result_details": "ok"}}
+
+        def run(event_request: Any, *_args: Any) -> dict:
+            calls.append("run")
+            sent.append(event_request.request.lease_id)
+            return success
 
         wm.worker_unavailable_reason.return_value = None
         wm.wait_until_executable = AsyncMock(side_effect=lambda *_: calls.append("wait"))
         wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
         lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
-        wm.route_to_worker = AsyncMock(side_effect=lambda *_: calls.append("run") or success)
+        wm.route_to_worker = AsyncMock(side_effect=run)
         wm.release_after_node = MagicMock(side_effect=lambda *_: calls.append("release"))
 
         request = ExecuteNodeRequest(
@@ -936,6 +1017,7 @@ class TestExecuteNodeWorkerRoute:
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert calls == ["wait", "acquire", "wait", "pick", "run", "release"]
+        assert sent == ["lease-1"], "the worker there checks the lease the node was sent under"
         wm.release_after_node.assert_called_once_with(lease)
 
     @pytest.mark.asyncio

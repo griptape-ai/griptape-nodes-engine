@@ -782,6 +782,9 @@ class ExecuteNodeRequest(RequestPayload):
             workflow's own folder to a workspace-relative path. These three mirror
             ContextManager.WorkflowContextState exactly; workflow_name None means the orchestrator
             had no workflow either, so there is nothing to adopt.
+        lease_id: The lease, on the engine that runs the worker, that the node is sent under. A worker
+            another engine runs asks that engine whether the lease holds it before running the node,
+            and refuses a node sent under none. None for a worker on this machine.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -798,6 +801,7 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
+    lease_id: str | None = None
 
 
 @dataclass

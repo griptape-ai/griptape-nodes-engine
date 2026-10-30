@@ -6,7 +6,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -15,6 +15,7 @@ from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    EventRequest,
     EventResultFailure,
     EventResultSuccess,
     ExecutionEvent,
@@ -34,6 +35,7 @@ from griptape_nodes.retained_mode.events.execution_events import NodeFinishProce
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.worker_events import CheckLeaseRequest, CheckLeaseResultSuccess
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -2296,3 +2298,63 @@ class TestNodeProcessEventTranslation:
             )
 
         assert received == [finish, finish]
+
+
+class _RecordingWorkerRequestClient:
+    """Stands in for a worker's RequestClient, recording where each request goes and answering it."""
+
+    def __init__(self, answer: dict) -> None:
+        self.answer = answer
+        self.sent: list[dict] = []
+
+    async def request_to_orchestrator(
+        self,
+        event_request: EventRequest,
+        orchestrator_request_topic: str,
+        worker_response_topic: str,
+        timeout_ms: int | None = None,
+    ) -> dict:
+        self.sent.append(
+            {
+                "request": event_request.request,
+                "request_topic": orchestrator_request_topic,
+                "response_topic": worker_response_topic,
+                "timeout_ms": timeout_ms,
+            }
+        )
+        return self.answer
+
+
+class TestAWorkerRequestingAnotherEngine:
+    """A worker another engine runs reaches that engine, not its orchestrator, as one of that engine's clients."""
+
+    @pytest.mark.asyncio
+    async def test_publishes_on_that_engine_s_topic_and_hears_back_on_its_own(self, engine: Engine) -> None:
+        client = _RecordingWorkerRequestClient(
+            {
+                "event_type": "EventResultSuccess",
+                "result_type": CheckLeaseResultSuccess.__name__,
+                "result": {"result_details": "held"},
+            }
+        )
+        engine.event_manager.configure_worker_forwarding(
+            request_client=client,  # type: ignore[arg-type]
+            orchestrator_request_topic="sessions/artist-sess/request",
+            worker_response_topic="sessions/artist-sess/workers/w1/response",
+            websocket_event_loop=asyncio.get_running_loop(),
+            timeout_ms=5000,
+        )
+        request = CheckLeaseRequest(lease_id="lease-1", worker_engine_id="w1")
+
+        with patch.object(engine, "get_engine_id", return_value="w1"):
+            result = await engine.event_manager.request_engine_from_worker("gpu-01", request)
+
+        assert isinstance(result, CheckLeaseResultSuccess)
+        assert client.sent == [
+            {
+                "request": request,
+                "request_topic": "engines/gpu-01/request",
+                "response_topic": "engines/w1/response",
+                "timeout_ms": 5000,
+            }
+        ]

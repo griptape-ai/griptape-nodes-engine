@@ -52,6 +52,7 @@ from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _REPORT_ATTEMPTS,
     _STATIC_URL_SETTLE_TIMEOUT_S,
+    HOST_ENGINE_ID_ENV,
     EngineLease,
     WorkerManager,
     WorkerRegistration,
@@ -3187,8 +3188,26 @@ class TestServingAnotherEnginesSession:
         args = cast("list[str]", spawned["args"])
         assert args[args.index("--session-id") + 1] == _ARTIST_SESSION
         assert spawned["library_name"] == _LIBRARY
-        # Nothing overrides the license or API key, so the worker inherits this machine's.
-        assert spawned["environ_overrides"] == {ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV: "http://workstation:8124"}
+        # Nothing overrides the license or API key, so the worker inherits this machine's. It knows this
+        # engine, which it asks before each node.
+        assert spawned["environ_overrides"] == {
+            ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV: "http://workstation:8124",
+            HOST_ENGINE_ID_ENV: _ENGINE,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_engine_with_no_id_starts_no_worker(self, worker_manager: WorkerManager) -> None:
+        """Its worker could not ask it before each node, so would run whatever it was sent."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        worker_manager.engine.get_engine_id.return_value = None  # type: ignore[attr-defined]
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "no engine ID" in str(result.result_details)
+        spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_the_worker_reaches_the_artist_the_way_the_artist_reached_this_engine(
@@ -3988,7 +4007,7 @@ class TestSharingThisEngineBetweenRuns:
         result = await _dispatched_by(worker_manager, intruder, _release("a1"))
 
         assert isinstance(result, EventResultFailure)
-        assert not worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.is_set()
+        assert worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].holds_engine
         worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
         await hold
 
@@ -4022,6 +4041,113 @@ class TestSharingThisEngineBetweenRuns:
         worker_manager._managed_worker_processes["Local Library"] = _worker_proc_mock()
 
         assert worker_manager._capacity_refusal(f"{_ARTIST_SESSION}/{_LIBRARY}") is None
+
+
+async def _checked_locally(
+    worker_manager: WorkerManager, lease_id: str = "a1", worker_engine_id: str = "w1"
+) -> EventResultSuccess | EventResultFailure:
+    """Dispatch a CheckLeaseRequest the way a worker this engine runs sends one: as one of its own clients."""
+    event_manager = EventManager()
+    event_manager.register_request_handlers(worker_manager)
+    request = worker_events.CheckLeaseRequest(lease_id=lease_id, worker_engine_id=worker_engine_id)
+    return await event_manager.ahandle_request(request)
+
+
+class TestAWorkerAskingWhetherItsNodeMayRun:
+    """The worker a node was sent to asks this engine, so this engine alone decides when other engines' nodes run."""
+
+    @pytest.mark.asyncio
+    async def test_a_lease_holding_this_engine_lets_the_node_run(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+        worker_manager._hosted_workers["w1"] = _HostedWorker(
+            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
+        )
+        hold = await _granted(worker_manager, line)
+
+        result = await _checked_locally(worker_manager)
+
+        assert isinstance(result.result, worker_events.CheckLeaseResultSuccess)
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
+        await hold
+
+    @pytest.mark.asyncio
+    async def test_a_lease_still_waiting_in_line_does_not(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        _FakeLine(worker_manager)
+        worker_manager._hosted_workers["w1"] = _HostedWorker(
+            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
+        )
+        acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
+        await _settle()
+
+        result = await _checked_locally(worker_manager)
+
+        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
+        assert "not holding itself" in str(result.result.result_details)
+        acquiring.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_released_lease_does_not(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+        worker_manager._hosted_workers["w1"] = _HostedWorker(
+            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
+        )
+        hold = await _granted(worker_manager, line)
+        await _sent_by(_ARTIST, worker_manager.handle_release_lease_request, _release("a1"))
+        await hold
+
+        result = await _checked_locally(worker_manager)
+
+        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_another_engine_s_lease_does_not_let_this_worker_run(self, worker_manager: WorkerManager) -> None:
+        """A worker runs only under a lease of the engine it serves, whatever lease it names."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+        worker_manager._hosted_workers["w-other"] = _HostedWorker(
+            worker_key="another-sess/lib", engine_id="another-artist-engine", session_id="another-sess"
+        )
+        hold = await _granted(worker_manager, line)
+
+        result = await _checked_locally(worker_manager, worker_engine_id="w-other")
+
+        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
+        await hold
+
+    @pytest.mark.asyncio
+    async def test_a_worker_this_engine_does_not_run_is_refused(self, worker_manager: WorkerManager) -> None:
+        result = await _checked_locally(worker_manager, worker_engine_id="stranger")
+
+        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
+        assert "runs no worker stranger" in str(result.result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_another_engine_may_not_ask(self, worker_manager: WorkerManager) -> None:
+        """Only the workers this engine runs reach it as its own clients."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+        worker_manager._hosted_workers["w1"] = _HostedWorker(
+            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
+        )
+        hold = await _granted(worker_manager, line)
+
+        result = await _dispatched_by(
+            worker_manager, _ARTIST, worker_events.CheckLeaseRequest(lease_id="a1", worker_engine_id="w1")
+        )
+
+        assert isinstance(result, EventResultFailure)
+        assert not isinstance(result.result, worker_events.CheckLeaseResultSuccess)
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
+        await hold
 
 
 def _in_run(worker_manager: WorkerManager, run_id: str = "run-1") -> MagicMock:

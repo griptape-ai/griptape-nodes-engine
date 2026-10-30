@@ -347,7 +347,8 @@ class AcquireLeaseRequest(RequestPayload):
     engine until `ReleaseLeaseRequest` releases it, so the run's later nodes there ask for nothing more.
 
     Args:
-        lease_id: Names this lease, in `ReleaseLeaseRequest` and `ReportPlaceInLineRequest`.
+        lease_id: Names this lease, in `ReleaseLeaseRequest`, `ReportPlaceInLineRequest`, and on each
+            `ExecuteNodeRequest` sent under it.
         run_id: The run the lease is for, or None for a node run on its own, which has a lease of its own.
     """
 
@@ -423,6 +424,37 @@ class ReportPlaceInLineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
 @PayloadRegistry.register
 class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The place in line came from an engine other than the one the lease waits on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckLeaseRequest(RequestPayload):
+    """Sent by a worker that another engine runs, to that engine, before it runs a node.
+
+    The engine answers whether the lease the node was sent under holds it now, for the engine the
+    worker serves. A node sent under no lease, or one that does not hold it, does not run, so only the
+    engine that runs the worker decides when its workers run another engine's nodes.
+
+    Args:
+        lease_id: The `lease_id` the `ExecuteNodeRequest` carried.
+        worker_engine_id: The worker asking, which names the engine it serves.
+    """
+
+    lease_id: str
+    worker_engine_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The lease holds the engine for the engine the worker serves, so the node may run."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The lease does not hold the engine, so the node may not run, with why."""
 
 
 @dataclass

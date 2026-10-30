@@ -3417,7 +3417,9 @@ class NodeManager(EngineScoped):
         the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values.
+        parameter values. A worker another engine runs first asks that engine
+        whether the lease the node was sent under holds it, and refuses the
+        node if not.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
@@ -3428,6 +3430,9 @@ class NodeManager(EngineScoped):
         node = None
         if is_worker:
             library_name = (request.node_metadata or {}).get("library")
+            lease_refusal = await self.engine.worker_manager.lease_refusal(request.node_name, request.lease_id)
+            if lease_refusal is not None:
+                return ExecuteNodeResultFailure(result_details=lease_refusal)
         else:
             obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
@@ -3769,6 +3774,8 @@ class NodeManager(EngineScoped):
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:
                 return preparation_failure
+            if lease is not None:
+                request.lease_id = lease.lease_id
             return await self._execute_node_via_worker(request, wm, worker)
         finally:
             wm.release_after_node(lease)

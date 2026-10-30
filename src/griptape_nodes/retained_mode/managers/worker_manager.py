@@ -82,6 +82,10 @@ _ENGINE_REQUEST_TIMEOUT_S = 60.0
 _REPORT_ATTEMPTS = 5
 _REPORT_RETRY_PAUSE_S = 10.0
 
+# Set on a worker this engine runs for another engine, to this engine's ID. The worker asks this engine,
+# before each node, whether the lease the node was sent under holds it.
+HOST_ENGINE_ID_ENV = "GTN_HOST_ENGINE_ID"
+
 
 @dataclass
 class _SessionRegistration:
@@ -145,6 +149,11 @@ class _EngineRun:
     @property
     def key(self) -> tuple[str, str]:
         return (self.engine_id, self.lease_id)
+
+    @property
+    def holds_engine(self) -> bool:
+        """Whether the lease holds this engine now: granted, and not yet released."""
+        return self.granted.done() and self.granted.result() is None and not self.released.is_set()
 
 
 @dataclass
@@ -296,6 +305,10 @@ class WorkerManager(EngineScoped):
 
         # Reports and lease releases sent to other engines from synchronous callbacks, held until answered.
         self._engine_notices: set[asyncio.Task] = set()
+
+        # The engine that runs this worker for another engine, which decides when it may run each node,
+        # or None for any other engine.
+        self._host_engine_id: str | None = os.environ.get(HOST_ENGINE_ID_ENV)
 
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
@@ -1074,6 +1087,34 @@ class WorkerManager(EngineScoped):
             self._report_until_answered(lease.host_engine_id, request, f"lease {lease.lease_id} was released")
         )
 
+    async def lease_refusal(self, node_name: str, lease_id: str | None) -> str | None:
+        """Why this worker must not run the node now, or None if it may.
+
+        A worker another engine runs asks that engine whether the lease the node was sent under holds it
+        now. Any other worker runs each node it is sent.
+        """
+        host_engine_id = self._host_engine_id
+        if host_engine_id is None:
+            return None
+        if lease_id is None:
+            return (
+                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because it was sent "
+                "without a lease on that engine, so that engine had not agreed to run it."
+            )
+        request = worker_events.CheckLeaseRequest(
+            lease_id=lease_id, worker_engine_id=cast("str", self.engine.get_engine_id())
+        )
+        try:
+            result = await self._event_manager.request_engine_from_worker(host_engine_id, request)
+        except TimeoutError:
+            return (
+                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because that engine "
+                "did not answer whether it may run the node."
+            )
+        if not result.succeeded():
+            return f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
+        return None
+
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL the workspace is served on, awaited until initialization decides it.
 
@@ -1648,10 +1689,13 @@ class WorkerManager(EngineScoped):
         resolved = self._worker_command(library_name, session_id)
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
+        # `_start_refusal` refuses a start while this engine has none.
+        own_engine_id = cast("str", self.engine.get_engine_id())
         # Read before anything awaits, since a lost connection can forget the session meanwhile.
         session = self._sessions[session_id]
-        # The worker runs on this machine's license or API key, which it inherits like a local worker.
-        environ_overrides: dict[str, str] = {}
+        # The worker runs on this machine's license or API key, which it inherits like a local worker. It
+        # runs a node only while this engine holds itself for the lease the node was sent under.
+        environ_overrides: dict[str, str] = {HOST_ENGINE_ID_ENV: own_engine_id}
         # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
         if session.static_server_base_url is not None:
             environ_overrides[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = session.static_server_base_url
@@ -1704,6 +1748,10 @@ class WorkerManager(EngineScoped):
         self, library_name: str, session_id: str, worker_key: str
     ) -> worker_events.StartWorkerForEngineResultFailure | None:
         """The failure a start of `worker_key`'s worker for that session returns, or None if this engine will start it."""
+        if self.engine.get_engine_id() is None:
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details="this engine has no engine ID, which its workers need to ask it before each node."
+            )
         refusal = self._refusal_to_serve(library_name, session_id)
         if refusal is not None:
             return worker_events.StartWorkerForEngineResultFailure(
@@ -1861,6 +1909,32 @@ class WorkerManager(EngineScoped):
         await self._end_engine_run(engine_run, "its lease was released.")
         return worker_events.ReleaseLeaseResultSuccess(
             result_details=f"Released lease {request.lease_id} of engine {engine_id}."
+        )
+
+    @handles(worker_events.CheckLeaseRequest)
+    def handle_check_lease_request(
+        self, request: worker_events.CheckLeaseRequest
+    ) -> worker_events.CheckLeaseResultSuccess | worker_events.CheckLeaseResultFailure:
+        """Answer a worker this engine runs whether the lease its node was sent under holds this engine now.
+
+        Takes no sender rule, so it is answered only for this engine's own clients, which is how the
+        workers it runs reach it. Answered for the engine the worker serves, whatever lease it names.
+        """
+        engine_id = self.hosted_for(request.worker_engine_id)
+        if engine_id is None:
+            return worker_events.CheckLeaseResultFailure(
+                result_details=f"this engine runs no worker {request.worker_engine_id} for another engine."
+            )
+        engine_run = self._engine_runs.get((engine_id, request.lease_id))
+        if engine_run is None or not engine_run.holds_engine:
+            return worker_events.CheckLeaseResultFailure(
+                result_details=(
+                    f"that engine is not holding itself for engine {engine_id}'s run now. The run may have "
+                    "ended, or another run has that engine."
+                )
+            )
+        return worker_events.CheckLeaseResultSuccess(
+            result_details=f"Lease {request.lease_id} of engine {engine_id} holds this engine."
         )
 
     @handles(
