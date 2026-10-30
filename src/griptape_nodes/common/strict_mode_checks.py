@@ -39,7 +39,6 @@ class StrictModeRule:
     correctness: bool
     description: str
     remediation_template: str
-    worker_escalation: bool = True
 
     def render(self, **context: Any) -> str:
         return self.remediation_template.format(**context)

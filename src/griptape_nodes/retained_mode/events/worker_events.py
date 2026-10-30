@@ -132,10 +132,10 @@ class UnregisterWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 @dataclass
 @PayloadRegistry.register
 class StartWorkerRequest(RequestPayload):
-    """Internal request to spawn a worker subprocess for a library that requires one.
+    """Internal request to spawn a worker subprocess for a library whose nodes execute in one.
 
-    Sent by LibraryManager when a worker-delegated library finishes loading on the
-    orchestrator. WorkerManager handles this by waiting for an active session then
+    Sent by LibraryManager when a library that declares pip_dependencies_exec finishes loading on
+    the orchestrator. WorkerManager handles this by waiting for an active session then
     spawning the worker subprocess.
 
     Args:

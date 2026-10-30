@@ -114,8 +114,7 @@ def _default_severity_resolver(*, rule_id: str, is_worker: bool) -> StrictModeSe
 
     Correctness rules ({@code correctness=True} in the registry) fail on
     both sides. Non-correctness rules warn on the orchestrator and
-    escalate to ERROR on the worker (subject to the rule's
-    ``worker_escalation`` flag). Unregistered rules fall back to the
+    escalate to ERROR on the worker. Unregistered rules fall back to the
     historical worker=ERROR / orchestrator=WARNING split so detectors
     can land before the registry entry is added.
     """
@@ -137,7 +136,7 @@ def _default_severity_resolver(*, rule_id: str, is_worker: bool) -> StrictModeSe
         return StrictModeSeverity.ERROR if is_worker else StrictModeSeverity.WARNING
     if rule.correctness:
         return StrictModeSeverity.ERROR
-    if is_worker and rule.worker_escalation:
+    if is_worker:
         return StrictModeSeverity.ERROR
     return StrictModeSeverity.WARNING
 

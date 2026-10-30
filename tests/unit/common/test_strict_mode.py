@@ -49,7 +49,6 @@ def fake_rules() -> Iterator[None]:
         correctness=False,
         description="synthetic ergonomics rule for tests",
         remediation_template="ergonomics: {detail}",
-        worker_escalation=False,
     )
     correctness = StrictModeRule(
         rule_id="fake-correctness",
@@ -255,6 +254,20 @@ class TestReporterReport:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(errors) == 1
         assert len(warnings) == 0
+
+    def test_worker_escalates_ergonomics_rule_to_error(
+        self,
+        reporter: StrictModeReporter,
+        fake_rules: None,  # noqa: ARG002
+    ) -> None:
+        with reporter.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="n",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            reporter.report(rule_id="fake-ergonomics", message="something bad")
+            assert scope.violations[0].severity is StrictModeSeverity.ERROR
 
 
 class TestSeverityResolverInjection:
