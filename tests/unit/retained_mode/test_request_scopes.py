@@ -574,3 +574,41 @@ class TestForwardingDecidedOnce:
         assert len(handler.forwarded) == 1
         assert handler.forwards_now_calls == 1
         assert calls.workflows == []
+
+
+class TestAddressingFailures:
+    def test_post_dispatch_hooks_see_an_addressing_failure(self, engine: Engine, calls: _Calls) -> None:
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+        seen: list[ResultPayload] = []
+
+        def hook(request: RequestPayload, result: ResultPayload) -> None:  # noqa: ARG001
+            seen.append(result)
+
+        engine.event_manager.add_post_dispatch_hook(_ScopeProbeRequest, hook)
+        try:
+            result_event = engine.event_manager.handle_request(
+                _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=NOT_OPEN_ID)
+            )
+        finally:
+            engine.event_manager.remove_post_dispatch_hook(_ScopeProbeRequest, hook)
+
+        assert seen == [result_event.result]
+        assert isinstance(result_event.result, WorkflowNotOpenResultFailure)
+
+
+class TestRemoteHandlerOutOfNodeExecution:
+    def test_on_its_sync_local_path_it_passes_the_workflow_through(self, engine: Engine, calls: _Calls) -> None:
+        event_manager = engine.event_manager
+        workflow = _open_workflow(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+        original = event_manager.get_manager_for_request_type(_ScopeProbeRequest)
+        event_manager.replace_manager_for_request_type(
+            _ScopeProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
+        )
+
+        result_event = event_manager.handle_request(
+            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+        )
+
+        assert result_event.succeeded()
+        assert calls.workflows == [workflow]
