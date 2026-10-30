@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from griptape_nodes.exe_types.node_types import BaseNode, Connection
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultFailure,
@@ -41,6 +43,10 @@ from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultSuccess,
     DeleteNodeRequest,
     SerializeNodeToCommandsRequest,
+)
+from griptape_nodes.retained_mode.events.validation_events import (
+    ValidateFlowDependenciesRequest,
+    ValidateFlowDependenciesResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -135,6 +141,31 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         assert other.objects.has("canvas")
         assert engine.current_workflow().flows.name_to_parent_name == {}
         assert not engine.object_manager.has_object_with_name("canvas")
+
+    def test_validating_from_a_node_follows_the_connections_of_the_workflow_it_is_handed(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        other = WorkflowRuntime("other", engine)
+        engine.flow_manager.on_create_flow_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"), other)
+        start = MagicMock(spec=BaseNode)
+        start.name = "start"
+        start.validate_before_workflow_run.return_value = []
+        downstream = MagicMock(spec=BaseNode)
+        downstream.name = "downstream"
+        downstream.validate_before_workflow_run.return_value = []
+        other.objects.add("start", start)
+        other.objects.add("downstream", downstream)
+        other.flows.connections.connections[0] = Connection(start, MagicMock(), downstream, MagicMock())
+        other.flows.connections.outgoing_index["start"] = {"out": [0]}
+        other.flows.connections.incoming_index["downstream"] = {"in": [0]}
+
+        result = asyncio.run(
+            engine.flow_manager.on_validate_flow_dependencies_request(
+                ValidateFlowDependenciesRequest(flow_name="canvas", flow_node_name="start"), other
+            )
+        )
+
+        assert isinstance(result, ValidateFlowDependenciesResultSuccess)
+        downstream.validate_before_workflow_run.assert_called_once_with()
 
 
 class TestNestedRequestsCarryTheHandlersWorkflow:

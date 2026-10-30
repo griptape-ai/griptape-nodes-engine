@@ -3636,7 +3636,7 @@ class FlowManager(EngineScoped):
                 details = f"Provided node with name {flow_node_name} does not exist"
                 return ValidateFlowDependenciesResultFailure(result_details=details)
             # Gets all nodes in that connected group to be ran
-            nodes = flow.get_all_connected_nodes(flow_node)
+            nodes = self.get_all_connected_nodes_in(workflow, flow_node)
         else:
             nodes = flow.nodes.values()
         # If we're just running the whole flow
@@ -6041,7 +6041,35 @@ class FlowManager(EngineScoped):
 
     def get_connections_on_node(self, node: BaseNode) -> list[BaseNode] | None:
         """Edge method for code not handed a workflow."""
-        connections = self.get_connections()
+        return self._connected_nodes(self.get_connections(), node)
+
+    def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:
+        """Edge method for code not handed a workflow; engine code calls `get_all_connected_nodes_in`."""
+        return self._all_connected_nodes(self.get_connections(), node)
+
+    def get_all_connected_nodes_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode]:
+        """Every node reachable from `node` through the workflow's connections, `node` first."""
+        return self._all_connected_nodes(workflow.flows.connections, node)
+
+    def _all_connected_nodes(self, connections: Connections, node: BaseNode) -> list[BaseNode]:
+        discovered = {}
+        processed = {}
+        queue = Queue()
+        queue.put(node)
+        discovered[node] = True
+        while not queue.empty():
+            curr_node = queue.get()
+            processed[curr_node] = True
+            next_nodes = self._connected_nodes(connections, curr_node)
+            if next_nodes:
+                for next_node in next_nodes:
+                    if next_node not in discovered:
+                        discovered[next_node] = True
+                        queue.put(next_node)
+        return list(processed.keys())
+
+    @staticmethod
+    def _connected_nodes(connections: Connections, node: BaseNode) -> list[BaseNode]:
         # get all of the connection ids
         connected_nodes = []
         # Handle outgoing connections
@@ -6066,24 +6094,6 @@ class FlowManager(EngineScoped):
                     connected_nodes.append(connection.source_node)
         # Return all connected nodes. No duplicates
         return connected_nodes
-
-    def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:
-        """Edge method for code not handed a workflow."""
-        discovered = {}
-        processed = {}
-        queue = Queue()
-        queue.put(node)
-        discovered[node] = True
-        while not queue.empty():
-            curr_node = queue.get()
-            processed[curr_node] = True
-            next_nodes = self.get_connections_on_node(curr_node)
-            if next_nodes:
-                for next_node in next_nodes:
-                    if next_node not in discovered:
-                        discovered[next_node] = True
-                        queue.put(next_node)
-        return list(processed.keys())
 
     def is_node_connected(self, start_node: BaseNode, node: BaseNode) -> list[str]:
         """Check if node is in the forward control path from start_node, returning boundary nodes if connected.
