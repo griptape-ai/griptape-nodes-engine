@@ -106,7 +106,7 @@ def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntim
 
 def _open_two(engine: Engine) -> list[WorkflowRuntime]:
     """Two workflows open at once, through the test seam that allows it."""
-    engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
     opened = []
     for display_name in ("A", "B"):
         workflow = engine.workflow_registry.register_unsaved(display_name, listed=False)
@@ -346,3 +346,35 @@ class TestHostReads:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.current_workflow_id == workflow.workflow_id
+
+
+class TestRequestsARuntimeSends:
+    """A runtime's requests act on that runtime's workflow, whatever its caller has bound."""
+
+    @pytest.mark.asyncio
+    async def test_they_act_on_the_runtimes_workflow(self, engine: Engine, calls: _Calls) -> None:
+        a, b = _open_two(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        with engine.bind_workflow(a):
+            sync_result = b.handle_request(_ScopeProbeRequest())
+            async_result = await b.ahandle_request(_ScopeProbeRequest())
+
+        assert sync_result.succeeded()
+        assert async_result.succeeded()
+        assert calls.workflows == [b, b]
+        assert calls.current == [b, b]
+
+    @pytest.mark.asyncio
+    async def test_a_closed_runtimes_requests_are_refused_not_sent_to_the_open_one(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        closed = _open_workflow(engine, "closed")
+        engine.close_workflow(closed)
+        _open_workflow(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        result = await closed.ahandle_request(_ScopeProbeRequest())
+
+        assert isinstance(result, WorkflowNotOpenResultFailure)
+        assert calls.workflows == []

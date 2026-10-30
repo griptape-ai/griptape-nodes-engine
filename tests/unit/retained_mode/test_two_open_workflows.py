@@ -1,7 +1,7 @@
 """Two workflows open in one engine at once, driven through dispatch with envelope workflow ids.
 
 Not a feature test: the engine opens one workflow at a time. Each test drives the foundation with a
-second workflow open next to the first (`OpenWorkflowSet(allow_several_open=True)`, a test seam), to
+second workflow open next to the first (`OpenWorkflowSet(engine, allow_several_open=True)`, a test seam), to
 check that each workflow's state and teardown stay its own. A gap later work closes is a strict xfail
 with the gap as its reason.
 """
@@ -235,7 +235,7 @@ def spike_library() -> Iterator[None]:
 
 def _allow_several_open(engine: Engine) -> None:
     """Swap in an open set that lets a second workflow open next to the first (the spike's one switch)."""
-    engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
 
 
 def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
