@@ -159,6 +159,27 @@ class TestGenericValidators:
         node.set_parameter_value("prompts", ["too many words", "also too many"])
         assert _messages(validate_inputs(node)) == ["Input 1 in 'prompts' has 3 words and the limit is 1."]
 
+    @pytest.mark.parametrize("wrap", [lambda v: v, lambda v: v.first(1)], ids=["bare", "first"])
+    def test_a_validators_own_fit_rule_holds_through_a_wrapper(self, wrap: Any) -> None:
+        @dataclass(frozen=True)
+        class TextOnly(PreRunValidator):
+            @override
+            def check(
+                self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None
+            ) -> NodeError | None:
+                return None
+
+            @override
+            def require_fits(self, parameter: Parameter) -> None:
+                super().require_fits(parameter)
+                if parameter.type != "str":
+                    msg = f"TextOnly refuses {parameter.type}"
+                    raise TypeError(msg)
+
+        ParameterString(name="prompt", pre_run_validators=[wrap(TextOnly())])
+        with pytest.raises(TypeError, match="TextOnly refuses int"):
+            ParameterInt(name="count", pre_run_validators=[wrap(TextOnly())])
+
     def test_validate_node_reports_the_validators_then_the_nodes_own(self) -> None:
         own = ValueError("Pick a model.")
 

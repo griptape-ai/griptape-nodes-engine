@@ -209,6 +209,13 @@ class _MediaWrapped(MediaValidator):
     def candidates(self) -> Sequence[PreRunValidator]:
         return [replace(self, inner=validator) for validator in self.inner.candidates()]
 
+    # A condition can read more than the validator inside, so this wrapper's own `needs` must fit
+    # too; then the validator inside applies any rules it adds of its own.
+    @override
+    def require_fits(self, parameter: Parameter) -> None:
+        super().require_fits(parameter)
+        self.inner.require_fits(parameter)
+
 
 @dataclass(frozen=True)
 class _Conditional(_MediaWrapped):

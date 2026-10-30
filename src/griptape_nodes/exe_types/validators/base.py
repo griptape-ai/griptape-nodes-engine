@@ -111,6 +111,11 @@ class _FirstItems(PreRunValidator):
     def candidates(self) -> Sequence[PreRunValidator]:
         return [validator.first(self.count) for validator in self.inner.candidates()]
 
+    # The validator inside decides whether it fits, including any rules it adds of its own.
+    @override
+    def require_fits(self, parameter: Parameter) -> None:
+        self.inner.require_fits(parameter)
+
     @override
     def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
         if position is not None and position > self.count:

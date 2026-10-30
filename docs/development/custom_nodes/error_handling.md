@@ -375,7 +375,7 @@ The rest are for image, video and audio files; see "Limits on media files" below
 **Messages name the input.** Each message starts with the parameter's display name: "The input in
 'Prompt'". On a `ParameterList`, each item is checked on its own and named by its position,
 "Input 2 in 'prompts'", while `MaxCount` checks the list's length. A media parameter says what it
-holds instead of "input": "The image in 'Start Frame'", "Video 2 in 'clips'".
+holds instead of "input": "The image in 'Start Frame'", "Video 2 in 'clips'", "The audio clip in 'Voice'".
 
 **Limits that depend on a setting.** When the limits change with the selected model, wrap them in
 `IfParameter`. At the node's turn it picks the list for the other parameter's current value, or
