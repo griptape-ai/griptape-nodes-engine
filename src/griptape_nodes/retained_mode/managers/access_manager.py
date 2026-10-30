@@ -74,7 +74,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointAttribute,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -129,7 +129,7 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} candidate model(s).",
         )
 
-    @handles(QueryModelAccessForNodeRequest)
+    @handles(QueryModelAccessForNodeRequest, scope=RequestScope.HOST)
     def on_query_model_access_for_node_request(self, request: QueryModelAccessForNodeRequest) -> ResultPayload:
         """Node-attributed. Engine derives candidates from declarations unless caller overrides."""
         try:
