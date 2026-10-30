@@ -86,7 +86,7 @@ class ObjectManager(EngineScoped):
             # Let the object's manager know. TODO: https://github.com/griptape-ai/griptape-nodes/issues/869
         match source_obj:
             case ControlFlow():
-                self.engine.flow_manager.handle_flow_rename(old_name=request.object_name, new_name=final_name)
+                self.engine.flow_manager.handle_flow_rename(workflow, old_name=request.object_name, new_name=final_name)
             case BaseNode():
                 self.engine.node_manager.handle_node_rename(old_name=request.object_name, new_name=final_name)
             case _:

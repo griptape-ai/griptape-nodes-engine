@@ -1095,16 +1095,17 @@ class FlowManager(EngineScoped):
         for node in flow.nodes.values():
             node.state = NodeResolutionState.UNRESOLVED
 
-    def handle_flow_rename(self, old_name: str, new_name: str) -> None:
+    def handle_flow_rename(self, workflow: WorkflowRuntime, old_name: str, new_name: str) -> None:
         # Replace the old flow name and its parent first.
-        parent = self._name_to_parent_name[old_name]
-        self._name_to_parent_name[new_name] = parent
-        del self._name_to_parent_name[old_name]
+        name_to_parent_name = workflow.flows.name_to_parent_name
+        parent = name_to_parent_name[old_name]
+        name_to_parent_name[new_name] = parent
+        del name_to_parent_name[old_name]
 
         # Now iterate through everyone who pointed to the old one as a parent and update it.
-        for flow_name, parent_name in self._name_to_parent_name.items():
+        for flow_name, parent_name in name_to_parent_name.items():
             if parent_name == old_name:
-                self._name_to_parent_name[flow_name] = new_name
+                name_to_parent_name[flow_name] = new_name
 
         # Let the Node Manager know about the change, too.
         self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
@@ -5297,6 +5298,10 @@ class FlowManager(EngineScoped):
         finally:
             _current_run_id.reset(token)
             self._finish_run_if_over(flows)
+
+    def check_for_existing_running_flow_in(self, workflow: WorkflowRuntime) -> bool:
+        """Whether the workflow has a run in progress."""
+        return self._flow_is_running(workflow.flows)
 
     def check_for_existing_running_flow(self) -> bool:
         flows = self._current_flows_or_none()
