@@ -33,6 +33,7 @@ from griptape_nodes.exe_types.param_types.parameter_string import ParameterStrin
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
+from griptape_nodes.exe_types.validators import media_validator
 from griptape_nodes.exe_types.validators._runner import (
     validate_inputs,
     validate_node,
@@ -269,9 +270,11 @@ class TestLists:
             )
         )
 
-    def test_a_whole_list_media_validator_reads_nothing(self, tmp_path: Path) -> None:
-        # A validator handed the whole list judges the list, so no item's file is read for it.
+    def test_a_whole_list_media_validator_reads_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A validator handed the whole list judges the list, so nothing is read for it.
         seen: list[MediaInfo] = []
+        reads_attempted: list[object] = []
+        monkeypatch.setattr(media_validator, "read_media", lambda value, *_a, **_k: reads_attempted.append(value))
 
         class TotalSize(MediaValidator):
             checks_whole_list = True
@@ -288,6 +291,7 @@ class TestLists:
         node.set_parameter_value("reference_images", [str(image_file(tmp_path, 10, 10))])
         assert validate_inputs(node) == []
         assert seen == [MediaInfo()]
+        assert reads_attempted == []
 
     def test_checks_each_item_by_its_position(self, tmp_path: Path) -> None:
         node = self._list_node(SideRange(min=300))
