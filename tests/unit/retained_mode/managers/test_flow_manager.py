@@ -171,7 +171,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_without_metadata)
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands is None
@@ -183,7 +183,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_unrelated_metadata)
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands is None
@@ -193,7 +193,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path="/does/not/exist.png")
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
@@ -203,7 +203,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_flow_commands)
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands == empty_flow_commands
@@ -221,7 +221,7 @@ class TestExtractFlowCommandsFromImageMetadata:
     def test_returns_failure_when_flow_commands_are_unreadable(self, engine: Engine, text: str, reason: str) -> None:
         path = _image_with_flow_commands_text(text)
         try:
-            result = engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+            result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
                 ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
             )
         finally:
@@ -241,7 +241,7 @@ class TestExtractFlowCommandsFromImageMetadata:
             return image
 
         with patch.object(Image, "open", _open):
-            engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+            engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
                 ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
             )
 
@@ -888,7 +888,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
         flow_manager = engine.flow_manager
         flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
 
-        result = flow_manager.on_serialize_flow_to_commands(
+        result = flow_manager.serialization.on_serialize_flow_to_commands(
             SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
         )
         assert isinstance(result, SerializeFlowToCommandsResultSuccess)
@@ -940,7 +940,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
 
         # Serialization must succeed (not fail on the transient flow's internal connection) and
         # must not include the transient flow.
-        result = flow_manager.on_serialize_flow_to_commands(
+        result = flow_manager.serialization.on_serialize_flow_to_commands(
             SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
         )
         assert isinstance(result, SerializeFlowToCommandsResultSuccess), result
