@@ -10,6 +10,7 @@ import asyncio
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
 
@@ -30,6 +31,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 
 if TYPE_CHECKING:
@@ -265,3 +267,62 @@ async def test_a_debug_run_cancelled_while_a_step_checks_a_node_ends_when_the_st
     assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
     assert _state(engine, "Next") is NodeResolutionState.RESOLVED
     assert _state(engine, "Holder") is not NodeResolutionState.RESOLVED
+
+
+def _record_end_states(engine: Engine) -> list[str]:
+    """Record the state each run is in as the run queue ends it, which is how it says the run ended."""
+    flow_manager = engine.flow_manager
+    ended: list[str] = []
+    finish_run = flow_manager._finish_run
+
+    def recording_finish_run(run: Any) -> None:
+        if flow_manager._run_in_progress is run:
+            ended.append(run.state.value)
+        finish_run(run)
+
+    flow_manager._finish_run = recording_finish_run  # type: ignore[method-assign]
+    return ended
+
+
+@pytest.mark.parametrize(("fails", "state"), [(True, "failed"), (False, "finished")])
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_paused_debug_run_ends_saying_how_its_flow_stopped(
+    engine: Engine,
+    flow_name: str,
+    *,
+    fails: bool,
+    state: str,
+) -> None:
+    """A debug run pauses, then a continue runs it to the end; it ended failed if a node raised."""
+    _set_parameter(engine, "Holder", "gate_file", "")
+    if fails:
+
+        async def raise_instead() -> None:
+            msg = "Holder was set to fail."
+            raise RuntimeError(msg)
+
+        engine.node_manager.get_node_by_name("Holder").aprocess = raise_instead  # type: ignore[method-assign]
+    ended = _record_end_states(engine)
+
+    paused = await engine.ahandle_request(StartFlowFromNodeRequest(node_name="Holder", debug_mode=True))
+    assert isinstance(paused, StartFlowFromNodeResultSuccess), paused
+    assert ended == [], "the debug run ended instead of pausing"
+    await engine.ahandle_request(ContinueExecutionStepRequest(flow_name=flow_name))
+
+    assert ended == [state]
+
+
+@pytest.mark.usefixtures("parallel_mode", "flow_name")
+@pytest.mark.asyncio
+async def test_clearing_everything_ends_a_run_cancelled_even_when_stopping_it_fails(engine: Engine) -> None:
+    """Clear all tears the run down whatever its cancel does, so the run does not go on."""
+    _set_parameter(engine, "Holder", "gate_file", "")
+    ended = _record_end_states(engine)
+    paused = await engine.ahandle_request(StartFlowFromNodeRequest(node_name="Holder", debug_mode=True))
+    assert isinstance(paused, StartFlowFromNodeResultSuccess), paused
+
+    with patch.object(engine.flow_manager, "cancel_flow_run", side_effect=RuntimeError("worker gone")):
+        await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    assert ended == ["cancelled"]

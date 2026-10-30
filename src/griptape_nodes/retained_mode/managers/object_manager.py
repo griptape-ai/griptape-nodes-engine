@@ -122,7 +122,7 @@ class ObjectManager(EngineScoped):
         # A driver still parked holds its FSM claim until it wakes and abandons the
         # run; harmless here because deleting the flows drops the machine it holds.
         try:
-            await self.engine.flow_manager.cancel_all_runs()
+            await self.engine.flow_manager.cancel_all_runs(tearing_down=True)
         except Exception as e:
             logger.warning("Could not cancel the running workflow before clearing it. Continuing anyway: %s", e)
 
