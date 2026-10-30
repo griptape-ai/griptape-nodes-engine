@@ -39,7 +39,7 @@ def _flow_manager_with_advancing_machine() -> _AdvancingRun:
 
 def _flow_manager_with_open_workflow() -> FlowManager:
     engine = MagicMock()
-    runtime = WorkflowRuntime("workflow")
+    runtime = WorkflowRuntime("workflow", MagicMock())
     engine.current_workflow.return_value = runtime
     engine.current_workflow_or_none.return_value = runtime
     return FlowManager(MagicMock(spec=EventManager), engine=engine)

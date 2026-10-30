@@ -494,7 +494,7 @@ class TestWorkflowStateClearReleasesObjects:
         assert manager.drop_all_local_objects() == 0
 
     def test_closing_one_of_two_open_workflows_releases_only_its_objects(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         manager = engine.resource_manager
         released: list[str] = []
         registry = engine.workflow_registry

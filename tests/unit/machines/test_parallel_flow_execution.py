@@ -233,7 +233,7 @@ class TestFlowManagerDagBuilderIntegration:
 
         engine = MagicMock()
 
-        runtime = WorkflowRuntime("workflow")
+        runtime = WorkflowRuntime("workflow", MagicMock())
 
         engine.current_workflow.return_value = runtime
 
