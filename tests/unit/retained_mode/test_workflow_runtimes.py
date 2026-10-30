@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.object_events import (
 )
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
+    CreateVariableResultFailure,
     CreateVariableResultSuccess,
     GetVariableValueRequest,
     GetVariableValueResultFailure,
@@ -347,8 +348,8 @@ class TestVariablesOnTheRuntime:
     def test_creating_a_global_variable_needs_an_open_workflow(self, engine: Engine) -> None:
         result = engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
 
-        assert not result.succeeded()
-        assert "no workflow is open" in str(result.result_details)
+        assert isinstance(result, CreateVariableResultFailure)
+        assert "names no workflow and none is open" in str(result.result_details)
         lookup = engine.handle_request(GetVariableValueRequest(name="greeting", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(lookup, GetVariableValueResultFailure)
 

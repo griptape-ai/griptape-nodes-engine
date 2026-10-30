@@ -5,11 +5,12 @@ import contextvars
 import functools
 import inspect
 import logging
+import sys
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from typing import TYPE_CHECKING, Any, cast
 
 from asyncio_thread_runner import ThreadRunner
@@ -1479,6 +1480,9 @@ class EventManager(EngineScoped):
     ) -> WorkflowRuntime:
         """The workflow a WORKFLOW request acts on: the one it names, else the only open one.
 
+        A request that names none it can act on fails with its own failure type where it can (see
+        `_addressing_failure`).
+
         Raises:
             _RequestWorkflowError: The request names no workflow, or names nothing while none or
                 several are open.
@@ -1486,7 +1490,7 @@ class EventManager(EngineScoped):
         request_name = type(request).__name__
         if named is NO_WORKFLOW:
             msg = f"Attempted to run {request_name}. Failed because the request names no workflow."
-            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._addressing_failure(request, msg))
         if named is not None:
             return named
 
@@ -1496,14 +1500,33 @@ class EventManager(EngineScoped):
                 f"Attempted to run {request_name}. Failed because the request names no workflow and none is open. "
                 "Open a workflow, or name one on the request envelope."
             )
-            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._addressing_failure(request, msg))
         if len(open_workflows) > 1:
             msg = (
                 f"Attempted to run {request_name}. Failed because {len(open_workflows)} workflows are open and "
                 "the request did not name one. Name one on the request envelope."
             )
-            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._addressing_failure(request, msg))
         return open_workflows[0]
+
+    @staticmethod
+    def _addressing_failure(request: RequestPayload, details: str) -> ResultPayloadFailure:
+        """The failure for a request that names no workflow it can act on.
+
+        The request's own `<Name>ResultFailure` when its module defines one that needs nothing but
+        `result_details`, since callers such as the editor undo an optimistic edit on that type.
+        Otherwise a `GenericResultFailure`.
+        """
+        request_type = type(request)
+        failure_name = request_type.__name__.removesuffix("Request") + "ResultFailure"
+        failure_type = getattr(sys.modules.get(request_type.__module__), failure_name, None)
+        if not isinstance(failure_type, type) or not issubclass(failure_type, ResultPayloadFailure):
+            return GenericResultFailure(result_details=details)
+        for field in fields(failure_type):
+            needs_value = field.init and field.default is MISSING and field.default_factory is MISSING
+            if needs_value and field.name != "result_details":
+                return GenericResultFailure(result_details=details)
+        return failure_type(result_details=details)
 
     @staticmethod
     def _handler_with_workflow(
