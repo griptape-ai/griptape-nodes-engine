@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
@@ -346,6 +347,10 @@ class TestHostReads:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.current_workflow_id == workflow.workflow_id
+
+    def test_a_model_access_query_is_a_host_request(self, engine: Engine) -> None:
+        """It asks about a node type and the host's license, not a node in a workflow."""
+        assert engine.event_manager.get_scope_for_request_type(QueryModelAccessForNodeRequest) is RequestScope.HOST
 
 
 class TestRequestsARuntimeSends:
