@@ -330,10 +330,128 @@ including a list of validation problems. Otherwise it is a plain sentence for th
 #### Checking inputs before a run
 
 A provider that rejects an input still costs the user an upload and a wait, and sometimes credits.
-When its documentation gives limits on the files it accepts, declare them on the parameter with
-`pre_run_validators=`. The engine checks them at the node's turn, just before
-`validate_before_node_run`, and fails the node with every limit its inputs break, together with
-anything `validate_before_node_run` returns. The node never starts.
+When its documentation gives limits on the inputs it accepts, such as how many items a list holds,
+how long a prompt is, or an image's size, declare them on the parameter with `pre_run_validators=`.
+The engine checks them at the node's turn, just before `validate_before_node_run`, and fails the
+node with every limit its inputs break, together with anything `validate_before_node_run` returns.
+The node never starts.
+
+```python
+from griptape_nodes.exe_types.core_types import ParameterList
+from griptape_nodes.exe_types.validators import MaxCount
+
+INPUT_LIMITS_URL = "https://provider.example.com/docs/generate#limits"
+
+
+class Generate(SuccessFailureNode):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.add_parameter(
+            ParameterList(
+                name="prompts",
+                tooltip="Up to 4 prompts",
+                input_types=["str"],
+                type="str",
+                pre_run_validators=[MaxCount(4, noun="prompts")],
+            )
+        )
+
+    def input_limits_url(self) -> str | None:
+        return INPUT_LIMITS_URL
+```
+
+Five prompts then fail with "5 prompts are connected to 'prompts' and the limit is 4. Remove 1."
+and a "Provider limits" link to `input_limits_url()`.
+
+Import the validators from `griptape_nodes.exe_types.validators`. These work on any value:
+
+| Validator                                       | Checks                                                                 |
+| ----------------------------------------------- | ---------------------------------------------------------------------- |
+| `MaxCount(maximum, noun="prompts")`             | How many items a list parameter holds.                                 |
+| `IfParameter(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value. |
+
+The rest are for image, video and audio files; see "Limits on media files" below.
+
+**Messages name the input.** Each message starts with the parameter's display name: "The input in
+'Prompt'". On a `ParameterList`, each item is checked on its own and named by its position,
+"Input 2 in 'prompts'", while `MaxCount` checks the list's length. A media parameter says what it
+holds instead of "input": "The image in 'Start Frame'", "Video 2 in 'clips'".
+
+**Limits that depend on a setting.** When the limits change with the selected model, wrap them in
+`IfParameter`. At the node's turn it picks the list for the other parameter's current value, or
+`default` for any other value. The validators it picks can be any kind, media included, and a list
+can hold another `IfParameter`, for limits that depend on two settings. Override
+`input_limits_url()` to return the page for the current model too.
+
+The values it looks up can be anything a parameter holds, such as `True` for a switch. `key=` turns
+the value into what's looked up first: `key=bool` asks whether a list has any items.
+
+```python
+from griptape_nodes.exe_types.validators import IfParameter, MaxCount
+
+IfParameter("model", {"pro": [MaxCount(4, noun="prompts")]}, default=[MaxCount(1, noun="prompts")])
+IfParameter("strict", {True: [MaxCount(1, noun="prompts")]}, default=[MaxCount(3, noun="prompts")])
+IfParameter("examples", {False: [MaxCount(1, noun="prompts")]}, key=bool)
+```
+
+**Only the first items.** `.first(n)` narrows any validator to a list's first `n` items, for a
+provider that reads only that many. A validator that checks the whole list, such as `MaxCount`,
+isn't narrowed.
+
+**Rules across several inputs.** For a limit that involves more than one input, such as a combined
+length across several prompts, check it in the node's `validate_before_node_run`. The engine runs it
+right after the declared validators, in the same pass.
+
+```python
+from griptape_nodes.exe_types.node_error import NodeError
+
+MAX_TOTAL_WORDS = 500
+
+
+class Generate(SuccessFailureNode):
+    def validate_before_node_run(self) -> list[Exception] | None:
+        prompts = self.get_parameter_list_value("prompts") or []
+        total = sum(len(str(prompt).split()) for prompt in prompts)
+        if total <= MAX_TOTAL_WORDS:
+            return None
+        return [
+            NodeError(
+                f"The prompts in 'prompts' have {total} words together and the limit is "
+                f"{MAX_TOTAL_WORDS}. Shorten them."
+            )
+        ]
+```
+
+**Your own validator.** Most limits are a built-in validator, narrowed where needed with
+`IfParameter` or `.first(n)`. For one none of them covers, subclass `PreRunValidator` and return a
+`NodeError` from `check`, or None. `check` is also given a list item's `position`; take `**_` for
+any argument you don't use. A single input with no value, and each empty row of a list, is skipped
+before any validator runs; a validator with `checks_whole_list` still gets the list, even an empty
+one. Check that a required input is set in the node's `validate_before_node_run`.
+
+```python
+from dataclasses import dataclass
+from typing import Any, override
+
+from griptape_nodes.exe_types.node_error import NodeError
+from griptape_nodes.exe_types.validators import PreRunValidator
+
+
+@dataclass(frozen=True)
+class MaxWords(PreRunValidator):
+    maximum: int
+
+    @override
+    def check(self, value: Any, *, subject: str, docs_url: str | None, **_: Any) -> NodeError | None:
+        words = len(str(value).split())
+        if words <= self.maximum:
+            return None
+        return NodeError(f"{subject} has {words} words and the limit is {self.maximum}. Shorten it.")
+```
+
+##### Limits on media files
+
+For an image, video or audio input, declare the provider's file limits the same way:
 
 ```python
 from griptape_nodes.exe_types.param_types.parameter_image import ParameterImage
@@ -381,24 +499,22 @@ class ImageToVideo(SuccessFailureNode):
 A too-small start frame then fails with "The image in 'Start Frame' is 200x300 and each side must be
 at least 300 pixels. Use a larger one." and a "Provider limits" link to `input_limits_url()`.
 
-Import the validators from `griptape_nodes.exe_types.validators`:
+These validators read the file:
 
-| Validator                                       | Checks                                                                               |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `AllowedFormats("image/png", ...)`              | The format, read from the file: an image's, a video's container, an audio container. |
-| `MaxFileSize(maximum_bytes, strict=False)`      | The file size. With `strict=True`, for "less than 30 MB", exactly 30 MB is refused.  |
-| `SideRange(min=..., max=...)`                   | Each side of an image or video frame, in pixels.                                     |
-| `PixelArea(min_megapixels=..., ...)`            | The pixels in an image or video frame, in millions.                                  |
-| `AspectRatioRange(tallest, widest)`             | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
-| `ExactAspectRatios("16:9", "9:16")`             | The aspect ratio, for a provider that takes only certain shapes.                     |
-| `MinDuration(minimum_seconds, fix=...)`         | A video's or audio clip's shortest accepted length, in seconds.                      |
-| `MaxDuration(maximum_seconds, fix=...)`         | A video's or audio clip's longest accepted length, in seconds.                       |
-| `FrameRate(min=..., max=...)`                   | A video's frame rate.                                                                |
-| `FrameCount(min=..., max=...)`                  | A video's frame count.                                                               |
-| `VideoCodecs("h264", ...)`                      | A video's codec.                                                                     |
-| `AudioCodecs("mp3", ...)`                       | An audio clip's codec.                                                               |
-| `MaxCount(maximum, noun="images")`              | How many items a list parameter holds.                                               |
-| `IfParameter(parameter, {...}, default=, key=)` | Picks one of several lists of validators by another parameter's value.               |
+| Validator                                  | Checks                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `AllowedFormats("image/png", ...)`         | The format, read from the file: an image's, a video's container, an audio container. |
+| `MaxFileSize(maximum_bytes, strict=False)` | The file size. With `strict=True`, for "less than 30 MB", exactly 30 MB is refused.  |
+| `SideRange(min=..., max=...)`              | Each side of an image or video frame, in pixels.                                     |
+| `PixelArea(min_megapixels=..., ...)`       | The pixels in an image or video frame, in millions.                                  |
+| `AspectRatioRange(tallest, widest)`        | The aspect ratio, between two written the way providers write them, such as `"1:3"`. |
+| `ExactAspectRatios("16:9", "9:16")`        | The aspect ratio, for a provider that takes only certain shapes.                     |
+| `MinDuration(minimum_seconds, fix=...)`    | A video's or audio clip's shortest accepted length, in seconds.                      |
+| `MaxDuration(maximum_seconds, fix=...)`    | A video's or audio clip's longest accepted length, in seconds.                       |
+| `FrameRate(min=..., max=...)`              | A video's frame rate.                                                                |
+| `FrameCount(min=..., max=...)`             | A video's frame count.                                                               |
+| `VideoCodecs("h264", ...)`                 | A video's codec.                                                                     |
+| `AudioCodecs("mp3", ...)`                  | An audio clip's codec.                                                               |
 
 A validator that fits more than one kind of media, such as `SideRange`, checks the kind its
 parameter holds: a `ParameterImage`'s image, a `ParameterVideo`'s video, a `ParameterAudio`'s
@@ -413,51 +529,11 @@ can't be read, so its size and shape checks are skipped and the provider judges 
 `"hevc"`, `"mp3"` or `"pcm_s16le"`. The names the messages show (`"H.264"`, `"AC-3"`) and `"AVC"`
 work too, so translate the provider's wording into these names in your limits table.
 
-**Messages name the input.** Each message starts with the parameter's display name and what it
-holds: "The image in 'Start Frame'", "The video in 'Reference Video'", "The audio clip in 'Voice'".
-On a `ParameterList`, each item is checked on its own and named by its position, "Image 2 in
-'reference images'", while `MaxCount` checks the list's length.
-
-**Limits that depend on a setting.** When the limits change with the selected model, wrap them in
-`IfParameter`. At the node's turn it picks the list for the other parameter's current value, or
-`default` for any other value. A list can hold another `IfParameter`, for limits that depend on two
-settings. Override `input_limits_url()` to return the page for the current model too.
-
-The values it looks up can be anything a parameter holds, such as `True` for a switch. `key=` turns
-the value into what's looked up first: `key=bool` asks whether a list has any items.
-
-```python
-IfParameter("upscale", {True: []}, default=[SideRange(min=512)])
-IfParameter("reference_images", {False: [AllowedFormats("image/png")]}, key=bool)
-```
-
-```python
-from griptape_nodes.exe_types.validators import IfParameter, MaxCount
-
-ParameterList(
-    name="reference_images",
-    tooltip="Up to 4 reference images with the pro model, 1 with the others",
-    input_types=["ImageUrlArtifact"],
-    type="ImageUrlArtifact",
-    display_name="reference images",
-    pre_run_validators=[
-        AllowedFormats("image/jpeg", "image/png"),
-        IfParameter(
-            "model",
-            {"pro": [MaxCount(4, noun="images"), SideRange(min=300)]},
-            default=[MaxCount(1, noun="images"), SideRange(min=512)],
-        ),
-    ],
-)
-```
-
-**Limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap a media
+**Media limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap a media
 validator so it applies only to a value whose file the condition holds, or doesn't hold, for. A
 condition is a function given the value's `MediaInfo`, returning True or False; it marks what it
 reads with `@reads(...)`, so the engine reads that along with the validator's own readings. A
-condition sees only the file: a limit that depends on a setting is an `IfParameter`. On a list,
-`.first(n)` checks only the first `n` items, for a provider that reads only that many; it works on
-any validator.
+condition sees only the file: a limit that depends on a setting is an `IfParameter`.
 
 ```python
 from griptape_nodes.exe_types.validators import IfParameter, MaxFileSize, MediaNeed, SideRange, reads
@@ -477,11 +553,9 @@ ParameterImage(
 )
 ```
 
-**Rules across several inputs.** For a limit that involves more than one input, such as a total
-length across several clips, check it in the node's `validate_before_node_run`. The engine runs it
-right after the declared validators, in the same pass, so a reader from
-`griptape_nodes.utils.media_probe` called there returns what the validators already read, and no
-file is read twice.
+For a rule across several media inputs, such as a total length across several clips, a reader from
+`griptape_nodes.utils.media_probe` called in `validate_before_node_run` returns what the validators
+already read, and no file is read twice.
 
 ```python
 from griptape_nodes.utils.media_probe import local_video_probe
@@ -502,34 +576,6 @@ class ReferenceToVideo(SuccessFailureNode):
                 f"and the limit is {MAX_TOTAL_SECONDS}. Use shorter clips."
             )
         ]
-```
-
-**Your own validator.** Most limits are a built-in validator, narrowed where needed with
-`IfParameter`, `.first(n)`, or for a media validator `.when()` and `.unless()`. For one none of
-them covers, subclass `PreRunValidator` and return a `NodeError` from `check`, or None. `check` is
-also given a list item's `position`; take `**_` for any argument you don't use. A single input with
-no value, and each empty row of a list, is skipped before any validator runs; a validator with
-`checks_whole_list` still gets the list, even an empty one. Check that a required input is set in
-the node's `validate_before_node_run`.
-
-```python
-from dataclasses import dataclass
-from typing import Any, override
-
-from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import PreRunValidator
-
-
-@dataclass(frozen=True)
-class MaxWords(PreRunValidator):
-    maximum: int
-
-    @override
-    def check(self, value: Any, *, subject: str, docs_url: str | None, **_: Any) -> NodeError | None:
-        words = len(str(value).split())
-        if words <= self.maximum:
-            return None
-        return NodeError(f"{subject} has {words} words and the limit is {self.maximum}. Shorten it.")
 ```
 
 A limit on an image, video or audio file subclasses `MediaValidator` instead: set `needs` to the
@@ -561,7 +607,7 @@ class EvenSides(MediaValidator):
         return NodeError(f"{subject} is {frame.width}x{frame.height} and each side must be even. Crop it.")
 ```
 
-The checks follow these rules:
+The built-in media checks follow these rules:
 
 - **Skip what can't be read locally, don't fail it.** A remote URL, a format Pillow can't open, an
     image over Pillow's decompression-bomb limit (about 179 megapixels), a video or audio input when
@@ -611,9 +657,9 @@ request, an unsupported input, a missing API key, a plain `KeyError`, and valida
 
 ### Comprehensive Validation
 
-Use `validate_before_node_run()` for checks that aren't limits on a file, such as settings that
-can't be used together. Declare file limits with `pre_run_validators=` instead (see "Checking
-inputs before a run" above).
+Use `validate_before_node_run()` for checks across several inputs or settings, such as settings
+that can't be used together. Declare a limit on one input's value with `pre_run_validators=` instead
+(see "Checking inputs before a run" above).
 
 ```python
 def validate_before_node_run(self) -> list[Exception] | None:

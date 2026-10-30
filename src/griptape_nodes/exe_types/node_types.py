@@ -1459,15 +1459,9 @@ class BaseNode(ABC):
         execute in a worker is installed here with its edit-time dependencies only, and a value produced
         by a worker is held there and cannot be read from here.
 
-        The one exception is a media input's file limits. Declare those on the parameter with
-        `pre_run_validators=` (see `griptape_nodes.exe_types.validators`); the engine checks them just
-        before this method, and reports their errors with this method's. They read files and data URIs
-        on this machine and skip any value they can't read here. A file costs a header read (a full read
-        for WebP and AVIF), and each video or audio probe is time-limited; an image passed as a data URI
-        or in memory is decoded in full, so its cost grows with its size. A limit across several media
-        inputs, such as their total length, belongs here: the readers in
-        `griptape_nodes.utils.media_probe` (`local_video_probe` and the rest) return what the
-        validators already read, so no file is read twice.
+        A limit on one input's value is better declared on the parameter with `pre_run_validators=`
+        (see `griptape_nodes.exe_types.validators`): the engine checks those just before this method and
+        reports their errors with this method's. A limit across several inputs belongs here.
 
         It runs in a worker thread, not on the engine's event loop, so a slow check doesn't freeze the
         editor or other flows; the node waits for it before running. Setting parameter values and

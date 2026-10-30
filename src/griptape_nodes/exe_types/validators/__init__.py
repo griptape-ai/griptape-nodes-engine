@@ -3,7 +3,8 @@
 Import them from here:
 
 ```python
-from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, MaxFileSize
+from griptape_nodes.exe_types.validators import IfParameter, MaxCount, PreRunValidator
+from griptape_nodes.exe_types.validators import AllowedFormats, MaxFileSize  # limits on media files
 ```
 
 - `base`: `PreRunValidator`, a limit on any value.
@@ -18,8 +19,11 @@ from griptape_nodes.exe_types.validators import AllowedFormats, IfParameter, Max
 
 from __future__ import annotations
 
+# Validators for any kind of value.
 from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL, PreRunValidator
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
+
+# Validators for image, video and audio files.
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,

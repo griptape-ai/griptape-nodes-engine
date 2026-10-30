@@ -8,7 +8,6 @@ from griptape_nodes.exe_types.core_types import ParameterList, ParameterMode
 from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
-from griptape_nodes.exe_types.validators.media import MaxFileSize, SideRange
 from tests.unit.exe_types.mocks import MockNode
 
 DOCS = "https://example.com/limits"
@@ -16,19 +15,19 @@ DOCS = "https://example.com/limits"
 
 class TestMaxCount:
     def test_allows_the_maximum(self) -> None:
-        assert MaxCount(3).check([1, 2, 3], subject="images", docs_url=None) is None
+        assert MaxCount(3).check([1, 2, 3], subject="prompts", docs_url=None) is None
 
     def test_refuses_more_than_the_maximum(self) -> None:
-        error = MaxCount(2, noun="images").check([1, 2, 3], subject="reference images", docs_url=DOCS)
-        assert str(error) == "3 images are connected to 'reference images' and the limit is 2. Remove 1."
+        error = MaxCount(2, noun="prompts").check([1, 2, 3], subject="prompts", docs_url=DOCS)
+        assert str(error) == "3 prompts are connected to 'prompts' and the limit is 2. Remove 1."
         assert error is not None
         assert error.links
         assert error.links[0].url == DOCS
 
 
 class TestIfParameter:
-    PRO = (SideRange(min=300),)
-    DEFAULT = (SideRange(min=1000), MaxFileSize(1))
+    PRO = (MaxCount(4),)
+    DEFAULT = (MaxCount(1), MaxCount(2, noun="prompts"))
 
     def _node(self, model: str | None) -> MockNode:
         node = MockNode(name="node")
@@ -59,39 +58,39 @@ class TestIfParameter:
         node.set_parameter_value("size", "large")
         nested = IfParameter(
             "model",
-            {"pro": [MaxFileSize(1), IfParameter("size", {"large": self.PRO}, default=self.DEFAULT)]},
+            {"pro": [MaxCount(9), IfParameter("size", {"large": self.PRO}, default=self.DEFAULT)]},
         )
-        assert list(nested.selected(node)) == [MaxFileSize(1), *self.PRO]
+        assert list(nested.selected(node)) == [MaxCount(9), *self.PRO]
         node.set_parameter_value("size", "small")
-        assert list(nested.selected(node)) == [MaxFileSize(1), *self.DEFAULT]
+        assert list(nested.selected(node)) == [MaxCount(9), *self.DEFAULT]
 
     def test_lists_every_validator_reachable_through_nesting(self) -> None:
         nested = IfParameter("model", {"pro": [IfParameter("size", {"large": self.PRO})]}, default=self.DEFAULT)
         assert list(nested.candidates()) == [*self.PRO, *self.DEFAULT]
 
-    @pytest.mark.parametrize(("upscale", "expected"), [(True, []), (False, [SideRange(min=512)])])
-    def test_picks_by_a_value_that_is_not_text(self, upscale: bool, expected: list) -> None:  # noqa: FBT001
+    @pytest.mark.parametrize(("strict", "expected"), [(True, []), (False, [MaxCount(3)])])
+    def test_picks_by_a_value_that_is_not_text(self, strict: bool, expected: list) -> None:  # noqa: FBT001
         node = MockNode(name="node")
-        node.add_parameter(ParameterBool(name="upscale"))
-        node.set_parameter_value("upscale", upscale)
-        by_upscale = IfParameter("upscale", {True: []}, default=[SideRange(min=512)])
-        assert list(by_upscale.selected(node)) == expected
+        node.add_parameter(ParameterBool(name="strict"))
+        node.set_parameter_value("strict", strict)
+        by_strict = IfParameter("strict", {True: []}, default=[MaxCount(3)])
+        assert list(by_strict.selected(node)) == expected
 
-    @pytest.mark.parametrize(("images", "expected"), [([], list(PRO)), (["a.png"], list(DEFAULT))])
-    def test_key_turns_the_value_into_what_is_looked_up(self, images: list[str], expected: list) -> None:
+    @pytest.mark.parametrize(("examples", "expected"), [([], list(PRO)), (["a cat"], list(DEFAULT))])
+    def test_key_turns_the_value_into_what_is_looked_up(self, examples: list[str], expected: list) -> None:
         node = MockNode(name="node")
         node.add_parameter(
             ParameterList(
-                name="reference_images",
+                name="examples",
                 tooltip="",
-                input_types=["ImageUrlArtifact"],
-                type="ImageUrlArtifact",
+                input_types=["str"],
+                type="str",
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
             )
         )
-        node.set_parameter_value("reference_images", images)
-        by_images = IfParameter("reference_images", {False: self.PRO}, default=self.DEFAULT, key=bool)
-        assert list(by_images.selected(node)) == expected
+        node.set_parameter_value("examples", examples)
+        by_examples = IfParameter("examples", {False: self.PRO}, default=self.DEFAULT, key=bool)
+        assert list(by_examples.selected(node)) == expected
 
     def test_checks_nothing_itself(self) -> None:
         by_model = IfParameter("model", {"pro": self.PRO})

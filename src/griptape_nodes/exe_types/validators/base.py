@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_error import NodeError
     from griptape_nodes.exe_types.node_types import BaseNode
 
-__all__ = ["LIMITS_LINK_LABEL", "PreRunValidator"]
+__all__ = ["LIMITS_LINK_LABEL", "PreRunValidator", "require_validators_fit"]
 
 
 # The label on the docs link every validator's error carries.
@@ -60,6 +60,22 @@ class PreRunValidator(ABC):
     def candidates(self) -> Sequence[PreRunValidator]:
         """Every validator `selected` can return, so a parameter can refuse one that can't go on it."""
         return (self,)
+
+    def require_fits(self, parameter: Parameter) -> None:
+        """Raise when this validator can't check `parameter`, so a mistake shows when the node is built.
+
+        The default refuses a validator that checks a whole list on a parameter holding a single
+        value. A family that needs more of the parameter, such as a kind of value, adds its rules.
+
+        Raises:
+            TypeError: If this validator can't check `parameter`.
+        """
+        if self.checks_whole_list and not holds_list(parameter):
+            msg = (
+                f"Attempted to add {shown_name(self)} to parameter '{parameter.name}'. "
+                "Failed because it checks a list, and the parameter holds a single value."
+            )
+            raise TypeError(msg)
 
     def first(self, count: int) -> PreRunValidator:
         """This validator, applied only to the first `count` items of a list parameter.
@@ -116,15 +132,14 @@ def shown_name(validator: PreRunValidator) -> str:
     return type(validator).__name__
 
 
-def require_whole_list_validators_fit(parameter: Parameter, validator: PreRunValidator) -> None:
-    """Raise when a validator that judges a whole list is on a parameter holding a single value.
+def require_validators_fit(parameter: Parameter) -> None:
+    """Raise when a parameter declares a pre-run validator it can't be checked with.
+
+    Each validator, and each one an `IfParameter` or wrapper can pick, checks itself with `require_fits`.
 
     Raises:
-        TypeError: If `validator` checks the whole list and the parameter holds a single value.
+        TypeError: If any of them can't check `parameter`.
     """
-    if validator.checks_whole_list and not holds_list(parameter):
-        msg = (
-            f"Attempted to add {shown_name(validator)} to parameter '{parameter.name}'. "
-            "Failed because it checks a list, and the parameter holds a single value."
-        )
-        raise TypeError(msg)
+    for declared in parameter.pre_run_validators:
+        for validator in declared.candidates():
+            validator.require_fits(parameter)

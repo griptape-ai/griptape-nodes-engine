@@ -92,6 +92,88 @@ class _LimitedNode(MockNode):
         return DOCS
 
 
+@dataclass(frozen=True)
+class _MaxWords(PreRunValidator):
+    """A limit on any text value, for the runner's behaviour without media."""
+
+    maximum: int
+
+    @override
+    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
+        words = len(str(value).split())
+        if words <= self.maximum:
+            return None
+        return NodeError(f"{subject} has {words} words and the limit is {self.maximum}.")
+
+
+def _prompts(*validators: PreRunValidator) -> ParameterList:
+    return ParameterList(
+        name="prompts",
+        tooltip="",
+        input_types=["str"],
+        type="str",
+        allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+        pre_run_validators=validators,
+    )
+
+
+class TestGenericValidators:
+    """The runner on text inputs and plain validators: nothing here reads a file."""
+
+    def test_names_a_single_input_and_reports_its_error(self) -> None:
+        node = _node_with(ParameterString(name="prompt", display_name="Prompt", pre_run_validators=[_MaxWords(1)]))
+        node.set_parameter_value("prompt", "two words")
+        assert _messages(validate_inputs(node)) == ["The input in 'Prompt' has 2 words and the limit is 1."]
+
+    def test_skips_a_single_input_with_no_value(self) -> None:
+        node = _node_with(ParameterString(name="prompt", pre_run_validators=[_MaxWords(1)]))
+        assert validate_inputs(node) == []
+
+    def test_checks_each_item_by_its_position_and_skips_empty_rows(self) -> None:
+        node = _node_with(_prompts(_MaxWords(1)))
+        node.set_parameter_value("prompts", ["ok", None, "too many words"])
+        assert _messages(validate_inputs(node)) == ["Input 2 in 'prompts' has 3 words and the limit is 1."]
+
+    def test_counts_the_whole_list(self) -> None:
+        node = _node_with(_prompts(MaxCount(2, noun="prompts")))
+        node.set_parameter_value("prompts", ["a", "b", "c"])
+        assert _messages(validate_inputs(node)) == [
+            "3 prompts are connected to 'prompts' and the limit is 2. Remove 1."
+        ]
+
+    @pytest.mark.parametrize(("model", "expected"), [("pro", []), ("lite", ["The input in 'prompt' has 3 words"])])
+    def test_if_parameter_picks_by_another_parameter(self, model: str, expected: list[str]) -> None:
+        node = _node_with(
+            ParameterString(name="model"),
+            ParameterString(
+                name="prompt",
+                pre_run_validators=[IfParameter("model", {"pro": [_MaxWords(5)]}, default=[_MaxWords(1)])],
+            ),
+        )
+        node.set_parameter_value("model", model)
+        node.set_parameter_value("prompt", "three words here")
+        assert [message.split(" and ")[0] for message in _messages(validate_inputs(node))] == expected
+
+    def test_first_checks_only_the_first_items(self) -> None:
+        node = _node_with(_prompts(_MaxWords(1).first(1)))
+        node.set_parameter_value("prompts", ["too many words", "also too many"])
+        assert _messages(validate_inputs(node)) == ["Input 1 in 'prompts' has 3 words and the limit is 1."]
+
+    def test_validate_node_reports_the_validators_then_the_nodes_own(self) -> None:
+        own = ValueError("Pick a model.")
+
+        class _Checks(MockNode):
+            def validate_before_node_run(self) -> list[Exception] | None:
+                return [own]
+
+        node = _Checks(name="node")
+        node.add_parameter(ParameterString(name="prompt", pre_run_validators=[_MaxWords(1)]))
+        node.set_parameter_value("prompt", "two words")
+        errors = validate_node(node)
+        assert _messages(errors[:1]) == ["The input in 'prompt' has 2 words and the limit is 1."]
+        assert errors[1] is own
+
+
 class TestSingleInputs:
     def test_reports_nothing_for_a_node_without_validators(self, tmp_path: Path) -> None:
         node = _node_with(ParameterImage(name="image"))

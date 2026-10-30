@@ -28,8 +28,8 @@ __all__ = ["validate_inputs", "validate_node"]
 def validate_node(node: BaseNode) -> list[Exception]:
     """Run a node's declared validators, then its `validate_before_node_run`, and return their errors.
 
-    Both share one read of each input, so the validators and the node's own checks never read a file
-    twice.
+    Both run in one pass, so anything read for an input while checking it is shared between the
+    validators and the node's own checks.
     """
     with files_read_once():
         errors: list[Exception] = [*validate_inputs(node)]
@@ -40,10 +40,10 @@ def validate_node(node: BaseNode) -> list[Exception]:
 def validate_inputs(node: BaseNode) -> list[NodeError]:
     """Every error the node's inputs break its declared limits with, or an empty list.
 
-    For each parameter with `pre_run_validators`, reads its value once, for every reading those
-    validators need together, and runs each one. A list parameter's validators run on each item,
-    named by its position, except those that check the whole list. A value that can't be read
-    locally is skipped, as the checks underneath skip it.
+    For each parameter with `pre_run_validators`, gets its value and runs each validator that applies.
+    A list parameter's validators run on each item, named by its position, except those that check
+    the whole list. A single input with no value, an empty row, and a value held in another process
+    are skipped.
 
     Args:
         node: The node about to run.
@@ -101,7 +101,7 @@ def _value_here(node: BaseNode, name: str) -> Any:
     """The parameter's value, or None when it's held in another process and can't be read here.
 
     A value a worker produced and kept (a `serializable=False` output) reaches this process only as a
-    key, and reading it raises. It can't be read locally, so it's skipped like any other such value.
+    key, and reading it raises, so it's skipped.
     """
     try:
         return node.get_parameter_value(name)

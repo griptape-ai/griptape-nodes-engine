@@ -5,7 +5,15 @@ engine reads the union of those once per value and hands the same `MediaInfo` to
 validator on the parameter, so a validator never opens the file itself. `when` and `unless` narrow
 one by a `Condition` on what was read. The runner hands each value to `run_validators`, which reads
 the file once for the media validators among them, inside `files_read_once`, and names the input
-with `input_noun`; `require_validators_fit` checks a parameter's validators when it is built.
+with `input_noun`. `MediaValidator.require_fits` refuses a media validator on a parameter whose kind it
+can't read, when the node is built.
+
+The readers are in `griptape_nodes.utils.media_probe`. They read only files and data URIs on this
+machine and skip any value they can't read here: a file costs a header read (a full read for WebP
+and AVIF), each video or audio probe is time-limited, and an image passed as a data URI or in memory
+is decoded in full. A node's own `validate_before_node_run` can call them (`local_video_probe` and
+the rest) for a limit across several media inputs; during the node's checks they return what the
+validators already read.
 """
 
 from __future__ import annotations
@@ -17,7 +25,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, override
 
 from griptape_nodes.exe_types.validators.base import (
     PreRunValidator,
-    require_whole_list_validators_fit,
     shown_name,
 )
 from griptape_nodes.utils.media_probe import EMPTY_MEDIA, MediaInfo, MediaNeed, read_media, reading_once
@@ -30,7 +37,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["Condition", "MediaValidator", "reads", "require_validators_fit"]
+__all__ = ["Condition", "MediaValidator", "reads"]
 
 
 # The artifact type names a parameter declares for each kind of media.
@@ -131,6 +138,34 @@ class MediaValidator(PreRunValidator):
     @override
     def first(self, count: int) -> MediaValidator:
         return _FirstMediaItems(self, count)
+
+    @override
+    def require_fits(self, parameter: Parameter) -> None:
+        """Refuse a parameter that holds no media, or none of the media kinds this validator reads.
+
+        Raises:
+            TypeError: If a whole-list validator is on a single input, or this validator can't read
+                the media the parameter holds.
+        """
+        super().require_fits(parameter)
+        if not self.needs:
+            return
+        kind = media_kind_of(parameter)
+        name = shown_name(self)
+        if kind is None:
+            msg = (
+                f"Attempted to add {name} to parameter '{parameter.name}'. Failed because it checks media, "
+                f"and the parameter's type, {parameter.type}, isn't an image, video or audio artifact."
+            )
+            raise TypeError(msg)
+        media_needs = self.needs - {MediaNeed.SIZE}
+        if media_needs and MediaNeed(kind) not in media_needs:
+            readable = " or ".join(sorted(need.value for need in media_needs))
+            msg = (
+                f"Attempted to add {name} to parameter '{parameter.name}'. "
+                f"Failed because it checks {readable}, and the parameter holds {kind}."
+            )
+            raise TypeError(msg)
 
 
 def needs_of(validator: PreRunValidator) -> frozenset[MediaNeed]:
@@ -241,37 +276,6 @@ def needs_for_kind(validators: Iterable[PreRunValidator], kind: MediaKind | None
         if kind is not None and MediaNeed(kind) in validator_needs:
             needs.add(MediaNeed(kind))
     return frozenset(needs)
-
-
-def require_validators_fit(parameter: Parameter) -> None:
-    """Raise when a parameter declares a pre-run validator its type can't be checked with.
-
-    Raises:
-        TypeError: If a whole-list validator is on a single input, or a media validator is on a
-            parameter that holds no media, or none of the media it reads is the kind the parameter holds.
-    """
-    kind = media_kind_of(parameter)
-    for declared in parameter.pre_run_validators:
-        for validator in declared.candidates():
-            require_whole_list_validators_fit(parameter, validator)
-            validator_needs = needs_of(validator)
-            if not validator_needs:
-                continue
-            name = shown_name(validator)
-            if kind is None:
-                msg = (
-                    f"Attempted to add {name} to parameter '{parameter.name}'. Failed because it checks media, "
-                    f"and the parameter's type, {parameter.type}, isn't an image, video or audio artifact."
-                )
-                raise TypeError(msg)
-            media_needs = validator_needs - {MediaNeed.SIZE}
-            if media_needs and MediaNeed(kind) not in media_needs:
-                readable = " or ".join(sorted(need.value for need in media_needs))
-                msg = (
-                    f"Attempted to add {name} to parameter '{parameter.name}'. "
-                    f"Failed because it checks {readable}, and the parameter holds {kind}."
-                )
-                raise TypeError(msg)
 
 
 # What an input is called in a message, by the kind of media its parameter holds.
