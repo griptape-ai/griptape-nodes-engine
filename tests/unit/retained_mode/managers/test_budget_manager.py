@@ -18,6 +18,7 @@ import pytest
 
 from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.exe_types.node_types import BaseNode, aprocess_scope
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     ATTRIBUTION_HEADER_NAME,
@@ -40,10 +41,10 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 # The complete set of keys allowed on the wire. A new field must consciously update these,
-# which is the point: `project` is the only dimension the engine sends, and `BaseNode.name`
-# must never appear under any key.
+# which is the point: the header carries the same tags a direct call reports and nothing else,
+# and `BaseNode.name` must never appear under any key.
 ALLOWED_ENVELOPE_KEYS = {"v", "tags"}
-ALLOWED_TAG_KEYS = {"project"}
+ALLOWED_TAG_KEYS = {"project", "workflow", "node_type", "node_id", "engine_id", "session_id", "run_id"}
 
 
 def _decode(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
@@ -69,13 +70,18 @@ def _succeed(manager: BudgetManager, **kwargs: Any) -> GetAttributionContextResu
 
 
 def _mock_engine() -> MagicMock:
-    """A stand-in engine whose project manager answers with a JSON-encodable value.
+    """A stand-in engine whose peers answer with JSON-encodable values.
 
-    A bare MagicMock hands back MagicMocks, which `json.dumps` cannot encode -- so the one
-    peer the resolver reads is given a real value here and overridden per test.
+    A bare MagicMock hands back MagicMocks, which `json.dumps` cannot encode -- so every peer
+    the tags are read from is given a real value here: an empty project chain, overridden per
+    test, and no workflow, engine, session or run, so only what a test sets reaches the header.
     """
     mock_engine = MagicMock()
     mock_engine.project_manager.get_project_chain.return_value = []
+    mock_engine.context_manager.has_current_workflow.return_value = False
+    mock_engine.get_engine_id.return_value = None
+    mock_engine.get_session_id.return_value = None
+    mock_engine.flow_manager.current_run_id = None
     return mock_engine
 
 
@@ -527,9 +533,9 @@ class TestConfidentiality:
     def test_no_user_authored_label_appears(self, engine: Engine) -> None:
         """`BaseNode.name` and `ProjectTemplate.name` are user-authored and never travel.
 
-        Ids are the only strings the payload carries now, so no key named `name` at any depth
-        -- and the guard stays even though the builder makes it near-tautological, because it
-        is what a future dimension would trip over.
+        Ids, the workflow name and a node's class are the only strings the payload carries, so no
+        key named `name` at any depth -- and the guard stays even though the builder makes it
+        near-tautological, because it is what a future dimension would trip over.
         """
         result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
@@ -568,3 +574,164 @@ class TestWiring:
     def test_engine_exposes_the_budget_manager(self, engine: Engine) -> None:
         assert isinstance(engine.budget_manager, BudgetManager)
         assert engine.BudgetManager() is engine.budget_manager
+
+
+class _SpendingNode(BaseNode):
+    """A node class with a name distinct from any instance's, so the two can't be confused."""
+
+    def process(self) -> None:
+        return None
+
+
+def _engine_with_call_state() -> MagicMock:
+    """An engine in the middle of a run, with every tag a call can carry known."""
+    mock_engine = _mock_engine()
+    mock_engine.project_manager.get_project_chain.return_value = [_entry("shot-6", "Shot 6")]
+    mock_engine.context_manager.has_current_workflow.return_value = True
+    mock_engine.context_manager.get_current_workflow_name.return_value = "Poster pipeline"
+    mock_engine.get_engine_id.return_value = "engine-1"
+    mock_engine.get_session_id.return_value = "session-1"
+    mock_engine.flow_manager.current_run_id = "run-1"
+    return mock_engine
+
+
+class TestHeaderMatchesDirectCalls:
+    """The header describes a call the same way a direct call's report does (#5872)."""
+
+    def test_the_header_carries_the_tags_a_direct_call_reports(self) -> None:
+        """Built by one function, so the two cannot drift apart again."""
+        manager = BudgetManager(MagicMock(), engine=_engine_with_call_state())
+
+        assert _tags(_succeed(manager)) == manager._build_tags(node_type=None, node_id=None, run_id=None)
+
+    def test_the_header_carries_the_run_so_proxy_spend_totals_with_direct_spend(self) -> None:
+        tags = _tags(_succeed(BudgetManager(MagicMock(), engine=_engine_with_call_state())))
+
+        assert tags == {
+            "project": ["shot-6"],
+            "workflow": "Poster pipeline",
+            "engine_id": "engine-1",
+            "session_id": "session-1",
+            "run_id": "run-1",
+        }
+
+    def test_a_call_outside_a_run_carries_no_run(self) -> None:
+        mock_engine = _engine_with_call_state()
+        mock_engine.flow_manager.current_run_id = None
+
+        assert "run_id" not in _tags(_succeed(BudgetManager(MagicMock(), engine=mock_engine)))
+
+    def test_the_running_node_is_named_by_its_class_never_its_name(self) -> None:
+        manager = BudgetManager(MagicMock(), engine=_engine_with_call_state())
+        node = _SpendingNode(name="My secret shot name")
+
+        with aprocess_scope(node=node):
+            tags = _tags(_succeed(manager))
+
+        assert tags["node_type"] == "_SpendingNode"
+        assert "My secret shot name" not in json.dumps(tags)
+
+    def test_a_running_node_s_header_names_the_run_it_is_executing_for(self) -> None:
+        """A later run may be in progress by now; the header names the node's own run, as its report does."""
+        manager = BudgetManager(MagicMock(), engine=_engine_with_call_state())
+        node = _SpendingNode(name="Draft")
+
+        with aprocess_scope(node=node, run_id="run-that-made-the-call"):
+            tags = _tags(_succeed(manager))
+
+        assert tags["run_id"] == "run-that-made-the-call"
+
+    def test_no_node_is_named_outside_a_node_s_run(self) -> None:
+        assert "node_type" not in _tags(_succeed(BudgetManager(MagicMock(), engine=_engine_with_call_state())))
+
+
+class TestHeaderSizeLimit:
+    """Over Cloud's limit, detail is given up so the call keeps its project."""
+
+    # Entries of about 260 bytes each: 15 fit with every tag but a 256-character workflow name,
+    # and 20 are over the limit on their own.
+    FITS_WITHOUT_WORKFLOW = 15
+    OVER_ON_ITS_OWN = 20
+
+    @staticmethod
+    def _manager_with(*, chain_entries: int, workflow: str) -> BudgetManager:
+        mock_engine = _engine_with_call_state()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry(f"/Users/someone/Studio/{index:02d}/" + "d" * 230, None) for index in range(chain_entries)
+        ]
+        mock_engine.context_manager.get_current_workflow_name.return_value = workflow
+        return BudgetManager(MagicMock(), engine=mock_engine)
+
+    @staticmethod
+    def _decoded_size(result: GetAttributionContextResultSuccess) -> int:
+        return len(base64.urlsafe_b64decode(result.header_value))
+
+    def test_a_header_that_fits_keeps_every_tag(self) -> None:
+        tags = _tags(_succeed(self._manager_with(chain_entries=3, workflow="Poster pipeline")))
+
+        assert set(tags) == {"project", "workflow", "engine_id", "session_id", "run_id"}
+
+    def test_an_oversized_header_drops_the_workflow_first_and_keeps_the_run(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = self._manager_with(chain_entries=self.FITS_WITHOUT_WORKFLOW, workflow="w" * 256)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(manager)
+
+        tags = _tags(result)
+        assert "workflow" not in tags
+        assert tags["run_id"] == "run-1"
+        assert len(tags["project"]) == self.FITS_WITHOUT_WORKFLOW
+        assert self._decoded_size(result) <= budget_manager_module.MAX_DECODED_ATTRIBUTION_BYTES
+        assert "left out workflow," in caplog.text
+        # Names the dropped key, never its value: the workflow name is user-authored.
+        assert "w" * 256 not in caplog.text
+
+    def test_a_workflow_name_that_cannot_be_encoded_costs_only_the_workflow(self) -> None:
+        """A workflow named after a file whose name is not UTF-8 must not cost the call its project."""
+        mock_engine = _engine_with_call_state()
+        mock_engine.context_manager.get_current_workflow_name.return_value = "Poster \udcff draft"
+
+        tags = _tags(_succeed(BudgetManager(MagicMock(), engine=mock_engine)))
+
+        assert "workflow" not in tags
+        assert tags["project"] == ["shot-6"]
+        assert tags["run_id"] == "run-1"
+
+    def test_an_unencodable_project_drops_nothing_and_blames_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The optional tags did not cause it, so they stay and nothing is logged as left out."""
+        mock_engine = _engine_with_call_state()
+        mock_engine.project_manager.get_project_chain.return_value = [_entry("renders-\udce9", None)]
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _dispatch(BudgetManager(MagicMock(), engine=mock_engine))
+
+        assert isinstance(result, GetAttributionContextResultFailure)
+        assert "left out" not in caplog.text
+
+    def test_with_no_project_open_the_warning_says_nothing_about_a_project(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_engine = _engine_with_call_state()
+        mock_engine.project_manager.get_project_chain.return_value = []
+        mock_engine.context_manager.get_current_workflow_name.return_value = "Poster \udcff draft"
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(BudgetManager(MagicMock(), engine=mock_engine))
+
+        assert "project" not in _tags(result)
+        assert "left out workflow" in caplog.text
+        assert "project" not in caplog.text
+
+    def test_a_project_chain_too_large_alone_is_sent_as_it_is_today(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Every optional tag goes, and the project is still sent whole: no worse than before."""
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(self._manager_with(chain_entries=self.OVER_ON_ITS_OWN, workflow="Poster pipeline"))
+
+        # Cloud will not read a header this size, so the log must not claim the project got through.
+        assert "left out workflow," in caplog.text
+        assert "project" not in caplog.text
+
+        assert set(_tags(result)) == {"project"}
+        assert len(_tags(result)["project"]) == self.OVER_ON_ITS_OWN
