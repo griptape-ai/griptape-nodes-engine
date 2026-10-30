@@ -51,6 +51,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     require_request_sender,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class TestEventsWhileRebuildingACopy:
@@ -1613,6 +1614,36 @@ class TestPostDispatchHooks:
         await _drain_post_dispatch_hooks(event_manager)
 
         assert seen_engines == [engine]
+
+    @pytest.mark.asyncio
+    async def test_hook_sees_the_workflow_its_request_acted_on(self) -> None:
+        """The fresh context drops the workflow binding, so the hook gets the request's back.
+
+        Without it a hook reading the current workflow would see none, or, with several
+        open, fail to choose one, though the request it observes acted on a named workflow.
+        """
+        engine = Engine()
+        event_manager = engine.event_manager
+        event_manager.initialize_queue(asyncio.Queue())
+        workflow = WorkflowRuntime("bound")
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen_workflows: list[WorkflowRuntime | None] = []
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_workflows.append(engine.current_workflow_or_none())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with engine.bind_workflow(workflow):
+            await event_manager.ahandle_request(_ProbeRequest())
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert seen_workflows == [workflow]
 
     @pytest.mark.asyncio
     async def test_every_dispatch_gets_its_own_hook_invocation(self) -> None:

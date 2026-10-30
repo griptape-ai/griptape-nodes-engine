@@ -2,9 +2,10 @@ from dataclasses import dataclass
 
 import pytest
 
-from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_scope, handles
 
 
 @dataclass(kw_only=True)
@@ -81,6 +82,24 @@ class TestHandles:
                 def on_ping(request: _PingRequest) -> None:
                     pass
 
+    def test_records_the_declared_scope(self) -> None:
+        class _Host:
+            @handles(_PingRequest, scope=RequestScope.HOST)
+            def on_ping(self, request: _PingRequest) -> None:
+                pass
+
+        assert handled_request_scope(_Host.on_ping) is RequestScope.HOST
+        assert handled_request_scope(_Base.on_ping) is None
+
+    def test_stacked_marks_with_different_scopes_raise(self) -> None:
+        with pytest.raises(TypeError, match="same scope"):
+
+            class _Conflicting:
+                @handles(_PingRequest, scope=RequestScope.HOST)
+                @handles(_PongRequest)
+                def on_either(self, request: RequestPayload) -> None:
+                    pass
+
 
 class TestRegisterRequestHandlers:
     def test_registers_bound_methods_for_each_marked_type(self) -> None:
@@ -133,3 +152,74 @@ class TestRegisterRequestHandlers:
 
         with pytest.raises(ValueError, match="already assigned"):
             event_manager.register_request_handlers(_Base())
+
+
+class TestRegistrationChecksTheWorkflowParameter:
+    def test_each_scope_registers_with_its_signature(self) -> None:
+        class _Scoped:
+            @handles(_PingRequest, scope=RequestScope.WORKFLOW)
+            def on_ping(self, request: _PingRequest, workflow: object) -> None:
+                pass
+
+            @handles(_PongRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+            def on_pong(self, request: _PongRequest, workflow: object | None = None) -> None:
+                pass
+
+        event_manager = EventManager()
+
+        event_manager.register_request_handlers(_Scoped())
+
+        assert event_manager.get_scope_for_request_type(_PingRequest) is RequestScope.WORKFLOW
+        assert event_manager.get_scope_for_request_type(_PongRequest) is RequestScope.OPTIONAL_WORKFLOW
+
+    @pytest.mark.parametrize(
+        ("scope", "match"),
+        [
+            (RequestScope.WORKFLOW, "has no `workflow` parameter"),
+            (RequestScope.OPTIONAL_WORKFLOW, "defaulting to None"),
+        ],
+    )
+    def test_a_scope_that_takes_a_workflow_needs_the_parameter(self, scope: RequestScope, match: str) -> None:
+        def on_ping(request: _PingRequest) -> ResultPayload:  # noqa: ARG001
+            return GenericResultFailure(result_details="unused")
+
+        with pytest.raises(TypeError, match=match):
+            EventManager().assign_manager_to_request_type(_PingRequest, on_ping, scope=scope)
+
+    def test_workflow_scope_refuses_a_default(self) -> None:
+        def on_ping(request: _PingRequest, workflow: object = None) -> ResultPayload:  # noqa: ARG001
+            return GenericResultFailure(result_details="unused")
+
+        with pytest.raises(TypeError, match="has a default"):
+            EventManager().assign_manager_to_request_type(_PingRequest, on_ping, scope=RequestScope.WORKFLOW)
+
+    def test_host_refuses_a_workflow_parameter(self) -> None:
+        def on_ping(request: _PingRequest, workflow: object | None = None) -> ResultPayload:  # noqa: ARG001
+            return GenericResultFailure(result_details="unused")
+
+        with pytest.raises(TypeError, match="has a `workflow` parameter"):
+            EventManager().assign_manager_to_request_type(_PingRequest, on_ping, scope=RequestScope.HOST)
+
+    def test_undeclared_registers_with_a_workflow_parameter(self) -> None:
+        """A handler with no scope, such as a library's, is not checked: dispatch passes it the request alone."""
+
+        def on_ping(request: _PingRequest, workflow: object) -> ResultPayload:  # noqa: ARG001
+            return GenericResultFailure(result_details="unused")
+
+        event_manager = EventManager()
+
+        event_manager.assign_manager_to_request_type(_PingRequest, on_ping)
+
+        assert event_manager.get_manager_for_request_type(_PingRequest) is on_ping
+        assert event_manager.get_scope_for_request_type(_PingRequest) is None
+
+    def test_removing_the_handler_forgets_its_scope(self) -> None:
+        def on_ping(request: _PingRequest) -> ResultPayload:  # noqa: ARG001
+            return GenericResultFailure(result_details="unused")
+
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_PingRequest, on_ping, scope=RequestScope.HOST)
+
+        event_manager.remove_manager_from_request_type(_PingRequest)
+
+        assert event_manager.get_scope_for_request_type(_PingRequest) is None

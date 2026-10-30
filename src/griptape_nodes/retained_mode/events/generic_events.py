@@ -19,3 +19,14 @@ class GenericResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     round-trips through ``PayloadRegistry`` on the worker-forward path instead of
     raising "result_type is not registered".
     """
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The request's envelope named a workflow the engine doesn't have open, so it was not handled.
+
+    The one failure for every request whose envelope `open_workflow_id` names no open workflow,
+    whatever the request, so a client can tell it apart and reopen the workflow or refresh what is
+    open. HOST requests (`RequestScope`) ignore the id, so they never fail with it.
+    """
