@@ -253,6 +253,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
@@ -3529,11 +3530,19 @@ class NodeManager(EngineScoped):
         """
         # Adopt the orchestrator's workflow context before anything resolves a path. Loading resolves
         # paths too, so this comes first.
-        self.engine.context_manager.mirror_workflow_context(
-            request.workflow_name,
-            request.workflow_file_path,
-            request.workflow_working_directory,
-        )
+        try:
+            self.engine.context_manager.mirror_workflow_context(
+                request.orchestrator_workflow_id,
+                request.workflow_name,
+                request.workflow_file_path,
+                request.workflow_working_directory,
+            )
+        except ContextManager.MirroredWorkflowError as err:
+            return ExecuteNodeResultFailure(
+                result_details=str(err),
+                exception=err,
+                error=build_node_error_details(request.node_name, err),
+            )
         event_manager = self.engine.event_manager
         with event_manager.rebuild_scope(request.node_name):
             flow_name = self._create_worker_copy_flow(request.node_name)
@@ -3554,7 +3563,8 @@ class NodeManager(EngineScoped):
 
         Creating a flow needs a workflow in the current context, which a worker only mirrors from the
         orchestrator and which is empty when the orchestrator has none open, so one is supplied while
-        the flows are made. Nothing awaits in between, so no other chain sees it.
+        the flows are made, and its registry entry is removed afterwards. Nothing awaits in between,
+        so no other chain sees it.
         """
         context_manager = self.engine.context_manager
         supplies_workflow = not context_manager.has_current_workflow()
@@ -3582,7 +3592,9 @@ class NodeManager(EngineScoped):
             )
         finally:
             if supplies_workflow:
+                supplied_workflow_id = context_manager.get_current_workflow_id()
                 context_manager.pop_workflow()
+                self.engine.workflow_registry.remove(supplied_workflow_id)
         if not isinstance(flow_result, CreateFlowResultSuccess):
             details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {flow_result.result_details}"
             return ExecuteNodeResultFailure(result_details=details)

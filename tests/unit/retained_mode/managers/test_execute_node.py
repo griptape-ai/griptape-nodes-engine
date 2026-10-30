@@ -13,6 +13,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
+from griptape_nodes.node_library.workflow_registry import new_workflow_id
 from griptape_nodes.retained_mode.events.connection_events import DeleteConnectionRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
@@ -40,6 +41,7 @@ from tests.simulated_worker import simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata as ExecutionNodeMetadata
@@ -529,12 +531,44 @@ class TestTheWorkerLoadsACopy:
         assert result.parameter_output_values["source"] == "Echo@abc"
 
     @pytest.mark.asyncio
+    async def test_a_workflow_file_gone_since_dispatch_still_runs_the_node(
+        self, worker_engine: Engine, tmp_path: Path
+    ) -> None:
+        """The orchestrator still has the workflow open at that path, so the worker mirrors it in that folder."""
+        moved_away = tmp_path / "shots" / "lighting.py"
+        lighting_workflow_id = new_workflow_id()
+
+        result = await worker_engine.ahandle_request(
+            _request_for(
+                "_EchoNode",
+                orchestrator_workflow_id=lighting_workflow_id,
+                workflow_name="shots/lighting",
+                workflow_file_path=str(moved_away),
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        context_manager = worker_engine.context_manager
+        assert context_manager.get_current_workflow_id() == lighting_workflow_id
+        assert context_manager.get_current_workflow_working_directory() == str(moved_away.parent)
+
+    @pytest.mark.asyncio
     async def test_the_copy_and_its_flow_are_gone_after_the_run(self, worker_engine: Engine) -> None:
         result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "x"}))
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         assert _what_the_worker_holds(worker_engine) == {_WORKER_COPIES_FLOW}
         assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
+
+    @pytest.mark.asyncio
+    async def test_the_workflow_supplied_for_the_copy_flow_leaves_the_registry(self, worker_engine: Engine) -> None:
+        """With no orchestrator workflow, the workflow made to hold the copy's flow is not left registered."""
+        workflow_ids_before = worker_engine.workflow_registry.workflow_ids()
+
+        result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "x"}))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert worker_engine.workflow_registry.workflow_ids() == workflow_ids_before
 
     @pytest.mark.asyncio
     async def test_the_structure_it_was_sent_is_built_before_the_values_are_set(self, worker_engine: Engine) -> None:

@@ -877,6 +877,11 @@ class FileDestination:
         return self._file.location
 
     @property
+    def existing_file_policy(self) -> ExistingFilePolicy:
+        """What a write does when a file is already at the destination."""
+        return self._existing_file_policy
+
+    @property
     def name(self) -> str:
         return self._file.name
 
