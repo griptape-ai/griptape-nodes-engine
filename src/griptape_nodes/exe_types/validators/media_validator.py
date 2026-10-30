@@ -3,9 +3,9 @@
 `MediaValidator` builds on `PreRunValidator`: it declares the readings it needs (`needs`), and the
 engine reads the union of those once per value and hands the same `MediaInfo` to every media
 validator on the parameter, so a validator never opens the file itself. `when` and `unless` narrow
-one by a `Condition` on what was read. `run_check` and `needs_of` are how the runner tells a media
-validator from a plain one, and `require_validators_fit` checks a parameter's validators when it is
-built.
+one by a `Condition` on what was read. The runner hands each value to `run_validators`, which reads
+the file once for the media validators among them, inside `files_read_once`, and names the input
+with `input_noun`; `require_validators_fit` checks a parameter's validators when it is built.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.utils.media_values import MediaKind
 
-__all__ = ["Condition", "MediaValidator", "media_kind_of", "reads", "require_validators_fit"]
+__all__ = ["Condition", "MediaValidator", "reads", "require_validators_fit"]
 
 
 # The artifact type names a parameter declares for each kind of media.

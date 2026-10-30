@@ -48,7 +48,7 @@ from griptape_nodes.exe_types.validators.media import (
     MaxFileSize,
     SideRange,
 )
-from griptape_nodes.exe_types.validators.media_validator import reads
+from griptape_nodes.exe_types.validators.media_validator import MediaValidator, reads
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
@@ -268,6 +268,26 @@ class TestLists:
                 pre_run_validators=validators,
             )
         )
+
+    def test_a_whole_list_media_validator_reads_nothing(self, tmp_path: Path) -> None:
+        # A validator handed the whole list judges the list, so no item's file is read for it.
+        seen: list[MediaInfo] = []
+
+        class TotalSize(MediaValidator):
+            checks_whole_list = True
+            needs = frozenset({MediaNeed.SIZE})
+
+            @override
+            def check_media(
+                self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
+            ) -> NodeError | None:
+                seen.append(media)
+                return None
+
+        node = self._list_node(TotalSize())
+        node.set_parameter_value("reference_images", [str(image_file(tmp_path, 10, 10))])
+        assert validate_inputs(node) == []
+        assert seen == [MediaInfo()]
 
     def test_checks_each_item_by_its_position(self, tmp_path: Path) -> None:
         node = self._list_node(SideRange(min=300))
