@@ -52,7 +52,7 @@ from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _REPORT_ATTEMPTS,
     _STATIC_URL_SETTLE_TIMEOUT_S,
-    EngineAdmission,
+    EngineLease,
     WorkerManager,
     WorkerRegistration,
     _HostedWorker,
@@ -3555,8 +3555,12 @@ class _FakeLine:
         return run
 
 
-def _admit(admission_id: str, run_id: str | None = "run-1") -> worker_events.AdmitNodeRequest:
-    return worker_events.AdmitNodeRequest(admission_id=admission_id, run_id=run_id, node_name="Upscale")
+def _acquire(lease_id: str, run_id: str | None = "run-1") -> worker_events.AcquireLeaseRequest:
+    return worker_events.AcquireLeaseRequest(lease_id=lease_id, run_id=run_id)
+
+
+def _release(lease_id: str) -> worker_events.ReleaseLeaseRequest:
+    return worker_events.ReleaseLeaseRequest(lease_id=lease_id)
 
 
 def _configure(worker_manager: WorkerManager, settings: dict[str, object]) -> None:
@@ -3577,52 +3581,91 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
+async def _granted(worker_manager: WorkerManager, line: _FakeLine, lease_id: str = "a1") -> asyncio.Task[ResultPayload]:
+    """Acquire `lease_id` as the artist's engine and let it reach the front of the line, returning the hold."""
+    acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire(lease_id)))
+    await _settle()
+    hold = asyncio.create_task(line.runs[-1].spec.execute(worker_manager.engine))
+    assert isinstance(await acquiring, worker_events.AcquireLeaseResultSuccess)
+    return hold
+
+
+def _acquire_answered_when(answered: asyncio.Event) -> asyncio.Task[ResultPayload]:
+    """This engine's acquire of a lease on another engine, answered once `answered` is set."""
+
+    async def acquire() -> ResultPayload:
+        await answered.wait()
+        return worker_events.AcquireLeaseResultSuccess(result_details="ok")
+
+    return asyncio.create_task(acquire())
+
+
 class TestSharingThisEngineBetweenRuns:
     @pytest.mark.asyncio
-    async def test_a_node_waits_for_its_run_and_the_run_s_later_nodes_are_admitted_at_once(
+    async def test_a_lease_waits_for_its_turn_and_holds_the_engine_until_released(
         self, worker_manager: WorkerManager
     ) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
 
-        first = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+        acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
         await _settle()
-        assert not first.done()
+        assert not acquiring.done()
         hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-        assert isinstance(await first, worker_events.AdmitNodeResultSuccess)
-        second = await _sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a2"))
+        assert isinstance(await acquiring, worker_events.AcquireLeaseResultSuccess)
+        await asyncio.sleep(0.05)
+        assert not hold.done(), "the lease holds this engine until it is released"
 
-        assert isinstance(second, worker_events.AdmitNodeResultSuccess)
-        assert len(line.runs) == 1
-        await _sent_by(
-            _ARTIST, worker_manager.handle_report_run_ended_request, worker_events.ReportRunEndedRequest(run_id="run-1")
-        )
-        assert isinstance(await hold, worker_events.ReportRunEndedResultSuccess)
+        await _sent_by(_ARTIST, worker_manager.handle_release_lease_request, _release("a1"))
+
+        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReleaseLeaseResultSuccess)
         assert worker_manager._engine_runs == {}
 
     @pytest.mark.asyncio
-    async def test_a_waiting_node_is_told_its_run_s_place_in_line_and_when_it_stops_waiting(
+    async def test_the_same_lease_asked_for_twice_waits_in_line_once(self, worker_manager: WorkerManager) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        line = _FakeLine(worker_manager)
+
+        first = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
+        second = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
+        await _settle()
+        hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
+
+        assert isinstance(await first, worker_events.AcquireLeaseResultSuccess)
+        assert isinstance(await second, worker_events.AcquireLeaseResultSuccess)
+        assert len(line.runs) == 1
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
+        await hold
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_lease_is_told_its_place_in_line_until_it_is_granted(
         self, worker_manager: WorkerManager
     ) -> None:
         links = _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
 
-        admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+        acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
         await _settle()
         run = line.runs[0]
+        run.spec.on_place_in_line(run)
         run.position = 0
+        run.spec.on_place_in_line(run)
+        hold = asyncio.create_task(run.spec.execute(worker_manager.engine))
+        await acquiring
         run.spec.on_place_in_line(run)
         await asyncio.gather(*worker_manager._engine_notices)
 
         reports = [
-            (engine_id, request.position)
+            (engine_id, request.lease_id, request.position)
             for engine_id, request, _timeout_s in links.sent
             if isinstance(request, worker_events.ReportPlaceInLineRequest)
         ]
-        assert reports == [(_ARTIST_ENGINE, 1), (_ARTIST_ENGINE, 0)]
-        admitting.cancel()
+        assert reports == [(_ARTIST_ENGINE, "a1", 1), (_ARTIST_ENGINE, "a1", 0)]
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
+        await hold
 
     @pytest.mark.asyncio
     async def test_two_engines_waiting_on_each_other_is_logged_as_an_error(
@@ -3631,94 +3674,117 @@ class TestSharingThisEngineBetweenRuns:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         _FakeLine(worker_manager)
-        worker_manager._admissions["mine"] = EngineAdmission(
-            admission_id="mine", host_engine_id=_ARTIST_ENGINE, run_id="run-here"
+        waiting_there = _acquire_answered_when(asyncio.Event())
+        worker_manager._leases["mine"] = EngineLease(
+            lease_id="mine", host_engine_id=_ARTIST_ENGINE, run_id="run-here", request_task=waiting_there
         )
 
         with caplog.at_level(logging.ERROR):
-            admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+            acquiring = asyncio.create_task(
+                _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1"))
+            )
             await _settle()
 
         assert any(
             _ARTIST_ENGINE in record.getMessage() for record in caplog.records if record.levelno == logging.ERROR
         )
-        admitting.cancel()
+        acquiring.cancel()
+        waiting_there.cancel()
 
     @pytest.mark.asyncio
-    async def test_a_run_turned_away_refuses_its_waiting_nodes_saying_why(self, worker_manager: WorkerManager) -> None:
+    @pytest.mark.parametrize(
+        ("incoming_run_id", "mine_run_id", "mine_granted"),
+        [
+            (None, "run-here", False),
+            ("run-1", None, False),
+            ("run-1", "run-here", True),
+        ],
+        ids=["a-node-outside-a-run-holds-no-line", "this-engine-s-node-outside-a-run", "this-engine-s-lease-granted"],
+    )
+    async def test_engines_that_are_not_both_stuck_log_nothing(
+        self,
+        worker_manager: WorkerManager,
+        caplog: pytest.LogCaptureFixture,
+        incoming_run_id: str | None,
+        mine_run_id: str | None,
+        *,
+        mine_granted: bool,
+    ) -> None:
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        _FakeLine(worker_manager)
+        answered = asyncio.Event()
+        if mine_granted:
+            answered.set()
+        there = _acquire_answered_when(answered)
+        await _settle()
+        worker_manager._leases["mine"] = EngineLease(
+            lease_id="mine", host_engine_id=_ARTIST_ENGINE, run_id=mine_run_id, request_task=there
+        )
+
+        with caplog.at_level(logging.ERROR):
+            acquiring = asyncio.create_task(
+                _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1", run_id=incoming_run_id))
+            )
+            await _settle()
+
+        assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+        acquiring.cancel()
+        there.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_lease_turned_away_is_refused_saying_why(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
 
-        admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+        acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
         await _settle()
         line.runs[0].spec.on_turned_away("The run did not start: it was cancelled.")
-        result = await admitting
+        result = await acquiring
 
-        assert isinstance(result, worker_events.AdmitNodeResultFailure)
+        assert isinstance(result, worker_events.AcquireLeaseResultFailure)
         assert "it was cancelled" in str(result.result_details)
         assert worker_manager._engine_runs == {}
 
     @pytest.mark.asyncio
-    async def test_building_a_run_s_failure_leaves_its_waiting_nodes_waiting(
-        self, worker_manager: WorkerManager
-    ) -> None:
+    async def test_building_a_run_s_failure_leaves_its_lease_waiting(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
-        admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+        acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
         await _settle()
 
         failure = line.runs[0].spec.failure("The run did not start: it was cancelled.")
         await _settle()
 
-        assert isinstance(failure, worker_events.AdmitNodeResultFailure)
-        assert not admitting.done()
-        assert (_ARTIST_ENGINE, "run-1") in worker_manager._engine_runs
-        admitting.cancel()
+        assert isinstance(failure, worker_events.AcquireLeaseResultFailure)
+        assert not acquiring.done()
+        assert (_ARTIST_ENGINE, "a1") in worker_manager._engine_runs
+        acquiring.cancel()
 
     @pytest.mark.asyncio
-    async def test_a_node_sent_without_a_run_lets_the_engine_go_when_it_ends(
-        self, worker_manager: WorkerManager
-    ) -> None:
+    async def test_a_lease_released_while_it_waits_leaves_the_line(self, worker_manager: WorkerManager) -> None:
+        """Otherwise it would hold this engine for good once it reached the front."""
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
 
-        admitting = asyncio.create_task(
-            _sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1", run_id=None))
+        acquiring = asyncio.create_task(
+            _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1", run_id=None))
         )
         await _settle()
-        hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-        await admitting
-        await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
+        await _dispatched_by(worker_manager, _ARTIST, _release("a1"))
 
-        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
-
-    @pytest.mark.asyncio
-    async def test_a_node_sent_without_a_run_that_ends_while_waiting_leaves_the_line(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        """Otherwise its run would hold this engine for the idle timeout once it reached the front."""
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        line = _FakeLine(worker_manager)
-
-        admitting = asyncio.create_task(
-            _sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1", run_id=None))
-        )
-        await _settle()
-        await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
-
-        assert isinstance(await asyncio.wait_for(admitting, timeout=1.0), worker_events.AdmitNodeResultFailure)
+        assert isinstance(await asyncio.wait_for(acquiring, timeout=1.0), worker_events.AcquireLeaseResultFailure)
         assert worker_manager._engine_runs == {}
         worker_manager.engine.flow_manager.cancel_run.assert_awaited_once_with(line.runs[0].run_id)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_a_run_that_ends_while_workers_are_freed_for_it_lets_the_engine_go(
+    async def test_a_lease_released_while_workers_are_freed_for_it_lets_the_engine_go(
         self, worker_manager: WorkerManager
     ) -> None:
-        """Otherwise the run would hold this engine forever, and every run behind it would wait."""
+        """Otherwise the lease would hold this engine forever, and every run behind it would wait."""
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
@@ -3729,74 +3795,57 @@ class TestSharingThisEngineBetweenRuns:
             await freeing.wait()
 
         with patch.object(worker_manager, "_free_for_handoff", new=free_slowly):
-            admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+            acquiring = asyncio.create_task(
+                _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1"))
+            )
             await _settle()
             hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
             await _settle()
-            await _sent_by(
-                _ARTIST,
-                worker_manager.handle_report_run_ended_request,
-                worker_events.ReportRunEndedRequest(run_id="run-1"),
-            )
+            await _sent_by(_ARTIST, worker_manager.handle_release_lease_request, _release("a1"))
             freeing.set()
 
-            assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
-        assert isinstance(await admitting, worker_events.AdmitNodeResultFailure)
+            assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReleaseLeaseResultSuccess)
+        assert isinstance(await acquiring, worker_events.AcquireLeaseResultFailure)
 
     @pytest.mark.asyncio
-    async def test_a_run_whose_nodes_all_ended_keeps_the_engine_until_it_ends(
+    async def test_passing_to_another_engine_s_lease_frees_workers_before_granting_it(
         self, worker_manager: WorkerManager
     ) -> None:
-        """Its next node may come at any time, such as after a long node on the artist's own engine."""
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        line = _FakeLine(worker_manager)
-
-        admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
-        await _settle()
-        hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-        await admitting
-        await _dispatched_by(worker_manager, _ARTIST, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1"))
-        await asyncio.sleep(0.05)
-
-        assert not hold.done()
-        await _sent_by(
-            _ARTIST, worker_manager.handle_report_run_ended_request, worker_events.ReportRunEndedRequest(run_id="run-1")
-        )
-        assert isinstance(await asyncio.wait_for(hold, timeout=1.0), worker_events.ReportRunEndedResultSuccess)
-
-    @pytest.mark.asyncio
-    async def test_passing_to_another_engine_s_run_frees_workers_first(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
         worker_manager._last_engine_run_engine_id = "another-artist-engine"
+        order: list[str] = []
 
-        with patch.object(worker_manager, "_free_for_handoff", new=AsyncMock()) as free:
-            admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
+        async def free(_engine_id: str) -> None:
+            order.append("free")
+
+        with patch.object(worker_manager, "_free_for_handoff", new=AsyncMock(side_effect=free)) as freeing:
+            acquiring = asyncio.create_task(
+                _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1"))
+            )
             await _settle()
             hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-            await admitting
+            await acquiring
+            order.append("granted")
 
-        free.assert_awaited_once_with(_ARTIST_ENGINE)
-        worker_manager._engine_runs[(_ARTIST_ENGINE, "run-1")].released.set()
+        freeing.assert_awaited_once_with(_ARTIST_ENGINE)
+        assert order == ["free", "granted"]
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
         await hold
 
     @pytest.mark.asyncio
-    async def test_the_same_engine_s_next_run_keeps_its_models(self, worker_manager: WorkerManager) -> None:
+    async def test_the_same_engine_s_next_lease_keeps_its_models(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
         worker_manager._last_engine_run_engine_id = _ARTIST_ENGINE
 
         with patch.object(worker_manager, "_free_for_handoff", new=AsyncMock()) as free:
-            admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
-            await _settle()
-            hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-            await admitting
+            hold = await _granted(worker_manager, line)
 
         free.assert_not_awaited()
-        worker_manager._engine_runs[(_ARTIST_ENGINE, "run-1")].released.set()
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
         await hold
 
     @pytest.mark.asyncio
@@ -3897,17 +3946,14 @@ class TestSharingThisEngineBetweenRuns:
         assert worker_manager._tx.request_client._pending_requests == {}  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_an_engine_that_is_lost_lets_its_runs_go(self, worker_manager: WorkerManager) -> None:
+    async def test_an_engine_that_is_lost_lets_its_leases_go(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
 
-        holding = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
-        await _settle()
-        hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-        await holding
+        hold = await _granted(worker_manager, line)
         waiting = asyncio.create_task(
-            _sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a2", run_id="run-2"))
+            _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a2", run_id="run-2"))
         )
         await _settle()
 
@@ -3915,7 +3961,7 @@ class TestSharingThisEngineBetweenRuns:
 
         await asyncio.wait_for(hold, timeout=1.0)
         refused = await waiting
-        assert isinstance(refused, worker_events.AdmitNodeResultFailure)
+        assert isinstance(refused, worker_events.AcquireLeaseResultFailure)
         assert "lost its connection" in str(refused.result_details)
         line_cancel = worker_manager.engine.flow_manager.cancel_run
         line_cancel.assert_awaited_once_with(line.runs[1].run_id)  # type: ignore[attr-defined]
@@ -3925,30 +3971,25 @@ class TestSharingThisEngineBetweenRuns:
         _host_engine(worker_manager)
         line = _FakeLine(worker_manager)
 
-        result = await _dispatched_by(worker_manager, _ARTIST, _admit("a1"))
+        result = await _dispatched_by(worker_manager, _ARTIST, _acquire("a1"))
 
         assert not result.succeeded()
         assert "has not registered with this engine" in str(result.result.result_details)
         assert line.runs == []
 
     @pytest.mark.asyncio
-    async def test_only_the_engine_whose_node_it_is_may_end_it(self, worker_manager: WorkerManager) -> None:
+    async def test_only_the_engine_whose_lease_it_is_may_release_it(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         _register_session(worker_manager)
         line = _FakeLine(worker_manager)
-        admitting = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_admit_node_request, _admit("a1")))
-        await _settle()
-        hold = asyncio.create_task(line.runs[0].spec.execute(worker_manager.engine))
-        await admitting
+        hold = await _granted(worker_manager, line)
 
         intruder = RequestSender(engine_id="another-artist-engine", session_id="another-sess")
-        result = await _dispatched_by(
-            worker_manager, intruder, worker_events.ReportNodeExecutionEndedRequest(admission_id="a1")
-        )
+        result = await _dispatched_by(worker_manager, intruder, _release("a1"))
 
         assert isinstance(result, EventResultFailure)
-        assert "a1" in worker_manager._engine_runs[(_ARTIST_ENGINE, "run-1")].running
-        worker_manager._engine_runs[(_ARTIST_ENGINE, "run-1")].released.set()
+        assert not worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.is_set()
+        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
         await hold
 
     @pytest.mark.asyncio
@@ -3999,13 +4040,11 @@ def _offer_session_to(worker_manager: WorkerManager, engine_id: str) -> None:
     worker_manager._engine_registrations[(engine_id, _SESSION)] = accepted  # type: ignore[assignment]
 
 
-class TestTellingAnotherEngineARunEnded:
-    """That engine holds itself for the run until it hears, so the notice is sent again until it is answered."""
+class TestReleasingALeaseOnAnotherEngine:
+    """That engine holds itself for the lease until it hears, so the release is sent again until it is answered."""
 
     @pytest.mark.asyncio
-    async def test_a_node_sent_without_a_run_reports_its_end_until_it_is_answered(
-        self, worker_manager: WorkerManager
-    ) -> None:
+    async def test_a_node_s_own_lease_is_released_until_it_is_answered(self, worker_manager: WorkerManager) -> None:
         """Nothing else lets that engine go from a node sent without a run."""
         links = _host_engine(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
@@ -4013,7 +4052,7 @@ class TestTellingAnotherEngineARunEnded:
         tries = {"count": 0}
 
         async def lost_once(engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
-            if isinstance(request, worker_events.ReportNodeExecutionEndedRequest):
+            if isinstance(request, worker_events.ReleaseLeaseRequest):
                 tries["count"] += 1
                 if tries["count"] == 1:
                     links.sent.append((engine_id, request, timeout_s))
@@ -4023,12 +4062,12 @@ class TestTellingAnotherEngineARunEnded:
 
         worker_manager.engine.request = lost_once  # type: ignore[method-assign]
         with patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0):
-            admission = await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
-            await worker_manager.end_admission(admission)
+            lease = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+            worker_manager.release_after_node(lease)
             await asyncio.gather(*worker_manager._engine_notices)
 
-        lost_then_answered = ["ReportNodeExecutionEndedRequest"] * 2
-        assert [t for t in links.sent_types() if t == "ReportNodeExecutionEndedRequest"] == lost_then_answered
+        lost_then_answered = ["ReleaseLeaseRequest"] * 2
+        assert [t for t in links.sent_types() if t == "ReleaseLeaseRequest"] == lost_then_answered
 
     @pytest.mark.asyncio
     async def test_a_notice_that_does_not_arrive_is_sent_again_until_it_is_answered(
@@ -4054,10 +4093,10 @@ class TestTellingAnotherEngineARunEnded:
             caplog.at_level(logging.WARNING),
         ):
             await worker_manager._report_until_answered(
-                _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+                _HOST_ENGINE, worker_events.ReleaseLeaseRequest(lease_id="lease-1"), "lease lease-1 was released"
             )
 
-        assert links.sent_types() == ["ReportRunEndedRequest"] * (lost + 1)
+        assert links.sent_types() == ["ReleaseLeaseRequest"] * (lost + 1)
         assert sum("attempt" in record.getMessage() for record in caplog.records) == lost
 
     @pytest.mark.asyncio
@@ -4073,7 +4112,7 @@ class TestTellingAnotherEngineARunEnded:
             caplog.at_level(logging.WARNING),
         ):
             await worker_manager._report_until_answered(
-                _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+                _HOST_ENGINE, worker_events.ReleaseLeaseRequest(lease_id="lease-1"), "lease lease-1 was released"
             )
 
         assert len(links.sent) == _REPORT_ATTEMPTS
@@ -4083,11 +4122,11 @@ class TestTellingAnotherEngineARunEnded:
     async def test_no_notice_is_sent_to_an_engine_this_engine_has_no_session_with(
         self, worker_manager: WorkerManager
     ) -> None:
-        """Such as one it withdrew its session from, or lost: that engine already let the run go."""
+        """Such as one it withdrew its session from, or lost: that engine already let the lease go."""
         links = _host_engine(worker_manager)
 
         await worker_manager._report_until_answered(
-            _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+            _HOST_ENGINE, worker_events.ReleaseLeaseRequest(lease_id="lease-1"), "lease lease-1 was released"
         )
 
         assert links.sent == []
@@ -4105,7 +4144,7 @@ class TestTellingAnotherEngineARunEnded:
 
         with patch("griptape_nodes.retained_mode.managers.worker_manager.asyncio.sleep", new=withdraw_meanwhile):
             await worker_manager._report_until_answered(
-                _HOST_ENGINE, worker_events.ReportRunEndedRequest(run_id="run-1"), "run run-1 ended"
+                _HOST_ENGINE, worker_events.ReleaseLeaseRequest(lease_id="lease-1"), "lease lease-1 was released"
             )
 
         assert len(links.sent) == 1
@@ -4122,119 +4161,207 @@ class TestTellingAnotherEngineARunEnded:
         assert list(worker_manager._engine_registrations) == [("another-engine", _SESSION)]
 
 
-class TestAskingAnotherEngineToAdmitANode:
+class TestAskingAnotherEngineForALease:
     @pytest.mark.asyncio
-    async def test_the_admission_names_the_run_and_the_run_s_end_reaches_that_engine(
+    async def test_a_run_asks_each_engine_once_and_its_end_releases_the_lease(
         self, worker_manager: WorkerManager
     ) -> None:
         links = _host_engine(worker_manager)
-
         run = _in_run(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
 
-        admission = await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
-        await worker_manager.end_admission(admission)
+        first = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        worker_manager.release_after_node(first)
+        second = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+        worker_manager.release_after_node(second)
+        await _settle()
+        assert links.sent_types() == ["AcquireLeaseRequest"], "a run's later nodes ask for nothing more"
+
         run.ended.set_result(None)
         await _settle()
         await asyncio.gather(*worker_manager._engine_notices)
 
-        (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
-        assert cast("worker_events.AdmitNodeRequest", admit).run_id == "run-1"
-        assert links.sent[0][2] is None, "an admission waits as long as the run ahead of it"
-        assert links.sent_types() == ["AdmitNodeRequest", "ReportNodeExecutionEndedRequest", "ReportRunEndedRequest"]
+        assert first is not None
+        assert first is second
+        (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
+        assert cast("worker_events.AcquireLeaseRequest", acquire).run_id == "run-1"
+        assert links.sent[0][2] is None, "a lease waits as long as the run ahead of it"
+        (release,) = links.sent_of(worker_events.ReleaseLeaseRequest)
+        assert cast("worker_events.ReleaseLeaseRequest", release).lease_id == first.lease_id
         assert {engine_id for engine_id, _request, _timeout_s in links.sent} == {_HOST_ENGINE}
+        assert worker_manager._leases == {}
 
     @pytest.mark.asyncio
-    async def test_a_run_stops_waiting_when_its_admission_is_answered_even_without_a_last_report(
+    async def test_a_node_outside_any_run_has_a_lease_of_its_own_released_when_it_ends(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+
+        first = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        worker_manager.release_after_node(first)
+        second = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+        worker_manager.release_after_node(second)
+        await asyncio.gather(*worker_manager._engine_notices)
+
+        assert first is not None
+        assert second is not None
+        assert first.lease_id != second.lease_id
+        assert [
+            cast("worker_events.ReleaseLeaseRequest", r).lease_id
+            for r in links.sent_of(worker_events.ReleaseLeaseRequest)
+        ] == [
+            first.lease_id,
+            second.lease_id,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_run_stops_waiting_when_its_acquire_is_answered_even_without_a_last_report(
         self, worker_manager: WorkerManager
     ) -> None:
         """Otherwise a lost last report would leave the run listed as waiting while its node runs."""
         links = _host_engine(worker_manager)
-        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        links.blocked["AcquireLeaseRequest"] = asyncio.Event()
         report = worker_manager.engine.flow_manager.report_run_waiting_for_engine
         _in_run(worker_manager)
-        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
         await _settle()
-        (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
-        admission_id = cast("worker_events.AdmitNodeRequest", admit).admission_id
+        (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
+        lease_id = cast("worker_events.AcquireLeaseRequest", acquire).lease_id
         await _dispatched_by(
-            worker_manager,
-            _FROM_HOST_ENGINE,
-            worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=2),
+            worker_manager, _FROM_HOST_ENGINE, worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=2)
         )
 
-        links.blocked["AdmitNodeRequest"].set()
-        await admitting
+        links.blocked["AcquireLeaseRequest"].set()
+        await acquiring
         await _settle()
         late = await _dispatched_by(
-            worker_manager,
-            _FROM_HOST_ENGINE,
-            worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=1),
+            worker_manager, _FROM_HOST_ENGINE, worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=1)
         )
 
         assert isinstance(late, EventResultSuccess)
         assert [c.args for c in report.call_args_list] == [("run-1", 2), ("run-1", 0)]  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_a_library_that_runs_here_needs_no_admission(self, worker_manager: WorkerManager) -> None:
+    async def test_a_library_that_runs_here_needs_no_lease(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
 
-        assert await worker_manager.admit_on_engine("Local Library", "Upscale") is None
+        assert await worker_manager.acquire_lease("Local Library", "Upscale") is None
         assert links.sent == []
 
     @pytest.mark.asyncio
-    async def test_a_refused_admission_fails_the_node_saying_why(self, worker_manager: WorkerManager) -> None:
-        _host_engine(worker_manager, refuse={"AdmitNodeRequest": "the session asking for it never registered"})
+    async def test_a_refused_lease_fails_the_node_saying_why_and_the_run_s_next_node_asks_again(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(
+            worker_manager, refuse={"AcquireLeaseRequest": "the session asking for it never registered"}
+        )
+        _in_run(worker_manager)
 
         with pytest.raises(RuntimeError, match="never registered"):
-            await worker_manager.admit_on_engine(_LIBRARY, "Upscale")
+            await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        assert worker_manager._leases == {}
+        with pytest.raises(RuntimeError, match="never registered"):
+            await worker_manager.acquire_lease(_LIBRARY, "Denoise")
 
-        assert worker_manager._admissions == {}
+        assert links.sent_types().count("AcquireLeaseRequest") == 2  # noqa: PLR2004
+
+    @pytest.mark.asyncio
+    async def test_an_engine_that_cannot_be_reached_fails_the_node_and_ends_the_lease(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        links.not_found = "gpu-01 did not answer."
+
+        with pytest.raises(RuntimeError, match="gpu-01 did not answer"):
+            await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+
+        assert worker_manager._leases == {}
+
+    @pytest.mark.asyncio
+    async def test_a_node_cancelled_while_its_run_s_lease_waits_leaves_the_lease_to_the_run(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        links.blocked["AcquireLeaseRequest"] = asyncio.Event()
+        run = _in_run(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        cancelled = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
+        waiting = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Denoise"))
+        await _settle()
+
+        cancelled.cancel()
+        await _settle()
+        links.blocked["AcquireLeaseRequest"].set()
+        lease = await waiting
+
+        assert cancelled.cancelled()
+        assert lease is not None
+        assert links.sent_of(worker_events.ReleaseLeaseRequest) == []
+        run.ended.set_result(None)
+        await _settle()
+        await asyncio.gather(*worker_manager._engine_notices)
+        assert len(links.sent_of(worker_events.ReleaseLeaseRequest)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_outside_any_run_cancelled_while_its_lease_waits_releases_it(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        links.blocked["AcquireLeaseRequest"] = asyncio.Event()
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
+        await _settle()
+
+        acquiring.cancel()
+        await _settle()
+        await asyncio.gather(*worker_manager._engine_notices)
+
+        assert worker_manager._leases == {}
+        assert len(links.sent_of(worker_events.ReleaseLeaseRequest)) == 1
 
     @pytest.mark.asyncio
     async def test_the_run_s_place_in_line_there_is_reported_as_this_run_waiting(
         self, worker_manager: WorkerManager
     ) -> None:
         links = _host_engine(worker_manager)
-        links.blocked["AdmitNodeRequest"] = asyncio.Event()
+        links.blocked["AcquireLeaseRequest"] = asyncio.Event()
         _in_run(worker_manager)
-        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
         await _settle()
-        (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
-        admission_id = cast("worker_events.AdmitNodeRequest", admit).admission_id
+        (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
+        lease_id = cast("worker_events.AcquireLeaseRequest", acquire).lease_id
 
         result = await _dispatched_by(
-            worker_manager,
-            _FROM_HOST_ENGINE,
-            worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=2),
+            worker_manager, _FROM_HOST_ENGINE, worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=2)
         )
 
         assert isinstance(result, EventResultSuccess)
         worker_manager.engine.flow_manager.report_run_waiting_for_engine.assert_called_once_with(  # type: ignore[attr-defined]
             "run-1", 2
         )
-        links.blocked["AdmitNodeRequest"].set()
-        await admitting
+        links.blocked["AcquireLeaseRequest"].set()
+        await acquiring
 
     @pytest.mark.asyncio
     async def test_only_the_engine_it_waits_on_may_report_its_place(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
-        links.blocked["AdmitNodeRequest"] = asyncio.Event()
-        admitting = asyncio.create_task(worker_manager.admit_on_engine(_LIBRARY, "Upscale"))
+        links.blocked["AcquireLeaseRequest"] = asyncio.Event()
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
         await _settle()
-        (admit,) = links.sent_of(worker_events.AdmitNodeRequest)
-        admission_id = cast("worker_events.AdmitNodeRequest", admit).admission_id
+        (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
+        lease_id = cast("worker_events.AcquireLeaseRequest", acquire).lease_id
 
         result = await _dispatched_by(
             worker_manager,
             RequestSender(engine_id="some-other-engine", session_id=None),
-            worker_events.ReportPlaceInLineRequest(admission_id=admission_id, position=2),
+            worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=2),
         )
 
         assert isinstance(result, EventResultFailure)
         worker_manager.engine.flow_manager.report_run_waiting_for_engine.assert_not_called()  # type: ignore[attr-defined]
-        links.blocked["AdmitNodeRequest"].set()
-        await admitting
+        links.blocked["AcquireLeaseRequest"].set()
+        await acquiring
 
     @pytest.mark.asyncio
     async def test_a_worker_its_engine_stopped_is_started_again_before_the_next_node(

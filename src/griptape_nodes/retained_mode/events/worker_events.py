@@ -338,51 +338,77 @@ class ReportWorkerExitedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class AdmitNodeRequest(RequestPayload):
-    """Sent by the artist's engine to the engine whose worker will run a node, before sending the node.
+class AcquireLeaseRequest(RequestPayload):
+    """Sent by the artist's engine to the engine whose worker will run a run's nodes, before sending the first of them.
 
     That engine runs one run at a time, its own and other engines' alike, in the order they asked. It
-    answers once the node may run: at once while it is free or already running the node's run,
-    otherwise when the runs ahead end. While the node waits, it reports the run's place in line with
-    `ReportPlaceInLineRequest`.
+    answers once the lease holds it: at once while it is free, otherwise when the runs ahead end. While
+    the lease waits, it reports its place in line with `ReportPlaceInLineRequest`. The lease holds that
+    engine until `ReleaseLeaseRequest` releases it, so the run's later nodes there ask for nothing more.
 
     Args:
-        admission_id: Names this admission, in `ReportNodeExecutionEndedRequest` and `ReportPlaceInLineRequest`.
-        run_id: The run the node belongs to, or None for a node run on its own.
-        node_name: The node, named in that engine's log.
+        lease_id: Names this lease, in `ReleaseLeaseRequest` and `ReportPlaceInLineRequest`.
+        run_id: The run the lease is for, or None for a node run on its own, which has a lease of its own.
     """
 
-    admission_id: str
+    lease_id: str
     run_id: str | None
-    node_name: str
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
 @dataclass
 @PayloadRegistry.register
-class AdmitNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """The node may run."""
+class AcquireLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The lease holds the engine, and nodes may be sent under it."""
 
 
 @dataclass
 @PayloadRegistry.register
-class AdmitNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The node will not run on that engine."""
+class AcquireLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine will not run the run's nodes."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseLeaseRequest(RequestPayload):
+    """Sent by the artist's engine once it is done with a lease, so that engine serves the next run.
+
+    Sent when the lease's run ends, or, for a node run on its own, when the node ends, however either
+    ends. A lease still waiting in line leaves it.
+
+    Args:
+        lease_id: The `lease_id` of the lease's `AcquireLeaseRequest`.
+    """
+
+    lease_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine no longer holds itself for the lease."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine could not release the lease."""
 
 
 @dataclass
 @PayloadRegistry.register
 class ReportPlaceInLineRequest(RequestPayload):
-    """Sent by an engine to the artist's engine while one of its nodes waits there, each time its run's place changes.
+    """Sent by an engine to the artist's engine while one of its leases waits there, each time its place changes.
 
-    Sent once more with position 0 when the run stops waiting.
+    Sent once more with position 0 when the lease stops waiting.
 
     Args:
-        admission_id: The `admission_id` of the waiting node's `AdmitNodeRequest`.
-        position: The run's place in line, 1 being next, or 0 once it no longer waits.
+        lease_id: The `lease_id` of the waiting lease's `AcquireLeaseRequest`.
+        position: The lease's place in line, 1 being next, or 0 once it no longer waits.
     """
 
-    admission_id: str
+    lease_id: str
     position: int
     broadcast_result: bool = field(default=False, kw_only=True)
 
@@ -396,57 +422,7 @@ class ReportPlaceInLineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
 @dataclass
 @PayloadRegistry.register
 class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The place in line came from an engine other than the one the node waits on."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportNodeExecutionEndedRequest(RequestPayload):
-    """Sent by the artist's engine when a node another engine admitted ends, however it ends.
-
-    Args:
-        admission_id: The `admission_id` of the node's `AdmitNodeRequest`.
-    """
-
-    admission_id: str
-    broadcast_result: bool = field(default=False, kw_only=True)
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportNodeExecutionEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """The engine recorded the node as ended."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportNodeExecutionEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The engine could not record the node as ended."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportRunEndedRequest(RequestPayload):
-    """Sent by the artist's engine to every engine a run used, once the run ends, so they serve the next run.
-
-    Args:
-        run_id: The run that ended.
-    """
-
-    run_id: str
-    broadcast_result: bool = field(default=False, kw_only=True)
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportRunEndedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """The engine no longer holds itself for the run."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportRunEndedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The engine could not end the run."""
+    """The place in line came from an engine other than the one the lease waits on."""
 
 
 @dataclass
