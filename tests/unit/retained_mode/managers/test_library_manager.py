@@ -1792,50 +1792,6 @@ class TestAddLibraryPathsToSysPath:
             sys.path[:] = original_sys_path
 
 
-class TestCollectLibraryWorkflowFiles:
-    """Test collecting library-declared workflow files for the workflow registry."""
-
-    @pytest.mark.asyncio
-    async def test_repeat_collection_keeps_one_sys_path_entry_at_the_front(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Every registry refresh collects again; the library directory must not stack up on sys.path."""
-        library_manager = engine.library_manager
-        library_path = tmp_path / "griptape_nodes_library.json"
-        base_dir = str(tmp_path)
-        monkeypatch.setitem(
-            library_manager._library_file_path_to_info,
-            str(library_path),
-            _LibraryManager.LibraryInfo(
-                lifecycle_state=_LibraryManager.LibraryLifecycleState.LOADED,
-                fitness=_LibraryManager.LibraryFitness.GOOD,
-                library_path=str(library_path),
-                is_sandbox=False,
-                library_name="TestLib",
-            ),
-        )
-        library = MagicMock()
-        library.get_library_data.return_value.workflows = ["templates/demo.py"]
-        monkeypatch.setattr(sys, "path", [*sys.path, base_dir])
-
-        with (
-            patch.object(
-                engine,
-                "ahandle_request",
-                AsyncMock(
-                    return_value=ListRegisteredLibrariesResultSuccess(libraries=["TestLib"], result_details="ok")
-                ),
-            ),
-            patch.object(LibraryRegistry, "get_library", return_value=library),
-        ):
-            first = await library_manager.collect_library_workflow_files()
-            second = await library_manager.collect_library_workflow_files()
-
-        assert first == second == [str(tmp_path / "templates/demo.py")]
-        assert sys.path[0] == base_dir
-        assert sys.path.count(base_dir) == 1
-
-
 class SandboxImportSpyBase:
     """Shared fixture for sandbox tests that check which files get imported as node source."""
 

@@ -192,7 +192,7 @@ class WorkflowBranching(EngineScoped):
             )
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
-        is_library_workflow = bool(template_workflow.metadata.is_griptape_provided)
+        is_library_workflow = self.engine.workflow_manager.saver.is_library_workflow(template_workflow)
         if not template_workflow.metadata.is_template and not is_library_workflow:
             details = (
                 f"Attempted to create workflow from template '{request.template_name}'. "

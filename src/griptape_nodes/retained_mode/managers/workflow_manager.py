@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     EngineInitializationProgress,
     InitializationPhase,
     InitializationStatus,
+    WorkflowRegistryChanged,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
@@ -155,6 +156,8 @@ class WorkflowManager(EngineScoped):
         workflow_name: str | None = None
         workflow_dependencies: list[WorkflowDependencyInfo] = field(default_factory=list)
         problems: list[WorkflowProblem] = field(default_factory=list)
+        # The library set this verdict was judged against; see `note_library_set_changed`.
+        library_set_generation: int = 0
 
     _workflow_file_path_to_info: dict[str, WorkflowInfo]
 
@@ -203,6 +206,9 @@ class WorkflowManager(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
+        # Bumped whenever a library finishes loading or unloads. A cached verdict judged against
+        # an older generation is judged again the next time someone asks for it.
+        self._library_set_generation = 0
         self._squelch_workflow_altered_count = 0
         self._referenced_workflow_stack = []
         # Initialize as set: before refresh_workflow_registry has run, the registry
@@ -237,23 +243,19 @@ class WorkflowManager(EngineScoped):
         return self._referenced_workflow_stack[-1]
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
-        # Clear everything, library-provided workflows included, before re-registering. Workflows
-        # under the workspace are keyed workspace-relative, so after a workspace change (e.g. a
-        # project switch) an entry kept from before would resolve against the wrong directory.
-        self.engine.workflow_registry.clear_all_workflows()
-
-        # Discover workflows from libraries, config, and workspace.
+        # Close the gate before clearing, so list requests never answer from a half-empty registry.
         self._workflows_loading_complete.clear()
 
         try:
+            # Clear what this scan found last time, so a workspace change takes effect cleanly.
+            self.engine.workflow_registry.clear_workspace_workflows()
+
             default_workflow_section = "app_events.on_app_initialization_complete.workflows_to_register"
             config_mgr = self.engine.config_manager
 
             if workflows_to_register is None:
-                # Library-declared workflows go first so they claim their registry keys before
-                # the workspace scan, then the workflows behind library workflow nodes.
-                library_workflow_files = await self.engine.library_manager.collect_library_workflow_files()
-                await self._process_workflows_for_registration(library_workflow_files)
+                # The workflows behind library workflow nodes are keyed like workspace workflows, so
+                # the clear above dropped them; list them again for the current workspace.
                 self.engine.library_manager.register_library_workflow_node_workflows()
 
                 workflows_to_register = []
@@ -285,6 +287,8 @@ class WorkflowManager(EngineScoped):
                     config_mgr.set_config_value(default_workflow_section, workflows_to_register)
         finally:
             self._workflows_loading_complete.set()
+
+        self._announce_workflow_registry_changed()
 
     def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:
         workflow_file_paths = self.get_workflows_attempted_to_load()
@@ -409,8 +413,33 @@ class WorkflowManager(EngineScoped):
     def get_workflow_info_for_attempted_load(self, workflow_file_path: str) -> WorkflowInfo:
         return self._workflow_file_path_to_info[workflow_file_path]
 
-    def find_workflow_info_for_attempted_load(self, workflow_file_path: str) -> WorkflowInfo | None:
-        return self._workflow_file_path_to_info.get(workflow_file_path)
+    async def get_current_workflow_info(
+        self, file_path: str, *, registered_libraries: list[str] | None = None
+    ) -> WorkflowInfo | None:
+        """The verdict for a workflow file, judged again if the library set changed since.
+
+        Judging goes through `on_load_workflow_metadata_request`, which waits for any library
+        load in flight, so a verdict is never judged against a half-loaded set. Pass
+        `registered_libraries` when the caller is judging several files in a row, so each one
+        doesn't issue its own `ListRegisteredLibrariesRequest`.
+        """
+        workflow_info_key = self.build_workflow_info_key(file_path)
+        cached_info = self._workflow_file_path_to_info.get(workflow_info_key)
+        if cached_info is not None and cached_info.library_set_generation == self._library_set_generation:
+            return cached_info
+
+        await self.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name=file_path), registered_libraries=registered_libraries
+        )
+        return self._workflow_file_path_to_info.get(workflow_info_key)
+
+    def build_workflow_info_key(self, file_path: str) -> str:
+        """Build the key used to look up a workflow's load record.
+
+        Matches the key construction in on_load_workflow_metadata_request, which uses
+        workspace_path.joinpath() without resolving symlinks.
+        """
+        return str(self.engine.config_manager.workspace_path.joinpath(file_path))
 
     async def wait_for_workflows_loaded(self) -> None:
         """Wait until any registry refresh in progress has finished."""
@@ -461,7 +490,10 @@ class WorkflowManager(EngineScoped):
             )
 
             self.engine.workflow_registry.generate_new_workflow(
-                registry_key=registry_key, metadata=request.metadata, file_path=request.file_name
+                registry_key=registry_key,
+                metadata=request.metadata,
+                file_path=request.file_name,
+                library_name=request.library_name,
             )
         except Exception as e:
             details = f"Failed to register workflow with name '{request.metadata.name}'. Error: {e}"
@@ -546,17 +578,30 @@ class WorkflowManager(EngineScoped):
         )
 
     @handles(LoadWorkflowMetadata)
-    async def on_load_workflow_metadata_request(self, request: LoadWorkflowMetadata) -> ResultPayload:
-        """Load a workflow's metadata, reporting every way it can be flawed or unusable."""
-        complete_file_path = self.engine.config_manager.workspace_path.joinpath(request.file_name)
-        str_path = str(complete_file_path)
-
+    async def on_load_workflow_metadata_request(
+        self, request: LoadWorkflowMetadata, *, registered_libraries: list[str] | None = None
+    ) -> ResultPayload:
         # The editor can send LoadWorkflowMetadata before library registration finishes
         # (observed on Windows, engine cold start). Without this gate, the dependency
-        # check below would race LibraryRegistry and return LibraryNotRegisteredProblem
+        # check would race LibraryRegistry and return LibraryNotRegisteredProblem
         # for libraries that are milliseconds from being registered.
         await self.engine.library_manager._libraries_loading_complete.wait()
+        # Read before judging, so a library changing mid-judgement leaves the verdict stale
+        # rather than current.
+        library_set_generation = self._library_set_generation
+        result = await self._judge_workflow_file(request, registered_libraries=registered_libraries)
+        workflow_info = self._workflow_file_path_to_info.get(self.build_workflow_info_key(request.file_name))
+        if workflow_info is not None:
+            workflow_info.library_set_generation = library_set_generation
+        return result
+
+    async def _judge_workflow_file(
+        self, request: LoadWorkflowMetadata, *, registered_libraries: list[str] | None = None
+    ) -> ResultPayload:
+        """Read a workflow's header and record how it fares against the loaded libraries."""
         # Let us go into the darkness.
+        complete_file_path = self.engine.config_manager.workspace_path.joinpath(request.file_name)
+        str_path = str(complete_file_path)
         if not await anyio.Path(complete_file_path).is_file():
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.MISSING,
@@ -574,7 +619,9 @@ class WorkflowManager(EngineScoped):
             return metadata_or_failure
         workflow_metadata = metadata_or_failure
 
-        return await self._evaluate_workflow_metadata(str_path, workflow_metadata, registered_libraries=None)
+        return await self._evaluate_workflow_metadata(
+            str_path, workflow_metadata, registered_libraries=registered_libraries
+        )
 
     async def _evaluate_workflow_metadata(  # noqa: C901, PLR0912, PLR0915
         self,
@@ -596,18 +643,8 @@ class WorkflowManager(EngineScoped):
         """
         # We have valid dependencies, etc.
         # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes/issues/617
-        problems = []
+        problems = self._default_missing_dates(workflow_metadata)
         had_critical_error = False
-
-        # Confirm dates are correct.
-        if workflow_metadata.creation_date is None:
-            # Assign it to the epoch start and flag it as a warning.
-            workflow_metadata.creation_date = EPOCH_START
-            problems.append(MissingCreationDateProblem(default_date=str(EPOCH_START)))
-        if workflow_metadata.last_modified_date is None:
-            # Assign it to the epoch start and flag it as a warning.
-            workflow_metadata.last_modified_date = EPOCH_START
-            problems.append(MissingLastModifiedDateProblem(default_date=str(EPOCH_START)))
 
         if registered_libraries is None:
             list_libraries_result = await self.engine.ahandle_request(
@@ -790,6 +827,17 @@ class WorkflowManager(EngineScoped):
             metadata=workflow_metadata, result_details="Workflow metadata loaded successfully."
         )
 
+    def _default_missing_dates(self, workflow_metadata: WorkflowMetadata) -> list[WorkflowProblem]:
+        """Fill in a missing creation or modification date with the epoch start, flagging each one."""
+        problems: list[WorkflowProblem] = []
+        if workflow_metadata.creation_date is None:
+            workflow_metadata.creation_date = EPOCH_START
+            problems.append(MissingCreationDateProblem(default_date=str(EPOCH_START)))
+        if workflow_metadata.last_modified_date is None:
+            workflow_metadata.last_modified_date = EPOCH_START
+            problems.append(MissingLastModifiedDateProblem(default_date=str(EPOCH_START)))
+        return problems
+
     def _read_workflow_metadata_for_request(
         self, workflow_file_path: Path, workflow_path: str
     ) -> WorkflowMetadata | LoadWorkflowMetadataResultFailure:
@@ -860,10 +908,47 @@ class WorkflowManager(EngineScoped):
         if workflows_to_register:
             await self.register_list_of_workflows(workflows_to_register)
 
-    async def register_list_of_workflows(self, workflows_to_register: list[str]) -> None:
-        await self._process_workflows_for_registration(workflows_to_register)
+    async def register_list_of_workflows(
+        self, workflows_to_register: list[str], library_name: str | None = None
+    ) -> WorkflowRegistrationResult:
+        """Register every workflow found at the given paths, returning which ones landed.
 
-    def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
+        Already-registered paths are skipped and appear in neither list. Pass `library_name` when
+        the paths come from that library's `workflows` list.
+        """
+        registration = await self._process_workflows_for_registration(workflows_to_register, library_name=library_name)
+        if registration.succeeded:
+            self._announce_workflow_registry_changed()
+        return registration
+
+    def remove_library_workflows(self, library_name: str) -> None:
+        """Take every workflow `library_name` contributed out of the registry, with its verdict."""
+        removed = self.engine.workflow_registry.remove_workflows_from_library(library_name)
+        if not removed.registry_keys:
+            return
+
+        for workflow_file_path in removed.file_paths:
+            self._workflow_file_path_to_info.pop(self.build_workflow_info_key(workflow_file_path), None)
+        self._announce_workflow_registry_changed()
+
+    def note_library_set_changed(self) -> None:
+        """Mark every cached verdict stale, because a library finished loading or unloaded.
+
+        A verdict depends on which libraries are loaded, at which versions, and with which nodes,
+        so any of them changing can change it, in either direction.
+        """
+        self._library_set_generation += 1
+
+    def _announce_workflow_registry_changed(self) -> None:
+        """Tell clients showing the workflow list that the registry changed without them asking."""
+        self.engine.event_manager.put_event(AppEvent(payload=WorkflowRegistryChanged()))
+
+    def _register_workflow(
+        self,
+        workflow_to_register: str,
+        workflow_metadata: WorkflowMetadata,
+        library_name: str | None = None,
+    ) -> bool:
         """Registers a workflow from a file.
 
         Args:
@@ -872,6 +957,7 @@ class WorkflowManager(EngineScoped):
                 Passed in rather than re-read here: loading it parses the file's TOML
                 header, and the caller has to do that anyway to decide the file is
                 registerable, so re-reading would parse every workflow twice.
+            library_name: The library contributing this workflow, if any.
 
         Returns:
             bool: True if the workflow was successfully registered, False otherwise.
@@ -883,7 +969,7 @@ class WorkflowManager(EngineScoped):
 
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
-            metadata=workflow_metadata, file_name=str(workflow_to_register)
+            metadata=workflow_metadata, file_name=str(workflow_to_register), library_name=library_name
         )
         workflow_register_result = self.engine.handle_request(workflow_register_request)
         if not isinstance(workflow_register_result, RegisterWorkflowResultSuccess):
@@ -960,10 +1046,14 @@ class WorkflowManager(EngineScoped):
                 ),
             )
 
-    async def _process_workflows_for_registration(  # noqa: C901
-        self, workflows_to_register: list[str]
+    async def _process_workflows_for_registration(
+        self, workflows_to_register: list[str], library_name: str | None = None
     ) -> WorkflowRegistrationResult:
         """Process a list of workflow paths for registration.
+
+        Args:
+            workflows_to_register: Files and directories to scan for workflows.
+            library_name: The library these paths belong to, or None for the workspace scan.
 
         Returns:
             WorkflowRegistrationResult with succeeded and failed workflow names
@@ -971,32 +1061,100 @@ class WorkflowManager(EngineScoped):
         succeeded = []
         failed = []
 
-        # Build the set of registered-library roots (excluding sandbox) so their bundled
-        # workflow files are skipped during the workspace scan. Library-declared workflows
-        # (listed in griptape_nodes_library.json) are registered separately via
-        # LibraryManager.collect_library_workflow_files before this scan runs. Sandbox
-        # libraries are intentionally left scannable so in-development workflows appear.
-        library_exclusion_roots: list[Path] = []
-        for library_info in self.engine.library_manager._library_file_path_to_info.values():
-            if library_info.is_sandbox:
-                continue
-            library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
+        all_workflow_files = await self._collect_workflow_files_to_register(
+            workflows_to_register, library_name=library_name
+        )
 
-        # First pass: collect all workflow files to determine total count
-        all_workflow_files: set[Path] = set()
-        # Files whose metadata already parsed cleanly in this pass, so pass 2 doesn't have
-        # to re-read and re-parse them from disk. Files whose header is malformed are left
-        # out here (even though they're still added to all_workflow_files) so pass 2's
-        # existing per-failure-type error reporting runs unchanged for them.
-        parsed_metadata_by_file: dict[Path, WorkflowMetadata] = {}
+        # Skipped up front so a second pass over the same paths is neither a failure nor progress.
+        already_registered = {
+            workflow_file
+            for workflow_file in all_workflow_files
+            if self.engine.workflow_registry.has_workflow_with_name(
+                self._derive_registry_key_for_file(workflow_file, library_name=library_name)
+            )
+        }
+        for workflow_file in already_registered:
+            logger.debug("Skipping already registered workflow: %s", workflow_file)
+        workflow_files_to_process = sorted(all_workflow_files.keys() - already_registered)
+
+        # Track progress
+        total_workflows = len(workflow_files_to_process)
+
+        # The editor reads WORKFLOWS progress as the engine still booting, so only the workspace
+        # scan reports it. A library registering mid-session sends WorkflowRegistryChanged instead.
+        report_progress = library_name is None
+
+        # Second pass: process each workflow file with progress events
+        for current_index, workflow_file in enumerate(workflow_files_to_process, start=1):
+            workflow_name = str(workflow_file.name)
+
+            if report_progress:
+                self._report_workflow_scan_progress(
+                    item_name=workflow_name,
+                    status=InitializationStatus.LOADING,
+                    current=current_index,
+                    total=total_workflows,
+                )
+
+            # Process the workflow
+            result_name = await self._process_single_workflow_file(
+                workflow_file,
+                library_name=library_name,
+                pre_parsed_metadata=all_workflow_files[workflow_file],
+            )
+            if result_name:
+                succeeded.append(result_name)
+                if report_progress:
+                    self._report_workflow_scan_progress(
+                        item_name=workflow_name,
+                        status=InitializationStatus.COMPLETE,
+                        current=current_index,
+                        total=total_workflows,
+                    )
+            else:
+                failed.append(str(workflow_file))
+                if report_progress:
+                    self._report_workflow_scan_progress(
+                        item_name=workflow_name,
+                        status=InitializationStatus.FAILED,
+                        current=current_index,
+                        total=total_workflows,
+                        error="Failed to process workflow file",
+                    )
+
+        return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
+
+    async def _collect_workflow_files_to_register(  # noqa: C901
+        self, workflows_to_register: list[str], *, library_name: str | None
+    ) -> dict[Path, WorkflowMetadata | None]:
+        """Find every file among these paths that carries a workflow metadata header.
+
+        Args:
+            workflows_to_register: Files and directories to scan for workflows.
+            library_name: The library these paths belong to, or None for the workspace scan.
+
+        Returns:
+            Each workflow file found, mapped to its parsed metadata, or None when its header is
+            malformed and registration has to re-read it to report why.
+        """
+        # The workspace scan skips registered-library roots (excluding sandbox): their workflows
+        # are registered by the library itself. Sandbox libraries stay scannable so in-development
+        # workflows appear.
+        library_exclusion_roots: list[Path] = []
+        if library_name is None:
+            for library_info in self.engine.library_manager._library_file_path_to_info.values():
+                if library_info.is_sandbox:
+                    continue
+                library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
+
+        # Keeping the parsed metadata lets registration skip reading each file a second time.
+        workflow_files: dict[Path, WorkflowMetadata | None] = {}
 
         def try_parse_workflow_metadata(workflow_file: Path) -> None:
             candidate = self._classify_workflow_candidate(workflow_file)
             if not candidate.is_workflow:
                 return
-            all_workflow_files.add(workflow_file)
-            if candidate.metadata is not None:
-                parsed_metadata_by_file[workflow_file] = candidate.metadata
+            workflow_files[workflow_file] = candidate.metadata
 
         async def collect_workflow_files(path: Path) -> None:
             """Collect workflow files from a path."""
@@ -1023,132 +1181,88 @@ class WorkflowManager(EngineScoped):
             elif path.suffix == ".py":
                 try_parse_workflow_metadata(path)
 
-        # Collect all workflow files first
         for workflow_to_register in workflows_to_register:
             await collect_workflow_files(Path(workflow_to_register))
 
-        # Track progress
-        total_workflows = len(all_workflow_files)
+        return workflow_files
 
-        # The registered-library set can't change mid-scan, so fetch it once here instead of
-        # once per file. Every caller reaches this scan after library loading has already
-        # completed, so this wait doesn't block.
-        await self.engine.library_manager._libraries_loading_complete.wait()
-        list_libraries_result = await self.engine.ahandle_request(
-            ListRegisteredLibrariesRequest(broadcast_result=False)
+    def _report_workflow_scan_progress(
+        self,
+        *,
+        item_name: str,
+        status: InitializationStatus,
+        current: int,
+        total: int,
+        error: str | None = None,
+    ) -> None:
+        """Report one workflow file's place in the boot scan to the initialization progress feed."""
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.WORKFLOWS,
+                    item_name=item_name,
+                    status=status,
+                    current=current,
+                    total=total,
+                    error=error,
+                )
+            )
         )
-        if isinstance(list_libraries_result, ListRegisteredLibrariesResultSuccess):
-            registered_libraries = list_libraries_result.libraries
-        else:
-            # A failed fetch becomes [], so every workflow in the scan reports
-            # LibraryNotRegisteredProblem for each library it references.
-            registered_libraries = []
-
-        # Second pass: process each workflow file with progress events
-        for current_index, workflow_file in enumerate(all_workflow_files, start=1):
-            workflow_name = str(workflow_file.name)
-
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
-                )
-            )
-
-            # Process the workflow
-            result_name = await self._process_single_workflow_file(
-                workflow_file,
-                pre_parsed_metadata=parsed_metadata_by_file.get(workflow_file),
-                registered_libraries=registered_libraries,
-            )
-            if result_name:
-                succeeded.append(result_name)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
-            else:
-                failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
-                )
-
-        return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
 
     async def _process_single_workflow_file(
         self,
         workflow_file: Path,
+        library_name: str | None = None,
         *,
         pre_parsed_metadata: WorkflowMetadata | None = None,
-        registered_libraries: list[str] | None = None,
     ) -> str | None:
         """Process a single workflow file for registration.
 
         Returns:
-            Workflow name if registered successfully, None if failed or skipped
+            Workflow name if registered successfully, None if it could not be registered
         """
-        # Parse metadata once and use it for both registration check and actual registration.
-        # With cached metadata in hand, skip straight to evaluation instead of going through
-        # the bus handler, which would re-gate on library loading and re-read the file.
+        # Only the header is read here. Judging it against the loaded libraries waits until
+        # someone asks (see `get_current_workflow_info`), because a library registering its
+        # workflows mid-load would otherwise judge them against a half-loaded set.
         if pre_parsed_metadata is not None:
-            complete_file_path = self.engine.config_manager.workspace_path.joinpath(str(workflow_file))
-            load_metadata_result = await self._evaluate_workflow_metadata(
-                str(complete_file_path), pre_parsed_metadata, registered_libraries=registered_libraries
+            workflow_metadata = pre_parsed_metadata
+        else:
+            # A header that fails to parse still goes in the load report, so the user learns why.
+            metadata_or_failure = self._read_workflow_metadata_for_request(
+                workflow_file, self.build_workflow_info_key(str(workflow_file))
             )
-        else:
-            load_metadata_request = LoadWorkflowMetadata(file_name=str(workflow_file))
-            load_metadata_result = await self.on_load_workflow_metadata_request(load_metadata_request)
+            if isinstance(metadata_or_failure, LoadWorkflowMetadataResultFailure):
+                logger.debug("Skipping workflow with invalid metadata: %s", workflow_file)
+                return None
+            workflow_metadata = metadata_or_failure
+        self._default_missing_dates(workflow_metadata)
 
-        if not isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
-            logger.debug("Skipping workflow with invalid metadata: %s", workflow_file)
-            return None
-
-        # Convert to relative path if the workflow is under workspace_path before checking registry
-        config_mgr = self.engine.config_manager
-        workspace_path = config_mgr.workspace_path
-
-        if workflow_file.is_relative_to(workspace_path):
-            relative_path = workflow_file.relative_to(workspace_path)
-            file_path_to_register = str(relative_path)
-        else:
-            file_path_to_register = str(workflow_file)
-
+        file_path_to_register = self._registry_file_path(workflow_file, library_name=library_name)
         registry_key = derive_registry_key(file_path_to_register)
 
-        # Check if workflow is already registered using the path-based registry key
-        if self.engine.workflow_registry.has_workflow_with_name(registry_key):
-            logger.debug("Skipping already registered workflow: %s", workflow_file)
+        if not self._register_workflow(file_path_to_register, workflow_metadata, library_name=library_name):
             return None
 
-        # Hand the already-parsed metadata to the registrar so the file's TOML header is
-        # read once per workflow rather than twice.
-        if self._register_workflow(file_path_to_register, load_metadata_result.metadata):
-            return registry_key
-        return None
+        # The file may have changed since its verdict was last judged.
+        self._workflow_file_path_to_info.pop(self.build_workflow_info_key(file_path_to_register), None)
+        return registry_key
+
+    def _derive_registry_key_for_file(self, workflow_file: Path, *, library_name: str | None) -> str:
+        """The registry key a file on disk would register under."""
+        return derive_registry_key(self._registry_file_path(workflow_file, library_name=library_name))
+
+    def _registry_file_path(self, workflow_file: Path, *, library_name: str | None) -> str:
+        """Spell a workflow path the way the registry keys it.
+
+        A library's files stay where they are when the workspace moves, so they are keyed by
+        their absolute path. The workspace's own files are keyed relative to it.
+        """
+        if library_name is not None:
+            return str(workflow_file)
+        workspace_path = self.engine.config_manager.workspace_path
+        if workflow_file.is_relative_to(workspace_path):
+            return str(workflow_file.relative_to(workspace_path))
+        return str(workflow_file)
 
     def _classify_workflow_candidate(self, workflow_file: Path) -> WorkflowCandidate:
         """Decide whether a `.py` file is a workflow, keeping its metadata if it parsed.
@@ -1170,7 +1284,7 @@ class WorkflowManager(EngineScoped):
             WorkflowMetadataSchemaError,
         ):
             # One header, but it doesn't parse: a real workflow that needs reporting. The
-            # second pass re-reads it to produce the problem specific to this failure.
+            # second pass re-reads it and skips it.
             return WorkflowCandidate(is_workflow=True, metadata=None)
         except Exception as e:
             logger.debug("Skipping workflow file %s due to error: %s", workflow_file, e)

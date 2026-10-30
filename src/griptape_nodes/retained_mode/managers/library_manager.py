@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -493,39 +492,41 @@ class LibraryManager(EngineScoped):
                 "\n".join(reconcile_failures),
             )
 
-    async def collect_library_workflow_files(self) -> list[str]:
-        """Collect workflow file paths declared by all registered libraries.
+    async def register_workflows_for_library(self, library_info: LibraryInfo) -> None:
+        """Register the workflows one library declares, owned by that library.
 
-        Returns absolute paths to workflow files, adding each library's base directory
-        to sys.path so relative imports work when the workflow is loaded.
+        Workers are skipped: they never serve workflow lists.
         """
-        workflow_files: list[str] = []
-        library_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
-        if not isinstance(library_result, ListRegisteredLibrariesResultSuccess):
-            return workflow_files
-        for library_name in library_result.libraries:
-            try:
-                library = LibraryRegistry.get_library(name=library_name)
-            except KeyError:
-                logger.error("Could not find library '%s'", library_name)
-                continue
-            library_data = library.get_library_data()
-            if not library_data.workflows:
-                continue
-            # Workflows are stored relative to the library JSON; find the library's path.
-            for library_info in self._library_file_path_to_info.values():
-                if library_info.library_name == library_name:
-                    library_path = Path(library_info.library_path)
-                    base_dir = library_path.parent.absolute()
-                    # Put the directory first on the Python path to allow for relative imports.
-                    # Every registry refresh collects again, so drop an earlier entry rather
-                    # than stacking duplicates.
-                    if str(base_dir) in sys.path:
-                        sys.path.remove(str(base_dir))
-                    sys.path.insert(0, str(base_dir))
-                    workflow_files.extend(str(base_dir / workflow) for workflow in library_data.workflows)
-                    break
-        return workflow_files
+        library_name = library_info.library_name
+        if library_name is None or self._is_worker:
+            return
+
+        workflow_files = self._collect_workflow_files_for_library(library_info)
+        if not workflow_files:
+            return
+
+        await self.engine.workflow_manager.register_list_of_workflows(workflow_files, library_name=library_name)
+
+    def _collect_workflow_files_for_library(self, library_info: LibraryInfo) -> list[str]:
+        """Collect the absolute paths of the workflow files a single library declares.
+
+        The `workflows` entries in `griptape_nodes_library.json` are relative to that JSON file.
+        """
+        if library_info.library_name is None:
+            return []
+
+        try:
+            library = LibraryRegistry.get_library(name=library_info.library_name)
+        except KeyError:
+            logger.error("Could not find library '%s'", library_info.library_name)
+            return []
+
+        library_data = library.get_library_data()
+        if not library_data.workflows:
+            return []
+
+        base_dir = Path(library_info.library_path).parent.absolute()
+        return [str(base_dir / workflow) for workflow in library_data.workflows]
 
     def register_library_workflow_node_workflows(self) -> None:
         """List the workflows behind every registered library's workflow nodes in the workflow registry."""

@@ -16,6 +16,10 @@ from griptape_nodes.node_library.workflow_registry import (
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.library_events import (
+    ListRegisteredLibrariesRequest,
+    ListRegisteredLibrariesResultSuccess,
+)
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
 )
@@ -99,7 +103,7 @@ class WorkflowCatalog(EngineScoped):
         )
 
     @handles(GetWorkflowInfoRequest)
-    def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
+    async def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
             workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
@@ -118,9 +122,8 @@ class WorkflowCatalog(EngineScoped):
                 result_details=f"Workflow '{request.workflow_name}' is unsaved; returning empty info stub.",
             )
 
-        workflow_file_path = self._build_workflow_info_key(workflow.file_path)
-
-        wf_info = self.engine.workflow_manager.find_workflow_info_for_attempted_load(workflow_file_path)
+        workflow_file_path = self.engine.workflow_manager.build_workflow_info_key(workflow.file_path)
+        wf_info = await self.engine.workflow_manager.get_current_workflow_info(workflow.file_path)
         if wf_info is None:
             details = (
                 f"Attempted to get workflow info. Failed because no info was found for path '{workflow_file_path}'."
@@ -138,12 +141,23 @@ class WorkflowCatalog(EngineScoped):
         )
 
     @handles(ListAllWorkflowInfoRequest)
-    def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
+    async def on_list_all_workflow_info_request(self, _request: ListAllWorkflowInfoRequest) -> ResultPayload:
         try:
             registry_keys = self.engine.workflow_registry.list_workflows()
         except Exception as e:
             details = f"Attempted to list all workflow info. Failed to list workflows: {e}"
             return ListAllWorkflowInfoResultFailure(result_details=details)
+
+        # Fetched once for the whole listing: every re-judged workflow below would otherwise
+        # issue its own ListRegisteredLibrariesRequest, turning one library change into N queries.
+        list_libraries_result = await self.engine.ahandle_request(
+            ListRegisteredLibrariesRequest(broadcast_result=False)
+        )
+        registered_libraries = (
+            list_libraries_result.libraries
+            if isinstance(list_libraries_result, ListRegisteredLibrariesResultSuccess)
+            else []
+        )
 
         workflow_infos: dict[str, WorkflowInfoSummary] = {}
         for registry_key in registry_keys:
@@ -154,8 +168,9 @@ class WorkflowCatalog(EngineScoped):
             # Unsaved workflows are registry-only (no on-disk metadata to summarize).
             if workflow.file_path is None:
                 continue
-            workflow_file_path = self._build_workflow_info_key(workflow.file_path)
-            wf_info = self.engine.workflow_manager.find_workflow_info_for_attempted_load(workflow_file_path)
+            wf_info = await self.engine.workflow_manager.get_current_workflow_info(
+                workflow.file_path, registered_libraries=registered_libraries
+            )
             if wf_info is None:
                 continue
             workflow_infos[registry_key] = self._build_workflow_info_payload(wf_info)
@@ -258,14 +273,6 @@ class WorkflowCatalog(EngineScoped):
             return read_workflow_metadata(Path(file_path))
         except WorkflowMetadataError as err:
             return GetWorkflowMetadataResultFailure(result_details=str(err))
-
-    def _build_workflow_info_key(self, file_path: str) -> str:
-        """Build the key used to look up a workflow's load record.
-
-        Matches the key construction in on_load_workflow_metadata_request, which uses
-        workspace_path.joinpath() without resolving symlinks.
-        """
-        return str(self.engine.config_manager.workspace_path.joinpath(file_path))
 
     def _build_workflow_info_payload(self, wf_info: WorkflowManager.WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""

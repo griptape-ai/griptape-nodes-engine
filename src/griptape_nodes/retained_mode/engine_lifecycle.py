@@ -108,8 +108,8 @@ class EngineLifecycle:
         # Register all secrets now that libraries are loaded and settings are merged
         engine.secrets_manager.register_all_secrets()
 
-        # We have to load all libraries before we attempt to load workflows. The refresh registers
-        # library-declared workflows first, then user workflows.
+        # We have to load all libraries before we attempt to load workflows. Each library has
+        # already registered its own; this scans the workspace.
         await engine.workflow_manager.refresh_workflow_registry()
 
         self.announce_ready(is_initial_start=True)

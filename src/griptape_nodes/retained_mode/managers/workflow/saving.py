@@ -484,7 +484,17 @@ class WorkflowSaver(EngineScoped):
         if not self.engine.workflow_registry.has_workflow_with_name(current_workflow_name):
             return False
         current_workflow = self.engine.workflow_registry.get_workflow_by_name(current_workflow_name)
-        return bool(current_workflow.metadata.is_griptape_provided)
+        return self.is_library_workflow(current_workflow)
+
+    def is_library_workflow(self, workflow: Workflow | None) -> bool:
+        """True when saving this workflow has to copy it instead of overwriting it.
+
+        That is a workflow a library contributed or Griptape ships, template or not. A workflow the
+        user marked `is_template` themselves is theirs to overwrite.
+        """
+        if workflow is None:
+            return False
+        return workflow.library_name is not None or bool(workflow.metadata.is_griptape_provided)
 
     def generate_unique_filename(self, base_name: str) -> str:
         """Generate a unique filename for a workflow, avoiding collisions.
@@ -819,24 +829,26 @@ class WorkflowSaver(EngineScoped):
                 branched_from=branched_from,
             )
 
-        # Determine scenario and build target info
+        # Determine scenario and build target info.
         # A workflow a library provides is never saved over: saving it writes a new copy
-        # (SAVE_FROM_TEMPLATE), whether or not it is marked as a template. User-marked templates
-        # (is_template=True but is_griptape_provided=False) are the user's own files and save normally.
-        target_is_library_workflow = target_workflow and target_workflow.metadata.is_griptape_provided
-        current_is_library_workflow = current_workflow and current_workflow.metadata.is_griptape_provided
+        # (SAVE_FROM_TEMPLATE), whether or not it is marked as a template.
         destination: ProjectFileDestination | None = None
         file_path: Path | None = None
-        if target_is_library_workflow or current_is_library_workflow:
-            # Library-provided workflows always create new copies with unique names.
-            # Library-provided workflows are always disk-backed, so file_path is guaranteed.
+        if self.is_library_workflow(target_workflow) or self.is_library_workflow(current_workflow):
+            # Library-provided workflows always create new copies with unique names, and are always
+            # disk-backed, so file_path is guaranteed.
             scenario = SaveWorkflowScenario.SAVE_FROM_TEMPLATE
             template_workflow = target_workflow or current_workflow
             if template_workflow is None or template_workflow.file_path is None:
                 msg = "Save From Template scenario requires a disk-backed template workflow."
                 raise ValueError(msg)
-            # Use the registry key as base name, independent of the display name in metadata.
-            base_name = requested_file_name or derive_registry_key(template_workflow.file_path)
+            # A requested name that is the library workflow's own key is a plain save, not a Save As.
+            # Its key is a path inside the library, so the copy takes the file's stem instead, as
+            # CreateWorkflowFromTemplateRequest does, and lands where workflows are saved.
+            if requested_file_name and not self.is_library_workflow(target_workflow):
+                base_name = requested_file_name
+            else:
+                base_name = Path(template_workflow.file_path).stem
             file_name = self.generate_unique_filename(base_name)
             creation_date = datetime.now(tz=UTC)
             branched_from = None
