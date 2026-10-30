@@ -231,12 +231,13 @@ class WorkflowFileOperations(EngineScoped):
                     context_manager.has_current_workflow()
                     and context_manager.get_current_workflow_name() == old_registry_key
                 ):
-                    context_manager.set_current_workflow_name(new_registry_key)
-                    # The context also retains the workflow's path, and that is what
-                    # `workflow_dir` answers with. Move is the one operation that changes the
-                    # directory, so without this the builtin keeps resolving to the folder the
-                    # file just left.
-                    context_manager.set_current_workflow_file_path(str(new_absolute_path))
+                    # The context also retains the workflow's path (`workflow_dir` answers with
+                    # it), so key and path move together here.
+                    context_manager.rekey_workflow(
+                        old_name=old_registry_key,
+                        new_name=new_registry_key,
+                        new_file_path=str(new_absolute_path),
+                    )
 
         except OSError as e:
             error_messages = []
@@ -361,13 +362,19 @@ class WorkflowFileOperations(EngineScoped):
                     "Failed while attempting to remove the original file name from the registry."
                 )
 
-        # If the renamed workflow is the current context, update the context name so the
-        # heartbeat and other callers reflect the new registry key immediately. The retained
-        # path moves with it: rename keeps the directory, so `workflow_dir` is unaffected, but
-        # the path itself would otherwise name a file that no longer exists.
+        # If the renamed workflow is still the current context, repoint it so the heartbeat and
+        # other callers reflect the new registry key (and path) immediately. "Still" is
+        # load-bearing: an ordinary rename of a registered open workflow already had its context
+        # torn down by the delete above, via `on_delete_workflows_request`, so clients hear that
+        # teardown rather than a new key. This branch only catches renames that skip the delete
+        # (a Save As, or a rename resolving to the same key) and the stacked-duplicate case a
+        # `run_with_clean_slate=False` open leaves behind.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
-            context_manager.set_current_workflow_name(new_workflow_name)
-            context_manager.set_current_workflow_file_path(str(save_result.file_path))
+            context_manager.rekey_workflow(
+                old_name=old_workflow_name,
+                new_name=new_workflow_name,
+                new_file_path=str(save_result.file_path),
+            )
 
         return None

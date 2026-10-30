@@ -251,6 +251,7 @@ class WorkflowRunner(EngineScoped):
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
+            # push_workflow emits CurrentWorkflowChanged, as does the revert below.
             self.engine.context_manager.push_workflow(request.workflow_name)
             # run file
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)

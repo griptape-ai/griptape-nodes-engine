@@ -9,7 +9,7 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Only ONE can be active at a time. Reset with `ClearAllObjectStateRequest`.
+- **Workflow**: Top-level namespace. Only ONE can be active at a time. Open a saved one with `RunWorkflowFromRegistryRequest`; wipe back to an empty engine with `ClearAllObjectStateRequest`.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
@@ -135,12 +135,16 @@ Behavior:
 - **No nesting.** `EventRequestBatch` is intentionally absent from
     `SUPPORTED_REQUEST_EVENTS` and the inner `request_type` enum, so a batch cannot
     contain another batch.
-- **Default timeout scales with size.** `timeout_ms` defaults to
-    `30000 × len(requests)` clamped at `300000` ms (5 min). Pass an explicit
-    override when the last slot is `StartFlowRequest` or
-    any other long-running call; otherwise the synchronous run can eat the budget
-    meant for the rest of the batch. `bool` is rejected explicitly so `True`
-    cannot silently become 1ms.
+- **Default timeout scales with size.** `timeout_ms` defaults to the sum of what each
+    inner request gets on its own — `30000` ms for most, `300000` ms for
+    `RunWorkflowFromRegistryRequest`, which replays a whole saved file — clamped at
+    `300000` ms (5 min). Pass an explicit override when the last slot is
+    `StartFlowRequest` or any other long-running call; otherwise the synchronous run can
+    eat the budget meant for the rest of the batch.
+    `bool` is rejected explicitly so `True` cannot silently become 1ms.
+- **A timeout does not cancel anything.** The engine runs each request to completion on
+    its own loop, so a timeout only ends your wait. Read the state back rather than
+    resending — a resent batch runs its requests a second time.
 
 Return shape: a JSON array of trimmed slot responses in submission order. Each slot
 looks identical to the response that single-tool dispatch would have returned for
@@ -372,9 +376,17 @@ A typo here surfaces as an opaque validation error from pydantic, not a friendly
 
 ### Only one workflow in context at a time
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` first — this wipes
-EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today.
+`SetWorkflowContextRequest` refuses if a workflow is already in context. To open a saved
+workflow (replacing what's open), send `RunWorkflowFromRegistryRequest(workflow_name=...)`
+instead — it replays the saved `.py` and leaves it in the Current Context. It's destructive
+by default (`run_with_clean_slate=True` wipes the engine first), and it does NOT run the
+workflow; follow with `StartFlowRequest` for that. To close what's open without opening
+anything, `ClearAllObjectStateRequest(i_know_what_im_doing=True)` still wipes EVERYTHING.
+
+The engine broadcasts a `CurrentWorkflowChanged` app event whenever the Current Context
+moves, carrying `workflow_name` (`None` when nothing is open) and `is_saved` — so every
+attached client, not just the one that asked, can follow along. See that event's docstring
+for ordering details.
 
 ### Agents cannot be interrupted mid-run
 
@@ -388,6 +400,8 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Goal                                                                                | Tool                                                                                                                                                      |
 | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Bootstrap a workflow + flow from cold                                               | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
+| List the saved workflows (for their registry keys)                                  | `ListAllWorkflowsRequest`                                                                                                                                 |
+| Open a saved workflow (replacing what's open)                                       | `RunWorkflowFromRegistryRequest(workflow_name=...)` — loads its nodes; does not run it; discards unsaved work by default                                  |
 | Fan N requests out in one round trip                                                | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                                     | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest` (`include_metadata` for descriptions), `ListCategoriesInLibraryRequest`                 |
 | Inspect a node type's parameters                                                    | `DescribeNodeTypeRequest`                                                                                                                                 |
@@ -408,7 +422,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
-| Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
+| Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)` — leaves no current workflow                                                                      |
 
 ## Custom nodes
 

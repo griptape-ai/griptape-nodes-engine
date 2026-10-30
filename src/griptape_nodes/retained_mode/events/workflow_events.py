@@ -124,16 +124,31 @@ class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryRequest(RequestPayload):
-    """Run a workflow from the registry.
+    """Open a saved workflow from the registry and make it the Current Context.
 
-    Use when: Executing registered workflows, running workflows by name,
-    using workflow templates, automated workflow execution.
+    Replays the saved `.py` file, rebuilding the workflow's nodes, connections, and parameter
+    values, and leaves that workflow in the Current Context. It does NOT execute the
+    workflow; issue a StartFlowRequest afterwards for that. It cannot open an unsaved
+    workflow, since there is no file to replay -- use SetWorkflowContextRequest for that.
+
+    DESTRUCTIVE BY DEFAULT. With run_with_clean_slate=True this first wipes the engine,
+    discarding unsaved changes in whatever workflow is currently open. Save first
+    (SaveWorkflowRequest) if that matters.
+
+    Opening a large workflow can take a while, and a timeout on your side does not cancel it --
+    wait and read the graph back (ListNodesInFlowRequest) rather than resending.
 
     Args:
-        workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to start with a clean state (default: True)
+        workflow_name: Registry key of the workflow to open. These are the keys of the
+            dict returned by ListAllWorkflowsRequest, not the display name inside each
+            entry's metadata.
+        run_with_clean_slate: Whether to discard everything currently in the engine before
+            opening (default: True). True is the normal "open this workflow" behavior.
+            False loads the workflow's objects alongside whatever is already there and
+            nests it on top of the existing Current Context rather than replacing it, so
+            the workflow underneath stays on the stack. Rarely what you want.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, workflow unsaved, execution error)
     """
 
     workflow_name: str

@@ -418,25 +418,29 @@ class EventManager(EngineScoped):
             and self._event_loop is not None
         )
 
-    def put_event(self, event: Any) -> None:
+    def put_event(self, event: Any) -> bool:
         """Put event into async queue from sync context (non-blocking).
 
         Automatically detects if we're in a different thread and uses thread-safe operations.
 
         Args:
             event: The event to publish to the queue
+
+        Returns:
+            True once the event is on the queue, False when there is no queue yet or the event is
+            suppressed for the current context. Most callers can ignore this.
         """
         if self._event_queue is None:
-            return
+            return False
         # A worker building or discarding its copy of a node changes only its own graph, which no client
         # knows about; publishing that would show clients flows and nodes that don't exist for them.
         if _rebuilding_node_name.get() is not None:
-            return
+            return False
 
         # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
         if self.should_suppress_event(event):
             self._dispatch_to_execution_listeners(event)
-            return
+            return False
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -450,26 +454,31 @@ class EventManager(EngineScoped):
         # streamed token to a parameter) enqueues its own events *after* the triggering
         # event, preserving source order on the queue.
         self._dispatch_to_execution_listeners(event)
+        return True
 
-    async def aput_event(self, event: Any) -> None:
+    async def aput_event(self, event: Any) -> bool:
         """Put event into async queue from async context.
 
         Automatically detects if we're in a different thread and uses thread-safe operations.
 
         Args:
             event: The event to publish to the queue
+
+        Returns:
+            True once the event is on the queue, False when it never reached the queue. See
+            `put_event`.
         """
         if self._event_queue is None:
-            return
+            return False
         # A worker building or discarding its copy of a node changes only its own graph, which no client
         # knows about; publishing that would show clients flows and nodes that don't exist for them.
         if _rebuilding_node_name.get() is not None:
-            return
+            return False
 
         # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
         if self.should_suppress_event(event):
             self._dispatch_to_execution_listeners(event)
-            return
+            return False
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -482,6 +491,7 @@ class EventManager(EngineScoped):
         # Dispatch after enqueuing so a re-entrant emission from a callback lands on the
         # queue after its triggering event (see put_event).
         self._dispatch_to_execution_listeners(event)
+        return True
 
     def add_pre_dispatch_hook(
         self,

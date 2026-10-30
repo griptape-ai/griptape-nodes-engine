@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.context_events import (
+    CurrentWorkflowChanged,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
@@ -41,6 +43,18 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    _last_notified_workflow: ContextManager.CurrentWorkflow
+    _switch_owed: bool
+
+    class CurrentWorkflow(NamedTuple):
+        """Which Workflow is current and whether it has a file behind it.
+
+        Shared by CurrentWorkflowChanged and GetWorkflowContextRequest so the two answers
+        cannot drift; both read it from `_read_current_workflow`.
+        """
+
+        workflow_name: str | None
+        is_saved: bool | None
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -266,13 +280,27 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
+        # What the last CurrentWorkflowChanged actually carried onto the event queue, so a dedupe
+        # can tell "nothing is open" from "nothing has been announced yet". See
+        # `_notify_current_workflow_changed`.
+        self._last_notified_workflow = self.CurrentWorkflow(workflow_name=None, is_saved=None)
+        # Whether a switch was computed but never reached the queue, so the next notification goes
+        # out even if it would otherwise dedupe against `_last_notified_workflow`.
+        self._switch_owed = False
         event_manager.register_request_handlers(self)
 
     @handles(SetWorkflowContextRequest)
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
         # As of today, we only allow a single Workflow context at a time. This may change in the future.
         if self.has_current_workflow():
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{self.get_current_workflow_name()}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
+            msg = (
+                f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. "
+                f"Failed because an existing workflow, '{self.get_current_workflow_name()}', is already "
+                f"in the Current Context. To open a saved workflow -- loading its nodes, connections, and "
+                f"values, and replacing whatever is open now -- issue a RunWorkflowFromRegistry request "
+                f"instead; it does not require an empty context. To close the existing workflow and "
+                f"discard all of its objects without opening anything, issue a ClearAllObjectState request."
+            )
             return SetWorkflowContextFailure(result_details=msg)
 
         # Normalized here rather than at read time so `workflow_dir` never has to care whether
@@ -321,16 +349,11 @@ class ContextManager(EngineScoped):
 
     @handles(GetWorkflowContextRequest)
     def on_get_workflow_context_request(self, request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG002
-        workflow_name = None
-        is_saved = None
-        if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
-            if self.engine.workflow_registry.has_workflow_with_name(workflow_name):
-                is_saved = self.engine.workflow_registry.get_workflow_by_name(workflow_name).is_saved
+        current_workflow = self._read_current_workflow()
         return GetWorkflowContextSuccess(
-            workflow_name=workflow_name,
-            is_saved=is_saved,
-            result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
+            workflow_name=current_workflow.workflow_name,
+            is_saved=current_workflow.is_saved,
+            result_details=f"Successfully retrieved workflow context: {current_workflow.workflow_name or 'None'}",
         )
 
     @handles(EnsureWorkflowAndFlowRequest)
@@ -600,30 +623,39 @@ class ContextManager(EngineScoped):
 
         return self._workflow_stack[-1]._working_directory
 
-    def set_current_workflow_name(self, new_name: str) -> None:
-        """Update the name of the current Workflow context.
+    def rekey_workflow(self, *, old_name: str, new_name: str, new_file_path: str | None) -> None:
+        """Repoint every context entry for `old_name` at `new_name`, wherever it sits on the stack.
+
+        Covers the first save of a scratch workflow, a Save As, a Rename, and a Move -- all four
+        change the registry key and the file behind it together, so name and path are updated here
+        in one call before the CurrentWorkflowChanged notification goes out.
+
+        Walks the whole stack, not just the top entry, so a buried duplicate of the same key is not
+        left holding a name the registry has dropped. No match is quietly treated as nothing to do.
 
         Args:
-            new_name: The new name to assign to the current Workflow.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
+            old_name: The registry key the context currently holds.
+            new_name: The registry key it should hold instead.
+            new_file_path: The workflow's path on disk afterwards, or None if it has none.
         """
-        if not self.has_current_workflow():
-            msg = "No active Workflow context"
-            raise self.NoActiveWorkflowError(msg)
+        for workflow_context_state in self._workflow_stack:
+            if workflow_context_state._name == old_name:
+                workflow_context_state._name = new_name
+                workflow_context_state._file_path = new_file_path
 
-        self._workflow_stack[-1]._name = new_name
+        self._notify_current_workflow_changed()
 
     def set_current_workflow_file_path(self, new_file_path: str | None) -> None:
         """Update the file path retained on the current Workflow context.
 
-        Anything that relocates the current workflow's file on disk (Move, Rename) must call
-        this alongside `set_current_workflow_name`. The retained path is the authoritative
-        answer for the workflow's location -- `get_current_workflow_file_path` is preferred
-        over a registry lookup precisely because it survives a workspace switch -- so leaving
-        it at the pre-move value keeps `workflow_dir` pointing at the old directory even
-        though the registry is correct.
+        The retained path is the authoritative answer for the workflow's location --
+        `get_current_workflow_file_path` is preferred over a registry lookup precisely because it
+        survives a workspace switch -- so leaving it at the pre-move value keeps `workflow_dir`
+        pointing at the old directory even though the registry is correct.
+
+        Use when the path is all that changes and the registry key does not. Every relocation an
+        artist can trigger also changes the key, so those go through `rekey_workflow` instead,
+        which notifies clients; this setter does not, since the path isn't part of that payload.
 
         Args:
             new_file_path: The workflow's new path, or None when it no longer has one.
@@ -759,6 +791,7 @@ class ContextManager(EngineScoped):
             resolved_name, file_path=file_path, working_directory=working_directory
         )
         self._workflow_stack.append(workflow_context_state)
+        self._notify_current_workflow_changed()
         return resolved_name
 
     def pop_workflow(self) -> str:
@@ -775,6 +808,7 @@ class ContextManager(EngineScoped):
             raise self.EmptyStackError(msg)
 
         workflow_context = self._workflow_stack.pop()
+        self._notify_current_workflow_changed()
         return workflow_context._name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
@@ -902,3 +936,88 @@ class ContextManager(EngineScoped):
 
         current_node = current_flow._node_stack[-1]
         return current_node.pop_element()
+
+    def _notify_current_workflow_changed(self) -> None:
+        """Broadcast which Workflow is now current, when that answer has changed.
+
+        Called from `push_workflow`, `pop_workflow`, and `rekey_workflow` -- the only ways the
+        context can move. Most of those happen deep inside another request whose result doesn't
+        name the workflow that ended up in context, so without this a client that didn't issue the
+        request (a second editor, an agent over MCP) never finds out.
+
+        Reports which workflow is current, not that its contents finished loading:
+        RunWorkflowFromRegistry pushes before replaying the saved file, so this fires first and
+        the nodes follow as ordinary creation events.
+
+        Payload comes from `_read_current_workflow`, the same method GetWorkflowContextRequest
+        answers from, so the event and a direct probe can't disagree. The path is deliberately not
+        in the payload, which is why `set_current_workflow_file_path` doesn't notify on its own.
+
+        Deduped against `_last_notified_workflow` so "changed" means what it says. A switch that
+        couldn't be broadcast (queue not up yet, or the engine loop closed) sets `_switch_owed` so
+        the next notification still goes out even if it would otherwise look like a no-op dedupe.
+        """
+        current_workflow = self._read_current_workflow()
+
+        if not self._switch_owed and current_workflow == self._last_notified_workflow:
+            return
+
+        switched_to = "no workflow is open any more"
+        if current_workflow.workflow_name is not None:
+            switched_to = f"the open workflow is now '{current_workflow.workflow_name}'"
+
+        # A notification that cannot be sent must not fail the mutation that triggered it: `put_event`
+        # raises if the engine's loop has closed, and `pop_workflow` runs inside ClearAllObjectState's
+        # teardown, which turns any exception into a failure result for a wipe that actually succeeded.
+        try:
+            event_was_queued = self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=CurrentWorkflowChanged(
+                        workflow_name=current_workflow.workflow_name,
+                        is_saved=current_workflow.is_saved,
+                    )
+                )
+            )
+        except RuntimeError as e:
+            self._switch_owed = True
+            logger.warning(
+                "Attempted to tell connected editors that %s. They will be told at the next switch, "
+                "if the engine is still running to make one. Failed due to: %s",
+                switched_to,
+                e,
+            )
+            return
+
+        # Not queued means no queue yet, or a suppressed event -- neither a fault, but still left
+        # owed so the next switch retries the broadcast.
+        if not event_was_queued:
+            self._switch_owed = True
+            logger.debug(
+                "Did not tell connected editors that %s: the event was not broadcast. They will be "
+                "told at the next switch; a client that connects in between reads the current workflow "
+                "with a GetWorkflowContext request.",
+                switched_to,
+            )
+            return
+
+        self._switch_owed = False
+        self._last_notified_workflow = current_workflow
+
+    def _read_current_workflow(self) -> ContextManager.CurrentWorkflow:
+        """Read which Workflow is current and whether it has a file behind it.
+
+        The single source for both the CurrentWorkflowChanged payload and
+        GetWorkflowContextRequest's answer. `is_saved` is None rather than False when nothing is
+        open or the key in context isn't a registry entry -- "unknown", not "unsaved".
+        """
+        if not self.has_current_workflow():
+            return self.CurrentWorkflow(workflow_name=None, is_saved=None)
+
+        workflow_name = self.get_current_workflow_name()
+        if not self.engine.workflow_registry.has_workflow_with_name(workflow_name):
+            return self.CurrentWorkflow(workflow_name=workflow_name, is_saved=None)
+
+        return self.CurrentWorkflow(
+            workflow_name=workflow_name,
+            is_saved=self.engine.workflow_registry.get_workflow_by_name(workflow_name).is_saved,
+        )

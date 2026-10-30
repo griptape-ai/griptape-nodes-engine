@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
+    AppPayload,
     GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
@@ -90,7 +91,8 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Args:
         workflow_name: Name of the current workflow context (None if no context set)
         is_saved: Whether the current workflow is backed by a file on disk. None when
-                  no context is set or the context key is not in the registry.
+                  no context is set or the context key is not in the registry. Also
+                  carried by the CurrentWorkflowChanged app event.
     """
 
     workflow_name: str | None
@@ -158,3 +160,32 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class EnsureWorkflowAndFlowResultFailure(ResultPayloadFailure):
     """EnsureWorkflowAndFlow failed. Common causes: could not push workflow context, flow creation rejected by the engine."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CurrentWorkflowChanged(AppPayload):
+    """Current workflow switched notification.
+
+    Emitted by ContextManager whenever the workflow it reports as current changes: opening a
+    saved workflow, starting a scratch one, its first save, a move, a clear, or a delete. Observed
+    by every attached client, including one that did not make the change itself (a second editor,
+    an agent over MCP).
+
+    Reports which workflow, not whether its contents finished loading: RunWorkflowFromRegistry
+    switches the context before replaying the saved file, so this arrives first and the nodes
+    follow as ordinary creation events.
+
+    One operation can move the context more than once; the last event is the truth. Renaming the
+    open saved workflow reports the teardown that rename causes (deleting the old registry entry
+    while it's in context), not the new name -- renaming an unsaved workflow goes through the
+    inner save instead and reports the new key as expected.
+
+    Args:
+        workflow_name: Registry key of the workflow now in context, or None when nothing is open.
+        is_saved: Whether that workflow is backed by a file on disk. False for a workflow that has
+            never been saved, None when none is open.
+    """
+
+    workflow_name: str | None
+    is_saved: bool | None
