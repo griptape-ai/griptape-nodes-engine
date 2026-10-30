@@ -78,6 +78,8 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
+        # The process exits next, which would drop usage reports still queued.
+        await asyncio.to_thread(GriptapeNodes.BudgetManager().flush_reports)
         await self._stop_websocket_connection()
 
         GriptapeNodes.SessionManager().remove_session(self._session_id)
