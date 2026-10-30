@@ -2046,6 +2046,12 @@ class WorkerManager(EngineScoped):
         # That engine forgets this engine's session once it loses the connection, so the offer is gone too.
         for key in [key for key in self._engine_registrations if key[0] == engine_id]:
             del self._engine_registrations[key]
+        # It forgets the leases too, so a run's next node there asks for a new one. An acquire still waiting
+        # fails on its own, with the connection's loss as the reason.
+        for lease in [lease for lease in self._leases.values() if lease.host_engine_id == engine_id]:
+            del self._leases[lease.lease_id]
+            if lease.run_id is not None and self._run_leases.get((lease.run_id, lease.host_engine_id)) is lease:
+                del self._run_leases[(lease.run_id, lease.host_engine_id)]
         await self._forget_engine(engine_id, why="lost its connection")
 
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:

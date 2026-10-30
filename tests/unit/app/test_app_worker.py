@@ -4318,6 +4318,27 @@ class TestAskingAnotherEngineForALease:
         assert worker_manager._leases == {}
 
     @pytest.mark.asyncio
+    async def test_a_run_s_next_node_asks_for_a_new_lease_after_that_engine_was_lost(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """That engine forgot the lease with the connection, so the old one would be refused."""
+        links = _host_engine(worker_manager)
+        _in_run(worker_manager)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        before = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        worker_manager.release_after_node(before)
+
+        await worker_manager.on_engine_lost(_HOST_ENGINE)
+        _offer_session_to(worker_manager, _HOST_ENGINE)
+        after = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+
+        assert before is not None
+        assert after is not None
+        assert after.lease_id != before.lease_id
+        assert links.sent_types().count("AcquireLeaseRequest") == len([before, after])
+        assert "ReleaseLeaseRequest" not in links.sent_types(), "a lost engine is not told to release"
+
+    @pytest.mark.asyncio
     async def test_a_node_outside_any_run_has_a_lease_of_its_own_released_when_it_ends(
         self, worker_manager: WorkerManager
     ) -> None:
