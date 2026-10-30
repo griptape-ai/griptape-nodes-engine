@@ -19,6 +19,8 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
     CancelFlowResultSuccess,
     ContinueExecutionStepRequest,
+    ControlFlowCancelledEvent,
+    InvolvedNodesEvent,
     ResolveNodeRequest,
     ResolveNodeResultSuccess,
     RunQueuedEvent,
@@ -267,6 +269,67 @@ async def test_a_debug_run_cancelled_while_a_step_checks_a_node_ends_when_the_st
     assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
     assert _state(engine, "Next") is NodeResolutionState.RESOLVED
     assert _state(engine, "Holder") is not NodeResolutionState.RESOLVED
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_slow_cancel_leaves_the_run_that_started_while_it_waited_alone(
+    engine: Engine, flow_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run ends on its own while its cancel waits, and the next run starts: the cancel leaves that run be."""
+    flow_manager = engine.flow_manager
+    next_gate = tmp_path / "gates" / "next.gate"
+    _set_parameter(engine, "Next", "gate_file", str(next_gate))
+
+    holding = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Holder")))
+    await _wait_for_state(engine, "Holder", NodeResolutionState.RESOLVING)
+    waiting = asyncio.create_task(engine.ahandle_request(StartFlowFromNodeRequest(node_name="Next")))
+    await asyncio.sleep(_WAITING_SECONDS)
+    assert not waiting.done(), waiting.result()
+
+    # Telling a worker to cancel its node is a send that can take a while; hold it until the next run starts.
+    sending, may_send = asyncio.Event(), asyncio.Event()
+
+    async def slow_send(node_name: str) -> None:  # noqa: ARG001
+        if sending.is_set():
+            return
+        sending.set()
+        await may_send.wait()
+
+    monkeypatch.setattr(engine.node_manager, "cancel_worker_execution", slow_send)
+    cancel = asyncio.create_task(engine.ahandle_request(CancelFlowRequest(flow_name=flow_name)))
+    await asyncio.wait_for(sending.wait(), timeout=_RUN_TIMEOUT_SECONDS)
+
+    _open_gate(tmp_path)
+    await _finish(holding)
+    await _wait_for_state(engine, "Next", NodeResolutionState.RESOLVING)
+    next_machine = flow_manager._global_control_flow_machine
+    sent: list[Any] = []
+    put_event = engine.event_manager.put_event
+
+    def record(event: Any) -> None:
+        sent.append(getattr(getattr(event, "wrapped_event", None), "payload", None))
+        put_event(event)
+
+    monkeypatch.setattr(engine.event_manager, "put_event", record)
+
+    may_send.set()
+    await _finish(cancel)
+
+    assert flow_manager._global_control_flow_machine is next_machine
+    assert flow_manager.check_for_existing_running_flow(), "the cancel stopped the next run's flow"
+    assert "Next" in flow_manager.global_dag_builder.node_to_reference, "the cancel cleared the next run's nodes"
+    told_stopped = [
+        type(payload).__name__
+        for payload in sent
+        if isinstance(payload, ControlFlowCancelledEvent)
+        or (isinstance(payload, InvolvedNodesEvent) and not payload.involved_nodes)
+    ]
+    assert told_stopped == [], f"the editor was told the next run stopped: {told_stopped}"
+    next_gate.parent.mkdir(parents=True, exist_ok=True)
+    next_gate.write_text("open")
+    assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
+    assert _state(engine, "Next") is NodeResolutionState.RESOLVED
 
 
 def _record_end_states(engine: Engine) -> list[str]:
