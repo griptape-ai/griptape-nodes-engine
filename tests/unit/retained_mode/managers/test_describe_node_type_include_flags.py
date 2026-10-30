@@ -1,8 +1,7 @@
-"""Tests for a compact DescribeNodeTypeRequest: parameter specs, metadata-only fallbacks, and the spec cache."""
+"""Tests for DescribeNodeTypeRequest's include_* flags, dropdown options, metadata-only fallbacks, and the cache."""
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -11,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, StartNode, SuccessFailureNode
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
     LibraryMetadata,
@@ -20,20 +19,18 @@ from griptape_nodes.node_library.library_registry import (
     NodeDeprecationMetadata,
     NodeMetadata,
 )
-from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultFailure,
     DescribeNodeTypeResultSuccess,
-    NodeTypeParameterSpec,
+    ParameterDescription,
     RegisterSandboxNodeFromSourceRequest,
     RegisterSandboxNodeFromSourceResultSuccess,
     ReloadAllLibrariesRequest,
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.library.node_type_specs import NOTE_ELLIPSIS, NOTE_MAX_CHARS
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.traits.multi_options import MultiOptions
 from griptape_nodes.traits.options import Options
@@ -44,13 +41,13 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
 
-LIBRARY_NAME = "describe-node-type-compact-test-library"
-OTHER_LIBRARY_NAME = "describe-node-type-compact-other-library"
+LIBRARY_NAME = "describe-node-type-flags-test-library"
+OTHER_LIBRARY_NAME = "describe-node-type-flags-other-library"
 LONG_TOOLTIP = "The prompt sent to the model. " * 20
 
 
 class _CompactProbe(BaseNode):
-    """A node type with one parameter of each kind a compact spec distinguishes."""
+    """A node type with tooltips, ui_options, and each kind of dropdown."""
 
     constructed: ClassVar[int] = 0
 
@@ -155,7 +152,7 @@ def _schema(name: str) -> LibrarySchema:
         library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
         metadata=LibraryMetadata(
             author="test",
-            description="describe node type compact test library",
+            description="describe node type include flags test library",
             library_version="1.0.0",
             engine_version="1.0.0",
             tags=[],
@@ -171,7 +168,7 @@ def _metadata(*, deprecated: bool = False) -> NodeMetadata:
         deprecation = NodeDeprecationMetadata(deprecation_message="Use another node.")
     return NodeMetadata(
         category="test/category",
-        description="Probe node used by compact DescribeNodeType tests",
+        description="Probe node used by DescribeNodeType include flag tests",
         display_name="Probe",
         deprecation=deprecation,
     )
@@ -191,34 +188,47 @@ def _register_library(
     library.register_lazy_node_type(node_type_name, _metadata(deprecated=deprecated), loader=lambda: node_class)
 
 
+# What a client planning a workflow asks for: everything but names, types, modes, defaults and options.
+PLAN = {"include_metadata": False, "include_tooltips": False, "include_ui_options": False}
+
+
 def _describe_result(
-    engine: Engine, node_type: str, library: str | None = None
+    engine: Engine, node_type: str, library: str | None = None, **includes: bool
 ) -> DescribeNodeTypeResultSuccess | DescribeNodeTypeResultFailure:
+    flags = {**PLAN, **includes}
     result = engine.library_manager.catalog.describe_node_type_request(
-        DescribeNodeTypeRequest(node_type=node_type, library=library, compact=True)
+        DescribeNodeTypeRequest(
+            node_type=node_type,
+            library=library,
+            include_metadata=flags["include_metadata"],
+            include_tooltips=flags["include_tooltips"],
+            include_ui_options=flags["include_ui_options"],
+        )
     )
     assert isinstance(result, (DescribeNodeTypeResultSuccess, DescribeNodeTypeResultFailure))
     return result
 
 
-def _describe(engine: Engine, node_type: str, library: str | None = None) -> DescribeNodeTypeResultSuccess:
-    result = _describe_result(engine, node_type, library)
+def _describe(
+    engine: Engine, node_type: str, library: str | None = None, **includes: bool
+) -> DescribeNodeTypeResultSuccess:
+    result = _describe_result(engine, node_type, library, **includes)
     assert isinstance(result, DescribeNodeTypeResultSuccess), result.result_details
     return result
 
 
-def _specs(result: DescribeNodeTypeResultSuccess) -> list[NodeTypeParameterSpec]:
-    assert result.parameters == []
-    assert result.parameter_specs is not None
-    return result.parameter_specs
+def _describe_full(engine: Engine, node_type: str) -> DescribeNodeTypeResultSuccess:
+    result = engine.library_manager.catalog.describe_node_type_request(DescribeNodeTypeRequest(node_type=node_type))
+    assert isinstance(result, DescribeNodeTypeResultSuccess), result.result_details
+    return result
 
 
-def _specs_by_name(result: DescribeNodeTypeResultSuccess) -> dict[str, NodeTypeParameterSpec]:
-    return {param.name: param for param in _specs(result)}
+def _by_name(result: DescribeNodeTypeResultSuccess) -> dict[str, ParameterDescription]:
+    return {param.name: param for param in result.parameters}
 
 
 def _parameter_names(result: DescribeNodeTypeResultSuccess) -> list[str]:
-    return [param.name for param in _specs(result)]
+    return [param.name for param in result.parameters]
 
 
 def _warnings(result: DescribeNodeTypeResultSuccess | DescribeNodeTypeResultFailure) -> list[str]:
@@ -236,230 +246,108 @@ def _clean_registry_and_counters() -> Generator[None, None, None]:
     LibraryRegistry._clear()
 
 
-class TestDescribeNodeTypeCompactSpec:
-    """A compact request returns the fields a client plans with."""
+class TestDescribeNodeTypeIncludeFlags:
+    """Each include_* flag leaves out one part of the description; the rest stays as a full request has it."""
 
-    def test_node_level_fields(self, engine: Engine) -> None:
-        _register_library(deprecated=True)
+    def test_defaults_describe_everything(self, engine: Engine) -> None:
+        _register_library()
 
-        result = _describe(engine, _CompactProbe.__name__)
+        result = _describe_full(engine, _CompactProbe.__name__)
 
-        assert result.node_type == _CompactProbe.__name__
-        assert result.library == LIBRARY_NAME
-        # Listing the node types already gives the metadata.
-        assert result.metadata is None
-        assert result.exec_pins is False
-        assert _parameter_names(result) == ["prompt", "style", "tags", "legacy_mode", "images", "output"]
+        assert result.metadata is not None
+        assert result.metadata.category == "test/category"
+        prompt = _by_name(result)["prompt"]
+        assert prompt.tooltip == LONG_TOOLTIP
+        assert prompt.ui_options == {"display_name": "Prompt", "multiline": True}
+        assert _parameter_names(result) == ["prompt", "style", "tags", "legacy_mode", "images", "image", "output"]
         assert result.result_details == ResultDetails(
             message=f"Successfully described node type '{_CompactProbe.__name__}' in Library '{LIBRARY_NAME}'.",
             level=logging.DEBUG,
         )
 
-    def test_parameter_fields(self, engine: Engine) -> None:
+    def test_without_metadata(self, engine: Engine) -> None:
         _register_library()
 
-        by_name = _specs_by_name(_describe(engine, _CompactProbe.__name__))
+        result = _describe(
+            engine, _CompactProbe.__name__, include_metadata=False, include_tooltips=True, include_ui_options=True
+        )
 
-        prompt = by_name["prompt"]
+        assert result.metadata is None
+        assert _by_name(result)["prompt"].tooltip == LONG_TOOLTIP
+
+    def test_without_tooltips(self, engine: Engine) -> None:
+        _register_library()
+
+        result = _describe(
+            engine, _CompactProbe.__name__, include_metadata=True, include_tooltips=False, include_ui_options=True
+        )
+
+        assert result.metadata is not None
+        for param in result.parameters:
+            assert param.tooltip is None
+            assert param.tooltip_as_input is None
+            assert param.tooltip_as_property is None
+            assert param.tooltip_as_output is None
+        assert _by_name(result)["prompt"].ui_options == {"display_name": "Prompt", "multiline": True}
+
+    def test_without_ui_options(self, engine: Engine) -> None:
+        _register_library()
+
+        result = _describe(
+            engine, _CompactProbe.__name__, include_metadata=True, include_tooltips=True, include_ui_options=False
+        )
+
+        for param in result.parameters:
+            assert param.ui_options is None
+        assert _by_name(result)["prompt"].tooltip == LONG_TOOLTIP
+
+    def test_planning_request_keeps_what_wiring_needs(self, engine: Engine) -> None:
+        _register_library()
+
+        prompt = _by_name(_describe(engine, _CompactProbe.__name__))["prompt"]
+
         assert prompt.type == "str"
         assert prompt.input_types == ["str"]
         assert prompt.output_type == "str"
-        assert prompt.modes == ["input", "property", "output"]
-        assert prompt.default == "hello"
+        assert (prompt.mode_allowed_input, prompt.mode_allowed_property, prompt.mode_allowed_output) == (
+            True,
+            True,
+            True,
+        )
+        assert prompt.default_value == "hello"
         assert prompt.options is None
-        assert prompt.multi_input is False
-
-        output = by_name["output"]
-        assert output.modes == ["output"]
-        assert output.default is None
 
     def test_options_come_from_dropdown_and_multi_select_choices(self, engine: Engine) -> None:
         _register_library()
 
-        by_name = _specs_by_name(_describe(engine, _CompactProbe.__name__))
+        for result in (_describe(engine, _CompactProbe.__name__), _describe_full(engine, _CompactProbe.__name__)):
+            by_name = _by_name(result)
+            assert by_name["style"].options == ["photo", "sketch", "anime"]
+            assert by_name["tags"].options == ["red", "blue"]
+            # Written straight into ui_options, with no Options trait attached.
+            assert by_name["legacy_mode"].options == ["fast", "slow"]
 
-        assert by_name["style"].options == ["photo", "sketch", "anime"]
-        assert by_name["style"].modes == ["property"]
-        assert by_name["tags"].options == ["red", "blue"]
-        # Written straight into ui_options, with no Options trait attached.
-        assert by_name["legacy_mode"].options == ["fast", "slow"]
-
-    def test_parameter_list_is_multi_input(self, engine: Engine) -> None:
+    def test_every_parameter_is_listed(self, engine: Engine) -> None:
+        """Nothing is filtered out: there is no reliable marker for a deprecated parameter to filter on."""
         _register_library()
 
-        by_name = _specs_by_name(_describe(engine, _CompactProbe.__name__))
-
-        assert by_name["images"].multi_input is True
-        assert by_name["images"].modes == ["input"]
-        assert by_name["prompt"].multi_input is False
-
-    def test_parameter_whose_tooltip_starts_with_deprecated_is_left_out(self, engine: Engine) -> None:
-        """Listed, even flagged, a deprecated parameter invites connections that belong on its replacement."""
-        _register_library()
-
-        compact = _describe(engine, _CompactProbe.__name__)
-        full = engine.library_manager.catalog.describe_node_type_request(
-            DescribeNodeTypeRequest(node_type=_CompactProbe.__name__)
-        )
-
-        assert "image" not in _parameter_names(compact)
-        assert isinstance(full, DescribeNodeTypeResultSuccess)
-        assert "image" in [param.name for param in full.parameters]
-
-    def test_note_is_the_tooltip_cut_at_a_word(self, engine: Engine) -> None:
-        _register_library()
-
-        by_name = _specs_by_name(_describe(engine, _CompactProbe.__name__))
-
-        note = by_name["prompt"].note
-        assert note is not None
-        assert len(note) <= NOTE_MAX_CHARS
-        assert note.endswith(NOTE_ELLIPSIS)
-        assert note.startswith("The prompt sent to the model. The prompt sent")
-        # Cut between words, not inside one.
-        assert note.removesuffix(NOTE_ELLIPSIS).split(" ")[-1] in {"The", "prompt", "sent", "to", "the", "model"}
-        assert by_name["images"].note is None
-
-    def test_note_is_left_out_when_short_or_only_the_name(self, engine: Engine) -> None:
-        class _NotesProbe(BaseNode):
-            def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
-                super().__init__(name=name, metadata=metadata)
-                self.add_parameter(Parameter(name="style", type="str", tooltip="Picture style"))
-                self.add_parameter(Parameter(name="negative_prompt", type="str", tooltip="Negative prompt."))
-                self.add_parameter(
-                    Parameter(name="seed", type="int", tooltip="Fixes the random noise so a run can be repeated")
-                )
-
-        _register_library(node_class=_NotesProbe)
-
-        by_name = _specs_by_name(_describe(engine, _NotesProbe.__name__))
-
-        assert by_name["style"].note is None
-        assert by_name["negative_prompt"].note is None
-        assert by_name["seed"].note == "Fixes the random noise so a run can be repeated"
-
-    def test_leaves_out_tooltips_and_ui_options(self, engine: Engine) -> None:
-        _register_library()
-
-        for param in _specs(_describe(engine, _CompactProbe.__name__)):
-            assert not hasattr(param, "tooltip")
-            assert not hasattr(param, "ui_options")
-
-    def test_full_request_is_unchanged(self, engine: Engine) -> None:
-        """Without `compact`, the request returns full descriptions and no parameter specs."""
-        _register_library()
-
-        result = engine.library_manager.catalog.describe_node_type_request(
-            DescribeNodeTypeRequest(node_type=_CompactProbe.__name__, library=LIBRARY_NAME)
-        )
-
-        assert isinstance(result, DescribeNodeTypeResultSuccess)
-        assert result.parameter_specs is None
-        by_name = {param.name: param for param in result.parameters}
-        assert by_name["prompt"].tooltip == LONG_TOOLTIP
-        assert by_name["prompt"].ui_options == {"display_name": "Prompt", "multiline": True}
-        assert result.result_details == ResultDetails(
-            message=f"Successfully described node type '{_CompactProbe.__name__}' in Library '{LIBRARY_NAME}'.",
-            level=logging.DEBUG,
+        assert _parameter_names(_describe(engine, _CompactProbe.__name__)) == _parameter_names(
+            _describe_full(engine, _CompactProbe.__name__)
         )
 
     def test_full_request_probes_every_time(self, engine: Engine) -> None:
-        """Only compact requests are cached, so a full request re-reads machine-dependent choices."""
+        """Only requests that leave something out are cached, so a full one re-reads machine-dependent choices."""
         _register_library()
         _describe(engine, _CompactProbe.__name__)
 
         for _ in range(2):
-            engine.library_manager.catalog.describe_node_type_request(
-                DescribeNodeTypeRequest(node_type=_CompactProbe.__name__)
-            )
+            _describe_full(engine, _CompactProbe.__name__)
 
         assert _CompactProbe.constructed == 3  # noqa: PLR2004
 
 
-class TestDescribeNodeTypeCompactExecPins:
-    """The standard exec_in/exec_out pair becomes `exec_pins`; other control parameters stay listed."""
-
-    def test_control_node_reports_exec_pins_instead_of_listing_them(self, engine: Engine) -> None:
-        class _ControlProbe(ControlNode):
-            def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
-                super().__init__(name=name, metadata=metadata)
-                self.add_parameter(Parameter(name="prompt", type="str", tooltip="Prompt"))
-
-        _register_library(node_class=_ControlProbe)
-
-        result = _describe(engine, _ControlProbe.__name__)
-
-        assert result.exec_pins is True
-        assert _parameter_names(result) == ["prompt"]
-
-    def test_failure_branch_stays_in_the_specs(self, engine: Engine) -> None:
-        class _BranchingProbe(SuccessFailureNode):
-            pass
-
-        _register_library(node_class=_BranchingProbe)
-
-        result = _describe(engine, _BranchingProbe.__name__)
-
-        assert result.exec_pins is True
-        assert _parameter_names(result) == ["failure"]
-        assert _specs_by_name(result)["failure"].modes == ["output"]
-
-    def test_lone_standard_pin_stays_in_the_specs(self, engine: Engine) -> None:
-        """Without both standard pins, `exec_pins` would misdescribe the node, so the one it has is listed."""
-
-        class _StartProbe(StartNode):
-            pass
-
-        _register_library(node_class=_StartProbe)
-
-        result = _describe(engine, _StartProbe.__name__)
-
-        assert result.exec_pins is False
-        assert _parameter_names(result) == ["exec_out"]
-
-
-class TestDescribeNodeTypeCompactWire:
-    """On the wire, a spec leaves out every field at its default value."""
-
-    def test_fields_at_their_default_are_left_out(self, engine: Engine) -> None:
-        _register_library()
-
-        result = _describe(engine, _CompactProbe.__name__)
-        wire = json.loads(converters.client.dumps(result))
-        by_name = {spec["name"]: spec for spec in wire["parameter_specs"]}
-
-        assert wire["metadata"] is None
-        assert wire["exec_pins"] is False
-        assert by_name["output"] == {"name": "output", "type": "str", "modes": ["output"]}
-        assert by_name["images"] == {
-            "name": "images",
-            "type": "list[ImageArtifact]",
-            "modes": ["input"],
-            "input_types": ["list[ImageArtifact]", "list"],
-            "multi_input": True,
-        }
-        assert by_name["style"] == {
-            "name": "style",
-            "type": "str",
-            "modes": ["property"],
-            "default": "photo",
-            "options": ["photo", "sketch", "anime"],
-        }
-
-    def test_spec_reads_back_with_its_defaults(self) -> None:
-        spec = NodeTypeParameterSpec(
-            name="count", type="int", input_types=["int", "float"], output_type="int", modes=["input", "property"]
-        )
-
-        wire = converters.client.unstructure(spec)
-        read_back = converters.client.structure(wire, NodeTypeParameterSpec)
-
-        assert wire == {"name": "count", "type": "int", "modes": ["input", "property"], "input_types": ["int", "float"]}
-        assert read_back == spec
-
-
-class TestDescribeNodeTypeCompactFailures:
-    """A compact request fails, or falls back to library metadata, as a full request does."""
+class TestDescribeNodeTypeIncludeFlagFailures:
+    """A trimmed request fails, or falls back to library metadata, as a full request does."""
 
     def test_unknown_node_type_fails(self, engine: Engine) -> None:
         _register_library()
@@ -479,23 +367,16 @@ class TestDescribeNodeTypeCompactFailures:
         library = LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
         library.register_new_node_type(_RaisingProbe, _metadata())
 
-        compact = _describe(engine, _RaisingProbe.__name__)
-        full = engine.library_manager.catalog.describe_node_type_request(
-            DescribeNodeTypeRequest(node_type=_RaisingProbe.__name__)
-        )
+        trimmed = _describe(engine, _RaisingProbe.__name__)
+        full = _describe_full(engine, _RaisingProbe.__name__)
 
-        assert isinstance(full, DescribeNodeTypeResultSuccess)
-        assert compact.library == LIBRARY_NAME
-        assert compact.metadata is None
+        assert trimmed.library == LIBRARY_NAME
+        assert trimmed.metadata is None
         assert full.metadata is not None
         assert full.metadata.category == "test/category"
-        assert compact.parameter_specs == []
-        # Unknown, as opposed to a node type without the standard control parameters.
-        assert compact.exec_pins is None
-        assert full.parameter_specs is None
-        assert compact.parameters == full.parameters == []
-        assert _warnings(compact) == _warnings(full)
-        assert _warnings(compact) == ["Parameter probe failed because: RuntimeError: simulated I/O failure"]
+        assert trimmed.parameters == full.parameters == []
+        assert _warnings(trimmed) == _warnings(full)
+        assert _warnings(trimmed) == ["Parameter probe failed because: RuntimeError: simulated I/O failure"]
 
     def test_module_that_fails_to_import_is_described_without_parameters(self, engine: Engine) -> None:
         library = LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
@@ -508,8 +389,7 @@ class TestDescribeNodeTypeCompactFailures:
 
         result = _describe(engine, "BrokenNode", library=LIBRARY_NAME)
 
-        assert result.parameter_specs == []
-        assert result.exec_pins is None
+        assert result.parameters == []
         assert _warnings(result) == ["Node module failed to import: ImportError: No module named 'missing_dependency'"]
 
     def test_default_that_cannot_be_copied_is_described_without_parameters(self, engine: Engine) -> None:
@@ -528,7 +408,7 @@ class TestDescribeNodeTypeCompactFailures:
 
         for _ in range(2):
             result = _describe(engine, _UncopyableDefaultProbe.__name__)
-            assert result.parameter_specs == []
+            assert result.parameters == []
             [warning] = _warnings(result)
             assert warning.startswith("Parameter read failed because: TypeError: ")
 
@@ -548,8 +428,8 @@ class TestDescribeNodeTypeCompactFailures:
         assert _parameter_names(named) == ["replacement_only"]
 
 
-class TestDescribeNodeTypeCompactCache:
-    """Compact specs are built once per node type and dropped whenever registrations change."""
+class TestDescribeNodeTypeCache:
+    """Trimmed requests probe a node type once and drop what they kept whenever registrations change."""
 
     def test_second_call_does_not_create_the_node_again(self, engine: Engine) -> None:
         _register_library()
@@ -558,18 +438,18 @@ class TestDescribeNodeTypeCompactCache:
         second = _describe(engine, _CompactProbe.__name__)
 
         assert _CompactProbe.constructed == 1
-        assert _specs(second) == _specs(first)
+        assert second.parameters == first.parameters
 
     def test_caller_changing_a_spec_does_not_change_later_results(self, engine: Engine) -> None:
         _register_library()
 
-        first = _specs(_describe(engine, _CompactProbe.__name__))
-        first[0].default = "changed by caller"
+        first = _describe(engine, _CompactProbe.__name__).parameters
+        first[0].default_value = "changed by caller"
         first.clear()
 
-        second = _specs(_describe(engine, _CompactProbe.__name__))
+        second = _describe(engine, _CompactProbe.__name__).parameters
 
-        assert second[0].default == "hello"
+        assert second[0].default_value == "hello"
         assert _CompactProbe.constructed == 1
 
     def test_failures_are_not_cached(self, engine: Engine) -> None:
@@ -604,6 +484,16 @@ class TestDescribeNodeTypeCompactCache:
         assert _warnings(without_key) == ["Parameter probe failed because: RuntimeError: Missing credentials"]
         assert _warnings(with_key) == []
         assert _parameter_names(with_key) == ["prompt"]
+
+    def test_flags_share_one_cached_probe(self, engine: Engine) -> None:
+        _register_library()
+
+        without_tooltips = _describe(engine, _CompactProbe.__name__, include_tooltips=False, include_ui_options=True)
+        without_ui_options = _describe(engine, _CompactProbe.__name__, include_tooltips=True, include_ui_options=False)
+
+        assert _CompactProbe.constructed == 1
+        assert _by_name(without_tooltips)["prompt"].ui_options == {"display_name": "Prompt", "multiline": True}
+        assert _by_name(without_ui_options)["prompt"].tooltip == LONG_TOOLTIP
 
     def test_unload_drops_the_cached_spec(self, engine: Engine) -> None:
         _register_library()
@@ -681,7 +571,7 @@ class TestDescribeNodeTypeCompactCache:
         assert _RegisteringProbe.constructed == 2  # noqa: PLR2004
 
 
-class TestDescribeNodeTypeCompactSandboxReregistration:
+class TestDescribeNodeTypeSandboxReregistration:
     """Registering a sandbox node again from edited source describes the edited code."""
 
     _FILE_NAME = "describe_sandbox_node.py"
