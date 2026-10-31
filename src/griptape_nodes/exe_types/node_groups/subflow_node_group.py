@@ -94,9 +94,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         super().__init__(name, metadata)
         self._dedupe_side_parameter_metadata()
         self.control_in = ControlParameterInput(name="group_exec_in")
+        self.control_in.allowed_modes.add(ParameterMode.OUTPUT)
         self.add_parameter(self.control_in)
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.control_in.name)
         self.control_out = ControlParameterOutput(name="group_exec_out")
+        self.control_out.allowed_modes.add(ParameterMode.INPUT)
         self.add_parameter(self.control_out)
         self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.control_out.name)
         self.execution_environment = Parameter(
@@ -624,6 +626,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             proxy_parameter: The proxy parameter to potentially clean up
             metadata_key: The metadata key ('left_parameters' or 'right_parameters')
         """
+        if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
+            self._proxy_param_to_connections.pop(proxy_parameter.name, None)
+            return
+
         connection_count = self._proxy_param_to_connections.get(proxy_parameter.name)
         if connection_count is not None:
             # A proxy is installed before its two replacement connections are created. The first
@@ -1260,6 +1266,32 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         # Use existing proxy or create a new one
         if existing_proxy is not None:
             proxy_parameter = existing_proxy
+        elif (
+            is_incoming
+            and not isinstance(first_conn.target_node, SubflowNodeGroup)
+            and isinstance(grouped_parameter, ControlParameterInput)
+            and grouped_parameter.name == "exec_in"
+            and not self.engine.flow_manager.get_connections().get_incoming_connections_to_parameter(
+                self, self.control_in
+            )
+            and not self.engine.flow_manager.get_connections().get_outgoing_connections_from_parameter(
+                self, self.control_in
+            )
+        ):
+            proxy_parameter = self.control_in
+        elif (
+            not is_incoming
+            and not isinstance(first_conn.source_node, SubflowNodeGroup)
+            and isinstance(grouped_parameter, ControlParameterOutput)
+            and grouped_parameter.name == "exec_out"
+            and not self.engine.flow_manager.get_connections().get_outgoing_connections_from_parameter(
+                self, self.control_out
+            )
+            and not self.engine.flow_manager.get_connections().get_incoming_connections_to_parameter(
+                self, self.control_out
+            )
+        ):
+            proxy_parameter = self.control_out
         else:
             proxy_parameter = self._create_proxy_parameter_for_connection(grouped_parameter, is_incoming=is_incoming)
 

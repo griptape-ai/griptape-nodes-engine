@@ -363,6 +363,20 @@ class TestFailedRemove:
             )
             assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
 
+            group = _get_group(engine, group_name)
+            assert group.metadata.get("left_parameters") == ["group_exec_in"]
+            assert group.metadata.get("right_parameters") == ["group_exec_out"]
+            grouped_edges = {
+                (c.source_node.name, c.source_parameter.name, c.target_node.name, c.target_parameter.name)
+                for c in engine.flow_manager.get_connections().connections.values()
+            }
+            assert {
+                (source_name, "exec_out", group_name, "group_exec_in"),
+                (group_name, "group_exec_in", member_name, "exec_in"),
+                (member_name, "exec_out", group_name, "group_exec_out"),
+                (group_name, "group_exec_out", sink_name, "exec_in"),
+            } <= grouped_edges
+
             remove_result = engine.handle_request(
                 RemoveNodeFromNodeGroupRequest(node_names=[member_name], node_group_name=group_name)
             )
@@ -384,6 +398,45 @@ class TestFailedRemove:
             f"{member_name}.exec_out->{sink_name}.exec_in",
         } <= edges
         assert not any(group_name in edge for edge in edges)
+
+    def test_independent_control_chains_do_not_replace_each_other(self, engine: Engine, library_name: str) -> None:
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="IndependentControlChains", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+        with engine.context_manager.flow(flow.flow_name):
+            group = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+            sources = [_create_node(engine, "EchoNode", f"Source{i}", library_name) for i in range(2)]
+            members = [_create_node(engine, "EchoNode", f"Member{i}", library_name) for i in range(2)]
+            sinks = [_create_node(engine, "EchoNode", f"Sink{i}", library_name) for i in range(2)]
+            for source, member, sink in zip(sources, members, sinks, strict=True):
+                for start, end in ((source, member), (member, sink)):
+                    result = engine.handle_request(
+                        CreateConnectionRequest(
+                            source_node_name=start,
+                            source_parameter_name="exec_out",
+                            target_node_name=end,
+                            target_parameter_name="exec_in",
+                        )
+                    )
+                    assert isinstance(result, CreateConnectionResultSuccess), result
+                result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=[member], node_group_name=group))
+                assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        edges = {
+            (c.source_node.name, c.source_parameter.name, c.target_node.name, c.target_parameter.name)
+            for c in engine.flow_manager.get_connections().connections.values()
+        }
+        assert {
+            (sources[0], "exec_out", group, "group_exec_in"),
+            (group, "group_exec_in", members[0], "exec_in"),
+            (members[0], "exec_out", group, "group_exec_out"),
+            (group, "group_exec_out", sinks[0], "exec_in"),
+            (sources[1], "exec_out", group, "exec_in"),
+            (group, "exec_in", members[1], "exec_in"),
+            (members[1], "exec_out", group, "exec_out"),
+            (group, "exec_out", sinks[1], "exec_in"),
+        } <= edges
 
     def test_restores_an_outgoing_connection_when_a_connected_node_leaves_the_group(
         self, engine: Engine, library_name: str

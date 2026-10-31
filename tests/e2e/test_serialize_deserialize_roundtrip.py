@@ -200,8 +200,8 @@ class TestNodeGroupRoundTrip:
             assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
 
         original_group = _get_group(engine, group)
-        original_exec_in = original_group.get_parameter_by_name("exec_in")
-        original_exec_out = original_group.get_parameter_by_name("exec_out")
+        original_exec_in = original_group.get_parameter_by_name("group_exec_in")
+        original_exec_out = original_group.get_parameter_by_name("group_exec_out")
         assert isinstance(original_exec_in, ControlParameterInput)
         assert isinstance(original_exec_out, ControlParameterOutput)
         assert original_exec_in.display_name == "Flow In"
@@ -211,7 +211,7 @@ class TestNodeGroupRoundTrip:
             for parameter in original_group.parameters
             if isinstance(parameter, (ControlParameterInput, ControlParameterOutput))
         }
-        assert control_parameter_names == {"group_exec_in", "group_exec_out", "exec_in", "exec_out"}
+        assert control_parameter_names == {"group_exec_in", "group_exec_out"}
 
         commands = _serialize(engine, flow.flow_name)
 
@@ -222,8 +222,8 @@ class TestNodeGroupRoundTrip:
         restored_source = result.node_name_mappings["Source"]
         restored_middle = result.node_name_mappings["Middle"]
         restored_sink = result.node_name_mappings["Sink"]
-        restored_exec_in = restored_group.get_parameter_by_name("exec_in")
-        restored_exec_out = restored_group.get_parameter_by_name("exec_out")
+        restored_exec_in = restored_group.get_parameter_by_name("group_exec_in")
+        restored_exec_out = restored_group.get_parameter_by_name("group_exec_out")
         assert isinstance(restored_exec_in, ControlParameterInput)
         assert isinstance(restored_exec_out, ControlParameterOutput)
         assert restored_exec_in.display_name == "Flow In"
@@ -233,7 +233,7 @@ class TestNodeGroupRoundTrip:
             for parameter in restored_group.parameters
             if isinstance(parameter, (ControlParameterInput, ControlParameterOutput))
         }
-        assert restored_control_parameter_names == {"group_exec_in", "group_exec_out", "exec_in", "exec_out"}
+        assert restored_control_parameter_names == {"group_exec_in", "group_exec_out"}
 
         edges = {
             f"{connection.source_node.name}.{connection.source_parameter.name}"
@@ -241,10 +241,10 @@ class TestNodeGroupRoundTrip:
             for connection in engine.flow_manager.get_connections().connections.values()
         }
         assert {
-            f"{restored_source}.exec_out->{restored_group.name}.exec_in",
-            f"{restored_group.name}.exec_in->{restored_middle}.exec_in",
-            f"{restored_middle}.exec_out->{restored_group.name}.exec_out",
-            f"{restored_group.name}.exec_out->{restored_sink}.exec_in",
+            f"{restored_source}.exec_out->{restored_group.name}.group_exec_in",
+            f"{restored_group.name}.group_exec_in->{restored_middle}.exec_in",
+            f"{restored_middle}.exec_out->{restored_group.name}.group_exec_out",
+            f"{restored_group.name}.group_exec_out->{restored_sink}.exec_in",
         } <= edges
 
     def test_restores_control_boundary_ports_and_wall_edges(self, engine: Engine, library_name: str) -> None:
