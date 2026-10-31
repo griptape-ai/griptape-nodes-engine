@@ -400,10 +400,11 @@ isn't narrowed.
 
 **Rules across several inputs.** For a limit that involves more than one input, such as a combined
 length across several prompts, check it in the node's `validate_before_node_run`. The engine runs it
-right after the declared validators, in the same pass.
+right after the declared validators, in the same pass. `limit_error(message, docs_url)` builds the
+same error a validator returns, with a "Provider limits" link when `docs_url` is set.
 
 ```python
-from griptape_nodes.exe_types.node_error import NodeError
+from griptape_nodes.exe_types.validators import limit_error
 
 MAX_TOTAL_WORDS = 500
 
@@ -415,9 +416,10 @@ class Generate(SuccessFailureNode):
         if total <= MAX_TOTAL_WORDS:
             return None
         return [
-            NodeError(
+            limit_error(
                 f"The prompts in 'prompts' have {total} words together and the limit is "
-                f"{MAX_TOTAL_WORDS}. Shorten them."
+                f"{MAX_TOTAL_WORDS}. Shorten them.",
+                self.input_limits_url(),
             )
         ]
 ```
@@ -558,8 +560,8 @@ For a rule across several media inputs, such as a total length across several cl
 already read, and no file is read twice.
 
 ```python
+from griptape_nodes.exe_types.validators import limit_error
 from griptape_nodes.utils.media_probe import local_video_probe
-from griptape_nodes.exe_types.node_error import NodeError
 
 MAX_TOTAL_SECONDS = 30
 
@@ -571,9 +573,10 @@ class ReferenceToVideo(SuccessFailureNode):
         if total <= MAX_TOTAL_SECONDS:
             return None
         return [
-            NodeError(
+            limit_error(
                 f"The videos in 'Reference Videos' are {total:.1f} seconds long together "
-                f"and the limit is {MAX_TOTAL_SECONDS}. Use shorter clips."
+                f"and the limit is {MAX_TOTAL_SECONDS}. Use shorter clips.",
+                self.input_limits_url(),
             )
         ]
 ```
@@ -629,6 +632,24 @@ The built-in media checks follow these rules:
 - **Where a limit is ambiguous, refuse less.** Sizes are in MiB. A maximum length is checked
     against the shorter of the video stream and the whole file, and a minimum against the longer.
     Frame rates work the same way, with 1% leeway so 23.976 fps passes a 24 fps minimum.
+
+##### Testing a node's checks
+
+`validate_node(node)` runs a node's declared validators and then its `validate_before_node_run`, as
+the engine does at the node's turn, and returns every error. Set the inputs, then assert on the
+messages:
+
+```python
+from griptape_nodes.exe_types.validators import validate_node
+
+
+def test_refuses_too_many_prompts() -> None:
+    node = Generate(name="Generate")
+    node.set_parameter_value("prompts", ["a", "b", "c", "d", "e"])
+    assert [str(error) for error in validate_node(node)] == [
+        "5 prompts are connected to 'prompts' and the limit is 4. Remove 1."
+    ]
+```
 
 #### Common failures
 

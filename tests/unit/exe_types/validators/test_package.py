@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 import griptape_nodes.exe_types.validators as validators_package
+import griptape_nodes.exe_types.validators._checks as validators_checks
+import griptape_nodes.exe_types.validators._runner as validators_runner
 import griptape_nodes.exe_types.validators.base as validators_base
 import griptape_nodes.exe_types.validators.common as validators_common
 import griptape_nodes.exe_types.validators.media as validators_media
@@ -20,13 +22,16 @@ if TYPE_CHECKING:
 
 
 def test_exports_every_public_validator_and_the_types_they_use() -> None:
-    """Every `media` and `common` validator, and the base types, are the same objects from the package."""
+    """Every `media` and `common` validator, the base types and the helpers are the same objects from the package."""
     source: dict[str, ModuleType] = dict.fromkeys(validators_media.__all__, validators_media)
     source.update(dict.fromkeys(validators_common.__all__, validators_common))
     source.update(dict.fromkeys(("LIMITS_LINK_LABEL", "PreRunValidator"), validators_base))
     source.update(dict.fromkeys(("Condition", "MediaValidator", "reads"), validators_media_validator))
     # What a media validator reads comes from the probe, below the validators.
     source.update(dict.fromkeys(("MediaInfo", "MediaNeed"), media_probe))
+    # Helpers for a node's own checks and their tests.
+    source["limit_error"] = validators_checks
+    source["validate_node"] = validators_runner
     assert set(validators_package.__all__) == set(source)
     for name, module in source.items():
         assert getattr(validators_package, name) is getattr(module, name)

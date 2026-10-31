@@ -32,6 +32,12 @@ def check_count(
 
 
 def limit_error(message: str, docs_url: str | None) -> NodeError:
+    """The error for an input outside a limit, linking the provider's limits page when there is one.
+
+    Args:
+        message: What's wrong and how to fix it, naming the input.
+        docs_url: The provider's page documenting the limit, usually the node's `input_limits_url()`.
+    """
     if not docs_url:
         return NodeError(message, links=None)
     return NodeError(message, links=[NodeErrorLink(label=LIMITS_LINK_LABEL, url=docs_url)])

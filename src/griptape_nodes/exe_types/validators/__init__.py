@@ -15,11 +15,17 @@ from griptape_nodes.exe_types.validators import AllowedFormats, MaxFileSize  # l
   `griptape_nodes.utils.media_probe`), and `reads` to mark what a `Condition` for
   `MediaValidator.when` or `unless` reads.
 - `media`: the built-in media limits, such as `MaxFileSize` or `MaxDuration`.
+
+Two helpers for a node's own checks: `limit_error` builds the error a limit returns, with its link
+to the provider's limits page, for a rule checked in `validate_before_node_run`; `validate_node` runs
+a node's pre-run checks as the engine does at its turn, for testing them.
 """
 
 from __future__ import annotations
 
 # Validators for any kind of value.
+from griptape_nodes.exe_types.validators._checks import limit_error
+from griptape_nodes.exe_types.validators._runner import validate_node
 from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL, PreRunValidator
 from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
 
@@ -62,5 +68,7 @@ __all__ = [
     "PreRunValidator",
     "SideRange",
     "VideoCodecs",
+    "limit_error",
     "reads",
+    "validate_node",
 ]

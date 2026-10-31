@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.exe_types.core_types import ParameterList
 from griptape_nodes.exe_types.validators._checks import input_subject
 from griptape_nodes.exe_types.validators.base import holds_list
 from griptape_nodes.exe_types.validators.media_validator import files_read_once, input_noun, run_validators
@@ -111,6 +110,8 @@ def _value_here(node: BaseNode, name: str) -> Any:
 
 def _list_items(node: BaseNode, parameter: Parameter) -> list[Any]:
     """A list parameter's items, flattened, without empty rows; empty when they're held in another process."""
+    from griptape_nodes.exe_types.core_types import ParameterList  # avoid circular import
+
     if isinstance(parameter, ParameterList):
         try:
             return node.get_parameter_list_value(parameter.name)
