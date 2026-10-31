@@ -425,8 +425,9 @@ class Generate(SuccessFailureNode):
 ```
 
 **Your own validator.** Most limits are a built-in validator, narrowed where needed with
-`IfParameter` or `.first(n)`. For one none of them covers, subclass `PreRunValidator` and return a
-`NodeError` from `check`, or None. `check` is also given a list item's `position`; take `**_` for
+`IfParameter` or `.first(n)`. For one none of them covers, subclass `PreRunValidator` and return
+`limit_error(message, docs_url)` from `check`, or None, so the error links the provider's limits
+page like a built-in's. `check` is also given a list item's `position`; take `**_` for
 any argument you don't use. A single input with no value, and each empty row of a list, is skipped
 before any validator runs; a validator with `checks_whole_list` still gets the list, even an empty
 one. Check that a required input is set in the node's `validate_before_node_run`.
@@ -436,7 +437,7 @@ from dataclasses import dataclass
 from typing import Any, override
 
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import PreRunValidator
+from griptape_nodes.exe_types.validators import PreRunValidator, limit_error
 
 
 @dataclass(frozen=True)
@@ -448,7 +449,7 @@ class MaxWords(PreRunValidator):
         words = len(str(value).split())
         if words <= self.maximum:
             return None
-        return NodeError(f"{subject} has {words} words and the limit is {self.maximum}. Shorten it.")
+        return limit_error(f"{subject} has {words} words and the limit is {self.maximum}. Shorten it.", docs_url)
 ```
 
 ##### Limits on media files
@@ -594,7 +595,7 @@ what was already read.
 from typing import Any, override
 
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import MediaInfo, MediaNeed, MediaValidator
+from griptape_nodes.exe_types.validators import MediaInfo, MediaNeed, MediaValidator, limit_error
 
 
 class EvenSides(MediaValidator):
@@ -607,7 +608,7 @@ class EvenSides(MediaValidator):
         frame = media.frame
         if frame is None or (frame.width % 2 == 0 and frame.height % 2 == 0):
             return None
-        return NodeError(f"{subject} is {frame.width}x{frame.height} and each side must be even. Crop it.")
+        return limit_error(f"{subject} is {frame.width}x{frame.height} and each side must be even. Crop it.", docs_url)
 ```
 
 The built-in media checks follow these rules:
