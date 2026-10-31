@@ -1,11 +1,12 @@
 """Parameter3D component for 3D model inputs with enhanced UI options."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from griptape_nodes_library.three_d.three_d_artifact import ThreeDUrlArtifact  # pyright: ignore[reportMissingImports]
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 from griptape_nodes.utils.artifact_normalization import normalize_artifact_input
 
 
@@ -63,6 +64,7 @@ class Parameter3D(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ) -> None:
         """Initialize a 3D model parameter with enhanced UI options.
 
@@ -101,6 +103,7 @@ class Parameter3D(Parameter):
             element_type: Element type
             parent_container_name: Name of parent container
             badge: Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
+            pre_run_validators: Limits the engine checks the value against before the node runs
         """
         # Build ui_options dictionary from the provided UI-specific parameters
         if ui_options is None:
@@ -168,6 +171,7 @@ class Parameter3D(Parameter):
             element_type=element_type,
             parent_container_name=parent_container_name,
             badge=badge,
+            pre_run_validators=pre_run_validators,
         )
 
     @property

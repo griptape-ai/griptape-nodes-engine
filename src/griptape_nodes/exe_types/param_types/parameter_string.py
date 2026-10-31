@@ -1,10 +1,11 @@
 """ParameterString component for string inputs with enhanced UI options."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 
 
 class ParameterString(Parameter):
@@ -64,6 +65,7 @@ class ParameterString(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ) -> None:
         """Initialize a string parameter with enhanced UI options.
 
@@ -104,6 +106,7 @@ class ParameterString(Parameter):
             element_type: Element type
             parent_container_name: Name of parent container
             badge: Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
+            pre_run_validators: Limits the engine checks the value against before the node runs
         """
         # Build ui_options dictionary from the provided UI-specific parameters
         if ui_options is None:
@@ -175,6 +178,7 @@ class ParameterString(Parameter):
             element_type=element_type,
             parent_container_name=parent_container_name,
             badge=badge,
+            pre_run_validators=pre_run_validators,
         )
 
     def _accept_any(self, value: Any) -> str:

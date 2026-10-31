@@ -14,6 +14,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
 )
+from griptape_nodes.exe_types.validators._runner import validate_node
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
@@ -717,7 +718,7 @@ class ExecuteDagState(State):
             # The check runs in a thread so a slow one doesn't freeze the editor. While it runs, the user
             # can press Cancel. If they did, stop here: otherwise the node runs anyway (a provider node
             # would submit its job) even though the run was cancelled.
-            exceptions = await async_utils.to_thread(node_reference.node_reference.validate_before_node_run)
+            exceptions = await async_utils.to_thread(validate_node, node_reference.node_reference)
             if context.was_reset_since(generation):
                 ExecuteDagState._log_abandoned(context)
                 return None

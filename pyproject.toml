@@ -241,6 +241,9 @@ default.extend-ignore-re = [
 [tool.typos.default.extend-words]
 # HALD CLUT is a Color Lookup Table technique named after its inventor
 HALD = "HALD"
+# CAF is Apple's Core Audio Format, an audio container the pre-run input checks name
+caf = "caf"
+CAF = "CAF"
 
 [tool.pyright]
 venvPath = "."

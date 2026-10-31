@@ -26,12 +26,14 @@ from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
 from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, changed_trait_states
+from griptape_nodes.exe_types.validators.base import require_validators_fit
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from griptape_nodes.exe_types.elements.badge import BadgeData
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.exe_types.validators.base import PreRunValidator
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -123,6 +125,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     _on_local_object_drop: Callable[[Any], None] | None = None
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
+    _pre_run_validators: tuple[PreRunValidator, ...]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
     _on_outgoing_connection_removed: list[Callable[[Parameter, str, str], None]]
     _ui_options: dict
@@ -168,6 +171,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         parent_element_name: str | None = None,
         badge: BadgeData
         | None = None,  # Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ):
         if not element_id:
             element_id = str(uuid.uuid4().hex)
@@ -234,6 +238,11 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         else:
             self._validators = validators
 
+        if pre_run_validators is None:
+            self._pre_run_validators = ()
+        else:
+            self._pre_run_validators = tuple(pre_run_validators)
+
         self._on_incoming_connection_removed = []
         self._on_outgoing_connection_removed = []
 
@@ -265,6 +274,8 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         self.type = type
         self.input_types = input_types
         self.output_type = output_type
+        # After the types are set, since each validator checks that the parameter's type fits it.
+        require_validators_fit(self)
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a nested dictionary representation of this node and its children."""
@@ -394,6 +405,16 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
             validators += trait.validators_for_trait()
         validators += self._validators
         return validators
+
+    @property
+    def pre_run_validators(self) -> tuple[PreRunValidator, ...]:
+        """The limits the engine checks this parameter's value against at the node's turn, before it runs.
+
+        Unlike `validators`, which run each time a value is set and refuse it, these run once per run,
+        report every limit the value breaks, and fail the node instead. See
+        `griptape_nodes.exe_types.validators`.
+        """
+        return self._pre_run_validators
 
     @property
     def has_directly_attached_converters(self) -> bool:

@@ -1,6 +1,6 @@
 """ParameterButton component for button inputs with enhanced UI options."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 from griptape_nodes.exe_types.core_types import (
@@ -9,6 +9,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     Trait,
 )
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 from griptape_nodes.traits.button import Button
 
 # Type aliases matching Button trait
@@ -109,6 +110,7 @@ class ParameterButton(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ) -> None:
         """Initialize a button parameter with enhanced UI options.
 
@@ -155,6 +157,7 @@ class ParameterButton(Parameter):
             element_type: Element type
             parent_container_name: Name of parent container
             badge: Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
+            pre_run_validators: Limits the engine checks the value against before the node runs
         """
         # Build ui_options dictionary from the provided UI-specific parameters
         if ui_options is None:
@@ -220,6 +223,7 @@ class ParameterButton(Parameter):
             element_type=element_type,
             parent_container_name=parent_container_name,
             badge=badge,
+            pre_run_validators=pre_run_validators,
         )
 
         # Store button trait reference for property access

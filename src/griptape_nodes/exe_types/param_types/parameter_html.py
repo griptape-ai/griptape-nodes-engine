@@ -1,10 +1,11 @@
 """ParameterHtml component for HTML inputs with enhanced UI options."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 
 _HTML_PLACEHOLDER = "<div>\n  <p>Hello, <strong>world</strong>!</p>\n</div>"
 
@@ -63,6 +64,7 @@ class ParameterHtml(ParameterXml):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -97,6 +99,7 @@ class ParameterHtml(ParameterXml):
             element_type=element_type,
             parent_container_name=parent_container_name,
             badge=badge,
+            pre_run_validators=pre_run_validators,
         )
 
     def _convert(self, value: Any) -> str:

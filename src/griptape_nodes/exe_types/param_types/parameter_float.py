@@ -1,10 +1,11 @@
 """ParameterFloat component for float inputs with enhanced UI options."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
 from griptape_nodes.exe_types.param_types.parameter_number import ParameterNumber
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 
 
 class ParameterFloat(ParameterNumber):
@@ -64,6 +65,7 @@ class ParameterFloat(ParameterNumber):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ) -> None:
         """Initialize a float parameter with step validation.
 
@@ -103,6 +105,7 @@ class ParameterFloat(ParameterNumber):
             element_type: Element type
             parent_container_name: Name of parent container
             badge: Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
+            pre_run_validators: Limits the engine checks the value against before the node runs
         """
         # Call parent with float-specific settings
         super().__init__(
@@ -143,6 +146,7 @@ class ParameterFloat(ParameterNumber):
             element_type=element_type,
             parent_container_name=parent_container_name,
             badge=badge,
+            pre_run_validators=pre_run_validators,
         )
 
     def _convert_to_number(self, value: Any) -> float:  # noqa: PLR0911

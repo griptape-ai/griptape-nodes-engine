@@ -1443,6 +1443,14 @@ class BaseNode(ABC):
                     break
         return None
 
+    def input_limits_url(self) -> str | None:
+        """The page documenting this node's input limits, linked from each pre-run validator's error.
+
+        None by default. Override it in a node whose limits a provider documents, returning the page
+        for the current settings when it depends on them, such as the selected model.
+        """
+        return None
+
     def validate_before_node_run(self) -> list[Exception] | None:
         """Runs on the ORCHESTRATOR, immediately before this node is dispatched.
 
@@ -1450,6 +1458,10 @@ class BaseNode(ABC):
         looks like. This process may be nothing like the one that runs the node -- a library whose nodes
         execute in a worker is installed here with its edit-time dependencies only, and a value produced
         by a worker is held there and cannot be read from here.
+
+        A limit on one input's value is better declared on the parameter with `pre_run_validators=`
+        (see `griptape_nodes.exe_types.validators`): the engine checks those just before this method and
+        reports their errors with this method's. A limit across several inputs belongs here.
 
         It runs in a worker thread, not on the engine's event loop, so a slow check doesn't freeze the
         editor or other flows; the node waits for it before running. Setting parameter values and

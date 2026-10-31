@@ -18,6 +18,7 @@ All Parameter attributes:
 - **ui_options**: dict for UI customization
 - **converters**: list\[Callable\[[Any], Any\]\] for value transformation
 - **validators**: list\[Callable\[[Parameter, Any], None\]\] for validation
+- **pre_run_validators**: limits the engine checks the value against at the node's turn, before it runs, such as how many items a list holds, or a provider's limits on an image file. Unlike `validators`, they don't refuse a value as it's set; they fail the run with every limit it breaks. See [Checking inputs before a run](error_handling.md#checking-inputs-before-a-run)
 - **hide/hide_label/hide_property**: common UI flags (also available via `ui_options`; `ui_options` wins on conflict)
 - **allow_input/allow_property/allow_output**: convenience flags for configuring modes (ignored if `allowed_modes` is explicitly set)
 - **settable**: bool (default True) - False for computed/output parameters

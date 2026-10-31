@@ -2,12 +2,13 @@
 
 import warnings
 import xml.parsers.expat
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 from xml.etree.ElementTree import ParseError as XmlParseError
 from xml.etree.ElementTree import fromstring as parse_xml
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.validators.base import PreRunValidator
 
 _MIN_EXPAT = (2, 6, 0)
 if xml.parsers.expat.version_info < _MIN_EXPAT:
@@ -76,6 +77,7 @@ class ParameterXml(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
+        pre_run_validators: Sequence[PreRunValidator] | None = None,
     ) -> None:
         if ui_options is None:
             ui_options = {}
@@ -134,6 +136,7 @@ class ParameterXml(Parameter):
             element_type=element_type,
             parent_container_name=parent_container_name,
             badge=badge,
+            pre_run_validators=pre_run_validators,
         )
 
     def _convert(self, value: Any) -> str:
