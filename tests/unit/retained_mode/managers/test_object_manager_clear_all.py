@@ -33,11 +33,11 @@ class TestClearAllObjectStateCancelsFirst:
         calls: list[str] = []
         flow_manager = engine.flow_manager
 
-        async def cancel() -> None:
+        async def cancel(_workflow: object) -> None:
             calls.append("cancel")
 
         with (
-            patch.object(flow_manager, "cancel_all_runs", AsyncMock(side_effect=cancel)),
+            patch.object(flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=cancel)),
             patch.object(flow_manager, "reset_global_execution_state", side_effect=lambda: calls.append("reset")),
         ):
             result = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
@@ -53,7 +53,9 @@ class TestClearAllObjectStateCancelsFirst:
         flow_manager = engine.flow_manager
 
         with (
-            patch.object(flow_manager, "cancel_all_runs", AsyncMock(side_effect=RuntimeError("a node would not stop"))),
+            patch.object(
+                flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=RuntimeError("a node would not stop"))
+            ),
             patch.object(flow_manager, "reset_global_execution_state") as reset,
         ):
             result = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

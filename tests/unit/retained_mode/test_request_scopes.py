@@ -790,19 +790,33 @@ class TestAmbientUntilMigrated:
         assert scope_from_signature(handler) is None
 
 
+# Entry points that open, run into or report the open workflow from the ambient binding, so they stay in
+# `AMBIENT_UNTIL_MIGRATED`. They get a scope once entry points bind or close workflows by id.
+_ENTRY_POINTS_LEFT_UNSCOPED = {
+    "GetWorkflowContextRequest",
+    "RunWorkflowFromRegistryRequest",
+    "RunWorkflowFromScratchRequest",
+    "RunWorkflowWithCurrentStateRequest",
+    "SetWorkflowContextRequest",
+}
+
+
 class TestEveryEngineHandlerDeclaresAScope:
     """Library handlers registered at library load (`module_loading.py`) are not covered: none load here."""
 
     def test_every_handler_the_engine_registers_declares_a_scope(self, engine: Engine) -> None:
         event_manager = engine.event_manager
 
-        undeclared = sorted(
+        undeclared = {
             request_type.__name__
             for request_type in event_manager.registered_request_types()
             if event_manager.get_scope_for_request_type(request_type) is None
-        )
+        }
 
-        assert undeclared == []
+        assert undeclared == _ENTRY_POINTS_LEFT_UNSCOPED
+
+    def test_only_the_entry_points_keep_the_ambient_workflow(self) -> None:
+        assert _ENTRY_POINTS_LEFT_UNSCOPED == AMBIENT_UNTIL_MIGRATED
 
     def test_every_broadcast_handler_a_worker_registers_declares_host_scope(self) -> None:
         event_manager = EventManager()

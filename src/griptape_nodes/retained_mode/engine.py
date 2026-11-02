@@ -856,9 +856,10 @@ class Engine:
         parked holds its machine until it wakes and abandons the run; harmless, because the
         teardown drops the machine it holds.
         """
+        # Bound while nodes cancel, since their own cancellation code reads the bound workflow.
         with self.bind_workflow(workflow):
             try:
-                await self._flow_manager.cancel_all_runs()
+                await self._flow_manager.cancel_all_runs_in(workflow)
             except Exception as e:
                 # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
                 logger.warning("Could not cancel the running workflow before closing it. Continuing anyway: %s", e)

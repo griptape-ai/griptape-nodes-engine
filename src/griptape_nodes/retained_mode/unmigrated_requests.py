@@ -41,25 +41,10 @@ ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
 
 AMBIENT_UNTIL_MIGRATED: frozenset[str] = frozenset(
     {
-        "AcquireLeaseRequest",
-        "CancelAllRunsRequest",
-        "CancelRunRequest",
-        "CheckLeaseRequest",
-        "ExtractFlowCommandsFromImageMetadataRequest",
-        "GetTopLevelFlowRequest",
         "GetWorkflowContextRequest",
-        "ListFlowsInFlowRequest",
-        "ListRunsRequest",
-        "OfferSessionForWorkersRequest",
-        "ReleaseLeaseRequest",
-        "ReportPlaceInLineRequest",
-        "ReportWorkerExitedRequest",
         "RunWorkflowFromRegistryRequest",
         "RunWorkflowFromScratchRequest",
         "RunWorkflowWithCurrentStateRequest",
         "SetWorkflowContextRequest",
-        "StartWorkerForEngineRequest",
-        "StopWorkerForEngineRequest",
-        "WithdrawSessionOfferRequest",
     }
 )

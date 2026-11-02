@@ -1254,12 +1254,13 @@ class FlowSerialization(EngineScoped):
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
-        self, request: ExtractFlowCommandsFromImageMetadataRequest
+        self, request: ExtractFlowCommandsFromImageMetadataRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
 
         Args:
             request: ExtractFlowCommandsFromImageMetadataRequest with file path or URL
+            workflow: The open workflow a `deserialize` request builds the flow in
 
         Returns:
             ExtractFlowCommandsFromImageMetadataResultSuccess if successful
@@ -1338,7 +1339,7 @@ class FlowSerialization(EngineScoped):
         if request.deserialize:
             # Deserialize the flow
             deserialize_request = DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized_flow_commands)
-            deserialize_result = self.engine.handle_request(deserialize_request)
+            deserialize_result = workflow.handle_request(deserialize_request)
 
             # Validation: Check if deserialization succeeded
             if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
