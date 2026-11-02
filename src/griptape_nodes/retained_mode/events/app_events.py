@@ -525,6 +525,8 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         engine_version: Current engine version string
         engine_id: Unique engine identifier (None if not set)
         session_id: Current session identifier (None if no session)
+        engine_run_id: Id minted when this engine started, never saved. Workflow ids are only
+            valid while it stays the same; a new value means the engine restarted.
         timestamp: Heartbeat timestamp
         instance_type: Cloud instance type (None if not applicable)
         instance_region: Cloud instance region (None if not applicable)
@@ -583,6 +585,8 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     clients: list[SessionClient] = field(default_factory=list)
     # Id of the active workflow (None if none). Defaulted for backward compatibility.
     current_workflow_id: str | None = None
+    # Changes on every engine restart, unlike session_id. None from an engine too old to report it.
+    engine_run_id: str | None = None
 
 
 @dataclass

@@ -319,7 +319,16 @@ class BaseEvent(BaseModel, ABC):
 
 
 class EventRequest[P: Payload](BaseEvent):
-    """Request event."""
+    """Request event.
+
+    Args:
+        request: The request payload.
+        request_id: Id the caller matches the result by. Echoed on the result.
+        response_topic: Where the result is sent. Echoed on the result.
+        open_workflow_id: Id of the open workflow the request runs in. Echoed on the result.
+            The engine does not route by it yet, and never rejects a request for carrying one. A
+            payload field named `workflow_id` is something else: the workflow the request is about.
+    """
 
     request: P
     request_id: str | None = None
@@ -327,6 +336,7 @@ class EventRequest[P: Payload](BaseEvent):
     # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
     # `require_request_sender()`.
     sender: RequestSender | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
@@ -365,13 +375,21 @@ class EventRequestBatch(BaseEvent):
 
 
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
-    """Abstract base class for result events."""
+    """Abstract base class for result events.
+
+    Args:
+        open_workflow_id: The request envelope's `open_workflow_id`, echoed back: the open workflow
+            the request ran in. A result payload's own `workflow_id` is something else. For
+            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
+            Save As is a copy that is not open.
+    """
 
     request: P
     result: R
     request_id: str | None = None
     response_topic: str | None = None
     retained_mode: str | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""
