@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -95,7 +96,15 @@ class WorkflowFileOperations(EngineScoped):
         )
 
     @handles(RenameWorkflowRequest)
-    async def on_rename_workflow_request(self, request: RenameWorkflowRequest) -> ResultPayload:
+    async def on_rename_workflow_request(
+        self, request: RenameWorkflowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        """Rename the saved workflow the request names, or save the open `workflow` under the new name.
+
+        A named workflow that is open is renamed in place. Otherwise `workflow`'s graph is saved
+        under the new name and the old name's entry is deleted, which is how a rename reaches a
+        workflow the registry no longer knows by its old name.
+        """
         # Sanitize to a Python module-friendly name for the file stem (registry key).
         sanitized_stem = normalize_display_name(request.requested_name)
         if not sanitized_stem:
@@ -127,12 +136,19 @@ class WorkflowFileOperations(EngineScoped):
             if str(source_dir) not in ("", "."):
                 requested_file_name = f"{source_dir}/{sanitized_stem}"
 
-        if source is not None and self.engine.workflow_registry.is_open(source.workflow_id):
+        open_source = None
+        if source is not None:
+            open_source = self.engine.open_workflows.find(source.workflow_id)
+        if source is not None and open_source is not None:
             return await self._rename_open_workflow(
-                request=request, source=source, requested_file_name=requested_file_name, display_name=display_name
+                open_source,
+                request=request,
+                source=source,
+                requested_file_name=requested_file_name,
+                display_name=display_name,
             )
 
-        save_workflow_request = await self.engine.ahandle_request(
+        save_workflow_request = await workflow.ahandle_request(
             SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name)
         )
 
@@ -159,20 +175,23 @@ class WorkflowFileOperations(EngineScoped):
 
     async def _rename_open_workflow(
         self,
+        open_source: WorkflowRuntime,
         *,
         request: RenameWorkflowRequest,
         source: Workflow,
         requested_file_name: str,
         display_name: str,
     ) -> ResultPayload:
-        """Rename the open workflow: save its live graph to the new file under its own id, then delete the old file.
+        """Rename an open workflow: save its live graph to the new file under its own id, then delete the old file.
 
-        The workflow stays open and keeps its id; only its file and name change.
+        `open_source` is the runtime of `source`. The workflow stays open and keeps its id; only its
+        file and name change.
         """
         previous_absolute_path = source.absolute_path
         previous_file_path = source.file_path
 
         save_result = await self.engine.workflow_manager.saver.save_open_workflow(
+            open_source,
             SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name),
             keep_open_workflow_identity=True,
         )

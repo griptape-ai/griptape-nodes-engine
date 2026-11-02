@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -56,7 +57,14 @@ class WorkflowPublishing(EngineScoped):
         )
 
     @handles(PublishWorkflowRequest)
-    async def on_publish_workflow_request(self, request: PublishWorkflowRequest) -> ResultPayload:
+    async def on_publish_workflow_request(
+        self, request: PublishWorkflowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        """Save and publish the open `workflow`, which the request names by its registry name.
+
+        The publisher reads the graph through the bound workflow, which dispatch binds to `workflow`
+        and `asyncio.to_thread` carries into the publisher's thread.
+        """
         try:
             publisher_name = request.publisher_name
             event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
@@ -72,22 +80,30 @@ class WorkflowPublishing(EngineScoped):
             # Unsaved (registry-only) workflows cannot be published because publish emits a file
             # reference to the engine-registered workflow; the user must choose a save name first.
             workflow_file_name = request.workflow_name
-            try:
-                workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
-                if workflow.file_path is None:
-                    msg = (
-                        f"Cannot publish unsaved workflow '{request.workflow_name}'. "
-                        "Save the workflow before publishing."
-                    )
-                    raise ValueError(msg)
-                workflow_file_name = derive_registry_key(workflow.file_path)
-            except KeyError:
+            saved = self.engine.workflow_registry.find_by_name(request.workflow_name)
+            if saved is None:
                 details = (
                     f"While publishing, workflow '{request.workflow_name}' had not been saved or could not be found in the Workflow Registry. "
                     "Saving as a new and registered workflow before proceeding on publish attempt."
                 )
                 logger.info(details)
-            await self.engine.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
+            else:
+                # The publisher packages `workflow`'s graph, so another open workflow's name would
+                # publish one workflow's graph under the other's file.
+                if saved.workflow_id != workflow.workflow_id and self.engine.open_workflows.is_open(saved.workflow_id):
+                    msg = (
+                        f"Cannot publish workflow '{request.workflow_name}' from another workflow's tab. "
+                        "Publish it from its own tab."
+                    )
+                    raise ValueError(msg)  # noqa: TRY301
+                if saved.file_path is None:
+                    msg = (
+                        f"Cannot publish unsaved workflow '{request.workflow_name}'. "
+                        "Save the workflow before publishing."
+                    )
+                    raise ValueError(msg)  # noqa: TRY301
+                workflow_file_name = derive_registry_key(saved.file_path)
+            await workflow.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
 
             result = await asyncio.to_thread(publishing_handler.handler, request)
             if isinstance(result, PublishWorkflowResultSuccess) and not result.skip_published_workflow_registration:
