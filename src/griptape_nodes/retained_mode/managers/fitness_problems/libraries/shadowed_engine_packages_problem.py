@@ -42,5 +42,6 @@ class ShadowedEnginePackagesProblem(LibraryProblem):
         return (
             f"Installs components older than the ones Griptape Nodes runs on: {described}. This "
             "library still works, but those versions replace the engine's own, so unrelated parts "
-            "of the editor may misbehave."
+            "of the editor may misbehave. To fix this, reset the library in Library Management, "
+            "which rebuilds its environment."
         )
