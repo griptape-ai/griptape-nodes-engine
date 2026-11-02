@@ -1,8 +1,8 @@
 """A loose data sink outside a legacy loop must see the current run's value, not the previous run's.
 
-Shape: an unresolved node ("Sleep") feeds a data node ("Prompt") whose output goes to both a node
+Shape: an unresolved node ("Source") feeds a data node ("Prompt") whose output goes to both a node
 inside the loop body ("Body") and a loose data sink outside the loop with no control wires
-("Outside Sink"). The loop packager pulls "Sleep" and "Prompt" into the packaged body (they are
+("Outside Sink"). The loop packager pulls "Source" and "Prompt" into the packaged body (they are
 data dependencies of "Body", which sits on the control path) and removes them from every DAG
 network the outer flow runs in -- including the edge from "Prompt" to "Outside Sink". Under
 PARALLEL execution, the outer flow can then run "Outside Sink" before packaging copies "Prompt"'s
@@ -106,7 +106,7 @@ async def test_outside_loose_sink_sees_current_run_value(
         flow_name = flow_result.flow_name
 
         with engine.context_manager.flow(flow_name):
-            sleep_name = _create_node(engine, "SlowSourceControlNode", "Sleep")
+            source_name = _create_node(engine, "LoopBodyNode", "Source")
             prompt_name = _create_node(engine, "LoopBodyNode", "Prompt")
             start_name = _create_node(engine, "LoopStartNode", "Loop Start")
             body_name = _create_node(engine, "LoopBodyNode", "Body")
@@ -117,8 +117,9 @@ async def test_outside_loose_sink_sees_current_run_value(
             end_node = start_node.end_node
             assert end_node is not None, "The start node did not tether an end node."
 
-            # Sleep -> Prompt (both unresolved, pure data, no control wires).
-            _connect(engine, sleep_name, "result_details", prompt_name, "text")
+            # Source -> Prompt (pure data, no control wires). Editing Source's text before each run
+            # unresolves both, so both get packaged into the loop body.
+            _connect(engine, source_name, "result", prompt_name, "text")
             # Prompt feeds both the loop body (control path) and the outside loose sink (no
             # control wires on either Prompt or Outside Sink).
             _connect(engine, prompt_name, "result", body_name, "text")
@@ -127,16 +128,15 @@ async def test_outside_loose_sink_sees_current_run_value(
             _connect(engine, body_name, "exec_out", end_node.name, "add_item")
 
             observed = []
-            for seconds in (0.1, 0.2, 0.3):
+            for expected_text in ("run one", "run two", "run three"):
                 set_result = engine.handle_request(
-                    SetParameterValueRequest(node_name=sleep_name, parameter_name="seconds", value=seconds)
+                    SetParameterValueRequest(node_name=source_name, parameter_name="text", value=expected_text)
                 )
                 assert isinstance(set_result, SetParameterValueResultSuccess), set_result
 
                 run_result = await engine.ahandle_request(StartFlowRequest(flow_name=flow_name, flow_node_name=None))
                 assert isinstance(run_result, StartFlowResultSuccess), run_result
 
-                expected_text = f"Slept for {seconds} seconds"
                 prompt_node = engine.node_manager.get_node_by_name(prompt_name)
                 body_node = engine.node_manager.get_node_by_name(body_name)
                 outside_sink_node = engine.node_manager.get_node_by_name(outside_sink_name)
@@ -145,14 +145,13 @@ async def test_outside_loose_sink_sees_current_run_value(
                 body_result = str(body_node.parameter_output_values.get("result") or "")
                 outside_result = str(outside_sink_node.parameter_output_values.get("result") or "")
 
-                observed.append((seconds, expected_text, prompt_result, body_result, outside_result))
+                observed.append((expected_text, prompt_result, body_result, outside_result))
 
-                assert prompt_result == expected_text, f"seconds={seconds}: Prompt saw {prompt_result!r}"
-                assert body_result == expected_text, f"seconds={seconds}: Body (inside loop) saw {body_result!r}"
+                assert prompt_result == expected_text, f"{expected_text}: Prompt saw {prompt_result!r}"
+                assert body_result == expected_text, f"{expected_text}: Body (inside loop) saw {body_result!r}"
                 assert outside_result == expected_text, (
-                    f"seconds={seconds}: Outside Sink saw {outside_result!r}, expected the "
-                    f"current run's value {expected_text!r} (not a previous run's). All runs so "
-                    f"far: {observed!r}"
+                    f"{expected_text}: Outside Sink saw {outside_result!r}, expected the "
+                    f"current run's value (not a previous run's). All runs so far: {observed!r}"
                 )
     finally:
         config_manager.set_config_value("workflow_execution_mode", prior_mode)

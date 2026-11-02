@@ -6,7 +6,9 @@
     "description": "Minimal library used by loop-body packaging tests",
     "library_version": "0.1.0",
     "engine_version": "0.0.0",
-    "tags": ["test"],
+    "tags": [
+      "test"
+    ],
     "dependencies": {
       "pip_dependencies": []
     }
@@ -92,15 +94,6 @@
         "category": "test",
         "description": "Accepts any type, used to pull an upstream node in as a dependency",
         "display_name": "Any Sink"
-      }
-    },
-    {
-      "class_name": "SlowSourceControlNode",
-      "file_path": "loop_nodes.py",
-      "metadata": {
-        "category": "test",
-        "description": "Control-typed node left with no control wires; awaits asyncio.sleep(seconds)",
-        "display_name": "Slow Source"
       }
     },
     {
