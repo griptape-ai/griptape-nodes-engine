@@ -280,13 +280,18 @@ class VariablesManager(EngineScoped):
         return self.engine.project_manager.resolve_project_id(project_id)
 
     def _get_project_variable(
-        self, name: str, *, project_id: str | None, resolver: "ProjectVariableResolver | None" = None
+        self,
+        workflow: WorkflowRuntime,
+        name: str,
+        *,
+        project_id: str | None,
+        resolver: "ProjectVariableResolver | None" = None,
     ) -> FlowVariable | None:
         """Resolve a single project-layer variable (computed namespace first, then stored layer).
 
         ``project_id=None`` means the current project. Computed values (builtins/directories)
-        are resolved fresh via ProjectManager; a computed value whose context isn't ready
-        (e.g. {workflow_dir} with no workflow in context) yields None, matching the
+        are resolved fresh via ProjectManager for `workflow`; a computed value whose context isn't
+        ready (e.g. a directory macro that can't resolve) yields None, matching the
         silent-skip contract — the name exists, so the stored layer is NOT consulted as a
         fallback. Stored hits return a snapshot copy so callers can't mutate stored state through a
         response payload. Pass ``resolver`` to share resolved values across several reads.
@@ -303,11 +308,11 @@ class VariablesManager(EngineScoped):
         if name in project_manager.project_computed_names(project_id=effective):
             try:
                 if resolver is None:
-                    resolver = project_manager.computed_variable_resolver(project_id=effective)
+                    resolver = project_manager.computed_variable_resolver(project_id=effective, workflow=workflow)
                 return resolver.resolve_computed_variable(name)
             except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
-                # Computed name exists but its context isn't ready (e.g. {workflow_dir} with no
-                # workflow in context, or a directory macro that can't resolve). Silent-skip,
+                # Computed name exists but can't resolve right now (e.g. a directory macro that
+                # can't resolve, or {project_name}, which is not implemented). Silent-skip,
                 # no stored-layer fallback — the name is defined, just unavailable right now.
                 logger.debug("Computed project variable %r unavailable: %s", name, e)
                 return None
@@ -394,7 +399,7 @@ class VariablesManager(EngineScoped):
         return self.engine.project_manager.project_computed_names(project_id=effective)
 
     def _collect_resolvable_project_variables(
-        self, seen: set[str], *, project_id: str | None
+        self, workflow: WorkflowRuntime, seen: set[str], *, project_id: str | None
     ) -> list[ResolvedVariable]:
         """Enumerate project variables, resolving each name and skipping resolution failures.
 
@@ -408,12 +413,12 @@ class VariablesManager(EngineScoped):
             return []
         # One resolver for the whole enumeration, so the builtins every directory references
         # resolve once rather than once per directory.
-        resolver = self.engine.project_manager.computed_variable_resolver(project_id=effective)
+        resolver = self.engine.project_manager.computed_variable_resolver(project_id=effective, workflow=workflow)
         collected: list[ResolvedVariable] = []
         for name in self._list_project_variable_names(project_id=effective):
             if name in seen:
                 continue
-            variable = self._get_project_variable(name, project_id=effective, resolver=resolver)
+            variable = self._get_project_variable(workflow, name, project_id=effective, resolver=resolver)
             if variable is None:
                 continue
             collected.append(ResolvedVariable(variable=variable, layer=VariableLayerKind.PROJECT))
@@ -439,7 +444,7 @@ class VariablesManager(EngineScoped):
                 )
 
             case VariableScope.PROJECT_ONLY:
-                variable = self._get_project_variable(variable_name, project_id=project_id)
+                variable = self._get_project_variable(workflow, variable_name, project_id=project_id)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -468,7 +473,7 @@ class VariablesManager(EngineScoped):
                             variable=variable, found_scope=found_scope, found_layer=VariableLayerKind.FLOW
                         )
 
-                variable = self._get_project_variable(variable_name, project_id=project_id)
+                variable = self._get_project_variable(workflow, variable_name, project_id=project_id)
                 if variable is not None:
                     return VariableLookupResult(
                         variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
@@ -482,7 +487,7 @@ class VariablesManager(EngineScoped):
                 )
 
             case VariableScope.HIERARCHICAL_FROM_PROJECT:
-                variable = self._get_project_variable(variable_name, project_id=project_id)
+                variable = self._get_project_variable(workflow, variable_name, project_id=project_id)
                 if variable is not None:
                     return VariableLookupResult(
                         variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
@@ -955,7 +960,7 @@ class VariablesManager(EngineScoped):
 
             case VariableScope.PROJECT_ONLY:
                 # Just the project layer (entries tagged PROJECT inside the helper).
-                return self._collect_resolvable_project_variables(set(), project_id=project_id)
+                return self._collect_resolvable_project_variables(workflow, set(), project_id=project_id)
 
             case VariableScope.GLOBAL_ONLY:
                 # Just the global layer.
@@ -974,7 +979,7 @@ class VariablesManager(EngineScoped):
                 # entries and fills `seen`; then we add only the globals not shadowed,
                 # tagged GLOBAL because they come from the global layer.
                 seen: set[str] = set()
-                result = self._collect_resolvable_project_variables(seen, project_id=project_id)
+                result = self._collect_resolvable_project_variables(workflow, seen, project_id=project_id)
                 result.extend(
                     ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL)
                     for v in workflow.variables.global_layer.list()
@@ -1015,7 +1020,7 @@ class VariablesManager(EngineScoped):
                     seen_names.add(var.name)
 
         # Project layer (shadows global, shadowed by flow)
-        variables.extend(self._collect_resolvable_project_variables(seen_names, project_id=project_id))
+        variables.extend(self._collect_resolvable_project_variables(workflow, seen_names, project_id=project_id))
 
         # Global layer (lowest priority)
         variables.extend(
@@ -1039,7 +1044,7 @@ class VariablesManager(EngineScoped):
             variables.extend(ResolvedVariable(variable=v, layer=VariableLayerKind.FLOW) for v in flow_layer.list())
 
         # Project layer entries — silent-skip resolution failures for enumeration.
-        variables.extend(self._collect_resolvable_project_variables(set(), project_id=project_id))
+        variables.extend(self._collect_resolvable_project_variables(workflow, set(), project_id=project_id))
 
         variables.extend(
             ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in workflow.variables.global_layer.list()

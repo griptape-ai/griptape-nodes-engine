@@ -75,6 +75,8 @@ Builtins are resolved at the moment a macro is evaluated — not when the projec
 
 If a builtin variable is required but cannot be resolved (for example, `workflow_name` when no workflow is running), macro resolution fails with an error. If the variable is optional (marked with `?`), the block is silently omitted instead.
 
+Project environment values apply to the whole engine rather than to one workflow, so they never see `workflow_name` or `workflow_dir`. An environment value that requires either one is not applied, and a warning names it. The other environment values are still applied.
+
 ### Builtin variables in situation macros
 
 The `save_static_file` situation uses `workflow_dir` and `static_files_dir`:
