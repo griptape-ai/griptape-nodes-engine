@@ -260,8 +260,7 @@ class ContextManager(EngineScoped):
             CreateFlowResultSuccess,
         )
 
-        # Clients do not name their workflow on the envelope yet, and this call is how they find the
-        # one open. Until they do, a request that names none reuses the only open workflow.
+        # Clients name no workflow on the envelope yet, and find the open one through this call.
         if workflow is None:
             try:
                 workflow = self.engine.only_open_workflow_or_none()
