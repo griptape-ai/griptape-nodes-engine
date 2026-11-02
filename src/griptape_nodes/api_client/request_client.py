@@ -38,12 +38,12 @@ class _PendingRequest:
     # When True, EventResultFailure responses resolve the future with
     # the full payload dict instead of rejecting it with
     # ``Exception(error_msg)``. The default (False) preserves the
-    # original "failure -> raised exception" contract that
-    # ``request``/``request_from_worker``/``request_batch`` already
-    # rely on. The worker fan-out path opts in so the orchestrator can
-    # cattrs-structure the failure dict back into a real
-    # ``ResultPayloadFailure`` (preserving exception fidelity over the
-    # wire).
+    # original "failure -> raised exception" contract that ``request``
+    # and ``request_batch`` rely on. The two engine-to-engine paths opt
+    # in, the orchestrator's fan-out to workers and a worker's
+    # ``request_from_worker``, so the receiver can cattrs-structure the
+    # failure dict back into a real ``ResultPayloadFailure`` (preserving
+    # its type and exception over the wire).
     resolve_failures_as_payload: bool = False
 
 
@@ -218,7 +218,9 @@ class RequestClient:
         # Before tracking, so a request that cannot be sent leaves no pending response behind.
         payload_dict = json.loads(converters.engine.dumps(event_request))
 
-        response_future = await self._track_request(request_id)
+        # A failure comes back as its payload, so the worker's node gets the real failure result
+        # (a budget refusal, say) rather than an error raised in its place.
+        response_future = await self._track_request(request_id, resolve_failures_as_payload=True)
 
         if worker_response_topic not in self._subscribed_response_topics:
             await self.client.subscribe(worker_response_topic)
