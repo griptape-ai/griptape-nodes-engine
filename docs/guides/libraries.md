@@ -264,6 +264,24 @@ the reset finishes the next time the engine starts, and Griptape
 Nodes asks you to restart it. Libraries provided by your studio's
 environment can't be reset here. Ask whoever set up that environment.
 
+### "A library warns that it installs older components"
+
+The warning reads "Installs components older than the ones Griptape
+Nodes runs on" and lists each package with both versions. A
+library's environment comes ahead of Griptape Nodes' own packages,
+so those older copies are the ones Griptape Nodes uses, and features
+unrelated to the library can break. The library itself keeps
+working.
+
+The older packages are usually left over from an earlier install,
+for example running `uv sync` in a library you develop, which also
+installs that library's development tools. Updating or reloading
+the library doesn't remove them. Press **Reset** on the library's
+row, as described above, to rebuild its environment from what the
+library currently declares. If the warning comes back after a
+reset, the library itself requires the older versions; report it to
+the library's author.
+
 ### "A node looks broken or red in the editor"
 
 The engine couldn't construct that node — usually because its
