@@ -557,3 +557,31 @@ class TestNodesAndFlowsOnTheRuntime:
 
         first.flows.global_single_node_resolution = False
         assert not ExecuteDagState._should_skip_control_flow(context, MockNode(name="node"), "network")
+
+
+class TestSquelchWorkflowAltered:
+    @pytest.mark.asyncio
+    async def test_a_squelch_covers_its_own_task_and_not_another(self, engine: Engine) -> None:
+        """A load reports its own edits as unaltered; an edit made meanwhile from another task still counts."""
+        engine.context_manager.push_workflow(workflow_name="outer")
+        load_holds_squelch = asyncio.Event()
+        other_edit_done = asyncio.Event()
+
+        async def load() -> ResultPayload:
+            with engine.workflow_manager.squelch_workflow_altered():
+                load_holds_squelch.set()
+                await other_edit_done.wait()
+                return await engine.ahandle_request(CreateFlowRequest(parent_flow_name=None, flow_name="loaded"))
+
+        async def edit_from_another_task() -> ResultPayload:
+            await load_holds_squelch.wait()
+            result = await engine.ahandle_request(CreateFlowRequest(parent_flow_name=None, flow_name="edited"))
+            other_edit_done.set()
+            return result
+
+        loaded, edited = await asyncio.gather(load(), edit_from_another_task())
+
+        assert isinstance(loaded, CreateFlowResultSuccess)
+        assert isinstance(edited, CreateFlowResultSuccess)
+        assert loaded.altered_workflow_state is False
+        assert edited.altered_workflow_state is True
