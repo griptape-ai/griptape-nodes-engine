@@ -392,7 +392,9 @@ class TestGroupCopyBackKeepsConnectedList:
         )
         return node
 
-    def test_last_iteration_keeps_the_connected_items_only(self) -> None:
+    @pytest.mark.parametrize("stored_items", [[1], None])
+    def test_last_iteration_keeps_the_connected_items_only(self, stored_items: list[int] | None) -> None:
+        """A body node the loop never fed holds no stored list on the first run, so None is covered too."""
         node = self._make_list_node()
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -400,15 +402,14 @@ class TestGroupCopyBackKeepsConnectedList:
         package_result = _make_end_mapping("ListNode_items", "ListNode", "items")
 
         with patch.object(MockNode, "_param_has_incoming_connection", return_value=True):
-            node.set_parameter_value("items", [1])
+            if stored_items is not None:
+                node.set_parameter_value("items", stored_items)
             items = node.get_parameter_by_name("items")
             assert isinstance(items, ParameterList)
             entry = items.add_child_parameter()
             node.set_parameter_value(entry.name, 2)
-            assert node.get_parameter_value("items") == [1, 2]
 
             executor._apply_last_iteration_to_packaged_nodes({"ListNode_items": [1, 2]}, package_result)
 
-            assert node.parameter_values["items"] == [1]
-            assert node.get_parameter_value("items") == [1, 2]
+            assert node.parameter_values.get("items") == stored_items
         assert node.parameter_output_values["items"] == [1, 2]

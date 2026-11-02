@@ -4262,12 +4262,13 @@ class NodeExecutor(EngineScoped):
             #
             # And for a list connected to as a whole: the value here is the connected items
             # followed by the list's own entries, and storing it as the connected value would
-            # read the entries twice, and save them twice.
+            # read the entries twice, and save them twice. The connection is checked itself, since
+            # a body node the loop never fed holds no stored value yet on the first run.
             preserves_template = target_node.should_preserve_stored_template(target_param_name, param_value)
             rows_are_connected = target_node._list_rows.has_connected_rows(target_param)
             whole_list_is_connected = isinstance(
                 target_param, ParameterList
-            ) and target_node._has_connected_whole_list_value(target_param)
+            ) and target_node._param_has_incoming_connection(target_param.name)
             if not preserves_template and not rows_are_connected and not whole_list_is_connected:
                 target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
