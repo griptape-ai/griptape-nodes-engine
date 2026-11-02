@@ -10,14 +10,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
+    ForwardedException,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_check
 
 ATTRIBUTION_HEADER_NAME = "X-Griptape-Attribution"
+
+# How a BudgetExceededError names its type once it has crossed the worker boundary.
+_BUDGET_EXCEEDED_TYPE = f"{BudgetExceededError.__module__}.{BudgetExceededError.__qualname__}"
 ATTRIBUTION_SCHEMA_VERSION = 1
 
 
@@ -154,6 +159,16 @@ class BudgetAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
     blocked_by: list[dict[str, Any]]
     correlation_id: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Across the worker boundary the exception arrives as a ForwardedException naming only its
+        # type. Rebuild it from `blocked_by`, which crosses as plain data, so a node in a library
+        # worker that raises it stops the run naming the budgets, as a node in the engine does.
+        if isinstance(self.exception, ForwardedException) and self.exception.original_type == _BUDGET_EXCEEDED_TYPE:
+            self.exception = BudgetExceededError(
+                str(self.exception), refusal_from_check({"blocked_by": self.blocked_by})
+            )
 
 
 @dataclass

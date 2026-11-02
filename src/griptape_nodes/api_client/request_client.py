@@ -570,11 +570,11 @@ class RequestClient:
                 self._resolve_request_unlocked(request_id, payload)
                 return True
             if event_type == "EventResultFailure":
-                # Worker-tracked requests opt in to receiving the full
-                # payload dict so the orchestrator can cattrs-structure
-                # the failure back into a real ResultPayloadFailure
-                # (preserving the exception field). All other callers
-                # keep the legacy "raise Exception(error_msg)" contract.
+                # Engine-to-engine requests (the orchestrator's fan-out to
+                # workers and a worker's request_from_worker) opt in to the
+                # full payload dict, so the receiver can cattrs-structure it
+                # back into the real ResultPayloadFailure, exception and all.
+                # Other callers get an Exception carrying its message.
                 if entry.resolve_failures_as_payload:
                     self._resolve_request_unlocked(request_id, payload)
                     return True
