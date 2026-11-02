@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     ReleaseSettings,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
+from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.serialization.values import untag
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
@@ -771,7 +772,9 @@ class WorkerManager(EngineScoped):
             self._spawn_loop = asyncio.get_running_loop()
             self._managed_worker_processes[worker_key] = proc
             # Started on this loop, the only one that may await proc.wait().
-            watcher = self._spawn_loop.create_task(self._settle_when_worker_exits_early(worker_key, proc))
+            watcher = create_task_bound_to_no_workflow(
+                self._spawn_loop, self._settle_when_worker_exits_early(worker_key, proc)
+            )
             self._exit_watchers.add(watcher)
             watcher.add_done_callback(self._exit_watchers.discard)
         finally:
@@ -1345,7 +1348,8 @@ class WorkerManager(EngineScoped):
                 start = self._spawn_when_session_ready(library_name)
             else:
                 start = self._start_worker_on_engine(library_name, host_engine_id)
-        task = asyncio.get_running_loop().create_task(start)
+        # It outlives this request, so it acts on no workflow rather than the one the request names.
+        task = create_task_bound_to_no_workflow(asyncio.get_running_loop(), start)
         self._requested_spawns[library_name] = task
         task.add_done_callback(functools.partial(self._release_spawn_request, library_name=library_name))
         task.add_done_callback(functools.partial(self._log_spawn_error, library_name=library_name))
@@ -1465,7 +1469,9 @@ class WorkerManager(EngineScoped):
     def _schedule_remote_stop(self, worker_engine_id: str, host_engine_id: str) -> None:
         """Forget a start withdrawn while `host_engine_id` was answering it, and tell that engine to stop that worker."""
         self._remote_starts.pop(worker_engine_id, None)
-        task = asyncio.get_running_loop().create_task(self._stop_remote_worker(worker_engine_id, host_engine_id))
+        task = create_task_bound_to_no_workflow(
+            asyncio.get_running_loop(), self._stop_remote_worker(worker_engine_id, host_engine_id)
+        )
         self._stop_requests.add(task)
         task.add_done_callback(self._stop_requests.discard)
 
@@ -1499,7 +1505,9 @@ class WorkerManager(EngineScoped):
         self._engine_registrations.clear()
         for host_engine_id in host_engine_ids:
             self._forget_leases_on(host_engine_id)
-            task = asyncio.get_running_loop().create_task(self._withdraw_session_offer(host_engine_id))
+            task = create_task_bound_to_no_workflow(
+                asyncio.get_running_loop(), self._withdraw_session_offer(host_engine_id)
+            )
             self._stop_requests.add(task)
             task.add_done_callback(self._stop_requests.discard)
 
@@ -1524,7 +1532,9 @@ class WorkerManager(EngineScoped):
         key = (host_engine_id, session_id)
         registration = self._engine_registrations.get(key)
         if registration is None or registration.done():
-            registration = asyncio.get_running_loop().create_task(self._send_registration(host_engine_id))
+            registration = create_task_bound_to_no_workflow(
+                asyncio.get_running_loop(), self._send_registration(host_engine_id)
+            )
             registration.add_done_callback(lambda task: self._forget_unaccepted_registration(key, task))
             self._engine_registrations[key] = registration
         try:
@@ -1738,7 +1748,9 @@ class WorkerManager(EngineScoped):
         hosted.started.set()
         # It registers with the artist's engine, not here, so its unregistration never reaches this
         # engine. Watching the process is what reports its exit and lets another start for the session.
-        watcher = asyncio.get_running_loop().create_task(self._report_when_exited(worker_engine_id, hosted, proc))
+        watcher = create_task_bound_to_no_workflow(
+            asyncio.get_running_loop(), self._report_when_exited(worker_engine_id, hosted, proc)
+        )
         hosted.exit_watcher = watcher
         self._exit_watchers.add(watcher)
         watcher.add_done_callback(self._exit_watchers.discard)
@@ -2192,7 +2204,7 @@ class WorkerManager(EngineScoped):
 
     def _send_notice(self, notice: Coroutine[Any, Any, None]) -> None:
         """Send a report to another engine without waiting, holding the task until it is answered."""
-        task = asyncio.get_running_loop().create_task(notice)
+        task = create_task_bound_to_no_workflow(asyncio.get_running_loop(), notice)
         self._engine_notices.add(task)
         task.add_done_callback(self._engine_notices.discard)
 

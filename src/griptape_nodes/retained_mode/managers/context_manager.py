@@ -775,7 +775,12 @@ class ContextManager(EngineScoped):
             msg = "No active Workflow context"
             raise self.NoActiveWorkflowError(msg)
 
-        self._workflow_stack[-1].workflow_id = workflow_id
+        moved = self._workflow_stack[-1]
+        open_workflows = self.engine.open_workflows
+        # The open workflow's runtime follows it, so a request naming the copy's id reaches it.
+        if len(self._workflow_stack) == 1 and open_workflows.is_open(moved.workflow_id):
+            open_workflows.move(open_workflows.get(moved.workflow_id), workflow_id)
+        moved.workflow_id = workflow_id
 
     def get_current_flow(self) -> ControlFlow:
         """Get the current Flow object.
@@ -883,6 +888,9 @@ class ContextManager(EngineScoped):
 
         if working_directory is not None:
             workflow.working_directory = working_directory
+        if not self._workflow_stack:
+            # The workflow at the bottom of the stack is the open one. A push onto it opens nothing.
+            self.engine.open_workflows.open(workflow.workflow_id)
         self._workflow_stack.append(self.WorkflowContextState(workflow.workflow_id))
         return workflow.name
 
@@ -921,7 +929,13 @@ class ContextManager(EngineScoped):
             raise self.EmptyStackError(msg)
 
         name = self.get_current_workflow_name()
-        self._workflow_stack.pop()
+        popped = self._workflow_stack.pop()
+        open_workflows = self.engine.open_workflows
+        # Not open when the entry is a worker's mirror, which opens nothing.
+        if not self._workflow_stack and open_workflows.is_open(popped.workflow_id):
+            closed = open_workflows.get(popped.workflow_id)
+            open_workflows.close(closed)
+            self.engine.leave_closed_workflow(closed)
         return name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
