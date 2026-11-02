@@ -359,7 +359,6 @@ class WorkflowBranching(EngineScoped):
             result_messages = []
             try:
                 registry.remove(branch_workflow.workflow_id)
-                self.engine.workflow_manager.variable_substitution.drop(branch_workflow.workflow_id)
                 # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
                 Path(branch_content_file_path).unlink()
                 cleanup_message = f"Deleted branch workflow file and registry entry for '{request.workflow_name}'"

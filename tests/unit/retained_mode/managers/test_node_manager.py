@@ -20,6 +20,9 @@ from griptape_nodes.retained_mode.events.node_events import (
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.serialization.values import UndecodedValue
 
+# Workflow ids in the form the registry mints.
+_ORCHESTRATOR_WORKFLOW_ID = "0577bcf13a9809c5fcc5b68d391658f0"
+
 
 class TestNodeManagerBatchSetNodeMetadata:
     """Test the batch_set_node_metadata functionality in NodeManager."""
@@ -435,6 +438,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {"result": output_value}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
@@ -465,6 +469,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
@@ -495,6 +500,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
@@ -814,6 +820,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+            orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
         )
         result = await engine.ahandle_request(request)
         assert isinstance(result, ExecuteNodeResultFailure)
@@ -829,6 +836,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+            orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
         )
         result = await engine.ahandle_request(request)
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details

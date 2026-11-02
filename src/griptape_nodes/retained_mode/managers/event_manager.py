@@ -1152,7 +1152,10 @@ class EventManager(EngineScoped):
             raise RuntimeError(msg)
 
         response_payload = await self._send_from_worker(
-            request, request_topic=self._orchestrator_request_topic, response_topic=self._worker_response_topic
+            request,
+            request_topic=self._orchestrator_request_topic,
+            response_topic=self._worker_response_topic,
+            open_workflow_id=self._bound_worker_workflow_id(),
         )
         result_payload = _read_forwarded_result(request, response_payload)
 
@@ -1189,14 +1192,19 @@ class EventManager(EngineScoped):
         )
         return _read_forwarded_result(request, response_payload)
 
-    async def _send_from_worker(self, request: RequestPayload, *, request_topic: str, response_topic: str) -> dict:
-        """Publish `request` from this worker on `request_topic` and await the raw reply on `response_topic`."""
+    async def _send_from_worker(
+        self, request: RequestPayload, *, request_topic: str, response_topic: str, open_workflow_id: str | None = None
+    ) -> dict:
+        """Publish `request` from this worker on `request_topic` and await the raw reply on `response_topic`.
+
+        `open_workflow_id` names the workflow the request runs in on the engine that receives it.
+        """
         if self._worker_request_client is None or self._websocket_event_loop is None:
             msg = "Worker forwarding is enabled but not fully configured."
             raise RuntimeError(msg)
         response_future = asyncio.run_coroutine_threadsafe(
             self._worker_request_client.request_from_worker(
-                event_request=EventRequest(request=request),
+                event_request=EventRequest(request=request, open_workflow_id=open_workflow_id),
                 request_topic=request_topic,
                 worker_response_topic=response_topic,
                 timeout_ms=self._forward_timeout_ms,
@@ -1204,6 +1212,19 @@ class EventManager(EngineScoped):
             self._websocket_event_loop,
         )
         return await asyncio.wrap_future(response_future)
+
+    def _bound_worker_workflow_id(self) -> str | None:
+        """The orchestrator workflow id of the worker runtime the current work is bound to, else None.
+
+        A worker keeps its runtime for an orchestrator workflow under that workflow's id, so a request
+        forwarded from the node running in it names the workflow the orchestrator binds it to.
+        """
+        bound = bound_workflow.get()
+        if bound is None or bound is NO_WORKFLOW:
+            return None
+        if self.engine.worker_workflows.find(bound.workflow_id) is not bound:
+            return None
+        return bound.workflow_id
 
     def _refusal_for_sender(
         self, request: RequestPayload, result_context: ResultContext

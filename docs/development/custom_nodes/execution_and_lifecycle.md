@@ -154,6 +154,20 @@ class MyBlockingNode(ControlNode):
 - Each yielded callable runs synchronously on a background thread; the generator resumes with its return value
 - Fine for existing synchronous code (`requests`, blocking SDKs), but prefer `aprocess()` for new integrations
 
+### Starting Your Own Threads
+
+The engine knows which workflow a node runs in from the context of the code that runs it. `aprocess()`, yielded callables, and `asyncio.to_thread` carry that context along. A thread you start yourself doesn't: `threading.Thread`, a `ThreadPoolExecutor`, and `loop.run_in_executor` begin with an empty context. Code in such a thread can't find the node's workflow, so workflow-relative paths such as `{workflow_dir}` and `{outputs}` fail to resolve.
+
+Prefer `asyncio.to_thread`. When you need your own thread or pool, run each task inside its own copy of the current context:
+
+```python
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor() as pool:
+    futures = [pool.submit(contextvars.copy_context().run, render_frame, frame) for frame in frames]
+```
+
 ### Polling Pattern for Long-Running Tasks
 
 When integrating with APIs that use asynchronous task processing (video generation, model training, etc.), implement a three-step pattern. The examples below use synchronous `requests` calls, suited to the background-thread pattern above; in `aprocess()`, use `httpx.AsyncClient` and `await asyncio.sleep()` instead, as shown earlier.

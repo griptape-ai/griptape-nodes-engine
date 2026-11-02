@@ -366,7 +366,7 @@ class _WorkflowRegistry:
         self._by_id: dict[str, Workflow] = {}
 
     def is_open(self, workflow_id: str) -> bool:
-        """Whether the workflow with this id is open in the engine."""
+        """Whether the workflow with this id is open in the engine, or a worker keeps a runtime for it."""
         return self._is_workflow_open(workflow_id)
 
     def get(self, workflow_id: str) -> Workflow:
@@ -528,10 +528,10 @@ class _WorkflowRegistry:
     ) -> Workflow:
         """Register a new unsaved (in-memory) workflow, named "unsaved:<id>".
 
-        `workflow_id` is minted unless given. Only a mirror of another engine's workflow passes
-        one, so that both engines call the workflow by the same id. A given one must be in the form
-        the registry mints (32 lowercase hex digits), so that `unsaved_name_workflow_id` maps the
-        name back to it.
+        `workflow_id` is minted unless given. Only a worker registering its orchestrator's workflow
+        passes one, so that both engines call the workflow by the same id. A given one must be in
+        the form the registry mints (32 lowercase hex digits), so that `unsaved_name_workflow_id`
+        maps the name back to it.
 
         Raises:
             WorkflowRegistryError: `workflow_id` is not 32 lowercase hex digits.
