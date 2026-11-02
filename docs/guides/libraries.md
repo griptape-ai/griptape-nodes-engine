@@ -276,11 +276,12 @@ working.
 The older packages are usually left over from an earlier install,
 for example running `uv sync` in a library you develop, which also
 installs that library's development tools. Updating or reloading
-the library doesn't remove them. Press **Reset** on the library's
-row, as described above, to rebuild its environment from what the
-library currently declares. If the warning comes back after a
-reset, the library itself requires the older versions; report it to
-the library's author.
+the library doesn't remove them. In that case, pressing **Reset** on
+the library's row, as described above, rebuilds its environment from
+what the library currently declares and clears the warning. Reset
+can't help when the library itself requires the older versions: the
+warning comes back after the reset. Report that to the library's
+author.
 
 ### "A node looks broken or red in the editor"
 

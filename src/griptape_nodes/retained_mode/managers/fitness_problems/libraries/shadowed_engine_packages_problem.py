@@ -46,6 +46,7 @@ class ShadowedEnginePackagesProblem(LibraryProblem):
         return (
             f"Installs components older than the ones Griptape Nodes runs on: {described}. This "
             "library still works, but Griptape Nodes uses those older versions in place of its own, "
-            "so features unrelated to this library may break. Reset the library to rebuild its "
-            f"environment: {SHADOWED_PACKAGES_DOCS_URL}"
+            "so features unrelated to this library may break. If they are left over from an earlier "
+            "install, resetting the library rebuilds its environment without them. If they come "
+            f"back after a reset, the library requires them. More: {SHADOWED_PACKAGES_DOCS_URL}"
         )
