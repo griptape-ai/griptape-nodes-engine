@@ -622,7 +622,6 @@ class Library:
     _registered_pre_dispatch_hooks: list[Callable]
     _registered_post_dispatch_hooks: list[tuple[type, Callable]]
     _registered_request_handler_types: list[type]
-    # Request types this library exposes on the engine's MCP server, read by servers/mcp.py.
     _mcp_tools: list[MCPTool]
 
     def __init__(

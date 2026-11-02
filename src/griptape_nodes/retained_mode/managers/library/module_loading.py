@@ -595,8 +595,7 @@ class LibraryModuleLoading(EngineScoped):
                     err,
                 )
 
-        # Request types the library exposes on the engine's MCP server. Checked against the
-        # handlers just registered, so this has to run after them.
+        # Validated against the request handlers, so this must run after they register.
         if advanced_library:
             try:
                 self._register_mcp_tools(advanced_library, library)
