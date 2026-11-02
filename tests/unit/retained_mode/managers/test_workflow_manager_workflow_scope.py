@@ -1,0 +1,535 @@
+"""Workflow managers' handlers act on the workflow dispatch hands them, or on the saved workflow they name.
+
+The request envelope names the tab's open workflow; a body `workflow_name` names the saved workflow a
+request acts on. Most tests open a second workflow beside the first, so a handler that fell back to
+"the only open workflow" would fail instead of passing by luck.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
+from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultFailure,
+    EnsureWorkflowAndFlowResultSuccess,
+    GetWorkflowContextRequest,
+    SetWorkflowContextRequest,
+)
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    GetTopLevelFlowRequest,
+    GetTopLevelFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
+    SerializedFlowCommands,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+)
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.project_events import (
+    LoadProjectTemplateRequest,
+    LoadProjectTemplateResultSuccess,
+    SetCurrentProjectRequest,
+)
+from griptape_nodes.retained_mode.events.workflow_events import (
+    DeleteWorkflowRequest,
+    DeleteWorkflowResultSuccess,
+    GetVariableSubstitutionEnabledRequest,
+    GetWorkflowRunCommandRequest,
+    GetWorkflowRunCommandResultFailure,
+    GetWorkflowRunCommandResultSuccess,
+    GetWorkflowShapeRequest,
+    ImportWorkflowAsReferencedSubFlowResultFailure,
+    ImportWorkflowAsReferencedSubFlowResultSuccess,
+    PublishWorkflowRegisteredEventData,
+    PublishWorkflowRequest,
+    PublishWorkflowResultFailure,
+    PublishWorkflowResultSuccess,
+    RenameWorkflowRequest,
+    RenameWorkflowResultSuccess,
+    RunWorkflowFromRegistryRequest,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowWithCurrentStateRequest,
+    SaveSubflowToWorkflowRequest,
+    SaveSubflowToWorkflowResultSuccess,
+    SaveWorkflowFileFromSerializedFlowResultSuccess,
+    SaveWorkflowRequest,
+    SaveWorkflowResultSuccess,
+    SetVariableSubstitutionEnabledRequest,
+)
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.managers.library.common import RegisteredEventHandler
+from griptape_nodes.retained_mode.managers.workflow.branching import WorkflowBranching
+from griptape_nodes.retained_mode.managers.workflow.catalog import WorkflowCatalog
+from griptape_nodes.retained_mode.managers.workflow.file_operations import WorkflowFileOperations
+from griptape_nodes.retained_mode.managers.workflow.publishing import WorkflowPublishing
+from griptape_nodes.retained_mode.managers.workflow.referenced_import import ReferencedWorkflowImport
+from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
+from griptape_nodes.retained_mode.managers.workflow.saving import WorkflowSaver
+from griptape_nodes.retained_mode.managers.workflow.variable_substitution import VariableSubstitution
+from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from griptape_nodes.node_library.workflow_registry import Workflow
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+_HANDLER_CLASSES = (
+    ContextManager,
+    WorkflowManager,
+    WorkflowBranching,
+    WorkflowCatalog,
+    WorkflowFileOperations,
+    WorkflowPublishing,
+    ReferencedWorkflowImport,
+    WorkflowRunner,
+    WorkflowSaver,
+    VariableSubstitution,
+)
+# They act on the tab's open workflow: they read or change its graph.
+_WORKFLOW_REQUESTS = {
+    SaveWorkflowRequest,
+    SaveSubflowToWorkflowRequest,
+    ImportWorkflowAsReferencedSubFlowRequest,
+    GetVariableSubstitutionEnabledRequest,
+    SetVariableSubstitutionEnabledRequest,
+    RenameWorkflowRequest,
+    PublishWorkflowRequest,
+    GetWorkflowShapeRequest,
+}
+# They use the tab's open workflow when there is one and work without it.
+_OPTIONAL_WORKFLOW_REQUESTS = {EnsureWorkflowAndFlowRequest, GetWorkflowRunCommandRequest}
+# File runs and the context requests learn their workflow from the ambient binding until the entry
+# points bind the workflow they run in.
+_UNSCOPED_REQUESTS = {
+    RunWorkflowFromScratchRequest,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowFromRegistryRequest,
+    SetWorkflowContextRequest,
+    GetWorkflowContextRequest,
+}
+
+
+def _allow_several_open(engine: Engine) -> None:
+    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+
+
+def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
+    """Open a new unsaved workflow next to whatever is open, as an editor tab would."""
+    workflow = engine.workflow_registry.register_unsaved(display_name, listed=False)
+    return engine.open_workflow(workflow.workflow_id)
+
+
+def _name(engine: Engine, workflow: WorkflowRuntime) -> str:
+    return engine.workflow_registry.get(workflow.workflow_id).name
+
+
+def _send(engine: Engine, request: RequestPayload, workflow: WorkflowRuntime | None) -> ResultPayload:
+    """Dispatch `request` as a client would, with the envelope naming `workflow` (or nothing)."""
+    workflow_id = None if workflow is None else workflow.workflow_id
+    return engine.event_manager.handle_request(
+        request, result_context=ResultContext(open_workflow_id=workflow_id)
+    ).result
+
+
+def _send_async(engine: Engine, request: RequestPayload, workflow: WorkflowRuntime | None) -> ResultPayload:
+    workflow_id = None if workflow is None else workflow.workflow_id
+    return asyncio.run(
+        engine.event_manager.ahandle_request(request, result_context=ResultContext(open_workflow_id=workflow_id))
+    ).result
+
+
+def _create_flow(engine: Engine, workflow: WorkflowRuntime, flow_name: str) -> str:
+    result = _send(engine, CreateFlowRequest(parent_flow_name=None, flow_name=flow_name), workflow)
+    assert isinstance(result, CreateFlowResultSuccess), result.result_details
+    return result.flow_name
+
+
+def _write_saved_workflow(engine: Engine, path: Path, *, workflow_shape: WorkflowShape | None = None) -> Workflow:
+    """Register a saved workflow whose file holds only a placeholder body."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# a saved workflow\n", encoding="utf-8")
+    metadata = WorkflowMetadata(
+        name=path.stem,
+        schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+        engine_version_created_with="0.0.0",
+        node_libraries_referenced=[],
+        workflow_shape=workflow_shape,
+    )
+    return engine.workflow_registry.register_file(path, metadata)
+
+
+class _RecordedRequests:
+    """Stands in for `engine.ahandle_request`, answering flow requests and recording the workflow each is bound to."""
+
+    def __init__(self, flow_name: str) -> None:
+        self.flow_name = flow_name
+        self.bound: list[tuple[type, Any]] = []
+
+    async def __call__(self, request: RequestPayload) -> ResultPayload:
+        self.bound.append((type(request), bound_workflow.get()))
+        if isinstance(request, GetTopLevelFlowRequest):
+            return GetTopLevelFlowResultSuccess(flow_name=self.flow_name, result_details="ok")
+        if isinstance(request, SerializeFlowToCommandsRequest):
+            commands = SerializedFlowCommands(
+                flow_initialization_command=None,
+                serialized_node_commands=[],
+                serialized_connections=[],
+                unique_parameter_uuid_to_values={},
+                set_parameter_value_commands={},
+                set_lock_commands_per_node={},
+                sub_flows_commands=[],
+                node_dependencies=MagicMock(),
+                node_types_used=set(),
+            )
+            return SerializeFlowToCommandsResultSuccess(serialized_flow_commands=commands, result_details="ok")
+        msg = f"Unexpected request in test: {type(request).__name__}"
+        raise AssertionError(msg)
+
+
+@pytest.fixture
+def project_engine(engine: Engine, tmp_path: Path) -> Iterator[Engine]:
+    """The engine on the default project, with an empty workspace, so saves write real files."""
+    workspace = tmp_path.resolve() / "workspace"
+    workspace.mkdir()
+    project_yml = workspace / "project_template.yml"
+    project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+    load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+    assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+    engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+    engine.config_manager.workspace_path = workspace
+    yield engine
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.handle_request(SetCurrentProjectRequest(project_id=None))
+
+
+@pytest.fixture(autouse=True)
+def close_everything(engine: Engine) -> Iterator[None]:
+    """Close what each test opened."""
+    yield
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestWorkflowManagerScopes:
+    def test_every_handler_declares_its_scope(self, engine: Engine) -> None:
+        scopes = {
+            request_type: engine.event_manager.get_scope_for_request_type(request_type)
+            for handler_class in _HANDLER_CLASSES
+            for attr in vars(handler_class).values()
+            for request_type in handled_request_types(attr)
+        }
+
+        assert len(scopes) > len(_WORKFLOW_REQUESTS) + len(_OPTIONAL_WORKFLOW_REQUESTS) + len(_UNSCOPED_REQUESTS)
+        for request_type, scope in scopes.items():
+            expected: RequestScope | None = RequestScope.HOST
+            if request_type in _WORKFLOW_REQUESTS:
+                expected = RequestScope.WORKFLOW
+            if request_type in _OPTIONAL_WORKFLOW_REQUESTS:
+                expected = RequestScope.OPTIONAL_WORKFLOW
+            if request_type in _UNSCOPED_REQUESTS:
+                expected = None
+            assert scope is expected, f"{request_type.__name__} is {scope}, expected {expected}"
+
+
+class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
+    def test_deleting_the_open_workflow_closes_it(self, project_engine: Engine) -> None:
+        ensured = project_engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="tab"))
+        assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess), ensured.result_details
+        assert ensured.workflow_id is not None
+        tab = project_engine.open_workflows.get(ensured.workflow_id)
+        saved = _send_async(project_engine, SaveWorkflowRequest(), tab)
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+
+        deleted = _send_async(project_engine, DeleteWorkflowRequest(name=saved.workflow_name), None)
+
+        assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
+        assert not project_engine.open_workflows.is_open(tab.workflow_id)
+        assert project_engine.workflow_registry.find_by_id(tab.workflow_id) is None
+        assert not Path(saved.file_path).exists()
+
+    def test_deleting_another_workflow_leaves_the_open_one_open(self, project_engine: Engine) -> None:
+        other = _write_saved_workflow(project_engine, project_engine.config_manager.workspace_path / "other.py")
+        tab = _open(project_engine, "tab")
+
+        deleted = _send_async(project_engine, DeleteWorkflowRequest(name=other.name), tab)
+
+        assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
+        assert project_engine.open_workflows.is_open(tab.workflow_id)
+        assert project_engine.workflow_registry.find_by_id(other.workflow_id) is None
+
+    def test_renaming_an_open_workflow_from_another_tab_saves_that_workflow(self, engine: Engine) -> None:
+        _allow_several_open(engine)
+        tab = _open(engine, "tab")
+        target = _open(engine, "target")
+        saved_runtimes: list[WorkflowRuntime] = []
+
+        async def save_open_workflow(workflow: WorkflowRuntime, request: SaveWorkflowRequest, **_: Any) -> Any:
+            saved_runtimes.append(workflow)
+            return SaveWorkflowResultSuccess(
+                file_path=f"{request.file_name}.py", workflow_name=str(request.file_name), result_details="ok"
+            )
+
+        with (
+            patch.object(engine.workflow_manager.saver, "save_open_workflow", side_effect=save_open_workflow),
+            patch.object(engine.workflow_manager, "persist_external_workflow_registration"),
+        ):
+            renamed = _send_async(
+                engine, RenameWorkflowRequest(workflow_name=_name(engine, target), requested_name="renamed"), tab
+            )
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert saved_runtimes == [target]
+
+    def test_renaming_a_name_no_workflow_has_saves_the_handed_workflow(self, engine: Engine) -> None:
+        _allow_several_open(engine)
+        tab = _open(engine, "tab")
+        _open(engine, "beside")
+        saved_in: list[Any] = []
+
+        async def save(workflow: WorkflowRuntime, _request: SaveWorkflowRequest, **_: Any) -> Any:
+            saved_in.append(workflow)
+            return SaveWorkflowResultSuccess(file_path="renamed.py", workflow_name="renamed", result_details="ok")
+
+        with (
+            patch.object(engine.workflow_manager.saver, "save_open_workflow", side_effect=save),
+            patch.object(engine.workflow_manager, "persist_external_workflow_registration"),
+        ):
+            renamed = _send_async(engine, RenameWorkflowRequest(workflow_name="gone", requested_name="renamed"), tab)
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert saved_in == [tab]
+
+    def test_publishing_saves_and_publishes_the_workflow_it_is_handed(self, engine: Engine, tmp_path: Path) -> None:
+        _allow_several_open(engine)
+        _open(engine, "beside")
+        target = engine.open_workflow(_write_saved_workflow(engine, tmp_path.resolve() / "target.py").workflow_id)
+        saved_in: list[WorkflowRuntime] = []
+        published_in: list[Any] = []
+
+        async def save(workflow: WorkflowRuntime, _request: SaveWorkflowRequest, **_: Any) -> Any:
+            saved_in.append(workflow)
+            return SaveWorkflowResultSuccess(file_path="", workflow_name="", result_details="ok")
+
+        def publish(_request: PublishWorkflowRequest) -> PublishWorkflowResultSuccess:
+            # The publisher reads the graph through the bound workflow, in its own thread.
+            published_in.append(bound_workflow.get())
+            return PublishWorkflowResultSuccess(
+                published_workflow_file_path="", skip_published_workflow_registration=True, result_details="ok"
+            )
+
+        with (
+            patch.object(
+                engine.library_manager, "get_registered_event_handlers", return_value={"lib": _publisher(publish)}
+            ),
+            patch.object(engine.workflow_manager.saver, "save_open_workflow", side_effect=save),
+        ):
+            published = _send_async(
+                engine, PublishWorkflowRequest(workflow_name=_name(engine, target), publisher_name="lib"), target
+            )
+
+        assert isinstance(published, PublishWorkflowResultSuccess), published.result_details
+        assert saved_in == [target]
+        assert published_in == [target]
+
+    def test_publishing_another_open_workflow_by_name_is_refused(self, engine: Engine) -> None:
+        _allow_several_open(engine)
+        tab = _open(engine, "tab")
+        other = _open(engine, "other")
+        publish = MagicMock()
+
+        with patch.object(
+            engine.library_manager, "get_registered_event_handlers", return_value={"lib": _publisher(publish)}
+        ):
+            published = _send_async(
+                engine, PublishWorkflowRequest(workflow_name=_name(engine, other), publisher_name="lib"), tab
+            )
+
+        assert isinstance(published, PublishWorkflowResultFailure)
+        assert "from another workflow's tab" in str(published.result_details)
+        publish.assert_not_called()
+
+
+def _publisher(handler: Any) -> RegisteredEventHandler:
+    return RegisteredEventHandler(
+        handler=handler,
+        library_data=MagicMock(),
+        event_data=PublishWorkflowRegisteredEventData(
+            start_flow_node_type="Start",
+            start_flow_node_library_name="lib",
+            end_flow_node_type="End",
+            end_flow_node_library_name="lib",
+        ),
+    )
+
+
+class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
+    def test_save_serializes_and_records_the_workflow_it_is_handed(self, engine: Engine) -> None:
+        _allow_several_open(engine)
+        _open(engine, "tab")
+        target = _open(engine, "target")
+        recorded = _RecordedRequests(flow_name="target_canvas")
+        record_saved_file = MagicMock(return_value=MagicMock(name="saved", workflow_id="saved"))
+
+        with (
+            patch.object(engine, "ahandle_request", new=recorded),
+            patch.object(engine.workflow_manager, "extract_workflow_shape_in", side_effect=ValueError("no shape")),
+            patch.object(
+                engine.workflow_manager.saver,
+                "_save_workflow_file_inline",
+                return_value=SaveWorkflowFileFromSerializedFlowResultSuccess(
+                    file_path="target.py", workflow_metadata=MagicMock(), result_details="ok"
+                ),
+            ),
+            patch.object(engine.workflow_manager.saver, "_record_saved_file", record_saved_file),
+        ):
+            result = asyncio.run(
+                engine.workflow_manager.saver.on_save_workflow_request(SaveWorkflowRequest(file_name="target"), target)
+            )
+            extract_calls = engine.workflow_manager.extract_workflow_shape_in.call_args_list  # type: ignore[attr-defined]
+
+        assert isinstance(result, SaveWorkflowResultSuccess), result.result_details
+        assert recorded.bound == [(GetTopLevelFlowRequest, target), (SerializeFlowToCommandsRequest, target)]
+        assert [call.args[0] for call in extract_calls] == [target]
+        assert record_saved_file.call_args.args == (target,)
+
+    def test_save_subflow_serializes_the_handed_workflow_into_the_named_workflows_file(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        _allow_several_open(engine)
+        _open(engine, "tab")
+        source = _open(engine, "subflow source")
+        saved_target = _write_saved_workflow(engine, tmp_path.resolve() / "target.py")
+        recorded = _RecordedRequests(flow_name="unused")
+        written_paths: list[str | None] = []
+
+        async def save_file(request: Any) -> SaveWorkflowFileFromSerializedFlowResultSuccess:
+            written_paths.append(request.file_path)
+            return SaveWorkflowFileFromSerializedFlowResultSuccess(
+                file_path=str(request.file_path), workflow_metadata=saved_target.metadata, result_details="ok"
+            )
+
+        with (
+            patch.object(engine, "ahandle_request", new=recorded),
+            patch.object(engine.workflow_manager, "extract_workflow_shape_in", side_effect=ValueError("no shape")),
+            patch.object(
+                engine.workflow_manager.saver,
+                "on_save_workflow_file_from_serialized_flow_request",
+                side_effect=save_file,
+            ),
+        ):
+            result = asyncio.run(
+                engine.workflow_manager.saver.on_save_subflow_to_workflow(
+                    SaveSubflowToWorkflowRequest(flow_name="Sub", workflow_name=saved_target.name), source
+                )
+            )
+
+        assert isinstance(result, SaveSubflowToWorkflowResultSuccess), result.result_details
+        assert recorded.bound == [(SerializeFlowToCommandsRequest, source)]
+        assert written_paths == [str(saved_target.absolute_path)]
+
+    def test_referenced_import_creates_its_flow_in_the_workflow_it_is_handed(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        _allow_several_open(engine)
+        tab = _open(engine, "tab")
+        _create_flow(engine, tab, "tab_canvas")
+        importing = _open(engine, "importing")
+        canvas = _create_flow(engine, importing, "importing_canvas")
+        imported = _write_saved_workflow(engine, tmp_path.resolve() / "imported.py")
+
+        async def run_workflow(_relative_file_path: str, *, opens_workflow: bool) -> WorkflowExecutionResult:
+            assert not opens_workflow
+            # A workflow file creates its flow under the flow it runs in, in the workflow it is bound to.
+            created = engine.handle_request(CreateFlowRequest(parent_flow_name=canvas, flow_name="imported_flow"))
+            assert isinstance(created, CreateFlowResultSuccess), created.result_details
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        with patch.object(engine.workflow_manager.runner, "run_workflow", side_effect=run_workflow):
+            result = _send_async(
+                engine,
+                ImportWorkflowAsReferencedSubFlowRequest(workflow_name=imported.name, flow_name=canvas),
+                importing,
+            )
+            into_tab_flow = _send_async(
+                engine,
+                ImportWorkflowAsReferencedSubFlowRequest(workflow_name=imported.name, flow_name="tab_canvas"),
+                importing,
+            )
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess), result.result_details
+        assert result.created_flow_name == "imported_flow"
+        assert importing.flows.name_to_parent_name["imported_flow"] == canvas
+        assert "imported_flow" not in tab.flows.name_to_parent_name
+        # The tab's flow is not in the workflow the import was handed.
+        assert isinstance(into_tab_flow, ImportWorkflowAsReferencedSubFlowResultFailure)
+        assert "target flow does not exist" in str(into_tab_flow.result_details)
+
+    def test_ensure_creates_its_flow_in_the_workflow_it_is_handed(self, engine: Engine) -> None:
+        _allow_several_open(engine)
+        tab = _open(engine, "tab")
+        target = _open(engine, "target")
+
+        result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), target)
+
+        assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
+        assert result.workflow_id == target.workflow_id
+        assert result.created_workflow is False
+        assert result.created_flow is True
+        assert target.context.get_current_flow().name == result.flow_name
+        assert tab.flows.name_to_parent_name == {}
+
+    def test_ensure_naming_no_workflow_reuses_the_only_open_one(self, engine: Engine) -> None:
+        tab = _open(engine, "tab")
+
+        result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
+
+        assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
+        assert result.workflow_id == tab.workflow_id
+        assert result.created_workflow is False
+
+    def test_ensure_naming_no_workflow_while_several_are_open_fails(self, engine: Engine) -> None:
+        _allow_several_open(engine)
+        tab = _open(engine, "tab")
+        beside = _open(engine, "beside")
+
+        result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
+
+        assert isinstance(result, EnsureWorkflowAndFlowResultFailure)
+        assert "did not name one" in str(result.result_details)
+        assert engine.open_workflows.all_open() == [tab, beside]
+
+    def test_run_command_naming_nothing_answers_for_the_workflow_it_is_handed(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path.resolve()
+        engine.config_manager.workspace_path = workspace
+        _allow_several_open(engine)
+        saved = _write_saved_workflow(engine, workspace / "tab.py", workflow_shape=WorkflowShape(inputs={}, outputs={}))
+        tab = engine.open_workflow(saved.workflow_id)
+        _open(engine, "beside")
+
+        result = _send_async(engine, GetWorkflowRunCommandRequest(), tab)
+
+        assert isinstance(result, GetWorkflowRunCommandResultSuccess), result.result_details
+        assert "tab.py" in result.run_command
+
+    def test_run_command_naming_nothing_with_no_workflow_fails(self, engine: Engine) -> None:
+        result = _send_async(engine, GetWorkflowRunCommandRequest(), None)
+
+        assert isinstance(result, GetWorkflowRunCommandResultFailure)
+        assert "no workflow is loaded" in str(result.result_details)
