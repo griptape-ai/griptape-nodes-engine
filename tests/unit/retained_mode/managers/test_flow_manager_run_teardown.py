@@ -19,6 +19,7 @@ import pytest
 from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class _DoomedRun(NamedTuple):
@@ -36,7 +37,11 @@ def _doomed_run(monkeypatch: pytest.MonkeyPatch, *, cancel_also_fails: bool = Fa
     `reset_machine` drops the state the liveness check reads, the way the real one does, so the
     tests can assert on the check itself rather than on the call that is supposed to satisfy it.
     """
-    flow_manager = FlowManager(MagicMock(spec=EventManager), engine=MagicMock())
+    engine = MagicMock()
+    runtime = WorkflowRuntime("workflow")
+    engine.current_workflow.return_value = runtime
+    engine.current_workflow_or_none.return_value = runtime
+    flow_manager = FlowManager(MagicMock(spec=EventManager), engine=engine)
 
     machine = MagicMock()
     machine.current_state = MagicMock()  # Truthy and not CompleteState: a run in progress.

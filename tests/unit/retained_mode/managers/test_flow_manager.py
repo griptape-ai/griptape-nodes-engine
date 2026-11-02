@@ -56,6 +56,7 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_CO
 from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
+from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.serialization.commands import encode_commands
 
 
@@ -340,6 +341,8 @@ class TestStartFlowRequestDefaultsToCurrentContext:
 
         flow_manager = engine.flow_manager
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        # A run waits in its workflow's line, so one has to be open.
+        engine.context_manager.push_workflow("wf")
 
         # Stand in a current node so the handler can fall back to it. The node itself only
         # needs to expose `.name`; we short-circuit object lookup below.
@@ -377,6 +380,7 @@ class TestStartFlowFailureMessage:
 
     @pytest.fixture
     def ready_flow_manager(self, engine: Engine) -> Generator[Any, None, None]:
+        engine.context_manager.push_workflow(workflow_name="f_workflow")
         flow_manager = engine.flow_manager
         validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
         with (
@@ -400,10 +404,8 @@ class TestStartFlowFailureMessage:
         machine = MagicMock()
         machine.resolution_machine.is_errored.return_value = True
         machine.resolution_machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
-        with (
-            patch.object(ready_flow_manager, "start_flow"),
-            patch.object(ready_flow_manager, "_global_control_flow_machine", machine),
-        ):
+        ready_flow_manager._global_control_flow_machine = machine
+        with patch.object(ready_flow_manager, "start_flow"):
             result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
 
         assert isinstance(result, StartFlowResultFailure)
@@ -1062,6 +1064,17 @@ class TestReparentFlow:
         assert flow_manager.get_parent_flow(outer.flow_name) is None
 
 
+@pytest.fixture
+def open_workflow(engine: Engine) -> Generator[None, None, None]:
+    """Open a workflow for a run test: a run waits in, starts and ends in its workflow's line."""
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.context_manager.push_workflow("runs_wf")
+    try:
+        yield
+    finally:
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
 @dataclass
 class _Spec(RunSpec):
     """A run that executes `body`, standing in for a request's run."""
@@ -1080,6 +1093,7 @@ def _ran(name: str) -> StartFlowResultSuccess:
     return StartFlowResultSuccess(result_details=f"{name} ran")
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestRunsTakeTurns:
     """A run started while another is in progress waits its turn; a request from inside a run does not."""
 
@@ -1187,6 +1201,7 @@ async def _after(event: asyncio.Event, flow_manager: Any) -> Any:
     return await flow_manager.start_run(_Spec("left over", left_over))
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestRunsEndCleanly:
     """A run ends once, on the engine's loop, and waiting runs never outlive their workflow."""
 
@@ -1209,7 +1224,7 @@ class TestRunsEndCleanly:
 
         first_request = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", first)))
         await asyncio.sleep(0)
-        first_run = flow_manager._run_in_progress
+        first_run = engine.current_workflow().flows.run_in_progress
         assert first_run is not None
         waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
         await asyncio.sleep(0)
@@ -1249,18 +1264,18 @@ class TestRunsEndCleanly:
             executed.append("late")
             return _ran("late")
 
-        async def stop_the_flow() -> None:
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
             late.append(flow_manager.submit_run(_Spec("late", late_body)))
             flow_running["value"] = False
-            flow_manager._finish_run_if_over()
+            flow_manager._finish_run_if_over(flows)
 
         async def first() -> Any:
             flow_running["value"] = True
             return _ran("first")
 
         with (
-            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]),
-            patch.object(flow_manager, "cancel_flow_run", side_effect=stop_the_flow),
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
         ):
             await flow_manager.start_run(_Spec("flow", first))
             await flow_manager.cancel_all_runs()
@@ -1276,9 +1291,9 @@ class TestRunsEndCleanly:
         flow_running = {"value": False}
         executed: list[str] = []
 
-        async def stop_the_flow() -> None:
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
             flow_running["value"] = False
-            flow_manager._finish_run_if_over()
+            flow_manager._finish_run_if_over(flows)
 
         async def first() -> Any:
             flow_running["value"] = True
@@ -1289,8 +1304,8 @@ class TestRunsEndCleanly:
             return _ran("second")
 
         with (
-            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]),
-            patch.object(flow_manager, "cancel_flow_run", side_effect=stop_the_flow),
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
         ):
             await flow_manager.start_run(_Spec("flow", first))
             waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
@@ -1310,9 +1325,9 @@ class TestRunsEndCleanly:
         flow_manager = engine.flow_manager
         flow_running = {"value": False}
 
-        async def stop_the_flow() -> None:
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
             flow_running["value"] = False
-            flow_manager._finish_run_if_over()
+            flow_manager._finish_run_if_over(flows)
 
         async def first() -> Any:
             flow_running["value"] = True
@@ -1323,11 +1338,11 @@ class TestRunsEndCleanly:
             return _ran("second")
 
         with (
-            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]),
-            patch.object(flow_manager, "cancel_flow_run", side_effect=stop_the_flow),
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
         ):
             await flow_manager.start_run(_Spec("flow", first))
-            first_run = flow_manager._run_in_progress
+            first_run = engine.current_workflow().flows.run_in_progress
             assert first_run is not None
             waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
             await asyncio.sleep(0)
@@ -1350,20 +1365,20 @@ class TestRunsEndCleanly:
             loops.append(asyncio.get_running_loop())
             reported.set()
 
-        async def stop_the_flow() -> None:
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
             flow_running["value"] = False
-            flow_manager._finish_run_if_over()
+            flow_manager._finish_run_if_over(flows)
 
         async def first() -> Any:
             flow_running["value"] = True
             return _ran("first")
 
         with (
-            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]),
-            patch.object(flow_manager, "cancel_flow_run", side_effect=stop_the_flow),
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
         ):
             await flow_manager.start_run(_Spec("flow", first))
-            first_run = flow_manager._run_in_progress
+            first_run = engine.current_workflow().flows.run_in_progress
             assert first_run is not None
             first_run.ended.add_done_callback(on_run_ended)
 
@@ -1419,6 +1434,7 @@ class _HearingSpec(_Spec):
         self.turned_away.append(details)
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestRunSpecHooks:
     """A run's spec hears its place in line and why it was turned away; the run says when it ended."""
 
@@ -1477,18 +1493,20 @@ class TestRunSpecHooks:
             flow_running["value"] = True
             return _ran("paused")
 
-        with patch.object(flow_manager, "check_for_existing_running_flow", side_effect=lambda: flow_running["value"]):
+        flows = engine.current_workflow().flows
+        with patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]):
             await flow_manager.start_run(_Spec("flow", pauses))
-            run = flow_manager._run_in_progress
+            run = flows.run_in_progress
             assert run is not None
             assert run.outcome.done()
             assert not run.ended.done()
 
             flow_running["value"] = False
-            flow_manager._finish_run_if_over()
+            flow_manager._finish_run_if_over(flows)
             await asyncio.wait_for(run.ended, timeout=1.0)
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestRunRequests:
     """A script can see the runs and withdraw one that waits, through requests."""
 
@@ -1534,7 +1552,7 @@ class TestRunRequests:
 
         running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", waits_there)))
         await asyncio.sleep(0)
-        run = flow_manager._run_in_progress
+        run = engine.current_workflow().flows.run_in_progress
         assert run is not None
 
         flow_manager.report_run_waiting_for_engine(run.run_id, 2)
@@ -1584,6 +1602,7 @@ class TestRunRequests:
         assert "no run with that id" in str(result.result_details)
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestRunResultsNameTheirRun:
     """A run request's result says which run it started or joined."""
 
@@ -1593,7 +1612,7 @@ class TestRunResultsNameTheirRun:
         seen: list[str | None] = []
 
         async def body() -> Any:
-            run = flow_manager._run_in_progress
+            run = engine.current_workflow().flows.run_in_progress
             assert run is not None
             seen.append(run.run_id)
             return _ran("run")
@@ -1673,17 +1692,19 @@ class TestRunResultsNameTheirRun:
         assert executed == []
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestCancelAllRunsWhenIdle:
     @pytest.mark.asyncio
     async def test_an_idle_engine_has_nothing_to_cancel(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager
 
-        with patch.object(flow_manager, "cancel_flow_run") as cancel_flow_run:
+        with patch.object(flow_manager, "_cancel_run") as cancel_run:
             await flow_manager.cancel_all_runs()
 
-        cancel_flow_run.assert_not_called()
+        cancel_run.assert_not_called()
 
 
+@pytest.mark.usefixtures("open_workflow")
 class TestRunsNameTheirRequest:
     @pytest.mark.asyncio
     async def test_a_waiting_run_carries_the_id_of_the_request_that_submitted_it(self, engine: Engine) -> None:
