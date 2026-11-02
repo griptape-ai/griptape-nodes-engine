@@ -1010,6 +1010,7 @@ class NodeExecutor(EngineScoped):
         subprocess_executor = SubprocessWorkflowExecutor(
             workflow_path=str(published_workflow_filename),
             on_event=on_event,
+            parent_run_id=self.engine.flow_manager.current_run_id,
         )
         async with subprocess_executor as executor:
             await executor.arun(

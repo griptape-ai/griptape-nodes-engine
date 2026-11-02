@@ -510,6 +510,49 @@ class ParameterSpotlightEvent(ExecutionPayload):
 
 @dataclass
 @PayloadRegistry.register
+class FlowRunStartedEvent(ExecutionPayload):
+    """A run started: it has the machine, whether it waited for it or not.
+
+    Every `BudgetAccessRequest` and `ReportUsageRequest` sent during the run is tagged with
+    `run_id`, so a client can look up what the run's direct provider calls cost in Griptape Cloud
+    with a spend search filtered on the `run_id` tag. Every run that sends one sends one
+    `FlowRunEndedEvent` with the same id when it ends. A run cancelled while it waits never starts,
+    so it sends neither. Loop bodies, and node groups run in a local process of their own, are part
+    of the run that started them and send neither either.
+
+    Args:
+        run_id: The run, the same id its request's result, `RunQueuedEvent` and `ListRunsRequest`
+            name.
+        flow_name: The flow the run executes.
+    """
+
+    run_id: str
+    flow_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class FlowRunEndedEvent(ExecutionPayload):
+    """A run ended, however it ended: finished, failed, cancelled, or stopped before its flow started.
+
+    Sent once for every run that sent a `FlowRunStartedEvent`, from the one place a run ends, so a
+    client can close what it opened on the start event. A run's spend is all reported by now, apart
+    from a provider call still running when the run was cancelled.
+
+    Args:
+        run_id: The run `FlowRunStartedEvent` announced.
+        flow_name: The flow the run executed.
+        state: How it ended: "finished", "failed" or "cancelled", the values `ListRunsRequest`
+            reports a run's state in.
+    """
+
+    run_id: str
+    flow_name: str
+    state: str
+
+
+@dataclass
+@PayloadRegistry.register
 class ControlFlowResolvedEvent(ExecutionPayload):
     """A flow run finished.
 

@@ -161,21 +161,6 @@ def stub_cloud(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         thread.join(timeout=5)
 
 
-@pytest.fixture(params=["sequential", "parallel"])
-def execution_mode(request: pytest.FixtureRequest, engine: Engine) -> Iterator[str]:
-    """Run each test under both schedulers, restoring the engine's configuration afterwards."""
-    config_manager = engine.config_manager
-    previous_mode = config_manager.get_config_value("workflow_execution_mode")
-    previous_max = config_manager.get_config_value("max_nodes_in_parallel")
-    config_manager.set_config_value("workflow_execution_mode", request.param)
-    config_manager.set_config_value("max_nodes_in_parallel", 4)
-    try:
-        yield request.param
-    finally:
-        config_manager.set_config_value("workflow_execution_mode", previous_mode)
-        config_manager.set_config_value("max_nodes_in_parallel", previous_max)
-
-
 @pytest.fixture
 def registered_library(engine: Engine, tmp_path: Path, materialize_library: Callable[..., Path]) -> None:
     """Materialize and register the budget fixture library into the isolated engine."""
@@ -198,40 +183,6 @@ def _set_parameter(engine: Engine, node_name: str, parameter_name: str, value: A
     engine.handle_request(SetParameterValueRequest(parameter_name=parameter_name, node_name=node_name, value=value))
 
 
-def _record_published(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, payload_type: type, extract: Callable[[Any], Any]
-) -> list[Any]:
-    """Tap the event bus and record every published payload of the given type.
-
-    What the editor shows comes off this stream, so "the artist was told which budget" is a claim
-    about published events, not about the engine's internal state.
-    """
-    recorded: list[Any] = []
-    event_manager = engine.event_manager
-    real_put_event = event_manager.put_event
-    real_aput_event = event_manager.aput_event
-
-    def _note(event: object) -> None:
-        payload = getattr(getattr(event, "wrapped_event", None), "payload", event)
-        if isinstance(payload, payload_type):
-            recorded.append(extract(payload))
-
-    def _collect(event: object) -> None:
-        _note(event)
-        real_put_event(event)
-
-    async def _acollect(event: object) -> None:
-        _note(event)
-        await real_aput_event(event)
-
-    # Both spellings, because which one an event takes is an implementation detail of the code
-    # that emits it: the scheduler's error path is async and uses `aput_event`, the flow manager's
-    # cleanup is not and uses `put_event`. A tap on one of them silently records half the stream.
-    monkeypatch.setattr(event_manager, "put_event", _collect)
-    monkeypatch.setattr(event_manager, "aput_event", _acollect)
-    return recorded
-
-
 async def _run(engine: Engine, flow_name: str) -> Any:
     """Run the flow to completion and hand back whatever the engine concluded."""
     return await engine.ahandle_request(StartFlowRequest(flow_name=flow_name))
@@ -241,8 +192,8 @@ async def _run(engine: Engine, flow_name: str) -> Any:
 @pytest.mark.usefixtures("registered_library", "execution_mode")
 @pytest.mark.asyncio
 async def test_a_refusal_halts_the_run_and_names_every_budget(
+    record_published: Callable[..., list[Any]],
     engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
     create_node: Callable[..., str],
     stub_cloud: str,
 ) -> None:
@@ -251,7 +202,7 @@ async def test_a_refusal_halts_the_run_and_names_every_budget(
     create_node(NODE_TYPE, "Refused", flow_name, library_name=LIBRARY_NAME)
     _set_parameter(engine, "Refused", "url", f"{stub_cloud}{REFUSED_PATH}")
 
-    node_errors = _record_published(engine, monkeypatch, NodeErrorEvent, lambda payload: payload.error_message)
+    node_errors = record_published(NodeErrorEvent, lambda payload: payload.error_message)
 
     result = await _run(engine, flow_name)
 
@@ -310,8 +261,8 @@ async def test_a_refusal_takes_a_wired_failure_branch(
 @pytest.mark.usefixtures("registered_library", "execution_mode")
 @pytest.mark.asyncio
 async def test_a_node_that_catches_nothing_still_halts_with_the_budgets_named(
+    record_published: Callable[..., list[Any]],
     engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
     create_node: Callable[..., str],
     stub_cloud: str,
 ) -> None:
@@ -324,7 +275,7 @@ async def test_a_node_that_catches_nothing_still_halts_with_the_budgets_named(
     create_node(UNHANDLED_NODE_TYPE, "Refused", flow_name, library_name=LIBRARY_NAME)
     _set_parameter(engine, "Refused", "url", f"{stub_cloud}{REFUSED_PATH}")
 
-    node_errors = _record_published(engine, monkeypatch, NodeErrorEvent, lambda payload: payload.error_message)
+    node_errors = record_published(NodeErrorEvent, lambda payload: payload.error_message)
 
     result = await _run(engine, flow_name)
 
