@@ -51,7 +51,9 @@ from griptape_nodes.retained_mode.events.diagnostics_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
+from tests.workflow_context import push_unsaved_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -535,12 +537,14 @@ class TestTheOpenWorkflow:
 
         The troubleshooting button has to work exactly then, so the bundle ignores that id.
         """
-        result = await engine.ahandle_request(
-            CollectDiagnosticsRequest(
-                output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
-            ),
-            workflow_id="a-workflow-closed-since",
-        )
+        result = (
+            await engine.event_manager.ahandle_request(
+                CollectDiagnosticsRequest(
+                    output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+                ),
+                result_context=ResultContext(open_workflow_id="a-workflow-closed-since"),
+            )
+        ).result
 
         assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
         assert f"workflow/{open_workflow.name}" in _members(result)
@@ -564,12 +568,14 @@ class TestTheOpenWorkflow:
     @pytest.mark.asyncio
     async def test_nothing_open_and_a_stale_envelope_id_still_collects(self, engine: Engine, tmp_path: Path) -> None:
         """The editor's id outlives the last workflow it named; the bundle is still collected."""
-        result = await engine.ahandle_request(
-            CollectDiagnosticsRequest(
-                output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
-            ),
-            workflow_id="a-workflow-closed-since",
-        )
+        result = (
+            await engine.event_manager.ahandle_request(
+                CollectDiagnosticsRequest(
+                    output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+                ),
+                result_context=ResultContext(open_workflow_id="a-workflow-closed-since"),
+            )
+        ).result
 
         assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
         assert [warning for warning in result.manifest.warnings if "No workflow is open" in warning] != []

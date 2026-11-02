@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers import budget_manager as budget_manager_module
 from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError
 from griptape_nodes.utils.http_utils import request_with_retry
@@ -736,9 +737,12 @@ class TestWorkflowTag:
         http.return_value = _response(200, {"allowed": True})
         workflow = push_unsaved_workflow(budget_engine, "poster_flow")
 
-        result = await budget_engine.ahandle_request(
-            BudgetAccessRequest(model="gpt-5-nano"), workflow_id=workflow.workflow_id
-        )
+        result = (
+            await budget_engine.event_manager.ahandle_request(
+                BudgetAccessRequest(model="gpt-5-nano"),
+                result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+            )
+        ).result
 
         assert isinstance(result, BudgetAccessResultSuccess), result.result_details
         assert _sent(http)["tags"]["workflow"] == workflow.name
@@ -750,9 +754,12 @@ class TestWorkflowTag:
         http.return_value = _response(201, {"spend_id": "s-1"})
         workflow = push_unsaved_workflow(budget_engine, "poster_flow")
 
-        result = await budget_engine.ahandle_request(
-            ReportUsageRequest(declared_cost_micro_usd=1), workflow_id=workflow.workflow_id
-        )
+        result = (
+            await budget_engine.event_manager.ahandle_request(
+                ReportUsageRequest(declared_cost_micro_usd=1),
+                result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+            )
+        ).result
 
         assert isinstance(result, ReportUsageResultSuccess), result.result_details
         assert _sent(http)["tags"]["workflow"] == workflow.name

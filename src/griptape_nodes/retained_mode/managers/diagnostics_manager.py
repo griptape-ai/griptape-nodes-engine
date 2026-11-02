@@ -920,8 +920,11 @@ class DiagnosticsManager(EngineScoped):
         )
 
     async def _build_session_section(self, redactor: Redactor, warnings: list[str]) -> SessionDiagnostics:
-        """Report what the engine currently has open."""
-        workflow = self.engine.open_workflows.sole_workflow_or_none()
+        """Report what the engine currently has open: its workflow, when exactly one is open."""
+        open_workflows = self.engine.open_workflows.all_open()
+        workflow = None
+        if len(open_workflows) == 1:
+            workflow = open_workflows[0]
 
         workflow_name = None
         workflow_path = None

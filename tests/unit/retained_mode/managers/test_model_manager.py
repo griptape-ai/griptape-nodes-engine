@@ -55,7 +55,7 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.managers.model_manager import (
     _PROGRESS_PIPE_ENV_VAR,
     _STATUS_READ_LOCK_ATTEMPTS,
@@ -430,10 +430,10 @@ class TestDeclareModelInvocationCatalogEnrichment:
 
         engine.event_manager.add_authorization_hook(capture)
 
-        result = engine.handle_request(
+        result = engine.event_manager.handle_request(
             DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
-            workflow_id=workflow.workflow_id,
-        )
+            result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+        ).result
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)
         # The InvokeModel checkpoint now carries the provider and family the
