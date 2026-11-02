@@ -39,6 +39,25 @@ part of its context.
 
 The `name` must match the skill's folder name, and `description` tells the agent when to use the skill. The body can be as long or short as you need — code snippets, step-by-step instructions, reference tables, etc.
 
+If a `SKILL.md` has a mistake in its frontmatter, the agent leaves that skill out and logs a warning naming the file. Your other skills still load.
+
+Add `disable-model-invocation: true` to the frontmatter to keep a skill in the folder without offering it to the agent.
+
+## Bundled files
+
+A skill folder can hold more than `SKILL.md`, such as reference documents, templates, or data files. Mention them in the skill's instructions:
+
+```
+my-skill/
+├── SKILL.md
+└── references/
+    └── color-palette.md
+```
+
+When the agent uses the skill, it sees a list of the skill's text files and can read any of them. JSON and YAML files are read as data. Scripts and binary files such as images are left out of the list.
+
+Write `${SKILL_DIR}` in a skill's instructions to refer to the skill's own folder. The agent sees the full path in its place.
+
 ## Example: a house style guide
 
 ```markdown
