@@ -50,16 +50,11 @@ dependencies = [
   # PR #5449 raised the `mcp` ceiling without checking this; PR #5493 papered over the fallout
   # for pydantic-ai-skills but left this one. Lift no lower than this floor.
   "pydantic-ai-slim[mcp,openai]>=2.29.0",
-  # Floor at 2.0: agents/pydantic_ai/runner.py builds a SkillsCapability with the 2.x
-  # arguments (`scripts`, `include`) that replaced 1.x's `exclude_tools`/`auto_reload`.
-  # Ceiling below 3.0 so the next major cannot silently break the sidebar agent at
-  # construction time the way 2.0.0 did (see issue 5491).
-  "pydantic-ai-skills>=2.0,<3",
-  # Ceiling below 0.52: from 0.52 harness reads skills from a workspace on each run, and
-  # pydantic-ai-skills 2.1 answers that with `LocalWorkspaceBackend`, which raises on Windows.
-  # Lift once pydantic-ai-skills reads skills without a POSIX-only backend and the runner
-  # validates skills at run time (see issue 5881).
-  "pydantic-ai-harness>=0.28,<0.52",
+  # Floor at 0.57: the first release whose `Skills.load` skips a `SKILL.md` with bad
+  # frontmatter instead of failing the whole library. agents/pydantic_ai/skills.py relies on
+  # that, and on `Skills(workspace=...)` and `SkillDefinition.render`.
+  "pydantic-ai-harness[skills]>=0.57",
+  "pyyaml>=6.0.2",
 ]
 
 [project.optional-dependencies]

@@ -2,29 +2,32 @@
 
 Every test drives a real run through a scripted `FunctionModel`, so they pin what the
 model sees and receives rather than how the runner builds it: the skill catalog, the
-`read_skill_resource` tool, the instructions `load_capability` returns, and what each
-resource read returns or retries with.
+`read_skill_resource` tool, the instructions a loaded skill delivers, and what each
+resource read returns or retries with. Catalog entries and loaded instructions are
+read out of pydantic-ai's framing, which belongs to pydantic-ai rather than the runner.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from pydantic_ai.workspaces import LocalWorkspaceBackend
 
 from griptape_nodes.agents.pydantic_ai.runner import PydanticAgentRunner
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
 
 READ_SKILL_RESOURCE_DESCRIPTION = (
     "<summary>Read a supplementary file bundled with a skill.\n\n"
@@ -69,7 +72,11 @@ READ_SKILL_RESOURCE_SCHEMA = {
 
 CATALOG_PREAMBLE = (
     "The following capabilities are deferred and can be loaded using the `load_capability` tool. "
-    "A capability's tools stay hidden until it is loaded:"
+    "A capability's tools stay hidden until it is loaded:\n"
+)
+
+_LOADED_CAPABILITY = re.compile(
+    r'<context id="capability:(?P<name>[^"]+)">\n(?P<instructions>.*)\n</context>', re.DOTALL
 )
 
 
@@ -79,6 +86,8 @@ class _Run:
 
     steps: list[AgentInfo] = field(default_factory=list)
     results: list[Any] = field(default_factory=list)
+    loaded: dict[str, str] = field(default_factory=dict)
+    """The instructions each loaded skill delivered, by skill name."""
 
 
 def _runner(workspace: Path, threads_dir: Path, *, auto_load_skills: bool = True) -> PydanticAgentRunner:
@@ -96,14 +105,16 @@ def _runner(workspace: Path, threads_dir: Path, *, auto_load_skills: bool = True
 async def _drive(runner: PydanticAgentRunner, calls: list[tuple[str, dict[str, Any]]]) -> _Run:
     """Run `runner` with a model that makes `calls` one per step, then answers "done".
 
-    Returns the tools and instructions the model saw on each step, and for each call
-    either the tool's return content or the retry prompt it was answered with.
+    Returns the tools and instructions the model saw on each step, for each call either
+    the tool's return content or the retry prompt it was answered with, and the
+    instructions each loaded skill delivered.
     """
     run = _Run()
 
-    async def stream(_messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[Any]:
+    async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[Any]:
         step = len(run.steps)
         run.steps.append(info)
+        run.loaded.update(_loaded_instructions(messages))
         if step < len(calls):
             name, args = calls[step]
             yield {0: DeltaToolCall(name=name, json_args=json.dumps(args), tool_call_id=f"call-{step}")}
@@ -145,6 +156,24 @@ def _write(path: Path, content: str | bytes) -> Path:
     return path
 
 
+def _loaded_instructions(messages: list[ModelMessage]) -> dict[str, str]:
+    """The instructions each loaded skill delivered in `messages`, by skill name."""
+    loaded: dict[str, str] = {}
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                loaded.update({m["name"]: m["instructions"] for m in _LOADED_CAPABILITY.finditer(part.content)})
+    return loaded
+
+
+def _catalog(info: AgentInfo) -> str | None:
+    """The skill entries in the catalog the model saw, or `None` when it saw no catalog."""
+    if info.instructions is None or CATALOG_PREAMBLE not in info.instructions:
+        return None
+    entries = info.instructions.split(CATALOG_PREAMBLE, 1)[1]
+    return entries.split("\n</context>", 1)[0]
+
+
 def _tool_names(info: AgentInfo) -> set[str]:
     return {tool.name for tool in info.function_tools}
 
@@ -177,7 +206,7 @@ async def test_no_skills_when_skills_dir_missing(workspace: Path, threads: Path)
     run = await _drive(_runner(workspace, threads), [])
 
     assert _tool_names(run.steps[0]) == set()
-    assert run.steps[0].instructions is None
+    assert _catalog(run.steps[0]) is None
 
 
 @pytest.mark.asyncio
@@ -198,9 +227,24 @@ async def test_catalog_lists_each_skill(workspace: Path, threads: Path) -> None:
 
     run = await _drive(_runner(workspace, threads), [])
 
-    assert run.steps[0].instructions == (
-        f"{CATALOG_PREAMBLE}\n- alpha: Alpha does folded work.\n- beta: Beta line one.\nBeta line two."
+    assert _catalog(run.steps[0]) == "- alpha: Alpha does folded work.\n- beta: Beta line one.\nBeta line two."
+
+
+@pytest.mark.asyncio
+async def test_skill_hidden_from_the_model(workspace: Path, threads: Path) -> None:
+    """A skill whose frontmatter sets `disable-model-invocation: true` is left out of the catalog."""
+    _write_skill(workspace, "shown")
+    hidden = workspace / ".agents/skills/hidden"
+    _write(
+        hidden / "SKILL.md",
+        "---\nname: hidden\ndescription: Hidden.\ndisable-model-invocation: true\n---\n\nBody.",
     )
+    _write(hidden / "references/notes.md", "notes")
+
+    run = await _drive(_runner(workspace, threads), [])
+
+    assert _catalog(run.steps[0]) == "- shown: shown description"
+    assert _tool_names(run.steps[0]) == {"load_capability"}
 
 
 @pytest.mark.asyncio
@@ -240,16 +284,14 @@ async def test_loaded_instructions(workspace: Path, threads: Path) -> None:
     run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
 
     directory = skill_dir.resolve()
-    assert run.results == [
-        {
-            "instructions": (
-                f"# Skill: demo-skill\n\nSee {directory}/x and {directory}.\n\nDone.\n\n"
-                "## Bundled files\n\n"
-                "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
-                "- `data.json`\n- `references/notes.md`"
-            )
-        }
-    ]
+    assert run.loaded == {
+        "demo-skill": (
+            f"# Skill: demo-skill\n\nSee {directory}/x and {directory}.\n\nDone.\n\n"
+            "## Bundled files\n\n"
+            "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
+            "- `data.json`\n- `references/notes.md`"
+        )
+    }
 
 
 @pytest.mark.asyncio
@@ -259,7 +301,7 @@ async def test_loaded_instructions_without_files_or_body(workspace: Path, thread
 
     run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
 
-    assert run.results == [{"instructions": "# Skill: demo-skill"}]
+    assert run.loaded == {"demo-skill": "# Skill: demo-skill"}
 
 
 @pytest.mark.asyncio
@@ -272,15 +314,13 @@ async def test_file_list_is_truncated(workspace: Path, threads: Path) -> None:
     run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
 
     listed = "\n".join(f"- `references/{index:02d}.md`" for index in range(50))
-    assert run.results == [
-        {
-            "instructions": (
-                "# Skill: demo-skill\n\n## Bundled files\n\n"
-                "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
-                f"{listed}\n- ...and 3 more"
-            )
-        }
-    ]
+    assert run.loaded == {
+        "demo-skill": (
+            "# Skill: demo-skill\n\n## Bundled files\n\n"
+            "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
+            f"{listed}\n- ...and 3 more"
+        )
+    }
 
 
 @pytest.mark.asyncio
@@ -303,10 +343,9 @@ async def test_which_files_are_resources(workspace: Path, threads: Path, tmp_pat
         executable = _write(skill_dir / "tool", "#!/bin/sh\necho hi\n")
         executable.chmod(0o755)
 
-    with pytest.warns(UserWarning, match="symlink escape"):
-        run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
+    run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
 
-    instructions = run.results[0]["instructions"]
+    instructions = run.loaded["demo-skill"]
     listed = [line[3:-1] for line in instructions.splitlines() if line.startswith("- `")]
     assert listed == ["config.yaml", "deep/nested/page.txt", "references/notes.md", "scripts/README.md"]
 
@@ -388,16 +427,14 @@ async def test_broken_skill_costs_only_itself(workspace: Path, threads: Path) ->
 
     run = await _drive(_runner(workspace, threads), [_load("good-skill")])
 
-    assert run.steps[0].instructions == f"{CATALOG_PREAMBLE}\n- good-skill: good-skill description"
-    assert run.results == [
-        {
-            "instructions": (
-                "# Skill: good-skill\n\nGuidance for the task.\n\n## Bundled files\n\n"
-                "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
-                "- `references/notes.md`"
-            )
-        }
-    ]
+    assert _catalog(run.steps[0]) == "- good-skill: good-skill description"
+    assert run.loaded == {
+        "good-skill": (
+            "# Skill: good-skill\n\nGuidance for the task.\n\n## Bundled files\n\n"
+            "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
+            "- `references/notes.md`"
+        )
+    }
 
 
 @pytest.mark.asyncio
@@ -411,18 +448,15 @@ async def test_no_skills_when_every_skill_is_broken(workspace: Path, threads: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs POSIX permissions that bind this user")
 async def test_unreadable_skill_costs_skills_not_the_run(workspace: Path, threads: Path) -> None:
     """A `SKILL.md` that cannot be read costs the skills, not the run."""
-    _write_skill(workspace, "demo-skill")
-    real_read_text = Path.read_text
-
-    def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
-        if path.name == "SKILL.md":
-            raise PermissionError(13, "Permission denied")
-        return real_read_text(path, *args, **kwargs)
-
-    with patch.object(Path, "read_text", read_text):
+    skill_md = _write_skill(workspace, "demo-skill") / "SKILL.md"
+    skill_md.chmod(0)
+    try:
         run = await _drive(_runner(workspace, threads), [])
+    finally:
+        skill_md.chmod(0o644)
 
     assert _tool_names(run.steps[0]) == set()
 
@@ -432,7 +466,6 @@ async def test_skills_load_without_a_posix_workspace(workspace: Path, threads: P
     """Skills load where `LocalWorkspaceBackend` cannot be built, as on Windows."""
     skill_dir = _write_skill(workspace, "demo-skill")
     _write(skill_dir / "references/notes.md", "notes")
-    LocalWorkspaceBackend = pytest.importorskip("pydantic_ai.workspaces").LocalWorkspaceBackend  # noqa: N806
     unsupported = NotImplementedError("`LocalWorkspaceBackend` only supports POSIX platforms at the moment")
 
     with patch.object(LocalWorkspaceBackend, "__init__", side_effect=unsupported):
@@ -451,7 +484,7 @@ async def test_each_run_reads_skills_again(workspace: Path, threads: Path) -> No
     _write_skill(workspace, "second-skill")
     second = await _drive(runner, [])
 
-    assert first.steps[0].instructions == f"{CATALOG_PREAMBLE}\n- first-skill: first-skill description"
-    assert second.steps[0].instructions == (
-        f"{CATALOG_PREAMBLE}\n- first-skill: first-skill description\n- second-skill: second-skill description"
+    assert _catalog(first.steps[0]) == "- first-skill: first-skill description"
+    assert _catalog(second.steps[0]) == (
+        "- first-skill: first-skill description\n- second-skill: second-skill description"
     )
