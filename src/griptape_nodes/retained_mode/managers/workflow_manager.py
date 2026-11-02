@@ -105,6 +105,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from contextvars import Token
     from types import TracebackType
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -117,6 +118,16 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
+
+# How many squelch contexts the current context is inside of; see `WorkflowManager.WorkflowSquelchContext`.
+#
+# Scoped to the context rather than to the manager because a squelch belongs to the load that
+# entered it, not to a workflow: a load closes the workflow it starts from and opens the one it
+# loads. A ContextVar is inherited by the requests the load dispatches, the tasks it spawns, and
+# `asyncio.to_thread` work, so edits made from any other task are still reported as edits.
+_squelch_workflow_altered_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_squelch_workflow_altered_depth", default=0
+)
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -174,9 +185,10 @@ class WorkflowManager(EngineScoped):
 
         def __init__(self, manager: WorkflowManager):
             self.manager = manager
+            self._token: Token[int] | None = None
 
         def __enter__(self) -> None:
-            self.manager._squelch_workflow_altered_count += 1
+            self._token = _squelch_workflow_altered_depth.set(_squelch_workflow_altered_depth.get() + 1)
 
         def __exit__(
             self,
@@ -184,15 +196,13 @@ class WorkflowManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self.manager._squelch_workflow_altered_count -= 1
-
-    _squelch_workflow_altered_count: int = 0
+            if self._token is not None:
+                _squelch_workflow_altered_depth.reset(self._token)
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
         self._referenced_workflow_stack = contextvars.ContextVar("referenced_workflow_stack", default=())
-        self._squelch_workflow_altered_count = 0
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -449,7 +459,7 @@ class WorkflowManager(EngineScoped):
         return self.WorkflowSquelchContext(self)
 
     def should_squelch_workflow_altered(self) -> bool:
-        return self._squelch_workflow_altered_count > 0
+        return _squelch_workflow_altered_depth.get() > 0
 
     def persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
@@ -899,8 +909,12 @@ class WorkflowManager(EngineScoped):
         return self.engine.workflow_registry.refresh_file(file_path, metadata)
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
-        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`."""
-        return await self.runner.run_workflow(relative_file_path)
+        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`.
+
+        Builds into the current workflow, else opens the file as one.
+        """
+        opens_workflow = not self.engine.context_manager.has_current_workflow()
+        return await self.runner.run_workflow(relative_file_path, opens_workflow=opens_workflow)
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""

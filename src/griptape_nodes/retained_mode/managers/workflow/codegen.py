@@ -576,7 +576,27 @@ class WorkflowCodeGenerator(EngineScoped):
         # the project passed via --project-file-path, and only then is a bundle's own
         # griptape_nodes_config.json read, which is what registers the bundle's required
         # node libraries.
-        with_stmt.body = [await_main_call, ensure_context_call, *with_stmt.body]
+        # A standalone run has nothing open, so it opens the file as its workflow first.
+        open_workflow_call = ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
+                            attr="ContextManager",
+                            ctx=ast.Load(),
+                        ),
+                        args=[],
+                        keywords=[],
+                    ),
+                    attr="push_workflow",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[ast.keyword(arg="file_path", value=ast.Name(id="__file__", ctx=ast.Load()))],
+            )
+        )
+        with_stmt.body = [open_workflow_call, await_main_call, ensure_context_call, *with_stmt.body]
 
         # === Generate async aexecute_workflow function ===
         async_func_def = ast.AsyncFunctionDef(
@@ -1213,53 +1233,9 @@ class WorkflowCodeGenerator(EngineScoped):
             ast.fix_missing_locations(register_call)
             code_blocks.append(register_call)
 
-        # Generate context manager assignment
-        assign_context_manager = ast.Assign(
-            targets=[ast.Name(id="context_manager", ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
-                    attr="ContextManager",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[],
-            ),
-        )
-        ast.fix_missing_locations(assign_context_manager)
-        code_blocks.append(assign_context_manager)
-
-        has_check = ast.Call(
-            func=ast.Attribute(
-                value=ast.Name(id="context_manager", ctx=ast.Load()),
-                attr="has_current_workflow",
-                ctx=ast.Load(),
-            ),
-            args=[],
-            keywords=[],
-        )
-        test = ast.UnaryOp(op=ast.Not(), operand=has_check)
-
-        push_call = ast.Expr(
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="context_manager", ctx=ast.Load()),
-                    attr="push_workflow",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[ast.keyword(arg="file_path", value=ast.Name(id="__file__", ctx=ast.Load()))],
-            )
-        )
-        ast.fix_missing_locations(push_call)
-
-        if_stmt = ast.If(
-            test=test,
-            body=[push_call],
-            orelse=[],
-        )
-        ast.fix_missing_locations(if_stmt)
-        code_blocks.append(if_stmt)
+        # build_workflow() opens no workflow: it builds into the one its caller opened or bound.
+        # The engine's load paths decide that (`WorkflowRunner.run_workflow`), and a standalone run
+        # opens the file in aexecute_workflow().
 
         # When variable substitution is disabled, bake a request call into build_workflow()
         # so the setting is restored on every load — including running the file as a script.
