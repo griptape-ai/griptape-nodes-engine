@@ -367,6 +367,57 @@ class _ImageInputDataNode(DataNode):
         self.seen_image = self.parameter_values.get("image")
 
 
+class _RunRecordingDataNode(DataNode):
+    """DataNode recording the run id it held while it ran."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.run_id_while_running: str | None = None
+
+    def process(self) -> None:
+        self.run_id_while_running = self.run_id
+
+
+class TestExecuteNodeHoldsItsRun:
+    """A node names the run it executes for, so its budget requests can, and lets go of it afterwards."""
+
+    @pytest.mark.asyncio
+    async def test_a_node_holds_the_request_s_run_while_it_runs(self) -> None:
+        node = _RunRecordingDataNode("spender", metadata={"node_type": "RunRecordingDataNode", "library": "lib"})
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=node),
+            library_manager=_make_mock_library_manager(is_worker=False),
+        )
+
+        result = await node_manager.on_execute_node_request(
+            ExecuteNodeRequest(
+                node_name="spender", node_metadata=cast("ExecutionNodeMetadata", dict(node.metadata)), run_id="run-1"
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result
+        assert node.run_id_while_running == "run-1"
+        assert node.run_id is None, "A node that has finished executing is no longer executing for a run."
+
+    @pytest.mark.asyncio
+    async def test_a_node_that_fails_still_lets_go_of_its_run(self) -> None:
+        node = _RunRecordingDataNode("spender", metadata={"node_type": "RunRecordingDataNode", "library": "lib"})
+        node.process = MagicMock(side_effect=RuntimeError("provider down"))  # type: ignore[method-assign]
+        node_manager = _make_node_manager(
+            object_manager=_make_mock_obj_mgr(existing_node=node),
+            library_manager=_make_mock_library_manager(is_worker=False),
+        )
+
+        result = await node_manager.on_execute_node_request(
+            ExecuteNodeRequest(
+                node_name="spender", node_metadata=cast("ExecutionNodeMetadata", dict(node.metadata)), run_id="run-1"
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultFailure), result
+        assert node.run_id is None
+
+
 class TestExecuteNodeLocalRouteHydratesUntaggedDicts:
     """Local-route regression: an untagged artifact dict from the editor reaches process() as the artifact."""
 

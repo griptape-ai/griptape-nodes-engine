@@ -5,7 +5,7 @@ Griptape Cloud enforces spending budgets on every call that goes through the Gri
 - `BudgetAccessRequest`, sent **before** the call, asks Cloud whether the call fits the budgets of the open project.
 - `ReportUsageRequest`, sent **after** the call, tells Cloud what the call cost, so it counts against those budgets and shows in usage auditing.
 
-The engine adds the project, workflow, workflow run, engine and session to both requests for you. Send the provider's own name for the model, such as `gpt-5-nano`, in both requests, so a refusal and the spend it would have been are grouped under the same model in usage audits. Pass the node's class name as `node_type`. `node_id` is for an opaque id; never pass the node's name, which the user types and may not want shared.
+The engine adds the project, workflow, workflow run, engine and session to both requests for you. Send the provider's own name for the model, such as `gpt-5-nano`, in both requests, so a refusal and the spend it would have been are grouped under the same model in usage audits. Pass the node's class name as `node_type`. Save the node's `run_id` when the call starts and pass that saved value as `run_id` on both requests, as the examples below do. `node_id` is for an opaque id; never pass the node's name, which the user types and may not want shared.
 
 ## Before the call: `BudgetAccessRequest`
 
@@ -16,11 +16,14 @@ from griptape_nodes.retained_mode.events.budget_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+# Saved now, while the node is executing for its run, and passed to both requests.
+run_id = self.run_id
 check = await GriptapeNodes.ahandle_request(
     BudgetAccessRequest(
         model="gpt-5-nano",
         estimated_cost_micro_usd=40_000,
         node_type=type(self).__name__,
+        run_id=run_id,
     )
 )
 if isinstance(check, BudgetAccessResultFailure):
@@ -48,6 +51,7 @@ await GriptapeNodes.ahandle_request(
         model="gpt-5-nano",
         activity_type="chat_completion",
         node_type=type(self).__name__,
+        run_id=run_id,
         correlation_id=check.correlation_id,
     )
 )
@@ -81,7 +85,7 @@ await GriptapeNodes.ahandle_request(
 
 ## What one run cost
 
-Every `BudgetAccessRequest` and `ReportUsageRequest` sent while a workflow runs carries that run's id as the `run_id` tag, so Griptape Cloud can total what one run cost, apart from earlier runs of the same workflow. A loop's iterations, a node run while a flow is already running, and a node group set to run in a separate process on the same machine all count toward the run in progress. A group sent to a remote execution environment reports under that environment's own run ids. A request sent while no run is in progress carries no `run_id`.
+Each `BudgetAccessRequest` and `ReportUsageRequest` carries the id of the workflow run that made the call as the `run_id` tag, so Griptape Cloud can total what one run cost, apart from earlier runs of the same workflow. A node holds its run's id as `self.run_id` while it executes. Save it in a local variable when the call starts, as `run_id = self.run_id`, and pass that saved value on both requests: a node stops holding its run once its execution ends, and a slow call can report after that, such as one that finishes after Cancel. A request that names no run is counted toward the run in progress when it arrives, if there is one. A loop's iterations, a node run while a flow is already running, and a node group set to run in a separate process on the same machine all count toward the run in progress. A group sent to a remote execution environment reports under that environment's own run ids.
 
 The id is the run's own: the one its request's result names in `run_id`, and the one `RunQueuedEvent`, `ListRunsRequest` and `CancelRunRequest` use. A run started while another is in progress waits its turn and keeps that id. The engine announces it on `FlowRunStartedEvent` when the run starts, so a client can learn the id as the run starts rather than when its request returns, and on `FlowRunEndedEvent` when the run ends, with how it ended: finished, failed, or cancelled. Every run that sends a start event sends exactly one end event, including a run whose flow fails before it starts.
 

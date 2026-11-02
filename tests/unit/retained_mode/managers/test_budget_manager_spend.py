@@ -239,6 +239,40 @@ class TestBudgetCheckAllowed:
         assert first.correlation_id != second.correlation_id
 
 
+class TestRunAttribution:
+    """A call names the run that made it; the run in progress when it arrives can be another."""
+
+    def test_a_check_that_names_its_run_keeps_it(self, http: MagicMock) -> None:
+        http.return_value = _response(200, {"allowed": True})
+        engine = _mock_engine()
+        engine.flow_manager.current_run_id = "later-run"
+
+        _check(_manager(engine), BudgetAccessRequest(model="m", run_id="calling-run"))
+
+        assert _sent(http)["tags"]["run_id"] == "calling-run"
+
+    def test_a_report_that_names_its_run_keeps_it(self, http: MagicMock) -> None:
+        http.return_value = _response(201)
+        engine = _mock_engine()
+        engine.flow_manager.current_run_id = "later-run"
+
+        _manager(engine).on_report_usage_request(
+            ReportUsageRequest(declared_cost_micro_usd=1, model="m", run_id="calling-run")
+        )
+
+        assert _sent(http)["tags"]["run_id"] == "calling-run"
+
+    def test_a_call_that_names_no_run_counts_toward_the_run_in_progress(self, http: MagicMock) -> None:
+        """What a library that doesn't send `run_id` yet gets."""
+        http.return_value = _response(201)
+        engine = _mock_engine()
+        engine.flow_manager.current_run_id = "run-in-progress"
+
+        _manager(engine).on_report_usage_request(ReportUsageRequest(declared_cost_micro_usd=1, model="m"))
+
+        assert _sent(http)["tags"]["run_id"] == "run-in-progress"
+
+
 class TestBudgetCheckDenied:
     def test_names_every_budget_and_halts_the_run(self, http: MagicMock) -> None:
         blocked_by = [a_rejection("Marketing Q3"), a_rejection("Studio", frozen=True)]
