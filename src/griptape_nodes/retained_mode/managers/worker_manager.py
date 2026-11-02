@@ -41,11 +41,16 @@ from griptape_nodes.retained_mode.managers.external_environment import (
     worker_requests_from_environment,
 )
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
+from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.managers.settings import (
     DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY,
+    DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY,
+    DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY,
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
+    ReleaseSettings,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.serialization.values import untag
@@ -53,12 +58,13 @@ from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_EN
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Coroutine
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.run_queue import Run
 
 logger = logging.getLogger("griptape_nodes_app")
 
@@ -72,6 +78,15 @@ _STATIC_URL_SETTLE_TIMEOUT_S = 30.0
 # answers once its process exists, so this bounds an engine that is down or unreachable.
 _ENGINE_REQUEST_TIMEOUT_S = 60.0
 
+# How many times an engine tries to release a lease on another engine, and how long it pauses between
+# tries. That engine holds itself for the lease until it hears, or until it loses its connection to this one.
+_REPORT_ATTEMPTS = 5
+_REPORT_RETRY_PAUSE_S = 10.0
+
+# Set on a worker this engine runs for another engine, to this engine's ID. The worker asks this engine,
+# before each node, whether the lease the node was sent under holds it.
+HOST_ENGINE_ID_ENV = "GTN_HOST_ENGINE_ID"
+
 
 @dataclass
 class _SessionRegistration:
@@ -82,6 +97,15 @@ class _SessionRegistration:
     # The version of each library the session declared, checked against this engine's again at every
     # start, since this engine's libraries can change after the session registered.
     library_versions: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _WorkerUnavailable:
+    """Why no worker will run a library."""
+
+    reason: str
+    # The library's next node asks for its worker again, as after another engine refused it for capacity.
+    retryable: bool = False
 
 
 @dataclass
@@ -104,6 +128,66 @@ class _HostedWorker:
     process: asyncio.subprocess.Process | None = None
     # Set once the start has spawned the process or given up, which a stop sent meanwhile waits for.
     started: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reports the process's exit to the artist's engine, done once that engine has answered.
+    exit_watcher: asyncio.Task | None = None
+
+
+@dataclass
+class _EngineRun:
+    """Another engine's lease on this engine, waiting in this engine's line of runs or holding this engine."""
+
+    engine_id: str
+    lease_id: str
+    # The lease's run on that engine, or None for a node run on its own.
+    run_id: str | None
+    # Resolved with None once the lease holds this engine, or with why it never will.
+    granted: asyncio.Future[str | None]
+    # Set when the lease is released.
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+    # This engine's own run that stands for it in the line, set once it is submitted.
+    line_run: Run | None = None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.engine_id, self.lease_id)
+
+    @property
+    def holds_engine(self) -> bool:
+        """Whether the lease holds this engine now: granted, and not yet released."""
+        return self.granted.done() and self.granted.result() is None and not self.released.is_set()
+
+
+@dataclass
+class _EngineRunSpec(RunSpec):
+    """A lease of another engine's, which holds this engine from when it starts until that engine releases it."""
+
+    manager: WorkerManager
+    engine_run: _EngineRun
+    flow_name: str
+
+    async def execute(self, engine: Engine) -> ResultPayload:  # noqa: ARG002
+        return await self.manager.hold_for_engine_run(self.engine_run)
+
+    def failure(self, details: str) -> ResultPayload:
+        return worker_events.AcquireLeaseResultFailure(result_details=details)
+
+    def on_place_in_line(self, run: Run) -> None:
+        self.manager.report_place_in_line(self.engine_run, run.position)
+
+    def on_turned_away(self, details: str) -> None:
+        self.manager.refuse_engine_run(self.engine_run, details)
+
+
+@dataclass
+class EngineLease:
+    """A lease this engine holds, or waits for, on the engine that runs a library's worker, until it is released."""
+
+    lease_id: str
+    host_engine_id: str
+    # The run on this engine the lease is for, or None for a node run on its own.
+    run_id: str | None
+    # The request acquiring it, done once that engine has answered.
+    request_task: asyncio.Task[ResultPayload] | None = None
 
 
 @dataclass
@@ -208,6 +292,25 @@ class WorkerManager(EngineScoped):
         # not garbage-collected while they wait for the answer.
         self._stop_requests: set[asyncio.Task] = set()
 
+        # Other engines' leases on this engine, waiting in its line or holding it, by (engine, lease).
+        self._engine_runs: dict[tuple[str, str], _EngineRun] = {}
+
+        # The engine whose lease last held this engine, so the next lease from another engine frees its workers.
+        self._last_engine_run_engine_id: str | None = None
+
+        # Leases this engine holds or waits for on other engines, by lease ID, until each is released.
+        self._leases: dict[str, EngineLease] = {}
+
+        # The lease each of this engine's runs has on each engine, by (run, engine), shared by the run's nodes.
+        self._run_leases: dict[tuple[str, str], EngineLease] = {}
+
+        # Reports and lease releases sent to other engines from synchronous callbacks, held until answered.
+        self._engine_notices: set[asyncio.Task] = set()
+
+        # The engine that runs this worker for another engine, which decides when it may run each node,
+        # or None for any other engine.
+        self._host_engine_id: str | None = os.environ.get(HOST_ENGINE_ID_ENV)
+
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
 
@@ -250,7 +353,7 @@ class WorkerManager(EngineScoped):
         # answer questions about a PROCESS: is one coming, has it loaded the library, did it die.
         # One owner, so one writer.
         self._execution_ready: dict[str | None, asyncio.Event] = {}
-        self._worker_unavailable: dict[str | None, str] = {}
+        self._worker_unavailable: dict[str | None, _WorkerUnavailable] = {}
 
         config = engine.config_manager
         configured_interval_s: float = config.get_config_value(
@@ -275,6 +378,7 @@ class WorkerManager(EngineScoped):
         )
 
         event_manager.register_request_handlers(self)
+        event_manager.recognize_sessions(self.has_registered_session)
 
         # Subscribe to domain events from ConfigManager / SecretsManager so
         # those managers don't have to know workers exist. The listeners are
@@ -856,12 +960,15 @@ class WorkerManager(EngineScoped):
         event_request: EventRequest,
         worker_engine_id: str,
         worker_request_topic: str,
+        *,
+        response_topic: str | None = None,
     ) -> dict:
         """Forward event_request to the named worker and await the raw result payload.
 
         Registers a Future via RequestClient keyed by request_id and resolves it when
         the worker response arrives. The caller is responsible for deserializing the
-        returned dict into the appropriate result type.
+        returned dict into the appropriate result type. `response_topic` is where the worker
+        answers, by default the worker's response topic in this engine's session.
         """
         request_id = event_request.request_id or str(uuid.uuid4())
         # Opt into structured-failure delivery so a worker-side
@@ -885,6 +992,7 @@ class WorkerManager(EngineScoped):
                 event_request.model_copy(update={"request_id": request_id}),
                 worker_engine_id=worker_engine_id,
                 worker_request_topic=worker_request_topic,
+                response_topic=response_topic,
             )
             return await asyncio.wrap_future(future)
         except BaseException:
@@ -895,6 +1003,118 @@ class WorkerManager(EngineScoped):
             # execution, each still carrying its worker's tag for fail_requests_by_tag to walk.
             self._tx.request_client.discard_request(request_id)
             raise
+
+    async def acquire_lease(self, library_name: str, node_name: str) -> EngineLease | None:
+        """Wait until the engine that runs `library_name`'s worker holds a lease for the node, or None if it runs here.
+
+        A run asks each engine once: its later nodes there wait on the same lease, and its end releases
+        it. A node outside any run has a lease of its own, which `release_after_node` releases.
+        Unbounded, like the node itself: another run can hold that engine for as long as it runs. That
+        engine may stop this engine's worker there to free itself for the lease, so pick the worker only
+        after this returns, through `wait_until_executable`, which starts it again.
+
+        Raises:
+            RuntimeError: That engine will not run the node, with why.
+        """
+        host_engine_id = self._engine_for_library(library_name)
+        if host_engine_id is None:
+            return None
+        lease = self._lease_for(host_engine_id)
+        request_task = cast("asyncio.Task[ResultPayload]", lease.request_task)
+        try:
+            # Shielded, since the run's other nodes may wait on the same lease.
+            result = await asyncio.shield(request_task)
+        except EngineNotFoundError as e:
+            self._end_lease(lease)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {e}"
+            raise RuntimeError(msg) from e
+        except asyncio.CancelledError:
+            self.release_after_node(lease)
+            raise
+        if not result.succeeded():
+            # Ended, so the run's next node there asks again.
+            self._end_lease(lease)
+            msg = f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
+            raise RuntimeError(msg)
+        return lease
+
+    def release_after_node(self, lease: EngineLease | None) -> None:
+        """Release a node's lease once the node ends, however it ends, if it is the node's own.
+
+        A run's lease is released when the run ends instead, since its later nodes use it too.
+        """
+        if lease is None or lease.run_id is not None:
+            return
+        self._end_lease(lease)
+
+    def _lease_for(self, host_engine_id: str) -> EngineLease:
+        """The lease the code executing now uses on `host_engine_id`, acquired there if it has none."""
+        run = self.engine.flow_manager.current_run()
+        if run is not None:
+            lease = self._run_leases.get((run.run_id, host_engine_id))
+            if lease is not None:
+                return lease
+        run_id = None
+        if run is not None:
+            run_id = run.run_id
+        lease = EngineLease(lease_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=run_id)
+        self._leases[lease.lease_id] = lease
+        request = worker_events.AcquireLeaseRequest(lease_id=lease.lease_id, run_id=run_id)
+        lease.request_task = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
+        # However the acquire is answered, the run no longer waits, even if that engine's last report was lost.
+        lease.request_task.add_done_callback(lambda _task: self._stop_reporting_wait(lease))
+        if run is not None:
+            self._run_leases[(run.run_id, host_engine_id)] = lease
+            run.ended.add_done_callback(lambda _ended: self._end_lease(lease))
+        return lease
+
+    def _stop_reporting_wait(self, lease: EngineLease) -> None:
+        if lease.run_id is not None:
+            self.engine.flow_manager.report_run_waiting_for_engine(lease.run_id, 0)
+
+    def _end_lease(self, lease: EngineLease) -> None:
+        """Release a lease on its engine, once, however it ended, so that engine serves the next run.
+
+        Sent without waiting and retried: while the two engines are connected, nothing else releases it.
+        """
+        if self._leases.pop(lease.lease_id, None) is None:
+            return
+        if lease.run_id is not None and self._run_leases.get((lease.run_id, lease.host_engine_id)) is lease:
+            del self._run_leases[(lease.run_id, lease.host_engine_id)]
+        if lease.request_task is not None and not lease.request_task.done():
+            lease.request_task.cancel()
+        request = worker_events.ReleaseLeaseRequest(lease_id=lease.lease_id)
+        self._send_notice(
+            self._report_until_answered(lease.host_engine_id, request, f"lease {lease.lease_id} was released")
+        )
+
+    async def lease_refusal(self, node_name: str, lease_id: str | None) -> str | None:
+        """Why this worker must not run the node now, or None if it may.
+
+        A worker another engine runs asks that engine whether the lease the node was sent under holds it
+        now. Any other worker runs each node it is sent.
+        """
+        host_engine_id = self._host_engine_id
+        if host_engine_id is None:
+            return None
+        if lease_id is None:
+            return (
+                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because it was sent "
+                "without a lease on that engine, so that engine had not agreed to run it."
+            )
+        request = worker_events.CheckLeaseRequest(
+            lease_id=lease_id, worker_engine_id=cast("str", self.engine.get_engine_id())
+        )
+        try:
+            result = await self._event_manager.request_engine_from_worker(host_engine_id, request)
+        except TimeoutError:
+            return (
+                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because that engine "
+                "did not answer whether it may run the node."
+            )
+        if not result.succeeded():
+            return f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
+        return None
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL the workspace is served on, awaited until initialization decides it.
@@ -1196,13 +1416,15 @@ class WorkerManager(EngineScoped):
             return
         result = await self._ask_engine_to_start_worker(library_name, host_engine_id, session_id)
         if isinstance(result, worker_events.StartWorkerForEngineResultFailure) and result.session_unknown:
-            # That engine restarted since this engine registered with it, so register again, once.
+            # That engine's record of the session does not name the library, so register again, once.
             result = await self._ask_engine_to_start_worker(library_name, host_engine_id, session_id)
         if result is None or isinstance(result, worker_events.StartWorkerForEngineResultSuccess):
             return
         reason = f"{host_engine_id} did not start its worker: {result.result_details}"
         logger.error("Not starting a worker for library '%s': %s", library_name, reason)
-        self.note_worker_unavailable(library_name, reason)
+        # The node waiting now fails with the reason; after a capacity refusal, the library's next node asks again.
+        at_capacity = isinstance(result, worker_events.StartWorkerForEngineResultFailure) and result.at_capacity
+        self.note_worker_unavailable(library_name, reason, retryable=at_capacity)
 
     async def _ask_engine_to_start_worker(
         self, library_name: str, host_engine_id: str, session_id: str
@@ -1276,6 +1498,7 @@ class WorkerManager(EngineScoped):
         host_engine_ids = {host_engine_id for host_engine_id, _session_id in self._engine_registrations}
         self._engine_registrations.clear()
         for host_engine_id in host_engine_ids:
+            self._forget_leases_on(host_engine_id)
             task = asyncio.get_running_loop().create_task(self._withdraw_session_offer(host_engine_id))
             self._stop_requests.add(task)
             task.add_done_callback(self._stop_requests.discard)
@@ -1410,7 +1633,7 @@ class WorkerManager(EngineScoped):
 
     @handles(
         worker_events.OfferSessionForWorkersRequest,
-        sender=RequiredSender.SESSION,
+        sender=RequiredSender.ANY_SESSION,
         owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
     )
     def handle_offer_session_for_workers_request(
@@ -1462,18 +1685,19 @@ class WorkerManager(EngineScoped):
             return worker_events.StartWorkerForEngineResultFailure(
                 result_details=f"A worker for library '{library_name}' is already starting for that session."
             )
-        refusal = self._refusal_to_serve(library_name, session_id)
+        refusal = self._start_refusal(library_name, session_id, worker_key)
         if refusal is not None:
-            return worker_events.StartWorkerForEngineResultFailure(
-                result_details=refusal, session_unknown=self._session_must_register(library_name, session_id)
-            )
+            return refusal
         resolved = self._worker_command(library_name, session_id)
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
+        # `_start_refusal` refuses a start while this engine has none.
+        own_engine_id = cast("str", self.engine.get_engine_id())
         # Read before anything awaits, since a lost connection can forget the session meanwhile.
         session = self._sessions[session_id]
-        # The worker runs on this machine's license or API key, which it inherits like a local worker.
-        environ_overrides: dict[str, str] = {}
+        # The worker runs on this machine's license or API key, which it inherits like a local worker. It
+        # runs a node only while this engine holds itself for the lease the node was sent under.
+        environ_overrides: dict[str, str] = {HOST_ENGINE_ID_ENV: own_engine_id}
         # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
         if session.static_server_base_url is not None:
             environ_overrides[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = session.static_server_base_url
@@ -1515,19 +1739,52 @@ class WorkerManager(EngineScoped):
         # It registers with the artist's engine, not here, so its unregistration never reaches this
         # engine. Watching the process is what reports its exit and lets another start for the session.
         watcher = asyncio.get_running_loop().create_task(self._report_when_exited(worker_engine_id, hosted, proc))
+        hosted.exit_watcher = watcher
         self._exit_watchers.add(watcher)
         watcher.add_done_callback(self._exit_watchers.discard)
         return worker_events.StartWorkerForEngineResultSuccess(
             result_details=f"Started worker {worker_engine_id} for library '{library_name}' for another engine."
         )
 
+    def _start_refusal(
+        self, library_name: str, session_id: str, worker_key: str
+    ) -> worker_events.StartWorkerForEngineResultFailure | None:
+        """The failure a start of `worker_key`'s worker for that session returns, or None if this engine will start it."""
+        if self.engine.get_engine_id() is None:
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details="this engine has no engine ID, which its workers need to ask it before each node."
+            )
+        refusal = self._refusal_to_serve(library_name, session_id)
+        if refusal is not None:
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details=refusal, session_unknown=self._session_must_register(library_name, session_id)
+            )
+        capacity_refusal = self._capacity_refusal(worker_key)
+        if capacity_refusal is not None:
+            return worker_events.StartWorkerForEngineResultFailure(result_details=capacity_refusal, at_capacity=True)
+        return None
+
+    def _capacity_refusal(self, worker_key: str) -> str | None:
+        """Why this engine runs no more workers for other engines, or None if it may start `worker_key`'s."""
+        max_workers = self.engine.config_manager.get_config_value(DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY, default=None)
+        if max_workers is None:
+            return None
+        # Starts still under way count, and a worker this start replaces does not.
+        running = len(
+            {hosted.worker_key for hosted in self._hosted_workers.values() if hosted.worker_key != worker_key}
+        )
+        if running < max_workers:
+            return None
+        return (
+            f"this engine already runs {running} workers for other engines, the most its "
+            f"{DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY} setting allows."
+        )
+
     def _refusal_to_serve(self, library_name: str, session_id: str) -> str | None:
         """Why this engine will not start `library_name`'s worker for that session, or None if it will."""
         if not self.engine.can_reach_other_engines:
             return "this engine has no connections to other engines."
-        session = self._sessions.get(session_id)
-        if session is None:
-            return "the session asking for it never registered with this engine."
+        session = self._sessions[session_id]
         if library_name not in session.library_versions:
             return "the session did not name it when it registered with this engine, so its version was never checked."
         return self._library_version_refusal(library_name, session.library_versions[library_name])
@@ -1549,8 +1806,7 @@ class WorkerManager(EngineScoped):
 
     def _session_must_register(self, library_name: str, session_id: str) -> bool:
         """Whether the artist's engine should register the session again before this library can start."""
-        session = self._sessions.get(session_id)
-        return session is None or library_name not in session.library_versions
+        return library_name not in self._sessions[session_id].library_versions
 
     async def _report_when_exited(
         self, worker_engine_id: str, hosted: _HostedWorker, proc: asyncio.subprocess.Process
@@ -1564,6 +1820,10 @@ class WorkerManager(EngineScoped):
             reason = "exited"
         logger.debug("Worker %s for key '%s' %s (exit code %s)", worker_engine_id, hosted.worker_key, reason, exit_code)
         self._hosted_workers.pop(worker_engine_id, None)
+        # A request this engine sent it, such as freeing its models at a handoff, will never be answered.
+        await self._tx.request_client.fail_requests_by_tag(
+            worker_engine_id, worker_events.WorkerGoneError(f"worker '{worker_engine_id}' {reason}")
+        )
         request = worker_events.ReportWorkerExitedRequest(
             worker_engine_id=worker_engine_id, exit_code=exit_code, reason=reason
         )
@@ -1583,7 +1843,7 @@ class WorkerManager(EngineScoped):
     @handles(
         worker_events.StopWorkerForEngineRequest,
         sender=RequiredSender.ENGINE,
-        owner=lambda manager, request, _sender: manager._engine_served_by(request.worker_engine_id),
+        owner=lambda manager, request, _sender: manager.hosted_for(request.worker_engine_id),
     )
     async def handle_stop_worker_for_engine_request(
         self, request: worker_events.StopWorkerForEngineRequest
@@ -1610,6 +1870,137 @@ class WorkerManager(EngineScoped):
             result_details=f"Forgot the sessions engine {engine_id} offered."
         )
 
+    @handles(
+        worker_events.AcquireLeaseRequest,
+        sender=RequiredSender.SESSION,
+        owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
+    )
+    async def handle_acquire_lease_request(
+        self, request: worker_events.AcquireLeaseRequest
+    ) -> worker_events.AcquireLeaseResultSuccess | worker_events.AcquireLeaseResultFailure:
+        """Answer once another engine's lease holds this engine, which waits while another run has this engine.
+
+        The lease waits in this engine's own line of runs, and holds this engine from when it reaches the
+        front until it is released.
+        """
+        sender = require_request_sender()
+        engine_run = self._engine_runs.get((sender.engine_id, request.lease_id))
+        if engine_run is None:
+            engine_run = self._submit_engine_run(sender.engine_id, request)
+            self._log_if_waiting_on_each_other(engine_run)
+        refusal = await asyncio.shield(engine_run.granted)
+        if refusal is not None:
+            return worker_events.AcquireLeaseResultFailure(result_details=refusal)
+        return worker_events.AcquireLeaseResultSuccess(result_details=f"Lease {request.lease_id} holds this engine.")
+
+    @handles(
+        worker_events.ReleaseLeaseRequest,
+        sender=RequiredSender.SESSION,
+        owner=lambda manager, _request, sender: manager._engine_that_offered(sender),
+    )
+    async def handle_release_lease_request(
+        self, request: worker_events.ReleaseLeaseRequest
+    ) -> worker_events.ReleaseLeaseResultSuccess:
+        """Release another engine's lease, so the next run in line gets this engine, or take it out of line."""
+        engine_id = require_request_sender().engine_id
+        engine_run = self._engine_runs.get((engine_id, request.lease_id))
+        if engine_run is None:
+            return worker_events.ReleaseLeaseResultSuccess(
+                result_details=f"This engine held no lease {request.lease_id} for engine {engine_id}."
+            )
+        await self._end_engine_run(engine_run, "its lease was released.")
+        return worker_events.ReleaseLeaseResultSuccess(
+            result_details=f"Released lease {request.lease_id} of engine {engine_id}."
+        )
+
+    @handles(worker_events.CheckLeaseRequest)
+    def handle_check_lease_request(
+        self, request: worker_events.CheckLeaseRequest
+    ) -> worker_events.CheckLeaseResultSuccess | worker_events.CheckLeaseResultFailure:
+        """Answer a worker this engine runs whether the lease its node was sent under holds this engine now.
+
+        Takes no sender rule, so it is answered only for this engine's own clients, which is how the
+        workers it runs reach it. Answered for the engine the worker serves, whatever lease it names.
+        """
+        engine_id = self.hosted_for(request.worker_engine_id)
+        if engine_id is None:
+            return worker_events.CheckLeaseResultFailure(
+                result_details=f"this engine runs no worker {request.worker_engine_id} for another engine."
+            )
+        engine_run = self._engine_runs.get((engine_id, request.lease_id))
+        if engine_run is None or not engine_run.holds_engine:
+            return worker_events.CheckLeaseResultFailure(
+                result_details=(
+                    f"that engine is not holding itself for engine {engine_id}'s run now. The run may have "
+                    "ended, or another run has that engine."
+                )
+            )
+        return worker_events.CheckLeaseResultSuccess(
+            result_details=f"Lease {request.lease_id} of engine {engine_id} holds this engine."
+        )
+
+    @handles(
+        worker_events.ReportPlaceInLineRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager._engine_leasing(request.lease_id),
+    )
+    def handle_report_place_in_line_request(
+        self, request: worker_events.ReportPlaceInLineRequest
+    ) -> worker_events.ReportPlaceInLineResultSuccess:
+        """Report the place in line of a run here whose lease waits on another engine, as if it waited here."""
+        lease = self._leases.get(request.lease_id)
+        # A report that arrives after the acquire was answered is out of date.
+        waiting = lease is not None and lease.request_task is not None and not lease.request_task.done()
+        if lease is None or lease.run_id is None or not waiting:
+            return worker_events.ReportPlaceInLineResultSuccess(
+                result_details="No run here waits on that lease, so there was nothing to report."
+            )
+        self.engine.flow_manager.report_run_waiting_for_engine(lease.run_id, request.position)
+        return worker_events.ReportPlaceInLineResultSuccess(result_details=f"Reported place {request.position}.")
+
+    async def hold_for_engine_run(self, engine_run: _EngineRun) -> ResultPayload:
+        """Hold this engine for another engine's lease, from when it reaches the front of the line until it is released.
+
+        Passing from one engine's lease to another's first frees workers, as `distributed_execution.release`
+        says, and only then grants the lease, so a worker it stops has been reported stopped before that
+        engine sends a node. Freeing is best effort: a failure there still hands this engine over.
+        """
+        if self._last_engine_run_engine_id not in (None, engine_run.engine_id):
+            try:
+                await self._free_for_handoff(engine_run.engine_id)
+            except Exception:
+                logger.exception("Could not free this engine's workers for engine %s's run.", engine_run.engine_id)
+        self._last_engine_run_engine_id = engine_run.engine_id
+        try:
+            if not engine_run.granted.done():
+                engine_run.granted.set_result(None)
+            await engine_run.released.wait()
+        finally:
+            self._forget_engine_run(engine_run)
+        return worker_events.ReleaseLeaseResultSuccess(
+            result_details=f"Engine {engine_run.engine_id}'s lease let this engine go."
+        )
+
+    def report_place_in_line(self, engine_run: _EngineRun, position: int) -> None:
+        """Tell the engine whose lease waits here its place in line."""
+        if engine_run.granted.done():
+            return
+        self._send_notice(self._send_place_in_line(engine_run.engine_id, engine_run.lease_id, position))
+
+    def refuse_engine_run(self, engine_run: _EngineRun, details: str) -> None:
+        """Tell another engine's lease waiting here that it will not get this engine, and why.
+
+        Also releases it, so a lease refused while `hold_for_engine_run` frees workers for it lets this engine go.
+        """
+        if not engine_run.granted.done():
+            engine_run.granted.set_result(details)
+        engine_run.released.set()
+        self._forget_engine_run(engine_run)
+
+    def has_registered_session(self, sender: RequestSender) -> bool:
+        """Whether the sender's session registered with this engine, offering it to run that engine's work."""
+        return sender.session_id in self._sessions
+
     def _engine_that_offered(self, sender: RequestSender) -> str | None:
         """The engine that offered the sender's session to this one, or None if none has."""
         session = self._sessions.get(cast("str", sender.session_id))
@@ -1617,12 +2008,15 @@ class WorkerManager(EngineScoped):
             return None
         return session.engine_id
 
-    def _engine_served_by(self, worker_engine_id: str) -> str | None:
-        """The engine a worker this engine runs serves, or None if it runs no such worker."""
-        hosted = self._hosted_workers.get(worker_engine_id)
-        if hosted is None:
-            return None
-        return hosted.engine_id
+    async def _recycle_hosted_worker(self, hosted: _HostedWorker) -> None:
+        """Stop a worker for a handoff, returning once its engine has heard it stopped.
+
+        Its engine starts it again before that library's next node, so the next lease must not be granted
+        while that engine still counts the stopped worker as running.
+        """
+        await self._stop_hosted_worker(hosted)
+        if hosted.exit_watcher is not None:
+            await asyncio.shield(hosted.exit_watcher)
 
     async def _stop_hosted_worker(self, hosted: _HostedWorker) -> None:
         """Stop a worker this engine runs for another engine. Its exit watcher reports it stopped.
@@ -1651,10 +2045,26 @@ class WorkerManager(EngineScoped):
             self.note_worker_unavailable(
                 start.library_name, f"the connection to {engine_id}, which runs its worker, was lost."
             )
+        # That engine forgets this engine's session once it loses the connection, so the offer is gone too.
+        for key in [key for key in self._engine_registrations if key[0] == engine_id]:
+            del self._engine_registrations[key]
+        self._forget_leases_on(engine_id)
         await self._forget_engine(engine_id, why="lost its connection")
 
+    def _forget_leases_on(self, engine_id: str) -> None:
+        """Forget this engine's leases on `engine_id`, which forgets them with the session, so a run's next node asks again.
+
+        Neither released nor cancelled: that engine has no session to release them in, and an acquire still
+        waiting fails on its own, with the reason.
+        """
+        for lease in [lease for lease in self._leases.values() if lease.host_engine_id == engine_id]:
+            del self._leases[lease.lease_id]
+            if lease.run_id is not None and self._run_leases.get((lease.run_id, lease.host_engine_id)) is lease:
+                del self._run_leases[(lease.run_id, lease.host_engine_id)]
+
     async def _forget_engine(self, engine_id: str, *, why: str) -> None:
-        """Forget the sessions `engine_id` offered this engine, and stop their workers."""
+        """Forget the sessions `engine_id` offered this engine, let its runs go, and stop their workers."""
+        await self._end_engine_runs_from(engine_id, f"engine {engine_id} {why}.")
         offered = [session_id for session_id, session in self._sessions.items() if session.engine_id == engine_id]
         for session_id in offered:
             del self._sessions[session_id]
@@ -1669,6 +2079,169 @@ class WorkerManager(EngineScoped):
             len(hosted),
         )
         await asyncio.gather(*(self._stop_hosted_worker(worker) for worker in hosted))
+
+    def _submit_engine_run(self, engine_id: str, request: worker_events.AcquireLeaseRequest) -> _EngineRun:
+        """Submit another engine's lease to this engine's line, as a run that stands for it."""
+        engine_run = _EngineRun(
+            engine_id=engine_id,
+            lease_id=request.lease_id,
+            run_id=request.run_id,
+            granted=asyncio.get_running_loop().create_future(),
+        )
+        self._engine_runs[engine_run.key] = engine_run
+        spec = _EngineRunSpec(manager=self, engine_run=engine_run, flow_name=f"a run from engine {engine_id}")
+        engine_run.line_run = self.engine.flow_manager.submit_run(spec)
+        return engine_run
+
+    def _log_if_waiting_on_each_other(self, engine_run: _EngineRun) -> None:
+        """Log an error if another engine's run waits here while this engine's run waits on that engine.
+
+        Each run holds its own engine while it waits on the other, so neither engine's line moves.
+        """
+        if engine_run.run_id is None or engine_run.line_run is None or not engine_run.line_run.position:
+            return
+        waiting_there = any(
+            lease.host_engine_id == engine_run.engine_id
+            and lease.run_id is not None
+            and lease.request_task is not None
+            and not lease.request_task.done()
+            for lease in self._leases.values()
+        )
+        if not waiting_there:
+            return
+        logger.error(
+            "A run from engine %s waits for this engine while a run here waits for engine %s. Neither "
+            "continues until one is cancelled. Engines that send nodes to each other can stop each other this way.",
+            engine_run.engine_id,
+            engine_run.engine_id,
+        )
+
+    async def _end_engine_runs_from(self, engine_id: str, reason: str) -> None:
+        """Let go of every lease from `engine_id`, holding this engine or waiting for it."""
+        for engine_run in [run for run in self._engine_runs.values() if run.engine_id == engine_id]:
+            await self._end_engine_run(engine_run, reason)
+
+    async def _end_engine_run(self, engine_run: _EngineRun, reason: str) -> None:
+        """Let another engine's lease go: one holding this engine releases it, and one still waiting leaves the line."""
+        if engine_run.granted.done():
+            engine_run.released.set()
+            return
+        # Refused first, so its acquire hears `reason` rather than the line's own cancellation.
+        self.refuse_engine_run(engine_run, reason)
+        if engine_run.line_run is not None:
+            await self.engine.flow_manager.cancel_run(engine_run.line_run.run_id)
+
+    def _forget_engine_run(self, engine_run: _EngineRun) -> None:
+        if self._engine_runs.get(engine_run.key) is engine_run:
+            del self._engine_runs[engine_run.key]
+
+    def _engine_leasing(self, lease_id: str) -> str | None:
+        """The engine this engine asked for a lease, or None if it asked for no such lease."""
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            return None
+        return lease.host_engine_id
+
+    async def _send_place_in_line(self, engine_id: str, lease_id: str, position: int) -> None:
+        request = worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=position)
+        try:
+            result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        except EngineNotFoundError as e:
+            logger.warning("Could not tell engine %s its run's place in line: %s", engine_id, e)
+            return
+        if not isinstance(result, worker_events.ReportPlaceInLineResultSuccess):
+            logger.warning("Engine %s did not take its run's place in line: %s", engine_id, result.result_details)
+
+    async def _report_until_answered(self, engine_id: str, request: RequestPayload, what: str) -> None:
+        """Tell `engine_id` `what`, trying again until it answers or this engine has no session with it.
+
+        Used for the reports that let that engine go, which nothing else does while it is connected, so a
+        lost one would hold it from every other run.
+        """
+        for attempt in range(1, _REPORT_ATTEMPTS + 1):
+            if attempt > 1:
+                await asyncio.sleep(_REPORT_RETRY_PAUSE_S)
+            if not self._has_session_with(engine_id):
+                logger.info("Not telling engine %s that %s: this engine no longer uses it.", engine_id, what)
+                return
+            try:
+                result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+            except EngineNotFoundError as e:
+                logger.warning(
+                    "Could not tell engine %s that %s (attempt %d of %d): %s",
+                    engine_id,
+                    what,
+                    attempt,
+                    _REPORT_ATTEMPTS,
+                    e,
+                )
+                continue
+            if not result.succeeded():
+                logger.warning("Engine %s did not take the report that %s: %s", engine_id, what, result.result_details)
+            return
+        logger.error(
+            "Gave up telling engine %s that %s. It runs no one else's nodes until it loses its connection to "
+            "this engine or this engine stops its workers.",
+            engine_id,
+            what,
+        )
+
+    def _has_session_with(self, engine_id: str) -> bool:
+        """Whether this engine offered its session to `engine_id` and has not withdrawn it or lost that engine."""
+        return any(host_engine_id == engine_id for host_engine_id, _session_id in self._engine_registrations)
+
+    def _send_notice(self, notice: Coroutine[Any, Any, None]) -> None:
+        """Send a report to another engine without waiting, holding the task until it is answered."""
+        task = asyncio.get_running_loop().create_task(notice)
+        self._engine_notices.add(task)
+        task.add_done_callback(self._engine_notices.discard)
+
+    async def _free_for_handoff(self, incoming_engine_id: str) -> None:
+        """Free workers, as `distributed_execution.release` says, before this engine passes to `incoming_engine_id`'s run."""
+        config = self.engine.config_manager
+        defaults = ReleaseSettings()
+        which = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY, default=defaults.which)
+        how = config.get_config_value(DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY, default=defaults.how)
+        if which == "none":
+            return
+        frees = []
+        for worker_engine_id, hosted in list(self._hosted_workers.items()):
+            if which == "others" and hosted.engine_id == incoming_engine_id:
+                continue
+            if how == "recycle":
+                # Its exit is reported stopped, so its engine starts it again before that library's next node.
+                logger.info("Stopping worker %s to free this engine for another engine's run.", worker_engine_id)
+                frees.append(self._recycle_hosted_worker(hosted))
+            else:
+                frees.append(self._drop_library_named_objects(worker_engine_id, hosted))
+        # All at once, so a worker that never answers delays the handoff by one timeout, not one each. Each is
+        # waited out even if another fails, so none is still stopping once the next lease is granted.
+        outcomes = await asyncio.gather(*frees, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, Exception):
+                logger.error("Could not free a worker for engine %s's run: %s", incoming_engine_id, outcome)
+
+    async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
+        """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
+        event = EventRequest(request=worker_events.DropLibraryNamedLocalObjectsRequest())
+        request_topic = f"sessions/{hosted.session_id}/workers/{worker_engine_id}/request"
+        # The worker is in the session of the engine it serves, not this engine's, so it answers on this engine's own topic.
+        response_topic = f"engines/{self.engine.get_engine_id()}/response"
+        try:
+            result = await asyncio.wait_for(
+                self.route_to_worker(event, worker_engine_id, request_topic, response_topic=response_topic),
+                timeout=_ENGINE_REQUEST_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Worker %s did not free its models within %.0f seconds.", worker_engine_id, _ENGINE_REQUEST_TIMEOUT_S
+            )
+            return
+        except worker_events.WorkerGoneError:
+            # Gone, so nothing of it is left to free.
+            logger.info("Worker %s exited before it freed its models.", worker_engine_id)
+            return
+        logger.info("Worker %s: %s", worker_engine_id, result.get("result", {}).get("result_details"))
 
     async def _wait_for_session(self, library_name: str) -> str | None:
         """Return the active session's id once there is one, or None, recorded, if none came."""
@@ -1791,14 +2364,15 @@ class WorkerManager(EngineScoped):
         if ready is not None:
             ready.set()
 
-    def note_worker_unavailable(self, library_name: str | None, reason: str) -> None:
+    def note_worker_unavailable(self, library_name: str | None, reason: str, *, retryable: bool = False) -> None:
         """Record why no worker will run `library_name`, and release anything waiting on one.
 
         Recording without releasing leaves the next run waiting out the whole startup grace before
         blaming a library load that never began; releasing without recording leaves it blaming a
-        worker that "may still be starting up" for the rest of the session.
+        worker that "may still be starting up" for the rest of the session. A `retryable` reason has
+        the library's next node ask for its worker again.
         """
-        self._worker_unavailable[library_name] = reason
+        self._worker_unavailable[library_name] = _WorkerUnavailable(reason=reason, retryable=retryable)
         self.note_library_loaded(library_name)
 
     def forget_library(self, library_name: str) -> None:
@@ -1814,7 +2388,17 @@ class WorkerManager(EngineScoped):
 
     def worker_unavailable_reason(self, library_name: str | None) -> str | None:
         """Why no worker is available to run `library_name`, or None if that is not the problem."""
-        return self._worker_unavailable.get(library_name)
+        unavailable = self._worker_unavailable.get(library_name)
+        if unavailable is None:
+            return None
+        return unavailable.reason
+
+    def hosted_for(self, worker_engine_id: str) -> str | None:
+        """The engine a worker this engine runs serves, or None if it runs no such worker."""
+        hosted = self._hosted_workers.get(worker_engine_id)
+        if hosted is None:
+            return None
+        return hosted.engine_id
 
     def worker_host(self, worker_engine_id: str) -> str | None:
         """The engine that runs a worker this engine asked another engine for, or None for any other worker.
@@ -1839,7 +2423,7 @@ class WorkerManager(EngineScoped):
         ready = self._execution_ready.get(library_name)
         return ready is None or ready.is_set()
 
-    async def wait_until_executable(self, library_name: str | None) -> None:
+    async def wait_until_executable(self, library_name: str | None, *, start_stopped: bool = True) -> None:
         """Block until `library_name` can be executed, or until it is settled that it cannot.
 
         A worker registers BEFORE it loads libraries -- registration is what carries the
@@ -1851,7 +2435,16 @@ class WorkerManager(EngineScoped):
         worker evicted). Bounded anyway, because "every" is a claim about code that will keep
         changing and the cost of it being wrong once is a node that hangs with no diagnosis. A named
         timeout is a bug report; an unbounded wait is a mystery.
+
+        A library whose worker another engine stopped, to free itself for another engine's run, has that
+        worker started there again first, unless `start_stopped` is False: then such a library returns at
+        once, as before a lease, which must not load the library there while another run holds that engine.
         """
+        if library_name is not None:
+            if start_stopped:
+                await self._start_remote_worker_if_stopped(library_name)
+            elif self._remote_worker_stopped(library_name):
+                return
         if self.has_settled(library_name):
             return
         if library_name is None:
@@ -1873,6 +2466,22 @@ class WorkerManager(EngineScoped):
                     f"process did not finish loading the library within {self.library_load_timeout_s:.0f} seconds."
                 )
             raise RuntimeError(msg) from None
+
+    async def _start_remote_worker_if_stopped(self, library_name: str) -> None:
+        """Start a library's worker on its engine again, if that engine stopped it rather than it ending on its own."""
+        if not self._remote_worker_stopped(library_name):
+            return
+        await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
+
+    def _remote_worker_stopped(self, library_name: str) -> bool:
+        """Whether `library_name`'s worker on another engine is stopped and may be started again there."""
+        if self._engine_for_library(library_name) is None:
+            return False
+        if self.is_worker_running_or_starting(library_name):
+            return False
+        # A worker that ended on its own left a reason, which stays until the library is reset.
+        unavailable = self._worker_unavailable.get(library_name)
+        return unavailable is None or unavailable.retryable
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.
@@ -1953,6 +2562,7 @@ class WorkerManager(EngineScoped):
         *,
         worker_engine_id: str,
         worker_request_topic: str,
+        response_topic: str | None = None,
     ) -> None:
         """Route an event to the appropriate worker's dedicated request topic.
 
@@ -1960,8 +2570,10 @@ class WorkerManager(EngineScoped):
         Future: consult a WorkerRegistry to select the correct worker based on event type
         or target library.
         """
-        session_id = self.engine.get_session_id()
-        worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
+        worker_response_topic = response_topic
+        if worker_response_topic is None:
+            session_id = self.engine.get_session_id()
+            worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
         await self._tx.send_message("EventRequest", converters.engine.dumps(forwarded), worker_request_topic)

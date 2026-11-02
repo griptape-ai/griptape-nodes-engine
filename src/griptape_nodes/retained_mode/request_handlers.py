@@ -22,7 +22,9 @@ class RequiredSender(StrEnum):
 
     # Another engine, named on the request's envelope.
     ENGINE = "engine"
-    # Another engine, and the session it sent the request from.
+    # Another engine, from any of its sessions, as for the request that registers the session with this engine.
+    ANY_SESSION = "any_session"
+    # Another engine, from a session that registered with this engine, as `EventManager.recognize_sessions` tells.
     SESSION = "session"
 
 

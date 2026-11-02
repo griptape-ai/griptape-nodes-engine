@@ -1,4 +1,4 @@
-"""Tests for `RequestClient.request_to_orchestrator`."""
+"""Tests for `RequestClient.request_from_worker`."""
 
 from __future__ import annotations
 
@@ -54,8 +54,8 @@ class TestRequestToOrchestrator:
         event_request = EventRequest(request=_RequestHoldingAnything(anything=_NoJsonForm()))
 
         with pytest.raises(EventSerializationError):
-            await request_client.request_to_orchestrator(
-                event_request, orchestrator_request_topic="orchestrator", worker_response_topic="worker"
+            await request_client.request_from_worker(
+                event_request, request_topic="orchestrator", worker_response_topic="worker"
             )
 
         assert request_client._pending_requests == {}

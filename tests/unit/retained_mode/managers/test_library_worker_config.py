@@ -346,7 +346,10 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
             executes_in_worker=True,
         )
         library_manager._library_file_path_to_info["/some/path.json"] = info
-        _use_engine(library_manager, MagicMock(abroadcast_app_event=AsyncMock()))
+        parts_engine = MagicMock(abroadcast_app_event=AsyncMock())
+        # A bare mock's settings name another engine for every library, which would run 'Lib' there.
+        parts_engine.config_manager.get_config_value.return_value = {}
+        _use_engine(library_manager, parts_engine)
         if spawned:
             worker_manager.expect_worker("Lib")
         if loaded:

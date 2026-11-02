@@ -68,6 +68,9 @@ from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileUploadUrlRequest,
 )
 from griptape_nodes.retained_mode.events.worker_events import (
+    DropLibraryNamedLocalObjectsRequest,
+    DropLibraryNamedLocalObjectsResultFailure,
+    DropLibraryNamedLocalObjectsResultSuccess,
     RegisterWorkerRequest,
     StartWorkerRequest,
     UnregisterWorkerRequest,
@@ -359,6 +362,7 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # a RemoteHandler forwards.
         DropAllLocalObjectsRequest,
         DropLocalObjectsRequest,
+        DropLibraryNamedLocalObjectsRequest,
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
@@ -540,6 +544,27 @@ async def _handle_drop_local_objects(
     return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
 
 
+async def _handle_drop_library_named_local_objects(
+    request: DropLibraryNamedLocalObjectsRequest,  # noqa: ARG001
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release the objects this process's libraries named themselves, keeping what the engine parked."""
+    resource_manager = event_manager.engine.resource_manager
+
+    try:
+        # Off the loop for the same reason as its siblings: a release hook is `del model` plus a CUDA
+        # cache flush, and a worker whose loop is blocked past the heartbeat timeout is evicted.
+        dropped = await to_thread(resource_manager.drop_library_named_local_objects)
+    except Exception as e:
+        details = (
+            "Attempted to release what this worker's libraries keep between runs. "
+            f"Failed because of {type(e).__name__}: {e}."
+        )
+        return DropLibraryNamedLocalObjectsResultFailure(result_details=details)
+    return DropLibraryNamedLocalObjectsResultSuccess(result_details=f"Released {dropped} library-named object(s).")
+
+
 async def _adopt_on_engine_loop(
     request: ActivateProjectRequest,
     adopt: Callable[[ActivateProjectRequest], Coroutine[Any, Any, ResultPayload]],
@@ -677,7 +702,7 @@ def register_broadcast_handlers(
 
 
 def _register_local_object_handlers(event_manager: EventManager) -> None:
-    """Wire the two teardown requests that free objects this worker is holding."""
+    """Wire the teardown requests that free objects this worker is holding."""
 
     async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
         return await _handle_drop_all_local_objects(request, event_manager=event_manager)
@@ -688,3 +713,10 @@ def _register_local_object_handlers(event_manager: EventManager) -> None:
         return await _handle_drop_local_objects(request, event_manager=event_manager)
 
     event_manager.assign_manager_to_request_type(DropLocalObjectsRequest, handle_drop_local_objects)
+
+    async def handle_drop_library_named_local_objects(request: DropLibraryNamedLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_library_named_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(
+        DropLibraryNamedLocalObjectsRequest, handle_drop_library_named_local_objects
+    )

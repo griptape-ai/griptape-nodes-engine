@@ -236,19 +236,25 @@ def _why_local_request_is_refused(rule: _AssignedSenderRule | None) -> str | Non
     """Why a request no other engine sent must not run its handler, or None if it may."""
     if rule is None:
         return None
-    if rule.required is RequiredSender.SESSION:
+    if rule.required in (RequiredSender.ANY_SESSION, RequiredSender.SESSION):
         return "it did not come from another engine's session"
     return "it did not come from another engine"
 
 
 def _why_engine_request_is_refused(
-    rule: _AssignedSenderRule | None, request: RequestPayload, sender: RequestSender
+    rule: _AssignedSenderRule | None,
+    request: RequestPayload,
+    sender: RequestSender,
+    is_registered_session: Callable[[RequestSender], bool] | None,
 ) -> str | None:
     """Why a request another engine sent must not run its handler, or None if it may."""
     if rule is None:
         return "another engine may not send it"
-    if rule.required is RequiredSender.SESSION and sender.session_id is None:
+    needs_session = rule.required in (RequiredSender.ANY_SESSION, RequiredSender.SESSION)
+    if needs_session and sender.session_id is None:
         return "it did not come from one of that engine's sessions"
+    if rule.required is RequiredSender.SESSION and (is_registered_session is None or not is_registered_session(sender)):
+        return "the session it came from has not registered with this engine"
     owner_id = None
     if rule.owner is not None:
         owner_id = rule.owner(request, sender)
@@ -264,6 +270,8 @@ class EventManager(EngineScoped):
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # The request types another engine may send, and which engines. Any other is refused. See `@handles`.
         self._sender_rules: dict[type[RequestPayload], _AssignedSenderRule] = {}
+        # Tells whether a sender's session registered with this engine. Until one is given, no session has.
+        self._is_registered_session: Callable[[RequestSender], bool] | None = None
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
         # Libraries subscribe while they load, which runs in asyncio.to_thread, while a broadcast
@@ -959,6 +967,19 @@ class EventManager(EngineScoped):
                     request_type, getattr(owner, name), sender=rule.required, owner=owner_of
                 )
 
+    def recognize_sessions(self, is_registered_session: Callable[[RequestSender], bool]) -> None:
+        """Tell whether a sender's session registered with this engine, which `RequiredSender.SESSION` requests need.
+
+        The manager that registers sessions gives it, once.
+
+        Raises:
+            ValueError: Another manager already gave one.
+        """
+        if self._is_registered_session is not None:
+            msg = "Attempted to give the engine a way to recognize sessions. Failed because it already has one."
+            raise ValueError(msg)
+        self._is_registered_session = is_registered_session
+
     def configure_worker_forwarding(
         self,
         *,
@@ -1071,45 +1092,19 @@ class EventManager(EngineScoped):
         sync handle_request path does, since it blocks its own thread on the result and can
         only do so when the coroutine runs on another thread's loop.
         """
-        if (
-            self._worker_request_client is None
-            or self._orchestrator_request_topic is None
-            or self._worker_response_topic is None
-            or self._websocket_event_loop is None
-        ):
+        if self._orchestrator_request_topic is None or self._worker_response_topic is None:
             msg = "Worker forwarding is enabled but not fully configured."
             raise RuntimeError(msg)
 
-        event_request: EventRequest = EventRequest(request=request)
-
-        response_future = asyncio.run_coroutine_threadsafe(
-            self._worker_request_client.request_to_orchestrator(
-                event_request=event_request,
-                orchestrator_request_topic=self._orchestrator_request_topic,
-                worker_response_topic=self._worker_response_topic,
-                timeout_ms=self._forward_timeout_ms,
-            ),
-            self._websocket_event_loop,
+        response_payload = await self._send_from_worker(
+            request, request_topic=self._orchestrator_request_topic, response_topic=self._worker_response_topic
         )
-        response_payload = await asyncio.wrap_future(response_future)
-
-        event_type = response_payload.get("event_type", "")
-        result_type_name = response_payload.get("result_type")
-        result_data = response_payload.get("result", {})
-
-        if not result_type_name:
-            msg = f"Forwarded response for {type(request).__name__} missing 'result_type'."
-            raise RuntimeError(msg)
-
-        resolved_result_type = PayloadRegistry.get_type(result_type_name)
-        if resolved_result_type is None:
-            msg = f"Forwarded response 'result_type' is not registered: {result_type_name}"
-            raise RuntimeError(msg)
-
-        result_payload = cast("ResultPayload", converters.engine.structure(result_data, resolved_result_type))
+        result_payload = _read_forwarded_result(request, response_payload)
 
         event_cls: type[EventResultSuccess | EventResultFailure]
-        event_cls = EventResultSuccess if event_type == "EventResultSuccess" else EventResultFailure
+        event_cls = (
+            EventResultSuccess if response_payload.get("event_type", "") == "EventResultSuccess" else EventResultFailure
+        )
 
         return event_cls(
             request=request,
@@ -1117,6 +1112,43 @@ class EventManager(EngineScoped):
             result=result_payload,
             response_topic=result_context.get("response_topic"),
         )
+
+    async def request_engine_from_worker(self, engine_id: str, request: RequestPayload) -> ResultPayload:
+        """Send a request from this worker to the engine `engine_id`, as one of that engine's own clients, and return its result.
+
+        For a worker another engine runs, to reach that engine rather than its orchestrator. It travels
+        the connection the worker's orchestrator traffic does, which that engine carries, and is answered
+        on this worker's own engine topic, which no orchestrator listens on.
+
+        Raises:
+            TimeoutError: The engine did not answer within the worker's forwarding timeout.
+        """
+        own_engine_id = self.engine.get_engine_id()
+        if own_engine_id is None:
+            msg = f"Attempted to send a {type(request).__name__} to engine {engine_id}. Failed because this worker has no engine ID."
+            raise RuntimeError(msg)
+        response_payload = await self._send_from_worker(
+            request,
+            request_topic=f"engines/{engine_id}/request",
+            response_topic=f"engines/{own_engine_id}/response",
+        )
+        return _read_forwarded_result(request, response_payload)
+
+    async def _send_from_worker(self, request: RequestPayload, *, request_topic: str, response_topic: str) -> dict:
+        """Publish `request` from this worker on `request_topic` and await the raw reply on `response_topic`."""
+        if self._worker_request_client is None or self._websocket_event_loop is None:
+            msg = "Worker forwarding is enabled but not fully configured."
+            raise RuntimeError(msg)
+        response_future = asyncio.run_coroutine_threadsafe(
+            self._worker_request_client.request_from_worker(
+                event_request=EventRequest(request=request),
+                request_topic=request_topic,
+                worker_response_topic=response_topic,
+                timeout_ms=self._forward_timeout_ms,
+            ),
+            self._websocket_event_loop,
+        )
+        return await asyncio.wrap_future(response_future)
 
     def _refusal_for_sender(
         self, request: RequestPayload, result_context: ResultContext
@@ -1132,7 +1164,7 @@ class EventManager(EngineScoped):
             reason = _why_local_request_is_refused(rule)
             attempted = f"Attempted to handle a {type(request).__name__}."
         else:
-            reason = _why_engine_request_is_refused(rule, request, sender)
+            reason = _why_engine_request_is_refused(rule, request, sender, self._is_registered_session)
             attempted = f"Attempted to handle a {type(request).__name__} from engine {sender.engine_id}."
         if reason is None:
             return None
@@ -1968,3 +2000,20 @@ class EventTranslationContext:
         except Exception:
             # If we can't create a new instance, return the original
             return event
+
+
+def _read_forwarded_result(request: RequestPayload, response_payload: dict) -> ResultPayload:
+    """The result payload a forwarded request's raw reply carries."""
+    result_type_name = response_payload.get("result_type")
+    result_data = response_payload.get("result", {})
+
+    if not result_type_name:
+        msg = f"Forwarded response for {type(request).__name__} missing 'result_type'."
+        raise RuntimeError(msg)
+
+    resolved_result_type = PayloadRegistry.get_type(result_type_name)
+    if resolved_result_type is None:
+        msg = f"Forwarded response 'result_type' is not registered: {result_type_name}"
+        raise RuntimeError(msg)
+
+    return cast("ResultPayload", converters.engine.structure(result_data, resolved_result_type))

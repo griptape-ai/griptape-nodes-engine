@@ -190,12 +190,15 @@ class StartWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
     """The engine did not start the worker.
 
     Args:
-        session_unknown: The session that asked has not registered with this engine, as after this
-            engine restarts, or registered without naming the library, as after its settings
-            changed. It may register and ask again.
+        session_unknown: The session that asked registered without naming the library, as after its
+            settings changed. It may register and ask again. A session that never registered is
+            refused before the request is handled.
+        at_capacity: This engine already runs as many workers for other engines as it allows. It may
+            ask again later.
     """
 
     session_unknown: bool = False
+    at_capacity: bool = False
 
 
 @dataclass
@@ -331,3 +334,147 @@ class ReportWorkerExitedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class ReportWorkerExitedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The exit was reported by an engine other than the one running the worker."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AcquireLeaseRequest(RequestPayload):
+    """Sent by the artist's engine to the engine whose worker will run a run's nodes, before sending the first of them.
+
+    That engine runs one run at a time, its own and other engines' alike, in the order they asked. It
+    answers once the lease holds it: at once while it is free, otherwise when the runs ahead end. While
+    the lease waits, it reports its place in line with `ReportPlaceInLineRequest`. The lease holds that
+    engine until `ReleaseLeaseRequest` releases it, so the run's later nodes there ask for nothing more.
+
+    Args:
+        lease_id: Names this lease, in `ReleaseLeaseRequest`, `ReportPlaceInLineRequest`, and on each
+            `ExecuteNodeRequest` sent under it.
+        run_id: The run the lease is for, or None for a node run on its own, which has a lease of its own.
+    """
+
+    lease_id: str
+    run_id: str | None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class AcquireLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The lease holds the engine, and nodes may be sent under it."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AcquireLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine will not run the run's nodes."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseLeaseRequest(RequestPayload):
+    """Sent by the artist's engine once it is done with a lease, so that engine serves the next run.
+
+    Sent when the lease's run ends, or, for a node run on its own, when the node ends, however either
+    ends. A lease still waiting in line leaves it.
+
+    Args:
+        lease_id: The `lease_id` of the lease's `AcquireLeaseRequest`.
+    """
+
+    lease_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The engine no longer holds itself for the lease."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReleaseLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The engine could not release the lease."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportPlaceInLineRequest(RequestPayload):
+    """Sent by an engine to the artist's engine while one of its leases waits there, each time its place changes.
+
+    Sent once more with position 0 when the lease stops waiting.
+
+    Args:
+        lease_id: The `lease_id` of the waiting lease's `AcquireLeaseRequest`.
+        position: The lease's place in line, 1 being next, or 0 once it no longer waits.
+    """
+
+    lease_id: str
+    position: int
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportPlaceInLineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The artist's engine passed the place in line on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The place in line came from an engine other than the one the lease waits on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckLeaseRequest(RequestPayload):
+    """Sent by a worker that another engine runs, to that engine, before it runs a node.
+
+    The engine answers whether the lease the node was sent under holds it now, for the engine the
+    worker serves. A node sent under no lease, or one that does not hold it, does not run, so only the
+    engine that runs the worker decides when its workers run another engine's nodes.
+
+    Args:
+        lease_id: The `lease_id` the `ExecuteNodeRequest` carried.
+        worker_engine_id: The worker asking, which names the engine it serves.
+    """
+
+    lease_id: str
+    worker_engine_id: str
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The lease holds the engine for the engine the worker serves, so the node may run."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The lease does not hold the engine, so the node may not run, with why."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent to a worker to release what its libraries keep between runs, such as a loaded model.
+
+    Sent by an engine that runs nodes for other engines, as it passes from one engine's run to another's,
+    so the incoming run has the GPU to itself. Values the engine parked for a node's parameters stay: a
+    later node of the same run may still need them, and nothing could rebuild them.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The worker released what its libraries kept between runs."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLibraryNamedLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The worker failed while releasing what its libraries kept between runs."""

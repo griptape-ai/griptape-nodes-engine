@@ -604,6 +604,13 @@ class Engine:
         """
         return self._worker_manager.worker_host(worker_engine_id)
 
+    def hosted_for(self, worker_engine_id: str) -> str | None:
+        """The engine this one runs the worker `worker_engine_id` for, or None for a worker it runs for no other engine.
+
+        The transports ask this to reach such a worker the way it reaches that engine.
+        """
+        return self._worker_manager.hosted_for(worker_engine_id)
+
     def clear_current_workflow_data(self) -> None:
         """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
 
