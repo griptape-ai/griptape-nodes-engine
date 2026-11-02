@@ -150,6 +150,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     rename_project_template,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -2017,7 +2018,7 @@ class ProjectManager(EngineScoped):
         `ProjectVariableResolver` for the recursion and reference-lookup rules.
         """
         # Applied to the whole process, so no workflow's folder or name may leak into it.
-        resolver = self._build_variable_resolver(template, project_info, None)
+        resolver = self._build_variable_resolver(template, project_info, NO_WORKFLOW)
         for key in template.environment:
             try:
                 resolver.resolve_env(key)
@@ -2026,7 +2027,7 @@ class ProjectManager(EngineScoped):
         return dict(resolver.env_resolved)
 
     def _build_variable_resolver(
-        self, template: ProjectTemplate, project_info: ProjectInfo, workflow: WorkflowRuntime | None
+        self, template: ProjectTemplate, project_info: ProjectInfo, workflow: WorkflowRuntime | NoWorkflow | None
     ) -> ProjectVariableResolver:
         """Build a resolver that recursively resolves directories and env vars for this project.
 
@@ -5025,7 +5026,7 @@ class ProjectManager(EngineScoped):
         return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
     def _get_builtin_variable_value(
-        self, var_name: str, project_info: ProjectInfo, workflow: WorkflowRuntime | None
+        self, var_name: str, project_info: ProjectInfo, workflow: WorkflowRuntime | NoWorkflow | None
     ) -> str:
         """Get the value of a single builtin variable.
 
@@ -5110,16 +5111,18 @@ class ProjectManager(EngineScoped):
         """
         return str(self._config_manager.workspace_path)
 
-    def workflow_for_paths(self, workflow: WorkflowRuntime | None) -> WorkflowRuntime | None:
+    def workflow_for_paths(self, workflow: WorkflowRuntime | NoWorkflow | None) -> WorkflowRuntime | None:
         """The workflow a request's paths, macros and file provenance resolve for.
 
-        `workflow`, else the engine's only open workflow: clients name no workflow on the request
-        envelope yet, and their path requests rely on the one open. The fallback goes once clients
-        send it.
+        `workflow`, none for NO_WORKFLOW, else the engine's only open workflow: clients name no
+        workflow on the request envelope yet, and their path requests rely on the one open. The
+        fallback goes once clients send it.
 
         Raises:
             WorkflowNotNamedError: `workflow` is None and several workflows are open.
         """
+        if workflow is NO_WORKFLOW:
+            return None
         if workflow is not None:
             return workflow
         return self.engine.only_open_workflow_or_none()
