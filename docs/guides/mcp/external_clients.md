@@ -20,27 +20,23 @@ INFO MCP server listening at http://127.0.0.1:8125/mcp/
 
 ## Library tools
 
-Some node libraries add tools for their own product, such as a library for a compositing app
-that can list and run that app's workflows. These tools are not on the address above, so an
-agent only loads the tools of the products you use. Each library has its own address, named
-after the library in lowercase with underscores for spaces:
+Some node libraries provide their own MCP tools (see
+[`get_mcp_tools`](../../development/custom_nodes/advanced_libraries.md#get_mcp_tools)). These
+tools aren't served at the main address above.
+
+To use one library's tools, add its address to your client as a separate server. The address
+ends with the library's name in lowercase, with underscores in place of spaces and punctuation:
 
 ```
 http://localhost:8125/mcp/libraries/nuke_nodes_library/
 ```
 
-Add it to your client as a second server next to `griptape-nodes`. Your client then shows the
-tools under that server's name.
-
-To get the engine's tools and some libraries' tools from one server, list the libraries after
-`?libraries=`, separated by commas:
+Or, to get the engine's tools and some libraries' tools from one server, add the libraries to the
+main address, separated by commas:
 
 ```
-http://localhost:8125/mcp/?libraries=nuke_nodes_library
+http://localhost:8125/mcp/?libraries=nuke_nodes_library,other_library
 ```
-
-If a library's address returns an error, check that the library is loaded in the editor's
-**Libraries** panel and that the address spells its name correctly.
 
 ## Overrides
 
