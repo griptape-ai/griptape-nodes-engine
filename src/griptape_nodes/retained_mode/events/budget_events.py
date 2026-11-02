@@ -24,11 +24,13 @@ ATTRIBUTION_SCHEMA_VERSION = 1
 @dataclass
 @PayloadRegistry.register
 class GetAttributionContextRequest(RequestPayload):
-    """Describe the current project so an outbound call can be attributed to it.
+    """Describe the current call so it can be attributed: its project, workflow, run and node.
 
-    The result carries project ids and no credential. Ids are user-influenced -- usually a slug
-    of the project name, replaceable with any string, and a filesystem path on a project created
-    before ids existed -- and all of it is visible to an SSL-inspecting egress proxy.
+    The result carries no credential. It carries the same tags a direct call reports: project ids,
+    the workflow name, the run id, engine and session ids, and the running node's class. Project
+    ids are user-influenced -- usually a slug of the project name, replaceable with any string, and
+    a filesystem path on a project created before ids existed -- and the workflow name is what the
+    artist typed. All of it is visible to an SSL-inspecting egress proxy.
 
     Best-effort: nothing here raises. Not knowing which project to bill is not a reason to refuse
     work -- the spend is legitimate, it just lands unattributed. A chain that cannot be read
@@ -56,9 +58,11 @@ class GetAttributionContextRequest(RequestPayload):
 class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """An attribution header value is available; attach it to the outbound request.
 
-    `header_value` is `base64url(utf-8 JSON)` with padding kept, decoding to `{"v": 1}` when no
-    project is open and `{"v": 1, "tags": {"project": [...]}}` otherwise. The bare envelope is
-    sent for forward-compatibility rather than as a signal. `<system-defaults>` never travels.
+    `header_value` is `base64url(utf-8 JSON)` with padding kept, decoding to `{"v": 1, "tags": {...}}`
+    with the same tags a direct call reports, or to the bare `{"v": 1}` when there are none. The
+    bare envelope is sent for forward-compatibility rather than as a signal. `<system-defaults>`
+    never travels. Tags other than `project` are left out, `workflow` first, when the header could
+    not be sent with them: over Griptape Cloud's 4096-byte limit, or not valid UTF-8.
 
     Args:
         header_value: The encoded header value to send

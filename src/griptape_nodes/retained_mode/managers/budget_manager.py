@@ -3,10 +3,13 @@
 The project chain is read from the project manager per request, so a project switch between two
 calls shows up on the second. Calls through Griptape Cloud carry the attribution header and Cloud
 enforces budgets itself; `griptape_nodes.utils.budget_refusal` turns its refusal into something
-an artist can act on. A direct provider call bypasses Cloud, so this manager asks
+an artist can act on. The header and a direct call's `tags` are built by `_tags_for`, so the two
+describe a call the same way. A direct provider call bypasses Cloud, so this manager asks
 `POST /api/budget-checks` before it and posts `POST /api/spend` after it.
 
-Project ids travel exactly as stored -- unstripped, uncut, never repaired.
+Project ids travel exactly as stored -- unstripped, uncut, never repaired. The workflow name is
+the one user-authored value that travels, in the header as in the body; a node or project name
+never does.
 
 The header value stays out of `result_details`, which is logged. That is all this module can do
 about disclosure: `broadcast_result` is a field any caller can flip, post-dispatch hooks see the
@@ -33,6 +36,7 @@ from griptape_nodes.drivers.cloud_credentials import (
     resolve_cloud_base_url,
     resolve_cloud_credential,
 )
+from griptape_nodes.exe_types.node_types import get_running_node
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
@@ -80,14 +84,64 @@ REPORT_FLUSH_TIMEOUT_SECONDS = REPORT_TIMEOUT_SECONDS * REPORT_MAX_ATTEMPTS
 _DESCRIPTOR_CAPS = {"provider": 64, "model": 255, "activity_type": 255}
 
 
-def _build_attribution_payload(project_chain: list[str]) -> dict[str, Any]:
-    """Build the decoded payload for a project chain, which may be empty.
+# Griptape Cloud's limit on the decoded attribution header (its MAX_DECODED_LENGTH).
+MAX_DECODED_ATTRIBUTION_BYTES = 4096
+# Optional header tags, in the order they are given up when the header cannot be sent with them.
+_HEADER_DROP_ORDER = ("workflow", "node_type", "node_id", "session_id", "engine_id", "run_id")
 
-    An empty chain omits `tags` and the bare `{"v": 1}` still goes out, for forward-compatibility.
+
+def _build_attribution_payload(tags: dict[str, Any]) -> dict[str, Any]:
+    """Build the decoded payload for a set of tags, which may be empty.
+
+    Empty tags omit `tags` and the bare `{"v": 1}` still goes out, for forward-compatibility.
     """
-    if not project_chain:
+    if not tags:
         return {"v": ATTRIBUTION_SCHEMA_VERSION}
-    return {"v": ATTRIBUTION_SCHEMA_VERSION, "tags": {"project": list(project_chain)}}
+    return {"v": ATTRIBUTION_SCHEMA_VERSION, "tags": tags}
+
+
+def _fit_attribution_tags(tags: dict[str, Any]) -> list[str]:
+    """Drop optional tags until the header can be sent, and return the keys dropped.
+
+    An optional tag never costs a call its project. Cloud replaces a header over its size limit
+    with its default attribution, losing the project too, and a value that cannot be encoded as
+    UTF-8 -- a workflow named after a file whose name is not -- costs the whole header. So detail
+    is given up in `_HEADER_DROP_ORDER` until the header fits and encodes: `workflow` first, being
+    the largest and user-authored, and `run_id` last, being what totals a run's proxy spend with
+    its direct spend. `project` is never dropped. A project that cannot be encoded drops nothing,
+    since the header is refused either way, by `_encode_attribution_payload`, which says why.
+    """
+    dropped: list[str] = []
+    if not _encodable({key: value for key, value in tags.items() if key == "project"}):
+        return dropped
+    for key in _HEADER_DROP_ORDER:
+        if _sendable(tags):
+            break
+        if key in tags:
+            del tags[key]
+            dropped.append(key)
+    return dropped
+
+
+def _sendable(tags: dict[str, Any]) -> bool:
+    """Whether the header for these tags encodes as UTF-8 within Cloud's decoded size limit."""
+    raw = _encoded(tags)
+    if raw is None:
+        return False
+    return len(raw) <= MAX_DECODED_ATTRIBUTION_BYTES
+
+
+def _encodable(tags: dict[str, Any]) -> bool:
+    """Whether the header for these tags encodes as UTF-8, whatever its size."""
+    return _encoded(tags) is not None
+
+
+def _encoded(tags: dict[str, Any]) -> bytes | None:
+    """The header's decoded bytes for these tags, as Cloud measures them, or None if not UTF-8."""
+    try:
+        return json.dumps(_build_attribution_payload(tags), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
 
 
 def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
@@ -160,7 +214,26 @@ class BudgetManager(EngineScoped):
                 )
             )
 
-        header_value = _encode_attribution_payload(_build_attribution_payload(project_chain))
+        running_node = get_running_node()
+        node_type = None
+        run_id = None
+        if running_node is not None:
+            # The class, never `name`: a node's name is what the artist typed on the canvas.
+            node_type = type(running_node).__name__
+            run_id = running_node.run_id
+        # No node_id: nodes have no stable opaque id, and direct-call reports send none either.
+        tags = self._tags_for(project_chain, node_type=node_type, node_id=None, run_id=run_id)
+        dropped = _fit_attribution_tags(tags)
+        if dropped:
+            # Names the keys, never their values: `workflow` is user-authored. Says nothing about the
+            # project, which may be absent, sent, or still over the limit on its own.
+            logger.warning(
+                "Attribution header left out %s, which would have kept it from being sent (over Griptape "
+                "Cloud's %s-byte limit or not valid UTF-8).",
+                ", ".join(dropped),
+                MAX_DECODED_ATTRIBUTION_BYTES,
+            )
+        header_value = _encode_attribution_payload(_build_attribution_payload(tags))
         if header_value is None:
             return GetAttributionContextResultFailure(
                 result_details=ResultDetails(
@@ -320,13 +393,18 @@ class BudgetManager(EngineScoped):
         return [entry.id for entry in chain if entry.id.strip() != SYSTEM_DEFAULTS_KEY]
 
     def _build_tags(self, node_type: str | None, node_id: str | None, run_id: str | None) -> dict[str, Any]:
-        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown.
+        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown."""
+        return self._tags_for(self._resolve_project_chain(), node_type=node_type, node_id=node_id, run_id=run_id)
+
+    def _tags_for(
+        self, project_chain: list[str] | None, *, node_type: str | None, node_id: str | None, run_id: str | None
+    ) -> dict[str, Any]:
+        """The tags describing a call, for a direct call's body and the attribution header alike.
 
         A call that names its run keeps it, since the run in progress when the request arrives may be
         a later one. One that names none is counted toward the run in progress, if any.
         """
         tags: dict[str, Any] = {}
-        project_chain = self._resolve_project_chain()
         if project_chain:
             tags["project"] = project_chain
         context_manager = self.engine.context_manager
