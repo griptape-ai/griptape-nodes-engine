@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NamedTuple, Self
 from unittest.mock import MagicMock, patch
 
 import httpx2
@@ -724,3 +724,70 @@ class TestWiring:
         manager = engine.budget_manager
         assert engine._event_manager._request_type_to_manager[BudgetAccessRequest] == manager.on_budget_access_request
         assert engine._event_manager._request_type_to_manager[ReportUsageRequest] == manager.on_report_usage_request
+
+
+class _HeldReports(NamedTuple):
+    manager: BudgetManager
+    release: threading.Event
+    sent: list[str]
+
+
+class TestFlushReports:
+    """An engine process about to exit waits for its queued reports, which the daemon thread would lose."""
+
+    @staticmethod
+    def _held_manager(monkeypatch: pytest.MonkeyPatch) -> _HeldReports:
+        """A manager with the real report thread, whose sends wait until `release` is set."""
+        release = threading.Event()
+        sent: list[str] = []
+
+        def held_send(self: BudgetManager, body: dict[str, Any]) -> None:  # noqa: ARG001
+            release.wait()
+            sent.append(body["idempotency_key"])
+
+        monkeypatch.setattr(BudgetManager, "_send_report", held_send)
+        manager = BudgetManager(MagicMock(), engine=_mock_engine())
+        return _HeldReports(manager=manager, release=release, sent=sent)
+
+    def test_waits_until_queued_reports_are_sent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        held = self._held_manager(monkeypatch)
+        costs = [1, 2]
+        for cost in costs:
+            held.manager.on_report_usage_request(ReportUsageRequest(declared_cost_micro_usd=cost, model="m"))
+        threading.Timer(0.05, held.release.set).start()
+
+        unsent = held.manager.flush_reports(timeout=5)
+
+        assert unsent == 0
+        assert len(held.sent) == len(costs)
+
+    def test_reports_what_is_still_unsent_when_the_wait_ends(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        held = self._held_manager(monkeypatch)
+        held.manager.on_report_usage_request(ReportUsageRequest(declared_cost_micro_usd=1, model="m"))
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            unsent = held.manager.flush_reports(timeout=0.05)
+        held.release.set()
+
+        assert unsent == 1
+        assert "1 usage report(s) not yet sent" in caplog.text
+
+    def test_returns_at_once_with_nothing_queued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        held = self._held_manager(monkeypatch)
+
+        assert held.manager.flush_reports(timeout=5) == 0
+
+    def test_a_report_that_fails_unexpectedly_still_counts_as_done(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A send that raises is dropped and logged; it must not leave the flush waiting for it."""
+
+        def failing_send(self: BudgetManager, body: dict[str, Any]) -> None:  # noqa: ARG001
+            msg = "something nobody anticipated"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(BudgetManager, "_send_report", failing_send)
+        manager = BudgetManager(MagicMock(), engine=_mock_engine())
+        manager.on_report_usage_request(ReportUsageRequest(declared_cost_micro_usd=1, model="m"))
+
+        assert manager.flush_reports(timeout=5) == 0
