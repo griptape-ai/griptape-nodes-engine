@@ -279,7 +279,7 @@ class TestSerializeNodeWithoutLibraryMetadata:
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="proxy_workflow", flow_name="proxy_flow"))
 
         node = ErrorProxyNode(
             name="Execute Python",

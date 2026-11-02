@@ -5,9 +5,6 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple
 
-from griptape_nodes.files.path_utils import (
-    derive_registry_key,
-)
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
@@ -67,6 +64,14 @@ class WorkflowBranching(EngineScoped):
             source_workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to branch workflow '{request.workflow_name}' because it does not exist"
+            return BranchWorkflowResultFailure(result_details=details)
+
+        # A branch copies the source's header, so it must have been read.
+        if source_workflow.metadata_is_placeholder:
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}'. Failed because its file's metadata header "
+                "could not be read. Save the workflow to regenerate the header."
+            )
             return BranchWorkflowResultFailure(result_details=details)
 
         # Branch copies the source workflow file and produces a new file on disk.
@@ -152,19 +157,16 @@ class WorkflowBranching(EngineScoped):
                 details = f"Failed to branch workflow '{request.workflow_name}': {created.error_details}"
                 return BranchWorkflowResultFailure(result_details=details)
 
-            # Key by the path actually written, and report that key: callers open the branch by
+            # Register the path actually written, and report its name: callers open the branch by
             # the name they get back.
-            branch_registry_key = derive_registry_key(created.relative_file_path)
-            self.engine.workflow_registry.generate_new_workflow(
-                registry_key=branch_registry_key,
-                metadata=branch_metadata,
-                file_path=created.relative_file_path,
-            )
+            branch_workflow = self.engine.workflow_registry.register_file(created.relative_file_path, branch_metadata)
 
             details = f"Successfully branched workflow '{request.workflow_name}' as '{branch_name}'"
             return BranchWorkflowResultSuccess(
-                branched_workflow_name=branch_registry_key,
+                branched_workflow_name=branch_workflow.name,
                 original_workflow_name=request.workflow_name,
+                branched_workflow_id=branch_workflow.workflow_id,
+                original_workflow_id=source_workflow.workflow_id,
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
@@ -253,19 +255,15 @@ class WorkflowBranching(EngineScoped):
             details = f"Attempted to create workflow from template '{request.template_name}'. {created.error_details}"
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
-        # Key by the path actually written, and hand that key back: the caller puts the new
+        # Register the path actually written, and hand its name back: the caller puts the new
         # workflow into context by this name, so it has to be the name the registry holds.
-        registry_key = derive_registry_key(created.relative_file_path)
-        self.engine.workflow_registry.generate_new_workflow(
-            registry_key=registry_key,
-            metadata=new_metadata,
-            file_path=created.relative_file_path,
-        )
+        created_workflow = self.engine.workflow_registry.register_file(created.relative_file_path, new_metadata)
 
         details = f"Successfully created workflow '{new_file_name}' from template '{request.template_name}'"
         return CreateWorkflowFromTemplateResultSuccess(
-            workflow_name=registry_key,
+            workflow_name=created_workflow.name,
             file_path=created.absolute_path,
+            workflow_id=created_workflow.workflow_id,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
@@ -300,6 +298,16 @@ class WorkflowBranching(EngineScoped):
             details = (
                 f"Failed to merge workflow branch '{request.workflow_name}' because "
                 "either the branch or its source is unsaved (no file on disk)."
+            )
+            return MergeWorkflowBranchResultFailure(result_details=details)
+
+        # A merge removes the branch's entry, which an open workflow keeps, and rewrites the
+        # source's file, which an open source's next save would write over.
+        registry = self.engine.workflow_registry
+        if registry.is_open(branch_workflow.workflow_id) or registry.is_open(source_workflow.workflow_id):
+            details = (
+                f"Attempted to merge workflow branch '{request.workflow_name}' into '{source_workflow_name}'. "
+                "Failed because one of them is open. Open another workflow first."
             )
             return MergeWorkflowBranchResultFailure(result_details=details)
 
@@ -350,8 +358,8 @@ class WorkflowBranching(EngineScoped):
             # Remove the branch workflow from registry and delete file
             result_messages = []
             try:
-                self.engine.workflow_registry.delete_workflow_by_name(request.workflow_name)
-                self.engine.workflow_manager.variable_substitution.drop(request.workflow_name)
+                registry.remove(branch_workflow.workflow_id)
+                self.engine.workflow_manager.variable_substitution.drop(branch_workflow.workflow_id)
                 # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
                 Path(branch_content_file_path).unlink()
                 cleanup_message = f"Deleted branch workflow file and registry entry for '{request.workflow_name}'"
@@ -367,7 +375,9 @@ class WorkflowBranching(EngineScoped):
             result_messages.append(ResultDetail(message=success_message, level=logging.INFO))
 
             return MergeWorkflowBranchResultSuccess(
-                merged_workflow_name=source_workflow_name, result_details=ResultDetails(*result_messages)
+                merged_workflow_name=source_workflow_name,
+                workflow_id=source_workflow.workflow_id,
+                result_details=ResultDetails(*result_messages),
             )
 
         except Exception as e:
@@ -458,6 +468,7 @@ class WorkflowBranching(EngineScoped):
             details = f"Successfully reset branch workflow '{request.workflow_name}' to match source workflow '{source_workflow_name}'"
             return ResetWorkflowBranchResultSuccess(
                 reset_workflow_name=request.workflow_name,
+                workflow_id=branch_workflow.workflow_id,
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
