@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import NodeExecutor
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues
 from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeRequest,
@@ -370,3 +370,45 @@ class TestGroupCopyBackPreservesTemplate:
         assert request.is_output is False
         assert request.parameter_name == "prompt"
         assert request.value == "hyperreal"
+
+
+class TestGroupCopyBackKeepsConnectedList:
+    """Copy-back must not store a connected list's combined value as the connected value.
+
+    The node reads the connected items followed by its own entries. Storing that combined list as the
+    connected value would read the entries twice, and save them twice.
+    """
+
+    @staticmethod
+    def _make_list_node() -> MockNode:
+        node = MockNode(name="ListNode")
+        node.add_parameter(
+            ParameterList(
+                name="items",
+                tooltip="test",
+                input_types=["int"],
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        return node
+
+    def test_last_iteration_keeps_the_connected_items_only(self) -> None:
+        node = self._make_list_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("ListNode_items", "ListNode", "items")
+
+        with patch.object(MockNode, "_param_has_incoming_connection", return_value=True):
+            node.set_parameter_value("items", [1])
+            items = node.get_parameter_by_name("items")
+            assert isinstance(items, ParameterList)
+            entry = items.add_child_parameter()
+            node.set_parameter_value(entry.name, 2)
+            assert node.get_parameter_value("items") == [1, 2]
+
+            executor._apply_last_iteration_to_packaged_nodes({"ListNode_items": [1, 2]}, package_result)
+
+            assert node.parameter_values["items"] == [1]
+            assert node.get_parameter_value("items") == [1, 2]
+        assert node.parameter_output_values["items"] == [1, 2]

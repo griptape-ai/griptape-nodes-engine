@@ -27,7 +27,7 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
 )
-from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import ParameterList, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
     BaseWhileNodeGroup,
@@ -4259,9 +4259,16 @@ class NodeExecutor(EngineScoped):
             # list written to a node becomes its rows, and replacing a connected row would
             # remove its connection, which the list refuses. Those rows belong to their
             # connections; the output value below still carries the iteration's list.
+            #
+            # And for a list connected to as a whole: the value here is the connected items
+            # followed by the list's own entries, and storing it as the connected value would
+            # read the entries twice, and save them twice.
             preserves_template = target_node.should_preserve_stored_template(target_param_name, param_value)
             rows_are_connected = target_node._list_rows.has_connected_rows(target_param)
-            if not preserves_template and not rows_are_connected:
+            whole_list_is_connected = isinstance(
+                target_param, ParameterList
+            ) and target_node._has_connected_whole_list_value(target_param)
+            if not preserves_template and not rows_are_connected and not whole_list_is_connected:
                 target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
 
