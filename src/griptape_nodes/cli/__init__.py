@@ -1,1 +1,0 @@
-"""Griptape Nodes CLI module."""
