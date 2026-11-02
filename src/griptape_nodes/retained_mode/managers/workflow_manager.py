@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -110,6 +112,62 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
+
+# Minimum gap between workflow-registration progress events. Each workflow used to send two
+# events, so a 500-workflow scan put ~1,000 messages on the websocket ahead of the request's own
+# result. Ten updates a second is still smooth for a progress readout.
+WORKFLOW_PROGRESS_MIN_INTERVAL_S = 0.1
+
+
+class WorkflowRegistrationProgressReporter:
+    """Sends workflow-registration progress events, at most one per interval.
+
+    Two kinds of event always go out, because clients depend on each one: a failure (clients list
+    the failed items) and the scan's final event (clients end their loading state on it). Anything
+    else is dropped if the previous event went out less than ``min_interval_s`` ago.
+    """
+
+    def __init__(
+        self,
+        put_event: Callable[[AppEvent], None],
+        total: int,
+        *,
+        min_interval_s: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._put_event = put_event
+        self._total = total
+        # Resolved here rather than as defaults so the module constant can be patched in tests.
+        self._min_interval_s = WORKFLOW_PROGRESS_MIN_INTERVAL_S if min_interval_s is None else min_interval_s
+        self._clock = clock or time.monotonic
+        self._last_sent_at: float | None = None
+
+    def report(
+        self,
+        *,
+        item_name: str,
+        status: InitializationStatus,
+        current: int,
+        error: str | None = None,
+    ) -> None:
+        is_final = current >= self._total and status != InitializationStatus.LOADING
+        must_send = is_final or status == InitializationStatus.FAILED
+        now = self._clock()
+        if not must_send and self._last_sent_at is not None and now - self._last_sent_at < self._min_interval_s:
+            return
+        self._last_sent_at = now
+        self._put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.WORKFLOWS,
+                    item_name=item_name,
+                    status=status,
+                    current=current,
+                    total=self._total,
+                    error=error,
+                )
+            )
+        )
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -877,9 +935,11 @@ class WorkflowManager(EngineScoped):
         # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
 
-        # Register it as a success.
+        # Register it as a success. Not broadcast: a scan registers every workflow in the project, and
+        # one result per workflow queued ~500 messages ahead of the triggering request's own result.
+        # Clients get the scan's progress events instead, and the result details still go to the log.
         workflow_register_request = RegisterWorkflowRequest(
-            metadata=workflow_metadata, file_name=str(workflow_to_register)
+            metadata=workflow_metadata, file_name=str(workflow_to_register), broadcast_result=False
         )
         workflow_register_result = self.engine.handle_request(workflow_register_request)
         if not isinstance(workflow_register_result, RegisterWorkflowResultSuccess):
@@ -956,11 +1016,17 @@ class WorkflowManager(EngineScoped):
         # (listed in griptape_nodes_library.json) are registered separately via
         # LibraryManager.collect_library_workflow_files before this scan runs. Sandbox
         # libraries are intentionally left scannable so in-development workflows appear.
-        library_exclusion_roots: list[Path] = []
+        # Checked once per scanned file, so the roots become plain string prefixes up front:
+        # Path.is_relative_to walks every parent of the file and showed up as seconds on
+        # large workspaces. A trailing separator keeps `lib2/` from matching `lib/`, and
+        # normcase gives the same case-insensitive match Windows paths get.
+        library_exclusion_prefixes: list[str] = []
         for library_info in self.engine.library_manager._library_file_path_to_info.values():
             if library_info.is_sandbox:
                 continue
-            library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
+            root = os.path.normcase(str(Path(library_info.library_path).parent.resolve()))
+            library_exclusion_prefixes.append(root if root.endswith(os.sep) else root + os.sep)
+        library_exclusion_prefix_tuple = tuple(library_exclusion_prefixes)
 
         # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
@@ -995,9 +1061,9 @@ class WorkflowManager(EngineScoped):
                     # rejects unsaved keys paired with a file path).
                     if workflow_file.name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
                         continue
-                    if library_exclusion_roots:
-                        resolved_workflow_file = workflow_file.resolve()
-                        if any(resolved_workflow_file.is_relative_to(root) for root in library_exclusion_roots):
+                    if library_exclusion_prefix_tuple:
+                        resolved_workflow_file = os.path.normcase(str(workflow_file.resolve()))
+                        if (resolved_workflow_file + os.sep).startswith(library_exclusion_prefix_tuple):
                             continue
                     try_parse_workflow_metadata(workflow_file)
             elif path.suffix == ".py":
@@ -1025,23 +1091,11 @@ class WorkflowManager(EngineScoped):
             registered_libraries = []
 
         # Second pass: process each workflow file with progress events
+        progress = WorkflowRegistrationProgressReporter(self.engine.event_manager.put_event, total_workflows)
         for current_index, workflow_file in enumerate(all_workflow_files, start=1):
             workflow_name = str(workflow_file.name)
+            progress.report(item_name=workflow_name, status=InitializationStatus.LOADING, current=current_index)
 
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
-                )
-            )
-
-            # Process the workflow
             result_name = await self._process_single_workflow_file(
                 workflow_file,
                 pre_parsed_metadata=parsed_metadata_by_file.get(workflow_file),
@@ -1049,32 +1103,14 @@ class WorkflowManager(EngineScoped):
             )
             if result_name:
                 succeeded.append(result_name)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
+                progress.report(item_name=workflow_name, status=InitializationStatus.COMPLETE, current=current_index)
             else:
                 failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
+                progress.report(
+                    item_name=workflow_name,
+                    status=InitializationStatus.FAILED,
+                    current=current_index,
+                    error="Failed to process workflow file",
                 )
 
         return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
