@@ -314,9 +314,7 @@ class DiagnosticsManager(EngineScoped):
 
         # Extension coercion off: a zip is written as a zip, and a diagnostics bundle
         # renamed by format sniffing would break whatever the user is about to attach it to.
-        # Written with no workflow: the bundle describes the engine, and dispatch would hand an
-        # unaddressed request whichever workflow it finds open.
-        result = await self.engine.os_manager.on_write_file_request(
+        result = await self.engine.ahandle_request(
             WriteFileRequest(
                 file_path=str(destination),
                 content=data,

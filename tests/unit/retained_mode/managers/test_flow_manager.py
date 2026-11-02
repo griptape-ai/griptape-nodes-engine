@@ -1618,7 +1618,7 @@ class TestRunRequests:
         waiting = [asyncio.ensure_future(flow_manager.start_run(_Spec(name, waits))) for name in ("second", "third")]
         await asyncio.sleep(0)
 
-        result = flow_manager.on_list_runs_request(ListRunsRequest())
+        result = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
 
         assert isinstance(result, ListRunsResultSuccess)
         assert [(run.flow_name, run.state, run.position) for run in result.runs] == [
@@ -1647,9 +1647,9 @@ class TestRunRequests:
         assert run is not None
 
         flow_manager.report_run_waiting_for_engine(run.run_id, 2)
-        waiting = flow_manager.on_list_runs_request(ListRunsRequest())
+        waiting = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
         flow_manager.report_run_waiting_for_engine(run.run_id, 0)
-        admitted = flow_manager.on_list_runs_request(ListRunsRequest())
+        admitted = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
 
         assert isinstance(waiting, ListRunsResultSuccess)
         assert isinstance(admitted, ListRunsResultSuccess)
@@ -1819,7 +1819,7 @@ class TestRunsNameTheirRequest:
         with patch("griptape_nodes.retained_mode.managers.flow_manager.current_request_id", return_value="client-7"):
             waiting_run = flow_manager.submit_run(_Spec("flow", second))
 
-        listed = flow_manager.on_list_runs_request(ListRunsRequest())
+        listed = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
 
         assert isinstance(listed, ListRunsResultSuccess)
         assert [run.request_id for run in listed.runs if run.run_id == waiting_run.run_id] == ["client-7"]

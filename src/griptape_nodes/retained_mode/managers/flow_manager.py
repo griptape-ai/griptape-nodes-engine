@@ -2016,19 +2016,8 @@ class FlowManager(EngineScoped):
             return CancelAllRunsResultFailure(result_details=details)
         return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
 
-    def on_list_runs_request(self, request: ListRunsRequest) -> ResultPayload:
-        """List the open workflow's runs, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow; dispatch
-        calls `on_list_runs_request_in_workflow`. With no workflow open there are none.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return ListRunsResultSuccess(runs=[], result_details="Listed 0 run(s).")
-        return self.on_list_runs_request_in_workflow(request, workflow)
-
     @handles(ListRunsRequest)
-    def on_list_runs_request_in_workflow(self, _request: ListRunsRequest, workflow: WorkflowRuntime) -> ResultPayload:
+    def on_list_runs_request(self, _request: ListRunsRequest, workflow: WorkflowRuntime) -> ResultPayload:
         runs: list[RunInfo] = []
         flows = workflow.flows
         in_progress = flows.run_in_progress

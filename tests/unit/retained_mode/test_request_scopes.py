@@ -13,10 +13,15 @@ import pytest
 from griptape_nodes.app.worker_routing import RemoteHandler, register_broadcast_handlers
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
+from griptape_nodes.retained_mode.events.agent_events import ResolveToolApprovalsRequest, RunAgentRequest
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
     GetEngineVersionRequest,
+)
+from griptape_nodes.retained_mode.events.arbitrary_python_events import (
+    RunArbitraryPythonStringRequest,
+    RunArbitraryPythonStringResultSuccess,
 )
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
 from griptape_nodes.retained_mode.events.budget_events import BudgetAccessRequest, ReportUsageRequest
@@ -838,6 +843,9 @@ OPTIONAL_WORKFLOW_HOST_STATE_REQUESTS = [
     DeclareModelInvocationRequest,
     BudgetAccessRequest,
     ReportUsageRequest,
+    RunAgentRequest,
+    ResolveToolApprovalsRequest,
+    RunArbitraryPythonStringRequest,
 ]
 
 
@@ -847,3 +855,18 @@ class TestHostStateRequestsThatTakeAWorkflow:
         self, engine: Engine, request_type: type[RequestPayload]
     ) -> None:
         assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.OPTIONAL_WORKFLOW
+
+
+class TestArbitraryPython:
+    def test_its_requests_act_on_the_only_open_workflow_when_it_names_none(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+        code = (
+            "from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest\n"
+            "from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes\n"
+            "GriptapeNodes.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name='scripted'))\n"
+        )
+
+        result = engine.event_manager.handle_request(RunArbitraryPythonStringRequest(python_string=code)).result
+
+        assert isinstance(result, RunArbitraryPythonStringResultSuccess), result.result_details
+        assert "scripted" in workflow.flows.name_to_parent_name

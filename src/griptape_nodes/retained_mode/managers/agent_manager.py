@@ -179,6 +179,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import (
     GTN_MCP_SERVER_HOST,
@@ -203,6 +204,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -713,16 +715,22 @@ class AgentManager(EngineScoped):
             self._runner_cache.clear()
 
     @handles(RunAgentRequest)
-    async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
+    async def on_handle_run_agent_request(
+        self, request: RunAgentRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Run a chat turn whose instructions describe `workflow`'s current flow, when there is one."""
         try:
-            return await self._run_agent(request)
+            return await self._run_agent(request, workflow)
         except Exception as e:
             return self._agent_run_failure(e, request.provider_name)
 
     @handles(ResolveToolApprovalsRequest)
-    async def on_handle_resolve_tool_approvals_request(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
+    async def on_handle_resolve_tool_approvals_request(
+        self, request: ResolveToolApprovalsRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Resume a chat turn whose instructions describe `workflow`'s current flow, when there is one."""
         try:
-            return await self._resolve_tool_approvals(request)
+            return await self._resolve_tool_approvals(request, workflow)
         except Exception as e:
             return self._agent_run_failure(e, request.provider_name)
 
@@ -765,18 +773,18 @@ class AgentManager(EngineScoped):
             return str(exc)
         return f"Griptape Cloud refused the request because {POLICY_DENIED_HINT} ({exc})"
 
-    async def _run_agent(self, request: RunAgentRequest) -> ResultPayload:
+    async def _run_agent(self, request: RunAgentRequest, workflow: WorkflowRuntime | None) -> ResultPayload:
         thread_id = self._validate_thread_for_run(request.thread_id)
         active = self._claim_thread(thread_id)
         if active is None:
             return _reply_in_progress_failure(f"send a message in conversation {thread_id}")
         try:
-            return await self._run_agent_on_claimed_thread(request, thread_id, active)
+            return await self._run_agent_on_claimed_thread(request, thread_id, active, workflow)
         finally:
             self._release_thread(thread_id, active)
 
     async def _run_agent_on_claimed_thread(
-        self, request: RunAgentRequest, thread_id: str, active: _ActiveRun
+        self, request: RunAgentRequest, thread_id: str, active: _ActiveRun, workflow: WorkflowRuntime | None
     ) -> ResultPayload:
         history = self._thread_storage.load_history(thread_id)
         is_first_run = len(history) == 0
@@ -804,6 +812,7 @@ class AgentManager(EngineScoped):
             persist_prompt=composed.persist,
             approval=ToolApprovalDeps(granted=granted),
             deferred_tool_results=deferred_tool_results,
+            workflow=workflow,
         )
 
         # A first run creates the thread; title it from the input even when the
@@ -821,7 +830,9 @@ class AgentManager(EngineScoped):
             library_mcp_server_names=request.library_mcp_servers,
         )
 
-    async def _resolve_tool_approvals(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
+    async def _resolve_tool_approvals(
+        self, request: ResolveToolApprovalsRequest, workflow: WorkflowRuntime | None
+    ) -> ResultPayload:
         thread_id = request.thread_id
         if not self._thread_storage.thread_exists(thread_id):
             details = f"Attempted to answer the approval request in conversation {thread_id}. Failed because the conversation does not exist."
@@ -836,12 +847,16 @@ class AgentManager(EngineScoped):
         if active is None:
             return _reply_in_progress_failure(f"answer the approval request in conversation {thread_id}")
         try:
-            return await self._resolve_tool_approvals_on_claimed_thread(request, thread_id, active)
+            return await self._resolve_tool_approvals_on_claimed_thread(request, thread_id, active, workflow)
         finally:
             self._release_thread(thread_id, active)
 
     async def _resolve_tool_approvals_on_claimed_thread(
-        self, request: ResolveToolApprovalsRequest, thread_id: str, active: _ActiveRun
+        self,
+        request: ResolveToolApprovalsRequest,
+        thread_id: str,
+        active: _ActiveRun,
+        workflow: WorkflowRuntime | None,
     ) -> ResultPayload:
         # Read from the saved conversation rather than anything held in memory, so
         # an approval card still works after the engine restarts.
@@ -871,6 +886,7 @@ class AgentManager(EngineScoped):
             persist_prompt=None,
             approval=ToolApprovalDeps(granted=plan.granted),
             deferred_tool_results=plan.results,
+            workflow=workflow,
         )
         return self._finish_turn(
             result,
@@ -893,18 +909,19 @@ class AgentManager(EngineScoped):
         persist_prompt: str | list[UserContent] | None,
         approval: ToolApprovalDeps,
         deferred_tool_results: DeferredToolResults | None,
+        workflow: WorkflowRuntime | None,
     ) -> AgentRunResult:
         """Run one agent turn on ``thread_id``, streaming its events.
 
         ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
-        is what ``CancelAgentRequest`` sets.
+        is what ``CancelAgentRequest`` sets. The instructions describe ``workflow``'s current flow.
         """
         runner = self._build_runner(
             provider_name=provider_name,
             model_name=model_name,
         )
         attribution_headers = await self._attribution_headers(provider_name)
-        workflow_context = await self._workflow_context()
+        workflow_context = await self._workflow_context(workflow)
 
         event_manager = self.engine.event_manager
 
@@ -937,7 +954,7 @@ class AgentManager(EngineScoped):
                 deferred_tool_results=deferred_tool_results,
             )
 
-    async def _workflow_context(self) -> _WorkflowContext:
+    async def _workflow_context(self, workflow: WorkflowRuntime | None) -> _WorkflowContext:
         """The available node types and the current flow, rendered for one run's instructions.
 
         Read fresh every run rather than cached, so a library loaded or a node added
@@ -945,7 +962,7 @@ class AgentManager(EngineScoped):
         are not broadcast, and a failure costs the run some context rather than
         showing the user an error.
         """
-        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context())
+        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context(workflow))
         return _WorkflowContext(node_types=node_types, flow=flow)
 
     async def _node_types_context(self) -> str:
@@ -983,10 +1000,16 @@ class AgentManager(EngineScoped):
             libraries[library_name] = result.node_metadata
         return _render_node_types(libraries)
 
-    async def _flow_context(self) -> str:
-        if not self.engine.context_manager.has_current_flow():
+    async def _flow_context(self, workflow: WorkflowRuntime | None) -> str:
+        if workflow is None:
+            # The editor names no workflow on the envelope yet; until it does, the chat describes the only open one.
+            try:
+                workflow = self.engine.only_open_workflow_or_none()
+            except WorkflowNotNamedError:
+                workflow = None
+        if workflow is None or not workflow.context.has_current_flow():
             return _NO_FLOW_INSTRUCTION
-        summary = await self.engine.ahandle_request(
+        summary = await workflow.ahandle_request(
             GetFlowSummaryRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
         )
         if not isinstance(summary, GetFlowSummaryResultSuccess):

@@ -37,6 +37,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _render_node_types,
     _WorkflowContext,
 )
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -192,7 +193,7 @@ class TestWorkflowContext:
     async def test_no_flow_open_gives_the_node_types_and_says_there_is_no_flow(
         self, chat_manager: AgentManager
     ) -> None:
-        context = await chat_manager._workflow_context()
+        context = await chat_manager._workflow_context(None)
 
         assert f"Library '{_LIBRARY_NAME}':\n  text:\n    - _ContextNode: Holds a prompt" in context.node_types
         assert context.flow == _NO_FLOW_INSTRUCTION
@@ -204,7 +205,7 @@ class TestWorkflowContext:
         engine.library_manager._libraries_loading_complete.clear()
 
         # Loading never finishes in this test, so a wait of any length would time out here.
-        context = await asyncio.wait_for(chat_manager._workflow_context(), timeout=1)
+        context = await asyncio.wait_for(chat_manager._workflow_context(None), timeout=1)
 
         assert context.node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
         assert "answers once libraries finish loading" in context.node_types
@@ -214,11 +215,11 @@ class TestWorkflowContext:
         self, engine: Engine, chat_manager: AgentManager
     ) -> None:
         engine.library_manager._libraries_loading_complete.clear()
-        assert (await chat_manager._workflow_context()).node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        assert (await chat_manager._workflow_context(None)).node_types == _NODE_TYPES_NOT_LISTED_INSTRUCTION
 
         engine.library_manager._libraries_loading_complete.set()
 
-        assert f"Library '{_LIBRARY_NAME}':" in (await chat_manager._workflow_context()).node_types
+        assert f"Library '{_LIBRARY_NAME}':" in (await chat_manager._workflow_context(None)).node_types
 
     @pytest.mark.asyncio
     async def test_open_flow_gives_its_summary(self, engine: Engine, chat_manager: AgentManager) -> None:
@@ -230,10 +231,29 @@ class TestWorkflowContext:
         created = engine.handle_request(CreateNodeRequest(node_type="_ContextNode", node_name="writer"))
         assert isinstance(created, CreateNodeResultSuccess), created
 
-        context = await chat_manager._workflow_context()
+        context = await chat_manager._workflow_context(None)
 
         assert context.flow.startswith("Current flow: 'main',")
         assert f"  - writer (_ContextNode from '{_LIBRARY_NAME}')" in context.flow
+
+    @pytest.mark.asyncio
+    async def test_the_handed_workflow_is_described_not_another_open_one(
+        self, engine: Engine, chat_manager: AgentManager
+    ) -> None:
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+        described = engine.open_workflow(engine.workflow_registry.register_unsaved("described").workflow_id)
+        engine.open_workflow(engine.workflow_registry.register_unsaved("beside").workflow_id)
+        flow = described.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        handed = await chat_manager._workflow_context(described)
+        unnamed = await chat_manager._workflow_context(None)
+
+        assert handed.flow.startswith("Current flow: 'main',")
+        # With several open, a request that names none describes none rather than guessing.
+        assert unnamed.flow == _NO_FLOW_INSTRUCTION
 
     @pytest.mark.asyncio
     async def test_flow_that_cannot_be_rendered_is_left_out(
@@ -251,6 +271,6 @@ class TestWorkflowContext:
 
         monkeypatch.setattr(f"{AgentManager.__module__}._render_flow", unrenderable)
 
-        context = await chat_manager._workflow_context()
+        context = await chat_manager._workflow_context(None)
 
         assert context.flow == ""
