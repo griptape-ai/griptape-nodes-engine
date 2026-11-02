@@ -24,7 +24,6 @@ from mcp.types import (
     Tool,
     ToolAnnotations,
 )
-from pydantic import TypeAdapter
 from starlette.requests import Request
 from starlette.types import Receive, Scope, Send
 
@@ -189,7 +188,8 @@ class _ToolSelection:
     """Which tools the endpoint a request arrived on serves."""
 
     include_engine_tools: bool
-    library_slugs: frozenset[str]
+    # In the order the client listed them, which decides who wins a name clash between libraries.
+    library_slugs: tuple[str, ...]
 
 
 # Synthetic MCP tool name for the batch envelope. Not a request payload (and so not a member of
@@ -526,16 +526,31 @@ async def _tools_for_request(ctx: ServerRequestContext[Any]) -> dict[str, MCPToo
     if not selection.library_slugs:
         return dict(ENGINE_TOOLS)
 
-    library_tools = await _run_on_engine_loop(lambda: _collect_library_tools(selection.library_slugs))
+    tools_by_slug = await _run_on_engine_loop(lambda: _collect_library_tools(selection.library_slugs))
+    missing = [slug for slug in selection.library_slugs if slug not in tools_by_slug]
+    if missing:
+        names = ", ".join(f"'{slug}'" for slug in missing)
+        msg = (
+            f"Attempted to list the MCP tools of library {names}. Failed because no loaded library "
+            f"with that name exposes MCP tools. Check the library is loaded and the address uses its "
+            f"name in lowercase, with underscores for spaces."
+        )
+        raise ValueError(msg)
+
+    library_tools: dict[str, MCPTool] = {}
+    for slug in selection.library_slugs:
+        for tool in tools_by_slug[slug]:
+            name = tool.request_type.__name__
+            if name in library_tools:
+                mcp_server_logger.warning(
+                    "Library MCP tool '%s' from '%s' has the same name as one from an earlier library; "
+                    "serving the earlier one.",
+                    name,
+                    slug,
+                )
+                continue
+            library_tools[name] = tool
     if not selection.include_engine_tools:
-        if not library_tools:
-            slug = next(iter(selection.library_slugs))
-            msg = (
-                f"Attempted to list the MCP tools of library '{slug}'. Failed because no loaded library "
-                f"with that name exposes MCP tools. Check the library is loaded and the address uses its "
-                f"name in lowercase, with underscores for spaces."
-            )
-            raise ValueError(msg)
         return library_tools
 
     for name in library_tools.keys() & ENGINE_TOOLS.keys():
@@ -552,33 +567,36 @@ def _tool_selection_for_request(request: object) -> _ToolSelection:
     engine tools.
     """
     if not isinstance(request, Request):
-        return _ToolSelection(include_engine_tools=True, library_slugs=frozenset())
+        return _ToolSelection(include_engine_tools=True, library_slugs=())
 
     # The path relative to the /mcp mount, so "/mcp/libraries/nuke/" reads as ["libraries", "nuke"].
     route_path = request.scope["path"].removeprefix(request.scope.get("root_path", ""))
     segments = [segment for segment in route_path.split("/") if segment]
     library_path_length = 2
     if len(segments) == library_path_length and segments[0] == LIBRARIES_PATH_SEGMENT:
-        return _ToolSelection(include_engine_tools=False, library_slugs=frozenset({segments[1]}))
+        return _ToolSelection(include_engine_tools=False, library_slugs=(segments[1],))
 
     requested = request.query_params.get(LIBRARIES_QUERY_PARAM, "")
-    slugs = frozenset(slug.strip() for slug in requested.split(",") if slug.strip())
+    stripped = (slug.strip() for slug in requested.split(","))
+    slugs = tuple(dict.fromkeys(slug for slug in stripped if slug))
     return _ToolSelection(include_engine_tools=True, library_slugs=slugs)
 
 
-def _collect_library_tools(slugs: frozenset[str]) -> dict[str, MCPTool]:
-    """Return the MCP tools of the loaded libraries whose slugs are given.
+def _collect_library_tools(slugs: tuple[str, ...]) -> dict[str, list[MCPTool]]:
+    """Return the MCP tools of the loaded libraries whose slugs are given, keyed by slug.
 
-    Must run on the engine loop: libraries load and unload there, and reading the registry from
-    another thread can catch it mid-change.
+    Slugs whose libraries expose no tools are left out. Must run on the engine loop: libraries
+    load and unload there, and reading the registry from another thread can catch it mid-change.
     """
-    tools: dict[str, MCPTool] = {}
+    tools_by_slug: dict[str, list[MCPTool]] = {}
     for library_name in LibraryRegistry.list_libraries():
-        if library_config_slug(library_name) not in slugs:
+        slug = library_config_slug(library_name)
+        if slug not in slugs:
             continue
-        for tool in LibraryRegistry.get_library(library_name).get_mcp_tools():
-            tools[tool.request_type.__name__] = tool
-    return tools
+        tools = LibraryRegistry.get_library(library_name).get_mcp_tools()
+        if tools:
+            tools_by_slug.setdefault(slug, []).extend(tools)
+    return tools_by_slug
 
 
 def _tool_definition(tool: MCPTool) -> Tool:
@@ -590,7 +608,7 @@ def _tool_definition(tool: MCPTool) -> Tool:
     return Tool(
         name=request_type.__name__,
         description=request_type.__doc__,
-        input_schema=TypeAdapter(request_type).json_schema(),
+        input_schema=tool.input_schema(),
         annotations=annotations,
     )
 

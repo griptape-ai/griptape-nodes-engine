@@ -528,26 +528,26 @@ class TestToolSelectionForRequest:
         selection = _tool_selection_for_request(_context_for("/mcp/").request)
 
         assert selection.include_engine_tools is True
-        assert selection.library_slugs == frozenset()
+        assert selection.library_slugs == ()
 
     def test_libraries_query_adds_libraries_to_engine_tools(self) -> None:
-        selection = _tool_selection_for_request(_context_for("/mcp/", b"libraries=a,%20b,,").request)
+        selection = _tool_selection_for_request(_context_for("/mcp/", b"libraries=b,%20a,,b").request)
 
         assert selection.include_engine_tools is True
-        assert selection.library_slugs == frozenset({"a", "b"})
+        assert selection.library_slugs == ("b", "a")
 
     @pytest.mark.parametrize("url_path", ["/mcp/libraries/nuke/", "/mcp/libraries/nuke"])
     def test_library_endpoint_serves_one_library_only(self, url_path: str) -> None:
         selection = _tool_selection_for_request(_context_for(url_path).request)
 
         assert selection.include_engine_tools is False
-        assert selection.library_slugs == frozenset({"nuke"})
+        assert selection.library_slugs == ("nuke",)
 
     def test_non_http_request_gets_engine_tools(self) -> None:
         selection = _tool_selection_for_request(None)
 
         assert selection.include_engine_tools is True
-        assert selection.library_slugs == frozenset()
+        assert selection.library_slugs == ()
 
 
 @pytest.mark.usefixtures("probe_library")
@@ -599,11 +599,10 @@ class TestLibraryTools:
             await list_tools(_context_for("/mcp/libraries/missing/"), None)
 
     @pytest.mark.asyncio
-    async def test_unknown_library_in_query_is_ignored(self) -> None:
-        result = await list_tools(_context_for("/mcp/", b"libraries=missing"), None)
-
-        names = {tool.name for tool in result.tools}
-        assert names == set(ENGINE_TOOLS) | {EVENT_REQUEST_BATCH_TOOL_NAME}
+    async def test_unknown_library_in_query_fails_with_its_name(self) -> None:
+        query = f"libraries={_PROBE_LIBRARY_SLUG},missing".encode()
+        with pytest.raises(MCPError, match="library 'missing'"):
+            await list_tools(_context_for("/mcp/", query), None)
 
     @pytest.mark.asyncio
     async def test_calls_a_library_tool(self) -> None:
@@ -634,10 +633,21 @@ class TestLibraryTools:
 
     @pytest.mark.asyncio
     async def test_engine_tool_wins_a_name_clash(self) -> None:
-        clashing = MCPTool(ProbeStartRenderRequest)
-        tools = {"ListRegisteredLibrariesRequest": clashing}
+        clashing = MCPTool(type("ListRegisteredLibrariesRequest", (ProbeStartRenderRequest,), {}))
+        tools_by_slug = {"anything": [clashing]}
 
-        with patch.object(mcp_module, "_collect_library_tools", return_value=tools):
+        with patch.object(mcp_module, "_collect_library_tools", return_value=tools_by_slug):
             served = await _tools_for_request(_context_for("/mcp/", b"libraries=anything"))
 
         assert served["ListRegisteredLibrariesRequest"] is ENGINE_TOOLS["ListRegisteredLibrariesRequest"]
+
+    @pytest.mark.asyncio
+    async def test_first_listed_library_wins_a_name_clash(self) -> None:
+        first = MCPTool(ProbeStartRenderRequest)
+        second = MCPTool(ProbeStartRenderRequest, read_only=True)
+        tools_by_slug = {"first": [first], "second": [second]}
+
+        with patch.object(mcp_module, "_collect_library_tools", return_value=tools_by_slug):
+            served = await _tools_for_request(_context_for("/mcp/", b"libraries=first,second"))
+
+        assert served["ProbeStartRenderRequest"] is first

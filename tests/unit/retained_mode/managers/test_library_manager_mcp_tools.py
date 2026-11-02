@@ -32,18 +32,27 @@ class _UnhandledRequest(RequestPayload):
     pass
 
 
+class _NoSchema:
+    pass
+
+
+@dataclass
+class _UnschemableRequest(RequestPayload):
+    thing: _NoSchema | None = None
+
+
 def _handler(_request: RequestPayload) -> ResultPayload:
     raise NotImplementedError
 
 
 class _HandlingLib(AdvancedNodeLibrary):
-    """Handles _HandledRequest and _OtherHandledRequest, and exposes the tools it is given."""
+    """Handles the requests above except _UnhandledRequest, and exposes the tools it is given."""
 
     def __init__(self, tools: list) -> None:
         self._tools = tools
 
     def get_request_handlers(self) -> list:
-        return [(_HandledRequest, _handler), (_OtherHandledRequest, _handler)]
+        return [(_HandledRequest, _handler), (_OtherHandledRequest, _handler), (_UnschemableRequest, _handler)]
 
     def get_mcp_tools(self) -> list:
         return self._tools
@@ -107,6 +116,16 @@ class TestMCPToolRegistration:
         problem = next(p for p in library_info.problems if isinstance(p, MCPToolRegistrationProblem))
         assert "_UnhandledRequest" in problem.error_message
         assert "get_request_handlers()" in problem.error_message
+
+    def test_tool_without_a_json_schema_exposes_no_tools(self, engine: Engine) -> None:
+        library = _make_library(_HandlingLib([MCPTool(_HandledRequest), MCPTool(_UnschemableRequest)]))
+        library_info = _make_library_info()
+
+        _load(engine, library, library_info)
+
+        assert library.get_mcp_tools() == []
+        problem = next(p for p in library_info.problems if isinstance(p, MCPToolRegistrationProblem))
+        assert "_UnschemableRequest" in problem.error_message
 
     def test_entry_that_is_not_an_mcp_tool_exposes_no_tools(self, engine: Engine) -> None:
         library = _make_library(_HandlingLib([_HandledRequest]))

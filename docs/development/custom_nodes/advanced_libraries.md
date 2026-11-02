@@ -326,8 +326,11 @@ Constraints on the mechanism:
     `get_request_handlers`. A tool that breaks this rule, or an entry that is not an
     `MCPTool`, is reported as an `MCPToolRegistrationProblem` and none of your tools are
     exposed.
-- **The engine's tools win a name clash.** If a request shares its name with one of the
-    engine's tools, the combined address serves the engine's.
+- **Use fields Pydantic can describe.** The input schema comes from Pydantic, so a field
+    typed with an arbitrary class has no schema. It is reported the same way.
+- **The first tool with a name wins.** If a request shares its name with one of the
+    engine's tools, the combined address serves the engine's. If two libraries on one
+    address share a name, the one listed first in `?libraries=` wins.
 
 ### `get_post_dispatch_hooks`
 

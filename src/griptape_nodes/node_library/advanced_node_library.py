@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from pydantic import TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -30,6 +32,13 @@ class MCPTool:
 
     request_type: type[RequestPayload]
     read_only: bool = False
+
+    def input_schema(self) -> dict[str, Any]:
+        """Return the JSON schema of the request's fields, which agents fill in to call the tool.
+
+        Raises pydantic.errors.PydanticUserError if a field's type has no JSON schema.
+        """
+        return TypeAdapter(self.request_type).json_schema()
 
 
 class AdvancedNodeLibrary:

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pydantic.errors import PydanticUserError
+
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import (
     WorkflowNode,
@@ -782,14 +784,22 @@ class LibraryModuleLoading(EngineScoped):
                     f"an MCPTool naming a request type."
                 )
                 raise TypeError(msg)
+            request_name = getattr(tool.request_type, "__name__", tool.request_type)
             if tool.request_type not in handled_types:
-                request_name = getattr(tool.request_type, "__name__", tool.request_type)
                 msg = (
                     f"Attempted to expose '{request_name}' as an MCP tool from library '{library_name}'. "
                     f"Failed because the library does not handle that request. Return it from "
                     f"get_request_handlers() too."
                 )
                 raise ValueError(msg)
+            try:
+                tool.input_schema()
+            except PydanticUserError as err:
+                msg = (
+                    f"Attempted to expose '{request_name}' as an MCP tool from library '{library_name}'. "
+                    f"Failed because its fields can't be described to an agent: {err}"
+                )
+                raise ValueError(msg) from err
 
         library._mcp_tools = list(tools)
         if tools:
