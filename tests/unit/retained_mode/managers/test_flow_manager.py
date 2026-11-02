@@ -1,13 +1,14 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
 import asyncio
+import contextlib
 import itertools
 import json
 import tempfile
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1336,6 +1337,82 @@ class TestRunsEndCleanly:
 
             result = await asyncio.wait_for(waiting, timeout=1.0)
         assert str(result.result_details) == "second ran"
+
+
+class TestRunsEndInTheRightState:
+    """The state a run ends in says how it ended: the run queue reads it once the run is over."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_whose_task_is_cancelled_ends_cancelled(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        ended = _record_end_states(flow_manager)
+        drivers: list[asyncio.Task] = []
+
+        async def body() -> Any:
+            # The run's body executes in the task that drives the run.
+            drivers.append(cast("asyncio.Task", asyncio.current_task()))
+            await asyncio.Event().wait()
+
+        run = flow_manager.submit_run(_Spec("flow", body))
+        for _ in range(10):
+            if drivers:
+                break
+            await asyncio.sleep(0)
+        (driver,) = drivers
+        driver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(driver), timeout=1.0)
+
+        assert run.outcome.cancelled()
+        assert ended == ["cancelled"]
+
+    @pytest.mark.parametrize("cancel_all", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_run_whose_cancel_fails_ends_as_its_flow_did(self, engine: Engine, *, cancel_all: bool) -> None:
+        """Stopping the flow raised, so the cancel failed and the run went on to finish."""
+        flow_manager = engine.flow_manager
+        ended = _record_end_states(flow_manager)
+        may_end = asyncio.Event()
+
+        async def body() -> Any:
+            await may_end.wait()
+            return _ran("run")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", body)))
+        await asyncio.sleep(0)
+        run = flow_manager._run_in_progress
+        assert run is not None
+
+        async def cancel() -> None:
+            if cancel_all:
+                await flow_manager.cancel_all_runs()
+            else:
+                await flow_manager.cancel_run(run.run_id)
+
+        with (
+            patch.object(flow_manager, "check_for_existing_running_flow", return_value=True),
+            patch.object(flow_manager, "cancel_flow_run", side_effect=RuntimeError("worker gone")),
+            pytest.raises(RuntimeError, match="worker gone"),
+        ):
+            await cancel()
+        may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert ended == ["finished"]
+
+
+def _record_end_states(flow_manager: Any) -> list[str]:
+    """Record the state each run is in as the run queue ends it, which is how it says the run ended."""
+    ended: list[str] = []
+    finish_run = flow_manager._finish_run
+
+    def recording_finish_run(run: Any) -> None:
+        if flow_manager._run_in_progress is run:
+            ended.append(run.state.value)
+        finish_run(run)
+
+    flow_manager._finish_run = recording_finish_run
+    return ended
 
 
 class TestRunSpecs:

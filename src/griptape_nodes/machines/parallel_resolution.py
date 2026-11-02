@@ -1102,8 +1102,14 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         # running locally on the orchestrator.
         # Snapshot: dispatching suspends, and a driver waking in that window can
         # add to node_to_reference, breaking this iteration mid-cancel.
+        # Only nodes this run still has executing: the worker request is found by
+        # node name, so once this run's task for a node is done, the request under
+        # that name may be the next run's, started while an earlier send suspended.
+        # Checked right before each send, since every send can suspend.
         node_manager = self.context.engine.node_manager
-        for dag_node in list(self.context.node_to_reference.values()):
+        for task, dag_node in list(self.context.task_to_node.items()):
+            if task.done():
+                continue
             await node_manager.cancel_worker_execution(dag_node.node_reference.name)
 
         # Cancel all running tasks
