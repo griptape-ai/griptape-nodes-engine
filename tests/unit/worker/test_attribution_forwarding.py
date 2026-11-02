@@ -213,7 +213,6 @@ class TestSpendRequestsAreForwardedFromWorkers:
             request_topic_fn=lambda: "request",
             response_topic_fn=lambda: "response",
         ) as request_client:
-            wire.request_client = request_client
             worker.configure_worker_forwarding(
                 request_client=request_client,
                 orchestrator_request_topic="sessions/s/request",
@@ -257,7 +256,6 @@ class _WireToOrchestrator:
 
     def __init__(self, answer: Any) -> None:
         self.answer = answer
-        self.request_client: RequestClient | None = None
         self.subscribe = AsyncMock()
         self._filters: list[Any] = []
 
