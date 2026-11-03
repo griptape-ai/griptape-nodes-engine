@@ -42,6 +42,8 @@ from griptape_nodes.retained_mode.events.project_events import (
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
     DeleteWorkflowResultSuccess,
+    GetPublishOptionsRequest,
+    GetPublishOptionsResultSuccess,
     GetVariableSubstitutionEnabledRequest,
     GetWorkflowRunCommandRequest,
     GetWorkflowRunCommandResultFailure,
@@ -113,7 +115,7 @@ _WORKFLOW_REQUESTS = {
     GetWorkflowShapeRequest,
 }
 # They use the tab's open workflow when there is one and work without it.
-_OPTIONAL_WORKFLOW_REQUESTS = {EnsureWorkflowAndFlowRequest, GetWorkflowRunCommandRequest}
+_OPTIONAL_WORKFLOW_REQUESTS = {EnsureWorkflowAndFlowRequest, GetPublishOptionsRequest, GetWorkflowRunCommandRequest}
 # File runs and the context requests learn their workflow from the ambient binding until the entry
 # points bind the workflow they run in.
 _UNSCOPED_REQUESTS = {
@@ -364,7 +366,7 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         publish.assert_not_called()
 
 
-def _publisher(handler: Any) -> RegisteredEventHandler:
+def _publisher(handler: Any, get_publish_options: Any = None) -> RegisteredEventHandler:
     return RegisteredEventHandler(
         handler=handler,
         library_data=MagicMock(),
@@ -373,8 +375,30 @@ def _publisher(handler: Any) -> RegisteredEventHandler:
             start_flow_node_library_name="lib",
             end_flow_node_type="End",
             end_flow_node_library_name="lib",
+            get_publish_options=get_publish_options,
         ),
     )
+
+
+class TestPublishOptions:
+    def test_the_callback_reads_the_only_open_workflow_when_the_request_names_none(self, engine: Engine) -> None:
+        """Publishers read the open graph for their saved settings."""
+        workflow = _open(engine, "open")
+        seen: list[WorkflowRuntime | None] = []
+
+        def get_publish_options(_request: GetPublishOptionsRequest) -> GetPublishOptionsResultSuccess:
+            seen.append(engine.current_workflow_or_none())
+            return GetPublishOptionsResultSuccess(fields=[], result_details="options")
+
+        with patch.object(
+            engine.library_manager,
+            "get_registered_event_handlers",
+            return_value={"lib": _publisher(MagicMock(), get_publish_options)},
+        ):
+            result = engine.handle_request(GetPublishOptionsRequest(workflow_name="open", publisher_name="lib"))
+
+        assert isinstance(result, GetPublishOptionsResultSuccess), result.result_details
+        assert seen == [workflow]
 
 
 class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
