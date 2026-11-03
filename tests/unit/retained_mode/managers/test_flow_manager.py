@@ -217,8 +217,8 @@ class TestExtractFlowCommandsFromImageMetadata:
 
         result = engine.handle_request(request)
 
-        assert result.failed()
-        assert "none is open" in str(result.result_details)
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert "Failed to deserialize" in str(result.result_details)
 
     def test_returns_commands_when_flow_commands_key_present(
         self, engine: Engine, image_with_flow_commands: str, empty_flow_commands: SerializedFlowCommands

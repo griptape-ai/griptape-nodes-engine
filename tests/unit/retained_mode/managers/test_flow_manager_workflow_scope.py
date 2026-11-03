@@ -17,6 +17,9 @@ from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionResultFailure,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelAllRunsRequest,
+    CancelRunRequest,
+    ListRunsRequest,
     StartLocalSubflowRequest,
     StartLocalSubflowResultFailure,
 )
@@ -25,6 +28,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowResultSuccess,
     DeleteFlowRequest,
     DeleteFlowResultSuccess,
+    ExtractFlowCommandsFromImageMetadataRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
     ListFlowsInCurrentContextRequest,
@@ -65,8 +69,15 @@ def _open_workflow(engine: Engine) -> WorkflowRuntime:
     return engine.current_workflow()
 
 
-# Every FlowManager request acts on a workflow.
-_HOST_REQUESTS: set[type] = set()
+# They answer with no workflow, and use the one they are handed.
+_OPTIONAL_WORKFLOW_REQUESTS = {
+    GetTopLevelFlowRequest,
+    ListFlowsInFlowRequest,
+    ExtractFlowCommandsFromImageMetadataRequest,
+    CancelRunRequest,
+    CancelAllRunsRequest,
+    ListRunsRequest,
+}
 
 
 def _create_canvas(engine: Engine, open_workflow_id: str | None = None) -> str:
@@ -90,9 +101,28 @@ class TestFlowManagerScopes:
         assert scopes, "FlowManager registers no handlers"
         for request_type, scope in scopes.items():
             expected = RequestScope.WORKFLOW
-            if request_type in _HOST_REQUESTS:
-                expected = RequestScope.HOST
+            if request_type in _OPTIONAL_WORKFLOW_REQUESTS:
+                expected = RequestScope.OPTIONAL_WORKFLOW
             assert scope is expected, f"{request_type.__name__} is {scope}, expected {expected}"
+
+
+class TestTopLevelFlowWithNoEnvelopeId:
+    """The editor names no workflow yet, and reads `flow_name=None` as "nothing is loaded"."""
+
+    def test_answers_for_the_only_open_workflow(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        flow_name = _create_canvas(engine)
+
+        result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
+
+        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
+        assert result.flow_name == flow_name
+
+    def test_answers_none_with_nothing_open(self, engine: Engine) -> None:
+        result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
+
+        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
+        assert result.flow_name is None
 
 
 class TestHandlersActOnTheWorkflowTheyAreHanded:

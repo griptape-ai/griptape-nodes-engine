@@ -23,7 +23,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
     ListFlowsInFlowRequest,
-    ListFlowsInFlowResultFailure,
+    ListFlowsInFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import (
@@ -436,11 +436,11 @@ class TestNodesAndFlowsOnTheRuntime:
         assert not engine.flow_manager.check_for_existing_running_flow()
         assert not engine.flow_manager.execution_is_advancing()
 
-    def test_listing_the_canvas_flows_with_no_workflow_open_fails(self, engine: Engine) -> None:
+    def test_listing_the_canvas_flows_with_no_workflow_open_finds_none(self, engine: Engine) -> None:
         result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=None))
 
-        assert isinstance(result, ListFlowsInFlowResultFailure)
-        assert "none is open" in str(result.result_details)
+        assert isinstance(result, ListFlowsInFlowResultSuccess), result.result_details
+        assert result.flow_names == []
 
     @pytest.mark.asyncio
     async def test_runs_and_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
