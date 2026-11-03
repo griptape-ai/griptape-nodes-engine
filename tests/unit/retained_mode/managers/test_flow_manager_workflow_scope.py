@@ -125,6 +125,39 @@ class TestTopLevelFlowWithNoEnvelopeId:
         assert result.flow_name is None
 
 
+class TestCancelWithNoEnvelopeId:
+    """Cancelling binds the open workflow it falls back to: nodes' own cancellation reads the binding."""
+
+    @pytest.mark.asyncio
+    async def test_cancelling_every_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+        seen: list[WorkflowRuntime | None] = []
+
+        async def cancel_all_runs_in(_workflow: WorkflowRuntime) -> None:
+            seen.append(engine.current_workflow_or_none())
+
+        with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
+            result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
+
+        assert result.succeeded(), result.result_details
+        assert seen == [workflow]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+        seen: list[WorkflowRuntime | None] = []
+
+        async def cancel_run_in(_workflow: WorkflowRuntime, _run_id: str) -> bool:
+            seen.append(engine.current_workflow_or_none())
+            return True
+
+        with patch.object(engine.flow_manager, "cancel_run_in", cancel_run_in):
+            result = (await engine.event_manager.ahandle_request(CancelRunRequest(run_id="run"))).result
+
+        assert result.succeeded(), result.result_details
+        assert seen == [workflow]
+
+
 class TestHandlersActOnTheWorkflowTheyAreHanded:
     def test_a_request_with_no_envelope_id_acts_on_the_open_workflow(self, engine: Engine) -> None:
         _open_workflow(engine)

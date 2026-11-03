@@ -2025,7 +2025,9 @@ class FlowManager(EngineScoped):
         workflow = self._handed_or_only_open(workflow)
         cancelled = False
         if workflow is not None:
-            cancelled = await self.cancel_run_in(workflow, request.run_id)
+            # Bound for the fallback too: nodes' own cancellation, such as stopping a worker, reads the binding.
+            with self.engine.bind_workflow(workflow):
+                cancelled = await self.cancel_run_in(workflow, request.run_id)
         if not cancelled:
             details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
             return CancelRunResultFailure(result_details=details)
@@ -2040,7 +2042,9 @@ class FlowManager(EngineScoped):
         if workflow is None:
             return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
         try:
-            await self.cancel_all_runs_in(workflow)
+            # Bound for the fallback too: nodes' own cancellation, such as stopping a worker, reads the binding.
+            with self.engine.bind_workflow(workflow):
+                await self.cancel_all_runs_in(workflow)
         except Exception as e:
             # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
             details = f"Attempted to cancel every run. Failed because the run in progress could not be cancelled: {e}"
