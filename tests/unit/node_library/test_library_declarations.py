@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
+    DocumentationLibraryProperty,
+    DocumentationNodeProperty,
     KeySupport,
     LifecycleStage,
     LifecycleStageLibraryProperty,
@@ -24,6 +26,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerMode,
     WorkerModeCompatibility,
     iter_catalog_models,
+    resolve_node_documentation_url,
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import (
@@ -192,6 +195,80 @@ class TestRoundTripSerialization:
         assert node_decls[0].stage is LifecycleStage.ALPHA
         assert isinstance(node_decls[1], ModelUsageNodeProperty)
         assert node_decls[1].model_ids == ["claude_opus_byok"]
+
+
+# ---------- DocumentationLibraryProperty / DocumentationNodeProperty ----------
+
+
+class TestDocumentationProperty:
+    def test_node_documentation_round_trips(self) -> None:
+        metadata = _make_node_metadata(
+            declarations=[DocumentationNodeProperty(url="https://docs.example.com/some-node")],
+        )
+
+        rebuilt = NodeMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, DocumentationNodeProperty)
+        assert decl.url == "https://docs.example.com/some-node"
+
+    def test_library_documentation_round_trips(self) -> None:
+        metadata = _make_library_metadata(
+            declarations=[DocumentationLibraryProperty(url="https://docs.example.com/some-library")],
+        )
+
+        rebuilt = LibraryMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, DocumentationLibraryProperty)
+        assert decl.url == "https://docs.example.com/some-library"
+
+    def test_url_is_required(self) -> None:
+        with pytest.raises(ValidationError):
+            DocumentationNodeProperty()  # type: ignore[call-arg]
+        with pytest.raises(ValidationError):
+            DocumentationLibraryProperty()  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize(
+        "bad_url", ["javascript:alert(1)", "data:text/html,<script>alert(1)</script>", "#settings", "not-a-url", ""]
+    )
+    def test_rejects_non_http_url(self, bad_url: str) -> None:
+        with pytest.raises(ValidationError, match="http"):
+            DocumentationNodeProperty(url=bad_url)
+        with pytest.raises(ValidationError, match="http"):
+            DocumentationLibraryProperty(url=bad_url)
+
+    @pytest.mark.parametrize("good_url", ["http://docs.example.com/node", "https://docs.example.com/node"])
+    def test_accepts_http_and_https(self, good_url: str) -> None:
+        assert DocumentationNodeProperty(url=good_url).url == good_url
+        assert DocumentationLibraryProperty(url=good_url).url == good_url
+
+
+class TestResolveNodeDocumentationUrl:
+    def test_no_declarations_resolves_to_none(self) -> None:
+        assert resolve_node_documentation_url([], []) is None
+
+    def test_node_url_alone(self) -> None:
+        node_decls = [DocumentationNodeProperty(url="https://docs.example.com/node")]
+
+        assert resolve_node_documentation_url(node_decls, []) == "https://docs.example.com/node"
+
+    def test_library_url_alone(self) -> None:
+        library_decls = [DocumentationLibraryProperty(url="https://docs.example.com/library")]
+
+        assert resolve_node_documentation_url([], library_decls) == "https://docs.example.com/library"
+
+    def test_node_url_overrides_library_url(self) -> None:
+        node_decls = [DocumentationNodeProperty(url="https://docs.example.com/node")]
+        library_decls = [DocumentationLibraryProperty(url="https://docs.example.com/library")]
+
+        assert resolve_node_documentation_url(node_decls, library_decls) == "https://docs.example.com/node"
+
+    def test_unrelated_declarations_are_ignored(self) -> None:
+        node_decls = [LifecycleStageNodeProperty(stage=LifecycleStage.BETA)]
+        library_decls = [LifecycleStageLibraryProperty(stage=LifecycleStage.STABLE)]
+
+        assert resolve_node_documentation_url(node_decls, library_decls) is None
 
 
 # ---------- ArbitraryPythonExecutionNodeProperty ----------
