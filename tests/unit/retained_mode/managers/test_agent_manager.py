@@ -37,6 +37,7 @@ from griptape_nodes.drivers.cloud_models import (
     ProviderCatalogEntry,
     provider_catalog_entries,
 )
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -79,7 +80,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
 )
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
@@ -88,6 +89,9 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultFailure,
     GetEnabledMCPServersResultSuccess,
+    LibraryMCPServer,
+    ListLibraryMCPServersRequest,
+    ListLibraryMCPServersResultSuccess,
     MCPServerConfig,
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
@@ -108,6 +112,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.servers.mcp import LibraryMCPTools
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError, refusal_from_body
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from tests.unit.utils.test_budget_refusal import a_refusal_body
@@ -240,6 +245,75 @@ class TestLookupEnabledMCPServers:
         engine = _RecordingEngine(GetEnabledMCPServersResultFailure(result_details="nope"))
 
         assert self._manager(engine)._lookup_enabled_mcp_servers() is None
+
+
+@dataclass
+class _ListRendersRequest(RequestPayload):
+    """List renders."""
+
+
+@dataclass
+class _StartRenderRequest(RequestPayload):
+    """Start a render."""
+
+
+_ACME = LibraryMCPTools(
+    library_name="Acme Render Tools",
+    slug="acme_render_tools",
+    tools=[MCPTool(_ListRendersRequest, read_only=True), MCPTool(_StartRenderRequest)],
+)
+
+
+class TestLibraryMCPServers:
+    @staticmethod
+    def _manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
+        manager = AgentManager.__new__(AgentManager)
+        manager._mcp_server_port = 9001
+        monkeypatch.setattr(f"{_AGENT_MANAGER_MODULE}.list_library_mcp_tools", lambda: [_ACME])
+        return manager
+
+    def test_lists_each_library_at_the_bound_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result = self._manager(monkeypatch).on_handle_list_library_mcp_servers_request(ListLibraryMCPServersRequest())
+
+        assert isinstance(result, ListLibraryMCPServersResultSuccess)
+        assert result.servers == [
+            LibraryMCPServer(
+                name="acme_render_tools",
+                library_name="Acme Render Tools",
+                url="http://localhost:9001/mcp/libraries/acme_render_tools/",
+                tool_names=["_ListRendersRequest", "_StartRenderRequest"],
+            )
+        ]
+
+    def test_builds_a_toolset_per_library_with_its_read_only_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager(monkeypatch)
+        built: list[tuple[str, str, frozenset[str]]] = []
+        monkeypatch.setattr(
+            f"{_AGENT_MANAGER_MODULE}.streamable_http_library",
+            lambda name, url, read_only: built.append((name, url, read_only)) or name,
+        )
+
+        toolsets = manager._library_toolsets(["acme_render_tools", "acme_render_tools"])
+
+        assert toolsets == ["acme_render_tools"]
+        assert built == [
+            (
+                "acme_render_tools",
+                "http://localhost:9001/mcp/libraries/acme_render_tools/",
+                frozenset({"_ListRendersRequest"}),
+            )
+        ]
+
+    def test_skips_a_library_that_serves_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = self._manager(monkeypatch)
+
+        with caplog.at_level(logging.WARNING):
+            toolsets = manager._library_toolsets(["missing"])
+
+        assert toolsets == []
+        assert "missing" in caplog.text
 
 
 class TestOnHandleListAgentModelsRequest:

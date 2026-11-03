@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from pydantic import TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -12,6 +15,30 @@ if TYPE_CHECKING:
         RequestPayload,
         ResultPayload,
     )
+
+
+@dataclass(frozen=True)
+class MCPTool:
+    """A request type a library exposes as a tool on the engine's MCP server.
+
+    The tool is named after the request type, its description is the request's docstring, and
+    its input schema comes from the request's fields.
+
+    Attributes:
+        request_type: A request type this library handles, returned from get_request_handlers().
+        read_only: Whether the tool only reads state. Clients use this to decide which tools
+            need the user's approval and which to offer in read-only modes.
+    """
+
+    request_type: type[RequestPayload]
+    read_only: bool = False
+
+    def input_schema(self) -> dict[str, Any]:
+        """Return the JSON schema of the request's fields, which agents fill in to call the tool.
+
+        Raises pydantic.errors.PydanticUserError if a field's type has no JSON schema.
+        """
+        return TypeAdapter(self.request_type).json_schema()
 
 
 class AdvancedNodeLibrary:
@@ -127,6 +154,34 @@ class AdvancedNodeLibrary:
             def get_request_handlers(self):
                 return [
                     (ConvertColorspaceRequest, self._handle_convert_colorspace),
+                ]
+        """
+        return []
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        """Return the request types to expose as tools on the engine's MCP server.
+
+        Each request type must also be returned from get_request_handlers(), so a library can
+        only expose requests it handles itself. A tool that breaks this rule is reported as an
+        MCPToolRegistrationProblem and none of the library's tools are exposed.
+
+        The engine registers the tools after get_request_handlers() and removes them when the
+        library is unloaded.
+
+        **Where the tools appear.** Library tools are kept apart from the engine's own tools, so
+        a client only pays for the products it uses. With the server at ``/mcp/``:
+
+        - ``/mcp/libraries/<slug>/`` serves only this library's tools.
+        - ``/mcp/?libraries=<slug>,<slug>`` serves the engine's tools plus the named libraries'.
+
+        The slug is the library name in lowercase, with each run of spaces and punctuation
+        replaced by one underscore, so "Acme Render Tools" becomes ``acme_render_tools``.
+
+        Example:
+            def get_mcp_tools(self):
+                return [
+                    MCPTool(ListRendersRequest, read_only=True),
+                    MCPTool(StartRenderRequest),
                 ]
         """
         return []

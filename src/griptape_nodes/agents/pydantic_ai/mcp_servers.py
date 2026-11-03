@@ -20,7 +20,8 @@ combinators rather than hand-rolled logic:
   sidebar's policy, so :func:`mcp_server_from_config` leaves it off: node
   libraries build agents from it too, and a node run has no one to ask. The
   sidebar applies it with :func:`require_user_tool_approval`, and
-  :func:`streamable_http_local` applies it to the engine's own server.
+  :func:`streamable_http_local` and :func:`streamable_http_library` apply it to
+  the engine's own server.
 
 Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
@@ -94,12 +95,14 @@ Each name must be a key of ``servers.mcp.SUPPORTED_REQUEST_EVENTS``; a test hold
 the two in step.
 """
 
-GTN_BATCH_TOOL_NAME = f"{GTN_SERVER_NAME}_EventRequestBatch"
-"""Prefixed name of the engine's batch tool, whose inner requests are gated one by one.
+BATCH_TOOL_BARE_NAME = "EventRequestBatch"
+"""Bare name of the batch tool the engine's MCP server serves on every address.
 
-The bare name must equal ``servers.mcp.EVENT_REQUEST_BATCH_TOOL_NAME``; a test
-holds the two in step.
+Must equal ``servers.mcp.EVENT_REQUEST_BATCH_TOOL_NAME``; a test holds the two in step.
 """
+
+GTN_BATCH_TOOL_NAME = f"{GTN_SERVER_NAME}_{BATCH_TOOL_BARE_NAME}"
+"""Prefixed name of the engine's batch tool, whose inner requests are gated one by one."""
 
 
 @dataclass(frozen=True)
@@ -222,6 +225,17 @@ def streamable_http_local(url: str) -> AbstractToolset[Any]:
     ).approval_required(_gtn_tool_requires_approval)
 
 
+def streamable_http_library(name: str, url: str, read_only_tools: frozenset[str]) -> AbstractToolset[Any]:
+    """Build the chat agent's toolset for one library's tools on the engine's MCP server.
+
+    Prefixed with ``name``, the library's slug. Calls to tools in ``read_only_tools`` (bare names)
+    run without asking and every other call waits for the user. The batch tool is hidden, since
+    approving it would approve every library tool inside it.
+    """
+    toolset = MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES)
+    return _library_toolset(name, toolset, read_only_tools)
+
+
 def require_user_tool_approval(toolset: AbstractToolset[Any]) -> AbstractToolset[Any]:
     """Make every call on a user-configured server's toolset wait for the user's approval.
 
@@ -269,6 +283,25 @@ def _gtn_tool_requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, 
 def _user_tool_requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, tool_args: dict[str, Any]) -> bool:
     """Gate every tool on a user-configured server: the engine cannot tell what they do."""
     return needs_approval(ctx.deps, grant_keys_for_call(tool_def.name, tool_args))
+
+
+def _library_toolset(name: str, toolset: AbstractToolset[Any], read_only_tools: frozenset[str]) -> AbstractToolset[Any]:
+    """Hide the batch tool, prefix with ``name``, and gate every tool not in ``read_only_tools``."""
+    composed = _compose(name, toolset, tool_blocklist=frozenset({BATCH_TOOL_BARE_NAME}))
+    return composed.approval_required(_library_tool_approval(name, read_only_tools))
+
+
+def _library_tool_approval(
+    name: str, read_only_tools: frozenset[str]
+) -> Callable[[RunContext[Any], ToolDefinition, dict[str, Any]], bool]:
+    """Build the approval gate for a library toolset prefixed with ``name``."""
+
+    def requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, tool_args: dict[str, Any]) -> bool:
+        if tool_def.name.removeprefix(f"{name}_") in read_only_tools:
+            return False
+        return needs_approval(ctx.deps, grant_keys_for_call(tool_def.name, tool_args))
+
+    return requires_approval
 
 
 def _connect_timeout(config: Mapping[str, Any]) -> float:

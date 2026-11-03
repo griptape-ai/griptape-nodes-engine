@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AppEventListenerRegistrationProblem,
     ExecutionEventListenerRegistrationProblem,
+    MCPToolRegistrationProblem,
     PostDispatchHookRegistrationProblem,
     PreDispatchHookRegistrationProblem,
     RequestHandlerRegistrationProblem,
@@ -48,6 +49,22 @@ class TestExecutionEventListenerRegistrationProblem:
         assert caplog.records
         assert "err1" in result
         assert "err2" in result
+
+
+class TestMCPToolRegistrationProblem:
+    def test_collate_single_problem(self) -> None:
+        problem = MCPToolRegistrationProblem(error_message="tool boom")
+        result = MCPToolRegistrationProblem.collate_problems_for_display([problem])
+        assert result == "Error registering MCP tools: tool boom"
+
+    def test_collate_multiple_logs_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        problems = [
+            MCPToolRegistrationProblem(error_message="err1"),
+            MCPToolRegistrationProblem(error_message="err2"),
+        ]
+        with caplog.at_level("ERROR"):
+            MCPToolRegistrationProblem.collate_problems_for_display(problems)
+        assert caplog.records
 
 
 class TestPostDispatchHookRegistrationProblem:

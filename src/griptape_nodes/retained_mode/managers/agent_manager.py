@@ -38,7 +38,11 @@ from pydantic_ai.tools import DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import UsageLimits
 
 from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
-from griptape_nodes.agents.pydantic_ai.mcp_servers import grant_keys_for_call, streamable_http_local
+from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    grant_keys_for_call,
+    streamable_http_library,
+    streamable_http_local,
+)
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
     MCPToolsetCache,
     MCPToolsetLease,
@@ -168,12 +172,21 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
+    LibraryMCPServer,
+    ListLibraryMCPServersRequest,
+    ListLibraryMCPServersResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers import bind_free_socket
-from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
+from griptape_nodes.servers.mcp import (
+    GTN_MCP_SERVER_HOST,
+    GTN_MCP_SERVER_PORT,
+    LIBRARIES_PATH_SEGMENT,
+    list_library_mcp_tools,
+    start_mcp_server,
+)
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusal_from_exception
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
@@ -786,6 +799,7 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
             prompt=composed.live,
             persist_prompt=composed.persist,
             approval=ToolApprovalDeps(granted=granted),
@@ -804,6 +818,7 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
         )
 
     async def _resolve_tool_approvals(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
@@ -851,6 +866,7 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
             prompt=None,
             persist_prompt=None,
             approval=ToolApprovalDeps(granted=plan.granted),
@@ -861,6 +877,7 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
         )
 
     async def _run_turn(  # noqa: PLR0913
@@ -871,6 +888,7 @@ class AgentManager(EngineScoped):
         provider_name: str | None,
         model_name: str | None,
         mcp_server_names: list[str],
+        library_mcp_server_names: list[str],
         prompt: str | list[UserContent] | None,
         persist_prompt: str | list[UserContent] | None,
         approval: ToolApprovalDeps,
@@ -900,6 +918,7 @@ class AgentManager(EngineScoped):
                 ),
             )
 
+        library_toolsets = self._library_toolsets(library_mcp_server_names)
         # Nothing may sit between this and the `async with` that releases
         # it: a server left with a stray use count is never shut down.
         mcp = await self._acquire_mcp_toolsets(mcp_server_names)
@@ -911,7 +930,7 @@ class AgentManager(EngineScoped):
                 cancel_event=active.cancel_event,
                 persist_prompt=persist_prompt,
                 history_rehydrator=_rehydrate_history,
-                extra_toolsets=mcp.lease.toolsets,
+                extra_toolsets=[*mcp.lease.toolsets, *library_toolsets],
                 extra_instructions=_compose_run_instructions(workflow_context, mcp.instructions),
                 extra_headers=attribution_headers,
                 approval=approval,
@@ -1006,6 +1025,7 @@ class AgentManager(EngineScoped):
         provider_name: str | None,
         model_name: str | None,
         mcp_server_names: list[str],
+        library_mcp_server_names: list[str],
     ) -> RunAgentResultSuccess:
         """Record a finished turn and build the result the editor renders it from."""
         # A cancelled run saves no model response, so there is no response to record.
@@ -1018,6 +1038,7 @@ class AgentManager(EngineScoped):
                     provider_name=resolved_provider.name,
                     model=model_name or resolved_provider.model,
                     mcp_servers=mcp_server_names or [],
+                    library_mcp_servers=library_mcp_server_names or [],
                 ),
             )
 
@@ -1073,6 +1094,21 @@ class AgentManager(EngineScoped):
             },
             thread_id=result.thread_id,
             result_details=result_details,
+        )
+
+    @handles(ListLibraryMCPServersRequest)
+    def on_handle_list_library_mcp_servers_request(self, _: ListLibraryMCPServersRequest) -> ResultPayload:
+        servers = [
+            LibraryMCPServer(
+                name=library.slug,
+                library_name=library.library_name,
+                url=self._library_mcp_url(library.slug),
+                tool_names=[tool.request_type.__name__ for tool in library.tools],
+            )
+            for library in list_library_mcp_tools()
+        ]
+        return ListLibraryMCPServersResultSuccess(
+            servers=servers, result_details=f"Listed {len(servers)} library MCP server(s)."
         )
 
     @handles(ClearToolGrantsRequest)
@@ -1676,6 +1712,30 @@ class AgentManager(EngineScoped):
             ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
         )
         return _MCPAttachment(lease=lease, instructions=instructions)
+
+    def _library_toolsets(self, names: list[str]) -> list[AbstractToolset[Any]]:
+        """Build a toolset for each named library MCP server, skipping names no loaded library serves."""
+        read_only_by_slug: dict[str, set[str]] = {}
+        for library in list_library_mcp_tools():
+            read_only = read_only_by_slug.setdefault(library.slug, set())
+            read_only.update(tool.request_type.__name__ for tool in library.tools if tool.read_only)
+        unavailable = [name for name in names if name not in read_only_by_slug]
+        if unavailable:
+            logger.warning(
+                "Attempted to give the agent the tools of library %s. No loaded library with that name exposes "
+                "MCP tools, so the agent will run without them. Check the library is loaded.",
+                ", ".join(sorted(unavailable)),
+            )
+        toolsets: list[AbstractToolset[Any]] = []
+        for name in dict.fromkeys(names):
+            if name not in read_only_by_slug:
+                continue
+            read_only = frozenset(read_only_by_slug[name])
+            toolsets.append(streamable_http_library(name, self._library_mcp_url(name), read_only))
+        return toolsets
+
+    def _library_mcp_url(self, slug: str) -> str:
+        return f"http://localhost:{self._mcp_server_port}/mcp/{LIBRARIES_PATH_SEGMENT}/{slug}/"
 
     def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
         """Current config of every enabled MCP server, or ``None`` if unreadable.
