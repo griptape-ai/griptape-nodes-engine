@@ -10,11 +10,12 @@ the build-time fit check share.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Hashable, Mapping, Sequence
+    from collections.abc import Hashable, Mapping, Sequence
 
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_error import NodeError
@@ -33,7 +34,9 @@ __all__ = [
 LIMITS_LINK_LABEL = "Provider limits"
 
 # Whether a narrowed rule applies to one value, from the value and what the engine can read of it.
-type Condition = Callable[[Any, CheckContext], bool]
+# `CheckContext` is quoted: the alias is evaluated when something reads it, and `context` imports this
+# module, so a runtime import here would be circular.
+type Condition = Callable[[Any, "CheckContext"], bool]
 
 
 class PreRunRule(ABC):  # noqa: B024  # a marker for what `pre_run_validators=` takes; the engine walks the kinds

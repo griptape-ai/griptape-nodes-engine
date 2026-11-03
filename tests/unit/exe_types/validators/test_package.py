@@ -65,3 +65,15 @@ def test_importing_the_package_does_not_load_the_runner() -> None:
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, timeout=60)  # noqa: S603
     assert result.returncode == 0, result.stderr
+
+
+def test_the_condition_alias_resolves_at_runtime() -> None:
+    """Reading `Condition`'s value, as `get_type_hints` or a docs build does, finds every name it uses."""
+    code = (
+        "import typing\n"
+        "from griptape_nodes.exe_types.validators import Condition, PreRunRule\n"
+        "typing.get_type_hints(PreRunRule.when, include_extras=True)\n"
+        "print(Condition.__value__)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, timeout=60)  # noqa: S603
+    assert result.returncode == 0, result.stderr
