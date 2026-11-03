@@ -744,7 +744,9 @@ class BaseNode(ABC):
 
         Args:
             parameter: the Parameter on this node that is about to be changed
-            value: the value intended to be set (this has already gone through any converters and validators on the Parameter)
+            value: the value intended to be set (this has already gone through any converters and validators on the Parameter).
+                For a ParameterList fed by a connection to the list itself, this is only what the connection
+                delivered, and the list's own items are not included. It isn't called when one of those items changes.
 
         Returns:
             The final value to set for the Parameter. This gives the Node logic one last opportunity to mutate the value
@@ -779,7 +781,9 @@ class BaseNode(ABC):
 
         Args:
             parameter: the Parameter on this node that was just changed
-            value: the value that was set (already converted, validated, and possibly mutated by the node code)
+            value: the value that was set (already converted, validated, and possibly mutated by the node code).
+                For a ParameterList fed by a connection to the list itself, this is the list the node reads:
+                what the connection delivered, then the list's own items.
 
         Returns:
             Nothing
@@ -1158,7 +1162,7 @@ class BaseNode(ABC):
         # THESE MAY RAISE EXCEPTIONS. These can cause a running Flow to be canceled, or
         # cause a calling object to alter its assumptions/behavior. The value requested
         # to be assigned will NOT be set.
-        candidate_value = self._list_rows.convert_and_validate(parameter, value)
+        candidate_value = self._list_rows.convert_and_validate(parameter, value, initial_setup=initial_setup)
         self._list_rows.check_row_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
 
         # Allow custom node logic to prepare and possibly mutate the value before it is actually set.
@@ -1175,8 +1179,11 @@ class BaseNode(ABC):
                 self._also_record_as_result(parameter, final_value)
 
                 # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
+                # A connected list's hook sees the list the node now reads, its rows' items included.
                 with self._reporting_state_set_by("after_value_set"):
-                    self.after_value_set(parameter=parameter, value=final_value)
+                    self.after_value_set(
+                        parameter=parameter, value=self._list_rows.read_with_rows(parameter, final_value)
+                    )
             if emit_change:
                 self._emit_parameter_lifecycle_event(parameter)
         else:
@@ -1290,7 +1297,7 @@ class BaseNode(ABC):
         # (ParameterDictionary is abstract with no implementations). If one lands, lift this to
         # ParameterContainer and have each subclass supply its own payload-shape check.
         if isinstance(param, ParameterList) and self._has_connected_whole_list_value(param):
-            return self.parameter_values[param_name]
+            return self._connected_list_with_rows(param)
         if isinstance(param, ParameterContainer):
             return handle_container_parameter(self, param)
         if param_name in self.parameter_values:
@@ -1923,9 +1930,6 @@ class BaseNode(ABC):
         """Whether a ParameterList was handed an entire list through a connection to the list itself.
 
         Without that connection the list has no stored value, and is read from its rows.
-
-        Warns when the incoming list overrides manually-set rows or overruns `max_items`, since both
-        are silent data loss otherwise.
         """
         param_name = parameter_list.name
         if param_name not in self.parameter_values:
@@ -1943,30 +1947,24 @@ class BaseNode(ABC):
         if loading_node_name() == self.name:
             return True
 
-        if not self._param_has_incoming_connection(param_name):
-            return False
+        return self._param_has_incoming_connection(param_name)
 
-        child_count = len(parameter_list.find_elements_by_type(Parameter, find_recursively=False))
-        if child_count > 0:
-            logger.warning(
-                "Node '%s' list '%s' is fed by a connection, so its %d manually-set item(s) are being ignored. "
-                "Disconnect the list to use those items instead.",
-                self.name,
-                param_name,
-                child_count,
-            )
+    def _connected_list_with_rows(self, parameter_list: ParameterList) -> list[Any]:
+        """The list a connection delivered, followed by the items of the list's own rows.
 
+        Warns when the result overruns `max_items`, since the extra items may otherwise go unnoticed.
+        """
+        items = self._list_rows.connected_then_rows(parameter_list, self.parameter_values[parameter_list.name])
         max_items = parameter_list.max_items
-        if max_items is not None and len(value) > max_items:
+        if max_items is not None and len(items) > max_items:
             logger.warning(
                 "Node '%s' list '%s' received %d item(s) but accepts at most %d. The node runs with all of them.",
                 self.name,
-                param_name,
-                len(value),
+                parameter_list.name,
+                len(items),
                 max_items,
             )
-
-        return True
+        return items
 
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""
