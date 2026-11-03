@@ -168,7 +168,7 @@ class TestRuntimeLifecycle:
 
         # A request from another engine starts bound to no workflow, so it can open one beside "other".
         engine.event_manager.assign_manager_to_request_type(
-            _ReplaceWorkflowRequest, open_workflow, sender=RequiredSender.ENGINE
+            _ReplaceWorkflowRequest, open_workflow, sender=RequiredSender.ENGINE, without_workflow=None
         )
 
         engine.event_manager.handle_request(
@@ -192,7 +192,9 @@ class TestRuntimeLifecycle:
             acted_on.append(engine.current_workflow())
             return ResultPayloadSuccess(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ReplaceWorkflowRequest, replace_workflow)
+        engine.event_manager.assign_manager_to_request_type(
+            _ReplaceWorkflowRequest, replace_workflow, without_workflow=None
+        )
 
         engine.handle_request(_ReplaceWorkflowRequest())
 
@@ -573,7 +575,7 @@ class TestNodesAndFlowsOnTheRuntime:
             runs.append(asyncio.create_task(read_run_state()))
             return ResultPayloadSuccess(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_StartRunRequest, start_run)
+        engine.event_manager.assign_manager_to_request_type(_StartRunRequest, start_run, without_workflow=None)
         workflow_id = None
         if addressed:
             workflow_id = first.workflow_id

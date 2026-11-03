@@ -28,7 +28,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.objects import WorkflowObjects
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -47,7 +47,7 @@ class ObjectManager(EngineScoped):
         super().__init__(engine)
         _event_manager.register_request_handlers(self)
 
-    @handles(RenameObjectRequest, scope=RequestScope.WORKFLOW)
+    @handles(RenameObjectRequest)
     def on_rename_object_request(self, request: RenameObjectRequest, workflow: WorkflowRuntime) -> ResultPayload:
         # Does the source object exist?
         if request.object_name == request.requested_name:
@@ -107,7 +107,7 @@ class ObjectManager(EngineScoped):
             result_details = details
         return RenameObjectResultSuccess(final_name=final_name, result_details=result_details)
 
-    @handles(ClearAllObjectStateRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+    @handles(ClearAllObjectStateRequest)
     async def on_clear_all_object_state_request(
         self, request: ClearAllObjectStateRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:

@@ -146,7 +146,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -1461,7 +1461,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Resolved workspace for '{request.project_id}': {resolved}",
         )
 
-    @handles(ListProjectTemplatesRequest, scope=RequestScope.HOST)
+    @handles(ListProjectTemplatesRequest)
     async def on_list_project_templates_request(
         self, request: ListProjectTemplatesRequest
     ) -> ListProjectTemplatesResultSuccess:
@@ -3123,7 +3123,7 @@ class ProjectManager(EngineScoped):
             current_id = self._reduce_parent_link_to_id(template, anchor, file_path_to_id)
         return chain
 
-    @handles(SetCurrentProjectRequest, scope=RequestScope.HOST)
+    @handles(SetCurrentProjectRequest)
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
@@ -3550,7 +3550,7 @@ class ProjectManager(EngineScoped):
         """Mark `generation` as adopted, once its activation has fully succeeded."""
         self._last_adopted_generation = max(self._last_adopted_generation, generation)
 
-    @handles(GetCurrentProjectRequest, scope=RequestScope.HOST)
+    @handles(GetCurrentProjectRequest)
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
     ) -> GetCurrentProjectResultSuccess | GetCurrentProjectResultFailure:

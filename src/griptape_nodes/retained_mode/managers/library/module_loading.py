@@ -577,7 +577,8 @@ class LibraryModuleLoading(EngineScoped):
                 handlers = advanced_library.get_request_handlers()
                 for request_type, handler in handlers:
                     event_manager = self.engine.event_manager
-                    event_manager.assign_manager_to_request_type(request_type, handler)
+                    # Ambient unless its `workflow` parameter declares a scope, so a library written before scopes keeps working.
+                    event_manager.assign_manager_to_request_type(request_type, handler, without_workflow=None)
                     library._registered_request_handler_types.append(request_type)
                 if handlers:
                     logger.debug(

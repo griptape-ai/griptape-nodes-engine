@@ -193,13 +193,13 @@ class TestInstallRemoteHandlersSwap:
     """register_remote_handlers forwards everything except the local-only exclusions."""
 
     def test_swap_keeps_the_registered_scope(self) -> None:
-        """The wrapper declares no scope: dispatch keeps calling it as it called the handler it replaced."""
+        """The wrapper takes its original's signature, so dispatch keeps calling it as it called the original."""
         event_manager = EventManager()
 
         async def original(_request: RequestPayload, workflow: object) -> _StubResult:  # noqa: ARG001
             return _StubResult(result_details="ok")
 
-        event_manager.assign_manager_to_request_type(CreateNodeRequest, original, scope=RequestScope.WORKFLOW)
+        event_manager.assign_manager_to_request_type(CreateNodeRequest, original)
 
         register_remote_handlers(event_manager)
 

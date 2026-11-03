@@ -28,6 +28,7 @@ routing metadata.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
@@ -440,6 +441,10 @@ class RemoteHandler:
     original: Any  # HandlerCallback; typed loosely to avoid a runtime import cycle
     event_manager: EventManager
 
+    def __post_init__(self) -> None:
+        # Look like the handler this replaced, so its `workflow` parameter still declares the scope.
+        self.__signature__ = inspect.signature(self.original)
+
     async def __call__(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:
         """Forward `request`, or hand it and `kwargs` (the `workflow` its scope passes) to the original handler.
 
@@ -495,8 +500,8 @@ def register_remote_handlers(event_manager: EventManager) -> None:
     constructed) AND after ``configure_worker_forwarding`` has supplied the RequestClient,
     topic, and loop references. See ``_run_worker`` in app.py.
 
-    A swapped type keeps its declared scope (``RequestScope``): dispatch calls ``RemoteHandler``
-    with the workflow the scope passes, and it hands that workflow to the original.
+    A swapped type keeps its scope (``RequestScope``): ``RemoteHandler`` takes its original's
+    signature, and dispatch calls it with the workflow that scope passes, which it hands to the original.
     """
     for request_type in event_manager.registered_request_types():
         if request_type in LOCAL_ONLY_REQUEST_TYPES:
