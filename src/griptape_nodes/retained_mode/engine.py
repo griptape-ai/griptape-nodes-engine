@@ -746,17 +746,7 @@ class Engine:
             raise WorkflowNotOpenError(msg)
         if bound is not None:
             return bound
-
-        open_workflows = self._open_workflows.all_open()
-        if len(open_workflows) > 1:
-            msg = (
-                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
-                "open and the request did not name one."
-            )
-            raise WorkflowNotNamedError(msg)
-        if not open_workflows:
-            return None
-        return open_workflows[0]
+        return self.only_open_workflow_or_none()
 
     def only_open_workflow_or_none(self) -> WorkflowRuntime | None:
         """The engine's one open workflow, or None when none is open.
