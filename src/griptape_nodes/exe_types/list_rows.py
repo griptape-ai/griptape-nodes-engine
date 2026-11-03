@@ -106,22 +106,49 @@ class ListRows:
             return False
         if not _accepts_whole_list(parameter):
             return False
+        if self._node._param_has_incoming_connection(parameter.name):
+            # A connected list keeps the value as it arrived, ahead of its rows.
+            return False
         if isinstance(value, list) and value == handle_container_parameter(self._node, parameter):
             # Already what the rows hold.
-            return False
-        if self._node._param_has_incoming_connection(parameter.name):
-            # A connected list is read whole, and keeps the value as it arrived.
             return False
         self._replace(parameter, value)
         return True
 
-    def convert_and_validate(self, parameter: Parameter, value: Any) -> Any:
-        """Run `parameter`'s converters and validators on `value`, or on each item of a list a row adds."""
-        convert_and_validate = self._node._convert_and_validate
+    def convert_and_validate(self, parameter: Parameter, value: Any, *, initial_setup: bool) -> Any:
+        """Run `parameter`'s converters and validators on `value`, or on each item of a list a row adds.
+
+        A connected list's validators check the list the node will read: `value`, then its rows' items.
+        Not while loading, which doesn't ask whether the list is connected: the load may not have made
+        the connection yet, or its rows. The value is checked as it is.
+        """
+        node = self._node
+        if isinstance(parameter, ParameterList):
+            candidate_value = node._convert_value(parameter, value)
+            read_value = candidate_value if initial_setup else self.read_with_rows(parameter, candidate_value)
+            for validator in parameter.validators:
+                validator(parameter, read_value)
+            return candidate_value
+        convert_and_validate = node._convert_and_validate
         container = self._container_of(parameter)
         if not isinstance(container, ParameterList) or not container.row_value_is_items(value):
             return convert_and_validate(parameter, value)
         return [convert_and_validate(parameter, item) for item in value]
+
+    def read_with_rows(self, parameter: Parameter, value: Any) -> Any:
+        """What the node reads once a connected list stores `value`: those items, then its rows' items.
+
+        Any other value, or a list read from its rows alone, is returned as it is.
+        """
+        if not isinstance(parameter, ParameterList) or not isinstance(value, list):
+            return value
+        if self.holds_no_value(parameter):
+            return value
+        return self.connected_then_rows(parameter, value)
+
+    def connected_then_rows(self, parameter_list: ParameterList, connected: list[Any]) -> list[Any]:
+        """The items a connection delivered, then the items of the list's own rows."""
+        return [*connected, *handle_container_parameter(self._node, parameter_list)]
 
     def check_row_within_max_items(self, row: Parameter, value: Any, *, initial_setup: bool) -> None:
         if initial_setup:
@@ -153,10 +180,10 @@ class ListRows:
         """
         if container.name in self._being_replaced or initial_setup:
             return
-        if not self.holds_no_value(container):
-            # A connected list holds the value its connection delivered, which the rows don't change.
-            return
-        self._notify(container)
+        # A connected list's before_value_set gets only what its connection delivers, and its return
+        # is stored. A row change doesn't set that, so it runs only the validators and after_value_set.
+        connected = isinstance(container, ParameterList) and not self.holds_no_value(container)
+        self._notify(container, run_before_value_set=not connected)
 
     def has_connected_rows(self, parameter: Parameter) -> bool:
         """Whether `parameter` is a list with a row connected to another node, so its rows can't be replaced.
@@ -232,19 +259,21 @@ class ListRows:
         # Restored without running hooks, which could raise again and hide the error being undone.
         node.parameter_values.update(values)
 
-    def _notify(self, container: ParameterContainer) -> None:
-        """Run the container's validators and hooks on the value its rows now build.
+    def _notify(self, container: ParameterContainer, *, run_before_value_set: bool = True) -> None:
+        """Run the container's validators and hooks on the value the node now reads, the connected list included.
 
         Its converters don't run: each row ran them on its own item. The value isn't stored, since
-        reading the list builds it again. A running node records it as its result.
+        reading the list builds it again, so what before_value_set returns is unused. A running node
+        records it as its result.
         """
         node = self._node
-        value = handle_container_parameter(node, container)
+        value = node._get_raw_parameter_value(container.name)
         for validator in container.validators:
             validator(container, value)
         node._also_record_as_result(container, value)
         with self.hooks_running(container.name):
-            node.before_value_set(parameter=container, value=value)
+            if run_before_value_set:
+                node.before_value_set(parameter=container, value=value)
             with node._reporting_state_set_by("after_value_set"):
                 node.after_value_set(parameter=container, value=value)
 
