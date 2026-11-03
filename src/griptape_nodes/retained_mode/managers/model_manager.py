@@ -68,6 +68,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 from griptape_nodes.utils.async_utils import cancel_subprocess
 from griptape_nodes.utils.engine_dirs import engine_data_dir
 from griptape_nodes.utils.model_download_errors import (
@@ -1110,6 +1111,13 @@ class ModelManager(EngineScoped):
         Returns:
             ResultPayload: Success, meaning the node is cleared to proceed
         """
+        if workflow is None:
+            # Nodes declaring from their own threads name no workflow yet: until they do, the declaring
+            # node is looked up in the only open workflow, so provider- and family-scoped rules still gate it.
+            try:
+                workflow = self.engine.only_open_workflow_or_none()
+            except WorkflowNotNamedError:
+                workflow = None
         # License-policy checkpoint: gate the declared invocation on the stable
         # catalog key, enriched with the provider and family the key resolves to
         # (see _model_checkpoint_attributes) so a provider- or family-scoped rule

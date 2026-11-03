@@ -61,6 +61,7 @@ def _mock_engine(*, credential: str | None = "gt-key") -> MagicMock:
     ]
     engine.get_engine_id.return_value = "engine-1"
     engine.get_session_id.return_value = "session-1"
+    engine.only_open_workflow_or_none.return_value = None
     secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": credential}
     engine.secrets_manager.get_secret.side_effect = lambda name, **_: secrets.get(name)
     return engine
@@ -762,6 +763,19 @@ class TestWorkflowTag:
         ).result
 
         assert isinstance(result, ReportUsageResultSuccess), result.result_details
+        assert _sent(http)["tags"]["workflow"] == workflow.name
+
+    @pytest.mark.asyncio
+    async def test_a_check_naming_no_workflow_is_tagged_with_the_only_open_one(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        """As a node calls from its library's own thread pool: no envelope id and no binding."""
+        http.return_value = _response(200, {"allowed": True})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+
+        result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
         assert _sent(http)["tags"]["workflow"] == workflow.name
 
     @pytest.mark.asyncio

@@ -49,6 +49,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 from griptape_nodes.utils.budget_refusal import (
     BudgetExceededError,
     describe,
@@ -307,6 +308,12 @@ class BudgetManager(EngineScoped):
         project_chain = self._resolve_project_chain()
         if project_chain:
             tags["project"] = project_chain
+        if workflow is None:
+            # Nodes calling from their own threads name no workflow yet: until they do, tag the only open one.
+            try:
+                workflow = self.engine.only_open_workflow_or_none()
+            except WorkflowNotNamedError:
+                workflow = None
         if workflow is not None:
             tags["workflow"] = self.engine.workflow_registry.get(workflow.workflow_id).name
         candidates = {

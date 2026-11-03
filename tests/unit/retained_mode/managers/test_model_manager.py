@@ -14,6 +14,7 @@ Covers:
 """
 
 import asyncio
+import contextvars
 import importlib.util
 import io
 import json
@@ -444,6 +445,41 @@ class TestDeclareModelInvocationCatalogEnrichment:
             "model_families": ["GPT Image"],
         }
 
+    def test_a_declaration_from_a_fresh_context_is_enriched_from_the_only_open_workflow(
+        self,
+        engine: Engine,
+    ) -> None:
+        """As a node declares from its library's own thread pool: no envelope id and no binding."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        self._register_node("Probe_1", engine)
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        engine.event_manager.add_authorization_hook(capture)
+
+        result = (
+            contextvars.Context()
+            .run(
+                engine.event_manager.handle_request,
+                DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
+            )
+            .result
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultSuccess)
+        assert seen["attributes"] == {
+            "id": "gtc_gpt_image_1_mini",
+            "provider_id": "openai",
+            "model_families": ["GPT Image"],
+        }
+
     def test_family_scoped_hook_blocks_the_invocation(self, engine: Engine) -> None:
         # Mirrors a license policy that forbids a family via the attribute form
         # `resource.model_families.contains(...)`: with the family now on the
@@ -497,8 +533,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
 
         assert seen["attributes"] == {"id": "gtc_not_declared"}
 
-    def test_a_node_name_with_no_workflow_falls_back_to_bare_id(self, engine: Engine) -> None:
-        # The node is looked up only in the workflow the declaration is handed, never the open one.
+    def test_a_node_not_in_the_only_open_workflow_falls_back_to_bare_id(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -515,7 +550,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
         manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"), None
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_2"), None
         )
 
         assert seen["attributes"] == {"id": "gtc_gpt_image_1_mini"}
