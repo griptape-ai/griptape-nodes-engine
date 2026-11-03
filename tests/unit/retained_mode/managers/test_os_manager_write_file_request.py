@@ -556,6 +556,25 @@ class TestMetadataInjection:
         provider.collect_metadata_for_write.assert_called_once_with("image.png")
         provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
 
+    def test_metadata_is_collected_for_the_open_workflow_when_the_request_names_none(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """The embedded metadata describes the workflow the sidecar records, not none."""
+        workflow = engine.current_workflow()
+        seen = []
+
+        def collect(file_name: str) -> dict[str, str]:  # noqa: ARG001
+            seen.append(engine.current_workflow_or_none())
+            return {}
+
+        provider = MagicMock()
+        provider.collect_metadata_for_write.side_effect = collect
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
+            result = engine.handle_request(WriteFileRequest(file_path=str(temp_dir / "image.png"), content=b"png"))
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert seen == [workflow]
+
     def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""
         os_manager = engine.os_manager

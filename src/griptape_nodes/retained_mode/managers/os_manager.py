@@ -155,6 +155,7 @@ from griptape_nodes.retained_mode.managers.resource_types.compute_resource impor
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, handles
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
@@ -2753,7 +2754,10 @@ class OSManager(EngineScoped):
             # loop; only the re-encode with the collected metadata goes to a worker thread.
             provider = self.engine.artifact_manager.provider_for_write(file_path.name)
             if provider is not None:
-                metadata = provider.collect_metadata_for_write(file_path.name)
+                # Providers read the bound workflow, so bind the one the file's sidecar records.
+                metadata_workflow = self.engine.project_manager.workflow_for_paths(workflow)
+                with self.engine.bind_workflow(metadata_workflow if metadata_workflow is not None else NO_WORKFLOW):
+                    metadata = provider.collect_metadata_for_write(file_path.name)
                 if metadata:
                     content = await to_thread(provider.prepare_content_for_write, content, file_path.name, metadata)
 
