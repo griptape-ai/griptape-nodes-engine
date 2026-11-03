@@ -300,7 +300,9 @@ def _skill_capability(skill: SkillDefinition, directory: Path, resource_names: l
     instructions = [rendered]
     if resource_names:
         instructions.append(_bundled_files_section(resource_names))
-    return Capability(id=skill.name, description=skill.description, instructions=instructions, defer_loading=True)
+    # Continuation lines are indented, as harness does, so a multiline description can't pose as another catalog entry.
+    description = skill.description.replace("\n", "\n  ")
+    return Capability(id=skill.name, description=description, instructions=instructions, defer_loading=True)
 
 
 def _bundled_files_section(names: list[str]) -> str:
@@ -395,8 +397,16 @@ def _is_text_file(path: Path) -> bool:
 
 
 def _read_resource(resource: SkillResource) -> Any:
-    """The file's text, parsed when it is valid JSON or YAML."""
-    content = resource.path.read_text(encoding="utf-8")
+    """The file's text, parsed when it is valid JSON or YAML.
+
+    Raises:
+        ModelRetry: The file is gone or is not text after all, which only its first bytes were checked for.
+    """
+    try:
+        content = resource.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        msg = f"Resource '{resource.name}' could not be read: {e}"
+        raise ModelRetry(msg) from e
     suffix = PurePosixPath(resource.name).suffix.lower()
     if suffix == ".json":
         try:

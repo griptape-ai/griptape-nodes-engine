@@ -227,7 +227,7 @@ async def test_catalog_lists_each_skill(workspace: Path, threads: Path) -> None:
 
     run = await _drive(_runner(workspace, threads), [])
 
-    assert _catalog(run.steps[0]) == "- alpha: Alpha does folded work.\n- beta: Beta line one.\nBeta line two."
+    assert _catalog(run.steps[0]) == "- alpha: Alpha does folded work.\n- beta: Beta line one.\n  Beta line two."
 
 
 @pytest.mark.asyncio
@@ -415,6 +415,22 @@ async def test_reading_resources(workspace: Path, threads: Path) -> None:
         "Resource 'notes.md' not found in skill 'other-skill'. Available: []. "
         "Use the exact name from the skill instructions."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_resource_that_fails_to_read_is_a_retry(workspace: Path, threads: Path) -> None:
+    """A file that passes the text check on its first bytes but is not text later asks the model to retry."""
+    skill_dir = _write_skill(workspace, "demo-skill")
+    _write(skill_dir / "late.md", b"a" * 70_000 + b"\xff")
+    _write(skill_dir / "notes.md", "notes")
+
+    run = await _drive(
+        _runner(workspace, threads),
+        [_load("demo-skill"), _read("demo-skill", "late.md"), _read("demo-skill", "notes.md")],
+    )
+
+    assert str(run.results[1]).startswith("Resource 'late.md' could not be read:")
+    assert run.results[2] == "notes"
 
 
 @pytest.mark.asyncio
