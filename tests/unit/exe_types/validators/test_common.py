@@ -1,4 +1,4 @@
-"""Tests for `MaxCount`, and for `IfParameter` and the narrowing rules as `pick_validators` walks them."""
+"""Tests for `MaxCount`, and for `IfParameter` and the narrowing rules as `_pick_validators` walks them."""
 
 from __future__ import annotations
 
@@ -7,32 +7,32 @@ import pytest
 from griptape_nodes.exe_types.core_types import ParameterList, ParameterMode
 from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
-from griptape_nodes.exe_types.validators.base import IfParameter, PreRunRule, PreRunValidator, pick_validators
+from griptape_nodes.exe_types.validators.base import IfParameter, PreRunRule, PreRunValidator, _pick_validators
 from griptape_nodes.exe_types.validators.common import MaxCount
-from griptape_nodes.exe_types.validators.context import CheckContext, read_setting
+from griptape_nodes.exe_types.validators.context import CheckContext
+from griptape_nodes.exe_types.validators.runner import _read_setting
 from tests.unit.exe_types.mocks import MockNode
 
 DOCS = "https://example.com/limits"
 
 
 def _ctx(subject: str, docs_url: str | None) -> CheckContext:
-    node = MockNode(name="node")
     parameter = ParameterString(name="prompts")
-    return CheckContext(node=node, parameter=parameter, value=None, subject=subject, docs_url=docs_url)
+    return CheckContext(parameter=parameter, value=None, subject=subject, docs_url=docs_url)
 
 
 def _picked_on(node: MockNode, rule: PreRunRule) -> list[PreRunValidator]:
     """The validators `rule` picks on `node` now, as the runner resolves them."""
 
     def branches(choice: IfParameter) -> tuple[PreRunRule, ...]:
-        return choice.listed_for(read_setting(node, choice.parameter, for_parameter="prompts"))
+        return choice._listed_for(_read_setting(node, choice.parameter, for_parameter="prompts"))
 
-    return [picked.validator for picked in pick_validators(rule, branches)]
+    return [picked.validator for picked in _pick_validators(rule, branches)]
 
 
 def _every_branch(rule: PreRunRule) -> list[PreRunValidator]:
     """Every validator `rule` can pick, as the build-time fit check walks it."""
-    return [picked.validator for picked in pick_validators(rule, IfParameter.every_branch)]
+    return [picked.validator for picked in _pick_validators(rule, IfParameter._every_branch)]
 
 
 class TestMaxCount:
@@ -155,13 +155,13 @@ class TestPickValidators:
             return len(str(value)) > 3  # noqa: PLR2004
 
         rule = IfParameter("model", {"pro": [MaxCount(1), MaxCount(2)]}).first(3).first(2).unless(is_long)
-        picked = pick_validators(rule, IfParameter.every_branch)
+        picked = _pick_validators(rule, IfParameter._every_branch)
         assert [entry.first for entry in picked] == [2, 2]
         assert [entry.conditions for entry in picked] == [((is_long, False),), ((is_long, False),)]
 
     def test_refuses_something_that_is_not_a_rule(self) -> None:
         with pytest.raises(TypeError, match="pre_run_validators takes"):
-            pick_validators("MaxCount(1)", IfParameter.every_branch)  # pyright: ignore[reportArgumentType]
+            _pick_validators("MaxCount(1)", IfParameter._every_branch)  # pyright: ignore[reportArgumentType]
 
     def test_first_refuses_a_count_below_one(self) -> None:
         with pytest.raises(ValueError, match="at least 1"):

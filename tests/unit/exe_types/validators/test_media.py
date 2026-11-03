@@ -33,7 +33,6 @@ from griptape_nodes.utils.media_probe import (
     VideoProbe,
     local_size_bytes,
 )
-from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import (
     HAS_FFMPEG,
     HEIC_PHOTO,
@@ -59,7 +58,6 @@ needs_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg and ffprobe are
 def _ctx(media: MediaFile, docs_url: str | None = None) -> CheckContext:
     """A context for one input whose file reads as `media`."""
     ctx = CheckContext(
-        node=MockNode(name="node"),
         parameter=Parameter(name="input", tooltip="", type="str"),
         value=media.location,
         subject=SUBJECT,

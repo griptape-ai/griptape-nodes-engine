@@ -406,11 +406,11 @@ or False. A condition on a media file reads it through `ctx.media` (see "Limits 
 below). A limit that depends on another parameter's value is an `IfParameter`.
 
 ```python
-def is_long(value, ctx) -> bool:
-    return len(str(value).split()) > 50
+def is_draft(value, ctx) -> bool:
+    return str(value).startswith("draft:")
 
 
-MaxWords(100).unless(is_long)
+MaxWords(100).unless(is_draft)
 ```
 
 **Rules across several inputs.** For a limit that involves more than one input, such as a combined
@@ -443,8 +443,8 @@ class Generate(SuccessFailureNode):
 `IfParameter` or `.first(n)`. For one none of them covers, subclass `PreRunValidator` and implement
 `check(value, ctx)`. Return `limit_error(message, ctx.docs_url)`, or None, so the error links the
 provider's limits page like a built-in's. `ctx` is a `CheckContext`: `ctx.subject` starts the
-message naming the input, `ctx.position` is a list item's position, `ctx.media` reads a media file,
-and `ctx.setting(name)` reads another parameter's value. A single input with no value, and each empty row of a list, is skipped
+message naming the input, `ctx.position` is a list item's position, and `ctx.media` reads a media
+file. A limit that depends on another parameter's value is an `IfParameter`. A single input with no value, and each empty row of a list, is skipped
 before any validator runs; a validator with `checks_whole_list` still gets the list, even an empty
 one. Check that a required input is set in the node's `validate_before_node_run`.
 
@@ -601,7 +601,9 @@ A limit on an image, video or audio file subclasses `MediaValidator` instead, an
 through `ctx.media`, a `MediaFile` whose properties (`size_bytes`, `image`, `video`, `audio`,
 `frame`, `mime_type` and the rest) are read the first time a check asks for each, once per input
 however many validators ask. Set `kinds` to the media it can check, so the engine refuses it on a
-parameter holding another kind when the node is built. A property that can't be read here is None:
+parameter holding another kind when the node is built; a subclass without `kinds` is refused when
+it's defined. Reading `ctx.media` where there's no one file to read, on a parameter that holds no
+media or in a validator that checks the whole list, raises a `TypeError`. A property that can't be read here is None:
 skip the check then. For a reading `MediaFile` doesn't carry, call a reader (`local_size_bytes`,
 `local_image_info`, `local_image_format`, `local_video_probe`, `local_audio_probe`) from
 `griptape_nodes.utils.media_probe`; during the node's checks it returns what was already read.

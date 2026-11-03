@@ -1,7 +1,8 @@
 """Limits on image, video and audio files: validators that read the value's file through `ctx.media`.
 
-`MediaValidator` adds one thing to `PreRunValidator`: the kinds of media it can check (`kinds`), so a
-validator on a parameter that holds none of them is refused when the node is built. Everything else
+`MediaValidator` adds one thing to `PreRunValidator`: the kinds of media it can check (`kinds`), which
+every subclass must set, so a validator on a parameter that holds none of them is refused when the
+node is built. Everything else
 is a plain `check(value, ctx)`, reading what it needs from `ctx.media` (a `MediaFile`), which reads
 each property of the file the first time a check asks for it.
 
@@ -15,7 +16,8 @@ validators already read.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, override
+import inspect
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 from griptape_nodes.exe_types.validators.base import PreRunValidator
 from griptape_nodes.exe_types.validators.context import media_kind_of
@@ -25,8 +27,6 @@ if TYPE_CHECKING:
     from griptape_nodes.utils.media_values import MediaKind
 
 __all__ = ["MediaValidator"]
-
-ALL_MEDIA_KINDS: frozenset[MediaKind] = frozenset({"image", "video", "audio"})
 
 
 class MediaValidator(PreRunValidator):
@@ -46,10 +46,21 @@ class MediaValidator(PreRunValidator):
     ```
 
     A property `ctx.media` can't read here is None; skip the check then, and leave it to the provider.
+    A subclass that doesn't set `kinds` is refused when it's defined.
     """
 
     # The kinds of media `check` can judge. A parameter holding any other kind refuses the validator.
-    kinds: ClassVar[frozenset[MediaKind]] = ALL_MEDIA_KINDS
+    kinds: ClassVar[frozenset[MediaKind]]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if inspect.isabstract(cls) or getattr(cls, "kinds", None):
+            return
+        msg = (
+            f"Attempted to define {cls.__name__}. Failed because a MediaValidator must set `kinds` to the "
+            'media it checks, such as kinds = frozenset({"image"}), so it can be refused where it could never fire.'
+        )
+        raise TypeError(msg)
 
     @override
     def require_fits(self, parameter: Parameter) -> None:

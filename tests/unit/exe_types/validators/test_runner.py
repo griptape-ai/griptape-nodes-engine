@@ -368,24 +368,6 @@ class TestLists:
             )
         )
 
-    def test_a_whole_list_media_validator_reads_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A validator handed the whole list judges the list, so `ctx.media` reads no file for it.
-        seen: list[int | None] = []
-        monkeypatch.setattr(media_probe, "_read_size_bytes", lambda _location: pytest.fail("nothing should be read"))
-
-        class TotalSize(MediaValidator):
-            checks_whole_list = True
-
-            @override
-            def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
-                seen.append(ctx.media.size_bytes)
-                return None
-
-        node = self._list_node(TotalSize())
-        node.set_parameter_value("reference_images", [str(image_file(tmp_path, 10, 10))])
-        assert validate_inputs(node) == []
-        assert seen == [None]
-
     def test_checks_each_item_by_its_position(self, tmp_path: Path) -> None:
         node = self._list_node(SideRange(min=300))
         images = [str(image_file(tmp_path, 400, 400)), str(image_file(tmp_path, 200, 1000))]
@@ -965,3 +947,33 @@ def test_a_value_that_is_not_media_reads_as_nothing(tmp_path: Path) -> None:
     """On a parameter that holds no media, `ctx.media` reads nothing, even for a path to a real image."""
     media = MediaFile.of(str(image_file(tmp_path, 10, 10)), kind=None)
     assert (media.size_bytes, media.frame, media.mime_type, media.display_frame) == (None, None, None, None)
+
+
+class TestMistakesInACustomValidator:
+    """A mistake in a validator's own code fails loudly instead of skipping its check."""
+
+    def test_reading_the_media_file_of_a_parameter_that_holds_none_raises(self, tmp_path: Path) -> None:
+        class AnySize(PreRunValidator):
+            @override
+            def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+                return NodeError("too big") if (ctx.media.size_bytes or 0) > 1 else None
+
+        node = _node_with(ParameterString(name="path", pre_run_validators=[AnySize()]))
+        node.set_parameter_value("path", str(image_file(tmp_path, 10, 10)))
+        with pytest.raises(TypeError, match="isn't an image, video or audio artifact"):
+            validate_inputs(node)
+
+    def test_a_media_condition_on_a_whole_list_validator_raises(self, tmp_path: Path) -> None:
+        # The whole list has no one file, so `is_png` could never hold and the count would never be checked.
+        node = TestLists._list_node(MaxCount(1).when(_is_png))
+        node.set_parameter_value("reference_images", [str(image_file(tmp_path, 10, 10)) for _ in range(2)])
+        with pytest.raises(TypeError, match="given the whole list, not one file"):
+            validate_inputs(node)
+
+    def test_a_media_validator_that_does_not_say_what_it_checks_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="must set `kinds`"):
+
+            class EvenSides(MediaValidator):  # pyright: ignore[reportUnusedClass]
+                @override
+                def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+                    return None

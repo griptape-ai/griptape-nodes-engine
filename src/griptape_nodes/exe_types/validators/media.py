@@ -67,6 +67,7 @@ __all__ = [
     "VideoCodecs",
 ]
 
+_ANY_KIND: frozenset[MediaKind] = frozenset({"image", "video", "audio"})
 _FRAME_KINDS: frozenset[MediaKind] = frozenset({"image", "video"})
 _LENGTH_KINDS: frozenset[MediaKind] = frozenset({"video", "audio"})
 _VIDEO: frozenset[MediaKind] = frozenset({"video"})
@@ -86,6 +87,8 @@ class MaxFileSize(MediaValidator):
             refused too.
         fix: What the artist can do about it. Defaults to "Use a smaller file."
     """
+
+    kinds = _ANY_KIND
 
     maximum_bytes: int
     strict: bool = False
@@ -115,6 +118,8 @@ class AllowedFormats(MediaValidator):
     Raises:
         TypeError: If a format isn't a string, such as a tuple passed as one argument.
     """
+
+    kinds = _ANY_KIND
 
     mime_types: tuple[str, ...]
 

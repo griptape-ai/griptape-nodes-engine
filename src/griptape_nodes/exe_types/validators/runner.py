@@ -14,17 +14,12 @@ from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.validators._checks import input_noun, input_subject
 from griptape_nodes.exe_types.validators.base import (
     IfParameter,
-    PickedValidator,
     PreRunRule,
-    holds_list,
-    pick_validators,
+    _holds_list,
+    _pick_validators,
+    _PickedValidator,
 )
-from griptape_nodes.exe_types.validators.context import (
-    CheckContext,
-    SettingUnavailableError,
-    UnknownSettingError,
-    read_setting,
-)
+from griptape_nodes.exe_types.validators.context import CheckContext
 from griptape_nodes.utils.media_probe import reading_once
 
 if TYPE_CHECKING:
@@ -65,7 +60,7 @@ def validate_inputs(node: BaseNode) -> list[NodeError]:
     for parameter in declared:
         try:
             picked = _picked_now(node, parameter)
-        except UnknownSettingError as e:
+        except _UnknownSettingError as e:
             errors.append(NodeError(str(e), links=None))
             continue
         if not picked:
@@ -74,7 +69,7 @@ def validate_inputs(node: BaseNode) -> list[NodeError]:
     return errors
 
 
-def _picked_now(node: BaseNode, parameter: Parameter) -> list[PickedValidator]:
+def _picked_now(node: BaseNode, parameter: Parameter) -> list[_PickedValidator]:
     """The validators that apply to a parameter at the node's turn, each `IfParameter` resolved.
 
     An `IfParameter` whose setting is held in another process picks nothing.
@@ -82,46 +77,44 @@ def _picked_now(node: BaseNode, parameter: Parameter) -> list[PickedValidator]:
 
     def branches(rule: IfParameter) -> Sequence[PreRunRule]:
         try:
-            current = read_setting(node, rule.parameter, for_parameter=parameter.name)
-        except SettingUnavailableError:
+            current = _read_setting(node, rule.parameter, for_parameter=parameter.name)
+        except _SettingUnavailableError:
             return ()
-        return rule.listed_for(current)
+        return rule._listed_for(current)
 
-    picked: list[PickedValidator] = []
+    picked: list[_PickedValidator] = []
     for rule in parameter.pre_run_validators:
-        picked.extend(pick_validators(rule, branches))
+        picked.extend(_pick_validators(rule, branches))
     return picked
 
 
 def _check_parameter(
-    node: BaseNode, parameter: Parameter, picked: Sequence[PickedValidator], *, docs_url: str | None
+    node: BaseNode, parameter: Parameter, picked: Sequence[_PickedValidator], *, docs_url: str | None
 ) -> list[NodeError]:
     """Run one parameter's validators on its value, or on each item and the whole list."""
     shown_name = parameter.display_name or parameter.name
     noun = input_noun(parameter)
-    if not holds_list(parameter):
+    if not _holds_list(parameter):
         value = _value_here(node, parameter.name)
         if value is None:
             return []
         subject = input_subject(shown_name, noun=noun)
-        ctx = CheckContext(node=node, parameter=parameter, value=value, subject=subject, docs_url=docs_url)
+        ctx = CheckContext(parameter=parameter, value=value, subject=subject, docs_url=docs_url)
         return _run(picked, value, ctx)
 
     items = _list_items(node, parameter)
     whole_list = [entry for entry in picked if entry.validator.checks_whole_list]
     per_item = [entry for entry in picked if not entry.validator.checks_whole_list]
-    ctx = CheckContext(node=node, parameter=parameter, value=items, subject=shown_name, docs_url=docs_url)
+    ctx = CheckContext(parameter=parameter, value=items, subject=shown_name, docs_url=docs_url)
     errors = _run(whole_list, items, ctx)
     for position, item in enumerate(items, start=1):
         subject = input_subject(shown_name, noun=noun, position=position)
-        ctx = CheckContext(
-            node=node, parameter=parameter, value=item, subject=subject, docs_url=docs_url, position=position
-        )
+        ctx = CheckContext(parameter=parameter, value=item, subject=subject, docs_url=docs_url, position=position)
         errors.extend(_run(per_item, item, ctx))
     return errors
 
 
-def _run(picked: Sequence[PickedValidator], value: Any, ctx: CheckContext) -> list[NodeError]:
+def _run(picked: Sequence[_PickedValidator], value: Any, ctx: CheckContext) -> list[NodeError]:
     """Each error the validators that apply to `value` report, sharing one context."""
     errors: list[NodeError] = []
     for entry in picked:
@@ -131,6 +124,34 @@ def _run(picked: Sequence[PickedValidator], value: Any, ctx: CheckContext) -> li
         if error is not None:
             errors.append(error)
     return errors
+
+
+class _UnknownSettingError(ValueError):
+    """An `IfParameter` names a parameter the node doesn't have, such as a misspelled one."""
+
+
+class _SettingUnavailableError(Exception):
+    """The parameter an `IfParameter` reads is held in another process and can't be read here."""
+
+
+def _read_setting(node: BaseNode, name: str, *, for_parameter: str) -> Any:
+    """The current value of the parameter an `IfParameter` on `for_parameter` picks its limits by.
+
+    Raises:
+        _UnknownSettingError: If the node has no parameter called `name`, so a misspelled name fails
+            the node's checks instead of reading as None and quietly applying `default`.
+        _SettingUnavailableError: If the value is held in another process and can't be read here.
+    """
+    if node.get_parameter_by_name(name) is None:
+        msg = (
+            f"Attempted to read parameter '{name}' to pick the limits for '{for_parameter}'. "
+            f"Failed because the node has no parameter called '{name}'."
+        )
+        raise _UnknownSettingError(msg)
+    try:
+        return node.get_parameter_value(name)
+    except RuntimeError as e:
+        raise _SettingUnavailableError(name) from e
 
 
 def _value_here(node: BaseNode, name: str) -> Any:

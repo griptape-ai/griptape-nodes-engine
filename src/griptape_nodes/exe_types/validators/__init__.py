@@ -11,7 +11,7 @@ from griptape_nodes.exe_types.validators import AllowedFormats, MaxFileSize  # l
   for limits that depend on another parameter's value; `Condition`, what `when` and `unless` take to
   narrow any rule; and `PreRunRule`, the type of anything `pre_run_validators=` takes.
 - `context`: `CheckContext`, what `check` and a condition are handed: the input's subject and limits
-  page, its media file (`ctx.media`), and other parameters' values (`ctx.setting`).
+  page, and its media file (`ctx.media`).
 - `common`: `MaxCount` for a list's length.
 - `media_validator`: `MediaValidator`, the family for image, video and audio files.
 - `media`: the built-in media limits, such as `MaxFileSize` or `MaxDuration`.
