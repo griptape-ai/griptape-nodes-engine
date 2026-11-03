@@ -104,6 +104,11 @@ def sender_rules(attr: object) -> dict[type[RequestPayload], SenderRule]:
     return getattr(getattr(attr, "__func__", attr), _SENDER_RULES_ATTR, {})
 
 
+def takes_workflow_parameter(handler: Callable[..., Any]) -> bool:
+    """Whether `handler`'s signature names a `workflow` parameter."""
+    return "workflow" in inspect.signature(handler).parameters
+
+
 def scope_from_signature(handler: Callable[..., Any]) -> RequestScope | None:
     """The scope `handler`'s `workflow` parameter declares, or None when it has no `workflow` parameter.
 

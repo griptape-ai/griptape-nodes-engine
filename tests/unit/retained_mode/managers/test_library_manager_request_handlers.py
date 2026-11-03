@@ -168,6 +168,18 @@ class TestRequestHandlerRegistration:
         assert engine.event_manager.get_scope_for_request_type(_TestRequest) is None
         assert str(engine.handle_request(_TestRequest()).result_details) == workflow.workflow_id
 
+    def test_a_handler_taking_kwargs_and_no_workflow_stays_ambient(self, engine: Engine) -> None:
+        """Its signature can't say whether it takes a workflow, so it keeps the request-only call it had."""
+
+        def handler(request: _TestRequest, **kwargs: object) -> _TestResult:
+            return _TestResult(result_details=f"{type(request).__name__} {sorted(kwargs)}")
+
+        library_info = _load(engine, handler)
+
+        assert library_info.problems == []
+        assert engine.event_manager.get_scope_for_request_type(_TestRequest) is None
+        assert str(engine.handle_request(_TestRequest()).result_details) == "_TestRequest []"
+
     def test_a_handler_with_a_workflow_parameter_is_handed_the_workflow(self, engine: Engine) -> None:
         def handler(request: _TestRequest, workflow: WorkflowRuntime) -> _TestResult:  # noqa: ARG001
             return _TestResult(result_details=workflow.workflow_id)

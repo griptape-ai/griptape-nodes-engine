@@ -52,6 +52,7 @@ from griptape_nodes.retained_mode.request_handlers import (
     handled_request_types,
     scope_from_signature,
     sender_rules,
+    takes_workflow_parameter,
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
@@ -1001,7 +1002,10 @@ class EventManager(EngineScoped):
         if existing_manager is not None:
             msg = f"Attempted to assign an event of type {request_type} to manager {callback.__name__}, but that request is already assigned to manager {existing_manager.__name__}."
             raise ValueError(msg)
-        scope = scope_from_signature(callback)
+        scope = None
+        # A library handler that names no `workflow` stays ambient, even one taking *args or **kwargs.
+        if without_workflow is not None or takes_workflow_parameter(callback):
+            scope = scope_from_signature(callback)
         if scope is None and request_type.__name__ not in AMBIENT_UNTIL_MIGRATED:
             scope = without_workflow
         self._request_type_to_manager[request_type] = callback
