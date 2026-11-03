@@ -569,7 +569,7 @@ def _tool_selection_for_request(request: object) -> _ToolSelection:
     if not isinstance(request, Request):
         return _ToolSelection(include_engine_tools=True, library_slugs=())
 
-    # The path relative to the /mcp mount, so "/mcp/libraries/nuke/" reads as ["libraries", "nuke"].
+    # The path relative to the /mcp mount, so "/mcp/libraries/acme/" reads as ["libraries", "acme"].
     route_path = request.scope["path"].removeprefix(request.scope.get("root_path", ""))
     segments = [segment for segment in route_path.split("/") if segment]
     library_path_length = 2

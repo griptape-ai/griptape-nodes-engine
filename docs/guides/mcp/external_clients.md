@@ -25,17 +25,18 @@ Some node libraries provide their own MCP tools (see
 tools aren't served at the main address above.
 
 To use one library's tools, add its address to your client as a separate server. The address
-ends with the library's name in lowercase, with underscores in place of spaces and punctuation:
+ends with the library's name in lowercase, with underscores in place of spaces and punctuation.
+For a library named "Acme Render Tools":
 
 ```
-http://localhost:8125/mcp/libraries/nuke_nodes_library/
+http://localhost:8125/mcp/libraries/acme_render_tools/
 ```
 
 Or, to get the engine's tools and some libraries' tools from one server, add the libraries to the
-main address, separated by commas:
+main address, separated by commas. For "Acme Render Tools" and "Paint & Composite Tools":
 
 ```
-http://localhost:8125/mcp/?libraries=nuke_nodes_library,other_library
+http://localhost:8125/mcp/?libraries=acme_render_tools,paint_composite_tools
 ```
 
 ## Overrides

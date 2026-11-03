@@ -175,7 +175,7 @@ class AdvancedNodeLibrary:
         - ``/mcp/?libraries=<slug>,<slug>`` serves the engine's tools plus the named libraries'.
 
         The slug is the library name in lowercase, with each run of spaces and punctuation
-        replaced by one underscore, so "Nuke Nodes Library" becomes ``nuke_nodes_library``.
+        replaced by one underscore, so "Acme Render Tools" becomes ``acme_render_tools``.
 
         Example:
             def get_mcp_tools(self):

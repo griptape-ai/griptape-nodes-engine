@@ -536,12 +536,12 @@ class TestToolSelectionForRequest:
         assert selection.include_engine_tools is True
         assert selection.library_slugs == ("b", "a")
 
-    @pytest.mark.parametrize("url_path", ["/mcp/libraries/nuke/", "/mcp/libraries/nuke"])
+    @pytest.mark.parametrize("url_path", ["/mcp/libraries/acme/", "/mcp/libraries/acme"])
     def test_library_endpoint_serves_one_library_only(self, url_path: str) -> None:
         selection = _tool_selection_for_request(_context_for(url_path).request)
 
         assert selection.include_engine_tools is False
-        assert selection.library_slugs == ("nuke",)
+        assert selection.library_slugs == ("acme",)
 
     def test_non_http_request_gets_engine_tools(self) -> None:
         selection = _tool_selection_for_request(None)
