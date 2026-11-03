@@ -154,7 +154,13 @@ def test_update_thread_metadata_rename(storage: LocalThreadStorageDriver) -> Non
 def test_append_run_record_appears_in_get_thread_metadata(storage: LocalThreadStorageDriver) -> None:
     """append_run_record persists a RunRecord that get_thread_metadata returns."""
     thread_id, _ = storage.create_thread(title="conversation")
-    record = RunRecord(message_index=1, provider_name="griptape_cloud", model="claude-sonnet-5", mcp_servers=["brave"])
+    record = RunRecord(
+        message_index=1,
+        provider_name="griptape_cloud",
+        model="claude-sonnet-5",
+        mcp_servers=["brave"],
+        library_mcp_servers=["acme_render_tools"],
+    )
     storage.append_run_record(thread_id, record)
 
     thread = storage.get_thread_metadata(thread_id)

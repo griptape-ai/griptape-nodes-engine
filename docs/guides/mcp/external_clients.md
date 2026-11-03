@@ -22,7 +22,8 @@ INFO MCP server listening at http://127.0.0.1:8125/mcp/
 
 Some node libraries provide their own MCP tools (see
 [`get_mcp_tools`](../../development/custom_nodes/advanced_libraries.md#get_mcp_tools)). These
-tools aren't served at the main address above.
+tools aren't served at the main address above. The editor's chat agent picks them up without
+any setup (see [Library tools](../agent/mcp_servers.md#library-tools)).
 
 To use one library's tools, add its address to your client as a separate server. The address
 ends with the library's name in lowercase, with underscores in place of spaces and punctuation.

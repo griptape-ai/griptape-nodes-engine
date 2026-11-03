@@ -184,6 +184,16 @@ LIBRARIES_QUERY_PARAM = "libraries"
 
 
 @dataclass(frozen=True)
+class LibraryMCPTools:
+    """The MCP tools one loaded library exposes."""
+
+    library_name: str
+    # The library's name in the address it is served at, /mcp/libraries/<slug>/.
+    slug: str
+    tools: list[MCPTool]
+
+
+@dataclass(frozen=True)
 class _ToolSelection:
     """Which tools the endpoint a request arrived on serves."""
 
@@ -582,20 +592,31 @@ def _tool_selection_for_request(request: object) -> _ToolSelection:
     return _ToolSelection(include_engine_tools=True, library_slugs=slugs)
 
 
+def list_library_mcp_tools() -> list[LibraryMCPTools]:
+    """Return the loaded libraries that expose MCP tools, with their tools.
+
+    Must run on the engine loop: libraries load and unload there, and reading the registry from
+    another thread can catch it mid-change.
+    """
+    libraries: list[LibraryMCPTools] = []
+    for library_name in LibraryRegistry.list_libraries():
+        tools = LibraryRegistry.get_library(library_name).get_mcp_tools()
+        if tools:
+            libraries.append(
+                LibraryMCPTools(library_name=library_name, slug=library_config_slug(library_name), tools=tools)
+            )
+    return libraries
+
+
 def _collect_library_tools(slugs: tuple[str, ...]) -> dict[str, list[MCPTool]]:
     """Return the MCP tools of the loaded libraries whose slugs are given, keyed by slug.
 
-    Slugs whose libraries expose no tools are left out. Must run on the engine loop: libraries
-    load and unload there, and reading the registry from another thread can catch it mid-change.
+    Slugs whose libraries expose no tools are left out. Must run on the engine loop.
     """
     tools_by_slug: dict[str, list[MCPTool]] = {}
-    for library_name in LibraryRegistry.list_libraries():
-        slug = library_config_slug(library_name)
-        if slug not in slugs:
-            continue
-        tools = LibraryRegistry.get_library(library_name).get_mcp_tools()
-        if tools:
-            tools_by_slug.setdefault(slug, []).extend(tools)
+    for library in list_library_mcp_tools():
+        if library.slug in slugs:
+            tools_by_slug.setdefault(library.slug, []).extend(library.tools)
     return tools_by_slug
 
 

@@ -308,6 +308,10 @@ learn what the tool does and its fields to learn what to send, so write the docs
 an agent that has never seen your product. Set `read_only=True` on tools that only read
 state. Clients use it to skip asking the user before a call.
 
+In the editor, your library appears under **Libraries** in the chat sidebar's **MCP servers**
+dropdown, so users can give the built-in agent your tools without any setup. The agent asks
+the user before calling any tool without `read_only=True`.
+
 Your tools stay off the engine's own address, so agents that don't use your product don't
 have to load them. With the server at its default `http://localhost:8125/mcp/`:
 
