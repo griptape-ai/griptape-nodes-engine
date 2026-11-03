@@ -5,6 +5,7 @@ import inspect
 import logging
 import threading
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from unittest.mock import AsyncMock, patch
 
@@ -361,59 +362,123 @@ class _ForwardableProbeResult(ResultPayloadSuccess):
     """Minimal success payload paired with _ForwardableProbeRequest."""
 
 
-class TestHandleRequestForwardingFromRunningLoop:
-    """``handle_request`` dispatch of a RemoteHandler from inside a running loop.
+_caller_marker: ContextVar[str | None] = ContextVar("_caller_marker", default=None)
 
-    From a side loop on another thread, such as one a sync request drives, the
-    forward runs on the engine loop and the caller's thread blocks on it. On the
-    engine loop itself that would never return, so it fails. Outside node
-    execution the RemoteHandler is not involved and the request runs locally.
-    """
+
+class TestHandleRequestFromAnotherThread:
+    """A sync request from a thread other than the engine loop's runs on the loop, which owns engine state."""
 
     @pytest.mark.asyncio
-    async def test_sync_dispatch_from_a_side_loop_forwards_on_the_engine_loop(self) -> None:
+    @pytest.mark.timeout(10, method="thread")
+    async def test_a_sync_handler_runs_on_the_loop_thread(self) -> None:
         event_manager = EventManager()
+        event_manager.initialize_queue()
+        handler_threads: list[int] = []
 
-        # The engine loop runs on another thread; the test's loop stands in for a side loop.
-        engine_loop = asyncio.new_event_loop()
-        engine_thread = threading.Thread(target=engine_loop.run_forever, daemon=True)
-        engine_thread.start()
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            handler_threads.append(threading.get_ident())
+            return _ProbeResult(result_details="ok")
 
-        captured: dict[str, object] = {}
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
 
-        async def fake_forward(
-            _request: RequestPayload,
-            _result_context: object,
-        ) -> EventResultSuccess:
-            # Record which loop actually executed the forward.
-            captured["forward_loop"] = asyncio.get_running_loop()
-            return EventResultSuccess(
-                request=_request,
-                result=_ForwardableProbeResult(result_details="forwarded"),
-            )
+        result = await asyncio.to_thread(event_manager.handle_request, _ProbeRequest())
 
-        # Register a RemoteHandler shape: dispatch table entry points at it directly.
-        # ``handle_request`` detects RemoteHandler via isinstance and forwards on the engine loop.
+        assert result.succeeded()
+        assert handler_threads == [threading.get_ident()]
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_an_async_handler_runs_on_the_engine_loop(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue()
+        handler_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            handler_loops.append(asyncio.get_running_loop())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        result = await asyncio.to_thread(event_manager.handle_request, _ProbeRequest())
+
+        assert result.succeeded()
+        assert handler_loops == [asyncio.get_running_loop()]
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_the_callers_context_reaches_the_handler(self) -> None:
+        """The workflow and node a node thread is bound to must carry over to the loop."""
+        event_manager = EventManager()
+        event_manager.initialize_queue()
+        seen: list[str | None] = []
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            seen.append(_caller_marker.get())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        def call_from_node_thread() -> None:
+            _caller_marker.set("node-thread")
+            event_manager.handle_request(_ProbeRequest())
+
+        await asyncio.to_thread(call_from_node_thread)
+
+        assert seen == ["node-thread"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_a_request_from_a_thread_the_loop_is_blocked_on_runs_on_that_thread(self) -> None:
+        """Sync code on the loop drives an async handler on a side thread; the loop cannot take its requests."""
+        event_manager = EventManager()
+        event_manager.initialize_queue()
+        inner_threads: list[int] = []
+
+        def inner(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
+            inner_threads.append(threading.get_ident())
+            return _ForwardableProbeResult(result_details="inner")
+
+        async def outer(_request: _ProbeRequest) -> _ProbeResult:
+            event_manager.handle_request(_ForwardableProbeRequest())
+            return _ProbeResult(result_details="outer")
+
+        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, inner)
+        event_manager.assign_manager_to_request_type(_ProbeRequest, outer)
+
+        result = event_manager.handle_request(_ProbeRequest())
+
+        assert result.succeeded()
+        assert inner_threads
+        assert inner_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_a_worker_node_thread_forwards_on_the_engine_loop(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue()
+        forward_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def fake_forward(request: RequestPayload, _result_context: object) -> EventResultSuccess:
+            forward_loops.append(asyncio.get_running_loop())
+            return EventResultSuccess(request=request, result=_ForwardableProbeResult(result_details="forwarded"))
+
         async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
             return _ForwardableProbeResult(result_details="local")
 
-        remote = RemoteHandler(original=original, event_manager=event_manager)
-        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
-        event_manager._event_loop = engine_loop
+        event_manager.assign_manager_to_request_type(
+            _ForwardableProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
+        )
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
-        try:
-            with event_manager.node_execution_scope():
-                result = event_manager.handle_request(_ForwardableProbeRequest())
-        finally:
-            engine_loop.call_soon_threadsafe(engine_loop.stop)
-            engine_thread.join(timeout=1.0)
-            engine_loop.close()
+        with event_manager.node_execution_scope():
+            result = await asyncio.to_thread(event_manager.handle_request, _ForwardableProbeRequest())
 
-        assert captured["forward_loop"] is engine_loop
-        assert isinstance(result, EventResultSuccess)
-        assert isinstance(result.result, _ForwardableProbeResult)
+        assert forward_loops == [asyncio.get_running_loop()]
         assert "forwarded" in str(result.result.result_details)
+
+
+class TestHandleRequestForwardingOnTheLoop:
+    """On the engine loop a worker's sync forward would block the loop its reply arrives on."""
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10, method="thread")

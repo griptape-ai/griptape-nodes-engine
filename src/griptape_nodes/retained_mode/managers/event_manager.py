@@ -58,11 +58,10 @@ from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
     import types
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Coroutine, Iterator
     from collections.abc import Set as AbstractSet
 
     from griptape_nodes.api_client.request_client import RequestClient
-    from griptape_nodes.app.worker_routing import RemoteHandler
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -322,6 +321,10 @@ class EventManager(EngineScoped):
         self._loop_thread_id: int | None = None
         # Keep a reference to the event loop for thread-safe operations
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        # How many sync bridges the loop thread is currently blocked in (see `_while_loop_blocks`).
+        # While it is above zero, a request from another thread cannot run on the loop.
+        self._loop_blocked_depth: int = 0
+        self._loop_blocked_lock = threading.Lock()
         # Worker-to-orchestrator forwarding state. Inert until
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
@@ -454,6 +457,33 @@ class EventManager(EngineScoped):
             and current_thread_id != self._loop_thread_id
             and self._event_loop is not None
         )
+
+    def _should_run_on_loop(self) -> bool:
+        """Whether a sync request from this thread should run on the engine loop instead.
+
+        The loop owns engine state, so requests from node threads and library thread pools run
+        there. Not while the loop thread is blocked in a sync bridge: the bridge may be waiting on
+        this very thread, and the request would never run.
+        """
+        loop = self._event_loop
+        if loop is None or not loop.is_running() or not self._is_cross_thread_call():
+            return False
+        with self._loop_blocked_lock:
+            return self._loop_blocked_depth == 0
+
+    @contextmanager
+    def _while_loop_blocks(self) -> Iterator[None]:
+        """Mark the loop thread as blocked for the duration, if this is the loop thread."""
+        on_loop_thread = self._loop_thread_id is not None and threading.get_ident() == self._loop_thread_id
+        if on_loop_thread:
+            with self._loop_blocked_lock:
+                self._loop_blocked_depth += 1
+        try:
+            yield
+        finally:
+            if on_loop_thread:
+                with self._loop_blocked_lock:
+                    self._loop_blocked_depth -= 1
 
     def put_event(self, event: Any) -> None:
         """Put event into async queue from sync context (non-blocking).
@@ -865,7 +895,7 @@ class EventManager(EngineScoped):
                 # and whose underlying `call_soon_threadsafe` captures
                 # `copy_context()` on *this* thread. Entering a fresh context first is
                 # what makes the copy it takes an empty one.
-                with ThreadRunner() as runner:
+                with self._while_loop_blocks(), ThreadRunner() as runner:
                     contextvars.Context().run(runner.run, coro)
             else:
                 contextvars.Context().run(asyncio.run, coro)
@@ -1668,7 +1698,18 @@ class EventManager(EngineScoped):
                 open_workflow_id, the open workflow the request runs in, echoed on the result. The
                 handler runs bound to that open workflow; one that names no open workflow fails the
                 request. A HOST handler ignores open_workflow_id (see `RequestScope`).
+
+        Called from a thread other than the engine loop's, as node code is, the request runs on the
+        loop, which owns engine state, and this thread blocks until it finishes. The loop schedules it
+        with a copy of this thread's context, so the workflow and node the caller is bound to carry over.
         """
+        if self._should_run_on_loop():
+            future = asyncio.run_coroutine_threadsafe(
+                self.ahandle_request(request, result_context=result_context),
+                cast("asyncio.AbstractEventLoop", self._event_loop),
+            )
+            return future.result()
+
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
@@ -1734,7 +1775,11 @@ class EventManager(EngineScoped):
                 bound_workflow.reset(binding_token)
 
     def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:
-        """Call a request handler from sync code, bridging async handlers onto a loop."""
+        """Call a request handler from sync code, bridging async handlers onto a loop.
+
+        Reached on the engine loop's thread, or with no engine loop running, such as from the CLI,
+        bootstrap scripts, or a thread the loop is blocked on. Other threads run on the loop instead.
+        """
         # Lazy import: worker_routing imports ResultContext from this module at
         # runtime, so a top-level import here would cycle through event_manager
         # -> worker_routing -> event_manager during module load.
@@ -1743,46 +1788,33 @@ class EventManager(EngineScoped):
         if isinstance(callback, RemoteHandler):
             if not self.in_node_execution():
                 return self._invoke_handler_from_sync(callback.original, request)
-            return self._forward_from_sync(callback, request)
+            if _running_loop() is not None and _running_loop() is self._event_loop:
+                msg = (
+                    f"Attempted to send '{type(request).__name__}' with handle_request from a node running in a worker. "
+                    "Failed because the reply arrives on the event loop this call would block. "
+                    "Use ahandle_request from async node code."
+                )
+                raise RuntimeError(msg)
+            return self._run_coroutine_from_sync(callback(request))
 
-        # Support async callbacks invoked from sync code. If no loop is running
-        # (bootstrap, worker threads) asyncio.run drives the coroutine directly.
-        # If a loop IS running (pre-#4449 workflow files exec'd from inside the
-        # engine loop), dispatch onto a side loop via ThreadRunner. The #4469
-        # deadlock shape is specific to callbacks whose coroutines share
-        # primitives with the caller's loop; RemoteHandler is the only such case
-        # and is handled above by _forward_from_sync.
-        # For all other async handlers the side-loop path is safe.
         if inspect.iscoroutinefunction(callback):
-            if _running_loop() is None:
-                return asyncio.run(callback(request))
-            with ThreadRunner() as runner:
-                return runner.run(callback(request))
+            return self._run_coroutine_from_sync(callback(request))
 
         return callback(request)
 
-    def _forward_from_sync(self, callback: RemoteHandler, request: RequestPayload) -> ResultPayload:
-        """Forward a request a worker's node made from sync code, blocking its thread on the reply.
+    def _run_coroutine_from_sync(self, coro: Coroutine[Any, Any, ResultPayload]) -> ResultPayload:
+        """Drive an async handler to completion from sync code.
 
-        The reply arrives on the engine loop, so a caller on that loop cannot block on it.
+        With no loop running, asyncio.run drives it. On a running loop (sync code on the engine loop,
+        such as a pre-#4449 workflow file or a parameter callback), a side loop on its own thread drives
+        it while this thread blocks. The #4469 deadlock shape is specific to coroutines that share
+        primitives with the caller's loop; a worker's forward is the only such case, and it hops back
+        to the engine loop for the transport.
         """
-        running_loop = _running_loop()
-        if running_loop is None:
-            return asyncio.run(callback(request))
-        if self._event_loop is None:
-            msg = (
-                f"Cannot forward '{type(request).__name__}' from a running event loop: "
-                "the engine event loop is not set. This indicates a bootstrap order bug."
-            )
-            raise RuntimeError(msg)
-        if running_loop is self._event_loop:
-            msg = (
-                f"Attempted to send '{type(request).__name__}' with handle_request from a node running in a worker. "
-                "Failed because the reply arrives on the event loop this call would block. "
-                "Use ahandle_request from async node code."
-            )
-            raise RuntimeError(msg)
-        return asyncio.run_coroutine_threadsafe(callback(request), self._event_loop).result()
+        if _running_loop() is None:
+            return asyncio.run(coro)
+        with self._while_loop_blocks(), ThreadRunner() as runner:
+            return runner.run(coro)
 
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
@@ -1935,7 +1967,7 @@ class EventManager(EngineScoped):
                         tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
             if _running_loop() is not None:
-                with ThreadRunner() as runner:
+                with self._while_loop_blocks(), ThreadRunner() as runner:
                     runner.run(_broadcast_async())
             else:
                 asyncio.run(_broadcast_async())
