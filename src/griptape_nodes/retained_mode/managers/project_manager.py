@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -511,7 +512,7 @@ class _BuiltinResolutionResult(NamedTuple):
     `conflicts` are names where the caller already had a value AND it disagreed with
     the resolved builtin (per the project's "no silent override of builtins" policy).
     `unavailable` maps each unavailable builtin name to the exception that explains
-    why (e.g. "No current workflow"). Callers decide separately whether
+    why (e.g. MacroNeedsWorkflowError). Callers decide separately whether
     unavailability of a *required* builtin is fatal; when they raise, they should
     surface the exception text so users can tell which precondition is missing.
     """
@@ -1697,13 +1698,17 @@ class ProjectManager(EngineScoped):
         self, request: GetPathForMacroRequest, workflow: WorkflowRuntime | None = None
     ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
         """Resolve the request's macro for `workflow`, which `{workflow_dir}` and `{workflow_name}` need."""
-        return self.get_path_for_macro_in(workflow, request)
-
-    def get_path_for_macro_in(
-        self, workflow: WorkflowRuntime | None, request: GetPathForMacroRequest
-    ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
-        """Resolve `request` for `workflow`, for engine code that holds the workflow it resolves for."""
         return self._resolve_path_for_macro(request, workflow)
+
+    def get_path_for_macro_in(self, workflow: WorkflowRuntime | None, request: GetPathForMacroRequest) -> ResultPayload:
+        """Resolve `request` through dispatch for `workflow`, for engine code that holds the workflow it resolves for.
+
+        Dispatched, so the request's `failure_log_level` and the pre-dispatch hooks apply. With no
+        workflow, the request is unaddressed and resolves for its caller's workflow, if any.
+        """
+        if workflow is None:
+            return self.engine.handle_request(request)
+        return workflow.handle_request(request)
 
     def _resolve_path_for_macro(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: GetPathForMacroRequest, workflow: WorkflowRuntime | None
