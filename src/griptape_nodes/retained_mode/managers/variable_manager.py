@@ -55,7 +55,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     VariableDetails,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 if TYPE_CHECKING:
@@ -534,7 +534,7 @@ class VariablesManager(EngineScoped):
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
-    @handles(CreateVariableRequest, scope=RequestScope.WORKFLOW)
+    @handles(CreateVariableRequest)
     def on_create_variable_request(self, request: CreateVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Create a new variable.
 
@@ -620,7 +620,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully created variable '{request.name}' in flow '{target_flow}'."
         )
 
-    @handles(GetVariableRequest, scope=RequestScope.WORKFLOW)
+    @handles(GetVariableRequest)
     def on_get_variable_request(self, request: GetVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Get a full variable by name."""
         try:
@@ -643,7 +643,7 @@ class VariablesManager(EngineScoped):
             variable=result.variable, result_details=f"Successfully retrieved variable '{request.name}'."
         )
 
-    @handles(GetVariableValueRequest, scope=RequestScope.WORKFLOW)
+    @handles(GetVariableValueRequest)
     def on_get_variable_value_request(
         self, request: GetVariableValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
@@ -668,7 +668,7 @@ class VariablesManager(EngineScoped):
             value=result.variable.value, result_details=f"Successfully retrieved value for variable '{request.name}'."
         )
 
-    @handles(SetVariableValueRequest, scope=RequestScope.WORKFLOW)
+    @handles(SetVariableValueRequest)
     def on_set_variable_value_request(
         self, request: SetVariableValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
@@ -719,7 +719,7 @@ class VariablesManager(EngineScoped):
         self._unresolve_nodes_referencing_variables(workflow, [request.name])
         return SetVariableValueResultSuccess(result_details=f"Successfully set value for variable '{request.name}'.")
 
-    @handles(GetVariableTypeRequest, scope=RequestScope.WORKFLOW)
+    @handles(GetVariableTypeRequest)
     def on_get_variable_type_request(self, request: GetVariableTypeRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Get the type of a variable."""
         try:
@@ -742,7 +742,7 @@ class VariablesManager(EngineScoped):
             type=result.variable.type, result_details=f"Successfully retrieved type for variable '{request.name}'."
         )
 
-    @handles(SetVariableTypeRequest, scope=RequestScope.WORKFLOW)
+    @handles(SetVariableTypeRequest)
     def on_set_variable_type_request(self, request: SetVariableTypeRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Set the type of an existing variable.
 
@@ -790,7 +790,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully set type for variable '{request.name}' to '{request.type}'."
         )
 
-    @handles(DeleteVariableRequest, scope=RequestScope.WORKFLOW)
+    @handles(DeleteVariableRequest)
     def on_delete_variable_request(self, request: DeleteVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Delete a variable.
 
@@ -836,7 +836,7 @@ class VariablesManager(EngineScoped):
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
-    @handles(RenameVariableRequest, scope=RequestScope.WORKFLOW)
+    @handles(RenameVariableRequest)
     def on_rename_variable_request(self, request: RenameVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: PLR0911
         """Rename a variable.
 
@@ -923,7 +923,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
         )
 
-    @handles(HasVariableRequest, scope=RequestScope.WORKFLOW)
+    @handles(HasVariableRequest)
     def on_has_variable_request(self, request: HasVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Check if a variable exists."""
         try:
@@ -1050,7 +1050,7 @@ class VariablesManager(EngineScoped):
 
         return variables
 
-    @handles(ListVariablesRequest, scope=RequestScope.WORKFLOW)
+    @handles(ListVariablesRequest)
     def on_list_variables_request(self, request: ListVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
@@ -1071,7 +1071,7 @@ class VariablesManager(EngineScoped):
             variables=variables, layers=layers, result_details=f"Successfully listed {len(variables)} variables."
         )
 
-    @handles(ListSubstitutablesRequest, scope=RequestScope.WORKFLOW)
+    @handles(ListSubstitutablesRequest)
     def on_list_substitutables_request(
         self, request: ListSubstitutablesRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
@@ -1122,7 +1122,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Successfully listed {len(substitutables)} substitutable(s).",
         )
 
-    @handles(GetVariablesRequest, scope=RequestScope.WORKFLOW)
+    @handles(GetVariablesRequest)
     def on_get_variables_request(self, request: GetVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Probe specific names in scope; report which resolved and which didn't.
 
@@ -1162,7 +1162,7 @@ class VariablesManager(EngineScoped):
             result_details=f"Probed {len(request.names)} variable name(s): {len(resolved)} resolved, {len(unresolved)} unresolved.",
         )
 
-    @handles(ResolveSubstitutionRequest, scope=RequestScope.WORKFLOW)
+    @handles(ResolveSubstitutionRequest)
     def on_resolve_substitution_request(
         self, request: ResolveSubstitutionRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
@@ -1209,7 +1209,7 @@ class VariablesManager(EngineScoped):
             variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
 
-    @handles(SetVariablesRequest, scope=RequestScope.WORKFLOW)
+    @handles(SetVariablesRequest)
     def on_set_variables_request(self, request: SetVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """DEPRECATED shim: set multiple variable values atomically (all-or-nothing).
 
@@ -1265,7 +1265,7 @@ class VariablesManager(EngineScoped):
         self._unresolve_nodes_referencing_variables(workflow, list(request.variables.keys()))
         return SetVariablesResultSuccess(result_details=f"Successfully set {len(request.variables)} variable(s).")
 
-    @handles(GetVariableDetailsRequest, scope=RequestScope.WORKFLOW)
+    @handles(GetVariableDetailsRequest)
     def on_get_variable_details_request(
         self, request: GetVariableDetailsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:

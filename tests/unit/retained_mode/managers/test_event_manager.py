@@ -1662,7 +1662,7 @@ class TestPostDispatchHooks:
         async def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok")
 
-        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         seen_workflows: list[WorkflowRuntime | None] = []
 

@@ -54,7 +54,7 @@ def _count_handler_calls(engine: Engine) -> list[_ProbeRequest]:
         calls.append(request)
         return _ProbeResult(result_details="ok")
 
-    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
     return calls
 
 
@@ -62,7 +62,7 @@ def _record_current_workflow(engine: Engine) -> None:
     def handler(_request: _ProbeRequest) -> _ProbeResult:
         return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
 
 class TestCurrentWorkflow:
@@ -138,7 +138,7 @@ class TestClosedWorkflowBinding:
             engine.context_manager.push_workflow(workflow_name="opened")
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         result = engine.event_manager.handle_request(_ProbeRequest()).result
 
@@ -236,7 +236,9 @@ class TestDispatchBindsTheEnvelopeWorkflow:
         def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=RequiredSender.ENGINE)
+        engine.event_manager.assign_manager_to_request_type(
+            _ProbeRequest, handler, sender=RequiredSender.ENGINE, without_workflow=None
+        )
 
         result_event = engine.event_manager.handle_request(
             _ProbeRequest(), result_context=ResultContext(sender=_OTHER_ENGINE)
@@ -251,7 +253,9 @@ class TestDispatchBindsTheEnvelopeWorkflow:
         def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=RequiredSender.ENGINE)
+        engine.event_manager.assign_manager_to_request_type(
+            _ProbeRequest, handler, sender=RequiredSender.ENGINE, without_workflow=None
+        )
 
         result_event = engine.event_manager.handle_request(
             _ProbeRequest(), result_context=ResultContext(sender=_OTHER_ENGINE, open_workflow_id=workflow.workflow_id)
@@ -274,7 +278,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             spawned.append(asyncio.create_task(read_after_release()))
             return _ProbeResult(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         with engine.bind_workflow(NO_WORKFLOW):
             await engine.event_manager.ahandle_request(
@@ -299,7 +303,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             spawned.append(asyncio.create_task(read_after_release()))
             return _ProbeResult(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         await engine.event_manager.ahandle_request(_ProbeRequest())
         engine.context_manager.pop_workflow()
@@ -317,7 +321,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             opened.append(_open(engine, "opened"))
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         result_event = engine.event_manager.handle_request(_ProbeRequest())
 
@@ -331,7 +335,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             bound_workflow.set(bound)
             return _ProbeResult(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         engine.event_manager.handle_request(_ProbeRequest())
 

@@ -15,21 +15,21 @@ F = TypeVar("F", bound="Callable[..., Any]")
 
 _HANDLED_REQUEST_TYPES_ATTR = "__handled_request_types__"
 _SENDER_RULES_ATTR = "__sender_rules__"
-_HANDLED_REQUEST_SCOPE_ATTR = "__handled_request_scope__"
 
 
 class RequestScope(StrEnum):
-    """What a request acts on, declared by its handler with `@handles(..., scope=...)`.
+    """What a request acts on, read from its handler's `workflow` parameter when the handler registers.
 
-    HOST: the engine rather than one workflow. Dispatch binds no workflow, ignores a workflow id on
-        the request envelope and never rejects one. The handler has no `workflow` parameter.
-    WORKFLOW: one open workflow: the one the request envelope names, else the caller's, else the
-        only open one. The handler takes `workflow` with no default.
-    OPTIONAL_WORKFLOW: works without a workflow: the one the envelope names, else the caller's, else
-        none, never the only open one. The handler takes `workflow=None`.
+    HOST: no `workflow` parameter. The engine rather than one workflow: dispatch binds no workflow,
+        ignores a workflow id on the request envelope and never rejects one.
+    WORKFLOW: `workflow: WorkflowRuntime`. One open workflow: the one the request envelope names, else
+        the caller's, else the only open one.
+    OPTIONAL_WORKFLOW: `workflow: WorkflowRuntime | None = None`. Works without a workflow: the one the
+        envelope names, else the caller's, else none, never the only open one.
 
-    A handler that declares no scope is called with the request alone. Its parameters are not checked,
-    so a library handler with a parameter of any name keeps registering.
+    A library handler with no `workflow` parameter, and an engine handler listed in
+    `AMBIENT_UNTIL_MIGRATED`, have no scope: dispatch calls them with the request alone, bound to the
+    caller's workflow or the only open one.
     """
 
     HOST = "host"
@@ -65,13 +65,12 @@ def handles(
     *request_types: type[RequestPayload],
     sender: RequiredSender | None = None,
     owner: Callable[[Any, Any, RequestSender], str | None] | None = None,
-    scope: RequestScope | None = None,
 ) -> Callable[[F], F]:
     """Mark a method as the handler for `request_types`. `EventManager.register_request_handlers` wires it up.
 
     Requests another engine sends are refused unless the handler names `sender`: then only they
-    run it, and, with `owner`, only from the engine that owns what the request names. `scope`
-    declares what the request acts on (see `RequestScope`).
+    run it, and, with `owner`, only from the engine that owns what the request names. The method's
+    `workflow` parameter declares what the request acts on (see `RequestScope`).
     """
     # A bare `@handles` passes the method itself here and would otherwise mark nothing.
     if not request_types or not all(inspect.isclass(request_type) for request_type in request_types):
@@ -86,12 +85,7 @@ def handles(
         if isinstance(method, (staticmethod, classmethod)):
             msg = f"@handles must sit directly above `def`, below any @staticmethod or @classmethod. Got {method!r}."
             raise TypeError(msg)
-        # One handler has one signature, so stacked marks must agree on what it is passed.
-        if handled_request_types(method) and handled_request_scope(method) != scope:
-            msg = f"Every @handles on {method.__qualname__} must declare the same scope."
-            raise TypeError(msg)
         setattr(method, _HANDLED_REQUEST_TYPES_ATTR, (*handled_request_types(method), *request_types))
-        setattr(method, _HANDLED_REQUEST_SCOPE_ATTR, scope)
         if sender is not None:
             rule = SenderRule(required=sender, owner=owner)
             setattr(method, _SENDER_RULES_ATTR, {**sender_rules(method), **dict.fromkeys(request_types, rule)})
@@ -110,45 +104,36 @@ def sender_rules(attr: object) -> dict[type[RequestPayload], SenderRule]:
     return getattr(getattr(attr, "__func__", attr), _SENDER_RULES_ATTR, {})
 
 
-def handled_request_scope(attr: object) -> RequestScope | None:
-    """The scope `@handles` declared, or None when it declared none. Looks through @staticmethod and @classmethod."""
-    return getattr(getattr(attr, "__func__", attr), _HANDLED_REQUEST_SCOPE_ATTR, None)
+def scope_from_signature(handler: Callable[..., Any]) -> RequestScope | None:
+    """The scope `handler`'s `workflow` parameter declares, or None when it has no `workflow` parameter.
 
-
-def check_handler_signature(
-    handler: Callable[..., Any], scope: RequestScope | None, request_type: type[RequestPayload]
-) -> None:
-    """Check that `handler` takes the `workflow` argument dispatch passes for `scope`, by parameter name.
-
-    A handler that declares no scope is not checked: dispatch passes it the request alone.
+    Reads `inspect.signature`, which follows `functools.wraps` and a `__signature__` attribute, so a
+    wrapper declares the scope of the handler it wraps.
 
     Raises:
-        TypeError: The handler's `workflow` parameter does not match its scope.
+        TypeError: The signature can't say. The handler takes `*args` or `**kwargs` without naming
+            `workflow`, as a wrapper that hides its handler's signature does, or its `workflow`
+            parameter defaults to something other than None.
     """
-    if scope is None:
-        return
-    parameter = inspect.signature(handler).parameters.get("workflow")
     name = getattr(handler, "__qualname__", repr(handler))
-    attempt = f"Attempted to register '{name}' as the handler for {request_type.__name__} with scope {scope.name}."
-
-    if scope is RequestScope.WORKFLOW:
-        if parameter is None:
-            msg = f"{attempt} Failed because it has no `workflow` parameter. Add `workflow` with no default."
+    parameters = inspect.signature(handler).parameters
+    parameter = parameters.get("workflow")
+    if parameter is None:
+        variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        if any(other.kind in variadic for other in parameters.values()):
+            msg = (
+                f"Attempted to register the request handler '{name}'. Failed because it takes *args or **kwargs, "
+                "so whether it takes a workflow can't be read from its signature. Name the parameters it takes, "
+                "or wrap it with functools.wraps."
+            )
             raise TypeError(msg)
-        if parameter.default is not inspect.Parameter.empty:
-            msg = f"{attempt} Failed because its `workflow` parameter has a default. Remove the default: dispatch always passes a workflow."
-            raise TypeError(msg)
-        return
-
-    if scope is RequestScope.OPTIONAL_WORKFLOW:
-        if parameter is None or parameter.default is not None:
-            msg = f"{attempt} Failed because it has no `workflow` parameter defaulting to None. Add `workflow=None`."
-            raise TypeError(msg)
-        return
-
-    if parameter is not None:
+        return None
+    if parameter.default is None:
+        return RequestScope.OPTIONAL_WORKFLOW
+    if parameter.default is not inspect.Parameter.empty:
         msg = (
-            f"{attempt} Failed because it has a `workflow` parameter, which dispatch passes only to "
-            "WORKFLOW and OPTIONAL_WORKFLOW handlers. Remove it, or declare one of those scopes."
+            f"Attempted to register the request handler '{name}'. Failed because its `workflow` parameter "
+            f"defaults to {parameter.default!r}. Give it no default, or default it to None."
         )
         raise TypeError(msg)
+    return RequestScope.WORKFLOW

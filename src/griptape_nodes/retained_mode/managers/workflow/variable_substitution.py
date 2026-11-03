@@ -11,7 +11,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetVariableSubstitutionEnabledResultNotAlteredSuccess,
     SetVariableSubstitutionEnabledResultSuccess,
 )
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -45,7 +45,7 @@ class VariableSubstitution(EngineScoped):
             return True
         return workflow.variables.substitution_enabled
 
-    @handles(GetVariableSubstitutionEnabledRequest, scope=RequestScope.WORKFLOW)
+    @handles(GetVariableSubstitutionEnabledRequest)
     def on_get_variable_substitution_enabled_request(
         self,
         request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
@@ -58,7 +58,7 @@ class VariableSubstitution(EngineScoped):
             enabled=enabled,
         )
 
-    @handles(SetVariableSubstitutionEnabledRequest, scope=RequestScope.WORKFLOW)
+    @handles(SetVariableSubstitutionEnabledRequest)
     def on_set_variable_substitution_enabled_request(
         self, request: SetVariableSubstitutionEnabledRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:

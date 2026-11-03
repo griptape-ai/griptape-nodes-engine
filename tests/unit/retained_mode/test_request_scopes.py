@@ -1,4 +1,4 @@
-"""Dispatch binds, and hands a handler, the workflow its declared scope takes."""
+"""Dispatch binds, and hands a handler, the workflow its signature's scope takes."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from griptape_nodes.retained_mode.events.config_events import (
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
 from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest, RenameObjectResultFailure
+from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
@@ -52,9 +53,11 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetVariableSubstitutionEnabledRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.retained_mode.request_handlers import RequestScope
+from griptape_nodes.retained_mode.request_handlers import RequestScope, scope_from_signature
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
+from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED
+from tests.unit.host_workflow_reads import HostWorkflowRead
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -90,7 +93,7 @@ class _Calls:
 
     def workflow_handler(self, request: RequestPayload, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG002
         self.workflows.append(workflow)
-        self.current.append(self.engine.current_workflow_or_none())
+        self.current.append(_bound())
         return _ScopeProbeResult(result_details="ran")
 
     async def optional_handler(
@@ -99,12 +102,20 @@ class _Calls:
         workflow: WorkflowRuntime | None = None,
     ) -> ResultPayload:
         self.workflows.append(workflow)
-        self.current.append(self.engine.current_workflow_or_none())
+        self.current.append(_bound())
         return _ScopeProbeResult(result_details="ran")
 
     def host_handler(self, request: RequestPayload) -> ResultPayload:  # noqa: ARG002
-        self.current.append(self.engine.current_workflow_or_none())
+        self.current.append(_bound())
         return _ScopeProbeResult(result_details="ran")
+
+
+def _bound() -> WorkflowRuntime | None:
+    """The workflow the current work is bound to, read without counting as a workflow read."""
+    binding = bound_workflow.get()
+    if binding is NO_WORKFLOW:
+        return None
+    return binding
 
 
 @pytest.fixture
@@ -117,11 +128,11 @@ def _register(engine: Engine, calls: _Calls, scope: RequestScope, request_type: 
     event_manager = engine.event_manager
     match scope:
         case RequestScope.WORKFLOW:
-            event_manager.assign_manager_to_request_type(request_type, calls.workflow_handler, scope=scope)
+            event_manager.assign_manager_to_request_type(request_type, calls.workflow_handler)
         case RequestScope.OPTIONAL_WORKFLOW:
-            event_manager.assign_manager_to_request_type(request_type, calls.optional_handler, scope=scope)
+            event_manager.assign_manager_to_request_type(request_type, calls.optional_handler)
         case RequestScope.HOST:
-            event_manager.assign_manager_to_request_type(request_type, calls.host_handler, scope=scope)
+            event_manager.assign_manager_to_request_type(request_type, calls.host_handler)
 
 
 def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntime:
@@ -214,9 +225,9 @@ class TestScopesThatTakeAWorkflow:
             return close_handler(request, workflow)
 
         if scope is RequestScope.WORKFLOW:
-            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, workflow_close_handler, scope=scope)
+            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, workflow_close_handler)
         else:
-            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, close_handler, scope=scope)
+            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, close_handler)
 
         with engine.bind_workflow(workflow):
             engine.handle_request(_ScopeProbeRequest())
@@ -335,7 +346,7 @@ class TestHostScope:
         def host_handler(request: _ScopeProbeRequest) -> ResultPayload:  # noqa: ARG001
             return engine.handle_request(_InnerProbeRequest())
 
-        engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, host_handler, scope=RequestScope.HOST)
+        engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, host_handler)
 
         result_event = engine.event_manager.handle_request(
             _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
@@ -618,3 +629,83 @@ class TestRemoteHandlerOutOfNodeExecution:
 
         assert result_event.succeeded()
         assert calls.workflows == [workflow]
+
+
+class TestHostWorkflowReads:
+    """The autouse fixture records a HOST handler that reads the current workflow while one is open."""
+
+    def test_a_host_handler_reading_the_current_workflow_is_recorded(
+        self, engine: Engine, fail_on_host_workflow_reads: list[HostWorkflowRead]
+    ) -> None:
+        _open_workflow(engine)
+
+        def host_handler(request: _ScopeProbeRequest) -> ResultPayload:  # noqa: ARG001
+            engine.current_workflow_or_none()
+            return _ScopeProbeResult(result_details="ran")
+
+        engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, host_handler)
+
+        engine.handle_request(_ScopeProbeRequest())
+
+        assert fail_on_host_workflow_reads == [
+            HostWorkflowRead(request_type_name="_ScopeProbeRequest", read="read the current workflow")
+        ]
+        fail_on_host_workflow_reads.clear()
+
+    def test_a_read_in_an_unscoped_request_a_host_handler_sends_is_not(
+        self, engine: Engine, fail_on_host_workflow_reads: list[HostWorkflowRead]
+    ) -> None:
+        """An unmigrated handler's reads are its own debt, not a dependence of the HOST handler that sent it."""
+        _open_workflow(engine)
+
+        def ambient_handler(request: _InnerProbeRequest) -> ResultPayload:  # noqa: ARG001
+            engine.current_workflow_or_none()
+            return _ScopeProbeResult(result_details="ran")
+
+        def host_handler(request: _ScopeProbeRequest) -> ResultPayload:  # noqa: ARG001
+            return engine.handle_request(_InnerProbeRequest())
+
+        engine.event_manager.assign_manager_to_request_type(_InnerProbeRequest, ambient_handler, without_workflow=None)
+        engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, host_handler)
+
+        engine.handle_request(_ScopeProbeRequest())
+
+        assert fail_on_host_workflow_reads == []
+
+    def test_a_workflow_handler_reading_the_current_workflow_is_not(
+        self, engine: Engine, fail_on_host_workflow_reads: list[HostWorkflowRead]
+    ) -> None:
+        _open_workflow(engine)
+
+        def workflow_handler(request: _ScopeProbeRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG001
+            engine.current_workflow_or_none()
+            return _ScopeProbeResult(result_details="ran")
+
+        engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, workflow_handler)
+
+        engine.handle_request(_ScopeProbeRequest())
+
+        assert fail_on_host_workflow_reads == []
+
+
+class TestAmbientUntilMigrated:
+    """Each entry is a request type whose engine handler still reads the ambient workflow."""
+
+    @pytest.mark.parametrize("name", sorted(AMBIENT_UNTIL_MIGRATED))
+    def test_names_a_request_type(self, name: str) -> None:
+        request_type = PayloadRegistry.get_type(name)
+
+        assert request_type is not None
+        assert issubclass(request_type, RequestPayload)
+
+    @pytest.mark.parametrize("name", sorted(AMBIENT_UNTIL_MIGRATED))
+    def test_its_handler_takes_no_workflow(self, engine: Engine, name: str) -> None:
+        """A handler that takes a workflow is migrated, so its entry should be removed."""
+        request_type = PayloadRegistry.get_type(name)
+        assert request_type is not None
+        assert issubclass(request_type, RequestPayload)
+        handler = engine.event_manager.get_manager_for_request_type(request_type)
+        if handler is None:
+            pytest.skip(f"{name} is registered only in a worker.")
+
+        assert scope_from_signature(handler) is None
