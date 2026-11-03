@@ -46,9 +46,9 @@ class TestRowInputTypes:
 
         refs.add_child(row)
 
-        assert row.input_types == ["VideoUrlArtifact", "ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
+        assert row.input_types == ["VideoUrlArtifact", "list[VideoUrlArtifact]", "list"]
 
-    def test_a_row_restored_already_widened_is_unchanged(self, node: MockNode) -> None:
+    def test_a_row_saved_with_list_variants_is_not_widened_again(self, node: MockNode) -> None:
         refs = _refs(node)
         saved_types = ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
         row = Parameter(name="saved_row", tooltip="t", input_types=saved_types, parent_container_name="refs")
@@ -56,6 +56,20 @@ class TestRowInputTypes:
         refs.add_child(row)
 
         assert row.input_types == saved_types
+        assert row.save_dict()["input_types"] == ["ImageUrlArtifact"]
+
+    def test_a_row_saves_only_its_item_types(self, node: MockNode) -> None:
+        row = _refs(node).add_child_parameter()
+
+        assert row.save_dict()["input_types"] == ["ImageUrlArtifact"]
+
+    def test_a_row_taken_out_of_the_list_accepts_only_its_item_types(self, node: MockNode) -> None:
+        refs = _refs(node)
+        row = refs.add_child_parameter()
+
+        refs.remove_child(row)
+
+        assert row.input_types == ["ImageUrlArtifact"]
 
     def test_existing_rows_follow_a_change_of_input_types(self, node: MockNode) -> None:
         refs = _refs(node)

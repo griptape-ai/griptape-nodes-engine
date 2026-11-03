@@ -335,6 +335,8 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         our_dict = self.to_dict()
         our_dict["ui_options"] = self.authored_ui_options()
         our_dict["traits"] = self.trait_states()
+        # What the parent adds is derived again when the parameter is loaded into it.
+        our_dict["input_types"] = self._own_input_types()
         return our_dict
 
     def to_event(self, node: BaseNode) -> dict:
@@ -677,6 +679,17 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
 
     def _custom_getter_for_property_input_types(self) -> list[str]:
         """Derived classes may override this. Overriding property getter/setters is fraught with peril."""
+        own_input_types = self._own_input_types()
+        if isinstance(self._parent, Parameter):
+            return self._parent.input_types_for_child(own_input_types)
+        return own_input_types
+
+    def input_types_for_child(self, input_types: list[str]) -> list[str]:
+        """Return what a child parameter whose own input types are `input_types` accepts."""
+        return input_types
+
+    def _own_input_types(self) -> list[str]:
+        """The input types set on this parameter, without what its parent adds."""
         if self._input_types:
             return self._input_types
         if self._type:
