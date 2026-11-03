@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -38,8 +37,8 @@ async def _forward_a_request(engine: Engine) -> EventRequest:
         request_client=orchestrator,  # type: ignore[arg-type]
         orchestrator_request_topic="orchestrator",
         worker_response_topic="worker",
-        websocket_event_loop=asyncio.get_running_loop(),
     )
+    engine.event_manager.initialize_queue()
     with pytest.raises(RuntimeError, match="recorded"):
         await engine.event_manager.forward_to_orchestrator(
             GetParameterValueRequest(node_name="node", parameter_name="value"), {}

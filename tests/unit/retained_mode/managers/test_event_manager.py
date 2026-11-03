@@ -261,7 +261,7 @@ class TestHandleRequestLoopSafety:
 
     The #4469 deadlock is specific to callbacks whose coroutines share
     primitives with the caller's loop; ``RemoteHandler`` is the only such
-    shape and is routed onto the WS loop via ``run_coroutine_threadsafe``.
+    shape and forwards on the engine loop via ``run_coroutine_threadsafe``.
     For every other async handler the side-loop path is safe, so we keep
     it to preserve back-compat for pre-#4449 workflows that ``exec()``
     sync code from inside the engine loop.
@@ -364,23 +364,20 @@ class _ForwardableProbeResult(ResultPayloadSuccess):
 class TestHandleRequestForwardingFromRunningLoop:
     """``handle_request`` dispatch of a RemoteHandler from inside a running loop.
 
-    A RemoteHandler's forwarding path hops onto a dedicated websocket event
-    loop running on a separate thread. That loop does not share primitives
-    with the caller's loop, so blocking the caller thread on the resulting
-    future is safe -- the #4469 deadlock shape does not apply. This is
-    distinct from the local async-handler case (still fails fast) because
-    dispatching a regular async handler locally would block the caller's own
-    loop.
+    From a side loop on another thread, such as one a sync request drives, the
+    forward runs on the engine loop and the caller's thread blocks on it. On the
+    engine loop itself that would never return, so it fails. Outside node
+    execution the RemoteHandler is not involved and the request runs locally.
     """
 
     @pytest.mark.asyncio
-    async def test_sync_dispatch_from_running_loop_forwards_via_websocket_loop(self) -> None:
+    async def test_sync_dispatch_from_a_side_loop_forwards_on_the_engine_loop(self) -> None:
         event_manager = EventManager()
 
-        # Spin up a dedicated loop on another thread to stand in for the websocket loop.
-        ws_loop = asyncio.new_event_loop()
-        ws_thread = threading.Thread(target=ws_loop.run_forever, daemon=True)
-        ws_thread.start()
+        # The engine loop runs on another thread; the test's loop stands in for a side loop.
+        engine_loop = asyncio.new_event_loop()
+        engine_thread = threading.Thread(target=engine_loop.run_forever, daemon=True)
+        engine_thread.start()
 
         captured: dict[str, object] = {}
 
@@ -396,27 +393,61 @@ class TestHandleRequestForwardingFromRunningLoop:
             )
 
         # Register a RemoteHandler shape: dispatch table entry points at it directly.
-        # ``handle_request`` detects RemoteHandler via isinstance and routes onto the WS loop.
+        # ``handle_request`` detects RemoteHandler via isinstance and forwards on the engine loop.
         async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
             return _ForwardableProbeResult(result_details="local")
 
         remote = RemoteHandler(original=original, event_manager=event_manager)
         event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
-        event_manager._websocket_event_loop = ws_loop
+        event_manager._event_loop = engine_loop
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
         try:
             with event_manager.node_execution_scope():
                 result = event_manager.handle_request(_ForwardableProbeRequest())
         finally:
-            ws_loop.call_soon_threadsafe(ws_loop.stop)
-            ws_thread.join(timeout=1.0)
-            ws_loop.close()
+            engine_loop.call_soon_threadsafe(engine_loop.stop)
+            engine_thread.join(timeout=1.0)
+            engine_loop.close()
 
-        assert captured["forward_loop"] is ws_loop
+        assert captured["forward_loop"] is engine_loop
         assert isinstance(result, EventResultSuccess)
         assert isinstance(result.result, _ForwardableProbeResult)
         assert "forwarded" in str(result.result.result_details)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_sync_dispatch_on_the_engine_loop_during_node_execution_fails(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue()
+
+        async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
+            return _ForwardableProbeResult(result_details="local")
+
+        remote = RemoteHandler(original=original, event_manager=event_manager)
+        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
+
+        with event_manager.node_execution_scope():
+            result = event_manager.handle_request(_ForwardableProbeRequest())
+
+        assert not result.succeeded()
+        assert "Use ahandle_request" in str(result.result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_sync_dispatch_on_the_engine_loop_outside_node_execution_runs_locally(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue()
+
+        async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
+            return _ForwardableProbeResult(result_details="local")
+
+        remote = RemoteHandler(original=original, event_manager=event_manager)
+        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
+
+        result = event_manager.handle_request(_ForwardableProbeRequest())
+
+        assert isinstance(result.result, _ForwardableProbeResult)
+        assert "local" in str(result.result.result_details)
 
 
 class TestBroadcastAppEventLoopSafety:
@@ -2402,9 +2433,9 @@ class TestAWorkerRequestingAnotherEngine:
             request_client=client,  # type: ignore[arg-type]
             orchestrator_request_topic="sessions/artist-sess/request",
             worker_response_topic="sessions/artist-sess/workers/w1/response",
-            websocket_event_loop=asyncio.get_running_loop(),
             timeout_ms=5000,
         )
+        engine.event_manager.initialize_queue()
         request = CheckLeaseRequest(lease_id="lease-1", worker_engine_id="w1")
 
         with patch.object(engine, "get_engine_id", return_value="w1"):

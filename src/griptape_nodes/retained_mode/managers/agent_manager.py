@@ -572,9 +572,9 @@ class _ActiveRun:
     """Handle to an in-flight agent run, used to deliver cancellation.
 
     ``cancel_event`` belongs to ``loop`` (the loop the run awaits on). A
-    ``CancelAgentRequest`` may be handled on a different loop (skip-the-line
-    requests run on the websocket loop), so the event is always set via
-    ``loop.call_soon_threadsafe`` rather than touched directly.
+    ``CancelAgentRequest`` may be handled on a different loop, such as when the
+    run was started through sync ``handle_request`` on a side loop, so the event
+    is always set via ``loop.call_soon_threadsafe`` rather than touched directly.
     """
 
     cancel_event: asyncio.Event

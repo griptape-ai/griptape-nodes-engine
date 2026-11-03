@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
@@ -43,6 +44,20 @@ class TestNodeTypes:
 
         # Verify all yields were processed
         assert results == ["result1", "result2"]
+
+    @pytest.mark.asyncio
+    async def test_aprocess_runs_a_sync_process_off_the_event_loop(self) -> None:
+        """A slow process() would otherwise stall heartbeats and cancels."""
+        process_threads: list[int] = []
+
+        class _RecordsThread(MockNode):
+            def process(self) -> None:
+                process_threads.append(threading.get_ident())
+
+        await _RecordsThread(name="n").aprocess()
+
+        assert process_threads
+        assert process_threads[0] != threading.get_ident()
 
 
 class TestConnectionRemovedHooks:

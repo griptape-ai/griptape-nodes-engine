@@ -6,12 +6,10 @@ that produced them. These tests pin that machinery -- ``EventManager.forward_to_
 ``RequestClient`` response matching, and the cross-loop dispatch topology -- without a real
 websocket, using a fake broker that loops forwarded requests into a real engine's dispatch.
 
-The topology reproduced here is the real one, because it is exactly the topology that has
-bitten before (see ``configure_worker_forwarding``'s docstring): the ``RequestClient`` and its
-futures live on a daemon thread's event loop, while the code that forwards runs on the main
-loop, so every forward crosses loops twice. Awaiting the client's primitives from the wrong
-loop historically stalled for seconds per request; the latency assertions here exist to fail
-if that regression returns.
+Replies are delivered from a broker thread's event loop while the code that forwards runs on
+the engine loop, so every forward crosses loops twice. Awaiting the client's primitives from the
+wrong loop historically stalled for seconds per request; the latency assertions here exist to
+fail if that regression returns.
 
 The contract these tests pin:
 
@@ -122,7 +120,7 @@ class FakeBrokerClient:
 
 
 class BrokerThread:
-    """A daemon thread running its own event loop, like the app's websocket thread."""
+    """A daemon thread running its own event loop, delivering replies from off the engine loop."""
 
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -152,9 +150,9 @@ async def forwarding() -> AsyncIterator[FakeBrokerClient]:
         request_client=request_client,
         orchestrator_request_topic=ORCHESTRATOR_REQUEST_TOPIC,
         worker_response_topic=WORKER_RESPONSE_TOPIC,
-        websocket_event_loop=broker.loop,
         timeout_ms=1_000,
     )
+    event_manager.initialize_queue()
     yield fake_client
     broker.run(request_client.__aexit__(None, None, None))
     broker.shutdown()

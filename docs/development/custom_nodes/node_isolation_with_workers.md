@@ -31,8 +31,8 @@ A few terms used throughout this page:
     is on `sys.path` only in the worker.
 - **`process` and `aprocess`** — your node's execution method.
     Implement `process(self) -> ...` as you do today; the framework
-    wraps it as `async def aprocess(self) -> None` so it can run on the
-    worker's event loop. The strict-mode rules describe behavior "from
+    wraps it as `async def aprocess(self) -> None`, which runs `process`
+    on a background thread. The strict-mode rules describe behavior "from
     inside aprocess," but in practice that means "from inside the
     `process` method you wrote."
 

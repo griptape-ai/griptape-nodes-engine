@@ -1116,7 +1116,7 @@ class TestOtherSharedState:
         event_manager._worker_request_client = cast("Any", _CapturingClient())
         event_manager._orchestrator_request_topic = "orchestrator"
         event_manager._worker_response_topic = "worker"
-        event_manager._websocket_event_loop = transport_loop
+        event_manager._event_loop = transport_loop
         try:
             with worker_engine.run_in_worker_workflow(runtime), pytest.raises(RuntimeError, match="captured"):
                 await event_manager.forward_to_orchestrator(

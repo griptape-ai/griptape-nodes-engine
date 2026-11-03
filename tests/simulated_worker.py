@@ -121,7 +121,8 @@ def simulated_worker_engine(orchestrator: Engine) -> Iterator[SimulatedWorker]:
     forwarding_loop = asyncio.new_event_loop()
     forwarding_thread = threading.Thread(target=forwarding_loop.run_forever, daemon=True)
     forwarding_thread.start()
-    event_manager._websocket_event_loop = forwarding_loop
+    # The engine loop, on its own thread, as in the app. Node code forwards from the test's loop.
+    event_manager._event_loop = forwarding_loop
     try:
         yield worker
     finally:

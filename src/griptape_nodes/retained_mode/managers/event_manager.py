@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
 
     from griptape_nodes.api_client.request_client import RequestClient
+    from griptape_nodes.app.worker_routing import RemoteHandler
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -327,7 +328,6 @@ class EventManager(EngineScoped):
         self._worker_request_client: RequestClient | None = None
         self._orchestrator_request_topic: str | None = None
         self._worker_response_topic: str | None = None
-        self._websocket_event_loop: asyncio.AbstractEventLoop | None = None
         self._forward_timeout_ms: int | None = None
         # Node-execution refcount. Incremented on node_execution_scope entry,
         # decremented on exit. Plain instance state guarded by a lock so any thread
@@ -1037,24 +1037,16 @@ class EventManager(EngineScoped):
         request_client: RequestClient,
         orchestrator_request_topic: str,
         worker_response_topic: str,
-        websocket_event_loop: asyncio.AbstractEventLoop,
         timeout_ms: int | None = None,
     ) -> None:
         """Enable worker -> orchestrator forwarding for requests originated from node execution.
 
-        Called once at worker startup after the RequestClient is constructed and topics
-        are subscribed. Inert on the orchestrator (never called there).
-
-        websocket_event_loop is the loop that owns the Client (the daemon thread's loop).
-        Forwarding is dispatched there via run_coroutine_threadsafe so the sync
-        handle_request path can block its own thread on the result, which is only safe when
-        the coroutine runs on another thread's loop. RequestClient's own state is
-        loop-agnostic, so the hop is about the blocking caller rather than about reaching it.
+        Called once at worker startup, on the engine loop, after the RequestClient is constructed
+        and topics are subscribed. Inert on the orchestrator (never called there).
         """
         self._worker_request_client = request_client
         self._orchestrator_request_topic = orchestrator_request_topic
         self._worker_response_topic = worker_response_topic
-        self._websocket_event_loop = websocket_event_loop
         self._forward_timeout_ms = timeout_ms
         self._worker_forwarding_enabled = True
 
@@ -1140,12 +1132,6 @@ class EventManager(EngineScoped):
         Wraps the request in an EventRequest, awaits the orchestrator's EventResult
         payload, and reconstructs it as an EventResultSuccess/EventResultFailure whose
         shape matches the locally-dispatched path.
-
-        The send/track/await is dispatched onto the websocket event loop (configured via
-        configure_worker_forwarding), the loop that owns the transport. Reaching
-        RequestClient state does not require that -- the state is loop-agnostic -- but the
-        sync handle_request path does, since it blocks its own thread on the result and can
-        only do so when the coroutine runs on another thread's loop.
         """
         if self._orchestrator_request_topic is None or self._worker_response_topic is None:
             msg = "Worker forwarding is enabled but not fully configured."
@@ -1200,19 +1186,19 @@ class EventManager(EngineScoped):
 
         `open_workflow_id` names the workflow the request runs in on the engine that receives it.
         """
-        if self._worker_request_client is None or self._websocket_event_loop is None:
+        if self._worker_request_client is None or self._event_loop is None:
             msg = "Worker forwarding is enabled but not fully configured."
             raise RuntimeError(msg)
-        response_future = asyncio.run_coroutine_threadsafe(
-            self._worker_request_client.request_from_worker(
-                event_request=EventRequest(request=request, open_workflow_id=open_workflow_id),
-                request_topic=request_topic,
-                worker_response_topic=response_topic,
-                timeout_ms=self._forward_timeout_ms,
-            ),
-            self._websocket_event_loop,
+        send = self._worker_request_client.request_from_worker(
+            event_request=EventRequest(request=request, open_workflow_id=open_workflow_id),
+            request_topic=request_topic,
+            worker_response_topic=response_topic,
+            timeout_ms=self._forward_timeout_ms,
         )
-        return await asyncio.wrap_future(response_future)
+        if _running_loop() is self._event_loop:
+            return await send
+        # Called from node code on another thread's loop. The transport belongs to the engine loop.
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(send, self._event_loop))
 
     def _bound_worker_workflow_id(self) -> str | None:
         """The orchestrator workflow id of the worker runtime the current work is bound to, else None.
@@ -1749,38 +1735,15 @@ class EventManager(EngineScoped):
 
     def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:
         """Call a request handler from sync code, bridging async handlers onto a loop."""
-        # Worker-side RemoteHandler callbacks are async but safe to invoke from any
-        # running loop except the WS loop itself: forward_to_orchestrator dispatches onto
-        # the WS loop via run_coroutine_threadsafe, which then runs on a different thread
-        # than the caller's loop, so no primitives are shared and the #4469 deadlock shape
-        # does not apply. A caller on the WS loop would block the loop it waits on.
-        # Hop the callback onto the WS loop here and block the caller's thread on the
-        # concurrent.futures.Future so RemoteHandler itself stays a plain async callable.
-        #
         # Lazy import: worker_routing imports ResultContext from this module at
         # runtime, so a top-level import here would cycle through event_manager
         # -> worker_routing -> event_manager during module load.
         from griptape_nodes.app.worker_routing import RemoteHandler
 
         if isinstance(callback, RemoteHandler):
-            running_loop = _running_loop()
-            if running_loop is None:
-                return asyncio.run(callback(request))
-            if self._websocket_event_loop is None:
-                msg = (
-                    f"Cannot forward '{type(request).__name__}' from a running event loop: "
-                    "the websocket event loop is not configured. This indicates a bootstrap order bug."
-                )
-                raise RuntimeError(msg)
-            if running_loop is self._websocket_event_loop:
-                msg = (
-                    f"Cannot handle '{type(request).__name__}' synchronously on the websocket event loop: "
-                    "its handler is dispatched onto that same loop, so blocking on it here would never return. "
-                    "Use ahandle_request from code running on this loop."
-                )
-                raise RuntimeError(msg)
-            future = asyncio.run_coroutine_threadsafe(callback(request), self._websocket_event_loop)
-            return future.result()
+            if not self.in_node_execution():
+                return self._invoke_handler_from_sync(callback.original, request)
+            return self._forward_from_sync(callback, request)
 
         # Support async callbacks invoked from sync code. If no loop is running
         # (bootstrap, worker threads) asyncio.run drives the coroutine directly.
@@ -1788,7 +1751,7 @@ class EventManager(EngineScoped):
         # engine loop), dispatch onto a side loop via ThreadRunner. The #4469
         # deadlock shape is specific to callbacks whose coroutines share
         # primitives with the caller's loop; RemoteHandler is the only such case
-        # and is handled above via run_coroutine_threadsafe onto the WS loop.
+        # and is handled above by _forward_from_sync.
         # For all other async handlers the side-loop path is safe.
         if inspect.iscoroutinefunction(callback):
             if _running_loop() is None:
@@ -1797,6 +1760,29 @@ class EventManager(EngineScoped):
                 return runner.run(callback(request))
 
         return callback(request)
+
+    def _forward_from_sync(self, callback: RemoteHandler, request: RequestPayload) -> ResultPayload:
+        """Forward a request a worker's node made from sync code, blocking its thread on the reply.
+
+        The reply arrives on the engine loop, so a caller on that loop cannot block on it.
+        """
+        running_loop = _running_loop()
+        if running_loop is None:
+            return asyncio.run(callback(request))
+        if self._event_loop is None:
+            msg = (
+                f"Cannot forward '{type(request).__name__}' from a running event loop: "
+                "the engine event loop is not set. This indicates a bootstrap order bug."
+            )
+            raise RuntimeError(msg)
+        if running_loop is self._event_loop:
+            msg = (
+                f"Attempted to send '{type(request).__name__}' with handle_request from a node running in a worker. "
+                "Failed because the reply arrives on the event loop this call would block. "
+                "Use ahandle_request from async node code."
+            )
+            raise RuntimeError(msg)
+        return asyncio.run_coroutine_threadsafe(callback(request), self._event_loop).result()
 
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]

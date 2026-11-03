@@ -1408,8 +1408,12 @@ class BaseNode(ABC):
 
         Default implementation wraps the existing process() method to maintain backwards compatibility.
         Subclasses can override this method to provide direct async implementation.
+
+        process() runs in a thread so a node doing slow work does not stall the event loop, which
+        answers heartbeats and cancels while the node runs. A generator's body runs on the loop and
+        each callable it yields runs in a thread.
         """
-        result = self.process()
+        result = await async_utils.to_thread(self.process)
 
         if result is None:
             # Simple synchronous node - nothing to do

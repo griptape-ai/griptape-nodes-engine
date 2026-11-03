@@ -34,6 +34,8 @@ Nodes have two ways to perform long-running work without stalling the engine:
 1. **Override `async def aprocess()` (preferred).** The engine awaits it on its event loop, so genuinely asynchronous integrations (async HTTP clients, `await asyncio.sleep()` polling) run concurrently with the rest of the engine.
 1. **Override `process()` and `yield` callables (`AsyncResult`).** Each yielded callable is executed **synchronously on a background thread** — the engine stays responsive, but the work itself is still blocking, sequential code.
 
+A plain `process()` that neither yields nor is overridden by `aprocess()` also runs on a background thread, so blocking code in it does not stall the engine.
+
 If you are writing a new integration, reach for `aprocess()` and async I/O. Use the `yield` pattern when your integration is built on synchronous libraries (`requests`, blocking SDKs) that you don't want to rewrite.
 
 ### Async Processing with `aprocess()` (Preferred)
@@ -109,6 +111,7 @@ class MyAsyncNode(ControlNode):
 - Override `async def aprocess()` instead of `process()` — the engine awaits it directly
 - Use async I/O throughout: `httpx.AsyncClient` for requests, `await asyncio.sleep()` for polling delays
 - Blocking calls (`requests`, `time.sleep()`) inside `aprocess()` stall the engine's event loop — if you must call a blocking function, wrap it with `await asyncio.to_thread(blocking_fn)`
+- Send requests from `aprocess()` with `await GriptapeNodes.ahandle_request(...)`. In a worker, `handle_request` called from `aprocess()` fails, because the reply arrives on the event loop it would block
 - The base class's default `aprocess()` wraps `process()`, so nodes only need to override one of the two
 
 ### Blocking Work on a Background Thread (`process()` + `yield`)
