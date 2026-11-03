@@ -57,7 +57,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.utils import media_probe
 from griptape_nodes.utils.media_probe import (
     ImageInfo,
-    MediaFile,
     VideoProbe,
     local_image_info,
     local_video_probe,
@@ -943,16 +942,10 @@ class TestNodeInAGroup:
             engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
-def test_a_value_that_is_not_media_reads_as_nothing(tmp_path: Path) -> None:
-    """On a parameter that holds no media, `ctx.media` reads nothing, even for a path to a real image."""
-    media = MediaFile.of(str(image_file(tmp_path, 10, 10)), kind=None)
-    assert (media.size_bytes, media.frame, media.mime_type, media.display_frame) == (None, None, None, None)
-
-
 class TestMistakesInACustomValidator:
     """A mistake in a validator's own code fails loudly instead of skipping its check."""
 
-    def test_reading_the_media_file_of_a_parameter_that_holds_none_raises(self, tmp_path: Path) -> None:
+    def test_reading_the_media_file_of_a_parameter_that_holds_none_fails_the_node(self, tmp_path: Path) -> None:
         class AnySize(PreRunValidator):
             @override
             def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
@@ -960,15 +953,19 @@ class TestMistakesInACustomValidator:
 
         node = _node_with(ParameterString(name="path", pre_run_validators=[AnySize()]))
         node.set_parameter_value("path", str(image_file(tmp_path, 10, 10)))
-        with pytest.raises(TypeError, match="isn't an image, video or audio artifact"):
-            validate_inputs(node)
+        assert _messages(validate_inputs(node)) == [
+            (
+                "Attempted to read the media file of 'path'. Failed because the parameter's type, str, "
+                "isn't an image, video or audio artifact."
+            )
+        ]
 
-    def test_a_media_condition_on_a_whole_list_validator_raises(self, tmp_path: Path) -> None:
+    def test_a_media_condition_on_a_whole_list_validator_fails_the_node(self, tmp_path: Path) -> None:
         # The whole list has no one file, so `is_png` could never hold and the count would never be checked.
         node = TestLists._list_node(MaxCount(1).when(_is_png))
         node.set_parameter_value("reference_images", [str(image_file(tmp_path, 10, 10)) for _ in range(2)])
-        with pytest.raises(TypeError, match="given the whole list, not one file"):
-            validate_inputs(node)
+        (message,) = _messages(validate_inputs(node))
+        assert "given the whole list, not one file" in message
 
     def test_a_media_validator_that_does_not_say_what_it_checks_is_refused(self) -> None:
         with pytest.raises(TypeError, match="must set `kinds`"):
@@ -977,3 +974,13 @@ class TestMistakesInACustomValidator:
                 @override
                 def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
                     return None
+
+    def test_a_media_mistake_reaches_the_node_as_its_error_and_not_the_run(self, tmp_path: Path) -> None:
+        # The resolution machine fails the node on what `validate_node` returns; anything it raises
+        # ends the whole run instead. A validator's mistake has to come back as an error.
+        # A plain validator passes the build-time check, so only the run can catch its media condition.
+        node = _node_with(ParameterString(name="path", pre_run_validators=[_MaxWords(1).when(_is_png)]))
+        node.set_parameter_value("path", str(image_file(tmp_path, 10, 10)))
+        (error,) = validate_node(node)
+        assert isinstance(error, NodeError)
+        assert "isn't an image, video or audio artifact" in str(error)

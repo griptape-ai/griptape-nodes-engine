@@ -12,14 +12,9 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.exe_types.core_types import ParameterList
 from griptape_nodes.exe_types.node_error import NodeError
 from griptape_nodes.exe_types.validators._checks import input_noun, input_subject
-from griptape_nodes.exe_types.validators.base import (
-    IfParameter,
-    PreRunRule,
-    _holds_list,
-    _pick_validators,
-    _PickedValidator,
-)
-from griptape_nodes.exe_types.validators.context import CheckContext
+from griptape_nodes.exe_types.validators._tree import PickedValidator, listed_for, pick_validators
+from griptape_nodes.exe_types.validators.base import IfParameter, PreRunRule, holds_list
+from griptape_nodes.exe_types.validators.context import CheckContext, NoMediaFileError
 from griptape_nodes.utils.media_probe import reading_once
 
 if TYPE_CHECKING:
@@ -50,7 +45,8 @@ def validate_inputs(node: BaseNode) -> list[NodeError]:
     on its value. A list parameter's validators run on each item, named by its position, except those
     that check the whole list. A single input with no value, an empty row, and a value held in
     another process are skipped, as are the checks an `IfParameter` picks by a setting held in
-    another process. A rule that reads a parameter the node doesn't have is reported as an error.
+    another process. A rule that reads a parameter the node doesn't have, or a media file where there's
+    none to read, is reported as an error.
     """
     declared = [parameter for parameter in node.parameters if parameter.pre_run_validators]
     if not declared:
@@ -69,7 +65,7 @@ def validate_inputs(node: BaseNode) -> list[NodeError]:
     return errors
 
 
-def _picked_now(node: BaseNode, parameter: Parameter) -> list[_PickedValidator]:
+def _picked_now(node: BaseNode, parameter: Parameter) -> list[PickedValidator]:
     """The validators that apply to a parameter at the node's turn, each `IfParameter` resolved.
 
     An `IfParameter` whose setting is held in another process picks nothing.
@@ -80,21 +76,21 @@ def _picked_now(node: BaseNode, parameter: Parameter) -> list[_PickedValidator]:
             current = _read_setting(node, rule.parameter, for_parameter=parameter.name)
         except _SettingUnavailableError:
             return ()
-        return rule._listed_for(current)
+        return listed_for(rule, current)
 
-    picked: list[_PickedValidator] = []
+    picked: list[PickedValidator] = []
     for rule in parameter.pre_run_validators:
-        picked.extend(_pick_validators(rule, branches))
+        picked.extend(pick_validators(rule, branches))
     return picked
 
 
 def _check_parameter(
-    node: BaseNode, parameter: Parameter, picked: Sequence[_PickedValidator], *, docs_url: str | None
+    node: BaseNode, parameter: Parameter, picked: Sequence[PickedValidator], *, docs_url: str | None
 ) -> list[NodeError]:
     """Run one parameter's validators on its value, or on each item and the whole list."""
     shown_name = parameter.display_name or parameter.name
     noun = input_noun(parameter)
-    if not _holds_list(parameter):
+    if not holds_list(parameter):
         value = _value_here(node, parameter.name)
         if value is None:
             return []
@@ -114,16 +110,27 @@ def _check_parameter(
     return errors
 
 
-def _run(picked: Sequence[_PickedValidator], value: Any, ctx: CheckContext) -> list[NodeError]:
-    """Each error the validators that apply to `value` report, sharing one context."""
+def _run(picked: Sequence[PickedValidator], value: Any, ctx: CheckContext) -> list[NodeError]:
+    """Each error the validators that apply to `value` report, sharing one context.
+
+    A condition or check that reads a media file where there's none to read is reported as its error.
+    """
     errors: list[NodeError] = []
     for entry in picked:
-        if not entry.applies(value, ctx):
-            continue
-        error = entry.validator.check(value, ctx)
+        try:
+            error = _check_one(entry, value, ctx)
+        except NoMediaFileError as e:
+            error = NodeError(str(e), links=None)
         if error is not None:
             errors.append(error)
     return errors
+
+
+def _check_one(entry: PickedValidator, value: Any, ctx: CheckContext) -> NodeError | None:
+    """The validator's error for `value`, or None when it passes or its narrowing rules it out."""
+    if not entry.applies(value, ctx):
+        return None
+    return entry.validator.check(value, ctx)
 
 
 class _UnknownSettingError(ValueError):

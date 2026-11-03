@@ -1,4 +1,4 @@
-"""What a validator's `check` is handed besides the value: the input it is checking, and its node.
+"""What a validator's `check` is handed besides the value: the input it is checking, and how to read its media file.
 
 The runner builds one `CheckContext` per value. A check reads what it needs from it: the start of
 its message (`subject`), the limits page to link (`docs_url`), a list item's `position`, and what the
@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.exe_types.validators.base import _holds_list
+from griptape_nodes.exe_types.validators.base import holds_list
 from griptape_nodes.utils.media_probe import MediaFile
 
 if TYPE_CHECKING:
@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     from griptape_nodes.utils.media_values import MediaKind
 
 __all__ = ["CheckContext"]
+
+
+class NoMediaFileError(TypeError):
+    """A check or condition read `ctx.media` where there's no one file to read, so it could never fire.
+
+    A mistake in the validator, not the input: the runner fails the node's checks with it, naming the
+    parameter, rather than quietly skipping the limit.
+    """
 
 
 @dataclass
@@ -50,7 +58,7 @@ class CheckContext:
         Each property is None when it can't be read here: a remote URL, or a file nothing here can open.
 
         Raises:
-            TypeError: If there's no one file to read, so a check or condition on it could never fire:
+            NoMediaFileError: If there's no one file to read, so a check or condition on it could never fire:
                 the parameter doesn't hold image, video or audio, or this is a whole-list validator's
                 context, which holds the list.
         """
@@ -62,13 +70,13 @@ class CheckContext:
                 f"Attempted to read the media file of '{self.parameter.name}'. Failed because the "
                 f"parameter's type, {self.parameter.type}, isn't an image, video or audio artifact."
             )
-            raise TypeError(msg)
-        if self.position is None and _holds_list(self.parameter):
+            raise NoMediaFileError(msg)
+        if self.position is None and holds_list(self.parameter):
             msg = (
                 f"Attempted to read the media file of '{self.parameter.name}'. Failed because this "
                 "check is given the whole list, not one file; check each item instead."
             )
-            raise TypeError(msg)
+            raise NoMediaFileError(msg)
         self._media = MediaFile.of(self.value, kind=kind)
         return self._media
 

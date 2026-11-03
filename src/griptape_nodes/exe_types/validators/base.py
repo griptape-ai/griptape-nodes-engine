@@ -3,8 +3,8 @@
 A `PreRunValidator` is a limit on one input, checked by its `check(value, ctx)`. The rest of a rule
 is a tree the engine walks: `IfParameter` picks validators by another parameter's value, and
 `first`, `when` and `unless` narrow a rule to a list's first items or to values a condition holds
-for. `_pick_validators` is the one walk: the runner uses it to find what applies at the node's turn,
-and `require_validators_fit` to check every branch when the parameter is built.
+for (`FirstItems` and `Conditional`). `_tree` holds the one walk of that tree, which the runner and
+the build-time fit check share.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ __all__ = [
     "IfParameter",
     "PreRunRule",
     "PreRunValidator",
-    "require_validators_fit",
 ]
 
 
@@ -54,7 +53,7 @@ class PreRunRule(ABC):  # noqa: B024  # a marker for what `pre_run_validators=` 
         if count < 1:
             msg = f"Attempted to apply a validator to the first {count} items. Failed because the count must be at least 1."
             raise ValueError(msg)
-        return _FirstItems(self, count)
+        return FirstItems(self, count)
 
     def when(self, condition: Condition) -> PreRunRule:
         """This rule, applied only to a value `condition` holds for.
@@ -71,11 +70,11 @@ class PreRunRule(ABC):  # noqa: B024  # a marker for what `pre_run_validators=` 
         It reads what it touches, as a check does. A limit that depends on another parameter's value
         is an `IfParameter`.
         """
-        return _Conditional(self, condition, applies_when=True)
+        return Conditional(self, condition, applies_when=True)
 
     def unless(self, condition: Condition) -> PreRunRule:
         """This rule, applied only to a value `condition` doesn't hold for. See `when`."""
-        return _Conditional(self, condition, applies_when=False)
+        return Conditional(self, condition, applies_when=False)
 
 
 class PreRunValidator(PreRunRule):
@@ -111,7 +110,7 @@ class PreRunValidator(PreRunRule):
         Raises:
             TypeError: If this validator can't check `parameter`.
         """
-        if self.checks_whole_list and not _holds_list(parameter):
+        if self.checks_whole_list and not holds_list(parameter):
             msg = (
                 f"Attempted to add {type(self).__name__} to parameter '{parameter.name}'. "
                 "Failed because it checks a list, and the parameter holds a single value."
@@ -161,116 +160,30 @@ class IfParameter(PreRunRule):
         object.__setattr__(self, "default", tuple(default))
         object.__setattr__(self, "key", key)
 
-    def _listed_for(self, current: Any) -> tuple[PreRunRule, ...]:
-        """The rules for the other parameter's value `current`, or `default`."""
-        if self.key is not None:
-            current = self.key(current)
-        for value, rules in self.choices:
-            if current == value:
-                return rules
-        return self.default
-
-    def _every_branch(self) -> tuple[PreRunRule, ...]:
-        """The rules of every choice and `default`, for checking all of them when the parameter is built."""
-        rules = [rule for _, listed in self.choices for rule in listed]
-        rules.extend(self.default)
-        return tuple(rules)
-
 
 @dataclass(frozen=True)
-class _FirstItems(PreRunRule):
-    """`rule`, applied only to a list's first `count` items."""
+class FirstItems(PreRunRule):
+    """`rule`, applied only to a list's first `count` items. What `first` returns; the engine walks it."""
 
     rule: PreRunRule
     count: int
 
 
 @dataclass(frozen=True)
-class _Conditional(PreRunRule):
-    """`rule`, applied only when `condition` holds for the value (or, with `applies_when=False`, doesn't)."""
+class Conditional(PreRunRule):
+    """`rule`, applied only when `condition` holds for the value (or, with `applies_when=False`, doesn't).
+
+    What `when` and `unless` return; the engine walks it.
+    """
 
     rule: PreRunRule
     condition: Condition
     applies_when: bool
 
 
-@dataclass(frozen=True)
-class _PickedValidator:
-    """A validator a rule reached, with the narrowing on its path from the declared rule.
+def holds_list(parameter: Parameter) -> bool:
+    """Whether a parameter's value is a list, whose items its validators check one by one.
 
-    Args:
-        validator: The validator to run.
-        first: The most items of a list it checks, from `first` on its path, or None for all of them.
-        conditions: Each `when` (True) or `unless` (False) on its path, outermost first.
+    For the engine's validator modules; not exported.
     """
-
-    validator: PreRunValidator
-    first: int | None = None
-    conditions: tuple[tuple[Condition, bool], ...] = ()
-
-    def applies(self, value: Any, ctx: CheckContext) -> bool:
-        """Whether the validator checks `value`: within `first`, and every condition agreeing."""
-        if self.first is not None and ctx.position is not None and ctx.position > self.first:
-            return False
-        return all(condition(value, ctx) == applies_when for condition, applies_when in self.conditions)
-
-
-def _pick_validators(
-    rule: PreRunRule, branches: Callable[[IfParameter], Sequence[PreRunRule]]
-) -> list[_PickedValidator]:
-    """Every validator `rule` reaches, with the narrowing on the path to it.
-
-    `branches` says which rules an `IfParameter` leads to: at the node's turn, the list for the
-    other parameter's value; when the parameter is built, every list.
-
-    Raises:
-        TypeError: If the rule, or one it holds, isn't a validator or a rule from this module.
-    """
-    return _walk(rule, branches, first=None, conditions=())
-
-
-def _walk(
-    rule: PreRunRule,
-    branches: Callable[[IfParameter], Sequence[PreRunRule]],
-    *,
-    first: int | None,
-    conditions: tuple[tuple[Condition, bool], ...],
-) -> list[_PickedValidator]:
-    """`_pick_validators` below one rule, carrying the narrowing on the path so far."""
-    match rule:
-        case PreRunValidator():
-            return [_PickedValidator(validator=rule, first=first, conditions=conditions)]
-        case _FirstItems(rule=inner, count=count):
-            narrowed = count if first is None else min(first, count)
-            return _walk(inner, branches, first=narrowed, conditions=conditions)
-        case _Conditional(rule=inner, condition=condition, applies_when=applies_when):
-            return _walk(inner, branches, first=first, conditions=(*conditions, (condition, applies_when)))
-        case IfParameter():
-            picked: list[_PickedValidator] = []
-            for branch in branches(rule):
-                picked.extend(_walk(branch, branches, first=first, conditions=conditions))
-            return picked
-        case _:
-            msg = (
-                f"Attempted to check an input with {rule!r}. Failed because pre_run_validators takes "
-                "validators, IfParameter, and what first, when and unless return."
-            )
-            raise TypeError(msg)
-
-
-def _holds_list(parameter: Parameter) -> bool:
-    """Whether a parameter's value is a list, whose items its validators check one by one."""
     return parameter.type.strip().lower().startswith("list[")
-
-
-def require_validators_fit(parameter: Parameter) -> None:
-    """Raise when a parameter declares a rule it can't be checked with.
-
-    Walks every branch of every declared rule and asks each validator reached whether it fits.
-
-    Raises:
-        TypeError: If a declared item isn't a rule, or a validator it reaches can't check `parameter`.
-    """
-    for rule in parameter.pre_run_validators:
-        for picked in _pick_validators(rule, IfParameter._every_branch):
-            picked.validator.require_fits(parameter)

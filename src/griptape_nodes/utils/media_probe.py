@@ -436,26 +436,24 @@ class MediaFile:
 
     Only the kind the input's parameter holds is read: an image parameter's value is never probed
     as a video. Each property is None when it can't be read here: a remote URL, a format nothing
-    here opens, ffprobe missing or out of time, or a value that isn't media. Inside `reading_once`,
+    here opens, or ffprobe missing or out of time. Inside `reading_once`,
     each reading of a location is taken once however many `MediaFile`s ask for it.
     """
 
-    def __init__(self, location: str | None, *, kind: MediaKind | None) -> None:
-        # Where the value was read from, such as a file path or data URI, or None when it holds no media.
+    def __init__(self, location: str | None, *, kind: MediaKind) -> None:
+        # Where the value was read from, such as a file path or data URI, or None when it names no file.
         self.location: str | None = location
-        self._kind: MediaKind | None = kind
+        self._kind: MediaKind = kind
 
     @classmethod
-    def of(cls, value: Any, *, kind: MediaKind | None) -> MediaFile:
-        """The media file a parameter value points at, for a parameter holding `kind` (None for no media)."""
-        if kind is None:
-            return cls(None, kind=None)
+    def of(cls, value: Any, *, kind: MediaKind) -> MediaFile:
+        """The media file a value points at, for a parameter holding `kind`."""
         return cls(coerce_media_url_or_data_uri(value, kind=kind) or None, kind=kind)
 
     @cached_property
     def size_bytes(self) -> int | None:
         """The file's size in bytes."""
-        if self.location is None or self._kind is None:
+        if self.location is None:
             return None
         return local_size_bytes(self.location, kind=self._kind)
 
