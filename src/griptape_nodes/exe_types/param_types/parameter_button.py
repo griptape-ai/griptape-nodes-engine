@@ -9,7 +9,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     Trait,
 )
-from griptape_nodes.exe_types.validators.base import PreRunValidator
+from griptape_nodes.exe_types.validators.base import PreRunRule
 from griptape_nodes.traits.button import Button
 
 # Type aliases matching Button trait
@@ -110,7 +110,7 @@ class ParameterButton(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ) -> None:
         """Initialize a button parameter with enhanced UI options.
 

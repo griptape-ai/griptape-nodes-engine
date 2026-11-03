@@ -10,7 +10,6 @@ import logging
 import os
 import subprocess
 import sys
-import typing
 from io import BytesIO
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -24,15 +23,13 @@ from griptape_nodes.utils import media_probe
 from griptape_nodes.utils.media_probe import (
     AudioProbe,
     ImageInfo,
-    MediaInfo,
-    MediaNeed,
+    MediaFile,
     VideoProbe,
     local_audio_probe,
     local_image_format,
     local_image_info,
     local_size_bytes,
     local_video_probe,
-    read_media,
     reading_once,
 )
 from tests.unit.exe_types.validators.media_files import HEIC_PHOTO
@@ -205,8 +202,10 @@ class TestLocalImageInfo:
 class TestReadersWithoutALocation:
     """A value that names no location, such as an empty artifact, reads as nothing."""
 
-    def test_read_media_reads_nothing(self) -> None:
-        assert read_media("   ", {MediaNeed.SIZE, MediaNeed.IMAGE}, kind="image") == MediaInfo()
+    def test_a_media_file_reads_nothing(self) -> None:
+        media = MediaFile.of("   ", kind="image")
+        assert media.location is None
+        assert (media.size_bytes, media.image, media.image_format, media.mime_type) == (None, None, None, None)
 
     @pytest.mark.parametrize(
         "reader",
@@ -388,8 +387,8 @@ class TestProbeTimeouts:
     @pytest.mark.usefixtures("slow_ffprobe")
     def test_skips_and_logs_a_probe_that_times_out(self, clip: Path, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"), reading_once():
-            info = read_media(str(clip), {MediaNeed.VIDEO}, kind="video")
-        assert info.video is None
+            media = MediaFile.of(str(clip), kind="video")
+            assert media.video is None
         assert any(
             f"ffprobe took longer than {media_probe.FFPROBE_TIMEOUT_SECONDS:g} seconds" in record.getMessage()
             and str(clip) in record.getMessage()
@@ -921,11 +920,6 @@ class TestAudio:
 class TestLayering:
     """The probe sits below the validators: they read with it, and it imports nothing of theirs."""
 
-    def test_resolves_mediainfos_type_hints_at_runtime(self) -> None:
-        hints = typing.get_type_hints(media_probe.MediaInfo)
-        assert hints["image"] == media_probe.ImageInfo | None
-        assert hints["video"] == media_probe.VideoProbe | None
-
     def test_imports_without_the_validators(self) -> None:
         code = (
             "import sys\n"
@@ -935,3 +929,34 @@ class TestLayering:
         )
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)  # noqa: S603
         assert result.returncode == 0, result.stderr
+
+
+class TestMediaFile:
+    """A `MediaFile` reads each property on first access, only for the kind its parameter holds."""
+
+    def test_reads_nothing_until_asked(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(media_probe, "_read_image_info", lambda _location: pytest.fail("read before asked"))
+        MediaFile.of(str(tmp_path / "a.png"), kind="image")
+
+    def test_reads_a_property_once_however_often_it_is_asked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[str] = []
+
+        def counting(location: str) -> ImageInfo:
+            reads.append(location)
+            return ImageInfo(10, 10, "image/png")
+
+        monkeypatch.setattr(media_probe, "_read_image_info", counting)
+        media = MediaFile.of(str(tmp_path / "a.png"), kind="image")
+        assert media.mime_type == "image/png"
+        assert media.frame == ImageInfo(10, 10, "image/png")
+        assert len(reads) == 1
+
+    def test_never_probes_an_image_parameters_value_as_a_video(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(media_probe, "_probe_video", lambda _location: pytest.fail("an image is never probed"))
+        media = MediaFile.of(str(tmp_path / "a.png"), kind="image")
+        assert media.video is None
+        assert media.audio is None

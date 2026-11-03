@@ -6,7 +6,7 @@ from typing import Any
 from json_repair import repair_json
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
-from griptape_nodes.exe_types.validators.base import PreRunValidator
+from griptape_nodes.exe_types.validators.base import PreRunRule
 
 
 class ParameterJson(Parameter):
@@ -67,7 +67,7 @@ class ParameterJson(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ) -> None:
         """Initialize a JSON parameter with enhanced UI options.
 

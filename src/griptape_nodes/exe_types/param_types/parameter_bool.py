@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
-from griptape_nodes.exe_types.validators.base import PreRunValidator
+from griptape_nodes.exe_types.validators.base import PreRunRule
 
 
 class ParameterBool(Parameter):
@@ -59,7 +59,7 @@ class ParameterBool(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ) -> None:
         """Initialize a boolean parameter with enhanced UI options.
 

@@ -380,8 +380,9 @@ holds instead of "input": "The image in 'Start Frame'", "Video 2 in 'clips'", "T
 **Limits that depend on a setting.** When the limits change with the selected model, wrap them in
 `IfParameter`. At the node's turn it picks the list for the other parameter's current value, or
 `default` for any other value. The validators it picks can be any kind, media included, and a list
-can hold another `IfParameter`, for limits that depend on two settings. Override
-`input_limits_url()` to return the page for the current model too.
+can hold another `IfParameter`, for limits that depend on two settings. The parameter it names must
+be on the node: a name the node doesn't have fails the node's checks, so a typo doesn't quietly
+apply `default`. Override `input_limits_url()` to return the page for the current model too.
 
 The values it looks up can be anything a parameter holds, such as `True` for a switch. `key=` turns
 the value into what's looked up first: `key=bool` asks whether a list has any items.
@@ -394,9 +395,23 @@ IfParameter("strict", {True: [MaxCount(1, noun="prompts")]}, default=[MaxCount(3
 IfParameter("examples", {False: [MaxCount(1, noun="prompts")]}, key=bool)
 ```
 
-**Only the first items.** `.first(n)` narrows any validator to a list's first `n` items, for a
-provider that reads only that many. A validator that checks the whole list, such as `MaxCount`,
-isn't narrowed.
+**Only the first items.** `.first(n)` narrows any validator, or an `IfParameter`, to a list's first
+`n` items, for a provider that reads only that many. A validator that checks the whole list, such
+as `MaxCount`, isn't narrowed.
+
+**Limits that depend on the value.** `.when(condition)` and `.unless(condition)` narrow any
+validator, or an `IfParameter`, to values a condition holds, or doesn't hold, for. A condition is a
+function given the value and its `CheckContext`, the same two arguments `check` gets, returning True
+or False. A condition on a media file reads it through `ctx.media` (see "Limits on media files"
+below). A limit that depends on another parameter's value is an `IfParameter`.
+
+```python
+def is_long(value, ctx) -> bool:
+    return len(str(value).split()) > 50
+
+
+MaxWords(100).unless(is_long)
+```
 
 **Rules across several inputs.** For a limit that involves more than one input, such as a combined
 length across several prompts, check it in the node's `validate_before_node_run`. The engine runs it
@@ -425,10 +440,11 @@ class Generate(SuccessFailureNode):
 ```
 
 **Your own validator.** Most limits are a built-in validator, narrowed where needed with
-`IfParameter` or `.first(n)`. For one none of them covers, subclass `PreRunValidator` and return
-`limit_error(message, docs_url)` from `check`, or None, so the error links the provider's limits
-page like a built-in's. `check` is also given a list item's `position`; take `**_` for
-any argument you don't use. A single input with no value, and each empty row of a list, is skipped
+`IfParameter` or `.first(n)`. For one none of them covers, subclass `PreRunValidator` and implement
+`check(value, ctx)`. Return `limit_error(message, ctx.docs_url)`, or None, so the error links the
+provider's limits page like a built-in's. `ctx` is a `CheckContext`: `ctx.subject` starts the
+message naming the input, `ctx.position` is a list item's position, `ctx.media` reads a media file,
+and `ctx.setting(name)` reads another parameter's value. A single input with no value, and each empty row of a list, is skipped
 before any validator runs; a validator with `checks_whole_list` still gets the list, even an empty
 one. Check that a required input is set in the node's `validate_before_node_run`.
 
@@ -437,7 +453,7 @@ from dataclasses import dataclass
 from typing import Any, override
 
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import PreRunValidator, limit_error
+from griptape_nodes.exe_types.validators import CheckContext, PreRunValidator, limit_error
 
 
 @dataclass(frozen=True)
@@ -445,11 +461,13 @@ class MaxWords(PreRunValidator):
     maximum: int
 
     @override
-    def check(self, value: Any, *, subject: str, docs_url: str | None, **_: Any) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
         words = len(str(value).split())
         if words <= self.maximum:
             return None
-        return limit_error(f"{subject} has {words} words and the limit is {self.maximum}. Shorten it.", docs_url)
+        return limit_error(
+            f"{ctx.subject} has {words} words and the limit is {self.maximum}. Shorten it.", ctx.docs_url
+        )
 ```
 
 ##### Limits on media files
@@ -532,19 +550,16 @@ can't be read, so its size and shape checks are skipped and the provider judges 
 `"hevc"`, `"mp3"` or `"pcm_s16le"`. The names the messages show (`"H.264"`, `"AC-3"`) and `"AVC"`
 work too, so translate the provider's wording into these names in your limits table.
 
-**Media limits that depend on the file.** `.when(condition)` and `.unless(condition)` wrap a media
-validator so it applies only to a value whose file the condition holds, or doesn't hold, for. A
-condition is a function given the value's `MediaInfo`, returning True or False; it marks what it
-reads with `@reads(...)`, so the engine reads that along with the validator's own readings. A
-condition sees only the file: a limit that depends on a setting is an `IfParameter`.
+**Media limits that depend on the file.** A condition for `.when()` or `.unless()` reads the file
+through `ctx.media`, the same way a media check does. Nothing is read until a condition or check asks
+for it, and what one reads, the rest reuse.
 
 ```python
-from griptape_nodes.exe_types.validators import IfParameter, MaxFileSize, MediaNeed, SideRange, reads
+from griptape_nodes.exe_types.validators import IfParameter, MaxFileSize, SideRange
 
 
-@reads(MediaNeed.IMAGE)
-def is_png(media) -> bool:
-    return media.mime_type == "image/png"
+def is_png(value, ctx) -> bool:
+    return ctx.media.mime_type == "image/png"
 
 
 ParameterImage(
@@ -582,33 +597,33 @@ class ReferenceToVideo(SuccessFailureNode):
         ]
 ```
 
-A limit on an image, video or audio file subclasses `MediaValidator` instead: set `needs` to the
-readings it uses (`MediaNeed.SIZE`, `IMAGE`, `VIDEO` or `AUDIO`) and implement `check_media`, which
-is handed them. The engine reads the input once for all the media validators on a parameter and
-hands each the same `MediaInfo`, and refuses one whose readings don't fit the parameter's kind
-when the node is built. For a reading `MediaInfo` doesn't carry, call a reader
-(`local_size_bytes`, `local_image_info`, `local_image_format`, `local_video_probe`,
-`local_audio_probe`) from `griptape_nodes.utils.media_probe`; during the node's checks it returns
-what was already read.
+A limit on an image, video or audio file subclasses `MediaValidator` instead, and reads the file
+through `ctx.media`, a `MediaFile` whose properties (`size_bytes`, `image`, `video`, `audio`,
+`frame`, `mime_type` and the rest) are read the first time a check asks for each, once per input
+however many validators ask. Set `kinds` to the media it can check, so the engine refuses it on a
+parameter holding another kind when the node is built. A property that can't be read here is None:
+skip the check then. For a reading `MediaFile` doesn't carry, call a reader (`local_size_bytes`,
+`local_image_info`, `local_image_format`, `local_video_probe`, `local_audio_probe`) from
+`griptape_nodes.utils.media_probe`; during the node's checks it returns what was already read.
 
 ```python
 from typing import Any, override
 
 from griptape_nodes.exe_types.node_error import NodeError
-from griptape_nodes.exe_types.validators import MediaInfo, MediaNeed, MediaValidator, limit_error
+from griptape_nodes.exe_types.validators import CheckContext, MediaValidator, limit_error
 
 
 class EvenSides(MediaValidator):
-    needs = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO})
+    kinds = frozenset({"image", "video"})
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, **_: Any
-    ) -> NodeError | None:
-        frame = media.frame
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        frame = ctx.media.frame
         if frame is None or (frame.width % 2 == 0 and frame.height % 2 == 0):
             return None
-        return limit_error(f"{subject} is {frame.width}x{frame.height} and each side must be even. Crop it.", docs_url)
+        return limit_error(
+            f"{ctx.subject} is {frame.width}x{frame.height} and each side must be even. Crop it.", ctx.docs_url
+        )
 ```
 
 The built-in media checks follow these rules:
@@ -641,7 +656,7 @@ the engine does at the node's turn, and returns every error. Set the inputs, the
 messages:
 
 ```python
-from griptape_nodes.exe_types.validators import validate_node
+from griptape_nodes.exe_types.validators.runner import validate_node
 
 
 def test_refuses_too_many_prompts() -> None:

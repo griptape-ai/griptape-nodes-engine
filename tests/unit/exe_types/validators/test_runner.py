@@ -33,13 +33,8 @@ from griptape_nodes.exe_types.param_types.parameter_string import ParameterStrin
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.exe_types.param_types.parameter_xml import ParameterXml
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
-from griptape_nodes.exe_types.validators import media_validator
-from griptape_nodes.exe_types.validators._runner import (
-    validate_inputs,
-    validate_node,
-)
-from griptape_nodes.exe_types.validators.base import PreRunValidator
-from griptape_nodes.exe_types.validators.common import IfParameter, MaxCount
+from griptape_nodes.exe_types.validators.base import IfParameter, PreRunRule, PreRunValidator
+from griptape_nodes.exe_types.validators.common import MaxCount
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
@@ -49,7 +44,11 @@ from griptape_nodes.exe_types.validators.media import (
     MaxFileSize,
     SideRange,
 )
-from griptape_nodes.exe_types.validators.media_validator import MediaValidator, reads
+from griptape_nodes.exe_types.validators.media_validator import MediaValidator
+from griptape_nodes.exe_types.validators.runner import (
+    validate_inputs,
+    validate_node,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
@@ -58,8 +57,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.utils import media_probe
 from griptape_nodes.utils.media_probe import (
     ImageInfo,
-    MediaInfo,
-    MediaNeed,
+    MediaFile,
     VideoProbe,
     local_image_info,
     local_video_probe,
@@ -71,6 +69,7 @@ from tests.unit.exe_types.validators.media_files import image_file
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from griptape_nodes.exe_types.validators.context import CheckContext
     from griptape_nodes.retained_mode.engine import Engine
 
 DOCS = "https://example.com/limits"
@@ -99,14 +98,14 @@ class _MaxWords(PreRunValidator):
     maximum: int
 
     @override
-    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
         words = len(str(value).split())
         if words <= self.maximum:
             return None
-        return NodeError(f"{subject} has {words} words and the limit is {self.maximum}.")
+        return NodeError(f"{ctx.subject} has {words} words and the limit is {self.maximum}.")
 
 
-def _prompts(*validators: PreRunValidator) -> ParameterList:
+def _prompts(*validators: PreRunRule) -> ParameterList:
     return ParameterList(
         name="prompts",
         tooltip="",
@@ -164,9 +163,7 @@ class TestGenericValidators:
         @dataclass(frozen=True)
         class TextOnly(PreRunValidator):
             @override
-            def check(
-                self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None
-            ) -> NodeError | None:
+            def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
                 return None
 
             @override
@@ -257,12 +254,10 @@ class TestSingleInputs:
         @dataclass(frozen=True)
         class NotEmpty(PreRunValidator):
             @override
-            def check(
-                self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None
-            ) -> NodeError | None:
+            def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
                 if value.strip():
                     return None
-                return NodeError(f"{subject} is blank. Write a prompt.")
+                return NodeError(f"{ctx.subject} is blank. Write a prompt.")
 
         node = _node_with(ParameterString(name="prompt", pre_run_validators=[NotEmpty()]))
         node.set_parameter_value("prompt", "   ")
@@ -360,7 +355,7 @@ class TestReadOnce:
 
 class TestLists:
     @staticmethod
-    def _list_node(*validators: PreRunValidator) -> MockNode:
+    def _list_node(*validators: PreRunRule) -> MockNode:
         return _node_with(
             ParameterList(
                 name="reference_images",
@@ -374,27 +369,22 @@ class TestLists:
         )
 
     def test_a_whole_list_media_validator_reads_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A validator handed the whole list judges the list, so nothing is read for it.
-        seen: list[MediaInfo] = []
-        reads_attempted: list[object] = []
-        monkeypatch.setattr(media_validator, "read_media", lambda value, *_a, **_k: reads_attempted.append(value))
+        # A validator handed the whole list judges the list, so `ctx.media` reads no file for it.
+        seen: list[int | None] = []
+        monkeypatch.setattr(media_probe, "_read_size_bytes", lambda _location: pytest.fail("nothing should be read"))
 
         class TotalSize(MediaValidator):
             checks_whole_list = True
-            needs = frozenset({MediaNeed.SIZE})
 
             @override
-            def check_media(
-                self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-            ) -> NodeError | None:
-                seen.append(media)
+            def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+                seen.append(ctx.media.size_bytes)
                 return None
 
         node = self._list_node(TotalSize())
         node.set_parameter_value("reference_images", [str(image_file(tmp_path, 10, 10))])
         assert validate_inputs(node) == []
-        assert seen == [MediaInfo()]
-        assert reads_attempted == []
+        assert seen == [None]
 
     def test_checks_each_item_by_its_position(self, tmp_path: Path) -> None:
         node = self._list_node(SideRange(min=300))
@@ -550,25 +540,23 @@ class TestIfParameter:
         assert parameter.copy().pre_run_validators == parameter.pre_run_validators
 
 
-@reads(MediaNeed.IMAGE)
-def _no_image_read(media: MediaInfo) -> bool:
-    return media.image is None
+def _no_image_read(_value: Any, ctx: CheckContext) -> bool:
+    return ctx.media.image is None
 
 
-@reads(MediaNeed.IMAGE)
-def _is_png(media: MediaInfo) -> bool:
-    return media.mime_type == "image/png"
+def _is_png(_value: Any, ctx: CheckContext) -> bool:
+    return ctx.media.mime_type == "image/png"
 
 
-def _always(_media: MediaInfo) -> bool:
+def _always(_value: Any, _ctx: CheckContext) -> bool:
     return True
 
 
 class TestConditions:
-    """`when` and `unless` narrow a validator by the file, and `first` by a list item's position."""
+    """`when` and `unless` narrow any rule by the value, and `first` by a list item's position."""
 
     @staticmethod
-    def _image_node(*validators: PreRunValidator, model: str = "pro") -> MockNode:
+    def _image_node(*validators: PreRunRule, model: str = "pro") -> MockNode:
         node = _node_with(
             ParameterString(name="model", default_value=model),
             ParameterImage(name="image", pre_run_validators=validators),
@@ -601,9 +589,11 @@ class TestConditions:
         node.set_parameter_value("image", str(unreadable))
         assert validate_inputs(node) == []
 
-    def test_reads_what_a_condition_declares_along_with_the_validators_needs(
+    def test_a_condition_reads_what_it_touches_and_shares_it_with_the_check(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # A condition on the format, over a validator that reads only the size: the format is read
+        # because the condition asked for it, with nothing declared, and read once.
         reads_seen: list[str] = []
 
         def counting(location: str) -> ImageInfo:
@@ -611,24 +601,29 @@ class TestConditions:
             return ImageInfo(10, 10, "image/png")
 
         monkeypatch.setattr(media_probe, "_read_image_info", counting)
-        wrapped = MaxFileSize(1).when(_no_image_read)
-        assert wrapped.needs == {MediaNeed.SIZE, MediaNeed.IMAGE}
-        node = self._image_node(wrapped)
+        node = self._image_node(MaxFileSize(1).when(_is_png), SideRange(min=300).when(_is_png))
         image = str(image_file(tmp_path, 10, 10))
         node.set_parameter_value("image", image)
-        with reading_once():
-            # The image was read for the condition, which then held false, so the size limit was skipped.
-            assert validate_inputs(node) == []
+        assert len(validate_inputs(node)) == 2
         assert reads_seen == [image]
 
-    def test_a_condition_without_declared_needs_reads_only_the_validators(self) -> None:
-        assert SideRange(min=1).when(_always).needs == SideRange.needs
+    def test_a_condition_works_on_any_rule(self) -> None:
+        def long_prompt(value: Any, _ctx: CheckContext) -> bool:
+            return len(str(value).split()) > 3
 
-    def test_conditions_on_the_file_are_for_media_validators_only(self) -> None:
-        # A condition reads the file; a validator that reads none puts its conditions on what it picks.
-        assert not hasattr(IfParameter("model", {}), "unless")
-        assert not hasattr(MaxCount(2), "when")
-        assert hasattr(SideRange(min=1), "when")
+        node = _node_with(ParameterString(name="prompt", pre_run_validators=[_MaxWords(1).when(long_prompt)]))
+        node.set_parameter_value("prompt", "two words")
+        assert validate_inputs(node) == []
+        node.set_parameter_value("prompt", "four words in all")
+        assert len(validate_inputs(node)) == 1
+
+    def test_a_condition_can_narrow_an_if_parameter(self, tmp_path: Path) -> None:
+        by_model = IfParameter("model", {"pro": [SideRange(min=300)]}).unless(_is_png)
+        node = self._image_node(by_model)
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200)))
+        assert validate_inputs(node) == []
+        node.set_parameter_value("image", str(image_file(tmp_path, 200, 200, "JPEG")))
+        assert len(validate_inputs(node)) == 1
 
     def test_first_wraps_each_pick_of_an_if_parameter(self, tmp_path: Path) -> None:
         by_model = IfParameter("model", {"pro": [SideRange(min=300)]}, default=[SideRange(min=1000)])
@@ -680,12 +675,8 @@ class TestConditions:
                 "AudioCodecs",
             ),
             (lambda: ParameterImage(name="p", pre_run_validators=[MaxCount(2).first(1)]), "a list"),
-            (
-                lambda: ParameterVideo(name="p", pre_run_validators=[MaxFileSize(1).when(_no_image_read)]),
-                "checks image, and the parameter holds video",
-            ),
         ],
-        ids=["conditional", "first-of-if-parameter", "whole-list-on-single", "condition-reads"],
+        ids=["conditional", "first-of-if-parameter", "whole-list-on-single"],
     )
     def test_the_build_time_fit_check_sees_through_wrappers(self, build: Any, match: str) -> None:
         with pytest.raises(TypeError, match=match):
@@ -919,7 +910,7 @@ class _Records(PreRunValidator):
     seen: ClassVar[list[Any]] = []
 
     @override
-    def check(self, value: Any, *, subject: str, docs_url: str | None, position: int | None = None) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
         _Records.seen.append(value)
         return None
 
@@ -970,9 +961,7 @@ class TestNodeInAGroup:
             engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
-def test_media_info_reports_nothing_it_was_not_given() -> None:
-    """An empty reading has no frame, format or displayed shape."""
-    assert MediaInfo().frame is None
-    assert MediaInfo().mime_type is None
-    assert MediaInfo().display_frame is None
-    assert MediaNeed("size") is MediaNeed.SIZE
+def test_a_value_that_is_not_media_reads_as_nothing(tmp_path: Path) -> None:
+    """On a parameter that holds no media, `ctx.media` reads nothing, even for a path to a real image."""
+    media = MediaFile.of(str(image_file(tmp_path, 10, 10)), kind=None)
+    assert (media.size_bytes, media.frame, media.mime_type, media.display_frame) == (None, None, None, None)

@@ -12,10 +12,11 @@ node's own `validate_before_node_run` can read with it too, for a rule across se
   tool to read it is missing or too slow. During a node's checks, each reader reads a location once
   and returns the same result after. A probe that runs out of time is logged as a warning and
   skipped, like any other input that can't be read here.
-- **`MediaInfo`** holds what was read of one value, and **`MediaNeed`** names one reading.
+- **`MediaFile`** is one media input, reading each property the first time it's asked for. A
+  validator gets one as `ctx.media`.
 
-`reading_once` and `read_media` are for the engine's validation runner, which opens one around each
-node's checks; they are not in `__all__`. Nothing here depends on the validators.
+`reading_once` is for the engine's validation runner, which opens one around each node's checks;
+it is not in `__all__`. Nothing here depends on the validators.
 """
 
 from __future__ import annotations
@@ -30,8 +31,8 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
 from enum import StrEnum
+from functools import cached_property
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -43,15 +44,14 @@ from griptape_nodes.files.path_utils import is_url
 from griptape_nodes.utils.media_values import MediaKind, coerce_media_url_or_data_uri
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterator
+    from collections.abc import Callable, Iterator
 
 logger = logging.getLogger("griptape_nodes")
 
 __all__ = [
     "AudioProbe",
     "ImageInfo",
-    "MediaInfo",
-    "MediaNeed",
+    "MediaFile",
     "VideoProbe",
     "local_audio_probe",
     "local_image_format",
@@ -83,8 +83,8 @@ _QUARTER_TURN_DEGREES = 90
 _HALF_TURN_DEGREES = 180
 
 
-class MediaNeed(StrEnum):
-    """One reading of a media value: its size, or its image, video or audio properties."""
+class _Reader(StrEnum):
+    """One reader, as a key in `_readings`: the size, or the image, video or audio properties."""
 
     SIZE = "size"
     IMAGE = "image"
@@ -94,7 +94,7 @@ class MediaNeed(StrEnum):
 
 # What the readers have read in the current `reading_once` block, by reader and location, or
 # None outside one. A reading that came back None is kept too, so an unreadable input isn't retried.
-_readings: ContextVar[dict[tuple[MediaNeed, str], Any] | None] = ContextVar("media_probe_readings", default=None)
+_readings: ContextVar[dict[tuple[_Reader, str], Any] | None] = ContextVar("media_probe_readings", default=None)
 
 
 class ImageInfo(NamedTuple):
@@ -124,49 +124,7 @@ def reading_once() -> Iterator[None]:
         _readings.reset(token)
 
 
-def read_media(value: Any, needs: Collection[MediaNeed], *, kind: MediaKind) -> MediaInfo:
-    """The readings `needs` names, of one media input, taken once.
-
-    Reduces the input to one location and hands that to each reader asked for: `local_size_bytes`
-    for `SIZE`, `local_image_info` for `IMAGE`, `local_video_probe` for `VIDEO` and
-    `local_audio_probe` for `AUDIO`. A reading not asked for, or that couldn't be taken, is None.
-    An image Pillow can't open, such as a HEIC photo, still has its format read from its file
-    signature where that names one, so a format check can judge it while the size checks skip.
-
-    Args:
-        value: The media input: an artifact, a path, a URL or a data URI.
-        needs: The readings to take.
-        kind: The kind of media the input's parameter holds, which says how to reduce it to a location.
-    """
-    location = coerce_media_url_or_data_uri(value, kind=kind)
-    if not location:
-        return EMPTY_MEDIA
-    size_bytes = None
-    image = None
-    image_format = None
-    video = None
-    audio = None
-    if MediaNeed.SIZE in needs:
-        size_bytes = local_size_bytes(location, kind=kind)
-    if MediaNeed.IMAGE in needs:
-        image = local_image_info(location)
-        if image is None:
-            image_format = _signature_image_format(location)
-    if MediaNeed.VIDEO in needs:
-        video = local_video_probe(location)
-    if MediaNeed.AUDIO in needs:
-        audio = local_audio_probe(location)
-    return MediaInfo(
-        size_bytes=size_bytes,
-        image=image,
-        image_format=image_format,
-        video=video,
-        audio=audio,
-        location=location,
-    )
-
-
-def _read_once(reader: MediaNeed, location: str, read: Callable[[str], Any]) -> Any:
+def _read_once(reader: _Reader, location: str, read: Callable[[str], Any]) -> Any:
     """`read(location)`, or what it returned before in the current `reading_once` block."""
     readings = _readings.get()
     if readings is None:
@@ -186,7 +144,7 @@ def local_size_bytes(value: Any, *, kind: MediaKind) -> int | None:
     location = coerce_media_url_or_data_uri(value, kind=kind)
     if not location:
         return None
-    return _read_once(MediaNeed.SIZE, location, _read_size_bytes)
+    return _read_once(_Reader.SIZE, location, _read_size_bytes)
 
 
 def _read_size_bytes(location: str) -> int | None:
@@ -217,7 +175,7 @@ def local_image_info(value: Any) -> ImageInfo | None:
     location = coerce_media_url_or_data_uri(value, kind="image")
     if not location:
         return None
-    return _read_once(MediaNeed.IMAGE, location, _read_image_info)
+    return _read_once(_Reader.IMAGE, location, _read_image_info)
 
 
 def local_image_format(value: Any) -> str | None:
@@ -417,7 +375,7 @@ def local_video_probe(value: Any) -> VideoProbe | None:
     location = coerce_media_url_or_data_uri(value, kind="video")
     if not location:
         return None
-    return _read_once(MediaNeed.VIDEO, location, _probe_video)
+    return _read_once(_Reader.VIDEO, location, _probe_video)
 
 
 def _probe_video(location: str) -> VideoProbe | None:
@@ -473,23 +431,61 @@ class AudioProbe(NamedTuple):
         return [s for s in (self.seconds, self.container_seconds) if s is not None]
 
 
-@dataclass(frozen=True)
-class MediaInfo:
-    """What the engine read from one media value: only the readings its validators asked for.
+class MediaFile:
+    """What one media input holds, each property read from it the first time it's asked for.
 
-    Each part is None when it wasn't asked for, or couldn't be read locally (a remote URL, a format
-    nothing here opens, ffprobe missing or out of time). A validator skips a reading that is None.
-    `image_format` is an image's format read from its file signature when `image` couldn't be read,
-    such as "image/heif" for a HEIC photo Pillow can't open, so a format check still judges it.
-    `location` is where the value was read from, such as a file path, so a check on its name reads it.
+    Only the kind the input's parameter holds is read: an image parameter's value is never probed
+    as a video. Each property is None when it can't be read here: a remote URL, a format nothing
+    here opens, ffprobe missing or out of time, or a value that isn't media. Inside `reading_once`,
+    each reading of a location is taken once however many `MediaFile`s ask for it.
     """
 
-    size_bytes: int | None = None
-    image: ImageInfo | None = None
-    image_format: str | None = None
-    video: VideoProbe | None = None
-    audio: AudioProbe | None = None
-    location: str | None = None
+    def __init__(self, location: str | None, *, kind: MediaKind | None) -> None:
+        # Where the value was read from, such as a file path or data URI, or None when it holds no media.
+        self.location: str | None = location
+        self._kind: MediaKind | None = kind
+
+    @classmethod
+    def of(cls, value: Any, *, kind: MediaKind | None) -> MediaFile:
+        """The media file a parameter value points at, for a parameter holding `kind` (None for no media)."""
+        if kind is None:
+            return cls(None, kind=None)
+        return cls(coerce_media_url_or_data_uri(value, kind=kind) or None, kind=kind)
+
+    @cached_property
+    def size_bytes(self) -> int | None:
+        """The file's size in bytes."""
+        if self.location is None or self._kind is None:
+            return None
+        return local_size_bytes(self.location, kind=self._kind)
+
+    @cached_property
+    def image(self) -> ImageInfo | None:
+        """An image's pixel size and format, as Pillow reads its header."""
+        if self.location is None or self._kind != "image":
+            return None
+        return local_image_info(self.location)
+
+    @cached_property
+    def image_format(self) -> str | None:
+        """An image's format from its file signature, such as "image/heif" for a HEIC photo Pillow can't open."""
+        if self.location is None or self._kind != "image" or self.image is not None:
+            return None
+        return _signature_image_format(self.location)
+
+    @cached_property
+    def video(self) -> VideoProbe | None:
+        """A video's container, codec, frame size, durations and frame rates, from one ffprobe run."""
+        if self.location is None or self._kind != "video":
+            return None
+        return local_video_probe(self.location)
+
+    @cached_property
+    def audio(self) -> AudioProbe | None:
+        """An audio clip's container, codec and durations."""
+        if self.location is None or self._kind != "audio":
+            return None
+        return local_audio_probe(self.location)
 
     @property
     def frame(self) -> ImageInfo | None:
@@ -521,10 +517,6 @@ class MediaInfo:
         return None
 
 
-# What a validator gets when nothing was read: the value holds no media, or no validator asked.
-EMPTY_MEDIA = MediaInfo()
-
-
 def local_audio_probe(value: Any) -> AudioProbe | None:
     """The container, codec and duration of an audio input, or None if it can't be read locally.
 
@@ -535,7 +527,7 @@ def local_audio_probe(value: Any) -> AudioProbe | None:
     location = coerce_media_url_or_data_uri(value, kind="audio")
     if not location:
         return None
-    return _read_once(MediaNeed.AUDIO, location, _probe_audio)
+    return _read_once(_Reader.AUDIO, location, _probe_audio)
 
 
 def _probe_audio(location: str) -> AudioProbe | None:

@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
-from griptape_nodes.exe_types.validators.base import PreRunValidator
+from griptape_nodes.exe_types.validators.base import PreRunRule
 from griptape_nodes.utils.dict_utils import to_dict
 
 
@@ -57,7 +57,7 @@ class ParameterDict(Parameter):
         element_type: str | None = None,
         parent_container_name: str | None = None,
         badge: BadgeData | None = None,
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ) -> None:
         """Initialize a dictionary parameter with enhanced UI options.
 

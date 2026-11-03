@@ -2,13 +2,21 @@
 
 `check_count` backs `MaxCount`; `limit_error` builds the `NodeError`, with its link to the provider's
 limits page, that every check in this package returns; `input_subject` starts the message naming the
-input. Checks for a particular kind of value live beside the validators that use them.
+input, and `input_noun` what it calls the input. Checks for a particular kind of value live beside the
+validators that use them.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
 from griptape_nodes.exe_types.validators.base import LIMITS_LINK_LABEL
+from griptape_nodes.exe_types.validators.context import media_kind_of
+
+if TYPE_CHECKING:
+    from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.utils.media_values import MediaKind
 
 
 def check_count(
@@ -54,3 +62,16 @@ def input_subject(parameter: str, *, noun: str, position: int | None = None) -> 
     if position is None:
         return f"The {noun} in '{parameter}'"
     return f"{noun[:1].upper()}{noun[1:]} {position} in '{parameter}'"
+
+
+# What an input is called in a message, by the kind of media its parameter holds.
+_NOUN_FOR_KIND: dict[MediaKind, str] = {"image": "image", "video": "video", "audio": "audio clip"}
+_DEFAULT_NOUN = "input"
+
+
+def input_noun(parameter: Parameter) -> str:
+    """What an input is called in a message: "image", "video" or "audio clip", or "input" for anything else."""
+    kind = media_kind_of(parameter)
+    if kind is None:
+        return _DEFAULT_NOUN
+    return _NOUN_FOR_KIND[kind]

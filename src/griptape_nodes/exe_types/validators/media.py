@@ -43,13 +43,14 @@ from griptape_nodes.exe_types.validators._media_checks import (
     check_video_codec,
 )
 from griptape_nodes.exe_types.validators.media_validator import MediaValidator
-from griptape_nodes.utils.media_probe import MediaInfo, MediaNeed
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.exe_types.node_error import NodeError
-    from griptape_nodes.utils.media_probe import ImageInfo
+    from griptape_nodes.exe_types.validators.context import CheckContext
+    from griptape_nodes.utils.media_probe import ImageInfo, MediaFile
+    from griptape_nodes.utils.media_values import MediaKind
 
 __all__ = [
     "AllowedFormats",
@@ -66,8 +67,10 @@ __all__ = [
     "VideoCodecs",
 ]
 
-_FRAME_NEEDS = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO})
-_LENGTH_NEEDS = frozenset({MediaNeed.VIDEO, MediaNeed.AUDIO})
+_FRAME_KINDS: frozenset[MediaKind] = frozenset({"image", "video"})
+_LENGTH_KINDS: frozenset[MediaKind] = frozenset({"video", "audio"})
+_VIDEO: frozenset[MediaKind] = frozenset({"video"})
+_AUDIO: frozenset[MediaKind] = frozenset({"audio"})
 
 # A subject for checking a validator's own arguments when it is built, before there is an input.
 _NO_SUBJECT = ""
@@ -84,23 +87,20 @@ class MaxFileSize(MediaValidator):
         fix: What the artist can do about it. Defaults to "Use a smaller file."
     """
 
-    needs = frozenset({MediaNeed.SIZE})
-
     maximum_bytes: int
     strict: bool = False
     fix: str | None = None
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         return check_size(
             media.size_bytes,
             maximum_bytes=self.maximum_bytes,
-            subject=subject,
+            subject=ctx.subject,
             fix=self.fix,
             strict=self.strict,
-            docs_url=docs_url,
+            docs_url=ctx.docs_url,
         )
 
 
@@ -116,8 +116,6 @@ class AllowedFormats(MediaValidator):
         TypeError: If a format isn't a string, such as a tuple passed as one argument.
     """
 
-    needs = frozenset({MediaNeed.IMAGE, MediaNeed.VIDEO, MediaNeed.AUDIO})
-
     mime_types: tuple[str, ...]
 
     def __init__(self, *mime_types: str) -> None:
@@ -125,14 +123,13 @@ class AllowedFormats(MediaValidator):
         object.__setattr__(self, "mime_types", mime_types)
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         if media.audio is not None:
             return check_mime_type(
-                media.audio.mime_type, subject=subject, allowed=self.mime_types, docs_url=docs_url, audio=True
+                media.audio.mime_type, subject=ctx.subject, allowed=self.mime_types, docs_url=ctx.docs_url, audio=True
             )
-        return check_mime_type(media.mime_type, subject=subject, allowed=self.mime_types, docs_url=docs_url)
+        return check_mime_type(media.mime_type, subject=ctx.subject, allowed=self.mime_types, docs_url=ctx.docs_url)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -142,37 +139,37 @@ class SideRange(MediaValidator):
     A video frame is measured as stored, turned upright for a rotated clip.
     """
 
-    needs = _FRAME_NEEDS
+    kinds = _FRAME_KINDS
 
     min: int | None = None
     max: int | None = None
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
-        return check_dimensions(media.frame, subject=subject, min_side=self.min, max_side=self.max, docs_url=docs_url)
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
+        return check_dimensions(
+            media.frame, subject=ctx.subject, min_side=self.min, max_side=self.max, docs_url=ctx.docs_url
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
 class PixelArea(MediaValidator):
     """The fewest and most pixels accepted in an image or video frame, in millions."""
 
-    needs = _FRAME_NEEDS
+    kinds = _FRAME_KINDS
 
     min_megapixels: float | None = None
     max_megapixels: float | None = None
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         return check_dimensions(
             media.frame,
-            subject=subject,
+            subject=ctx.subject,
             min_megapixels=self.min_megapixels,
             max_megapixels=self.max_megapixels,
-            docs_url=docs_url,
+            docs_url=ctx.docs_url,
         )
 
 
@@ -187,7 +184,7 @@ class AspectRatioRange(MediaValidator):
             of the two.
     """
 
-    needs = _FRAME_NEEDS
+    kinds = _FRAME_KINDS
 
     tallest: str
     widest: str
@@ -196,13 +193,12 @@ class AspectRatioRange(MediaValidator):
         check_aspect_ratio_range(None, subject=_NO_SUBJECT, widest=self.widest, tallest=self.tallest)
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         return _easier_shape(
             media,
             lambda frame: check_aspect_ratio_range(
-                frame, subject=subject, widest=self.widest, tallest=self.tallest, docs_url=docs_url
+                frame, subject=ctx.subject, widest=self.widest, tallest=self.tallest, docs_url=ctx.docs_url
             ),
         )
 
@@ -219,7 +215,7 @@ class ExactAspectRatios(MediaValidator):
         TypeError: If a ratio isn't a string, such as a tuple passed as one argument.
     """
 
-    needs = _FRAME_NEEDS
+    kinds = _FRAME_KINDS
 
     ratios: tuple[str, ...]
 
@@ -229,12 +225,13 @@ class ExactAspectRatios(MediaValidator):
         object.__setattr__(self, "ratios", ratios)
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         return _easier_shape(
             media,
-            lambda frame: check_aspect_ratio_exact(frame, subject=subject, ratios=self.ratios, docs_url=docs_url),
+            lambda frame: check_aspect_ratio_exact(
+                frame, subject=ctx.subject, ratios=self.ratios, docs_url=ctx.docs_url
+            ),
         )
 
 
@@ -250,20 +247,23 @@ class MinDuration(MediaValidator):
         fix: What the artist can do about a clip that is too short. Defaults to "Use a longer clip."
     """
 
-    needs = _LENGTH_NEEDS
+    kinds = _LENGTH_KINDS
 
     minimum_seconds: float
     fix: str | None = None
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         probe = media.video if media.video is not None else media.audio
         if probe is None:
             return None
         return check_min_duration(
-            probe.longest_seconds, subject=subject, minimum=self.minimum_seconds, fix=self.fix, docs_url=docs_url
+            probe.longest_seconds,
+            subject=ctx.subject,
+            minimum=self.minimum_seconds,
+            fix=self.fix,
+            docs_url=ctx.docs_url,
         )
 
 
@@ -279,20 +279,23 @@ class MaxDuration(MediaValidator):
         fix: What the artist can do about a clip that is too long. Defaults to "Shorten it."
     """
 
-    needs = _LENGTH_NEEDS
+    kinds = _LENGTH_KINDS
 
     maximum_seconds: float
     fix: str | None = None
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         probe = media.video if media.video is not None else media.audio
         if probe is None:
             return None
         return check_max_duration(
-            probe.shortest_seconds, subject=subject, maximum=self.maximum_seconds, fix=self.fix, docs_url=docs_url
+            probe.shortest_seconds,
+            subject=ctx.subject,
+            maximum=self.maximum_seconds,
+            fix=self.fix,
+            docs_url=ctx.docs_url,
         )
 
 
@@ -304,33 +307,36 @@ class FrameRate(MediaValidator):
     the one easier to meet. 1% leeway lets 23.976 fps through a 24 fps minimum.
     """
 
-    needs = frozenset({MediaNeed.VIDEO})
+    kinds = _VIDEO
 
     min: float | None = None
     max: float | None = None
     tolerance: float = FRAME_RATE_TOLERANCE
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         if media.video is None:
             return None
         rates = [rate for rate in (media.video.fps, media.video.nominal_fps) if rate is not None]
         if self.max is not None:
             error = check_frame_rate(
                 min(rates, default=None),
-                subject=subject,
+                subject=ctx.subject,
                 maximum=self.max,
                 tolerance=self.tolerance,
-                docs_url=docs_url,
+                docs_url=ctx.docs_url,
             )
             if error is not None:
                 return error
         if self.min is None:
             return None
         return check_frame_rate(
-            max(rates, default=None), subject=subject, minimum=self.min, tolerance=self.tolerance, docs_url=docs_url
+            max(rates, default=None),
+            subject=ctx.subject,
+            minimum=self.min,
+            tolerance=self.tolerance,
+            docs_url=ctx.docs_url,
         )
 
 
@@ -348,27 +354,26 @@ class FrameCount(MediaValidator):
             frame rate."
     """
 
-    needs = frozenset({MediaNeed.VIDEO})
+    kinds = _VIDEO
 
     min: int | None = None
     max: int | None = None
     fix: str | None = None
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         if media.video is None:
             return None
         if self.max is not None:
             error = check_frame_count(
-                media.video.fewest_frames, subject=subject, maximum=self.max, fix=self.fix, docs_url=docs_url
+                media.video.fewest_frames, subject=ctx.subject, maximum=self.max, fix=self.fix, docs_url=ctx.docs_url
             )
             if error is not None:
                 return error
         if self.min is None:
             return None
-        return check_frame_count(media.video.most_frames, subject=subject, minimum=self.min, docs_url=docs_url)
+        return check_frame_count(media.video.most_frames, subject=ctx.subject, minimum=self.min, docs_url=ctx.docs_url)
 
 
 @dataclass(frozen=True, init=False)
@@ -382,7 +387,7 @@ class VideoCodecs(MediaValidator):
         ValueError: If a codec isn't one `_media_checks` knows.
     """
 
-    needs = frozenset({MediaNeed.VIDEO})
+    kinds = _VIDEO
 
     codecs: tuple[str, ...]
 
@@ -392,12 +397,11 @@ class VideoCodecs(MediaValidator):
         object.__setattr__(self, "codecs", codecs)
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         if media.video is None:
             return None
-        return check_video_codec(media.video.codec, subject=subject, allowed=self.codecs, docs_url=docs_url)
+        return check_video_codec(media.video.codec, subject=ctx.subject, allowed=self.codecs, docs_url=ctx.docs_url)
 
 
 @dataclass(frozen=True, init=False)
@@ -411,7 +415,7 @@ class AudioCodecs(MediaValidator):
         ValueError: If a codec isn't one `_media_checks` knows.
     """
 
-    needs = frozenset({MediaNeed.AUDIO})
+    kinds = _AUDIO
 
     codecs: tuple[str, ...]
 
@@ -421,15 +425,14 @@ class AudioCodecs(MediaValidator):
         object.__setattr__(self, "codecs", codecs)
 
     @override
-    def check_media(
-        self, value: Any, media: MediaInfo, *, subject: str, docs_url: str | None, position: int | None = None
-    ) -> NodeError | None:
+    def check(self, value: Any, ctx: CheckContext) -> NodeError | None:
+        media = ctx.media
         if media.audio is None:
             return None
-        return check_audio_codec(media.audio.codec, subject=subject, allowed=self.codecs, docs_url=docs_url)
+        return check_audio_codec(media.audio.codec, subject=ctx.subject, allowed=self.codecs, docs_url=ctx.docs_url)
 
 
-def _easier_shape(media: MediaInfo, check: Callable[[ImageInfo | None], NodeError | None]) -> NodeError | None:
+def _easier_shape(media: MediaFile, check: Callable[[ImageInfo | None], NodeError | None]) -> NodeError | None:
     """A shape check's error for the stored frame, or None when the displayed frame passes it.
 
     Providers don't say whether they measure a frame's stored or displayed shape, so a shape check

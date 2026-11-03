@@ -12,8 +12,14 @@ import shutil
 import subprocess
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from PIL import Image
+
+from griptape_nodes.utils.media_probe import MediaFile
+
+if TYPE_CHECKING:
+    from griptape_nodes.utils.media_values import MediaKind
 
 HEIC_PHOTO = Path(__file__).parent / "fixtures" / "photo_64x48.heic"
 
@@ -72,3 +78,19 @@ def audio_file(directory: Path, *, seconds: float = 3, codec: str = "libmp3lame"
     cmd = [FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", source, "-c:a", codec, str(path)]
     subprocess.run(cmd, check=True, timeout=60)  # noqa: S603
     return path
+
+
+def readings(kind: MediaKind = "video", location: str | None = None, **read: Any) -> MediaFile:
+    """A `MediaFile` whose properties are already read, as `read` gives them, with no file behind it.
+
+    Any property not given reads as None. For testing a check on readings no real file is handy for,
+    such as a variable-frame-rate clip.
+    """
+    media = MediaFile(location, kind=kind)
+    for name in ("size_bytes", "image", "image_format", "video", "audio"):
+        # `cached_property` keeps its value in the instance's dict, so setting it there skips the read.
+        media.__dict__[name] = read.pop(name, None)
+    if read:
+        msg = f"Attempted to build test readings. Failed because MediaFile has no reading called {sorted(read)}."
+        raise TypeError(msg)
+    return media

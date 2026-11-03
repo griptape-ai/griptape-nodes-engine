@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.elements.badge import BadgeData
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.exe_types.validators.base import PreRunValidator
+    from griptape_nodes.exe_types.validators.base import PreRunRule
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -125,7 +125,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     _on_local_object_drop: Callable[[Any], None] | None = None
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
-    _pre_run_validators: tuple[PreRunValidator, ...]
+    _pre_run_validators: tuple[PreRunRule, ...]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
     _on_outgoing_connection_removed: list[Callable[[Parameter, str, str], None]]
     _ui_options: dict
@@ -171,7 +171,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         parent_element_name: str | None = None,
         badge: BadgeData
         | None = None,  # Optional BadgeData for initial badge (title, message, variant, and whether to show a clear button).
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ):
         if not element_id:
             element_id = str(uuid.uuid4().hex)
@@ -407,7 +407,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         return validators
 
     @property
-    def pre_run_validators(self) -> tuple[PreRunValidator, ...]:
+    def pre_run_validators(self) -> tuple[PreRunRule, ...]:
         """The limits the engine checks this parameter's value against at the node's turn, before it runs.
 
         Unlike `validators`, which run each time a value is set and refuse it, these run once per run,

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from griptape_nodes.exe_types.elements.trait import Trait
-    from griptape_nodes.exe_types.validators.base import PreRunValidator
+    from griptape_nodes.exe_types.validators.base import PreRunRule
 
 
 class ParameterContainer(Parameter, ABC):
@@ -49,7 +49,7 @@ class ParameterContainer(Parameter, ABC):
         exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ):
         super().__init__(
             name=name,
@@ -134,7 +134,7 @@ class ParameterList(ParameterContainer):
         child_prefix: str | None = None,
         grid: bool | None = None,
         grid_columns: int | None = None,
-        pre_run_validators: Sequence[PreRunValidator] | None = None,
+        pre_run_validators: Sequence[PreRunRule] | None = None,
     ):
         if traits:
             self._original_traits = traits

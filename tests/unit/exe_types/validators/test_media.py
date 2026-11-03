@@ -9,6 +9,8 @@ import pytest
 from griptape.artifacts import ImageArtifact
 from PIL import Image
 
+from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.validators.context import CheckContext
 from griptape_nodes.exe_types.validators.media import (
     AllowedFormats,
     AspectRatioRange,
@@ -27,12 +29,11 @@ from griptape_nodes.utils import media_probe
 from griptape_nodes.utils.media_probe import (
     AudioProbe,
     ImageInfo,
-    MediaInfo,
-    MediaNeed,
+    MediaFile,
     VideoProbe,
     local_size_bytes,
-    read_media,
 )
+from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.validators.media_files import (
     HAS_FFMPEG,
     HEIC_PHOTO,
@@ -40,6 +41,7 @@ from tests.unit.exe_types.validators.media_files import (
     data_uri,
     image_file,
     png_bytes,
+    readings,
     video_file,
 )
 
@@ -54,22 +56,36 @@ DOCS = "https://example.com/limits"
 needs_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg and ffprobe are needed to make and read a clip")
 
 
-def _messages(validators: list[MediaValidator], media: MediaInfo, value: Any = None) -> list[str]:
+def _ctx(media: MediaFile, docs_url: str | None = None) -> CheckContext:
+    """A context for one input whose file reads as `media`."""
+    ctx = CheckContext(
+        node=MockNode(name="node"),
+        parameter=Parameter(name="input", tooltip="", type="str"),
+        value=media.location,
+        subject=SUBJECT,
+        docs_url=docs_url,
+    )
+    ctx._media = media  # the file under test, read the way the runner reads it
+    return ctx
+
+
+def _messages(validators: list[MediaValidator], media: MediaFile) -> list[str]:
     """What each validator reports for one input, in order, leaving out those it passes."""
-    errors = [validator.check_media(value, media, subject=SUBJECT, docs_url=None) for validator in validators]
+    ctx = _ctx(media)
+    errors = [validator.check(media.location, ctx) for validator in validators]
     return [str(error) for error in errors if error is not None]
 
 
-def _image(value: Any) -> MediaInfo:
-    return read_media(value, {MediaNeed.SIZE, MediaNeed.IMAGE}, kind="image")
+def _image(value: Any) -> MediaFile:
+    return MediaFile.of(value, kind="image")
 
 
-def _video(value: Any) -> MediaInfo:
-    return read_media(value, {MediaNeed.SIZE, MediaNeed.VIDEO}, kind="video")
+def _video(value: Any) -> MediaFile:
+    return MediaFile.of(value, kind="video")
 
 
-def _audio(value: Any) -> MediaInfo:
-    return read_media(value, {MediaNeed.SIZE, MediaNeed.AUDIO}, kind="audio")
+def _audio(value: Any) -> MediaFile:
+    return MediaFile.of(value, kind="audio")
 
 
 class TestOnRealImages:
@@ -151,14 +167,15 @@ class TestOnRealImages:
 
     def test_links_the_docs_page(self, tmp_path: Path) -> None:
         media = _image(str(image_file(tmp_path, 100, 100)))
-        error = SideRange(min=300).check_media(None, media, subject=SUBJECT, docs_url=DOCS)
+        error = SideRange(min=300).check(media.location, _ctx(media, DOCS))
         assert error is not None
         assert error.links
         assert error.links[0].url == DOCS
 
     def test_skips_a_remote_image(self) -> None:
         media = _image("https://example.com/image.gif")
-        assert media == MediaInfo(location="https://example.com/image.gif")
+        assert media.location == "https://example.com/image.gif"
+        assert (media.size_bytes, media.image, media.mime_type) == (None, None, None)
         assert _messages(list(self.KLING), media) == []
 
     def test_reduces_an_in_memory_image_to_a_string_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -254,9 +271,9 @@ class TestOnRealVideos:
     def test_reads_a_real_clips_size_without_probing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         path = video_file(tmp_path)
         monkeypatch.setattr(media_probe, "local_video_probe", lambda _v: pytest.fail("a size limit needs no probe"))
-        media = read_media(str(path), {MediaNeed.SIZE}, kind="video")
-        assert media.size_bytes == path.stat().st_size
+        media = _video(str(path))
         assert len(_messages([MaxFileSize(1)], media)) == 1
+        assert media.size_bytes == path.stat().st_size
 
 
 @needs_ffmpeg
@@ -304,7 +321,7 @@ class TestVideoReadings:
     def test_checks_each_frame_rate_bound_against_the_easier_rate(
         self, average: float, nominal: float, validator: FrameRate, expected: str | None
     ) -> None:
-        media = MediaInfo(video=VideoProbe(info=None, seconds=5.0, fps=average, nominal_fps=nominal))
+        media = readings(video=VideoProbe(info=None, seconds=5.0, fps=average, nominal_fps=nominal))
         messages = _messages([validator], media)
         if expected is None:
             assert messages == []
@@ -327,7 +344,7 @@ class TestVideoReadings:
     def test_checks_each_duration_bound_against_the_easier_reading(
         self, stream: float, container: float, validator: MediaValidator, expected: str | None
     ) -> None:
-        media = MediaInfo(video=VideoProbe(info=None, seconds=stream, container_seconds=container))
+        media = readings(video=VideoProbe(info=None, seconds=stream, container_seconds=container))
         messages = _messages([validator], media)
         if expected is None:
             assert messages == []
@@ -336,7 +353,7 @@ class TestVideoReadings:
             assert expected in messages[0]
 
     def test_uses_a_given_duration_fix(self) -> None:
-        media = MediaInfo(video=VideoProbe(info=None, seconds=1.0))
+        media = readings(video=VideoProbe(info=None, seconds=1.0))
         assert _messages([MinDuration(3, fix="Pick a longer clip.")], media) == [
             f"{SUBJECT} is 1.00 seconds long and the minimum is 3. Pick a longer clip."
         ]
@@ -345,29 +362,24 @@ class TestVideoReadings:
         # A fix for a clip that is too short never shows on one that is too long, and the reverse.
         too_short = MinDuration(3, fix="Pick a clip of at least 3 seconds.")
         too_long = MaxDuration(10, fix="Cut it to 10 seconds or less.")
-        long_clip = MediaInfo(video=VideoProbe(info=None, seconds=12.0))
+        long_clip = readings(video=VideoProbe(info=None, seconds=12.0))
         assert _messages([too_short, too_long], long_clip) == [
             f"{SUBJECT} is 12.00 seconds long and the limit is 10. Cut it to 10 seconds or less."
         ]
-        short_clip = MediaInfo(video=VideoProbe(info=None, seconds=1.0))
+        short_clip = readings(video=VideoProbe(info=None, seconds=1.0))
         assert _messages([too_short, too_long], short_clip) == [
             f"{SUBJECT} is 1.00 seconds long and the minimum is 3. Pick a clip of at least 3 seconds."
         ]
 
     def test_a_given_fix_replaces_the_frame_count_suggestion(self) -> None:
-        media = MediaInfo(video=VideoProbe(info=None, seconds=12.0, fps=24.0, frames=288))
+        media = readings(video=VideoProbe(info=None, seconds=12.0, fps=24.0, frames=288))
         assert _messages([FrameCount(max=240, fix="Use fewer frames.")], media) == [
             f"{SUBJECT} has 288 frames and the limit is 240. Use fewer frames."
         ]
 
-    def test_check_without_readings_refuses_rather_than_passing(self) -> None:
-        # Without readings every media check would pass, so the plain `check` refuses to run.
-        with pytest.raises(TypeError, match="call check_media"):
-            MaxFileSize(1).check("clip.mp4", subject=SUBJECT, docs_url=None)
-
     def test_checks_frames_against_the_reading_easier_to_meet(self) -> None:
         # No recorded count: 3 s at 24 fps average (72 frames) or 30 fps declared (90 frames).
-        media = MediaInfo(video=VideoProbe(info=None, seconds=3.0, fps=24.0, nominal_fps=30.0))
+        media = readings(video=VideoProbe(info=None, seconds=3.0, fps=24.0, nominal_fps=30.0))
         assert _messages([FrameCount(min=80, max=80)], media) == []
         assert _messages([FrameCount(max=60)], media) == [
             f"{SUBJECT} has 72 frames and the limit is 60. Shorten it, or lower its frame rate."
@@ -379,17 +391,17 @@ class TestVideoReadings:
     def test_passes_a_shape_check_when_the_displayed_frame_fits(self) -> None:
         # 1440x1080 HDV with 4:3 pixels plays at 16:9.
         probe = VideoProbe(info=ImageInfo(1440, 1080, None), seconds=5.0, display_info=ImageInfo(1920, 1080, None))
-        media = MediaInfo(video=probe)
+        media = readings(video=probe)
         assert _messages([ExactAspectRatios("16:9"), AspectRatioRange("16:9", "16:9")], media) == []
 
     def test_checks_pixel_limits_against_the_stored_frame(self) -> None:
         probe = VideoProbe(info=ImageInfo(1440, 1080, None), seconds=5.0, display_info=ImageInfo(1920, 1080, None))
-        assert _messages([SideRange(max=1500)], MediaInfo(video=probe)) == []
+        assert _messages([SideRange(max=1500)], readings(video=probe)) == []
 
     def test_refuses_a_shape_neither_the_stored_nor_displayed_frame_fits(self) -> None:
         # 1440x1080 at 4:3 pixels plays at 16:9; neither shape is square.
         probe = VideoProbe(info=ImageInfo(1440, 1080, None), seconds=5.0, display_info=ImageInfo(1920, 1080, None))
-        assert _messages([ExactAspectRatios("1:1")], MediaInfo(video=probe)) == [
+        assert _messages([ExactAspectRatios("1:1")], readings(video=probe)) == [
             f"{SUBJECT} is 1440x1080, and its aspect ratio must be 1:1. Crop it."
         ]
 
@@ -406,11 +418,11 @@ class TestVideoReadings:
     def test_reports_a_maximum_without_checking_an_unset_minimum(
         self, validator: MediaValidator, expected: str
     ) -> None:
-        media = MediaInfo(video=VideoProbe(info=None, seconds=5.0, fps=60.0, frames=300))
+        media = readings(video=VideoProbe(info=None, seconds=5.0, fps=60.0, frames=300))
         assert _messages([validator], media) == [expected]
 
     def test_passes_a_clip_within_a_maximum_with_no_minimum(self) -> None:
-        media = MediaInfo(video=VideoProbe(info=None, seconds=5.0, fps=24.0, frames=120))
+        media = readings(video=VideoProbe(info=None, seconds=5.0, fps=24.0, frames=120))
         assert _messages([FrameRate(max=30), FrameCount(max=150)], media) == []
 
     def test_skips_every_check_for_a_video_it_could_not_read(self) -> None:
@@ -425,13 +437,14 @@ class TestVideoReadings:
             FrameCount(min=100),
             MaxFileSize(1),
         ]
-        assert _messages(validators, MediaInfo()) == []
+        assert _messages(validators, readings()) == []
 
     def test_skips_a_remote_video_without_probing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             media_probe.subprocess, "run", lambda *_a, **_k: pytest.fail("a remote video must not be probed")
         )
-        assert _video("https://example.com/clip.mp4") == MediaInfo(location="https://example.com/clip.mp4")
+        media = _video("https://example.com/clip.mp4")
+        assert (media.video, media.mime_type) == (None, None)
 
 
 class TestAspectRatioRangeBounds:
@@ -442,11 +455,11 @@ class TestAspectRatioRangeBounds:
 
 class TestAudioReadings:
     def test_accepts_an_mp4_videos_audio_where_video_mp4_is_listed(self) -> None:
-        media = MediaInfo(audio=AudioProbe(mime_type="audio/mp4", codec="aac", profile="LC", seconds=3.0))
+        media = readings("audio", audio=AudioProbe(mime_type="audio/mp4", codec="aac", profile="LC", seconds=3.0))
         assert _messages([AllowedFormats("audio/mpeg", "video/mp4")], media) == []
 
     def test_lists_only_the_names_the_provider_wrote_when_refusing(self) -> None:
-        media = MediaInfo(audio=AudioProbe(mime_type="audio/flac", codec="flac", profile=None, seconds=3.0))
+        media = readings("audio", audio=AudioProbe(mime_type="audio/flac", codec="flac", profile=None, seconds=3.0))
         assert _messages([AllowedFormats("audio/mpeg", "video/mp4")], media) == [
             f"{SUBJECT} is in FLAC format. Convert it to MP3 or MP4."
         ]
@@ -456,30 +469,30 @@ class TestAudioReadings:
         [("audio/x-matroska", "video/x-matroska"), ("audio/3gpp", "video/3gpp"), ("audio/webm", "video/webm")],
     )
     def test_accepts_a_videos_audio_where_its_container_is_listed(self, reading: str, listed: str) -> None:
-        media = MediaInfo(audio=AudioProbe(mime_type=reading, codec="aac", profile="LC", seconds=3.0))
+        media = readings("audio", audio=AudioProbe(mime_type=reading, codec="aac", profile="LC", seconds=3.0))
         assert _messages([AllowedFormats(listed)], media) == []
 
     def test_checks_both_duration_bounds_on_audio_with_generic_suggestions(self) -> None:
-        media = MediaInfo(audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
+        media = readings("audio", audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
         assert _messages([MaxDuration(1), MinDuration(5)], media) == [
             f"{SUBJECT} is 3.00 seconds long and the limit is 1. Shorten it.",
             f"{SUBJECT} is 3.00 seconds long and the minimum is 5. Use a longer clip.",
         ]
 
     def test_uses_a_given_fix_for_audio_that_is_too_long(self) -> None:
-        media = MediaInfo(audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
+        media = readings("audio", audio=AudioProbe(mime_type="audio/wav", codec="pcm_s16le", profile=None, seconds=3.0))
         assert _messages([MaxDuration(1, fix="Pick a shorter take.")], media) == [
             f"{SUBJECT} is 3.00 seconds long and the limit is 1. Pick a shorter take."
         ]
 
     def test_codec_validators_skip_the_other_kind(self) -> None:
-        audio = MediaInfo(audio=AudioProbe(mime_type="audio/mpeg", codec="mp3", profile=None, seconds=3.0))
-        video = MediaInfo(video=VideoProbe(info=None, seconds=3.0, codec="h264"))
+        audio = readings("audio", audio=AudioProbe(mime_type="audio/mpeg", codec="mp3", profile=None, seconds=3.0))
+        video = readings(video=VideoProbe(info=None, seconds=3.0, codec="h264"))
         assert _messages([VideoCodecs("hevc")], audio) == []
         assert _messages([AudioCodecs("aac")], video) == []
 
     def test_reports_the_audio_container_as_the_inputs_format(self) -> None:
-        media = MediaInfo(audio=AudioProbe(mime_type="audio/flac", codec="flac", profile=None, seconds=3.0))
+        media = readings("audio", audio=AudioProbe(mime_type="audio/flac", codec="flac", profile=None, seconds=3.0))
         assert media.mime_type == "audio/flac"
 
 
