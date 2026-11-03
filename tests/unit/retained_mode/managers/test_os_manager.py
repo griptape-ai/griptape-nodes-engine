@@ -298,6 +298,116 @@ class TestReadFileRequest:
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
 
+class TestReadFileRequestImagePreview:
+    """Test ReadFileRequest's image thumbnail generation: Pillow always runs first.
+
+    Size only matters once Pillow has already failed to decode the file -- base64-encoding a
+    multi-hundred-MB file whole is what hung the engine on large/multi-part images it can't open
+    (EXR sequences, for one). A large file Pillow *can* decode must still get a thumbnail. See
+    os_manager.py's _generate_thumbnail_from_image_content.
+    """
+
+    # Minimal valid 1x1 red PNG, built by hand so the test has no binary fixture dependency.
+    _ONE_PIXEL_PNG = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb0"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        """Point the workspace somewhere other than temp_dir so files aren't treated as already-served."""
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir / "workspace"
+        yield
+        engine.config_manager.workspace_path = original_workspace
+
+    def test_large_pillow_decodable_file_is_still_thumbnailed(self, engine: Engine, temp_dir: Path) -> None:
+        """A file over the size cap that Pillow can decode (e.g. a big JPEG) still gets a thumbnail."""
+        file_path = temp_dir / "huge.png"
+        file_path.write_bytes(self._ONE_PIXEL_PNG)
+
+        with patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(self._ONE_PIXEL_PNG) - 1):
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        assert result.content.startswith("data:image/webp;base64,")
+
+    def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, temp_dir: Path) -> None:
+        """A file over the size cap that Pillow can't decode must never be base64-encoded whole."""
+        file_path = temp_dir / "huge.exr"
+        content = b"not a real exr, just needs to fail a Pillow decode"
+        file_path.write_bytes(content)
+
+        with (
+            patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(content) - 1),
+            patch("mimetypes.guess_type", return_value=("image/aces", None)),
+            patch(
+                "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes",
+                return_value=None,
+            ) as mock_create_preview,
+        ):
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        mock_create_preview.assert_called_once()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert result.content == OSManager._NO_PREVIEW_DATA_URL
+
+    def test_pillow_decodable_format_is_thumbnailed(self, engine: Engine, temp_dir: Path) -> None:
+        """A format Pillow can decode (PNG) gets its 200px WEBP thumbnail."""
+        file_path = temp_dir / "test.png"
+        file_path.write_bytes(self._ONE_PIXEL_PNG)
+
+        request = ReadFileRequest(file_path=str(file_path))
+        result = engine.handle_request(request)
+
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        assert result.content.startswith("data:image/webp;base64,")
+
+    def test_undecodable_file_under_cap_returns_original_bytes(self, engine: Engine, temp_dir: Path) -> None:
+        """A format Pillow can't open, under the size cap, returns the raw bytes, never a hang."""
+        file_path = temp_dir / "test.exr"
+        content = b"not a real exr, just needs to never be decoded"
+        file_path.write_bytes(content)
+
+        # Windows' mimetypes table has no .exr entry; pin the image/aces guess Linux and macOS make.
+        with patch("mimetypes.guess_type", return_value=("image/aces", None)):
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        assert isinstance(result, ReadFileResultSuccess)
+        assert isinstance(result.content, str)
+        assert result.content.startswith("data:image/aces;base64,")
+
+    def test_should_transform_image_content_to_thumbnail_false_skips_decoding(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """Opting out of thumbnailing returns the raw bytes without ever calling Pillow."""
+        file_path = temp_dir / "test.png"
+        file_path.write_bytes(self._ONE_PIXEL_PNG)
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes"
+        ) as mock_create_preview:
+            request = ReadFileRequest(file_path=str(file_path), should_transform_image_content_to_thumbnail=False)
+            result = engine.handle_request(request)
+
+        mock_create_preview.assert_not_called()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert result.content == self._ONE_PIXEL_PNG
+
+
 class TestCreateFileRequest:
     """Test CreateFileRequest with failure_reason support."""
 
