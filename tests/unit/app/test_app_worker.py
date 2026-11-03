@@ -3709,30 +3709,6 @@ class TestSharingThisEngineBetweenRuns:
         await hold
 
     @pytest.mark.asyncio
-    async def test_two_engines_waiting_on_each_other_is_logged_as_an_error(
-        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        _FakeLine(worker_manager)
-        waiting_there = _acquire_answered_when(asyncio.Event())
-        worker_manager._leases["mine"] = EngineLease(
-            lease_id="mine", host_engine_id=_ARTIST_ENGINE, run_id="run-here", request_task=waiting_there
-        )
-
-        with caplog.at_level(logging.ERROR):
-            acquiring = asyncio.create_task(
-                _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1"))
-            )
-            await _settle()
-
-        assert any(
-            _ARTIST_ENGINE in record.getMessage() for record in caplog.records if record.levelno == logging.ERROR
-        )
-        acquiring.cancel()
-        waiting_there.cancel()
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("incoming_run_id", "mine_run_id", "mine_granted"),
         [

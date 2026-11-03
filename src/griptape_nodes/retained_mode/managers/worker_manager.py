@@ -136,7 +136,7 @@ class _HostedWorker:
 
 @dataclass
 class _EngineRun:
-    """Another engine's lease on this engine, waiting in this engine's line of runs or holding this engine."""
+    """Another engine's lease on this engine, waiting in the line of leases or holding this engine."""
 
     engine_id: str
     lease_id: str
@@ -146,7 +146,7 @@ class _EngineRun:
     granted: asyncio.Future[str | None]
     # Set when the lease is released.
     released: asyncio.Event = field(default_factory=asyncio.Event)
-    # This engine's own run that stands for it in the line, set once it is submitted.
+    # The run that stands for it in the line of leases, set once it is submitted.
     line_run: Run | None = None
 
     @property
@@ -1896,14 +1896,13 @@ class WorkerManager(EngineScoped):
     ) -> worker_events.AcquireLeaseResultSuccess | worker_events.AcquireLeaseResultFailure:
         """Answer once another engine's lease holds this engine, which waits while another run has this engine.
 
-        The lease waits in this engine's own line of runs, and holds this engine from when it reaches the
-        front until it is released.
+        The lease waits in the line of other engines' leases, which this engine's own runs don't join, and
+        holds this engine from when it reaches the front until it is released.
         """
         sender = require_request_sender()
         engine_run = self._engine_runs.get((sender.engine_id, request.lease_id))
         if engine_run is None:
             engine_run = self._submit_engine_run(sender.engine_id, request)
-            self._log_if_waiting_on_each_other(engine_run)
         refusal = await asyncio.shield(engine_run.granted)
         if refusal is not None:
             return worker_events.AcquireLeaseResultFailure(result_details=refusal)
@@ -2108,29 +2107,6 @@ class WorkerManager(EngineScoped):
         spec = _EngineRunSpec(manager=self, engine_run=engine_run, flow_name=f"a run from engine {engine_id}")
         engine_run.line_run = self.engine.flow_manager.submit_run(spec, flows=self._lease_line)
         return engine_run
-
-    def _log_if_waiting_on_each_other(self, engine_run: _EngineRun) -> None:
-        """Log an error if another engine's run waits here while this engine's run waits on that engine.
-
-        Each run holds its own engine while it waits on the other, so neither engine's line moves.
-        """
-        if engine_run.run_id is None or engine_run.line_run is None or not engine_run.line_run.position:
-            return
-        waiting_there = any(
-            lease.host_engine_id == engine_run.engine_id
-            and lease.run_id is not None
-            and lease.request_task is not None
-            and not lease.request_task.done()
-            for lease in self._leases.values()
-        )
-        if not waiting_there:
-            return
-        logger.error(
-            "A run from engine %s waits for this engine while a run here waits for engine %s. Neither "
-            "continues until one is cancelled. Engines that send nodes to each other can stop each other this way.",
-            engine_run.engine_id,
-            engine_run.engine_id,
-        )
 
     async def _end_engine_runs_from(self, engine_id: str, reason: str) -> None:
         """Let go of every lease from `engine_id`, holding this engine or waiting for it."""
