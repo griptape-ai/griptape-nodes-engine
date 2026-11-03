@@ -205,6 +205,14 @@ class TestAddSkill:
         assert skill.description == "Apply our house style: always."
         assert "Use sentence case." in (skill.folder / "SKILL.md").read_text(encoding="utf-8")
 
+    async def test_a_name_in_another_unicode_form_is_found_after_writing(self, tmp_path: Path) -> None:
+        name = "x-e\u0301"  # a decomposed accent, which the loader normalizes to "x-\u00e9"
+
+        skill = await add_skill([tmp_path], compose_skill_file(name, "Coffee.", "Body."))
+
+        assert skill.folder == tmp_path / name
+        assert skill.problem is None
+
     async def test_an_invalid_skill_is_never_written(self, tmp_path: Path) -> None:
         with pytest.raises(SkillWriteError, match="no description"):
             await add_skill([tmp_path], compose_skill_file("vague", "", "Body."))

@@ -193,7 +193,8 @@ async def add_skill(libraries: Sequence[Path], content: str) -> DiscoveredSkill:
     except OSError as e:
         msg = f"Could not write the skill into {library}: {e.strerror or e}."
         raise SkillWriteError(msg) from e
-    (written,) = [skill for skill in await discover_skills([library]) if skill.name == name]
+    # By folder, not name: the loader normalizes a name, so the two can differ in Unicode form.
+    (written,) = [skill for skill in await discover_skills([library]) if skill.folder == target]
     return written
 
 
