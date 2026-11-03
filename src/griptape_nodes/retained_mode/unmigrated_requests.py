@@ -1,9 +1,8 @@
 """The engine request types whose handlers still act on the ambient workflow.
 
 An engine handler with no `workflow` parameter is HOST (see `RequestScope`), except for the request
-types listed here, which keep the binding they had before handlers declared what they act on: the
-caller's workflow, else the only open one. Each change that gives these handlers a `workflow`
-parameter, or makes them HOST, removes their entries. The list is deleted once it is empty.
+types listed here, which act on the caller's workflow, else the only open one. Migrating a handler,
+by giving it a `workflow` parameter or confirming it is HOST, removes its entry.
 """
 
 AMBIENT_UNTIL_MIGRATED: frozenset[str] = frozenset(
