@@ -121,11 +121,13 @@ Settings for artifact providers and preview generation
 
 ## Agent
 
-Agent behavior and system prompt
+Agent behavior, system prompt, and skills
 
-| Setting               | Type   | Default | Environment variable              | Description                                                                                                                   |
-| --------------------- | ------ | ------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `agent.system_prompt` | string | `""`    | `GTN_CONFIG_AGENT__SYSTEM_PROMPT` | Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context. |
+| Setting                    | Type            | Default              | Environment variable                               | Description                                                                                                                                                                                                                                                                                                                                     |
+| -------------------------- | --------------- | -------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent.system_prompt`      | string          | `""`                 | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`                  | Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.                                                                                                                                                                                                                   |
+| `agent.skills_directories` | array of string | `[".agents/skills"]` | `GTN_CONFIG_AGENT__SKILLS_DIRECTORIES` (JSON list) | Folders the agent loads skills from. A relative path is resolved against the workspace directory. New skills are added to the first folder. Add a shared folder to give everyone on a team the same skills. The environment variable takes a JSON list, e.g. GTN_CONFIG_AGENT\_\_SKILLS_DIRECTORIES='[".agents/skills", "/mnt/studio/skills"]'. |
+| `agent.disabled_skills`    | array of string | `[]`                 | n/a (edit config file)                             | Names of skills the agent does not use, even though they are in a skills folder.                                                                                                                                                                                                                                                                |
 
 ## Libraries
 

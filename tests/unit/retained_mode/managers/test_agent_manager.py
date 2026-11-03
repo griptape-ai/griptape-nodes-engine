@@ -33,6 +33,7 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ToolCall,
     ToolResult,
 )
+from griptape_nodes.agents.skills import SkillSelection
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -56,19 +57,30 @@ from griptape_nodes.retained_mode.events.agent_events import (
     CreateAgentProviderRequest,
     CreateAgentProviderResultFailure,
     CreateAgentProviderResultSuccess,
+    CreateAgentSkillRequest,
+    CreateAgentSkillResultFailure,
+    CreateAgentSkillResultSuccess,
     CreateProviderPayload,
     DeleteAgentProviderRequest,
     DeleteAgentProviderResultFailure,
     DeleteAgentProviderResultSuccess,
+    DeleteAgentSkillRequest,
+    DeleteAgentSkillResultFailure,
+    DeleteAgentSkillResultSuccess,
     GetAgentConfigRequest,
     GetAgentConfigResultSuccess,
     GetThreadMetadataRequest,
     GetThreadMetadataResultFailure,
     GetThreadMetadataResultSuccess,
+    ImportAgentSkillRequest,
+    ImportAgentSkillResultFailure,
+    ImportAgentSkillResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
     ListAgentProvidersResultSuccess,
+    ListAgentSkillsRequest,
+    ListAgentSkillsResultSuccess,
     ListProviderModelsRequest,
     ListProviderModelsResultFailure,
     ListProviderModelsResultSuccess,
@@ -79,6 +91,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentResultFailure,
     RunAgentResultSuccess,
     RunRecord,
+    SetAgentSkillEnabledRequest,
+    SetAgentSkillEnabledResultFailure,
+    SetAgentSkillEnabledResultSuccess,
     ThreadMetadata,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
@@ -126,6 +141,11 @@ from tests.unit.utils.test_budget_refusal import a_refusal_body
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
 
+async def _no_skills() -> SkillSelection:
+    """Offer a run no skills."""
+    return SkillSelection(skills=[])
+
+
 @pytest.fixture
 def agent_manager() -> AgentManager:
     """Build a bare `AgentManager` without running `__init__`.
@@ -151,31 +171,156 @@ def providers_manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
     return manager
 
 
-class TestEnsureSkillsDirectory:
-    """`_ensure_skills_directory` scaffolds `.agents/skills` without ever raising."""
+class _FakeConfig:
+    """Holds config values in memory, the way the skills handlers read and write them."""
 
-    def test_creates_directory_and_readme(self, agent_manager: AgentManager, tmp_path: Path) -> None:
-        agent_manager._ensure_skills_directory(tmp_path)
+    def __init__(self, workspace: Path, values: dict[str, object] | None = None) -> None:
+        self.workspace_path = workspace
+        self.values: dict[str, object] = dict(values or {})
 
-        skills_dir = tmp_path / ".agents/skills"
-        assert skills_dir.is_dir()
-        assert (skills_dir / "README.md").read_text(encoding="utf-8") == _SKILLS_README
+    def get_config_value(self, key: str, default: object = None) -> object:
+        return self.values.get(key, default)
 
-    def test_existing_readme_is_not_overwritten(self, agent_manager: AgentManager, tmp_path: Path) -> None:
-        skills_dir = tmp_path / ".agents/skills"
-        skills_dir.mkdir(parents=True)
-        readme = skills_dir / "README.md"
-        readme.write_text("user edits", encoding="utf-8")
+    def set_config_value(self, key: str, value: object) -> None:
+        self.values[key] = value
 
-        agent_manager._ensure_skills_directory(tmp_path)
 
-        assert readme.read_text(encoding="utf-8") == "user edits"
+def _write_skill(library: Path, name: str) -> Path:
+    folder = library / name
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Use for {name}.\n---\n\nGuidance.")
+    return folder
+
+
+class TestAgentSkills:
+    """The skills requests read and write the folders in `agent.skills_directories`."""
+
+    @pytest.fixture
+    def config(self, tmp_path: Path) -> _FakeConfig:
+        shared = tmp_path / "shared"
+        return _FakeConfig(tmp_path / "ws", {"agent.skills_directories": [".agents/skills", str(shared)]})
+
+    @pytest.fixture
+    def manager(self, agent_manager: AgentManager, config: _FakeConfig) -> AgentManager:
+        agent_manager._engine = SimpleNamespace(config_manager=config)  # type: ignore[assignment]
+        return agent_manager
+
+    @pytest.mark.asyncio
+    async def test_list_reports_every_folder_and_scaffolds_the_first(
+        self, manager: AgentManager, config: _FakeConfig, tmp_path: Path
+    ) -> None:
+        _write_skill(tmp_path / "shared", "house-style")
+        config.values["agent.disabled_skills"] = ["house-style"]
+
+        result = await manager.on_handle_list_agent_skills_request(ListAgentSkillsRequest())
+
+        assert isinstance(result, ListAgentSkillsResultSuccess)
+        own = tmp_path / "ws" / ".agents/skills"
+        assert result.directories == [str(own), str(tmp_path / "shared")]
+        assert (own / "README.md").read_text(encoding="utf-8") == _SKILLS_README
+        assert [(skill.name, skill.enabled, skill.problem) for skill in result.skills] == [("house-style", False, None)]
+
+    @pytest.mark.asyncio
+    async def test_existing_readme_is_not_overwritten(self, manager: AgentManager, tmp_path: Path) -> None:
+        own = tmp_path / "ws" / ".agents/skills"
+        own.mkdir(parents=True)
+        (own / "README.md").write_text("user edits", encoding="utf-8")
+
+        await manager.on_handle_list_agent_skills_request(ListAgentSkillsRequest())
+
+        assert (own / "README.md").read_text(encoding="utf-8") == "user edits"
 
     def test_scaffold_failure_does_not_raise(self, agent_manager: AgentManager, tmp_path: Path) -> None:
         blocker = tmp_path / "not-a-dir"
         blocker.write_text("", encoding="utf-8")
 
-        agent_manager._ensure_skills_directory(blocker)
+        agent_manager._ensure_skills_directory(blocker / "skills")
+
+    @pytest.mark.asyncio
+    async def test_turning_a_skill_off_and_on(self, manager: AgentManager, config: _FakeConfig, tmp_path: Path) -> None:
+        _write_skill(tmp_path / "shared", "house-style")
+
+        off = await manager.on_handle_set_agent_skill_enabled_request(
+            SetAgentSkillEnabledRequest(name="house-style", enabled=False)
+        )
+        assert isinstance(off, SetAgentSkillEnabledResultSuccess)
+        assert config.values["agent.disabled_skills"] == ["house-style"]
+        assert (await manager._skill_selection()).names == []
+
+        on = await manager.on_handle_set_agent_skill_enabled_request(
+            SetAgentSkillEnabledRequest(name="house-style", enabled=True)
+        )
+        assert isinstance(on, SetAgentSkillEnabledResultSuccess)
+        assert config.values["agent.disabled_skills"] == []
+        assert (await manager._skill_selection()).names == ["house-style"]
+
+    @pytest.mark.asyncio
+    async def test_turning_off_an_unknown_skill_fails(self, manager: AgentManager) -> None:
+        result = await manager.on_handle_set_agent_skill_enabled_request(
+            SetAgentSkillEnabledRequest(name="ghost", enabled=False)
+        )
+
+        assert isinstance(result, SetAgentSkillEnabledResultFailure)
+        assert "ghost" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_create_writes_into_the_first_folder(self, manager: AgentManager, tmp_path: Path) -> None:
+        result = await manager.on_handle_create_agent_skill_request(
+            CreateAgentSkillRequest(name="house-style", description="Apply our style.", instructions="Be brief.")
+        )
+
+        assert isinstance(result, CreateAgentSkillResultSuccess)
+        assert result.skill is not None
+        assert result.skill.path == str(tmp_path / "ws" / ".agents/skills" / "house-style")
+        assert (await manager._skill_selection()).names == ["house-style"]
+
+    @pytest.mark.asyncio
+    async def test_create_reports_an_invalid_skill(self, manager: AgentManager) -> None:
+        result = await manager.on_handle_create_agent_skill_request(
+            CreateAgentSkillRequest(name="house-style", description="", instructions="Be brief.")
+        )
+
+        assert isinstance(result, CreateAgentSkillResultFailure)
+        assert "Attempted to create skill 'house-style'" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_import_names_the_skill_from_its_frontmatter(self, manager: AgentManager) -> None:
+        content = "---\nname: imported\ndescription: Came from a file.\n---\n\nGuidance."
+
+        result = await manager.on_handle_import_agent_skill_request(ImportAgentSkillRequest(content=content))
+
+        assert isinstance(result, ImportAgentSkillResultSuccess)
+        assert result.skill is not None
+        assert result.skill.name == "imported"
+
+    @pytest.mark.asyncio
+    async def test_import_reports_a_file_that_is_not_a_skill(self, manager: AgentManager) -> None:
+        result = await manager.on_handle_import_agent_skill_request(ImportAgentSkillRequest(content="hello"))
+
+        assert isinstance(result, ImportAgentSkillResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_delete_removes_a_skill_from_the_first_folder(
+        self, manager: AgentManager, config: _FakeConfig, tmp_path: Path
+    ) -> None:
+        folder = _write_skill(tmp_path / "ws" / ".agents/skills", "doomed")
+        config.values["agent.disabled_skills"] = ["doomed"]
+
+        result = await manager.on_handle_delete_agent_skill_request(DeleteAgentSkillRequest(name="doomed"))
+
+        assert isinstance(result, DeleteAgentSkillResultSuccess)
+        assert not folder.exists()
+        assert config.values["agent.disabled_skills"] == []
+
+    @pytest.mark.asyncio
+    async def test_delete_leaves_shared_skills_alone(self, manager: AgentManager, tmp_path: Path) -> None:
+        folder = _write_skill(tmp_path / "shared", "house-style")
+
+        result = await manager.on_handle_delete_agent_skill_request(DeleteAgentSkillRequest(name="house-style"))
+
+        assert isinstance(result, DeleteAgentSkillResultFailure)
+        assert "shared folder" in str(result.result_details)
+        assert folder.exists()
 
 
 class TestBuildAgentInstructions:
@@ -1307,7 +1452,6 @@ class TestBuildRunnerCredential:
             _AGENT_MANAGER_MODULE + ".PydanticAgentRunner",
             lambda **kwargs: captured.update(kwargs) or object(),
         )
-        monkeypatch.setattr(providers_manager, "_ensure_skills_directory", lambda _root: None)
         providers_manager._mcp_server_port = 1234
         # The runner is stubbed out, so these only need to exist, not be real.
         providers_manager._system_prompt_extra = ""
@@ -1586,6 +1730,8 @@ class TestRunAgentResultPayloadContract:
             library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
             only_open_workflow_or_none=lambda: None,
         )
+        # These tests are about the result payload, so offer no skills.
+        monkeypatch.setattr(manager, "_skill_selection", _no_skills)
         return manager
 
     @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 """Tests for the skills the runner offers the model from `.agents/skills`.
 
+Each run is given the selection the agent manager would build from that folder.
+
 Every test drives a real run through a scripted `FunctionModel`, so they pin what the
 model sees and receives rather than how the runner builds it: the skill catalog, the
 instructions a loaded skill delivers, and what the read-only file tools reach. Catalog
@@ -32,6 +34,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.workspaces import LocalWorkspaceBackend
 
 from griptape_nodes.agents.pydantic_ai.runner import PydanticAgentRunner
+from griptape_nodes.agents.skills import discover_skills, select_skills
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 
 if TYPE_CHECKING:
@@ -61,24 +64,25 @@ class _Run:
     """The instructions each loaded skill delivered, by skill name."""
 
 
-def _runner(workspace: Path, threads_dir: Path, *, auto_load_skills: bool = True) -> PydanticAgentRunner:
+def _runner(workspace: Path, threads_dir: Path) -> PydanticAgentRunner:
     """Build a runner rooted at `workspace` without touching Griptape Cloud."""
     storage = LocalThreadStorageDriver(threads_dir, config_manager=None, secrets_manager=None)  # type: ignore[arg-type]
-    return PydanticAgentRunner(
-        model_name="test",
-        api_key="dummy",
-        workspace_root=workspace,
-        storage=storage,
-        auto_load_skills=auto_load_skills,
-    )
+    return PydanticAgentRunner(model_name="test", api_key="dummy", workspace_root=workspace, storage=storage)
 
 
-async def _drive(runner: PydanticAgentRunner, calls: list[tuple[str, dict[str, Any]]]) -> _Run:
+async def _drive(
+    runner: PydanticAgentRunner,
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    offer_skills: bool = True,
+    libraries: list[Path] | None = None,
+) -> _Run:
     """Run `runner` with a model that makes `calls` one per step, then answers "done".
 
     Returns the tools and instructions the model saw on each step, for each call either
     the tool's return content or the retry prompt it was answered with, and the
-    instructions each loaded skill delivered.
+    instructions each loaded skill delivered. Skills come from `libraries`, by default the
+    workspace's `.agents/skills`.
     """
     run = _Run()
 
@@ -92,8 +96,14 @@ async def _drive(runner: PydanticAgentRunner, calls: list[tuple[str, dict[str, A
             return
         yield "done"
 
+    selection = None
+    if offer_skills:
+        if libraries is None:
+            libraries = [runner.workspace_root / ".agents/skills"]
+        selection = select_skills(await discover_skills(libraries), disabled=set())
+
     runner._agent = Agent(FunctionModel(stream_function=stream))
-    result = await runner.run("Go.")
+    result = await runner.run("Go.", skills=selection)
 
     for message in runner.storage.load_history(result.thread_id):
         if not isinstance(message, ModelRequest):
@@ -191,11 +201,11 @@ async def test_no_skills_when_skills_dir_missing(workspace: Path, threads: Path)
 
 
 @pytest.mark.asyncio
-async def test_no_skills_when_disabled(workspace: Path, threads: Path) -> None:
-    """`auto_load_skills=False` offers no skills even when skills exist."""
+async def test_no_skills_without_a_selection(workspace: Path, threads: Path) -> None:
+    """A run given no selection offers no skills even when skills exist."""
     _write_skill(workspace, "demo-skill")
 
-    run = await _drive(_runner(workspace, threads, auto_load_skills=False), [])
+    run = await _drive(_runner(workspace, threads), [], offer_skills=False)
 
     assert _tool_names(run.steps[0]) == set()
 
@@ -346,16 +356,66 @@ async def test_files_cannot_leave_their_skill(workspace: Path, threads: Path, tm
 
 
 @pytest.mark.asyncio
-async def test_a_link_beside_the_skills_stays_in_the_library(workspace: Path, threads: Path, tmp_path: Path) -> None:
-    """A top-level link that is not a skill folder reads as missing when it points out of the library."""
+async def test_only_offered_skills_are_reachable(workspace: Path, threads: Path, tmp_path: Path) -> None:
+    """The file tools reach the offered skills' folders and nothing else in the skills folder."""
     _write_skill(workspace, "demo-skill")
+    _write(
+        workspace / ".agents/skills/hidden/SKILL.md",
+        "---\nname: hidden\ndescription: Hidden.\ndisable-model-invocation: true\n---\n\nBody.",
+    )
+    _write(workspace / ".agents/skills/README.md", "about these skills")
     _write(tmp_path / "outside/secret.md", "secret")
     (workspace / ".agents/skills/stray").symlink_to(tmp_path / "outside", target_is_directory=True)
 
-    run = await _drive(_runner(workspace, threads), [_list("/"), _read("stray/secret.md")])
+    run = await _drive(
+        _runner(workspace, threads),
+        [
+            _list("/"),
+            _read("hidden/SKILL.md"),
+            _read("demo-skill/SKILL.md"),
+            _read("stray/secret.md"),
+            _read("demo-skill/SKILL.md"),
+            _read("README.md"),
+        ],
+    )
 
-    assert "stray" not in str(run.results[0])
-    assert run.results[1] == "Path not found: stray/secret.md"
+    assert run.results[0] == "demo-skill/"
+    assert run.results[1] == "Path not found: hidden/SKILL.md"
+    assert run.results[3] == "Path not found: stray/secret.md"
+    assert run.results[5] == "Path not found: README.md"
+
+
+@pytest.mark.asyncio
+async def test_skills_from_several_folders(workspace: Path, threads: Path, tmp_path: Path) -> None:
+    """Skills from different skills folders share one run, each at the path its instructions name."""
+    own = _write_skill(workspace, "own-skill")
+    _write(own / "notes.md", "own notes")
+    shared = _write_skill(tmp_path / "studio", "shared-skill")
+    _write(shared / "notes.md", "shared notes")
+
+    run = await _drive(
+        _runner(workspace, threads),
+        [_load("shared-skill"), _read("own-skill/notes.md"), _read("shared-skill/notes.md")],
+        libraries=[workspace / ".agents/skills", tmp_path / "studio/.agents/skills"],
+    )
+
+    assert _catalog(run.steps[0]) == "- own-skill: own-skill description\n- shared-skill: shared-skill description"
+    assert "Skill directory: `/shared-skill`." in run.loaded["shared-skill"]
+    assert _file_text(run.results[1]) == "own notes"
+    assert _file_text(run.results[2]) == "shared notes"
+
+
+@pytest.mark.asyncio
+async def test_a_skill_whose_folder_name_differs_in_unicode_form(workspace: Path, threads: Path) -> None:
+    """A skill is reached at its folder's spelling, which is what its instructions name."""
+    folder = workspace / ".agents/skills/\ufb01le-skill"
+    _write(folder / "SKILL.md", "---\nname: file-skill\ndescription: Files.\n---\n\nBody.")
+    _write(folder / "notes.md", "notes")
+
+    run = await _drive(_runner(workspace, threads), [_load("file-skill"), _read("\ufb01le-skill/notes.md")])
+
+    assert "Skill directory: `/\ufb01le-skill`." in run.loaded["file-skill"]
+    assert _file_text(run.results[1]) == "notes"
 
 
 @pytest.mark.asyncio

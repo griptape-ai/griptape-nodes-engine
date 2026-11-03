@@ -24,6 +24,7 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
+AGENT_SKILLS_DIRECTORIES_KEY = "agent.skills_directories"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
 DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
 DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
@@ -96,6 +97,25 @@ def _validate_beta_feature_map(map_key: str, v: Any, *, from_env: bool) -> dict[
     return valid
 
 
+def _json_list_from_env(config_key: str, v: Any, info: ValidationInfo) -> Any:
+    """Parse the JSON list an environment variable carries for a list setting.
+
+    Env vars are always strings and a list has no other string form, so under
+    `FROM_ENV_CONTEXT` a string is read as JSON. A blank one means an empty list.
+    A string from a config file is left for the list type to reject, as for any list setting.
+    """
+    from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+    if not from_env or not isinstance(v, str):
+        return v
+    if not v.strip():
+        return []
+    try:
+        return json.loads(v)
+    except json.JSONDecodeError as e:
+        msg = f"{config_key} must be a JSON list of strings, got {v!r}"
+        raise ValueError(msg) from e
+
+
 def _env_value_to_bool(config_key: str, value: Any) -> bool:
     """Convert a beta feature GTN_CONFIG_ string to a boolean, raising when it isn't one."""
     try:
@@ -166,7 +186,7 @@ MCP_SERVERS = Category(name="MCP Servers", description="Model Context Protocol s
 PROJECTS = Category(name="Projects", description="Project template configurations and registrations")
 STATIC_SERVER = Category(name="Static Server", description="Static file server configuration for serving media assets")
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
-AGENT = Category(name="Agent", description="Agent behavior and system prompt")
+AGENT = Category(name="Agent", description="Agent behavior, system prompt, and skills")
 LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
 BETA_FEATURES = Category(name="Beta Features", description="Experimental features that can be turned on or off")
 LOGGING = Category(name="Logging", description="Where engine logs are kept and how much history is retained")
@@ -429,22 +449,8 @@ class WorkerSettings(BaseModel):
     @field_validator("command_prefix", mode="before")
     @classmethod
     def validate_command_prefix(cls, v: Any, info: ValidationInfo) -> Any:
-        """Parse the JSON list a GTN_CONFIG_WORKER__COMMAND_PREFIX variable carries.
-
-        Env vars are always strings and a list has no other string form, so under
-        `FROM_ENV_CONTEXT` a string is read as JSON. A blank one means no prefix.
-        A string from a config file is left for the list type to reject, as for any list setting.
-        """
-        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
-        if not from_env or not isinstance(v, str):
-            return v
-        if not v.strip():
-            return []
-        try:
-            return json.loads(v)
-        except json.JSONDecodeError as e:
-            msg = f"{WORKER_COMMAND_PREFIX_KEY} must be a JSON list of strings, got {v!r}"
-            raise ValueError(msg) from e
+        """Parse the JSON list a GTN_CONFIG_WORKER__COMMAND_PREFIX variable carries."""
+        return _json_list_from_env(WORKER_COMMAND_PREFIX_KEY, v, info)
 
 
 class ReleaseSettings(BaseModel):
@@ -506,6 +512,26 @@ class AgentSettings(BaseModel):
         default="",
         description="Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
     )
+    skills_directories: list[str] = Field(
+        default_factory=lambda: [".agents/skills"],
+        json_schema_extra={"env_var_format": "json_list"},
+        description=(
+            "Folders the agent loads skills from. A relative path is resolved against the workspace directory. "
+            "New skills are added to the first folder. Add a shared folder to give everyone on a team the same "
+            "skills. The environment variable takes a JSON list, e.g. "
+            'GTN_CONFIG_AGENT__SKILLS_DIRECTORIES=\'[".agents/skills", "/mnt/studio/skills"]\'.'
+        ),
+    )
+    disabled_skills: list[str] = Field(
+        default_factory=list,
+        description="Names of skills the agent does not use, even though they are in a skills folder.",
+    )
+
+    @field_validator("skills_directories", mode="before")
+    @classmethod
+    def validate_skills_directories(cls, v: Any, info: ValidationInfo) -> Any:
+        """Parse the JSON list a GTN_CONFIG_AGENT__SKILLS_DIRECTORIES variable carries."""
+        return _json_list_from_env(AGENT_SKILLS_DIRECTORIES_KEY, v, info)
 
 
 class LibraryDependencyInstallBehavior(StrEnum):
