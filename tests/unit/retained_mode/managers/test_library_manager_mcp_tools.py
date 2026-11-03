@@ -69,10 +69,10 @@ def _make_library_info() -> LibraryManager.LibraryInfo:
     )
 
 
-def _make_library(advanced_library: AdvancedNodeLibrary) -> Library:
+def _make_library(advanced_library: AdvancedNodeLibrary, name: str = "TestLib") -> Library:
     schema = MagicMock(spec=LibrarySchema)
     schema.is_default_library = False
-    schema.name = "TestLib"
+    schema.name = name
     schema.nodes = []
     schema.workflow_nodes = []
     schema.widgets = []
@@ -126,6 +126,16 @@ class TestMCPToolRegistration:
         assert library.get_mcp_tools() == []
         problem = next(p for p in library_info.problems if isinstance(p, MCPToolRegistrationProblem))
         assert "_UnschemableRequest" in problem.error_message
+
+    def test_library_whose_name_gives_no_address_exposes_no_tools(self, engine: Engine) -> None:
+        library = _make_library(_HandlingLib([MCPTool(_HandledRequest)]), name="!!!")
+        library_info = _make_library_info()
+
+        _load(engine, library, library_info)
+
+        assert library.get_mcp_tools() == []
+        problem = next(p for p in library_info.problems if isinstance(p, MCPToolRegistrationProblem))
+        assert "'!!!'" in problem.error_message
 
     def test_entry_that_is_not_an_mcp_tool_exposes_no_tools(self, engine: Engine) -> None:
         library = _make_library(_HandlingLib([_HandledRequest]))

@@ -31,6 +31,7 @@ from griptape_nodes.node_library.library_registry import (
     WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.retained_mode.beta_features import library_config_slug
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import AppPayload, ExecutionPayload
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
@@ -775,6 +776,13 @@ class LibraryModuleLoading(EngineScoped):
         """Store the library's MCP tools on it, or raise without storing any if one is invalid."""
         library_name = library.get_library_data().name
         tools = advanced_library.get_mcp_tools()
+        if tools and not library_config_slug(library_name):
+            msg = (
+                f"Attempted to expose MCP tools from library '{library_name}'. Failed because the library's "
+                f"name has no letters or digits to build its address from, /mcp/libraries/<name>/. "
+                f"Add some to the library's name."
+            )
+            raise ValueError(msg)
         handled_types = library.get_registered_request_handler_types()
         for tool in tools:
             if not isinstance(tool, MCPTool):
