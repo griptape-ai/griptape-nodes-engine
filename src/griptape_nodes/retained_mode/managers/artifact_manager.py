@@ -712,11 +712,11 @@ class ArtifactManager(EngineScoped):
     ) -> "ResultPayload":
         """Answer `request` for `workflow`, for a handler that holds the workflow it resolves for, or None.
 
-        A held workflow gets the request addressed to it. None is answered here with no workflow:
-        dispatch would hand an unaddressed request whichever workflow it finds open.
+        Dispatched, so pre-dispatch hooks and the request's `failure_log_level` apply. With no
+        workflow, the request is unaddressed and resolves for its caller's workflow, if any.
         """
         if workflow is None:
-            return await self.on_handle_get_preview_for_artifact_request(request)
+            return await self.engine.ahandle_request(request)
         return await workflow.ahandle_request(request)
 
     @handles(GetPreviewForArtifactRequest)

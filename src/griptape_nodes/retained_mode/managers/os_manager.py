@@ -4469,11 +4469,11 @@ class OSManager(EngineScoped):
     ) -> ResultPayload:
         """Resolve `request` for `workflow`, for a handler that holds the workflow it resolves for, or None.
 
-        A held workflow gets the request addressed to it. None is resolved here with no workflow:
-        dispatch would hand an unaddressed request whichever workflow it finds open.
+        Dispatched, so pre-dispatch hooks and the request's `failure_log_level` apply. With no
+        workflow, the request is unaddressed and resolves for its caller's workflow, if any.
         """
         if workflow is None:
-            return self.on_handle_resolve_macro_path_request(request)
+            return self.engine.handle_request(request)
         return workflow.handle_request(request)
 
     def _validate_copy_tree_paths(
