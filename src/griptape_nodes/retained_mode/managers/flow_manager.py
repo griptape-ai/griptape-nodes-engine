@@ -2218,15 +2218,19 @@ class FlowManager(EngineScoped):
             run_id = flows.run_in_progress.run_id
         return self._of_run(await spec.execute(self.engine), run_id)
 
-    def submit_run(self, spec: RunSpec) -> Run:
+    def submit_run(self, spec: RunSpec, *, flows: WorkflowFlows | None = None) -> Run:
         """Queue a run of `spec` in the current workflow, starting it at once if no run of it is in progress.
 
+        `flows` names another line to queue it in, such as one for other engines' runs, which belong to
+        no workflow.
+
         Raises:
-            NoOpenWorkflowError: No workflow is current.
+            NoOpenWorkflowError: No workflow is current, and no `flows` was given.
         """
         # The run keeps its workflow's flows, so it waits, starts and ends in that workflow's line
         # even if another workflow is current when it does.
-        flows = self._current_flows()
+        if flows is None:
+            flows = self._current_flows()
         run = Run(
             run_id=str(uuid4()),
             spec=spec,
@@ -2244,12 +2248,13 @@ class FlowManager(EngineScoped):
         self._report_places_in_line(flows)
         return run
 
-    async def cancel_run(self, run_id: str) -> bool:
-        """Cancel a run of the current workflow, returning whether there was one.
+    async def cancel_run(self, run_id: str, *, flows: WorkflowFlows | None = None) -> bool:
+        """Cancel a run of the current workflow, or of the line `flows` names, returning whether there was one.
 
         A waiting run leaves the line, the run in progress stops.
         """
-        flows = self._current_flows_or_none()
+        if flows is None:
+            flows = self._current_flows_or_none()
         if flows is None:
             return False
         waiting = [run for run in flows.run_queue.snapshot() if run.run_id == run_id]

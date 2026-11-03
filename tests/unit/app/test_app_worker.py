@@ -3586,11 +3586,12 @@ class _FakeLine:
         flow_manager.submit_run = self.submit  # type: ignore[method-assign]
         flow_manager.cancel_run = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
-    def submit(self, spec: object) -> MagicMock:
+    def submit(self, spec: object, *, flows: object = None) -> MagicMock:
         run = MagicMock()
         run.run_id = f"line-{len(self.runs)}"
         run.position = 1
         run.spec = spec
+        run.flows = flows
         self.runs.append(run)
         return run
 
@@ -3818,7 +3819,9 @@ class TestSharingThisEngineBetweenRuns:
 
         assert isinstance(await asyncio.wait_for(acquiring, timeout=1.0), worker_events.AcquireLeaseResultFailure)
         assert worker_manager._engine_runs == {}
-        worker_manager.engine.flow_manager.cancel_run.assert_awaited_once_with(line.runs[0].run_id)  # type: ignore[attr-defined]
+        worker_manager.engine.flow_manager.cancel_run.assert_awaited_once_with(  # type: ignore[attr-defined]
+            line.runs[0].run_id, flows=worker_manager._lease_line
+        )
 
     @pytest.mark.asyncio
     async def test_a_lease_released_while_workers_are_freed_for_it_lets_the_engine_go(
@@ -4004,7 +4007,7 @@ class TestSharingThisEngineBetweenRuns:
         assert isinstance(refused, worker_events.AcquireLeaseResultFailure)
         assert "lost its connection" in str(refused.result_details)
         line_cancel = worker_manager.engine.flow_manager.cancel_run
-        line_cancel.assert_awaited_once_with(line.runs[1].run_id)  # type: ignore[attr-defined]
+        line_cancel.assert_awaited_once_with(line.runs[1].run_id, flows=worker_manager._lease_line)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_a_session_that_never_registered_is_refused(self, worker_manager: WorkerManager) -> None:

@@ -57,6 +57,7 @@ from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNode
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.serialization.commands import encode_commands
 
 
@@ -1091,6 +1092,48 @@ class _Spec(RunSpec):
 
 def _ran(name: str) -> StartFlowResultSuccess:
     return StartFlowResultSuccess(result_details=f"{name} ran")
+
+
+class TestALineOfItsOwn:
+    """Another engine's runs wait in a line that belongs to no workflow, since the engine serving them need not open one."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_in_a_line_of_its_own_runs_with_no_workflow_open(self, engine: Engine) -> None:
+        line = WorkflowFlows()
+
+        run = engine.flow_manager.submit_run(_Spec("a run from engine x", _ran_async("remote")), flows=line)
+        result = await asyncio.wait_for(run.outcome, timeout=1.0)
+
+        assert str(result.result_details) == "remote ran"
+        assert line.run_in_progress is None
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_run_in_a_line_of_its_own_is_cancelled_there(self, engine: Engine) -> None:
+        line = WorkflowFlows()
+        first_may_end = asyncio.Event()
+
+        async def holds() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        first = engine.flow_manager.submit_run(_Spec("first", holds), flows=line)
+        second = engine.flow_manager.submit_run(_Spec("second", _ran_async("second")), flows=line)
+
+        assert await engine.flow_manager.cancel_run(second.run_id, flows=line)
+        assert "did not start: it was cancelled" in str((await second.outcome).result_details)
+        first_may_end.set()
+        await asyncio.wait_for(first.outcome, timeout=1.0)
+
+    def test_a_run_given_no_line_still_needs_a_workflow(self, engine: Engine) -> None:
+        with pytest.raises(NoOpenWorkflowError):
+            engine.flow_manager.submit_run(_Spec("flow", _ran_async("flow")))
+
+
+def _ran_async(name: str) -> Callable[[], Awaitable[Any]]:
+    async def body() -> Any:
+        return _ran(name)
+
+    return body
 
 
 @pytest.mark.usefixtures("open_workflow")

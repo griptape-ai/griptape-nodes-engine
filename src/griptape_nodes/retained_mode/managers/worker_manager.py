@@ -54,6 +54,7 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
+from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.serialization.values import untag
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
@@ -295,6 +296,9 @@ class WorkerManager(EngineScoped):
 
         # Other engines' leases on this engine, waiting in its line or holding it, by (engine, lease).
         self._engine_runs: dict[tuple[str, str], _EngineRun] = {}
+        # The line other engines' runs wait in here. It belongs to no workflow: an engine that runs nodes
+        # for other engines need not have one open, and its machine is shared whichever is.
+        self._lease_line = WorkflowFlows()
 
         # The engine whose lease last held this engine, so the next lease from another engine frees its workers.
         self._last_engine_run_engine_id: str | None = None
@@ -2102,7 +2106,7 @@ class WorkerManager(EngineScoped):
         )
         self._engine_runs[engine_run.key] = engine_run
         spec = _EngineRunSpec(manager=self, engine_run=engine_run, flow_name=f"a run from engine {engine_id}")
-        engine_run.line_run = self.engine.flow_manager.submit_run(spec)
+        engine_run.line_run = self.engine.flow_manager.submit_run(spec, flows=self._lease_line)
         return engine_run
 
     def _log_if_waiting_on_each_other(self, engine_run: _EngineRun) -> None:
@@ -2141,7 +2145,7 @@ class WorkerManager(EngineScoped):
         # Refused first, so its acquire hears `reason` rather than the line's own cancellation.
         self.refuse_engine_run(engine_run, reason)
         if engine_run.line_run is not None:
-            await self.engine.flow_manager.cancel_run(engine_run.line_run.run_id)
+            await self.engine.flow_manager.cancel_run(engine_run.line_run.run_id, flows=self._lease_line)
 
     def _forget_engine_run(self, engine_run: _EngineRun) -> None:
         if self._engine_runs.get(engine_run.key) is engine_run:
