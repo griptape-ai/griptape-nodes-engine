@@ -6,7 +6,9 @@
     "description": "Minimal library used by loop-body packaging tests",
     "library_version": "0.1.0",
     "engine_version": "0.0.0",
-    "tags": ["test"],
+    "tags": [
+      "test"
+    ],
     "dependencies": {
       "pip_dependencies": []
     }
@@ -50,12 +52,48 @@
       }
     },
     {
+      "class_name": "LoopJoinNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Joins its `prefix` and `item` inputs into its `result` output",
+        "display_name": "Loop Join"
+      }
+    },
+    {
+      "class_name": "LoopResultsNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Copies its `items` list input to its `result` output",
+        "display_name": "Loop Results"
+      }
+    },
+    {
       "class_name": "LoopStartNode",
       "file_path": "loop_nodes.py",
       "metadata": {
         "category": "test",
         "description": "Iterative start node over a fixed list",
         "display_name": "Loop Start"
+      }
+    },
+    {
+      "class_name": "OutsideCounterDataNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Data node outside the loop with a run counter",
+        "display_name": "Outside Counter"
+      }
+    },
+    {
+      "class_name": "AnySinkDataNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Accepts any type, used to pull an upstream node in as a dependency",
+        "display_name": "Any Sink"
       }
     },
     {

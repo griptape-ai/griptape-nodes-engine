@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.managers.flow_manager import FlowManager, QueueItem
+    from griptape_nodes.retained_mode.managers.flow_manager import QueueItem
     from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 
 
@@ -343,7 +343,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         else:
             categories = self._drain_global_flow_queue(flows.global_flow_queue)
 
-        return self._seed_dag_from_categories(start_node, categories, dag_builder, flow_manager, node_manager)
+        return self._seed_dag_from_categories(start_node, categories, dag_builder, node_manager)
 
     @staticmethod
     def _drain_global_flow_queue(flow_queue: Queue[QueueItem]) -> DagNodeCategories:
@@ -374,19 +374,22 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         start_node: BaseNode,
         categories: DagNodeCategories,
         dag_builder: DagBuilder,
-        flow_manager: FlowManager,
         node_manager: NodeManager,
     ) -> list[BaseNode]:
         """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
-        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 adds data
-        sink (terminal/leaf) nodes. A sink that is only data-connected gets its own graph so its
-        dependencies resolve unconditionally; a sink reachable from a graph's forward control
-        path is instead registered as a control-gated candidate so branches stay gated. The
-        current classifier only routes control-disconnected nodes into data_sink_nodes, so the
-        gated branch is a defensive fallback and the data-connected case is what runs in practice.
+        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 handles the data
+        sinks (terminal/leaf nodes with no control wires). A sink that sits downstream of this run's
+        control path is marked stale and put off: seeded now, its upstream walk would stop at a node
+        still RESOLVED from the previous run and never add an edge to the control node about to
+        re-run above it, so it would run beside that node on its old output. The driver seeds the
+        deferred sinks once every control graph has finished
+        (``ExecuteDagState._seed_deferred_data_sinks``), when the control nodes have run and marked
+        their downstream stale, so the walk adopts exactly what must recompute. A sink with nothing
+        from the control path above it is seeded now and runs alongside everything else.
         """
         start_nodes = [start_node]
+        connections = dag_builder.connections
 
         # PASS 1: control/start entries build the control-flow graphs.
         for node in (*categories.start_nodes, *categories.control_nodes):
@@ -396,22 +399,22 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
                 if node not in start_nodes:
                     start_nodes.append(node)
 
-        # PASS 2: data sinks, after the control graphs exist.
+        # Everything this run's control walk will re-run, and every data node fed by any of it.
+        may_be_stale: set[str] = set()
+        for entry_node in start_nodes:
+            may_be_stale.update(DagBuilder.collect_nodes_in_forward_control_path(entry_node, None, connections))
+        visited: set[str] = set()
+        for name in list(may_be_stale):
+            may_be_stale.update(connections.collect_downstream_data_nodes(node_manager.get_node_by_name(name), visited))
+
+        # PASS 2: data sinks.
         for node in categories.data_sink_nodes:
             node.state = NodeResolutionState.UNRESOLVED
             if node.name in dag_builder.node_to_reference:
                 continue
-            disconnected = True
-            for graph_start_node_name in list(dag_builder.graphs):
-                graph_start_node = node_manager.get_node_by_name(graph_start_node_name)
-                boundary_nodes = flow_manager.is_node_connected(graph_start_node, node)
-                if boundary_nodes:
-                    disconnected = False
-                    if node.name not in dag_builder.start_node_candidates:
-                        dag_builder.start_node_candidates[node.name] = {}
-                    dag_builder.start_node_candidates[node.name][graph_start_node_name] = set(boundary_nodes)
-            if disconnected:
-                # Not gated by any control graph - resolve it (and its dependencies) on its own.
+            if node.name in may_be_stale:
+                dag_builder.deferred_data_sinks.append(node)
+            else:
                 dag_builder.add_node_with_dependencies(node, node.name)
 
         return start_nodes

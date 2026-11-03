@@ -50,6 +50,33 @@
       }
     },
     {
+      "class_name": "CounterControlNode",
+      "file_path": "iterative_group_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Control node that recomputes from its own instance state, no external input",
+        "display_name": "Counter"
+      }
+    },
+    {
+      "class_name": "DoublerDataNode",
+      "file_path": "iterative_group_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Pure data node with no control connections, interior to a loop body",
+        "display_name": "Doubler"
+      }
+    },
+    {
+      "class_name": "OutsideCounterDataNode",
+      "file_path": "iterative_group_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Data node outside the group with a run counter",
+        "display_name": "Outside Counter"
+      }
+    },
+    {
       "class_name": "ProbeForEachGroupNode",
       "file_path": "iterative_group_nodes.py",
       "metadata": {

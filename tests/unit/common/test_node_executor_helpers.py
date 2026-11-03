@@ -396,3 +396,59 @@ class TestControlFlowResolvedEventWireForm:
         assert received.parameter_output_values == values
         assert type(received.parameter_output_values["flag"]) is bool
         assert type(received.parameter_output_values["count"]) is int
+
+
+class TestRedirectPackagedEdgesAndRemove:
+    """Drop packaged nodes from one network without losing their outside consumers.
+
+    An outside consumer is left waiting on the node that stands in for the package (the loop End
+    or the group node), where the package's real values land once a pass finishes.
+    """
+
+    def test_outside_consumer_now_waits_on_replacement(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("Outside", "Body")  # Outside feeds a body node; both get packaged
+        network.add_edge("Outside", "Sink")  # ...and a loose sink that stays in the outer DAG
+        network.add_edge("Body", "End")
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"Outside", "Body"}, "End")
+
+        assert network.nodes() == {"End", "Sink"}
+        assert network.get_successors("End") == {"Sink"}
+        assert network.in_degree("Sink") == 1
+
+    def test_edges_between_packaged_nodes_are_dropped_not_redirected(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("A", "B")
+        network.add_edge("B", "End")
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"A", "B"}, "End")
+
+        assert network.nodes() == {"End"}
+        assert network.in_degree("End") == 0
+
+    def test_replacement_node_never_gains_a_self_loop(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("Body", "End")  # Body's only successor is the replacement itself
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"Body"}, "End")
+
+        assert network.nodes() == {"End"}
+        assert network.get_successors("End") == set()
+        assert network.in_degree("End") == 0
+
+    def test_nodes_absent_from_this_network_are_ignored(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("X", "Y")
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"NotHere"}, "End")
+
+        assert network.nodes() == {"X", "Y"}
