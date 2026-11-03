@@ -579,17 +579,19 @@ class DiagnosticsManager(EngineScoped):
 
     def _stage_workflow(self, bundle: DiagnosticsBundle, warnings: list[str], workflow: WorkflowRuntime) -> None:
         """Add `workflow`'s saved file to a bundle, when it has one."""
-        workflow_path = self.engine.workflow_registry.get(workflow.workflow_id).absolute_path
+        entry = self.engine.workflow_registry.get(workflow.workflow_id)
+        workflow_path = entry.absolute_path
         if workflow_path is None:
             warnings.append(
-                "The open workflow has never been saved, so it is not in this bundle. "
+                f"The open workflow '{entry.name}' has never been saved, so it is not in this bundle. "
                 "Save it and collect again to include it."
             )
             return
 
         if not workflow_path.exists():
             warnings.append(
-                f"The open workflow's file '{workflow_path.name}' is no longer on disk, so it is not in this bundle."
+                f"The open workflow '{entry.name}' has a file, '{workflow_path.name}', that is no longer on disk, "
+                "so it is not in this bundle."
             )
             return
 
