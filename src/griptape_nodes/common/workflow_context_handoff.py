@@ -16,13 +16,15 @@ from typing import NamedTuple
 
 
 class WorkflowContextSnapshot(NamedTuple):
-    """A workflow context in the three fields `ContextManager.WorkflowContextState` keeps.
+    """A workflow context: the workflow's id, plus what its registry entry answers for name, file and folder.
 
-    `name` None means the lending engine had no current workflow, and the adopting engine must then
-    have none either. Both engines degrading a path the same way is correct; disagreeing is the bug
-    this exists to prevent.
+    The adopting engine registers the workflow under the same id with those three, so its registry
+    answers like the lender's. `workflow_id` None means the lending engine had no current workflow,
+    and the adopting engine must then have none either. Both engines degrading a path the same way
+    is correct; disagreeing is the bug this exists to prevent.
     """
 
+    workflow_id: str | None = None
     name: str | None = None
     file_path: str | None = None
     working_directory: str | None = None

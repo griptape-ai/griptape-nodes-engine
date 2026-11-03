@@ -11,6 +11,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.list_rows import ListRows
+from griptape_nodes.exe_types.node_loading import node_loading
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState, aprocess_scope
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -427,13 +428,6 @@ class TestTheListFollowsItsRows:
 
         assert _rows(node) == []
 
-    def test_a_worker_is_sent_the_list_its_node_reads(self, engine: Engine, flow_name: str) -> None:
-        """A workflow saved before the list followed its rows can hold items whose rows are gone."""
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        node.parameter_values["items"] = ["removed"]
-
-        assert node._list_rows.values_for_dispatch()["items"] == []
-
 
 class TestLoadingASavedWorkflow:
     def test_saved_rows_win_over_the_saved_list(self, engine: Engine, flow_name: str) -> None:
@@ -665,36 +659,6 @@ class TestItemConvertersRunOncePerItem:
         assert _get_items(engine) == ["[a]", "[b]"]
 
 
-class TestDispatch:
-    def test_a_list_is_sent_without_its_rows(self, engine: Engine, flow_name: str) -> None:
-        """A worker builds its own rows, with new names, from the list."""
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        rows = [_add_row(engine, value) for value in ("a", "b")]
-
-        values = node._list_rows.values_for_dispatch()
-
-        assert values["items"] == ["a", "b"]
-        assert not set(rows) & set(values)
-
-    def test_a_list_with_nested_lists_is_sent_concatenated(self, engine: Engine, flow_name: str) -> None:
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        _set_items(engine, [["a", "b"], "c"])
-
-        values = node._list_rows.values_for_dispatch()
-
-        assert values["items"] == ["a", "b", "c"]
-
-    def test_a_list_built_from_its_rows_is_sent(self, engine: Engine, flow_name: str) -> None:
-        node = _add(engine, _ListNode(name="Lister"), flow_name)
-        row = _add_row(engine, "a")
-        assert "items" not in node.parameter_values
-
-        values = node._list_rows.values_for_dispatch()
-
-        assert values["items"] == ["a"]
-        assert row not in values
-
-
 class TestFillingRowsOnACopyWithNone:
     def test_it_does_not_ask_about_connections_to_rows_it_does_not_have(self, engine: Engine, flow_name: str) -> None:
         """On a worker that question goes to the orchestrator, so it costs a round trip."""
@@ -847,36 +811,76 @@ class TestAHookWritingItsList:
         assert "from a value hook" not in caplog.text
 
 
-class TestAWorkerFillingItsCopy:
-    @pytest.fixture
-    def worker(self, engine: Engine) -> object:
-        engine.library_manager._is_worker = True
-        yield
-        engine.library_manager._is_worker = False
+class TestLoadingAWholeList:
+    """A load (a workflow opening, a paste, a worker's copy) stores a whole list as it stores any value.
 
-    @pytest.mark.usefixtures("worker")
-    @pytest.mark.parametrize("items", [["a", "b", "c"], []])
-    def test_does_not_ask_the_orchestrator_about_connections(
-        self, engine: Engine, flow_name: str, items: list[str]
-    ) -> None:
+    The load may make the list's connection after its values, or never, as in a worker's copy, so whether
+    the list is connected is not asked while it loads. A save writes a whole list only for a list a
+    connection fed; any other list's rows arrive as values of their own.
+    """
+
+    def test_is_stored_without_asking_whether_the_list_is_connected(self, engine: Engine, flow_name: str) -> None:
         node = _add(engine, _ListNode(name="Lister"), flow_name)
 
         with patch.object(BaseNode, "_param_has_incoming_connection", return_value=False) as asked:
-            failure = engine.node_manager._apply_hydrated_values(node, "Lister", {"items": items})
+            result = engine.handle_request(
+                SetParameterValueRequest(
+                    node_name="Lister", parameter_name="items", value=["a", "b"], initial_setup=True
+                )
+            )
 
-        assert failure is None
+        assert isinstance(result, SetParameterValueResultSuccess), result
         asked.assert_not_called()
-        assert node.get_parameter_value("items") == items
+        assert node.parameter_values["items"] == ["a", "b"]
+        assert _rows(node) == []
 
-    @pytest.mark.usefixtures("worker")
-    def test_a_connected_list_over_max_items_runs_with_every_item(self, engine: Engine, flow_name: str) -> None:
-        """The orchestrator warns and runs with the whole list, so the worker must too."""
+    def test_more_items_than_max_items_are_kept(self, engine: Engine, flow_name: str) -> None:
+        """Only a connection delivers more items than fit, and the orchestrator runs with all of them."""
         node = _add(engine, _ListNode(name="Lister", max_items=2), flow_name)
 
-        with patch.object(BaseNode, "_param_has_incoming_connection", return_value=True):
-            failure = engine.node_manager._apply_hydrated_values(node, "Lister", {"items": ["a", "b", "c"]})
+        result = engine.handle_request(
+            SetParameterValueRequest(
+                node_name="Lister", parameter_name="items", value=["a", "b", "c"], initial_setup=True
+            )
+        )
+
+        assert isinstance(result, SetParameterValueResultSuccess), result
+        assert node.parameter_values["items"] == ["a", "b", "c"]
+        assert _rows(node) == []
+
+    def test_is_read_whole_while_its_node_loads(self, engine: Engine, flow_name: str) -> None:
+        """Code that runs as the node loads reads the value it was given, not rows it does not have yet."""
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+        node.parameter_values["items"] = ["a", "b"]
+
+        with (
+            patch.object(BaseNode, "_param_has_incoming_connection", return_value=False) as asked,
+            node_loading("Lister"),
+        ):
             value = node.get_parameter_value("items")
 
-        assert failure is None
-        assert value == ["a", "b", "c"]
-        assert _rows(node) == []
+        asked.assert_not_called()
+        assert value == ["a", "b"]
+
+    def test_an_unconnected_list_is_read_from_its_rows_once_loaded(self, engine: Engine, flow_name: str) -> None:
+        """A list stored beside rows that no longer hold it, as an older save can, is not what the node reads."""
+        node = _add(engine, _ListNode(name="Lister"), flow_name)
+
+        engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name="items", value=["removed"], initial_setup=True)
+        )
+
+        assert node.get_parameter_value("items") == []
+
+    def test_loading_its_rows_does_not_notify_the_list(self, engine: Engine, flow_name: str) -> None:
+        """Whether the rows are what the list holds depends on a connection the load may not have made yet."""
+        node = _add(engine, _ListHookNode(name="Lister"), flow_name)
+        row = _add_row(engine, "")
+        node.seen_lists.clear()
+
+        engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name=row, value="loaded", initial_setup=True)
+        )
+
+        assert node.seen_lists == []
+        assert _get_items(engine) == ["[loaded]"]

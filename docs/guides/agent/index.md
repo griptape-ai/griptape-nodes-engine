@@ -54,8 +54,9 @@ Replies, and images the agent generates, count against the budgets of the
 project you have open, as well as any budget for your whole organization.
 
 The message names every budget that blocked the reply. Bring those names to
-your Griptape administrator, who can raise or unfreeze the budget on Griptape
-Cloud. A budget that stops a workflow run is shown differently — see
+your Griptape administrator, who can raise or unfreeze them in the Admin
+Dashboard's [Spend & Budgets](../../enterprise/admin_dashboard.md#spend-budgets)
+page. A budget that stops a workflow run is shown differently — see
 [When a budget stops a run](../editor/running_workflows.md#when-a-budget-stops-a-run).
 
 ## What's next

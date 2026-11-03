@@ -142,6 +142,60 @@ class TestStrictModeReporter:
         assert [v.message for v in outer.violations] == ["outer-1", "outer-2"]
         assert [v.message for v in inner.violations] == ["inner-1"]
 
+    def test_a_scope_handed_to_its_enclosing_scope_adds_its_violations_there(
+        self,
+        reporter: StrictModeReporter,
+        fake_rules: None,  # noqa: ARG002
+    ) -> None:
+        """A worker loading its copy of a node is part of that node's execution, whose result must carry them."""
+        with reporter.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE, subject="node", library_name=None, is_worker=True
+        ) as execution:
+            with reporter.open_scope(
+                kind=StrictModeScopeKind.LOAD,
+                subject="node",
+                library_name=None,
+                is_worker=True,
+                hand_to_enclosing=True,
+            ) as load:
+                reporter.report(rule_id="fake-ergonomics", message="while loading")
+            reporter.report(rule_id="fake-ergonomics", message="while running")
+
+        assert [v.message for v in load.violations] == ["while loading"]
+        assert [(v.message, v.scope_kind) for v in execution.violations] == [
+            ("while loading", StrictModeScopeKind.LOAD),
+            ("while running", StrictModeScopeKind.RUNTIME_EXECUTE),
+        ]
+
+    def test_a_scope_not_handed_on_keeps_its_violations(
+        self,
+        reporter: StrictModeReporter,
+        fake_rules: None,  # noqa: ARG002
+    ) -> None:
+        with (
+            reporter.open_scope(
+                kind=StrictModeScopeKind.RUNTIME_EXECUTE, subject="node", library_name=None, is_worker=False
+            ) as execution,
+            reporter.open_scope(kind=StrictModeScopeKind.EDIT, subject="node", library_name=None, is_worker=False),
+        ):
+            reporter.report(rule_id="fake-ergonomics", message="while editing")
+
+        assert execution.violations == []
+
+    def test_a_scope_handed_on_with_nothing_enclosing_it_keeps_its_violations(
+        self,
+        reporter: StrictModeReporter,
+        fake_rules: None,  # noqa: ARG002
+    ) -> None:
+        """A workflow opening in the editor loads its nodes with no execution around them."""
+        with reporter.open_scope(
+            kind=StrictModeScopeKind.LOAD, subject="node", library_name=None, is_worker=False, hand_to_enclosing=True
+        ) as load:
+            reporter.report(rule_id="fake-ergonomics", message="while loading")
+
+        assert [v.message for v in load.violations] == ["while loading"]
+        assert reporter.current_scope() is None
+
 
 class TestReporterReport:
     def test_no_op_outside_scope(self, reporter: StrictModeReporter, caplog: pytest.LogCaptureFixture) -> None:

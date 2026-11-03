@@ -22,8 +22,15 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppEndSessionResultSuccess,
     AppGetSessionRequest,
     AppGetSessionResultSuccess,
+    AppJoinSessionRequest,
+    AppJoinSessionResultFailure,
+    AppJoinSessionResultSuccess,
+    AppLeaveSessionRequest,
+    AppLeaveSessionResultFailure,
+    AppLeaveSessionResultSuccess,
     AppStartSessionRequest,
     AppStartSessionResultSuccess,
+    SessionClient,
     SessionHeartbeatRequest,
     SessionHeartbeatResultFailure,
     SessionHeartbeatResultSuccess,
@@ -75,6 +82,9 @@ class SessionManager:
         self._engine_identity_manager = engine_identity_manager
         self._sessions_data = self._load_sessions_data()
         self._active_session_id = self._get_or_initialize_active_session()
+        # In memory only: a client's connection does not outlive the engine process, so
+        # persisting it next to the session would resurrect it on restart.
+        self._clients: dict[str, SessionClient] = {}
         if event_manager is not None:
             event_manager.register_request_handlers(self)
 
@@ -94,8 +104,36 @@ class SessionManager:
         Args:
             session_id: The session ID to set as active
         """
-        self._active_session_id = session_id
+        self._activate_session(session_id)
         logger.debug("Set active session ID to: %s", session_id)
+
+    def _activate_session(self, session_id: str | None) -> None:
+        """Clients belong to the session they attached to, so moving to another one drops them."""
+        if session_id != self._active_session_id:
+            self._clients.clear()
+        self._active_session_id = session_id
+
+    @property
+    def clients(self) -> list[SessionClient]:
+        """Clients attached to the active session, in attach order."""
+        return list(self._clients.values())
+
+    def attach_client(self, client_id: str, client_type: str, client_label: str = "") -> bool:
+        """Attach a client to the active session; re-attaching refreshes connected_at. False when no session is active."""
+        if self._active_session_id is None:
+            logger.debug("Refused to attach client %s: no active session", client_id)
+            return False
+        self._clients[client_id] = SessionClient(
+            client_id=client_id,
+            client_type=client_type,
+            connected_at=datetime.now(tz=UTC).isoformat(),
+            client_label=client_label,
+        )
+        logger.debug("Attached client %s (%s) to session %s", client_id, client_type, self._active_session_id)
+        return True
+
+    def detach_client(self, client_id: str) -> None:
+        self._clients.pop(client_id, None)
 
     @property
     def all_sessions(self) -> list[SessionData]:
@@ -124,7 +162,7 @@ class SessionManager:
         self._add_or_update_session(session_data)
 
         # Set as active session
-        self._active_session_id = session_id
+        self._activate_session(session_id)
         logger.debug("Saved and activated session: %s for engine: %s", session_id, engine_id)
 
     def remove_session(self, session_id: str) -> None:
@@ -143,9 +181,7 @@ class SessionManager:
         # Clear active session if it was the removed session
         if self._active_session_id == session_id:
             # Set to first remaining session or None
-            self._active_session_id = (
-                self._sessions_data.sessions[0].session_id if self._sessions_data.sessions else None
-            )
+            self._activate_session(self._sessions_data.sessions[0].session_id if self._sessions_data.sessions else None)
             logger.debug(
                 "Removed active session %s for engine %s, set new active session to: %s",
                 session_id,
@@ -159,7 +195,7 @@ class SessionManager:
     def clear_saved_session(self) -> None:
         """Clear all saved session data for the current engine."""
         # Clear active session
-        self._active_session_id = None
+        self._activate_session(None)
 
         # Clear in-memory session data
         self._sessions_data = SessionsStorage(sessions=[])
@@ -265,7 +301,7 @@ class SessionManager:
         self._sessions_data = sessions_data
 
     @handles(AppStartSessionRequest)
-    async def handle_session_start_request(self, request: AppStartSessionRequest) -> ResultPayload:  # noqa: ARG002
+    async def handle_session_start_request(self, request: AppStartSessionRequest) -> ResultPayload:
         current_session_id = self.active_session_id
         if current_session_id is None:
             # Client wants a new session
@@ -276,7 +312,37 @@ class SessionManager:
         else:
             details = f"Session '{current_session_id}' already active. Joining..."
 
+        if request.client_id:
+            self.attach_client(request.client_id, request.client_type, request.client_label)
+
         return AppStartSessionResultSuccess(current_session_id, result_details="Session started successfully.")
+
+    @handles(AppJoinSessionRequest)
+    async def handle_join_session_request(self, request: AppJoinSessionRequest) -> ResultPayload:
+        active = self.active_session_id
+        if active is None:
+            return AppJoinSessionResultFailure(
+                result_details=f"Attempted to join session '{request.session_id}'. Failed because no session is active."
+            )
+        if request.session_id != active:
+            return AppJoinSessionResultFailure(
+                result_details=(
+                    f"Attempted to join session '{request.session_id}'. "
+                    f"Failed because the active session is '{active}'."
+                )
+            )
+        if request.client_id:
+            self.attach_client(request.client_id, request.client_type, request.client_label)
+        return AppJoinSessionResultSuccess(session_id=active, result_details=f"Joined session '{active}'.")
+
+    @handles(AppLeaveSessionRequest)
+    async def handle_leave_session_request(self, request: AppLeaveSessionRequest) -> ResultPayload:
+        if self.active_session_id is None:
+            return AppLeaveSessionResultFailure(
+                result_details=f"Attempted to delist client '{request.client_id}'. Failed because no session is active."
+            )
+        self.detach_client(request.client_id)
+        return AppLeaveSessionResultSuccess(result_details=f"Client '{request.client_id}' left the session.")
 
     @handles(AppEndSessionRequest)
     async def handle_session_end_request(self, _: AppEndSessionRequest) -> ResultPayload:

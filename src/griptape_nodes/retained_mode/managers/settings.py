@@ -24,6 +24,10 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
+DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
+DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
+DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
+DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY = "distributed_execution.max_workers"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -443,6 +447,60 @@ class WorkerSettings(BaseModel):
             raise ValueError(msg) from e
 
 
+class ReleaseSettings(BaseModel):
+    which: Literal["none", "others", "all"] = Field(
+        default="others",
+        description=(
+            "On an engine that runs nodes for other engines: whose workers it frees when it passes from one "
+            "engine's run to another's. 'none' frees nothing, for an engine dedicated to one pipeline. 'others' "
+            "frees the workers of every engine but the incoming run's, so its own models stay loaded. 'all' "
+            "frees the incoming run's workers too."
+        ),
+    )
+    how: Literal["drop_cache", "recycle"] = Field(
+        default="drop_cache",
+        description=(
+            "How it frees them. 'drop_cache' has each worker drop what its libraries keep between runs, such as "
+            "a loaded model, and keeps values a later node of the same run still needs. 'recycle' stops the "
+            "worker, which starts again the next time one of its nodes runs; the only sure way to free "
+            "everything."
+        ),
+    )
+
+
+class DistributedExecutionSettings(BaseModel):
+    library_engines: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Libraries whose nodes run on another computer's engine. Each entry pairs a library's name with "
+            'that engine\'s ID, for example {"Griptape Nodes Diffusers Library": '
+            '"3f2c8e1a-5b7d-4c9e-a0f1-2b3c4d5e6f70"}. Libraries not listed, or listed with this engine\'s '
+            "own ID, run on this computer. Set it in a config file, not an environment variable: library "
+            "names are case-sensitive, and environment variable names are lowercased. See the guide "
+            "Running Nodes on Another Computer."
+        ),
+    )
+    release: ReleaseSettings = Field(default_factory=ReleaseSettings)
+    max_workers: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "On an engine that runs nodes for other engines: the most workers it runs for them at once. A start "
+            "beyond it is refused, and the node that needed it fails saying so; that library's next node asks "
+            "again. Empty (the default) sets no limit."
+        ),
+    )
+
+    @field_validator("library_engines", mode="after")
+    @classmethod
+    def validate_library_engines(cls, v: dict[str, str]) -> dict[str, str]:
+        for library_name, engine_id in v.items():
+            if not engine_id.strip():
+                msg = f"{DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY} entry for '{library_name}' must be an engine ID"
+                raise ValueError(msg)
+        return v
+
+
 class AgentSettings(BaseModel):
     system_prompt: str = Field(
         default="",
@@ -704,6 +762,10 @@ class Settings(BaseModel):
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,
+    )
+    distributed_execution: DistributedExecutionSettings = Field(
+        category=EXECUTION,
+        default_factory=DistributedExecutionSettings,
     )
     storage_backend: Literal["local", "gtc"] = Field(
         category=STORAGE,

@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
+from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
@@ -52,8 +53,6 @@ def _make_node(
     # None of these values are held, so the egress pass must not treat them as parkable. A MagicMock
     # parameter answers truthy to is_process_local, which would swap every value for a mock key.
     node.get_parameter_by_name.return_value = None
-    # No lists, so what is dispatched is the values themselves.
-    node._list_rows.values_for_dispatch.side_effect = lambda: dict(node.parameter_values)
     return node
 
 
@@ -95,7 +94,30 @@ class TestExecuteDispatchContract:
         assert request.node_name == "Greeter"
 
     @pytest.mark.asyncio
-    async def test_dispatches_current_parameter_values(self) -> None:
+    async def test_dispatches_the_open_workflows_context_and_id(self) -> None:
+        """A worker runs the node in the runtime it keeps for the orchestrator's workflow, under the id the request carries."""
+        node = _make_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
+        mock_engine.project_manager.workflow_context_for_dispatch.return_value = WorkflowContextSnapshot(
+            workflow_id="open-workflow-id",
+            name="shots/lighting",
+            file_path="/workspace/shots/lighting.py",
+            working_directory=None,
+        )
+
+        await executor.execute(node)
+
+        request = mock_engine.ahandle_request.call_args.args[0]
+        assert request.orchestrator_workflow_id == "open-workflow-id"
+        assert request.workflow_name == "shots/lighting"
+        assert request.workflow_file_path == "/workspace/shots/lighting.py"
+        assert request.workflow_working_directory is None
+
+    @pytest.mark.asyncio
+    async def test_dispatches_no_values_since_the_node_already_holds_them(self) -> None:
+        """The handler reads the node's own values, and fills them in itself when it forwards to a worker."""
         node = _make_node(parameter_values={"in": "hi", "n": 3})
 
         executor = _make_executor()
@@ -104,26 +126,8 @@ class TestExecuteDispatchContract:
         await executor.execute(node)
 
         request = mock_engine.ahandle_request.call_args.args[0]
-        assert request.parameter_values == {"in": "hi", "n": 3}
-
-    @pytest.mark.asyncio
-    async def test_dispatched_parameter_values_are_independent_copy(self) -> None:
-        """Mutating node.parameter_values after dispatch must not leak into the request."""
-        node = _make_node(parameter_values={"in": "hi"})
-        captured: dict[str, Any] = {}
-
-        async def capture(req: Any) -> ExecuteNodeResultSuccess:
-            # Mutate the node's live dict; the request's snapshot must not change.
-            node.parameter_values["in"] = "MUTATED"
-            captured["params"] = req.parameter_values
-            return _success_result()
-
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=capture)
-        await executor.execute(node)
-
-        assert captured["params"] == {"in": "hi"}
+        assert request.parameter_values == {}
+        assert request.element_modification_commands == []
 
     @pytest.mark.asyncio
     async def test_dispatches_node_metadata(self) -> None:

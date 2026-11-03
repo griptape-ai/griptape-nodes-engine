@@ -5,6 +5,7 @@ and the lock -- rather than the dict.
 """
 
 import asyncio
+import contextvars
 import sys
 import threading
 import time
@@ -23,7 +24,10 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.workflow_events import DeleteWorkflowRequest
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.resource_manager import LocalObjectEntry
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 _SECOND_READ_TIMEOUT_SECONDS = 0.25
 
@@ -323,6 +327,56 @@ class TestDropForLibrary:
         assert released == ["good"]
 
 
+class TestDropForWorkflow:
+    def test_an_entry_records_the_workflow_it_was_held_for(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        host_key = manager.put_local_object(Held("host"), owner="Lib A", source="N", key="host")
+        engine.context_manager.push_workflow("wf")
+        workflow_id = engine.context_manager.get_current_workflow_id()
+
+        with engine.bind_workflow(engine.current_workflow()):
+            key = manager.put_local_object(Held("wf"), owner="Lib A", source="N", key="wf")
+
+        entry = manager.entry_for(key)
+        host_entry = manager.entry_for(host_key)
+        assert entry is not None
+        assert host_entry is not None
+        assert entry.workflow_id == workflow_id
+        assert host_entry.workflow_id is None
+
+    def test_parking_for_a_closed_workflow_is_refused_and_records_nothing(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
+
+        with engine.bind_workflow(workflow):
+            # Closed by other work, as a node task started before the close sees it.
+            contextvars.copy_context().run(engine.context_manager.pop_workflow)
+            with pytest.raises(WorkflowNotOpenError, match="was closed"):
+                manager.put_local_object(Held("late"), owner="Lib A", source="N", key="late")
+
+        assert manager.drop_all_local_objects() == 0
+
+    def test_drops_only_that_workflows_objects(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        released: list[str] = []
+        for workflow_id, label in (("a", "a"), ("b", "b"), (None, "host")):
+            entry_value = Held(label)
+            key = manager.put_local_object(
+                entry_value, owner="Lib A", source="N", key=label, on_drop=lambda value: released.append(value.label)
+            )
+            entry = manager.entry_for(key)
+            assert entry is not None
+            entry.workflow_id = workflow_id
+
+        dropped = manager.drop_objects_for_workflow("a")
+
+        assert dropped == 1
+        assert released == ["a"]
+        assert manager.get_local_object(manager.local_object_key("b", owner="Lib A"), owner="Lib A") is not None
+        assert manager.get_local_object(manager.local_object_key("host", owner="Lib A"), owner="Lib A") is not None
+
+
 class TestPresence:
     def test_a_sentinel_distinguishes_absent_from_falsy(self, engine: Engine) -> None:
         """One sentinel lookup leaves no window for a drop between a presence check and a read."""
@@ -424,6 +478,7 @@ class TestWorkflowStateClearReleasesObjects:
     def test_tearing_down_a_workflow_releases_every_library(self, engine: Engine) -> None:
         manager = engine.resource_manager
         released: list[str] = []
+        engine.context_manager.push_workflow("wf")
         for library, label in (("Lib A", "a"), ("Lib B", "b")):
             manager.put_local_object(
                 Held(label),
@@ -433,11 +488,78 @@ class TestWorkflowStateClearReleasesObjects:
                 on_drop=lambda value: released.append(value.label),
             )
 
-        engine.context_manager.push_workflow("wf")
         engine.clear_current_workflow_data()
 
         assert sorted(released) == ["a", "b"]
         assert manager.drop_all_local_objects() == 0
+
+    def test_closing_one_of_two_open_workflows_releases_only_its_objects(self, engine: Engine) -> None:
+        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        manager = engine.resource_manager
+        released: list[str] = []
+        registry = engine.workflow_registry
+        closing = engine.open_workflow(registry.register_unsaved("closing", listed=False).workflow_id)
+        staying = engine.open_workflow(registry.register_unsaved("staying", listed=False).workflow_id)
+        for workflow, label in ((closing, "closing"), (staying, "staying")):
+            with engine.bind_workflow(workflow):
+                manager.put_local_object(
+                    Held(label),
+                    owner="Lib A",
+                    source="N",
+                    key=label,
+                    on_drop=lambda value: released.append(value.label),
+                )
+        manager.put_local_object(
+            Held("host"), owner="Lib A", source="N", key="host", on_drop=lambda value: released.append(value.label)
+        )
+
+        engine.close_workflow(closing)
+        released_while_one_stays_open = list(released)
+        engine.close_workflow(staying)
+
+        assert released_while_one_stays_open == ["closing"]
+        assert sorted(released) == ["closing", "staying"]
+
+    def test_clearing_everything_releases_the_objects_held_for_no_workflow(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        released: list[str] = []
+        manager.put_local_object(
+            Held("host"), owner="Lib A", source="N", key="host", on_drop=lambda value: released.append(value.label)
+        )
+        engine.context_manager.push_workflow("wf")
+
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        assert released == ["host"]
+
+    def test_clearing_one_workflow_keeps_the_objects_held_for_no_workflow(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        released: list[str] = []
+        manager.put_local_object(
+            Held("host"), owner="Lib A", source="N", key="host", on_drop=lambda value: released.append(value.label)
+        )
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
+
+        result = engine.event_manager.handle_request(
+            ClearAllObjectStateRequest(i_know_what_im_doing=True),
+            result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+        )
+
+        assert result.succeeded()
+        assert engine.open_workflows.all_open() == []
+        assert released == []
+
+    def test_the_teardown_broadcast_names_the_closed_workflow(self, engine: Engine) -> None:
+        worker_manager = engine.worker_manager
+        with patch.object(worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
+            asyncio.run(worker_manager.broadcast_local_object_teardown("closed-id"))
+            asyncio.run(worker_manager.broadcast_local_object_teardown())
+
+        assert [call.kwargs for call in drop_all.await_args_list] == [
+            {"workflow_id": "closed-id"},
+            {"workflow_id": None},
+        ]
 
     def test_clearing_object_state_broadcasts_to_workers(self, engine: Engine) -> None:
         """Teardown runs on the orchestrator, so without the broadcast the worker keeps its objects."""
@@ -453,7 +575,7 @@ class TestWorkflowStateClearReleasesObjects:
         engine.context_manager.push_workflow("wf")
 
         with (
-            patch.object(engine, "clear_current_workflow_data", side_effect=RuntimeError("teardown blew up")),
+            patch.object(engine, "_tear_down_workflow", side_effect=RuntimeError("teardown blew up")),
             patch.object(engine.worker_manager, "broadcast_local_object_teardown", AsyncMock()) as broadcast,
         ):
             result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
@@ -486,10 +608,10 @@ class TestWorkflowStateClearReleasesObjects:
         Deleting the open workflow reaches teardown without going through that handler, and without this
         every worker keeps its objects.
         """
-        engine.context_manager.push_workflow("wf")
+        workflow_name = engine.context_manager.push_workflow("wf")
 
         with patch.object(engine.worker_manager, "broadcast_local_object_teardown", AsyncMock()) as broadcast:
-            engine.handle_request(DeleteWorkflowRequest(name="wf"))
+            engine.handle_request(DeleteWorkflowRequest(name=workflow_name))
 
         assert broadcast.await_count == 1
 
@@ -746,7 +868,7 @@ class TestTeardownBroadcastPairing:
             patch.object(
                 worker_manager,
                 "broadcast_drop_all_local_objects",
-                AsyncMock(side_effect=lambda: order.append("drop_all")),
+                AsyncMock(side_effect=lambda **_: order.append("drop_all")),
             ),
         ):
             asyncio.run(worker_manager.broadcast_local_object_teardown())

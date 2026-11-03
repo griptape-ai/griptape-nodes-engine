@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import os
 import threading
 from functools import partial
 from http import HTTPStatus
@@ -19,7 +18,11 @@ from griptape.artifacts.image_url_artifact import ImageUrlArtifact
 from griptape.artifacts.url_artifact import UrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
-from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+)
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.file import File
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
@@ -84,7 +87,7 @@ class PublicArtifactUrlParameter:
             raise ValueError(msg)
 
         self._api_key = api_key
-        self._base_url = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        self._base_url = resolve_cloud_base_url()
         # Building the driver resolves the bucket over the network.
         self._storage_driver: GriptapeCloudStorageDriver | None = None
 

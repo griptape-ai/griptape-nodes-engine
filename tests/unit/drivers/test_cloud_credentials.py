@@ -7,8 +7,10 @@ import pytest
 from griptape_nodes.drivers.cloud_credentials import (
     API_KEY_SECRET_NAME,
     BASE_URL_SETTING_NAME,
+    DEFAULT_CLOUD_BASE_URL,
     LICENSE_SECRET_NAME,
     is_license_credential,
+    join_cloud_url,
     resolve_cloud_base_url,
     resolve_cloud_credential,
     resolve_cloud_host,
@@ -136,6 +138,22 @@ class TestResolveCloudBaseUrl:
 
         assert resolve_cloud_base_url(secrets) == "https://dev.cloud.griptape.ai"  # type: ignore[arg-type]
 
+    def test_an_empty_override_is_production(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "")
+
+        assert resolve_cloud_base_url() == DEFAULT_CLOUD_BASE_URL
+
+    def test_an_environment_override_wins_without_a_secrets_manager(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "https://example.com/prefix")
+
+        assert resolve_cloud_base_url() == "https://example.com/prefix"
+
+    def test_a_secrets_manager_is_read_instead_of_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "https://shell.example.com")
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "https://workspace.example.com"})
+
+        assert resolve_cloud_base_url(secrets) == "https://workspace.example.com"  # type: ignore[arg-type]
+
 
 class TestResolveCloudHost:
     """Which deployment we are talking to, which decides whose 403 we explain."""
@@ -181,3 +199,19 @@ class TestResolveCloudHost:
         secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "not-a-url"})
 
         assert resolve_cloud_host(secrets) == ""  # type: ignore[arg-type]
+
+
+class TestJoinCloudUrl:
+    """join_cloud_url() keeps any path on the base URL."""
+
+    @pytest.mark.parametrize(
+        ("base_url", "expected"),
+        [
+            ("https://cloud.griptape.ai", "https://cloud.griptape.ai/api/buckets"),
+            ("https://cloud.griptape.ai/", "https://cloud.griptape.ai/api/buckets"),
+            ("https://example.com/prefix", "https://example.com/prefix/api/buckets"),
+            ("https://example.com/prefix/", "https://example.com/prefix/api/buckets"),
+        ],
+    )
+    def test_join(self, base_url: str, expected: str) -> None:
+        assert join_cloud_url(base_url, "/api/buckets") == expected

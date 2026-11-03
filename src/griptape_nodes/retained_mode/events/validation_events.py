@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -12,7 +13,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class ValidateFlowDependenciesRequest(RequestPayload):
+class ValidateFlowDependenciesRequest(RequestPayload, GraphAccessMixin):
     """Validate that a flow has all required dependencies before execution.
 
     Use when: Pre-flight checks before flow execution, preventing runtime failures,

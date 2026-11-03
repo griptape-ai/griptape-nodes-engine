@@ -126,7 +126,7 @@ class TestSerializeNode:
     @pytest.mark.usefixtures("clean_object_state")
     def test_returns_json_loadable_payload(self, engine: Engine) -> None:
         """The returned string is valid JSON naming the node's original type."""
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="wf_node", flow_name="fl_node"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="wf_node", flow_name="fl_node"))
         _add_error_proxy_node(engine, "my_node")
 
         payload = _serialize_node("my_node", engine)
@@ -138,7 +138,7 @@ class TestSerializeNode:
     @pytest.mark.usefixtures("clean_object_state")
     def test_unknown_node_name_returns_none(self, engine: Engine) -> None:
         """A node name that does not exist fails the underlying request; this must degrade to None, not raise."""
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="wf_missing_node", flow_name="fl_missing"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="wf_missing_node", flow_name="fl_missing"))
 
         assert _serialize_node("no_such_node", engine) is None
 

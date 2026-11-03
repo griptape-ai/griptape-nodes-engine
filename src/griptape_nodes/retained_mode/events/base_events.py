@@ -8,6 +8,14 @@ from typing import Any, NoReturn, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 
+@dataclass(frozen=True)
+class RequestSender:
+    """The engine, and its session, that sent a request, when another engine sent it."""
+
+    engine_id: str
+    session_id: str | None = None
+
+
 @dataclass
 class ResultDetail:
     """A single detail about an operation result, including logging level and human readable message."""
@@ -168,6 +176,15 @@ class WorkflowNotAlteredMixin:
     altered_workflow_state: bool = field(default=False, init=False)
 
 
+class GraphAccessMixin:
+    """Marks a request that reads or changes connections, flows, flow variables, or node group membership.
+
+    A node must not send one while it is being created or having its saved state applied (strict-mode
+    rule ``graph-access-while-loading``): the graph around a loading node is incomplete, so the answer
+    would depend on how the node was loaded.
+    """
+
+
 class SkipTheLineMixin:
     """Mixin for events that should skip the event queue and be processed immediately.
 
@@ -302,11 +319,28 @@ class BaseEvent(BaseModel, ABC):
 
 
 class EventRequest[P: Payload](BaseEvent):
-    """Request event."""
+    """Request event.
+
+    Args:
+        request: The request payload.
+        request_id: Id the caller matches the result by. Echoed on the result.
+        response_topic: Where the result is sent. Echoed on the result.
+        open_workflow_id: Id of the open workflow the request runs in. Echoed on the result. The
+            handler, and every task it starts, acts on that workflow. An id that names no open
+            workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
+            handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
+            Left out, the request acts on the engine's only open workflow, unless another engine
+            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
+            else: the workflow the request is about.
+    """
 
     request: P
     request_id: str | None = None
     response_topic: str | None = None
+    # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
+    # `require_request_sender()`.
+    sender: RequestSender | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
@@ -345,13 +379,21 @@ class EventRequestBatch(BaseEvent):
 
 
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
-    """Abstract base class for result events."""
+    """Abstract base class for result events.
+
+    Args:
+        open_workflow_id: The request envelope's `open_workflow_id`, echoed back: the open workflow
+            the request ran in. A result payload's own `workflow_id` is something else. For
+            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
+            Save As is a copy that is not open.
+    """
 
     request: P
     result: R
     request_id: str | None = None
     response_topic: str | None = None
     retained_mode: str | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""

@@ -4,9 +4,12 @@ Strict mode is a runtime contract for what node code is allowed to do
 across the orchestrator/worker split. This module owns scope, severity
 resolution, and violation reporting -- and nothing else.
 
-One kind of strict-mode scope exists: ``RUNTIME_EXECUTE``, which opens
+Three kinds of strict-mode scope exist: ``RUNTIME_EXECUTE``, which opens
 around ``NodeManager.on_execute_node_request`` for a single node's
-execution.
+execution; ``LOAD``, which opens while ``NodeManager`` creates a node
+or applies its saved state (a workflow load, a paste, or a worker
+rebuilding its copy); and ``EDIT``, which a node's value or connection
+hook opens around itself when no other scope is active.
 
 Detectors live at their own call sites (e.g. ``EventManager.handle_request``,
 ``BaseNode.add_parameter``) and import the module-level singleton
@@ -63,6 +66,8 @@ class SeverityResolver(Protocol):
 
 class StrictModeScopeKind(StrEnum):
     RUNTIME_EXECUTE = "runtime_execute"
+    LOAD = "load"
+    EDIT = "edit"
 
 
 class StrictModeSeverity(StrEnum):
@@ -186,6 +191,7 @@ class StrictModeReporter:
         subject: str,
         library_name: str | None,
         is_worker: bool,
+        hand_to_enclosing: bool = False,
     ) -> Iterator[StrictModeScope]:
         """Push a new strict-mode scope onto the per-task stack.
 
@@ -193,6 +199,11 @@ class StrictModeReporter:
         ``report()`` always operate on the innermost. When the reporter
         is disabled the yielded scope is detached (not on the stack), so
         ``report()`` finds no active scope and no-ops.
+
+        ``hand_to_enclosing`` adds this scope's violations to the enclosing
+        scope's on exit, for work that is part of what the enclosing scope
+        covers: a worker's rebuild of a node belongs to that node's
+        execution, whose result its violations must reach.
         """
         scope = StrictModeScope(kind=kind, subject=subject, library_name=library_name, is_worker=is_worker)
         if not self._enabled:
@@ -204,6 +215,8 @@ class StrictModeReporter:
             yield scope
         finally:
             self._scope_stack.reset(token)
+            if hand_to_enclosing and previous:
+                previous[-1].violations.extend(scope.violations)
 
     @asynccontextmanager
     async def scoped_execution(

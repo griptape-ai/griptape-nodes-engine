@@ -1,14 +1,17 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
+import asyncio
 import itertools
 import json
 import tempfile
-from collections.abc import Generator
+from collections.abc import Awaitable, Callable, Generator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from asyncio_thread_runner import ThreadRunner
 from PIL import Image, ImageFile
 from PIL.PngImagePlugin import PngInfo
 
@@ -20,10 +23,20 @@ from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode,
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelAllRunsRequest,
+    CancelAllRunsResultSuccess,
+    CancelRunRequest,
+    CancelRunResultFailure,
+    CancelRunResultSuccess,
+    ListRunsRequest,
+    ListRunsResultSuccess,
+    ResolveNodeRequest,
+    ResolveNodeResultFailure,
     StartFlowFromNodeRequest,
     StartFlowFromNodeResultFailure,
     StartFlowRequest,
     StartFlowResultFailure,
+    StartFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
@@ -40,6 +53,10 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
+from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
+from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
+from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.serialization.commands import encode_commands
 
 
@@ -155,7 +172,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_without_metadata)
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands is None
@@ -167,7 +184,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_unrelated_metadata)
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands is None
@@ -177,7 +194,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path="/does/not/exist.png")
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
@@ -187,7 +204,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_flow_commands)
 
-        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands == empty_flow_commands
@@ -205,7 +222,7 @@ class TestExtractFlowCommandsFromImageMetadata:
     def test_returns_failure_when_flow_commands_are_unreadable(self, engine: Engine, text: str, reason: str) -> None:
         path = _image_with_flow_commands_text(text)
         try:
-            result = engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+            result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
                 ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
             )
         finally:
@@ -225,7 +242,7 @@ class TestExtractFlowCommandsFromImageMetadata:
             return image
 
         with patch.object(Image, "open", _open):
-            engine.flow_manager.on_extract_flow_commands_from_image_metadata(
+            engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
                 ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
             )
 
@@ -324,6 +341,8 @@ class TestStartFlowRequestDefaultsToCurrentContext:
 
         flow_manager = engine.flow_manager
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        # A run waits in its workflow's line, so one has to be open.
+        engine.context_manager.push_workflow("wf")
 
         # Stand in a current node so the handler can fall back to it. The node itself only
         # needs to expose `.name`; we short-circuit object lookup below.
@@ -361,6 +380,7 @@ class TestStartFlowFailureMessage:
 
     @pytest.fixture
     def ready_flow_manager(self, engine: Engine) -> Generator[Any, None, None]:
+        engine.context_manager.push_workflow(workflow_name="f_workflow")
         flow_manager = engine.flow_manager
         validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
         with (
@@ -384,10 +404,8 @@ class TestStartFlowFailureMessage:
         machine = MagicMock()
         machine.resolution_machine.is_errored.return_value = True
         machine.resolution_machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
-        with (
-            patch.object(ready_flow_manager, "start_flow"),
-            patch.object(ready_flow_manager, "_global_control_flow_machine", machine),
-        ):
+        ready_flow_manager._global_control_flow_machine = machine
+        with patch.object(ready_flow_manager, "start_flow"):
             result = await ready_flow_manager.on_start_flow_request(StartFlowRequest(flow_name="f"))
 
         assert isinstance(result, StartFlowResultFailure)
@@ -872,7 +890,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
         flow_manager = engine.flow_manager
         flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
 
-        result = flow_manager.on_serialize_flow_to_commands(
+        result = flow_manager.serialization.on_serialize_flow_to_commands(
             SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
         )
         assert isinstance(result, SerializeFlowToCommandsResultSuccess)
@@ -924,7 +942,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
 
         # Serialization must succeed (not fail on the transient flow's internal connection) and
         # must not include the transient flow.
-        result = flow_manager.on_serialize_flow_to_commands(
+        result = flow_manager.serialization.on_serialize_flow_to_commands(
             SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
         )
         assert isinstance(result, SerializeFlowToCommandsResultSuccess), result
@@ -1044,3 +1062,671 @@ class TestReparentFlow:
         # The rejected move must leave the hierarchy untouched.
         assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
         assert flow_manager.get_parent_flow(outer.flow_name) is None
+
+
+@pytest.fixture
+def open_workflow(engine: Engine) -> Generator[None, None, None]:
+    """Open a workflow for a run test: a run waits in, starts and ends in its workflow's line."""
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.context_manager.push_workflow("runs_wf")
+    try:
+        yield
+    finally:
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+@dataclass
+class _Spec(RunSpec):
+    """A run that executes `body`, standing in for a request's run."""
+
+    flow_name: str
+    body: Callable[[], Awaitable[Any]]
+
+    async def execute(self, engine: Engine) -> Any:  # noqa: ARG002
+        return await self.body()
+
+    def failure(self, details: str) -> Any:
+        return StartFlowResultFailure(validation_exceptions=[], result_details=details)
+
+
+def _ran(name: str) -> StartFlowResultSuccess:
+    return StartFlowResultSuccess(result_details=f"{name} ran")
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunsTakeTurns:
+    """A run started while another is in progress waits its turn; a request from inside a run does not."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_started_while_another_is_in_progress_starts_once_it_ends(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+        order: list[str] = []
+
+        async def first() -> Any:
+            order.append("first started")
+            await first_may_end.wait()
+            order.append("first ended")
+            return _ran("first")
+
+        async def second() -> Any:
+            order.append("second started")
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("second", second)))
+        await asyncio.sleep(0.05)
+        assert order == ["first started"]
+
+        first_may_end.set()
+        await asyncio.wait_for(asyncio.gather(running, waiting), timeout=1.0)
+
+        assert order == ["first started", "first ended", "second started"]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_waiting_run_never_executes_and_its_request_says_so(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+        executed: list[str] = []
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            executed.append("second")
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting_run = flow_manager.submit_run(_Spec("second", second))
+
+        assert await flow_manager.cancel_run(waiting_run.run_id) is True
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        result = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
+        assert "did not start: it was cancelled" in str(result.result_details)
+        assert executed == []
+
+    @pytest.mark.asyncio
+    async def test_a_request_from_inside_the_run_in_progress_does_not_wait_for_it(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+
+        async def nested() -> Any:
+            return _ran("nested")
+
+        async def outer() -> Any:
+            return await flow_manager.start_run(_Spec("flow", nested))
+
+        result = await asyncio.wait_for(flow_manager.start_run(_Spec("flow", outer)), timeout=1.0)
+
+        assert str(result.result_details) == "nested ran"
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_outlives_its_run_waits_like_any_other_request(self, engine: Engine) -> None:
+        """A task copies the run it was created in, so its run having ended must not count as being inside one."""
+        flow_manager = engine.flow_manager
+        later_run_holds = asyncio.Event()
+        later_run_may_end = asyncio.Event()
+        leftover: list[asyncio.Task] = []
+
+        async def first_run() -> Any:
+            leftover.append(asyncio.ensure_future(_after(later_run_holds, flow_manager)))
+            return _ran("first")
+
+        async def later_run() -> Any:
+            later_run_holds.set()
+            await later_run_may_end.wait()
+            return _ran("later")
+
+        await flow_manager.start_run(_Spec("first", first_run))
+        holding = asyncio.ensure_future(flow_manager.start_run(_Spec("later", later_run)))
+        await asyncio.sleep(0.05)
+
+        assert not leftover[0].done(), "a task left over from an ended run skipped the line"
+        later_run_may_end.set()
+        await asyncio.wait_for(holding, timeout=1.0)
+        result = await asyncio.wait_for(leftover[0], timeout=1.0)
+        assert str(result.result_details) == "left over ran"
+
+
+async def _after(event: asyncio.Event, flow_manager: Any) -> Any:
+    await event.wait()
+
+    async def left_over() -> Any:
+        return _ran("left over")
+
+    return await flow_manager.start_run(_Spec("left over", left_over))
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunsEndCleanly:
+    """A run ends once, on the engine's loop, and waiting runs never outlive their workflow."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_cancelled_while_it_validates_stops_before_starting_its_flow(self, engine: Engine) -> None:
+        """Before its flow starts there is no flow to stop, so the run stops itself where it would start one."""
+        flow_manager = engine.flow_manager
+        may_start = asyncio.Event()
+
+        async def first() -> Any:
+            await may_start.wait()
+            try:
+                await flow_manager.start_flow(MagicMock())
+            except RuntimeError as e:
+                return StartFlowResultFailure(validation_exceptions=[e], result_details=str(e))
+            return _ran("first")
+
+        async def second() -> Any:
+            return _ran("second")
+
+        first_request = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", first)))
+        await asyncio.sleep(0)
+        first_run = engine.current_workflow().flows.run_in_progress
+        assert first_run is not None
+        waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
+        await asyncio.sleep(0)
+
+        assert await flow_manager.cancel_run(first_run.run_id) is True
+        may_start.set()
+
+        first_result = await asyncio.wait_for(first_request, timeout=1.0)
+        assert "did not start: it was cancelled" in str(first_result.result_details)
+        second_result = await asyncio.wait_for(waiting, timeout=1.0)
+        assert str(second_result.result_details) == "second ran"
+
+    @pytest.mark.asyncio
+    async def test_a_run_cancelled_before_its_driver_runs_never_executes(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        executed: list[str] = []
+
+        async def body() -> Any:
+            executed.append("body")
+            return _ran("body")
+
+        run = flow_manager.submit_run(_Spec("flow", body))
+        assert await flow_manager.cancel_run(run.run_id) is True
+
+        result = await asyncio.wait_for(run.outcome, timeout=1.0)
+        assert "did not start: it was cancelled" in str(result.result_details)
+        assert executed == []
+
+    @pytest.mark.asyncio
+    async def test_a_run_submitted_while_all_runs_are_cancelled_is_turned_away_too(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+        late: list[Any] = []
+        executed: list[str] = []
+
+        async def late_body() -> Any:
+            executed.append("late")
+            return _ran("late")
+
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
+            late.append(flow_manager.submit_run(_Spec("late", late_body)))
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over(flows)
+
+        async def first() -> Any:
+            flow_running["value"] = True
+            return _ran("first")
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
+        ):
+            await flow_manager.start_run(_Spec("flow", first))
+            await flow_manager.cancel_all_runs()
+
+        result = await asyncio.wait_for(late[0].outcome, timeout=1.0)
+        assert "did not start: it was cancelled" in str(result.result_details)
+        assert executed == []
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_workflows_turns_away_the_run_waiting_behind_a_paused_one(self, engine: Engine) -> None:
+        """Clearing cancels the paused run first, which would otherwise start the waiting one against deleted flows."""
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+        executed: list[str] = []
+
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over(flows)
+
+        async def first() -> Any:
+            flow_running["value"] = True
+            return _ran("first")
+
+        async def second() -> Any:
+            executed.append("second")
+            return _ran("second")
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
+        ):
+            await flow_manager.start_run(_Spec("flow", first))
+            waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
+            await asyncio.sleep(0)
+
+            await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            result = await asyncio.wait_for(waiting, timeout=1.0)
+
+        assert "did not start: it was cancelled" in str(result.result_details)
+        assert executed == []
+
+    @pytest.mark.asyncio
+    async def test_the_next_run_starts_on_the_engine_loop_when_the_last_one_ends_on_another(
+        self, engine: Engine
+    ) -> None:
+        """A synchronous request, such as deleting a flow, runs its async handler on a short-lived loop."""
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over(flows)
+
+        async def first() -> Any:
+            flow_running["value"] = True
+            return _ran("first")
+
+        async def second() -> Any:
+            await asyncio.sleep(0.05)
+            return _ran("second")
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
+        ):
+            await flow_manager.start_run(_Spec("flow", first))
+            first_run = engine.current_workflow().flows.run_in_progress
+            assert first_run is not None
+            waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
+            await asyncio.sleep(0)
+
+            with ThreadRunner() as runner:
+                runner.run(flow_manager.cancel_run(first_run.run_id))
+
+            result = await asyncio.wait_for(waiting, timeout=1.0)
+        assert str(result.result_details) == "second ran"
+
+    @pytest.mark.asyncio
+    async def test_a_run_ended_on_another_loop_is_reported_on_the_run_s_own_loop(self, engine: Engine) -> None:
+        """A callback that starts a task would otherwise start it on a loop that is about to close."""
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+        reported = asyncio.Event()
+        loops: list[asyncio.AbstractEventLoop] = []
+
+        def on_run_ended(_ended: asyncio.Future[None]) -> None:
+            loops.append(asyncio.get_running_loop())
+            reported.set()
+
+        async def stop_the_flow(flows: WorkflowFlows) -> None:
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over(flows)
+
+        async def first() -> Any:
+            flow_running["value"] = True
+            return _ran("first")
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
+        ):
+            await flow_manager.start_run(_Spec("flow", first))
+            first_run = engine.current_workflow().flows.run_in_progress
+            assert first_run is not None
+            first_run.ended.add_done_callback(on_run_ended)
+
+            with ThreadRunner() as runner:
+                runner.run(flow_manager.cancel_run(first_run.run_id))
+
+            await asyncio.wait_for(reported.wait(), timeout=1.0)
+        assert loops == [asyncio.get_running_loop()]
+
+
+class TestRunSpecs:
+    """A queued run looks up what it runs when it starts, so something deleted while it waited fails cleanly."""
+
+    @pytest.mark.asyncio
+    async def test_a_flow_run_whose_flow_is_gone_fails(self, engine: Engine) -> None:
+        result = await StartFlowSpec(request=StartFlowRequest(flow_name="gone"), flow_name="gone").execute(engine)
+
+        assert isinstance(result, StartFlowResultFailure)
+        assert "Cannot start flow" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_run_from_a_node_that_is_gone_fails(self, engine: Engine) -> None:
+        spec = StartFlowFromNodeSpec(
+            request=StartFlowFromNodeRequest(node_name="gone"), flow_name="flow", node_name="gone"
+        )
+
+        result = await spec.execute(engine)
+
+        assert isinstance(result, StartFlowFromNodeResultFailure)
+        assert "does not exist" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_node_run_whose_node_is_gone_fails(self, engine: Engine) -> None:
+        spec = ResolveNodeSpec(request=ResolveNodeRequest(node_name="gone"), flow_name="flow", node_name="gone")
+
+        result = await spec.execute(engine)
+
+        assert isinstance(result, ResolveNodeResultFailure)
+        assert "does not exist" in str(result.result_details)
+
+
+@dataclass
+class _HearingSpec(_Spec):
+    """A run that records what its hooks hear."""
+
+    places: list[int] = field(default_factory=list)
+    turned_away: list[str] = field(default_factory=list)
+
+    def on_place_in_line(self, run: Run) -> None:
+        self.places.append(run.position)
+
+    def on_turned_away(self, details: str) -> None:
+        self.turned_away.append(details)
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunSpecHooks:
+    """A run's spec hears its place in line and why it was turned away; the run says when it ended."""
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_run_s_spec_hears_its_place_and_when_it_stops_waiting(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        spec = _HearingSpec("second", second)
+        waiting = asyncio.ensure_future(flow_manager.start_run(spec))
+        await asyncio.sleep(0)
+        first_may_end.set()
+        await asyncio.wait_for(asyncio.gather(running, waiting), timeout=1.0)
+
+        assert spec.places == [1, 0]
+
+    @pytest.mark.asyncio
+    async def test_a_run_turned_away_tells_its_spec_why_and_ends(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def never() -> Any:
+            return _ran("never")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        spec = _HearingSpec("second", never)
+        waiting_run = flow_manager.submit_run(spec)
+
+        await flow_manager.cancel_run(waiting_run.run_id)
+        await asyncio.wait_for(waiting_run.ended, timeout=1.0)
+
+        assert spec.turned_away == ["The run did not start: it was cancelled."]
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_a_paused_run_ends_when_its_flow_stops_not_when_its_request_returns(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+
+        async def pauses() -> Any:
+            flow_running["value"] = True
+            return _ran("paused")
+
+        flows = engine.current_workflow().flows
+        with patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]):
+            await flow_manager.start_run(_Spec("flow", pauses))
+            run = flows.run_in_progress
+            assert run is not None
+            assert run.outcome.done()
+            assert not run.ended.done()
+
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over(flows)
+            await asyncio.wait_for(run.ended, timeout=1.0)
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunRequests:
+    """A script can see the runs and withdraw one that waits, through requests."""
+
+    @pytest.mark.asyncio
+    async def test_runs_are_listed_in_progress_first_then_waiting_in_order(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def waits() -> Any:
+            return _ran("waiting")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting = [asyncio.ensure_future(flow_manager.start_run(_Spec(name, waits))) for name in ("second", "third")]
+        await asyncio.sleep(0)
+
+        result = flow_manager.on_list_runs_request(ListRunsRequest())
+
+        assert isinstance(result, ListRunsResultSuccess)
+        assert [(run.flow_name, run.state, run.position) for run in result.runs] == [
+            ("first", "running", 0),
+            ("second", "queued", 1),
+            ("third", "queued", 2),
+        ]
+        first_may_end.set()
+        await asyncio.wait_for(asyncio.gather(running, *waiting), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_a_run_waiting_for_another_engine_is_listed_as_a_run_waiting_here_would_be(
+        self, engine: Engine
+    ) -> None:
+        """Its place is the one that engine last reported, until it stops waiting."""
+        flow_manager = engine.flow_manager
+        may_end = asyncio.Event()
+
+        async def waits_there() -> Any:
+            await may_end.wait()
+            return _ran("first")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", waits_there)))
+        await asyncio.sleep(0)
+        run = engine.current_workflow().flows.run_in_progress
+        assert run is not None
+
+        flow_manager.report_run_waiting_for_engine(run.run_id, 2)
+        waiting = flow_manager.on_list_runs_request(ListRunsRequest())
+        flow_manager.report_run_waiting_for_engine(run.run_id, 0)
+        admitted = flow_manager.on_list_runs_request(ListRunsRequest())
+
+        assert isinstance(waiting, ListRunsResultSuccess)
+        assert isinstance(admitted, ListRunsResultSuccess)
+        assert [(r.state, r.position) for r in waiting.runs] == [("queued", 2)]
+        assert [(r.state, r.position) for r in admitted.runs] == [("running", 0)]
+        may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_waiting_run_by_request_withdraws_it(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+        executed: list[str] = []
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            executed.append("second")
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting_run = flow_manager.submit_run(_Spec("second", second))
+
+        result = await flow_manager.on_cancel_run_request(CancelRunRequest(run_id=waiting_run.run_id))
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert isinstance(result, CancelRunResultSuccess)
+        outcome = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
+        assert "did not start: it was cancelled" in str(outcome.result_details)
+        assert executed == []
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_run_that_does_not_exist_fails(self, engine: Engine) -> None:
+        result = await engine.flow_manager.on_cancel_run_request(CancelRunRequest(run_id="no-such-run"))
+
+        assert isinstance(result, CancelRunResultFailure)
+        assert "no run with that id" in str(result.result_details)
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunResultsNameTheirRun:
+    """A run request's result says which run it started or joined."""
+
+    @pytest.mark.asyncio
+    async def test_a_runs_result_carries_its_run_id(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        seen: list[str | None] = []
+
+        async def body() -> Any:
+            run = engine.current_workflow().flows.run_in_progress
+            assert run is not None
+            seen.append(run.run_id)
+            return _ran("run")
+
+        result = await flow_manager.start_run(_Spec("flow", body))
+
+        assert isinstance(result, StartFlowResultSuccess)
+        assert result.run_id == seen[0]
+
+    @pytest.mark.asyncio
+    async def test_a_request_from_inside_a_run_names_the_run_it_joined(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        nested_results: list[Any] = []
+
+        async def nested() -> Any:
+            return _ran("nested")
+
+        async def outer() -> Any:
+            nested_results.append(await flow_manager.start_run(_Spec("flow", nested)))
+            return _ran("outer")
+
+        outer_result = await flow_manager.start_run(_Spec("flow", outer))
+
+        assert isinstance(outer_result, StartFlowResultSuccess)
+        assert nested_results[0].run_id == outer_result.run_id
+
+    @pytest.mark.asyncio
+    async def test_a_turned_away_runs_failure_names_the_run(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting_run = flow_manager.submit_run(_Spec("second", second))
+
+        await flow_manager.cancel_run(waiting_run.run_id)
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        failure = await asyncio.wait_for(waiting_run.outcome, timeout=1.0)
+        assert isinstance(failure, StartFlowResultFailure)
+        assert failure.run_id == waiting_run.run_id
+
+    @pytest.mark.asyncio
+    async def test_cancelling_all_runs_turns_away_the_waiting_ones_and_starts_none(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+        executed: list[str] = []
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            executed.append("second")
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("second", second)))
+        await asyncio.sleep(0)
+
+        result = await flow_manager.on_cancel_all_runs_request(CancelAllRunsRequest())
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert isinstance(result, CancelAllRunsResultSuccess)
+        turned_away = await asyncio.wait_for(waiting, timeout=1.0)
+        assert "did not start: it was cancelled" in str(turned_away.result_details)
+        assert executed == []
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestCancelAllRunsWhenIdle:
+    @pytest.mark.asyncio
+    async def test_an_idle_engine_has_nothing_to_cancel(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+
+        with patch.object(flow_manager, "_cancel_run") as cancel_run:
+            await flow_manager.cancel_all_runs()
+
+        cancel_run.assert_not_called()
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunsNameTheirRequest:
+    @pytest.mark.asyncio
+    async def test_a_waiting_run_carries_the_id_of_the_request_that_submitted_it(self, engine: Engine) -> None:
+        """A client matches its own waiting run by the id it gave its request, even when another queued the same flow."""
+        flow_manager = engine.flow_manager
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        async def second() -> Any:
+            return _ran("second")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", first)))
+        await asyncio.sleep(0)
+        with patch("griptape_nodes.retained_mode.managers.flow_manager.current_request_id", return_value="client-7"):
+            waiting_run = flow_manager.submit_run(_Spec("flow", second))
+
+        listed = flow_manager.on_list_runs_request(ListRunsRequest())
+
+        assert isinstance(listed, ListRunsResultSuccess)
+        assert [run.request_id for run in listed.runs if run.run_id == waiting_run.run_id] == ["client-7"]
+        first_may_end.set()
+        await asyncio.wait_for(asyncio.gather(running, waiting_run.outcome), timeout=1.0)

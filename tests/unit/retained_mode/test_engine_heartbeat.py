@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
@@ -14,8 +15,6 @@ from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
 if TYPE_CHECKING:
     import pytest
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 
 class TestEngineHeartbeatOrchestratorId:
@@ -63,3 +62,48 @@ class TestEngineHeartbeatOperatingSystem:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.engine_os == "sentinel-os"
+
+
+class TestEngineHeartbeatClients:
+    """Heartbeat lists the clients attached to the session so discovery can show who holds an engine."""
+
+    def test_reports_no_clients_when_none_attached(self, engine: Engine) -> None:
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-none"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.clients == []
+
+    def test_reports_an_attached_client(self, engine: Engine) -> None:
+        session_manager = engine._session_manager
+        session_manager.save_session("session-hb")
+        assert session_manager.attach_client("nuke:shot010", "nuke")
+
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-client"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert [(c.client_id, c.client_type) for c in result.clients] == [("nuke:shot010", "nuke")]
+
+
+class TestEngineHeartbeatRunId:
+    """Heartbeat reports engine_run_id so a client can tell the engine restarted and drop its workflow ids."""
+
+    def test_stays_the_same_while_the_engine_runs(self, engine: Engine) -> None:
+        first = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-run-1"))
+        second = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-run-2"))
+
+        assert isinstance(first, EngineHeartbeatResultSuccess)
+        assert isinstance(second, EngineHeartbeatResultSuccess)
+        assert first.engine_run_id is not None
+        assert len(first.engine_run_id) == 32  # noqa: PLR2004
+        assert second.engine_run_id == first.engine_run_id
+
+    def test_a_new_engine_reports_a_new_run_id(self, engine: Engine) -> None:
+        restarted = Engine()
+
+        before = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-before"))
+        after = restarted.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-after"))
+
+        assert isinstance(before, EngineHeartbeatResultSuccess)
+        assert isinstance(after, EngineHeartbeatResultSuccess)
+        assert after.engine_run_id is not None
+        assert after.engine_run_id != before.engine_run_id

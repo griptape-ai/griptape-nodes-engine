@@ -126,15 +126,17 @@ class ReferencedWorkflowImport(EngineScoped):
         flows_before = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
 
         # Execute the workflow within the target flow context.
-        # When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow
+        # When track_as_referenced is True, wrap in `referenced_workflow` so the flow
         # serializes as an import command. When False, the flow serializes as inline content.
         workflow_manager = self.engine.workflow_manager
         with self.engine.context_manager.flow(flow_name):
             if request.track_as_referenced:
                 with workflow_manager.referenced_workflow(request.workflow_name):
-                    workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
+                    workflow_result = await workflow_manager.runner.run_workflow(
+                        workflow_file_path, opens_workflow=False
+                    )
             else:
-                workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path)
+                workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path, opens_workflow=False)
 
         if not workflow_result.execution_successful:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"

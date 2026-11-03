@@ -164,3 +164,33 @@ async def test_registering_a_library_runs_no_git(engine: Engine, tmp_path: Path)
         result = await engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=manifest))
 
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), result.result_details
+
+
+@pytest.mark.asyncio
+async def test_metadata_without_git_info_runs_no_git(engine: Engine, tmp_path: Path) -> None:
+    """A caller that opts out of git details gets every schema without any git lookup."""
+    manifests = [_write_library(tmp_path / f"lib-{i}", f"Library {i}") for i in range(LIBRARY_COUNT)]
+
+    def get_config_value(key: str, *, default: object = None, **_: object) -> object:
+        if key == LIBRARIES_TO_REGISTER_KEY:
+            return manifests
+        if key == LIBRARIES_TO_DOWNLOAD_KEY:
+            return []
+        return default
+
+    def no_git(_library_path: Path) -> tuple[str | None, str | None]:
+        msg = "metadata requested without git info must not look up git details"
+        raise AssertionError(msg)
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(engine.config_manager, "get_config_value", get_config_value)
+        patcher.setattr(metadata_loading, "get_git_info", no_git)
+        result = await engine.library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+            LoadMetadataForAllLibrariesRequest(include_git_info=False)
+        )
+
+    assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
+    assert [entry.library_schema.name for entry in result.successful_libraries] == [
+        f"Library {i}" for i in range(LIBRARY_COUNT)
+    ]
+    assert all(entry.git_remote is None and entry.git_ref is None for entry in result.successful_libraries)

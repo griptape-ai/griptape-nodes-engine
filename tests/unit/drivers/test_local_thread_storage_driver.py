@@ -55,6 +55,19 @@ def test_save_and_load_history_round_trips(storage: LocalThreadStorageDriver) ->
     assert any(isinstance(p, TextPart) and p.content == "Hello!" for p in reloaded[1].parts)
 
 
+def test_saved_history_leaves_out_instructions(storage: LocalThreadStorageDriver) -> None:
+    """Each run sends its own instructions, so a request's saved copy is dropped."""
+    thread_id, _ = storage.create_thread()
+    request = ModelRequest(parts=[UserPromptPart(content="hi")], instructions="a long catalog")
+
+    storage.save_history(thread_id, [request, ModelResponse(parts=[TextPart(content="hello")])])
+
+    loaded = storage.load_history(thread_id)
+    assert isinstance(loaded[0], ModelRequest)
+    assert loaded[0].instructions is None
+    assert loaded[0].parts == request.parts
+
+
 def test_image_url_in_user_prompt_round_trips(storage: LocalThreadStorageDriver) -> None:
     """A user prompt carrying an ImageUrl reference survives save/load intact."""
     thread_id, _ = storage.create_thread()

@@ -30,6 +30,12 @@ from griptape_nodes.utils import engine_dirs  # noqa: E402
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
 _session_log_home_patch = patch.object(engine_dirs, "xdg_state_home", lambda: Path(_session_log_home.name))
 
+# `workspace_directory` defaults to `GriptapeNodes` under the working directory, frozen at import.
+# From the repo root that is a developer's real workspace, whose sandbox library and project file
+# the engine would load and write into. Resolved because the real default holds no symlinks,
+# while macOS temporary directories sit behind `/var`.
+_session_workspace = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-workspace-")
+
 
 def _real_log_directory() -> Path | None:
     """The developer's real engine log directory, or None on a machine that has no home.
@@ -57,6 +63,8 @@ def pytest_configure() -> None:
     if real_log_directory is not None:
         _own_names_in_real_log_directory.update(path.name for path in real_log_directory.glob(_own_log_file_glob))
     _session_log_home_patch.start()
+    settings_module.Settings.model_fields["workspace_directory"].default = str(Path(_session_workspace.name).resolve())
+    settings_module.Settings.model_rebuild(force=True)
 
 
 def pytest_unconfigure() -> None:
@@ -64,6 +72,7 @@ def pytest_unconfigure() -> None:
     log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
     _session_log_home_patch.stop()
     _session_log_home.cleanup()
+    _session_workspace.cleanup()
 
 
 @pytest.fixture

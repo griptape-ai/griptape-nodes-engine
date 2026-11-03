@@ -52,18 +52,12 @@ RULES: dict[str, StrictModeRule] = {
         correctness=False,
         description=(
             "A node called add_parameter or remove_parameter during "
-            "aprocess, which violates the structure contract: a "
-            "node's parameter structure must be a deterministic "
-            "function of its parameter values, created in __init__ or "
-            "by a value hook. Structure created anywhere else cannot "
-            "survive, because each execution builds a fresh copy from "
-            "the node class and only VALUES carry over (hydration "
-            "re-runs the hooks, which is how derived structure "
-            "reappears). A direct mutation during aprocess is local "
-            "to the transient copy and never syncs; the request-driven "
-            "path syncs to the orchestrator but is not readable back "
-            "on the executing copy, and does not reappear on later "
-            "executions either."
+            "aprocess. In a worker, each execution runs on a copy "
+            "rebuilt from the orchestrator's node, so a direct mutation "
+            "during aprocess is local to that copy and never syncs. The "
+            "request-driven path syncs to the orchestrator's node, but "
+            "is not readable back on the executing copy until the next "
+            "execution rebuilds it."
         ),
         remediation_template=(
             "Node '{node_name}' (type '{node_class}') mutated parameter "
@@ -71,9 +65,68 @@ RULES: dict[str, StrictModeRule] = {
             "AddParameterToNodeRequest or RemoveParameterFromNodeRequest "
             "to propagate the change to the orchestrator. Note that the "
             "change reaches the orchestrator's node, not this one: do "
-            "not read the parameter back locally. Each execution builds "
-            "a fresh copy from the node class, so the parameter exists "
-            "here only if __init__ or a value hook re-creates it."
+            "not read the parameter back locally. Each execution rebuilds "
+            "its copy from the orchestrator's node, so the parameter "
+            "exists here from the next execution on."
+        ),
+    ),
+    "graph-access-while-loading": StrictModeRule(
+        rule_id="graph-access-while-loading",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node sent a request that reads or changes connections, its "
+            "flow, or another node while it was being created or having "
+            "its saved state applied: in before_value_set or "
+            "set_parameter_value with initial_setup, or as its creation "
+            "set its state. The graph around a "
+            "loading node is incomplete -- a workflow load makes "
+            "connections before values, a paste after them, and a "
+            "worker's copy of the node has no connections or other nodes "
+            "at all -- so the answer depends on how the node was loaded."
+        ),
+        remediation_template=(
+            "Node '{node_name}' sent {request_type} while it was loading. "
+            "While initial_setup is set, change the node itself (its "
+            "parameters, types and visibility) and leave connections and "
+            "other nodes alone: the loader makes the connections. Do the "
+            "graph work when the value is edited instead."
+        ),
+    ),
+    "state-read-bypassing-requests": StrictModeRule(
+        rule_id="state-read-bypassing-requests",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node read engine state through a manager while it ran, "
+            "instead of asking with a request. In a worker the manager "
+            "holds that process's own copy of the state, not the "
+            "orchestrator's, so the answer would be wrong; a request is "
+            "answered by whichever process owns the state."
+        ),
+        remediation_template=(
+            "Node '{node_name}' used {manager_name} while it ran. Use "
+            "GriptapeNodes.handle_request({request_hint}) instead, which "
+            "gives the same answer in-process and in a worker."
+        ),
+    ),
+    "state-outside-parameters": StrictModeRule(
+        rule_id="state-outside-parameters",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node's after_value_set or connection hook set an attribute "
+            "on the node. after_value_set doesn't run when a node loads, "
+            "so a reopened workflow never has that attribute, and neither "
+            "hook runs for the copy a worker builds to run the node, which "
+            "has no connections: anything that reads the attribute "
+            "behaves differently there."
+        ),
+        remediation_template=(
+            "Node '{node_name}' set attribute(s) {attribute_names} in "
+            "{hook_name}. Keep that state in a parameter (hidden if it "
+            "isn't for the user), or derive it from the node's values "
+            "where it is needed."
         ),
     ),
 }

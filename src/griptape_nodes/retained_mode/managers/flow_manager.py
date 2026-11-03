@@ -1,23 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import copy
-import json
+import contextlib
 import logging
-from dataclasses import dataclass, field, replace
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
-from io import BytesIO
-from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 from uuid import uuid4
-
-import httpx2
-from PIL import Image
 
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
-from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterContainer,
@@ -30,15 +25,11 @@ from griptape_nodes.exe_types.node_groups import BaseNodeGroup, SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import (
     BaseNode,
     ErrorProxyNode,
-    NodeDependencies,
     NodeResolutionState,
     StartNode,
-    VariableReference,
 )
 from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories, NodeState
-from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
@@ -52,16 +43,18 @@ from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionRequest,
     DeleteConnectionResultFailure,
     DeleteConnectionResultSuccess,
-    IncomingConnection,
-    ListConnectionsForNodeRequest,
-    ListConnectionsForNodeResultSuccess,
-    OutgoingConnection,
     ReplacedConnection,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
+    CancelAllRunsRequest,
+    CancelAllRunsResultFailure,
+    CancelAllRunsResultSuccess,
     CancelFlowRequest,
     CancelFlowResultFailure,
     CancelFlowResultSuccess,
+    CancelRunRequest,
+    CancelRunResultFailure,
+    CancelRunResultSuccess,
     ContinueExecutionStepRequest,
     ContinueExecutionStepResultFailure,
     ContinueExecutionStepResultSuccess,
@@ -73,6 +66,11 @@ from griptape_nodes.retained_mode.events.execution_events import (
     GetIsFlowRunningResultFailure,
     GetIsFlowRunningResultSuccess,
     InvolvedNodesEvent,
+    ListRunsRequest,
+    ListRunsResultSuccess,
+    RunIdMixin,
+    RunInfo,
+    RunQueuedEvent,
     SingleExecutionStepRequest,
     SingleExecutionStepResultFailure,
     SingleExecutionStepResultSuccess,
@@ -93,7 +91,6 @@ from griptape_nodes.retained_mode.events.execution_events import (
     UnresolveFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
-    PACKAGED_FLOW_BOUNDARY_KEY,
     TRANSIENT_KEY,
     AutoLayoutFlowRequest,
     AutoLayoutFlowResultFailure,
@@ -104,12 +101,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
     DeleteFlowResultFailure,
     DeleteFlowResultSuccess,
-    DeserializeFlowFromCommandsRequest,
-    DeserializeFlowFromCommandsResultFailure,
-    DeserializeFlowFromCommandsResultSuccess,
-    ExtractFlowCommandsFromImageMetadataRequest,
-    ExtractFlowCommandsFromImageMetadataResultFailure,
-    ExtractFlowCommandsFromImageMetadataResultSuccess,
     GetFlowDetailsRequest,
     GetFlowDetailsResultFailure,
     GetFlowDetailsResultSuccess,
@@ -118,7 +109,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetFlowMetadataResultSuccess,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
-    ImportWorkflowAsReferencedSubFlowRequest,
     ListFlowsInCurrentContextRequest,
     ListFlowsInCurrentContextResultFailure,
     ListFlowsInCurrentContextResultSuccess,
@@ -129,36 +119,17 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListNodesInFlowResultFailure,
     ListNodesInFlowResultSuccess,
     NodePosition,
-    OriginalNodeParameter,
-    PackageNodesAsSerializedFlowRequest,
-    PackageNodesAsSerializedFlowResultFailure,
-    PackageNodesAsSerializedFlowResultSuccess,
-    SanitizedParameterName,
-    SerializedConnectionKey,
-    SerializedFlowCommands,
-    SerializeFlowToCommandsRequest,
-    SerializeFlowToCommandsResultFailure,
-    SerializeFlowToCommandsResultSuccess,
     SetFlowMetadataRequest,
     SetFlowMetadataResultFailure,
     SetFlowMetadataResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
-    CreateNodeRequest,
     DeleteNodeRequest,
     DeleteNodeResultFailure,
-    DeserializeNodeFromCommandsRequest,
-    DeserializeNodeFromCommandsResultSuccess,
-    SerializedNodeCommands,
-    SerializedParameterValueTracker,
-    SerializeNodeToCommandsRequest,
-    SerializeNodeToCommandsResultSuccess,
     SetNodeMetadataRequest,
     SetNodeMetadataResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
-    AddParameterToNodeRequest,
-    AlterParameterDetailsRequest,
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.validation_events import (
@@ -166,36 +137,79 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateFlowDependenciesResultFailure,
     ValidateFlowDependenciesResultSuccess,
 )
-from griptape_nodes.retained_mode.events.variable_events import (
-    CreateVariableRequest,
-    GetVariableRequest,
-    GetVariableResultSuccess,
-    ListVariablesRequest,
-    ListVariablesResultSuccess,
-)
-from griptape_nodes.retained_mode.events.workflow_events import (
-    ImportWorkflowAsReferencedSubFlowResultSuccess,
-)
-from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.retained_mode.managers.event_manager import current_request_id
+from griptape_nodes.retained_mode.managers.flow.packaging import FlowPackaging
+from griptape_nodes.retained_mode.managers.flow.serialization import FlowSerialization
+from griptape_nodes.retained_mode.managers.flow.summary import FlowSummarizer
+from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec, RunState
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
-from griptape_nodes.retained_mode.managers.workflow.shape import (
-    build_workflow_shape_from_parameter_info,
-    extract_parameter_shape_info,
-)
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.variable_types import VariableScope
-from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands
-from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_legacy_image_flow_commands
-from griptape_nodes.serialization.values import Unencodable, decode_value, encodable_default, try_encode, value_key
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeNodes
-    from griptape_nodes.retained_mode.variable_types import FlowVariable
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 
 logger = logging.getLogger("griptape_nodes")
+
+# The run the code executing now belongs to. Tasks copy it when they are created, so every node a
+# run executes sees it, and a request a node makes can tell it comes from inside the run.
+_current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=None)
+
+_CANCELLED_BEFORE_STARTING = "The run did not start: it was cancelled."
+
+
+def current_run_id() -> str | None:
+    """The run the code executing now belongs to, or None outside any run."""
+    return _current_run_id.get()
+
+
+@dataclass(frozen=True)
+class StartFlowSpec(RunSpec):
+    """A run of a whole flow, from a `StartFlowRequest`."""
+
+    request: StartFlowRequest
+    flow_name: str
+
+    async def execute(self, engine: Engine) -> ResultPayload:
+        try:
+            flow = engine.flow_manager.get_flow_by_name(self.flow_name)
+        except KeyError as err:
+            return StartFlowResultFailure(
+                validation_exceptions=[err], result_details=f"Cannot start flow. Error: {err}"
+            )
+        return await engine.flow_manager.execute_start_flow(self.request, self.flow_name, flow)
+
+    def failure(self, details: str) -> ResultPayload:
+        return StartFlowResultFailure(validation_exceptions=[], result_details=details)
+
+
+@dataclass(frozen=True)
+class StartFlowFromNodeSpec(RunSpec):
+    """A run of a flow from one of its nodes, from a `StartFlowFromNodeRequest`."""
+
+    request: StartFlowFromNodeRequest
+    flow_name: str
+    node_name: str
+
+    async def execute(self, engine: Engine) -> ResultPayload:
+        start_node = engine.object_manager.attempt_get_object_by_name_as_type(self.node_name, BaseNode)
+        if not start_node:
+            return self.failure(f"Provided node with name {self.node_name} does not exist")
+        try:
+            flow = engine.flow_manager.get_flow_by_name(self.flow_name)
+        except KeyError as err:
+            return StartFlowFromNodeResultFailure(
+                validation_exceptions=[err], result_details=f"Cannot start flow. Error: {err}"
+            )
+        return await engine.flow_manager.execute_start_flow_from_node(self.request, self.flow_name, flow, start_node)
+
+    def failure(self, details: str) -> ResultPayload:
+        return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=details)
 
 
 class DagExecutionType(StrEnum):
@@ -211,132 +225,57 @@ class QueueItem(NamedTuple):
     dag_execution_type: DagExecutionType
 
 
-class ConnectionAnalysis(NamedTuple):
-    """Analysis of connections separated by type (data vs control) when packaging nodes."""
-
-    incoming_data_connections: list[IncomingConnection]
-    incoming_control_connections: list[IncomingConnection]
-    outgoing_data_connections: list[OutgoingConnection]
-    outgoing_control_connections: list[OutgoingConnection]
-
-
-class PackageNodeInfo(NamedTuple):
-    """Information about the node being packaged."""
-
-    package_node: BaseNode
-    package_flow_name: str
-
-
-class StartNodeIncomingDataResult(NamedTuple):
-    """Result of processing incoming data connections for a start node."""
-
-    parameter_commands: list[AddParameterToNodeRequest]
-    data_connections: list[SerializedFlowCommands.IndirectConnectionSerialization]
-    input_shape_data: WorkflowShapeNodes
-    parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand]
-
-
-class PackagingStartNodeResult(NamedTuple):
-    """Result of creating start node commands and connections for flow packaging."""
-
-    start_node_commands: SerializedNodeCommands
-    start_to_package_connections: list[SerializedFlowCommands.IndirectConnectionSerialization]
-    input_shape_data: WorkflowShapeNodes
-    start_node_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand]
-    parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter]
-    start_node_name: str
-
-
-class PackagingEndNodeResult(NamedTuple):
-    """Result of creating end node commands and data connections for flow packaging."""
-
-    end_node_commands: SerializedNodeCommands
-    package_to_end_connections: list[SerializedFlowCommands.IndirectConnectionSerialization]
-    output_shape_data: WorkflowShapeNodes
-
-
-class MultiNodeEndNodeResult(NamedTuple):
-    """Result of creating end node commands and parameter mappings for multi-node packaging."""
-
-    packaging_result: PackagingEndNodeResult
-    parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter]
-    alter_parameter_commands: list[AlterParameterDetailsRequest]
-    end_node_name: str
-
-
-class ImageFlowCommandsError(Exception):
-    """An image's metadata holds flow commands this engine cannot read.
-
-    The message completes "Failed because ...".
-    """
-
-
-class FlowDeserializationError(Exception):
-    """A saved Flow could not be rebuilt.
-
-    Rebuilding a Flow runs in three passes — nodes, then connections, then values — each of which
-    recurses through every subflow. Any of them can fail deep in the recursion, and all of them fail
-    the whole load. Raising this specific type lets on_deserialize_flow_from_commands catch exactly
-    the failures its own passes report, rather than every RuntimeError from the request handlers
-    those passes call into. The message is user-facing: it is appended to "Attempted to deserialize
-    a Flow 'X'. ", so phrase it as a sentence completing that thought.
-    """
-
-
-@dataclass
-class DeserializedFlowNodes:
-    """Nodes rebuilt from one Flow and everything below it, keyed the two ways callers need.
-
-    Connections are serialized against a Flow's whole subtree, not just its own level, so the
-    connection pass has to resolve UUIDs belonging to nodes that were rebuilt inside a subflow.
-    Collecting the whole subtree first is what lets a single pass wire them all up.
-
-    Flow names are collected for the same reason node names are: a group records the name of its
-    subflow, and both names are deduped on the way back in, so a group rebuilt into a session that
-    already holds one of the same name has to be pointed at the subflow this load actually created.
-    """
-
-    node_uuid_to_node_name: dict[SerializedNodeCommands.NodeUUID, str] = field(default_factory=dict)
-    original_name_to_node_name: dict[str, str] = field(default_factory=dict)
-    original_flow_name_to_flow_name: dict[str, str] = field(default_factory=dict)
-
-    def merge(self, other: DeserializedFlowNodes) -> None:
-        """Fold a subflow's rebuilt nodes into this one.
-
-        Args:
-            other: The nodes rebuilt from a subflow of this Flow
-        """
-        self.node_uuid_to_node_name.update(other.node_uuid_to_node_name)
-        self.original_name_to_node_name.update(other.original_name_to_node_name)
-        self.original_flow_name_to_flow_name.update(other.original_flow_name_to_flow_name)
-
-
 class FlowManager(EngineScoped):
-    _name_to_parent_name: dict[str, str | None]
-    _flow_to_referenced_workflow_name: dict[ControlFlow, str]
-    _connections: Connections
-
-    # Global execution state (moved from individual ControlFlows)
-    _global_flow_queue: Queue[QueueItem]
-    _global_control_flow_machine: ControlFlowMachine | None
-    _global_single_node_resolution: bool
-    _global_dag_builder: DagBuilder
     _node_executor: NodeExecutor
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-        self._name_to_parent_name = {}
-        self._flow_to_referenced_workflow_name = {}
-        self._connections = Connections()
-
-        # Initialize global execution state
-        self._global_flow_queue = Queue[QueueItem]()
-        self._global_control_flow_machine = None  # Track the current control flow machine
-        self._global_single_node_resolution = False
-        self._global_dag_builder = DagBuilder(self.engine)
+        # The flow hierarchy, connections and run state belong to the open workflow and live on its runtime.
+        # The properties below need a current workflow and raise without one. Lookups that can run with
+        # no workflow open use `_current_flows_or_none()`, and a run uses the flows it captured at its start.
         self._node_executor = NodeExecutor(self.engine)
+
+        self.packaging = FlowPackaging(event_manager, engine=engine)
+        self.serialization = FlowSerialization(event_manager, engine=engine)
+        self.summarizer = FlowSummarizer(event_manager, engine=engine)
+
+    @property
+    def _name_to_parent_name(self) -> dict[str, str | None]:
+        return self._current_flows().name_to_parent_name
+
+    @property
+    def _flow_to_referenced_workflow_name(self) -> dict[ControlFlow, str]:
+        return self._current_flows().flow_to_referenced_workflow_name
+
+    @property
+    def _connections(self) -> Connections:
+        return self._current_flows().connections
+
+    @property
+    def _global_flow_queue(self) -> Queue[QueueItem]:
+        return self._current_flows().global_flow_queue
+
+    @property
+    def _global_control_flow_machine(self) -> ControlFlowMachine | None:
+        return self._current_flows().global_control_flow_machine
+
+    @_global_control_flow_machine.setter
+    def _global_control_flow_machine(self, machine: ControlFlowMachine | None) -> None:
+        self._current_flows().global_control_flow_machine = machine
+
+    @property
+    def _global_single_node_resolution(self) -> bool:
+        return self._current_flows().global_single_node_resolution
+
+    @_global_single_node_resolution.setter
+    def _global_single_node_resolution(self, value: bool) -> None:
+        self._current_flows().global_single_node_resolution = value
+
+    @property
+    def _global_dag_builder(self) -> DagBuilder:
+        return self._current_flows().global_dag_builder
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -357,6 +296,21 @@ class FlowManager(EngineScoped):
     def get_connections(self) -> Connections:
         """Get the connections instance."""
         return self._connections
+
+    def _current_flows(self) -> WorkflowFlows:
+        """The current workflow's flows, for changes and runs, which need a workflow to hold them.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        return self.engine.current_workflow().flows
+
+    def _current_flows_or_none(self) -> WorkflowFlows | None:
+        """The current workflow's flows, or None for lookups that find nothing without a workflow."""
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return None
+        return workflow.flows
 
     def _cleanup_flow_on_failed_deserialization(self, flow_name: str, *, pushed_flow_context: bool) -> None:
         """Clean up a flow that failed during deserialization.
@@ -390,7 +344,9 @@ class FlowManager(EngineScoped):
         """Check if a connection exists."""
         connected_outputs = self.get_connected_output_parameters(source_node, source_parameter)
         for connected_node, connected_param in connected_outputs:
-            if connected_node is target_node and connected_param is target_parameter:
+            # By name, as the connection indexes are: a node can replace a connected parameter with
+            # a same-named one, and the connection still holds the one it replaced.
+            if connected_node is target_node and connected_param.name == target_parameter.name:
                 return True
         return False
 
@@ -518,11 +474,13 @@ class FlowManager(EngineScoped):
 
     @handles(GetTopLevelFlowRequest)
     def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:  # noqa: ARG002 (the request has to be assigned to the method)
-        for flow_name, parent in self._name_to_parent_name.items():
-            if parent is None:
-                return GetTopLevelFlowResultSuccess(
-                    flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
-                )
+        flows = self._current_flows_or_none()
+        if flows is not None:
+            for flow_name, parent in flows.name_to_parent_name.items():
+                if parent is None:
+                    return GetTopLevelFlowResultSuccess(
+                        flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
+                    )
         msg = "Attempted to get top level flow, but no such flow exists"
         logger.debug(msg)
         return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
@@ -623,7 +581,10 @@ class FlowManager(EngineScoped):
 
     def does_canvas_exist(self) -> bool:
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""
-        return any([parent is None for parent in self._name_to_parent_name.values()])  # noqa: C419
+        flows = self._current_flows_or_none()
+        if flows is None:
+            return False
+        return any([parent is None for parent in flows.name_to_parent_name.values()])  # noqa: C419
 
     @handles(CreateFlowRequest)
     def on_create_flow_request(self, request: CreateFlowRequest) -> ResultPayload:
@@ -723,6 +684,10 @@ class FlowManager(EngineScoped):
             result = DeleteFlowResultFailure(result_details=details)
             return result
 
+        # Before the cancel below, which would start the next waiting run against the flow being deleted.
+        flows = self._current_flows()
+        self._turn_away(flows, flows.run_queue.runs_for_flow(flow.name), f"its flow '{flow.name}' was deleted.")
+
         # Only cancel if the flow being deleted is the one tracked by the global control flow machine.
         # Isolated subflows (e.g., ForEach loop iterations) have their own separate ControlFlowMachine
         # and should not trigger cancellation of the global machine.
@@ -784,12 +749,7 @@ class FlowManager(EngineScoped):
 
             # If we've made it this far, we have deleted all the children Flows and their nodes.
             # Remove the flow from our map.
-            obj_mgr.del_obj_by_name(flow.name)
-            del self._name_to_parent_name[flow.name]
-
-            # Clean up referenced workflow tracking
-            if flow in self._flow_to_referenced_workflow_name:
-                del self._flow_to_referenced_workflow_name[flow]
+            self.forget_empty_flow(flow)
 
             # Clean up ControlFlowMachine and DAG orchestrator only if this is the global flow.
             # Isolated subflows have their own machines and should not clear the global state.
@@ -799,10 +759,24 @@ class FlowManager(EngineScoped):
             ):
                 self._global_control_flow_machine = None
                 self._global_dag_builder.clear()
+                self._finish_run_if_over(flows)
 
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)
         return result
+
+    def forget_empty_flow(self, flow: ControlFlow) -> None:
+        """Drop an empty flow from the records.
+
+        The part of deleting a flow that a worker discarding its copy's flow shares. Not a delete:
+        ``DeleteFlowRequest`` deletes the flow's nodes as well, which releases what they cached.
+        """
+        self.engine.object_manager.del_obj_by_name(flow.name)
+        del self._name_to_parent_name[flow.name]
+
+        # Clean up referenced workflow tracking
+        if flow in self._flow_to_referenced_workflow_name:
+            del self._flow_to_referenced_workflow_name[flow]
 
     @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(self, request: GetIsFlowRunningRequest) -> ResultPayload:
@@ -870,11 +844,13 @@ class FlowManager(EngineScoped):
                 result = ListFlowsInFlowResultFailure(result_details=details)
                 return result
 
-        # Create a list of all child flow names that point DIRECTLY to us.
+        # Create a list of all child flow names that point DIRECTLY to us. With no workflow open there are none.
         ret_list = []
-        for flow_name, parent_name in self._name_to_parent_name.items():
-            if parent_name == request.parent_flow_name:
-                ret_list.append(flow_name)
+        flows = self._current_flows_or_none()
+        if flows is not None:
+            for flow_name, parent_name in flows.name_to_parent_name.items():
+                if parent_name == request.parent_flow_name:
+                    ret_list.append(flow_name)
 
         details = f"Successfully got the list of Flows that are direct children of Flow '{request.parent_flow_name}'."
 
@@ -1136,16 +1112,18 @@ class FlowManager(EngineScoped):
             return CreateConnectionResultFailure(result_details=details)
 
         # Let the source make any internal handling decisions now that the Connection has been made.
-        source_node.after_outgoing_connection(
-            source_parameter=source_param, target_node=target_node, target_parameter=target_param
-        )
+        with source_node._reporting_state_set_by("after_outgoing_connection"):
+            source_node.after_outgoing_connection(
+                source_parameter=source_param, target_node=target_node, target_parameter=target_param
+            )
 
         # And target.
-        target_node.after_incoming_connection(
-            source_node=source_node,
-            source_parameter=source_param,
-            target_parameter=target_param,
-        )
+        with target_node._reporting_state_set_by("after_incoming_connection"):
+            target_node.after_incoming_connection(
+                source_node=source_node,
+                source_parameter=source_param,
+                target_parameter=target_param,
+            )
 
         # Check if either node is in a NodeGroup and track connections
 
@@ -1324,14 +1302,26 @@ class FlowManager(EngineScoped):
 
         # Cross-flow connections are now supported via global connection storage
 
-        # Now validate the parameters.
+        # Now validate the parameters. A node can remove a connected parameter without a request, which
+        # leaves the connection holding the only reference to it; that connection must still be deletable,
+        # or neither node nor their flow can be deleted.
+        stored_connection = self._connections.find_connection(
+            source_node=source_node_name,
+            source_parameter=request.source_parameter_name,
+            target_node=target_node_name,
+            target_parameter=request.target_parameter_name,
+        )
         source_param = source_node.get_parameter_by_name(request.source_parameter_name)
+        if source_param is None and stored_connection is not None:
+            source_param = stored_connection.source_parameter
         if source_param is None:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" Not found.'
 
             return DeleteConnectionResultFailure(result_details=details)
 
         target_param = target_node.get_parameter_by_name(request.target_parameter_name)
+        if target_param is None and stored_connection is not None:
+            target_param = stored_connection.target_parameter
         if target_param is None:
             details = f'Connection not deleted "{target_node_name}.{request.target_parameter_name}" Not found.'
 
@@ -1347,22 +1337,6 @@ class FlowManager(EngineScoped):
             details = f'Connection does not exist: "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}"'
 
             return DeleteConnectionResultFailure(result_details=details)
-
-        # Check if either node is in a NodeGroup and untrack connections BEFORE removing connection
-
-        # Find the connection before it's deleted
-        if (
-            source_node.name in self._connections.outgoing_index
-            and source_param.name in self._connections.outgoing_index[source_node.name]
-        ):
-            connection_ids = self._connections.outgoing_index[source_node.name][source_param.name]
-            for candidate_id in connection_ids:
-                candidate = self._connections.connections[candidate_id]
-                if (
-                    candidate.target_node.name == target_node.name
-                    and candidate.target_parameter.name == target_param.name
-                ):
-                    break
 
         # Remove the connection.
         if not self._connections.remove_connection(
@@ -1414,16 +1388,18 @@ class FlowManager(EngineScoped):
                 except KeyError as e:
                     logger.warning(e)
         # Let the source make any internal handling decisions now that the Connection has been REMOVED.
-        source_node.after_outgoing_connection_removed(
-            source_parameter=source_param, target_node=target_node, target_parameter=target_param
-        )
+        with source_node._reporting_state_set_by("after_outgoing_connection_removed"):
+            source_node.after_outgoing_connection_removed(
+                source_parameter=source_param, target_node=target_node, target_parameter=target_param
+            )
 
         # And target.
-        target_node.after_incoming_connection_removed(
-            source_node=source_node,
-            source_parameter=source_param,
-            target_parameter=target_param,
-        )
+        with target_node._reporting_state_set_by("after_incoming_connection_removed"):
+            target_node.after_incoming_connection_removed(
+                source_node=source_node,
+                source_parameter=source_param,
+                target_parameter=target_param,
+            )
 
         details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" deleted.'
 
@@ -1455,1327 +1431,8 @@ class FlowManager(EngineScoped):
         dag_node = self._global_dag_builder.node_to_reference.get(node.name)
         return dag_node is not None and dag_node.node_state is NodeState.PROCESSING
 
-    @handles(PackageNodesAsSerializedFlowRequest)
-    def on_package_nodes_as_serialized_flow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
-        self, request: PackageNodesAsSerializedFlowRequest
-    ) -> ResultPayload:
-        """Handle request to package multiple nodes as a serialized flow.
-
-        Creates a self-contained flow with Start → [Selected Nodes] → End structure,
-        where artificial start/end nodes interface with external connections only.
-        """
-        # Step 0: Apply defaults for None values
-        if request.start_node_type is None:
-            request.start_node_type = "StartFlow"
-        if request.end_node_type is None:
-            request.end_node_type = "EndFlow"
-
-        # Step 1: Reject empty node list
-        if not request.node_names:
-            return PackageNodesAsSerializedFlowResultFailure(
-                result_details="Attempted to package nodes as serialized flow. Failed because no nodes were specified in the node_names list."
-            )
-
-        # Step 2: Validate library and get version
-        library_version = self._validate_and_get_multi_node_library_info(request=request)
-        if isinstance(library_version, PackageNodesAsSerializedFlowResultFailure):
-            return library_version
-
-        # Step 3: Validate all nodes exist
-        validation_result = self._validate_multi_node_request(request)
-        if validation_result is not None:
-            return validation_result
-
-        # Get the actual node objects for processing
-        nodes_to_package = []
-        for node_name in request.node_names:
-            node = self.engine.node_manager.get_node_by_name(node_name)
-            nodes_to_package.append(node)
-
-        # Step 4: Initialize tracking variables and mappings (moved up so package node serialization can use them)
-        unique_parameter_uuid_to_values = {}
-        serialized_parameter_value_tracker = SerializedParameterValueTracker()
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID] = {}
-        packaged_nodes_set_parameter_value_commands: dict[
-            SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
-        ] = {}
-        packaged_nodes_internal_connections: list[SerializedFlowCommands.IndirectConnectionSerialization] = []
-
-        # Step 5: Serialize nodes with local execution environment to prevent recursive loops
-        serialized_package_nodes = self._serialize_package_nodes_for_local_execution(
-            nodes_to_package=nodes_to_package,
-            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-            node_name_to_uuid=node_name_to_uuid,
-            set_parameter_value_commands=packaged_nodes_set_parameter_value_commands,
-            internal_connections=packaged_nodes_internal_connections,
-        )
-        if isinstance(serialized_package_nodes, PackageNodesAsSerializedFlowResultFailure):
-            return serialized_package_nodes
-
-        # Step 6: Inject OUTPUT mode changes for PROPERTY-only parameters to enable value reconciliation after the
-        # packaged workflow is run.
-        # Example: Nodes A -> B -> C. If B has property-only parameters, those values may change during execution,
-        # so we need to send the value back after the packaged flow has run. We do this by making connections from
-        # B's property-only parameters to the End Node, ensuring they're reflected when the packaged flow returns.
-        # Since connections require an OUTPUT parameter mode, we inject that here.
-        self._inject_output_mode_for_property_parameters(nodes_to_package, serialized_package_nodes)
-
-        # Step 7: Analyze external connections (connections from/to nodes outside our selection)
-        node_connections_dict = self._analyze_multi_node_external_connections(package_nodes=nodes_to_package)
-        if isinstance(node_connections_dict, PackageNodesAsSerializedFlowResultFailure):
-            return node_connections_dict
-
-        # Step 8: Retrieve SubflowNodeGroup if node_group_name was provided
-        node_group_node: SubflowNodeGroup | None = None
-        if request.node_group_name:
-            try:
-                node = self.engine.node_manager.get_node_by_name(request.node_group_name)
-                if isinstance(node, SubflowNodeGroup):
-                    node_group_node = node
-            except Exception as e:
-                logger.debug("Failed to retrieve SubflowNodeGroup '%s': %s", request.node_group_name, e)
-
-        # Step 9: Create start node with parameters for external incoming connections
-        start_node_result = self._create_multi_node_start_node_with_connections(
-            request=request,
-            library_version=library_version,
-            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-            node_name_to_uuid=node_name_to_uuid,
-            external_connections_dict=node_connections_dict,
-            node_group_node=node_group_node,
-        )
-        if isinstance(start_node_result, PackageNodesAsSerializedFlowResultFailure):
-            return start_node_result
-
-        # Step 10: Create end node with parameters for external outgoing connections and parameter mappings
-        end_node_result = self._create_multi_node_end_node_with_connections(
-            request=request,
-            package_nodes=nodes_to_package,
-            node_name_to_uuid=node_name_to_uuid,
-            library_version=library_version,
-            node_connections_dict=node_connections_dict,
-        )
-        if isinstance(end_node_result, PackageNodesAsSerializedFlowResultFailure):
-            return end_node_result
-
-        end_node_packaging_result = end_node_result.packaging_result
-
-        # If no entry control node specified, connect start directly to end
-        if not request.entry_control_node_name and not request.entry_control_parameter_name:
-            start_to_end_control_connection = SerializedFlowCommands.IndirectConnectionSerialization(
-                source_node_uuid=start_node_result.start_node_commands.node_uuid,
-                source_parameter_name="exec_out",
-                target_node_uuid=end_node_packaging_result.end_node_commands.node_uuid,
-                target_parameter_name="exec_in",
-            )
-            start_node_result.start_to_package_connections.append(start_to_end_control_connection)
-
-        # Combine parameter mappings as a list: [Start node (index 0), End node (index 1)]
-        from griptape_nodes.retained_mode.events.flow_events import PackagedNodeParameterMapping
-
-        parameter_name_mappings = [
-            PackagedNodeParameterMapping(
-                node_name=start_node_result.start_node_name,
-                parameter_mappings=start_node_result.parameter_name_mappings,
-            ),
-            PackagedNodeParameterMapping(
-                node_name=end_node_result.end_node_name,
-                parameter_mappings=end_node_result.parameter_name_mappings,
-            ),
-        ]
-
-        # Step 11: Assemble final SerializedFlowCommands
-        # Collect all connections from start/end nodes and internal package connections
-        all_connections = self._collect_all_connections_for_multi_node_package(
-            start_node_result=start_node_result,
-            end_node_packaging_result=end_node_packaging_result,
-            packaged_nodes_internal_connections=packaged_nodes_internal_connections,
-        )
-
-        # Build WorkflowShape from collected parameter shape data
-        workflow_shape = build_workflow_shape_from_parameter_info(
-            input_node_params=start_node_result.input_shape_data,
-            output_node_params=end_node_packaging_result.output_shape_data,
-        )
-
-        # Create set parameter value commands dict
-        set_parameter_value_commands = {
-            start_node_result.start_node_commands.node_uuid: start_node_result.start_node_parameter_value_commands,
-            **packaged_nodes_set_parameter_value_commands,
-        }
-
-        # Collect all serialized nodes
-        all_serialized_nodes = [
-            start_node_result.start_node_commands,
-            *serialized_package_nodes,
-            end_node_packaging_result.end_node_commands,
-        ]
-
-        # Create comprehensive dependencies from all nodes
-        combined_dependencies = NodeDependencies()
-        for serialized_node in all_serialized_nodes:
-            combined_dependencies.aggregate_from(serialized_node.node_dependencies)
-
-        # Extract lock commands from serialized nodes (they're embedded in SerializedNodeCommands)
-        set_lock_commands_per_node = {}
-        for serialized_node in all_serialized_nodes:
-            if serialized_node.lock_node_command:
-                set_lock_commands_per_node[serialized_node.node_uuid] = serialized_node.lock_node_command
-
-        # Create a CreateFlowRequest for the packaged flow so that it can
-        # run as a standalone workflow.
-        # Flag it transient: the iterative executor deserializes this packaged body into one child
-        # flow per iteration, all parented to the running flow. They are recreated on every run and
-        # torn down after, so they must never be serialized into a saved workflow (otherwise a save
-        # bakes in a duplicate loop-body flow per iteration). The flow serializer skips transient
-        # child flows; CreateFlowRequest.metadata is applied directly to the created ControlFlow.
-        packaged_flow_metadata = {TRANSIENT_KEY: True}
-
-        create_packaged_flow_request = CreateFlowRequest(
-            parent_flow_name=None,  # Standalone flow
-            set_as_new_context=False,  # Let deserializer decide
-            metadata=packaged_flow_metadata,
-        )
-
-        # Aggregate node types used
-        combined_node_types_used = self._aggregate_node_types_used(
-            serialized_node_commands=all_serialized_nodes, sub_flows_commands=[]
-        )
-
-        # Build the complete serialized flow
-        final_serialized_flow = SerializedFlowCommands(
-            flow_initialization_command=create_packaged_flow_request,
-            serialized_node_commands=all_serialized_nodes,
-            serialized_connections=all_connections,
-            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-            set_parameter_value_commands=set_parameter_value_commands,
-            set_lock_commands_per_node=set_lock_commands_per_node,
-            sub_flows_commands=[],
-            node_dependencies=combined_dependencies,
-            node_types_used=combined_node_types_used,
-        )
-
-        return PackageNodesAsSerializedFlowResultSuccess(
-            serialized_flow_commands=final_serialized_flow,
-            workflow_shape=workflow_shape,
-            packaged_node_names=request.node_names,
-            parameter_name_mappings=parameter_name_mappings,
-            result_details=f"Successfully packaged {len(request.node_names)} nodes as serialized flow.",
-        )
-
-    def _validate_and_get_multi_node_library_info(
-        self, request: PackageNodesAsSerializedFlowRequest
-    ) -> str | PackageNodesAsSerializedFlowResultFailure:
-        """Validate start/end node types exist in library and return library version."""
-        # Early validation - ensure both start and end node types exist in the specified library
-        try:
-            start_end_library = LibraryRegistry.get_library_for_node_type(
-                node_type=request.start_node_type,  # type: ignore[arg-type]  # Guaranteed non-None by handler
-                specific_library_name=request.start_node_library_name,
-            )
-        except KeyError as err:
-            details = f"Attempted to package nodes with start node type '{request.start_node_type}' from library '{request.start_node_library_name}'. Failed because start node type was not found in library. Error: {err}."
-            return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-        try:
-            LibraryRegistry.get_library_for_node_type(
-                node_type=request.end_node_type,  # type: ignore[arg-type]  # Guaranteed non-None by handler
-                specific_library_name=request.end_node_library_name,
-            )
-        except KeyError as err:
-            details = f"Attempted to package nodes with end node type '{request.end_node_type}' from library '{request.end_node_library_name}'. Failed because end node type was not found in library. Error: {err}."
-            return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-        # Get the actual library version
-        start_end_library_metadata = start_end_library.get_metadata()
-        return start_end_library_metadata.library_version
-
-    def _validate_multi_node_request(
-        self, request: PackageNodesAsSerializedFlowRequest
-    ) -> PackageNodesAsSerializedFlowResultFailure | None:
-        """Validate that all requested nodes exist and control flow configuration is valid."""
-        # Validate all nodes exist
-        missing_nodes = []
-        for node_name in request.node_names:
-            try:
-                self.engine.node_manager.get_node_by_name(node_name)
-            except Exception:
-                missing_nodes.append(node_name)
-
-        if missing_nodes:
-            return PackageNodesAsSerializedFlowResultFailure(
-                result_details=f"Attempted to package nodes as serialized flow. Failed because the following nodes were not found: {', '.join(missing_nodes)}."
-            )
-
-        # Validate control flow configuration for non-empty node lists
-        if request.node_names and request.entry_control_parameter_name and not request.entry_control_node_name:
-            return PackageNodesAsSerializedFlowResultFailure(
-                result_details="Attempted to package nodes as serialized flow. Failed because entry_control_parameter_name was specified but entry_control_node_name was not. For multi-node packaging with a non-empty node list, both must be specified to avoid ambiguity about which node should receive the control connection."
-            )
-
-        # Validate entry_control_node_name exists and is in our package list
-        if request.entry_control_node_name and request.entry_control_node_name not in request.node_names:
-            return PackageNodesAsSerializedFlowResultFailure(
-                result_details=f"Attempted to package nodes as serialized flow. Failed because entry_control_node_name '{request.entry_control_node_name}' is not in the list of nodes to package: {request.node_names}."
-            )
-
-        return None
-
-    def _serialize_package_nodes_for_local_execution(  # noqa: C901, PLR0913, PLR0917
-        self,
-        nodes_to_package: list[BaseNode],
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-        serialized_parameter_value_tracker: SerializedParameterValueTracker,
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],  # OUTPUT: will be populated
-        set_parameter_value_commands: dict[  # OUTPUT: will be populated
-            SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
-        ],
-        internal_connections: list[SerializedFlowCommands.IndirectConnectionSerialization],  # OUTPUT: will be populated
-    ) -> list[SerializedNodeCommands] | PackageNodesAsSerializedFlowResultFailure:
-        """Serialize package nodes while temporarily setting execution environment to local to prevent recursive loops.
-
-        Args:
-            nodes_to_package: List of nodes to serialize
-            unique_parameter_uuid_to_values: Shared dictionary for deduplicating parameter values across all nodes
-            serialized_parameter_value_tracker: Tracker for serialized parameter values
-            node_name_to_uuid: OUTPUT - Dictionary mapping node names to UUIDs (populated by this method)
-            set_parameter_value_commands: OUTPUT - Dict mapping node UUIDs to parameter value commands (populated by this method)
-            internal_connections: OUTPUT - List of connections between package nodes (populated by this method)
-
-        Returns:
-            List of SerializedNodeCommands on success, or PackageNodesAsSerializedFlowResultFailure on failure
-        """
-        # Serialize each node using shared unique_parameter_uuid_to_values dictionary for deduplication
-        serialized_node_commands = []
-        serialized_node_group_commands = []  # SubflowNodeGroups must be added LAST
-
-        for node in nodes_to_package:
-            # Serialize this node using shared dictionaries for value deduplication
-            serialize_request = SerializeNodeToCommandsRequest(
-                node_name=node.name,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                include_existing_subflow_in_group=True,
-            )
-            serialize_result = self.engine.node_manager.on_serialize_node_to_commands(serialize_request)
-
-            if not isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
-                return PackageNodesAsSerializedFlowResultFailure(
-                    result_details=f"Attempted to package nodes as serialized flow. Failed to serialize node '{node.name}': {serialize_result.result_details}"
-                )
-
-            # Populate the shared node_name_to_uuid mapping
-            create_cmd = serialize_result.serialized_node_commands.create_node_command
-            # Get the node name from the CreateNodeRequest command.
-            node_name = create_cmd.node_name
-            if node_name is not None:
-                node_name_to_uuid[node_name] = serialize_result.serialized_node_commands.node_uuid
-
-            # BaseNodeGroups must be serialized LAST because they reference child node names via node_names_to_add
-            # If we deserialize a NodeGroup before its children, the child nodes won't exist yet
-            if isinstance(node, BaseNodeGroup):
-                serialized_node_group_commands.append(serialize_result.serialized_node_commands)
-            else:
-                serialized_node_commands.append(serialize_result.serialized_node_commands)
-
-            # Collect set parameter value commands (references to unique_parameter_uuid_to_values)
-            if serialize_result.set_parameter_value_commands:
-                set_parameter_value_commands[serialize_result.serialized_node_commands.node_uuid] = (
-                    serialize_result.set_parameter_value_commands
-                )
-
-        # Update BaseNodeGroup commands to use UUIDs instead of names in node_names_to_add
-        # This allows workflow generation to directly look up variable names from UUIDs
-
-        for node_group_command in serialized_node_group_commands:
-            create_cmd = node_group_command.create_node_command
-
-            if create_cmd.node_names_to_add:
-                node_uuids = []
-                for child_node_name in create_cmd.node_names_to_add:
-                    if child_node_name in node_name_to_uuid:
-                        uuid = node_name_to_uuid[child_node_name]
-                        node_uuids.append(uuid)
-                # Replace the list with UUIDs (as strings since that's what the field expects)
-                create_cmd.node_names_to_add = node_uuids
-
-        # Build internal connections between package nodes
-        package_node_names_set = {n.name for n in nodes_to_package}
-
-        # Get connections from the connection manager
-        connections_result = self._get_internal_connections_for_package(
-            nodes_to_package=nodes_to_package,
-            package_node_names_set=package_node_names_set,
-            node_name_to_uuid=node_name_to_uuid,
-        )
-
-        if isinstance(connections_result, PackageNodesAsSerializedFlowResultFailure):
-            return connections_result
-
-        internal_connections.extend(connections_result)
-        serialized_node_commands.extend(serialized_node_group_commands)
-        return serialized_node_commands
-
-    def _get_internal_connections_for_package(
-        self,
-        nodes_to_package: list[BaseNode],
-        package_node_names_set: set[str],
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
-    ) -> list[SerializedFlowCommands.IndirectConnectionSerialization] | PackageNodesAsSerializedFlowResultFailure:
-        """Get internal connections between package nodes.
-
-        Queries connections from the connection manager for all nodes being packaged.
-
-        Args:
-            nodes_to_package: List of nodes being packaged
-            package_node_names_set: Set of node names in the package for O(1) lookup
-            node_name_to_uuid: Mapping of node names to their UUIDs in the serialization
-
-        Returns:
-            List of serialized connections, or PackageNodesAsSerializedFlowResultFailure on error
-        """
-        internal_connections: list[SerializedFlowCommands.IndirectConnectionSerialization] = []
-        # Query connections from connection manager
-        for node in nodes_to_package:
-            list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
-            list_connections_result = self.engine.node_manager.on_list_connections_for_node_request(
-                list_connections_request
-            )
-
-            if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-                return PackageNodesAsSerializedFlowResultFailure(
-                    result_details=f"Attempted to package nodes as serialized flow. Failed to list connections for node '{node.name}': {list_connections_result.result_details}"
-                )
-
-            # Only include connections where BOTH source and target are in the package
-            for outgoing_conn in list_connections_result.outgoing_connections:
-                if outgoing_conn.target_node_name in package_node_names_set:
-                    source_uuid = node_name_to_uuid[node.name]
-                    target_uuid = node_name_to_uuid[outgoing_conn.target_node_name]
-                    internal_connections.append(
-                        SerializedFlowCommands.IndirectConnectionSerialization(
-                            source_node_uuid=source_uuid,
-                            source_parameter_name=outgoing_conn.source_parameter_name,
-                            target_node_uuid=target_uuid,
-                            target_parameter_name=outgoing_conn.target_parameter_name,
-                        )
-                    )
-
-        return internal_connections
-
-    def _inject_output_mode_for_property_parameters(
-        self, nodes_to_package: list[BaseNode], serialized_package_nodes: list[SerializedNodeCommands]
-    ) -> None:
-        """Inject OUTPUT mode for PROPERTY-only parameters to enable value reconciliation.
-
-        This method adds ALTER parameter commands to serialized nodes for parameters that have
-        PROPERTY mode but not OUTPUT mode. This allows the orchestrator/caller to reconcile
-        the packaged node's values after execution.
-
-        Args:
-            nodes_to_package: List of nodes being packaged
-            serialized_package_nodes: The serialized node commands to modify
-        """
-        # Apply ALTER parameter commands for PROPERTY-only parameters to enable OUTPUT mode
-        # We need these to emit their values back so that the orchestrator/caller
-        # can reconcile the packaged node's values after it is executed.
-        for package_node in nodes_to_package:
-            # Find the corresponding serialized node
-            serialized_node = None
-            for serialized_node_command in serialized_package_nodes:
-                # We need to get the create commoand.
-                create_cmd = serialized_node_command.create_node_command
-                # Get the node name from CreateNodeRequest
-                cmd_node_name = create_cmd.node_name
-                if cmd_node_name == package_node.name:
-                    serialized_node = serialized_node_command
-                    break
-
-            if serialized_node is None:
-                error_msg = f"Data integrity error: Could not find serialized node for package node '{package_node.name}'. This indicates a logic error in the serialization process."
-                raise RuntimeError(error_msg)
-
-            package_alter_parameter_commands = []
-            for package_param in package_node.parameters:
-                has_output_mode = ParameterMode.OUTPUT in package_param.allowed_modes
-                has_property_mode = ParameterMode.PROPERTY in package_param.allowed_modes
-                # If has PROPERTY but not OUTPUT, add ALTER command to enable OUTPUT
-                if has_property_mode and not has_output_mode:
-                    alter_param_request = AlterParameterDetailsRequest(
-                        parameter_name=package_param.name,
-                        node_name=package_node.name,
-                        mode_allowed_output=True,
-                    )
-                    package_alter_parameter_commands.append(alter_param_request)
-
-            # If we have alter parameter commands, append them to the existing element_modification_commands
-            if package_alter_parameter_commands:
-                serialized_node.element_modification_commands.extend(package_alter_parameter_commands)
-
-    def _analyze_multi_node_external_connections(
-        self, package_nodes: list[BaseNode]
-    ) -> dict[str, ConnectionAnalysis] | PackageNodesAsSerializedFlowResultFailure:
-        """Analyze external connections for each package node using filtered single-node analysis.
-
-        This method reuses the existing single-node connection analysis method but applies filtering
-        to only capture "external" connections - those that cross the package boundary.
-
-        External connections are:
-        - Incoming connections where the source node is NOT in the package
-        - Outgoing connections where the target node is NOT in the package
-
-        Internal connections (between nodes within the package) are filtered out by passing
-        the set of package node names to the single-node analysis method.
-
-        Args:
-            package_nodes: List of nodes being packaged together
-
-        Returns:
-            Dictionary mapping node_name -> ConnectionAnalysis, where each ConnectionAnalysis
-            contains only the external connections for that node, or failure result on error
-        """
-        package_node_names_set = {node.name for node in package_nodes}
-        node_connections = {}
-
-        for package_node in package_nodes:
-            # Perform a single node analysis, filtering out internal connections
-            connection_analysis = self._analyze_package_node_connections(
-                package_node=package_node,
-                node_name=package_node.name,
-                package_node_names=package_node_names_set,
-            )
-            if isinstance(connection_analysis, PackageNodesAsSerializedFlowResultFailure):
-                return PackageNodesAsSerializedFlowResultFailure(result_details=connection_analysis.result_details)
-
-            node_connections[package_node.name] = connection_analysis
-
-        return node_connections
-
-    def _analyze_package_node_connections(
-        self,
-        package_node: BaseNode,
-        node_name: str,
-        package_node_names: set[str] | None = None,
-    ) -> ConnectionAnalysis | PackageNodesAsSerializedFlowResultFailure:
-        """Analyze package node connections and separate control from data connections.
-
-        Args:
-            package_node: The node being analyzed
-            node_name: Name of the node
-            package_node_names: Set of node names in the package for filtering internal connections
-        """
-        # Get incoming and outgoing connections for this node
-        # Get connection details using the standard approach
-        list_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
-        list_connections_result = self.engine.node_manager.on_list_connections_for_node_request(
-            list_connections_request
-        )
-
-        if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-            details = f"Attempted to analyze connections for package node '{node_name}'. Failed because connection listing failed."
-            return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-        incoming_connections = list_connections_result.incoming_connections
-        outgoing_connections = list_connections_result.outgoing_connections
-
-        # Separate control connections from data connections based on package node's parameter types
-        incoming_data_connections = []
-        incoming_control_connections = []
-        for incoming_conn in incoming_connections:
-            # Filter out internal connections if package_node_names is provided
-            if package_node_names is not None and incoming_conn.source_node_name in package_node_names:
-                continue
-
-            # Get the package node's parameter to check if it's a control type
-            package_param = package_node.get_parameter_by_name(incoming_conn.target_parameter_name)
-            if package_param and ParameterTypeBuiltin.CONTROL_TYPE.value in package_param.input_types:
-                incoming_control_connections.append(incoming_conn)
-            else:
-                incoming_data_connections.append(incoming_conn)
-
-        outgoing_data_connections = []
-        outgoing_control_connections = []
-        for outgoing_conn in outgoing_connections:
-            # Filter out internal connections if package_node_names is provided
-            if package_node_names is not None and outgoing_conn.target_node_name in package_node_names:
-                continue
-
-            # Get the package node's parameter to check if it's a control type
-            package_param = package_node.get_parameter_by_name(outgoing_conn.source_parameter_name)
-            if package_param and ParameterTypeBuiltin.CONTROL_TYPE.value == package_param.output_type:
-                outgoing_control_connections.append(outgoing_conn)
-            else:
-                outgoing_data_connections.append(outgoing_conn)
-
-        return ConnectionAnalysis(
-            incoming_data_connections=incoming_data_connections,
-            incoming_control_connections=incoming_control_connections,
-            outgoing_data_connections=outgoing_data_connections,
-            outgoing_control_connections=outgoing_control_connections,
-        )
-
-    def _create_multi_node_end_node_with_connections(
-        self,
-        request: PackageNodesAsSerializedFlowRequest,
-        package_nodes: list[BaseNode],
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
-        library_version: str,
-        node_connections_dict: dict[str, ConnectionAnalysis],
-    ) -> MultiNodeEndNodeResult | PackageNodesAsSerializedFlowResultFailure:
-        """Create end node commands and connections for ALL package parameters that meet criteria (copied from single-node)."""
-        # Generate UUID and name for end node
-        end_node_uuid = SerializedNodeCommands.NodeUUID(str(uuid4()))
-        end_node_name = "End_Multi_Package"
-
-        # Build end node CreateNodeRequest
-        end_create_node_command = CreateNodeRequest(
-            node_type=request.end_node_type,  # type: ignore[arg-type]  # Guaranteed non-None by handler
-            specific_library_name=request.end_node_library_name,
-            node_name=end_node_name,
-            metadata={PACKAGED_FLOW_BOUNDARY_KEY: True},
-            initial_setup=True,
-            create_error_proxy_on_failure=False,
-        )
-
-        # Create library details
-        end_node_library_details = LibraryNameAndVersion(
-            library_name=request.end_node_library_name,
-            library_version=library_version,
-        )
-
-        # Initialize collections for building the end node
-        end_node_parameter_commands = []
-        package_to_end_connections = []
-        output_shape_data: WorkflowShapeNodes = {}
-        # Parameter name mappings (rosetta stone): maps mangled end node parameter names back to original (node_name, parameter_name)
-        # This is essential for callers to understand which end node outputs correspond to which original node parameters
-        parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter] = {}
-
-        # Handle external control connections first
-        self._create_end_node_control_connections(
-            request=request,
-            package_nodes=package_nodes,
-            node_connections_dict=node_connections_dict,
-            node_name_to_uuid=node_name_to_uuid,
-            end_node_uuid=end_node_uuid,
-            end_node_name=end_node_name,
-            end_node_parameter_commands=end_node_parameter_commands,
-            package_to_end_connections=package_to_end_connections,
-            parameter_name_mappings=parameter_name_mappings,
-            output_shape_data=output_shape_data,
-        )
-
-        # Process ALL parameters with OUTPUT or PROPERTY modes for comprehensive coverage
-        self._create_end_node_data_parameters_and_connections(
-            request=request,
-            package_nodes=package_nodes,
-            node_name_to_uuid=node_name_to_uuid,
-            end_node_uuid=end_node_uuid,
-            end_node_name=end_node_name,
-            end_node_parameter_commands=end_node_parameter_commands,
-            package_to_end_connections=package_to_end_connections,
-            parameter_name_mappings=parameter_name_mappings,
-            output_shape_data=output_shape_data,
-        )
-
-        # Build complete SerializedNodeCommands for end node
-        end_node_dependencies = NodeDependencies()
-        end_node_dependencies.libraries.add(end_node_library_details)
-
-        end_node_commands = SerializedNodeCommands(
-            create_node_command=end_create_node_command,
-            element_modification_commands=end_node_parameter_commands,
-            node_dependencies=end_node_dependencies,
-            node_uuid=end_node_uuid,
-        )
-
-        end_node_result = PackagingEndNodeResult(
-            end_node_commands=end_node_commands,
-            package_to_end_connections=package_to_end_connections,
-            output_shape_data=output_shape_data,
-        )
-
-        return MultiNodeEndNodeResult(
-            packaging_result=end_node_result,
-            parameter_name_mappings=parameter_name_mappings,
-            alter_parameter_commands=[],
-            end_node_name=end_node_name,
-        )
-
-    def _create_end_node_control_connections(  # noqa: PLR0913, PLR0917
-        self,
-        request: PackageNodesAsSerializedFlowRequest,
-        package_nodes: list[BaseNode],
-        node_connections_dict: dict[str, ConnectionAnalysis],  # Contains only EXTERNAL connections
-        node_name_to_uuid: dict[
-            str, SerializedNodeCommands.NodeUUID
-        ],  # Map node names to UUIDs for connection creation
-        end_node_uuid: SerializedNodeCommands.NodeUUID,
-        end_node_name: str,
-        end_node_parameter_commands: list[
-            AddParameterToNodeRequest
-        ],  # OUTPUT: Will populate with parameters to add to end node
-        package_to_end_connections: list[
-            SerializedFlowCommands.IndirectConnectionSerialization
-        ],  # OUTPUT: Will populate with connections to add
-        parameter_name_mappings: dict[
-            SanitizedParameterName, OriginalNodeParameter
-        ],  # OUTPUT: Will populate rosetta stone for parameter names so customer knows how to map mangled names back to original nodes.
-        output_shape_data: WorkflowShapeNodes,  # OUTPUT: Will populate with workflow shape data
-    ) -> None:
-        """Create control connections and parameters on end node for EXTERNAL control flow connections."""
-        for package_node in package_nodes:
-            node_connection_analysis = node_connections_dict.get(package_node.name)
-            if node_connection_analysis is None:
-                # This node has no external connections (neither incoming nor outgoing), skip it
-                continue
-
-            # Handle external outgoing control connections
-            for control_conn in node_connection_analysis.outgoing_control_connections:
-                # Get the source parameter for validation and processing
-                source_param = package_node.get_parameter_by_name(control_conn.source_parameter_name)
-                if source_param is None:
-                    msg = f"External control connection references parameter '{control_conn.source_parameter_name}' on node '{package_node.name}' which does not exist. This indicates a data consistency issue."
-                    raise ValueError(msg)
-
-                # Get the EndFlow node class for validation
-                end_library = LibraryRegistry.get_library_for_node_type(
-                    request.end_node_type,  # type: ignore[arg-type]  # Guaranteed non-None by handler
-                    request.end_node_library_name,
-                )
-                end_node_class = end_library.get_node_class(request.end_node_type)  # type: ignore[arg-type]
-
-                # Validate from package node's perspective (we know source param name, not target)
-                valid_connection = package_node.__class__.allow_outgoing_connection_by_class(
-                    end_node_class,
-                    source_param.name,  # source parameter name - we KNOW this
-                    None,  # target parameter name - we DON'T know this yet
-                )
-
-                # Only create the connection if validation passes
-                if not valid_connection:
-                    # Some nodes only allow connections to certain other nodes (for example ForEach Start and End Node). We shouldn't allow those connections to be serialized, because they'll fail on deserialization.
-                    logger.warning(
-                        "Skipping control connection from %s.%s to EndFlow - connection not allowed by node validation rules",
-                        package_node.name,
-                        source_param.name,
-                    )
-                    continue
-
-                # Use comprehensive helper to process this control parameter
-                self._process_parameter_for_end_node(
-                    request=request,
-                    parameter=source_param,
-                    node_name=package_node.name,
-                    node_uuid=node_name_to_uuid[package_node.name],
-                    end_node_name=end_node_name,
-                    end_node_uuid=end_node_uuid,
-                    tooltip=f"Control output {control_conn.source_parameter_name} from packaged node {package_node.name}",
-                    end_node_parameter_commands=end_node_parameter_commands,
-                    package_to_end_connections=package_to_end_connections,
-                    parameter_name_mappings=parameter_name_mappings,
-                    output_shape_data=output_shape_data,
-                )
-
-    def _create_end_node_data_parameters_and_connections(  # noqa: PLR0913, PLR0917
-        self,
-        request: PackageNodesAsSerializedFlowRequest,
-        package_nodes: list[BaseNode],
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
-        end_node_uuid: SerializedNodeCommands.NodeUUID,
-        end_node_name: str,
-        end_node_parameter_commands: list[
-            AddParameterToNodeRequest
-        ],  # OUTPUT: Will populate with parameters to add to end node
-        package_to_end_connections: list[
-            SerializedFlowCommands.IndirectConnectionSerialization
-        ],  # OUTPUT: Will populate with connections to add
-        parameter_name_mappings: dict[
-            SanitizedParameterName, OriginalNodeParameter
-        ],  # OUTPUT: Will populate rosetta stone for parameter names
-        output_shape_data: WorkflowShapeNodes,  # OUTPUT: Will populate with workflow shape data
-    ) -> None:
-        """Create data parameters and connections on end node for all OUTPUT/PROPERTY parameters from packaged nodes."""
-        for package_node in package_nodes:
-            package_node_uuid = node_name_to_uuid[package_node.name]
-
-            for package_param in package_node.parameters:
-                # Only process parameters with OUTPUT or PROPERTY mode
-                has_output_mode = ParameterMode.OUTPUT in package_param.allowed_modes
-                has_property_mode = ParameterMode.PROPERTY in package_param.allowed_modes
-
-                if not has_output_mode and not has_property_mode:
-                    continue
-
-                # Skip control parameters - those are handled by the control connections helper
-                if package_param.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
-                    continue
-
-                # Get the EndFlow node class for validation
-                try:
-                    end_library = LibraryRegistry.get_library_for_node_type(
-                        request.end_node_type,  # type: ignore[arg-type]  # Guaranteed non-None by handler
-                        request.end_node_library_name,
-                    )
-                    end_node_class = end_library.get_node_class(request.end_node_type)  # type: ignore[arg-type]
-
-                    # Validate from package node's perspective (we know source param name, not target)
-                    valid_connection = package_node.__class__.allow_outgoing_connection_by_class(
-                        end_node_class,
-                        package_param.name,  # source parameter name - we KNOW this
-                        None,  # target parameter name - we DON'T know this yet
-                    )
-                except KeyError as err:
-                    msg = f"Unable to find library for node type '{request.end_node_type}'"
-                    raise KeyError(msg) from err
-
-                # Use comprehensive helper to process this data parameter
-                if valid_connection:
-                    self._process_parameter_for_end_node(
-                        request=request,
-                        parameter=package_param,
-                        node_name=package_node.name,
-                        node_uuid=package_node_uuid,
-                        end_node_name=end_node_name,
-                        end_node_uuid=end_node_uuid,
-                        tooltip=f"Output parameter {package_param.name} from packaged node {package_node.name}",
-                        end_node_parameter_commands=end_node_parameter_commands,
-                        package_to_end_connections=package_to_end_connections,
-                        parameter_name_mappings=parameter_name_mappings,
-                        output_shape_data=output_shape_data,
-                    )
-
-    def _process_parameter_for_end_node(  # noqa: PLR0913, PLR0917
-        self,
-        request: PackageNodesAsSerializedFlowRequest,
-        parameter: Parameter,
-        node_name: str,
-        node_uuid: SerializedNodeCommands.NodeUUID,
-        end_node_name: str,
-        end_node_uuid: SerializedNodeCommands.NodeUUID,
-        tooltip: str,
-        end_node_parameter_commands: list[
-            AddParameterToNodeRequest
-        ],  # OUTPUT: Will populate with parameters to add to end node
-        package_to_end_connections: list[
-            SerializedFlowCommands.IndirectConnectionSerialization
-        ],  # OUTPUT: Will populate with connections to add
-        parameter_name_mappings: dict[
-            SanitizedParameterName, OriginalNodeParameter
-        ],  # OUTPUT: Will populate rosetta stone for parameter names
-        output_shape_data: WorkflowShapeNodes,  # OUTPUT: Will populate with workflow shape data
-    ) -> None:
-        """Process a single parameter for inclusion in the end node, handling all aspects of parameter creation and connection."""
-        # Create sanitized parameter name with collision avoidance
-        sanitized_param_name = self._generate_sanitized_parameter_name(
-            prefix=request.output_parameter_prefix,
-            node_name=node_name,
-            parameter_name=parameter.name,
-        )
-
-        # Build parameter name mapping for rosetta stone
-        parameter_name_mappings[sanitized_param_name] = OriginalNodeParameter(
-            node_name=node_name,
-            parameter_name=parameter.name,
-        )
-
-        # Extract parameter shape info for workflow shape (outputs to external consumers)
-        param_shape_info = extract_parameter_shape_info(parameter, include_control_params=True)
-        if param_shape_info is not None:
-            if end_node_name not in output_shape_data:
-                output_shape_data[end_node_name] = {}
-            output_shape_data[end_node_name][sanitized_param_name] = param_shape_info
-
-        # Create parameter command for end node
-        # Use flexible input types for data parameters to prevent type mismatch errors
-        # Control parameters must keep their exact types (cannot use "any")
-        is_control_param = parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value
-
-        add_param_request = AddParameterToNodeRequest(
-            node_name=end_node_name,
-            parameter_name=sanitized_param_name,
-            input_types=parameter.input_types if is_control_param else ["any"],  # Control: exact types; Data: any
-            output_type=parameter.output_type,  # Preserve original output type
-            default_value=None,
-            tooltip=tooltip,
-            initial_setup=True,
-        )
-        end_node_parameter_commands.append(add_param_request)
-
-        # Create connection from package node to end node
-        package_to_end_connection = SerializedFlowCommands.IndirectConnectionSerialization(
-            source_node_uuid=node_uuid,
-            source_parameter_name=parameter.name,
-            target_node_uuid=end_node_uuid,
-            target_parameter_name=sanitized_param_name,
-        )
-        package_to_end_connections.append(package_to_end_connection)
-
-    def _create_multi_node_start_node_with_connections(  # noqa: PLR0913, PLR0917
-        self,
-        request: PackageNodesAsSerializedFlowRequest,
-        library_version: str,
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-        serialized_parameter_value_tracker: SerializedParameterValueTracker,
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
-        external_connections_dict: dict[
-            str, ConnectionAnalysis
-        ],  # Contains EXTERNAL connections only - used to determine which parameters need start node inputs
-        node_group_node: SubflowNodeGroup | None = None,
-    ) -> PackagingStartNodeResult | PackageNodesAsSerializedFlowResultFailure:
-        """Create start node commands and connections for external incoming connections."""
-        # Generate UUID and name for start node
-        start_node_uuid = SerializedNodeCommands.NodeUUID(str(uuid4()))
-        start_node_name = "Start_Package_MultiNode"
-        # Parameter name mappings are essential to know which inputs are necessary on the start node given.
-        parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter] = {}
-
-        # Build start node CreateNodeRequest
-        start_create_node_command = CreateNodeRequest(
-            node_type=request.start_node_type,  # type: ignore[arg-type]  # Guaranteed non-None by handler
-            specific_library_name=request.start_node_library_name,
-            node_name=start_node_name,
-            metadata={PACKAGED_FLOW_BOUNDARY_KEY: True},
-            initial_setup=True,
-            create_error_proxy_on_failure=False,
-        )
-
-        # Create library details
-        start_node_library_details = LibraryNameAndVersion(
-            library_name=request.start_node_library_name,
-            library_version=library_version,
-        )
-
-        # Create parameter modification commands and connection mappings for the start node
-        start_node_parameter_commands = []
-        start_to_package_connections = []
-        start_node_parameter_value_commands = []
-        input_shape_data: WorkflowShapeNodes = {}
-
-        # Iterate through all EXTERNAL, INCOMING, DATA connections.
-        # We will then, for each connection:
-        #  1. Generate a mangled name
-        #  2. Add parameter with the mangled name for each connection source on the Start Node object
-        #  3. Extract the value from the source node and have it assigned to the Start Node so that it can be propagated
-        #  4. Create a connection from the Start Node to the package node
-        for target_node_name, connection_analysis in external_connections_dict.items():
-            result = self._create_start_node_parameters_and_connections_for_incoming_data(
-                target_node_name=target_node_name,
-                incoming_data_connections=connection_analysis.incoming_data_connections,
-                output_parameter_prefix=request.output_parameter_prefix,
-                start_node_name=start_node_name,
-                start_node_uuid=start_node_uuid,
-                start_create_node_command=start_create_node_command,
-                node_name_to_uuid=node_name_to_uuid,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                parameter_name_mappings=parameter_name_mappings,
-            )
-            if isinstance(result, PackageNodesAsSerializedFlowResultFailure):
-                return result
-
-            # Accumulate results from helper
-            start_node_parameter_commands.extend(result.parameter_commands)
-            start_to_package_connections.extend(result.data_connections)
-            start_node_parameter_value_commands.extend(result.parameter_value_commands)
-            # Merge input shape data
-            for node_name, params in result.input_shape_data.items():
-                if node_name not in input_shape_data:
-                    input_shape_data[node_name] = {}
-                input_shape_data[node_name].update(params)
-
-        # Create all control connections
-        control_connections = self._create_start_node_control_connections(
-            request=request,
-            start_node_uuid=start_node_uuid,
-            node_name_to_uuid=node_name_to_uuid,
-        )
-        if isinstance(control_connections, PackageNodesAsSerializedFlowResultFailure):
-            return control_connections
-
-        # Add control connections to the same list as data connections
-        start_to_package_connections.extend(control_connections)
-
-        # Set parameter values from SubflowNodeGroup if provided
-        if node_group_node is not None:
-            self._apply_node_group_parameters_to_start_node(
-                node_group_node=node_group_node,
-                start_node_library_name=request.start_node_library_name,
-                start_node_type=request.start_node_type,  # type: ignore[arg-type]  # Guaranteed non-None
-                start_node_parameter_value_commands=start_node_parameter_value_commands,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-            )
-
-        # Build complete SerializedNodeCommands for start node
-        start_node_dependencies = NodeDependencies()
-        start_node_dependencies.libraries.add(start_node_library_details)
-
-        start_node_commands = SerializedNodeCommands(
-            create_node_command=start_create_node_command,
-            element_modification_commands=start_node_parameter_commands,
-            node_dependencies=start_node_dependencies,
-            node_uuid=start_node_uuid,
-        )
-
-        return PackagingStartNodeResult(
-            start_node_commands=start_node_commands,
-            start_to_package_connections=start_to_package_connections,
-            input_shape_data=input_shape_data,
-            start_node_parameter_value_commands=start_node_parameter_value_commands,
-            parameter_name_mappings=parameter_name_mappings,
-            start_node_name=start_node_name,
-        )
-
-    def _apply_node_group_parameters_to_start_node(  # noqa: PLR0913, PLR0917
-        self,
-        node_group_node: SubflowNodeGroup,
-        start_node_library_name: str,
-        start_node_type: str,
-        start_node_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand],
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-        serialized_parameter_value_tracker: SerializedParameterValueTracker,
-    ) -> None:
-        """Apply parameter values from SubflowNodeGroup to the StartFlow node.
-
-        This method reads the execution environment metadata from the SubflowNodeGroup,
-        extracts parameter values for the specified StartFlow node type, and creates
-        set parameter value commands for those parameters.
-
-        Args:
-            node_group_node: The SubflowNodeGroup containing parameter values
-            start_node_library_name: Name of the library containing the StartFlow node
-            start_node_type: Type of the StartFlow node
-            start_node_parameter_value_commands: List to append parameter value commands to
-            unique_parameter_uuid_to_values: Dict to track unique parameter values
-            serialized_parameter_value_tracker: Tracker for serialized parameter values
-
-        Raises:
-            ValueError: If required metadata is missing from SubflowNodeGroup
-        """
-        # Get execution environment metadata from SubflowNodeGroup
-        if not node_group_node.metadata:
-            msg = f"SubflowNodeGroup '{node_group_node.name}' is missing metadata. Cannot apply parameters to StartFlow node."
-            raise ValueError(msg)
-
-        execution_env_metadata = node_group_node.metadata.get("execution_environment")
-        if not execution_env_metadata:
-            msg = f"SubflowNodeGroup '{node_group_node.name}' metadata is missing 'execution_environment'. Cannot apply parameters to StartFlow node."
-            raise ValueError(msg)
-
-        # Find the metadata for the current library
-        library_metadata = execution_env_metadata.get(start_node_library_name)
-        if library_metadata is None:
-            msg = f"SubflowNodeGroup '{node_group_node.name}' metadata does not contain library '{start_node_library_name}'. Available libraries: {list(execution_env_metadata.keys())}"
-            raise ValueError(msg)
-
-        # Verify this is the correct StartFlow node type
-        registered_start_flow_node = library_metadata.get("start_flow_node")
-        if registered_start_flow_node != start_node_type:
-            msg = f"SubflowNodeGroup '{node_group_node.name}' has mismatched StartFlow node type. Expected '{start_node_type}', but metadata has '{registered_start_flow_node}'"
-            raise ValueError(msg)
-
-        # Get the list of parameter names that belong to this StartFlow node
-        parameter_names = library_metadata.get("parameter_names", [])
-        if not parameter_names:
-            # This is not an error - it's valid for a StartFlow node to have no parameters
-            logger.debug(
-                "SubflowNodeGroup '%s' has no parameters registered for StartFlow node '%s'",
-                node_group_node.name,
-                start_node_type,
-            )
-            return
-
-        # For each parameter, get its value from the SubflowNodeGroup and create a set value command
-        class_name_prefix = start_node_type.lower()
-        for prefixed_param_name in parameter_names:
-            # Skip parameters that don't have the expected prefix for this StartFlow node.
-            # These are group-level settings that control the group's behavior
-            # but shouldn't be passed to the StartFlow node of each iteration.
-            if not prefixed_param_name.startswith(f"{class_name_prefix}_"):
-                logger.debug(
-                    "Skipping group-level parameter '%s' - not a StartFlow parameter (expected prefix '%s_')",
-                    prefixed_param_name,
-                    class_name_prefix,
-                )
-                continue
-
-            # Get the value from the SubflowNodeGroup parameter
-            param_value = node_group_node._get_raw_parameter_value(param_name=prefixed_param_name)
-
-            # Skip if no value is set
-            if param_value is None:
-                continue
-
-            # Strip the prefix to get the original parameter name for the StartFlow node
-            original_param_name = prefixed_param_name.removeprefix(f"{class_name_prefix}_")
-
-            encoded = try_encode(param_value)
-            if isinstance(encoded, Unencodable):
-                logger.warning(
-                    "Attempted to pass '%s' into the packaged flow. Failed because %s The flow runs without it.",
-                    prefixed_param_name,
-                    encoded.reason,
-                )
-                continue
-            value_id = id(param_value)
-            unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
-            unique_parameter_uuid_to_values[unique_param_uuid] = encoded
-            serialized_parameter_value_tracker.add_as_serializable(value_id, unique_param_uuid)
-
-            # Create set parameter value command
-            set_value_request = SetParameterValueRequest(
-                parameter_name=original_param_name,
-                value=None,  # Will be overridden when instantiated
-                is_output=False,
-                initial_setup=True,
-            )
-            indirect_set_value_command = SerializedNodeCommands.IndirectSetParameterValueCommand(
-                set_parameter_value_command=set_value_request,
-                unique_value_uuid=unique_param_uuid,
-            )
-            start_node_parameter_value_commands.append(indirect_set_value_command)
-
-    def _create_start_node_parameters_and_connections_for_incoming_data(  # noqa: PLR0913, PLR0917
-        self,
-        target_node_name: str,
-        incoming_data_connections: list[IncomingConnection],
-        output_parameter_prefix: str,
-        start_node_name: str,
-        start_node_uuid: SerializedNodeCommands.NodeUUID,
-        start_create_node_command: CreateNodeRequest,
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-        serialized_parameter_value_tracker: SerializedParameterValueTracker,
-        parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter],
-    ) -> StartNodeIncomingDataResult | PackageNodesAsSerializedFlowResultFailure:
-        """Create parameters and connections for incoming data connections to a specific target node."""
-        start_node_parameter_commands = []
-        start_to_package_connections = []
-        start_node_parameter_value_commands = []
-        input_shape_data: WorkflowShapeNodes = {}
-
-        for connection in incoming_data_connections:
-            target_parameter_name = connection.target_parameter_name
-
-            # Create sanitized parameter name with prefix + node + parameter
-            param_name = self._generate_sanitized_parameter_name(
-                prefix=output_parameter_prefix,
-                node_name=target_node_name,
-                parameter_name=target_parameter_name,
-            )
-
-            parameter_name_mappings[param_name] = OriginalNodeParameter(
-                node_name=target_node_name, parameter_name=target_parameter_name
-            )
-
-            # Get the source node to determine parameter type (from the external connection)
-            try:
-                source_node = self.engine.node_manager.get_node_by_name(connection.source_node_name)
-            except ValueError as err:
-                details = f"Attempted to package nodes as serialized flow. Failed because source node '{connection.source_node_name}' from incoming connection could not be found. Error: {err}."
-                return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-            # Get the source parameter
-            source_param = source_node.get_parameter_by_name(connection.source_parameter_name)
-            if not source_param:
-                details = f"Attempted to package nodes as serialized flow. Failed because source parameter '{connection.source_parameter_name}' on node '{connection.source_node_name}' from incoming connection could not be found."
-                return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-            # Extract parameter shape info for workflow shape (inputs from external sources)
-            param_shape_info = extract_parameter_shape_info(source_param, include_control_params=True)
-            if param_shape_info is not None:
-                if start_node_name not in input_shape_data:
-                    input_shape_data[start_node_name] = {}
-                input_shape_data[start_node_name][param_name] = param_shape_info
-
-            # Extract parameter value from source node to set on start node
-            param_value_commands = self.engine.node_manager.handle_parameter_value_saving(
-                parameter=source_param,
-                node=source_node,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                create_node_request=start_create_node_command,
-            )
-            if param_value_commands is not None:
-                # Modify each command to target the start node parameter instead
-                for param_value_command in param_value_commands:
-                    param_value_command.set_parameter_value_command.node_name = start_node_name
-                    param_value_command.set_parameter_value_command.parameter_name = param_name
-                    start_node_parameter_value_commands.append(param_value_command)
-
-            # Create parameter command for start node (following single-node pattern exactly)
-            # Use source parameter's default value to ensure type-safe propagation during connection creation
-            add_param_request = AddParameterToNodeRequest(
-                node_name=start_node_name,
-                parameter_name=param_name,
-                type=source_param.output_type,
-                default_value=encodable_default(source_param.default_value, source_node.name, source_param.name),
-                tooltip=f"Parameter {target_parameter_name} from node {target_node_name} in packaged flow",
-                initial_setup=True,
-            )
-            start_node_parameter_commands.append(add_param_request)
-
-            # Get target node UUID from mapping
-            target_node_uuid = node_name_to_uuid.get(target_node_name)
-            if target_node_uuid is None:
-                details = f"Attempted to package nodes as serialized flow. Failed because target node '{target_node_name}' UUID not found in mapping."
-                return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-            # Create connection from start node to target node
-            start_to_package_connections.append(
-                SerializedFlowCommands.IndirectConnectionSerialization(
-                    source_node_uuid=start_node_uuid,
-                    source_parameter_name=param_name,
-                    target_node_uuid=target_node_uuid,
-                    target_parameter_name=target_parameter_name,
-                )
-            )
-
-        return StartNodeIncomingDataResult(
-            parameter_commands=start_node_parameter_commands,
-            data_connections=start_to_package_connections,
-            input_shape_data=input_shape_data,
-            parameter_value_commands=start_node_parameter_value_commands,
-        )
-
-    def _create_start_node_control_connections(
-        self,
-        request: PackageNodesAsSerializedFlowRequest,
-        start_node_uuid: SerializedNodeCommands.NodeUUID,
-        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],
-    ) -> list[SerializedFlowCommands.IndirectConnectionSerialization] | PackageNodesAsSerializedFlowResultFailure:
-        """Create control connection from start node to entry control node.
-
-        Args:
-            request: The packaging request with control flow configuration
-            start_node_uuid: UUID of the start node
-            node_name_to_uuid: Mapping of node names to UUIDs for lookup
-
-        Returns:
-            List of control connections or failure result
-        """
-        control_connections = []
-
-        # Connect start node to specified entry control node (if specified)
-        if request.entry_control_node_name:
-            # Get the entry node (already validated to exist)
-            entry_node = self.engine.node_manager.get_node_by_name(request.entry_control_node_name)
-            entry_node_uuid = node_name_to_uuid[request.entry_control_node_name]
-
-            # Connect start node to specified entry control node
-            control_connection_result = self._create_start_node_control_connection(
-                entry_control_parameter_name=request.entry_control_parameter_name,
-                start_node_uuid=start_node_uuid,
-                package_node_uuid=entry_node_uuid,
-                package_node=entry_node,
-            )
-            if isinstance(control_connection_result, PackageNodesAsSerializedFlowResultFailure):
-                return PackageNodesAsSerializedFlowResultFailure(
-                    result_details=control_connection_result.result_details
-                )
-
-            control_connections.append(control_connection_result)
-
-        return control_connections
-
-    def _create_start_node_control_connection(
-        self,
-        entry_control_parameter_name: str | None,
-        start_node_uuid: SerializedNodeCommands.NodeUUID,
-        package_node_uuid: SerializedNodeCommands.NodeUUID,
-        package_node: BaseNode,
-    ) -> SerializedFlowCommands.IndirectConnectionSerialization | PackageNodesAsSerializedFlowResultFailure:
-        """Create control flow connection from start node to package node.
-
-        Connects the start node's first control output to the specified or first available package node control input.
-        """
-        if entry_control_parameter_name is not None:
-            # Case 1: Specific entry parameter name provided
-            package_control_input_name = entry_control_parameter_name
-        else:
-            # Case 2: Find the first available control input parameter
-            package_control_input_name = None
-            for param in package_node.parameters:
-                if ParameterTypeBuiltin.CONTROL_TYPE.value in param.input_types:
-                    package_control_input_name = param.name
-                    logger.warning(
-                        "No entry_control_parameter_name specified for packaging node '%s'. "
-                        "Using first available control input parameter: '%s'",
-                        package_node.name,
-                        package_control_input_name,
-                    )
-                    break
-
-            if package_control_input_name is None:
-                details = f"Attempted to package node '{package_node.name}'. Failed because no control input parameters found on the node, so cannot create control flow connection."
-                return PackageNodesAsSerializedFlowResultFailure(result_details=details)
-
-        # StartNode always has a control output parameter with name "exec_out"
-        source_control_parameter_name = "exec_out"
-
-        # Create the connection
-        control_connection = SerializedFlowCommands.IndirectConnectionSerialization(
-            source_node_uuid=start_node_uuid,
-            source_parameter_name=source_control_parameter_name,
-            target_node_uuid=package_node_uuid,
-            target_parameter_name=package_control_input_name,
-        )
-        return control_connection
-
-    def _collect_all_connections_for_multi_node_package(
-        self,
-        start_node_result: PackagingStartNodeResult,
-        end_node_packaging_result: PackagingEndNodeResult,
-        packaged_nodes_internal_connections: list[SerializedFlowCommands.IndirectConnectionSerialization],
-    ) -> list[SerializedFlowCommands.IndirectConnectionSerialization]:
-        """Collect all connections for the multi-node packaged flow.
-
-        Returns a list containing:
-        1. Start node connections (data + control)
-        2. End node connections (data)
-        3. Internal package node connections
-
-        Args:
-            start_node_result: Result containing start node and its connections
-            end_node_packaging_result: Result containing end node and its connections
-            packaged_nodes_internal_connections: Internal connections between package nodes
-
-        Returns:
-            List of all connections for the packaged flow
-        """
-        all_connections = []
-
-        # Add start and end node connections
-        all_connections.extend(start_node_result.start_to_package_connections)
-        all_connections.extend(end_node_packaging_result.package_to_end_connections)
-
-        # Add internal package node connections
-        all_connections.extend(packaged_nodes_internal_connections)
-
-        return all_connections
-
-    def _generate_sanitized_parameter_name(self, prefix: str, node_name: str, parameter_name: str) -> str:
-        """Generate a sanitized parameter name for multi-node packaging.
-
-        Creates a parameter name in the format: prefix + sanitized_node_name + _ + parameter_name
-        Node names are sanitized by replacing spaces and dots with underscores.
-
-        Args:
-            prefix: Prefix for the parameter name (e.g., "packaged_node_")
-            node_name: Original node name (may contain spaces, dots, etc.)
-            parameter_name: Original parameter name
-
-        Returns:
-            Sanitized parameter name safe for use (e.g., "packaged_node_Merge_Texts_merge_string")
-        """
-        sanitized_node_name = node_name.replace(" ", "_").replace(".", "_")
-        return f"{prefix}{sanitized_node_name}_{parameter_name}"
-
     @handles(StartFlowRequest)
-    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
+    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:
         # which flow
         flow_name = request.flow_name
         if not flow_name:
@@ -2790,12 +1447,11 @@ class FlowManager(EngineScoped):
                     "(e.g. via EnsureWorkflowAndFlowRequest or CreateFlowRequest) first."
                 )
                 return StartFlowResultFailure(validation_exceptions=[], result_details=details)
-        # get the flow by ID
-        try:
-            flow = self.get_flow_by_name(flow_name)
-        except KeyError as err:
-            details = f"Cannot start flow. Error: {err}"
-            return StartFlowResultFailure(validation_exceptions=[err], result_details=details)
+        return await self.start_run(StartFlowSpec(request=request, flow_name=flow_name))
+
+    async def execute_start_flow(  # noqa: C901, PLR0911, PLR0912
+        self, request: StartFlowRequest, flow_name: str, flow: ControlFlow
+    ) -> ResultPayload:
         # Check to see if the flow is already running.
         if self.check_for_existing_running_flow():
             details = "Cannot start flow. Flow is already running."
@@ -2840,6 +1496,8 @@ class FlowManager(EngineScoped):
             details = f"Couldn't start flow with name {flow_name}. Flow Validation Failed: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
+        # Read the run's outcome from its own workflow, even if another opened while it ran.
+        flows = self._current_flows()
         try:
             await self.start_flow(
                 flow,
@@ -2850,8 +1508,8 @@ class FlowManager(EngineScoped):
             details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
 
-        if self._global_control_flow_machine:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
+        if flows.global_control_flow_machine:
+            resolution_machine = flows.global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
                 result_details = f"Attempted to run flow '{flow_name}'. Failed due to: {error_message}"
@@ -2866,7 +1524,7 @@ class FlowManager(EngineScoped):
         return StartFlowResultSuccess(result_details=details)
 
     @handles(StartFlowFromNodeRequest)
-    async def on_start_flow_from_node_request(self, request: StartFlowFromNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
+    async def on_start_flow_from_node_request(self, request: StartFlowFromNodeRequest) -> ResultPayload:
         # Resolve the node first, falling back to the current-context node when node_name is
         # omitted. flow_name on this request is deprecated; when not supplied we derive it
         # from the node's parent flow so callers do not have to keep them in sync.
@@ -2889,12 +1547,13 @@ class FlowManager(EngineScoped):
             except KeyError as err:
                 details = f"Could not derive parent flow for node '{node_name}': {err}"
                 return StartFlowFromNodeResultFailure(validation_exceptions=[err], result_details=details)
-        # get the flow by ID
-        try:
-            flow = self.get_flow_by_name(flow_name)
-        except KeyError as err:
-            details = f"Cannot start flow. Error: {err}"
-            return StartFlowFromNodeResultFailure(validation_exceptions=[err], result_details=details)
+        return await self.start_run(
+            StartFlowFromNodeSpec(request=request, flow_name=flow_name, node_name=start_node.name)
+        )
+
+    async def execute_start_flow_from_node(  # noqa: PLR0911
+        self, request: StartFlowFromNodeRequest, flow_name: str, flow: ControlFlow, start_node: BaseNode
+    ) -> ResultPayload:
         # Check to see if the flow is already running.
         if self.check_for_existing_running_flow():
             details = "Cannot start flow. Flow is already running."
@@ -2918,6 +1577,8 @@ class FlowManager(EngineScoped):
             details = f"Couldn't start flow with name {flow_name}. Flow Validation Failed: {e}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
+        # Read the run's outcome from its own workflow, even if another opened while it ran.
+        flows = self._current_flows()
         try:
             await self.start_flow(
                 flow,
@@ -2928,8 +1589,8 @@ class FlowManager(EngineScoped):
             details = f"Attempted to run flow '{flow_name}'. Failed due to: {e}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
 
-        if self._global_control_flow_machine:
-            resolution_machine = self._global_control_flow_machine.resolution_machine
+        if flows.global_control_flow_machine:
+            resolution_machine = flows.global_control_flow_machine.resolution_machine
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
                 # Pass through the error message without adding extra wrapping
@@ -3109,6 +1770,7 @@ class FlowManager(EngineScoped):
 
         subflow_machine = ControlFlowMachine(
             flow.name,
+            dag_builder=DagBuilder(self._current_flows().connections),
             is_isolated=True,
             engine=self.engine,
         )
@@ -3173,8 +1835,12 @@ class FlowManager(EngineScoped):
             details = f"Could not cancel flow execution. Error: {err}"
 
             return CancelFlowResultFailure(result_details=details)
+        run = self._current_flows().run_in_progress
         try:
-            await self.cancel_flow_run()
+            if run is not None:
+                await self.cancel_run(run.run_id)
+            else:
+                await self.cancel_flow_run()
         except Exception as e:
             details = f"Could not cancel flow execution. Exception: {e}"
 
@@ -3182,6 +1848,55 @@ class FlowManager(EngineScoped):
         details = f"Successfully cancelled flow execution with name {flow_name}"
 
         return CancelFlowResultSuccess(result_details=details)
+
+    @handles(CancelRunRequest)
+    async def on_cancel_run_request(self, request: CancelRunRequest) -> ResultPayload:
+        cancelled = await self.cancel_run(request.run_id)
+        if not cancelled:
+            details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
+            return CancelRunResultFailure(result_details=details)
+        return CancelRunResultSuccess(result_details=f"Cancelled run '{request.run_id}'.")
+
+    @handles(CancelAllRunsRequest)
+    async def on_cancel_all_runs_request(self, _request: CancelAllRunsRequest) -> ResultPayload:
+        try:
+            await self.cancel_all_runs()
+        except Exception as e:
+            # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
+            details = f"Attempted to cancel every run. Failed because the run in progress could not be cancelled: {e}"
+            return CancelAllRunsResultFailure(result_details=details)
+        return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
+
+    @handles(ListRunsRequest)
+    def on_list_runs_request(self, _request: ListRunsRequest) -> ResultPayload:
+        runs: list[RunInfo] = []
+        flows = self._current_flows_or_none()
+        if flows is None:
+            return ListRunsResultSuccess(runs=runs, result_details="Listed 0 run(s).")
+        in_progress = flows.run_in_progress
+        if in_progress is not None:
+            # Waiting for another engine, which reported its place in that engine's line.
+            state = RunState.QUEUED if in_progress.position else in_progress.state
+            runs.append(
+                RunInfo(
+                    run_id=in_progress.run_id,
+                    flow_name=in_progress.flow_name,
+                    state=state,
+                    position=in_progress.position,
+                    request_id=in_progress.request_id,
+                )
+            )
+        for index, waiting in enumerate(flows.run_queue.snapshot()):
+            runs.append(
+                RunInfo(
+                    run_id=waiting.run_id,
+                    flow_name=waiting.flow_name,
+                    state=waiting.state,
+                    position=index + 1,
+                    request_id=waiting.request_id,
+                )
+            )
+        return ListRunsResultSuccess(runs=runs, result_details=f"Listed {len(runs)} run(s).")
 
     @handles(SingleNodeStepRequest)
     async def on_single_node_step_request(self, request: SingleNodeStepRequest) -> ResultPayload:
@@ -3198,7 +1913,8 @@ class FlowManager(EngineScoped):
             return SingleNodeStepResultFailure(validation_exceptions=[err], result_details=details)
         try:
             flow = self.get_flow_by_name(flow_name)
-            await self.single_node_step(flow)
+            with self._continuing_run_in_progress(self._current_flows()):
+                await self.single_node_step(flow)
         except Exception as e:
             details = f"Could not advance to the next step of a running workflow. Exception: {e}"
             return SingleNodeStepResultFailure(validation_exceptions=[], result_details=details)
@@ -3223,7 +1939,8 @@ class FlowManager(EngineScoped):
             return SingleExecutionStepResultFailure(result_details=details)
         change_debug_mode = request.request_id is not None
         try:
-            await self.single_execution_step(flow, change_debug_mode)
+            with self._continuing_run_in_progress(self._current_flows()):
+                await self.single_execution_step(flow, change_debug_mode)
         except Exception as e:
             # We REALLY don't want to fail here, else we'll take the whole engine down
             try:
@@ -3252,7 +1969,8 @@ class FlowManager(EngineScoped):
 
             return ContinueExecutionStepResultFailure(result_details=details)
         try:
-            await self.continue_executing(flow)
+            with self._continuing_run_in_progress(self._current_flows()):
+                await self.continue_executing(flow)
         except Exception as e:
             details = f"Failed to continue execution step. An exception occurred: {e}."
             return ContinueExecutionStepResultFailure(result_details=details)
@@ -3436,1070 +2154,6 @@ class FlowManager(EngineScoped):
             result_details=details,
         )
 
-    def _aggregate_flow_dependencies(
-        self, serialized_node_commands: list[SerializedNodeCommands], sub_flows_commands: list[SerializedFlowCommands]
-    ) -> NodeDependencies:
-        """Aggregate dependencies from nodes and sub-flows into a single NodeDependencies object.
-
-        Args:
-            serialized_node_commands: List of serialized node commands to aggregate from
-            sub_flows_commands: List of sub-flow commands to aggregate from
-
-        Returns:
-            NodeDependencies object with all dependencies merged
-        """
-        # Start with empty dependencies and aggregate into it
-        aggregated_deps = NodeDependencies()
-
-        # Aggregate dependencies from all nodes
-        for node_cmd in serialized_node_commands:
-            aggregated_deps.aggregate_from(node_cmd.node_dependencies)
-
-        # Aggregate dependencies from all sub-flows
-        for sub_flow_cmd in sub_flows_commands:
-            aggregated_deps.aggregate_from(sub_flow_cmd.node_dependencies)
-
-        return aggregated_deps
-
-    def _aggregate_node_types_used(
-        self, serialized_node_commands: list[SerializedNodeCommands], sub_flows_commands: list[SerializedFlowCommands]
-    ) -> set[LibraryNameAndNodeType]:
-        """Aggregate node types used from nodes and sub-flows.
-
-        Args:
-            serialized_node_commands: List of serialized node commands to aggregate from
-            sub_flows_commands: List of sub-flow commands to aggregate from
-
-        Returns:
-            Set of LibraryNameAndNodeType with all node types used
-
-        Raises:
-            ValueError: If a node command has no library name specified
-        """
-        node_types_used: set[LibraryNameAndNodeType] = set()
-
-        # Collect node types from all nodes in this flow
-        for node_cmd in serialized_node_commands:
-            create_cmd = node_cmd.create_node_command
-            node_type = create_cmd.node_type
-            library_name = create_cmd.specific_library_name
-            if library_name is None:
-                msg = f"Node type '{node_type}' has no library name specified during serialization"
-                raise ValueError(msg)
-            node_types_used.add(LibraryNameAndNodeType(library_name=library_name, node_type=node_type))
-
-        # Aggregate node types from all sub-flows
-        for sub_flow_cmd in sub_flows_commands:
-            node_types_used.update(sub_flow_cmd.node_types_used)
-
-        return node_types_used
-
-    def _aggregate_connections(
-        self,
-        flow_connections: list[SerializedFlowCommands.IndirectConnectionSerialization],
-        sub_flows_commands: list[SerializedFlowCommands],
-    ) -> list[SerializedFlowCommands.IndirectConnectionSerialization]:
-        """Aggregate connections from this flow and all sub-flows into a single list.
-
-        Args:
-            flow_connections: List of connections from the current flow
-            sub_flows_commands: List of sub-flow commands to aggregate from
-
-        Returns:
-            List of all connections from this flow and all sub-flows combined
-        """
-        aggregated_connections = list(flow_connections)
-
-        # Aggregate connections from all sub-flows
-        for sub_flow_cmd in sub_flows_commands:
-            aggregated_connections.extend(sub_flow_cmd.serialized_connections)
-
-        return aggregated_connections
-
-    def _aggregate_unique_parameter_values(
-        self,
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-        sub_flows_commands: list[SerializedFlowCommands],
-    ) -> dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]:
-        """Aggregate unique parameter values from this flow and all sub-flows.
-
-        Args:
-            unique_parameter_uuid_to_values: Unique parameter values from current flow
-            sub_flows_commands: List of sub-flow commands to aggregate from
-
-        Returns:
-            Dictionary with all unique parameter values merged
-        """
-        aggregated_values = dict(unique_parameter_uuid_to_values)
-
-        # Merge unique values from all sub-flows
-        for sub_flow_cmd in sub_flows_commands:
-            aggregated_values.update(sub_flow_cmd.unique_parameter_uuid_to_values)
-
-        return aggregated_values
-
-    def _serialize_variables_for_flow(
-        self,
-        flow_name: str,
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-        variable_references: set[VariableReference],
-    ) -> list[SerializedFlowCommands.SerializedVariableCommand]:
-        """Build SerializedVariableCommands for flow-scoped variables owned by this flow and declared by a node.
-
-        Only variables that are:
-          (a) owned by ``flow_name``, AND
-          (b) named by at least one declared ``VariableReference`` after scope resolution
-        get serialized. Variables present in engine state but not claimed by any node
-        (orphans from deleted nodes) are silently dropped.
-
-        Variable values share the parameter value pool in ``unique_parameter_uuid_to_values`` — the
-        generated workflow script references both kinds through the same ``top_level_unique_values_dict``.
-
-        Args:
-            flow_name: The flow whose flow-scoped variables are being serialized.
-            unique_parameter_uuid_to_values: Shared unique-value pool; variable values are added in place.
-            variable_references: Aggregated set of references declared by nodes in this flow and its subtree.
-
-        Returns:
-            A list of ``SerializedVariableCommand``s for this flow's declared flow-scoped variables.
-        """
-        declared_names_for_this_flow = self._resolve_declared_variable_names_for_flow(
-            flow_name=flow_name, variable_references=variable_references
-        )
-        if not declared_names_for_this_flow:
-            return []
-
-        flow_list_result = self.engine.handle_request(
-            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY)
-        )
-        if not isinstance(flow_list_result, ListVariablesResultSuccess):
-            logger.warning(
-                "Attempted to list flow-scoped variables for flow '%s' during serialization. Failed with: %s. Skipping.",
-                flow_name,
-                flow_list_result.result_details,
-            )
-            return []
-
-        return [
-            self._build_serialized_variable_command(
-                variable=variable,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-            )
-            for variable in flow_list_result.variables
-            if variable.name in declared_names_for_this_flow
-        ]
-
-    def _resolve_declared_variable_names_for_flow(
-        self,
-        flow_name: str,
-        variable_references: set[VariableReference],
-    ) -> set[str]:
-        """Return the names of variables owned by ``flow_name`` that are claimed by a declared reference.
-
-        This pass serializes *flow-owned* variables into the workflow script. References with
-        other scopes persist through separate stories (globals are a deferred follow-up;
-        project layer entries live in the project template, not the workflow) and are skipped
-        here with a debug log.
-
-        Resolution rules per reference scope:
-          - CURRENT_FLOW_ONLY: claims ``ref.name`` only if a variable with that name exists in ``flow_name``.
-          - HIERARCHICAL: uses ``GetVariableRequest`` to resolve; claims ``ref.name`` only if the resolved
-            variable is owned by ``flow_name`` (ancestor-owned variables get claimed by the ancestor's
-            own serialization pass).
-          - PROJECT_ONLY / HIERARCHICAL_FROM_PROJECT / GLOBAL_ONLY / ALL: not this pass's responsibility;
-            skipped with a debug log.
-        """
-        claimed_names: set[str] = set()
-
-        for ref in variable_references:
-            match ref.scope:
-                case VariableScope.CURRENT_FLOW_ONLY:
-                    if self._variable_is_owned_by(name=ref.name, flow_name=flow_name):
-                        claimed_names.add(ref.name)
-                case VariableScope.HIERARCHICAL:
-                    owning_flow = self._hierarchical_owning_flow_for(name=ref.name, starting_flow=flow_name)
-                    if owning_flow == flow_name:
-                        claimed_names.add(ref.name)
-                case (
-                    VariableScope.PROJECT_ONLY
-                    | VariableScope.HIERARCHICAL_FROM_PROJECT
-                    | VariableScope.GLOBAL_ONLY
-                    | VariableScope.ALL
-                ):
-                    logger.debug(
-                        "Skipping variable reference '%s' with scope '%s' during flow serialization.",
-                        ref.name,
-                        ref.scope,
-                    )
-                case _:
-                    msg = (
-                        f"Attempted to serialize variable reference '{ref.name}' during flow "
-                        f"serialization. Failed due to unknown scope '{ref.scope}'."
-                    )
-                    raise ValueError(msg)
-
-        return claimed_names
-
-    def _variable_is_owned_by(self, name: str, flow_name: str) -> bool:
-        """Return True if a flow-scoped variable with ``name`` exists directly in ``flow_name``."""
-        list_result = self.engine.handle_request(
-            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY)
-        )
-        if not isinstance(list_result, ListVariablesResultSuccess):
-            logger.debug(
-                "Attempted variable ownership check for '%s' in flow '%s'. Failed to list variables: %s",
-                name,
-                flow_name,
-                list_result.result_details,
-            )
-            return False
-        return any(variable.name == name for variable in list_result.variables)
-
-    def _hierarchical_owning_flow_for(self, name: str, starting_flow: str) -> str | None:
-        """Return the owning flow name of a variable found by hierarchical lookup, or None if not found."""
-        result = self.engine.handle_request(
-            GetVariableRequest(name=name, lookup_scope=VariableScope.HIERARCHICAL, starting_flow=starting_flow)
-        )
-        if not isinstance(result, GetVariableResultSuccess):
-            # A failure here is the expected signal for "variable does not resolve hierarchically" —
-            # e.g. a declared reference whose target was deleted. Logged at debug so it is available
-            # for diagnosis without generating noise during normal saves.
-            logger.debug(
-                "Hierarchical lookup for variable '%s' starting at flow '%s' did not resolve: %s",
-                name,
-                starting_flow,
-                result.result_details,
-            )
-            return None
-        return result.variable.owning_flow_name
-
-    def _build_serialized_variable_command(
-        self,
-        variable: FlowVariable,
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-    ) -> SerializedFlowCommands.SerializedVariableCommand:
-        """Pool the variable's encoded value under a hash of its content and build the indirect command."""
-        encoded = try_encode(variable.value)
-        if isinstance(encoded, Unencodable):
-            logger.warning(
-                "Attempted to save variable '%s'. Failed because %s It will reopen with no value.",
-                variable.name,
-                encoded.reason,
-            )
-            encoded = None
-        unique_value_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
-        unique_parameter_uuid_to_values[unique_value_uuid] = encoded
-
-        create_variable_command = CreateVariableRequest(
-            name=variable.name,
-            type=variable.type,
-            is_global=False,
-            value=None,  # Overridden at deserialization via top_level_unique_values_dict lookup.
-            owning_flow=variable.owning_flow_name,
-            initial_setup=True,
-        )
-        return SerializedFlowCommands.SerializedVariableCommand(
-            create_variable_command=create_variable_command,
-            unique_value_uuid=unique_value_uuid,
-        )
-
-    def _aggregate_set_parameter_value_commands(
-        self,
-        set_parameter_value_commands: dict[
-            SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
-        ],
-        sub_flows_commands: list[SerializedFlowCommands],
-    ) -> dict[SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]]:
-        """Aggregate set parameter value commands from this flow and all sub-flows.
-
-        Args:
-            set_parameter_value_commands: Set parameter value commands from current flow
-            sub_flows_commands: List of sub-flow commands to aggregate from
-
-        Returns:
-            Dictionary with all set parameter value commands merged
-        """
-        aggregated_commands = dict(set_parameter_value_commands)
-
-        # Merge commands from all sub-flows
-        for sub_flow_cmd in sub_flows_commands:
-            for node_uuid, commands in sub_flow_cmd.set_parameter_value_commands.items():
-                if node_uuid in aggregated_commands:
-                    aggregated_commands[node_uuid].extend(commands)
-                else:
-                    aggregated_commands[node_uuid] = list(commands)
-
-        return aggregated_commands
-
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/861
-    # similar manager refactors: https://github.com/griptape-ai/griptape-nodes/issues/806
-    @handles(SerializeFlowToCommandsRequest)
-    def on_serialize_flow_to_commands(self, request: SerializeFlowToCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
-        flow_name = request.flow_name
-        flow = None
-        if flow_name is None:
-            if self.engine.context_manager.has_current_flow():
-                flow = self.engine.context_manager.get_current_flow()
-                flow_name = flow.name
-            else:
-                details = "Attempted to serialize a Flow to commands from the Current Context. Failed because the Current Context was empty."
-                return SerializeFlowToCommandsResultFailure(result_details=details)
-        if flow is None:
-            # Does this flow exist?
-            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
-            if flow is None:
-                details = (
-                    f"Attempted to serialize Flow '{flow_name}' to commands, but no Flow with that name could be found."
-                )
-                return SerializeFlowToCommandsResultFailure(result_details=details)
-
-        # Track all parameter values that were in use by these Nodes (maps UUID to Parameter value)
-        unique_parameter_uuid_to_values = {}
-        # And track how values map into that map.
-        serialized_parameter_value_tracker = SerializedParameterValueTracker()
-
-        with self.engine.context_manager.flow(flow):
-            # The base flow creation, if desired.
-            if request.include_create_flow_command:
-                # Check if this flow is a referenced workflow
-                if self.is_referenced_workflow(flow):
-                    referenced_workflow_name = self.get_referenced_workflow_name(flow)
-                    create_flow_request = ImportWorkflowAsReferencedSubFlowRequest(
-                        workflow_name=referenced_workflow_name,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
-                        imported_flow_metadata=flow.metadata,
-                    )
-                else:
-                    # Always set set_as_new_context=False during serialization - let the workflow manager
-                    # that loads this serialized flow decide whether to push it to context or not
-                    # Get parent flow name from the flow manager's tracking
-                    parent_name = self.get_parent_flow(flow_name)
-                    create_flow_request = CreateFlowRequest(
-                        flow_name=flow_name,
-                        parent_flow_name=parent_name,
-                        set_as_new_context=False,
-                        metadata=flow.metadata,
-                    )
-            else:
-                create_flow_request = None
-
-            serialized_node_commands = []
-            serialized_node_group_commands = []  # SubflowNodeGroups must be added LAST
-            set_parameter_value_commands_per_node = {}  # Maps a node UUID to a list of set parameter value commands
-            set_lock_commands_per_node = {}  # Maps a node UUID to a set Lock command, if it exists.
-
-            # Now each of the child nodes in the flow.
-            node_name_to_uuid = {}
-            nodes_in_flow_request = ListNodesInFlowRequest()
-            nodes_in_flow_result = self.engine.handle_request(nodes_in_flow_request)
-            if not isinstance(nodes_in_flow_result, ListNodesInFlowResultSuccess):
-                details = (
-                    f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to list Nodes in the Flow."
-                )
-                return SerializeFlowToCommandsResultFailure(result_details=details)
-
-            # Serialize each node
-            for node_name in nodes_in_flow_result.node_names:
-                node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
-                if node is None:
-                    details = f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to serialize Node '{node_name}' within the Flow."
-                    return SerializeFlowToCommandsResultFailure(result_details=details)
-
-                with self.engine.context_manager.node(node):
-                    # Note: the parameter value stuff is pass-by-reference, and we expect the values to be modified in place.
-                    # This might be dangerous if done over the wire.
-
-                    # We set include_existing_subflow_in_group to true here, because we're serializing a whole flow, which means the subflows are being serialized
-                    serialize_node_request = SerializeNodeToCommandsRequest(
-                        unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,  # Unique values
-                        serialized_parameter_value_tracker=serialized_parameter_value_tracker,  # Mapping values to UUIDs,
-                        include_existing_subflow_in_group=True,
-                    )
-                    serialize_node_result = self.engine.handle_request(serialize_node_request)
-                    if not isinstance(serialize_node_result, SerializeNodeToCommandsResultSuccess):
-                        details = f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to serialize Node '{node_name}' within the Flow."
-                        return SerializeFlowToCommandsResultFailure(result_details=details)
-
-                    serialized_node = serialize_node_result.serialized_node_commands
-
-                    # Store the serialized node's UUID for correlation to connections and setting parameter values later.
-                    node_name_to_uuid[node_name] = serialized_node.node_uuid
-
-                    # BaseNodeGroups must be serialized LAST because CreateNodeGroupRequest references child node names
-                    # If we deserialize a NodeGroup before its children, the child nodes won't exist yet
-                    if isinstance(node, BaseNodeGroup):
-                        serialized_node_group_commands.append(serialized_node)
-                    else:
-                        serialized_node_commands.append(serialized_node)
-
-                    # Get the list of set value commands for THIS node.
-                    set_value_commands_list = serialize_node_result.set_parameter_value_commands
-                    if serialize_node_result.serialized_node_commands.lock_node_command is not None:
-                        set_lock_commands_per_node[serialized_node.node_uuid] = (
-                            serialize_node_result.serialized_node_commands.lock_node_command
-                        )
-                    set_parameter_value_commands_per_node[serialized_node.node_uuid] = set_value_commands_list
-
-            # Serialize sub-flows first, before creating connections.
-            # We need the complete UUID map from all flows to handle cross-flow connections.
-            parent_flow = self.engine.context_manager.get_current_flow()
-            parent_flow_name = parent_flow.name
-            flows_in_flow_request = ListFlowsInFlowRequest(parent_flow_name=parent_flow_name)
-            flows_in_flow_result = self.engine.handle_request(flows_in_flow_request)
-            if not isinstance(flows_in_flow_result, ListFlowsInFlowResultSuccess):
-                details = f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to list child Flows in the Flow."
-                return SerializeFlowToCommandsResultFailure(result_details=details)
-
-            sub_flow_commands = []
-            for child_flow in flows_in_flow_result.flow_names:
-                child_flow_obj = self.engine.object_manager.attempt_get_object_by_name_as_type(child_flow, ControlFlow)
-                if child_flow_obj is None:
-                    details = f"Attempted to serialize Flow '{flow_name}', but no Flow with that name could be found."
-                    return SerializeFlowToCommandsResultFailure(result_details=details)
-
-                # Skip transient child flows: they are runtime-only artifacts (e.g. a subflow a node
-                # imports at execution time, or a per-iteration loop-body flow) and must not be
-                # baked into the saved workflow.
-                if child_flow_obj.metadata.get(TRANSIENT_KEY):
-                    continue
-
-                # Check if this is a referenced workflow
-                if self.is_referenced_workflow(child_flow_obj):
-                    # For referenced workflows, create a minimal SerializedFlowCommands with just the import command
-                    referenced_workflow_name = self.get_referenced_workflow_name(child_flow_obj)
-                    import_command = ImportWorkflowAsReferencedSubFlowRequest(
-                        workflow_name=referenced_workflow_name,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
-                        imported_flow_metadata=child_flow_obj.metadata,
-                    )
-
-                    # Create NodeDependencies with just the referenced workflow
-                    sub_flow_dependencies = NodeDependencies(
-                        referenced_workflows={referenced_workflow_name}  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
-                    )
-
-                    serialized_flow = SerializedFlowCommands(
-                        flow_initialization_command=import_command,
-                        serialized_node_commands=[],
-                        serialized_connections=[],
-                        unique_parameter_uuid_to_values={},
-                        set_parameter_value_commands={},
-                        set_lock_commands_per_node={},
-                        sub_flows_commands=[],
-                        node_dependencies=sub_flow_dependencies,
-                        node_types_used=set(),
-                    )
-                    sub_flow_commands.append(serialized_flow)
-                else:
-                    # For standalone sub-flows, use the existing recursive serialization.
-                    with self.engine.context_manager.flow(flow=child_flow_obj):
-                        child_flow_request = SerializeFlowToCommandsRequest()
-                        child_flow_result = self.engine.handle_request(child_flow_request)
-                        if not isinstance(child_flow_result, SerializeFlowToCommandsResultSuccess):
-                            details = f"Attempted to serialize parent flow '{flow_name}'. Failed while serializing child flow '{child_flow}'."
-                            return SerializeFlowToCommandsResultFailure(result_details=details)
-                        serialized_flow = child_flow_result.serialized_flow_commands
-                        sub_flow_commands.append(serialized_flow)
-
-        # Append NodeGroup commands AFTER regular node commands
-        # This ensures child nodes exist before their parent NodeGroups are created during deserialization
-        serialized_node_commands.extend(serialized_node_group_commands)
-
-        # Update BaseNodeGroup commands to use UUIDs instead of names in node_names_to_add
-        # This allows workflow generation to directly look up variable names from UUIDs
-        # Build a complete node name to UUID map including nodes from all subflows
-        complete_node_name_to_uuid = dict(node_name_to_uuid)  # Start with current flow's nodes
-
-        def collect_subflow_node_uuids(subflow_commands_list: list[SerializedFlowCommands]) -> None:
-            """Recursively collect node name-to-UUID mappings from subflows."""
-            for subflow_cmd in subflow_commands_list:
-                for node_cmd in subflow_cmd.serialized_node_commands:
-                    # Extract node name from the create command
-                    create_cmd = node_cmd.create_node_command
-                    if create_cmd.node_name:
-                        complete_node_name_to_uuid[create_cmd.node_name] = node_cmd.node_uuid
-                # Recursively process nested subflows
-                if subflow_cmd.sub_flows_commands:
-                    collect_subflow_node_uuids(subflow_cmd.sub_flows_commands)
-
-        collect_subflow_node_uuids(sub_flow_commands)
-
-        for node_group_command in serialized_node_group_commands:
-            create_cmd = node_group_command.create_node_command
-
-            if create_cmd.node_names_to_add:
-                # Convert node names to UUIDs using the complete map (including subflows)
-                node_uuids = []
-                for child_node_name in create_cmd.node_names_to_add:
-                    if child_node_name in complete_node_name_to_uuid:
-                        uuid = complete_node_name_to_uuid[child_node_name]
-                        node_uuids.append(uuid)
-                # Replace the list with UUIDs (as strings since that's what the field expects)
-                create_cmd.node_names_to_add = node_uuids
-
-        # Now create the connections using the complete UUID map (includes all flows).
-        # This must happen after subflows are serialized so we have all UUIDs available.
-        create_connection_commands = []
-        for connection in self._get_connections_for_flow(flow):
-            source_node_name = connection.source_node.name
-            target_node_name = connection.target_node.name
-
-            # Use the complete UUID map that includes nodes from all subflows
-            if source_node_name not in complete_node_name_to_uuid:
-                details = f"Attempted to serialize Flow '{flow_name}'. Connection source node '{source_node_name}' not found in UUID map."
-                return SerializeFlowToCommandsResultFailure(result_details=details)
-            if target_node_name not in complete_node_name_to_uuid:
-                details = f"Attempted to serialize Flow '{flow_name}'. Connection target node '{target_node_name}' not found in UUID map."
-                return SerializeFlowToCommandsResultFailure(result_details=details)
-
-            source_node_uuid = complete_node_name_to_uuid[source_node_name]
-            target_node_uuid = complete_node_name_to_uuid[target_node_name]
-            create_connection_command = SerializedFlowCommands.IndirectConnectionSerialization(
-                source_node_uuid=source_node_uuid,
-                source_parameter_name=connection.source_parameter.name,
-                target_node_uuid=target_node_uuid,
-                target_parameter_name=connection.target_parameter.name,
-            )
-            create_connection_commands.append(create_connection_command)
-
-        # Aggregate all dependencies from nodes and sub-flows
-        aggregated_dependencies = self._aggregate_flow_dependencies(serialized_node_commands, sub_flow_commands)
-
-        # Aggregate all node types used from nodes and sub-flows
-        try:
-            aggregated_node_types_used = self._aggregate_node_types_used(serialized_node_commands, sub_flow_commands)
-        except ValueError as e:
-            details = f"Attempted to serialize Flow '{flow_name}' to commands. Failed while aggregating node types: {e}"
-            return SerializeFlowToCommandsResultFailure(result_details=details)
-
-        # Aggregate unique parameter values from this flow and all sub-flows
-        aggregated_unique_values = self._aggregate_unique_parameter_values(
-            unique_parameter_uuid_to_values, sub_flow_commands
-        )
-
-        # Aggregate all connections from this flow and all sub-flows
-        aggregated_connections = self._aggregate_connections(create_connection_commands, sub_flow_commands)
-
-        # Serialize flow-scoped variables owned by this flow that are declared by a node.
-        serialized_variable_commands = self._serialize_variables_for_flow(
-            flow_name=flow_name,
-            unique_parameter_uuid_to_values=aggregated_unique_values,
-            variable_references=aggregated_dependencies.variable_references,
-        )
-
-        # Extract flow name from initialization command if available
-        extracted_flow_name = None
-        if create_flow_request is not None and hasattr(create_flow_request, "flow_name"):
-            extracted_flow_name = create_flow_request.flow_name
-
-        serialized_flow = SerializedFlowCommands(
-            flow_initialization_command=create_flow_request,
-            serialized_node_commands=serialized_node_commands,
-            serialized_connections=aggregated_connections,
-            unique_parameter_uuid_to_values=aggregated_unique_values,
-            set_parameter_value_commands=set_parameter_value_commands_per_node,
-            set_lock_commands_per_node=set_lock_commands_per_node,
-            sub_flows_commands=sub_flow_commands,
-            node_dependencies=aggregated_dependencies,
-            node_types_used=aggregated_node_types_used,
-            flow_name=extracted_flow_name,
-            serialized_variable_commands=serialized_variable_commands,
-        )
-        details = f"Successfully serialized Flow '{flow_name}' into commands."
-        result = SerializeFlowToCommandsResultSuccess(serialized_flow_commands=serialized_flow, result_details=details)
-        return result
-
-    @handles(DeserializeFlowFromCommandsRequest)
-    def on_deserialize_flow_from_commands(self, request: DeserializeFlowFromCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912 (I am big and complicated and have a lot of negative edge-cases)
-        # Do we want to create a NEW Flow to deserialize into, or use the one in the Current Context?
-        if request.serialized_flow_commands.flow_initialization_command is None:
-            if self.engine.context_manager.has_current_flow():
-                flow = self.engine.context_manager.get_current_flow()
-                flow_name = flow.name
-                pushed_flow_context = False
-                created_new_flow = False
-            else:
-                details = "Attempted to deserialize a set of Flow Creation commands into the Current Context. Failed because the Current Context was empty."
-                return DeserializeFlowFromCommandsResultFailure(result_details=details)
-        else:
-            # Issue the creation command first.
-            flow_initialization_command = request.serialized_flow_commands.flow_initialization_command
-            flow_initialization_result = self.engine.handle_request(flow_initialization_command)
-
-            # Handle different types of creation commands
-            match flow_initialization_command:
-                case CreateFlowRequest():
-                    if not isinstance(flow_initialization_result, CreateFlowResultSuccess):
-                        details = f"Attempted to deserialize a serialized set of Flow Creation commands. Failed to create flow '{flow_initialization_command.flow_name}'."
-                        return DeserializeFlowFromCommandsResultFailure(result_details=details)
-                    flow_name = flow_initialization_result.flow_name
-                case ImportWorkflowAsReferencedSubFlowRequest():
-                    if not isinstance(flow_initialization_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
-                        details = f"Attempted to deserialize a serialized set of Flow Creation commands. Failed to import workflow '{flow_initialization_command.workflow_name}'."
-                        return DeserializeFlowFromCommandsResultFailure(result_details=details)
-                    flow_name = flow_initialization_result.created_flow_name
-                case _:
-                    details = f"Attempted to deserialize Flow Creation commands with unknown command type: {type(flow_initialization_command).__name__}."
-                    return DeserializeFlowFromCommandsResultFailure(result_details=details)
-
-            # Adopt the newly-created flow as our current context.
-            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
-            if flow is None:
-                details = f"Attempted to deserialize a serialized set of Flow Creation commands. Failed to find created flow '{flow_name}'."
-                return DeserializeFlowFromCommandsResultFailure(result_details=details)
-            self.engine.context_manager.push_flow(flow=flow)
-            pushed_flow_context = True  # Mark that we pushed this flow
-            created_new_flow = True  # Mark that we created this flow
-
-        # Deserializing a flow goes in a specific order: every node in this Flow AND its subflows
-        # first, then connections, then values. Connections are serialized against a Flow's whole
-        # subtree (see _aggregate_connections), so an edge crossing a Flow boundary names a node
-        # that lives one or more levels down. Connections are wired only after every node in the
-        # subtree exists, subflows included, because any earlier and such an edge fails with "node
-        # did not exist within the flow" and fails the whole load.
-        try:
-            deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands
-            )
-
-            # Now apply the connections, for this Flow and every Flow beneath it.
-            # We didn't know the exact name that would be used for the nodes, but we knew the node's
-            # creation UUID. Tie the UUID back to the node names.
-            #
-            # The outermost Flow claims every edge, deliberately, and the recursion below it finds
-            # nothing left to do: this Flow's serialized_connections is the fully aggregated list, and
-            # each edge is created the first time it is seen. Codegen resolves the same duplication
-            # the other way round -- it recurses first, so the innermost Flow wins -- because there
-            # the edge has to be written where its endpoints are already in scope as variables. Here
-            # every node in the subtree exists before any edge is made, so there is no such
-            # constraint and claiming at the top is the simpler of the two.
-            self._deserialize_connections_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands,
-                deserialized_nodes=deserialized_nodes,
-                created_connection_keys=set(),
-            )
-
-            # Now assign the values, again across the whole subtree.
-            # This is the same issue that we handle for Connections:
-            # we don't know the exact node name that would be used, but we do know the UUIDs.
-            self._deserialize_values_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands, deserialized_nodes=deserialized_nodes
-            )
-        except FlowDeserializationError as err:
-            details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
-            if created_new_flow:
-                self._cleanup_flow_on_failed_deserialization(flow_name, pushed_flow_context=pushed_flow_context)
-            return DeserializeFlowFromCommandsResultFailure(result_details=details)
-
-        node_name_mappings = deserialized_nodes.original_name_to_node_name
-
-        # Pop flow context if requested and we pushed it
-        if request.pop_flow_context_after and pushed_flow_context:
-            self.engine.context_manager.pop_flow()
-
-        details = f"Successfully deserialized Flow '{flow_name}'."
-        return DeserializeFlowFromCommandsResultSuccess(
-            flow_name=flow_name, result_details=details, node_name_mappings=node_name_mappings
-        )
-
-    def _deserialize_nodes_for_flow_and_subflows(
-        self, serialized_flow_commands: SerializedFlowCommands
-    ) -> DeserializedFlowNodes:
-        """Rebuild every node in a Flow and, recursively, in each of its subflows.
-
-        Each subflow is created and entered so its nodes land inside it, then left again, so the
-        rebuilt Flow hierarchy mirrors the serialized one.
-
-        Node groups are rebuilt last, after this Flow's ordinary nodes and after every subflow, for
-        the same reason the workflow file generator emits them last: a group claims its members by
-        name at creation time, and a member can live in a subflow below the group. Rebuilding the
-        group first silently dropped members that did not exist yet, leaving an empty group.
-
-        Args:
-            serialized_flow_commands: The commands for the Flow being rebuilt
-
-        Returns:
-            The rebuilt nodes of this Flow and its whole subtree
-
-        Raises:
-            FlowDeserializationError: If a node, or a subflow holding nodes, could not be rebuilt
-        """
-        deserialized_nodes = DeserializedFlowNodes()
-
-        regular_node_commands = [
-            serialized_node
-            for serialized_node in serialized_flow_commands.serialized_node_commands
-            if not serialized_node.is_node_group
-        ]
-        node_group_commands = [
-            serialized_node
-            for serialized_node in serialized_flow_commands.serialized_node_commands
-            if serialized_node.is_node_group
-        ]
-
-        for serialized_node in regular_node_commands:
-            self._deserialize_and_record_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
-
-        for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
-            sub_flow_nodes = self._deserialize_subflow_nodes(sub_flow_commands=sub_flow_commands)
-            deserialized_nodes.merge(sub_flow_nodes)
-
-        for serialized_node in node_group_commands:
-            self._deserialize_and_record_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
-
-        return deserialized_nodes
-
-    def _deserialize_and_record_node(
-        self, serialized_node: SerializedNodeCommands, deserialized_nodes: DeserializedFlowNodes
-    ) -> None:
-        """Rebuild one node and record the name it was given under both keys callers look it up by.
-
-        Args:
-            serialized_node: The commands for the node being rebuilt
-            deserialized_nodes: The collection to record the rebuilt node in
-
-        Raises:
-            FlowDeserializationError: If the node could not be rebuilt
-        """
-        node_name = self._deserialize_one_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
-        deserialized_nodes.node_uuid_to_node_name[serialized_node.node_uuid] = node_name
-        original_node_name = serialized_node.create_node_command.node_name
-        if original_node_name is not None:
-            # Callers map old names to new ones; a node saved without a name has nothing to map.
-            deserialized_nodes.original_name_to_node_name[original_node_name] = node_name
-
-    def _deserialize_one_node(
-        self, serialized_node: SerializedNodeCommands, deserialized_nodes: DeserializedFlowNodes
-    ) -> str:
-        """Rebuild a single node, resolving any group membership it declares.
-
-        Args:
-            serialized_node: The commands for the node being rebuilt
-            deserialized_nodes: Nodes rebuilt so far, used to resolve group membership UUIDs
-
-        Returns:
-            The name the rebuilt node was given
-
-        Raises:
-            FlowDeserializationError: If the node could not be rebuilt
-        """
-        create_cmd = serialized_node.create_node_command
-        serialized_node_for_deserialization = serialized_node
-
-        # A saved group names things by what they were called at save time, and every one of those
-        # names is deduped on the way back in. Rewrite them to what this load actually created,
-        # copying rather than mutating so the caller's serialized data is left as it was found.
-        if serialized_node.is_node_group:
-            create_cmd_copy = replace(
-                create_cmd,
-                node_names_to_add=self._remapped_group_member_names(
-                    create_cmd=create_cmd, deserialized_nodes=deserialized_nodes
-                ),
-                metadata=self._remapped_group_metadata(create_cmd=create_cmd, deserialized_nodes=deserialized_nodes),
-            )
-            serialized_node_for_deserialization = replace(serialized_node, create_node_command=create_cmd_copy)
-
-        deserialize_node_request = DeserializeNodeFromCommandsRequest(
-            serialized_node_commands=serialized_node_for_deserialization
-        )
-        deserialized_node_result = self.engine.handle_request(deserialize_node_request)
-        if not isinstance(deserialized_node_result, DeserializeNodeFromCommandsResultSuccess):
-            msg = f"Failed while rebuilding the node '{create_cmd.node_name}'."
-            raise FlowDeserializationError(msg)
-
-        return deserialized_node_result.node_name
-
-    def _remapped_group_member_names(
-        self, create_cmd: CreateNodeRequest, deserialized_nodes: DeserializedFlowNodes
-    ) -> list[str] | None:
-        """Turn a saved group's member UUIDs into the names its members were rebuilt under.
-
-        The field is declared as plain names, but a serialized group stores its members as UUIDs,
-        because the names they will be rebuilt under are not known until they are rebuilt.
-
-        Args:
-            create_cmd: The group's creation command as it was saved
-            deserialized_nodes: Nodes rebuilt so far, holding the UUID-to-name mapping
-
-        Returns:
-            The members' rebuilt names, or None if the group was saved holding nothing
-
-        Raises:
-            FlowDeserializationError: If any member was not rebuilt
-        """
-        if not create_cmd.node_names_to_add:
-            return None
-
-        member_uuids = [SerializedNodeCommands.NodeUUID(name) for name in create_cmd.node_names_to_add]
-        unresolved_count = sum(
-            1 for member_uuid in member_uuids if member_uuid not in deserialized_nodes.node_uuid_to_node_name
-        )
-        # A group IS its membership, so a group that comes back holding three of its five nodes is
-        # worse than a load that stops and says so. Every member is rebuildable by the time we get
-        # here because _deserialize_nodes_for_flow_and_subflows rebuilds groups last; if that
-        # ordering ever regresses, fail loudly instead of quietly returning a hollowed-out group.
-        if unresolved_count:
-            group_name = create_cmd.node_name or create_cmd.node_type
-            msg = f"Failed while rebuilding the group '{group_name}' because {unresolved_count} of its {len(member_uuids)} nodes were not rebuilt."
-            raise FlowDeserializationError(msg)
-
-        return [deserialized_nodes.node_uuid_to_node_name[member_uuid] for member_uuid in member_uuids]
-
-    def _remapped_group_metadata(
-        self, create_cmd: CreateNodeRequest, deserialized_nodes: DeserializedFlowNodes
-    ) -> dict | None:
-        """Point a saved group's `subflow_name` at the subflow this load created for it.
-
-        A group records its subflow by name, and that name is deduped like any other on the way in:
-        loading a graph into a session that already holds a same-named subflow creates the group's
-        one under a new name. Left unremapped, the rebuilt group reaches for the name it was saved
-        with, finds a flow belonging to something else, and moves the nodes it just loaded into it --
-        with no error, because the flow it names does exist.
-
-        Args:
-            create_cmd: The group's creation command as it was saved
-            deserialized_nodes: Rebuilt nodes, holding the saved-to-created flow name mapping
-
-        Returns:
-            Metadata with the subflow name rewritten, or the original if there is nothing to rewrite
-        """
-        saved_metadata = create_cmd.metadata
-        if saved_metadata is None:
-            return None
-
-        saved_subflow_name = saved_metadata.get("subflow_name")
-        if saved_subflow_name is None:
-            # Copy/paste strips subflow_name so the pasted group builds a fresh subflow of its own.
-            return saved_metadata
-
-        created_subflow_name = deserialized_nodes.original_flow_name_to_flow_name.get(saved_subflow_name)
-        if created_subflow_name is None:
-            # The group's subflow was not part of this load. Its own on-demand creation path handles
-            # that, and keeping a stale name would point it at whatever now answers to it.
-            remapped_metadata = copy.deepcopy(saved_metadata)
-            remapped_metadata.pop("subflow_name", None)
-            return remapped_metadata
-
-        if created_subflow_name == saved_subflow_name:
-            return saved_metadata
-
-        remapped_metadata = copy.deepcopy(saved_metadata)
-        remapped_metadata["subflow_name"] = created_subflow_name
-        return remapped_metadata
-
-    def _deserialize_subflow_nodes(self, sub_flow_commands: SerializedFlowCommands) -> DeserializedFlowNodes:
-        """Create one subflow and rebuild the nodes inside it, and inside its own subflows.
-
-        Args:
-            sub_flow_commands: The commands for the subflow being rebuilt
-
-        Returns:
-            The rebuilt nodes of the subflow and its whole subtree
-
-        Raises:
-            FlowDeserializationError: If the subflow could not be created or entered
-        """
-        flow_initialization_command = sub_flow_commands.flow_initialization_command
-        if flow_initialization_command is None:
-            # No creation command means "deserialize into the Flow already in context", which is
-            # this Flow: the nodes belong here rather than in a child.
-            return self._deserialize_nodes_for_flow_and_subflows(serialized_flow_commands=sub_flow_commands)
-
-        sub_flow_name = self._create_flow_for_deserialization(flow_initialization_command=flow_initialization_command)
-        sub_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(sub_flow_name, ControlFlow)
-        if sub_flow is None:
-            msg = f"Failed to find the sub-flow '{sub_flow_name}' just created for it."
-            raise FlowDeserializationError(msg)
-
-        # Nodes are created into the Flow at the top of the context stack, so enter the subflow
-        # while rebuilding its contents and leave it afterwards.
-        with self.engine.context_manager.flow(flow=sub_flow):
-            sub_flow_nodes = self._deserialize_nodes_for_flow_and_subflows(serialized_flow_commands=sub_flow_commands)
-
-        # Record what this flow was saved as against what it came back as. A group node saved a
-        # reference to its subflow by name, and the name is deduped on the way in, so the group has
-        # to be pointed at the flow this load created rather than a same-named one already here.
-        original_flow_name = self._original_flow_name_of(flow_initialization_command=flow_initialization_command)
-        if original_flow_name is not None:
-            sub_flow_nodes.original_flow_name_to_flow_name[original_flow_name] = sub_flow_name
-
-        return sub_flow_nodes
-
-    def _original_flow_name_of(
-        self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
-    ) -> str | None:
-        """The name a Flow was saved under, which is what a group's stored reference names it by.
-
-        Args:
-            flow_initialization_command: The command that brought the Flow into existence
-
-        Returns:
-            The saved name, or None if the command carries no name to map from
-        """
-        match flow_initialization_command:
-            case CreateFlowRequest():
-                return flow_initialization_command.flow_name
-            case ImportWorkflowAsReferencedSubFlowRequest():
-                # An imported workflow is referenced by workflow name, not by a flow name a group
-                # could have recorded, so there is nothing to map.
-                return None
-            case _:
-                return None
-
-    def _create_flow_for_deserialization(
-        self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
-    ) -> str:
-        """Issue a Flow's initialization command and return the name it was created under.
-
-        Args:
-            flow_initialization_command: The command that brings the Flow into existence
-
-        Returns:
-            The name of the created Flow
-
-        Raises:
-            FlowDeserializationError: If the Flow could not be created
-        """
-        flow_initialization_result = self.engine.handle_request(flow_initialization_command)
-
-        match flow_initialization_command:
-            case CreateFlowRequest():
-                if not isinstance(flow_initialization_result, CreateFlowResultSuccess):
-                    msg = f"Failed to create the sub-flow '{flow_initialization_command.flow_name}'."
-                    raise FlowDeserializationError(msg)
-                return flow_initialization_result.flow_name
-            case ImportWorkflowAsReferencedSubFlowRequest():
-                if not isinstance(flow_initialization_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
-                    msg = f"Failed to import the workflow '{flow_initialization_command.workflow_name}' as a sub-flow."
-                    raise FlowDeserializationError(msg)
-                return flow_initialization_result.created_flow_name
-            case _:
-                msg = f"Failed because the sub-flow used an unknown creation command: {type(flow_initialization_command).__name__}."
-                raise FlowDeserializationError(msg)
-
-    def _deserialize_connections_for_flow_and_subflows(
-        self,
-        serialized_flow_commands: SerializedFlowCommands,
-        deserialized_nodes: DeserializedFlowNodes,
-        created_connection_keys: set[SerializedConnectionKey],
-    ) -> None:
-        """Recreate the connections of a Flow and every Flow beneath it, each exactly once.
-
-        Serialization aggregates every subflow's connections up into each of its ancestors (see
-        _aggregate_connections), so an edge crossing N group boundaries is reported N+1 times. It
-        has to be created only once: re-issuing an existing edge is not a no-op, because
-        on_create_connection_request treats a duplicate as a restricted scenario and tears the
-        existing edge down before rebuilding it, which churns the group proxy parameters that the
-        edge was routed through. Claiming each edge the first time it is seen keeps the load path
-        from undoing the wiring it just restored.
-
-        Args:
-            serialized_flow_commands: The commands for the Flow being rebuilt
-            deserialized_nodes: Every node rebuilt for this Flow's whole subtree
-            created_connection_keys: Edges already created for this Flow's subtree, added to here
-
-        Raises:
-            FlowDeserializationError: If a connection names a node that was not rebuilt, or could not be made
-        """
-        for indirect_connection in serialized_flow_commands.serialized_connections:
-            source_node_name = deserialized_nodes.node_uuid_to_node_name.get(indirect_connection.source_node_uuid)
-            if source_node_name is None:
-                msg = "Failed while reconnecting the flow because the node a connection starts from was not rebuilt."
-                raise FlowDeserializationError(msg)
-            target_node_name = deserialized_nodes.node_uuid_to_node_name.get(indirect_connection.target_node_uuid)
-            if target_node_name is None:
-                msg = "Failed while reconnecting the flow because the node a connection leads to was not rebuilt."
-                raise FlowDeserializationError(msg)
-
-            connection_key = indirect_connection.key()
-            if connection_key in created_connection_keys:
-                continue
-            created_connection_keys.add(connection_key)
-
-            create_connection_request = CreateConnectionRequest(
-                source_node_name=source_node_name,
-                source_parameter_name=indirect_connection.source_parameter_name,
-                target_node_name=target_node_name,
-                target_parameter_name=indirect_connection.target_parameter_name,
-            )
-            create_connection_result = self.engine.handle_request(create_connection_request)
-            if create_connection_result.failed():
-                msg = f"Failed while reconnecting '{source_node_name}.{indirect_connection.source_parameter_name}' to '{target_node_name}.{indirect_connection.target_parameter_name}'."
-                raise FlowDeserializationError(msg)
-
-        for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
-            self._deserialize_connections_for_flow_and_subflows(
-                serialized_flow_commands=sub_flow_commands,
-                deserialized_nodes=deserialized_nodes,
-                created_connection_keys=created_connection_keys,
-            )
-
-    def _deserialize_values_for_flow_and_subflows(
-        self, serialized_flow_commands: SerializedFlowCommands, deserialized_nodes: DeserializedFlowNodes
-    ) -> None:
-        """Reapply the parameter values of a Flow and every Flow beneath it.
-
-        Args:
-            serialized_flow_commands: The commands for the Flow being rebuilt
-            deserialized_nodes: Every node rebuilt for this Flow's whole subtree
-
-        Raises:
-            FlowDeserializationError: If a value belongs to a node that was not rebuilt, or could not be set
-        """
-        for node_uuid, set_value_command_list in serialized_flow_commands.set_parameter_value_commands.items():
-            node_name = deserialized_nodes.node_uuid_to_node_name.get(node_uuid)
-            if node_name is None:
-                msg = "Failed while restoring saved values because the node they belong to was not rebuilt."
-                raise FlowDeserializationError(msg)
-            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
-            if node is None:
-                msg = f"Failed while restoring the saved values of '{node_name}'."
-                raise FlowDeserializationError(msg)
-
-            with self.engine.context_manager.node(node=node):
-                for indirect_set_value_command in set_value_command_list:
-                    self._apply_deserialized_parameter_value(
-                        indirect_set_value_command=indirect_set_value_command,
-                        node=node,
-                        unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
-                    )
-
-        for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
-            self._deserialize_values_for_flow_and_subflows(
-                serialized_flow_commands=sub_flow_commands, deserialized_nodes=deserialized_nodes
-            )
-
-    def _apply_deserialized_parameter_value(
-        self,
-        indirect_set_value_command: SerializedNodeCommands.IndirectSetParameterValueCommand,
-        node: BaseNode,
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-    ) -> None:
-        """Set one saved parameter value on a rebuilt node.
-
-        Args:
-            indirect_set_value_command: The saved assignment, referencing its value by UUID
-            node: The node the value belongs to
-            unique_parameter_uuid_to_values: The pool the value UUID resolves against
-
-        Raises:
-            FlowDeserializationError: If the value is missing from the pool, or could not be set
-        """
-        parameter_name = indirect_set_value_command.set_parameter_value_command.parameter_name
-        unique_value_uuid = indirect_set_value_command.unique_value_uuid
-        if unique_value_uuid not in unique_parameter_uuid_to_values:
-            msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}' because the value was missing."
-            raise FlowDeserializationError(msg)
-
-        # Call the SetParameterValueRequest, subbing in a freshly decoded copy of the pooled value.
-        indirect_set_value_command.set_parameter_value_command.value = decode_value(
-            unique_parameter_uuid_to_values[unique_value_uuid]
-        )
-        # Update the parameter value command to have the correct name.
-        indirect_set_value_command.set_parameter_value_command.node_name = node.name
-        set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
-        if set_parameter_value_result.failed():
-            msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}'."
-            raise FlowDeserializationError(msg)
-
     async def start_flow(
         self,
         flow: ControlFlow,
@@ -4507,180 +2161,346 @@ class FlowManager(EngineScoped):
         *,
         debug_mode: bool = False,
     ) -> None:
-        if self.check_for_existing_running_flow():
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
+        if self._flow_is_running(flows):
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
             raise RuntimeError(errormsg)
+        self._raise_if_run_cancelled(flows)
 
         if start_node is None:
-            if self._global_flow_queue.empty():
+            if flows.global_flow_queue.empty():
                 errormsg = "No Flow exists. You must create at least one control connection."
                 raise RuntimeError(errormsg)
-            queue_item = self._global_flow_queue.get()
+            queue_item = flows.global_flow_queue.get()
             start_node = queue_item.node
-            self._global_flow_queue.task_done()
+            flows.global_flow_queue.task_done()
 
         # Initialize global control flow machine and DAG builder
-
-        self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
+        machine = self._make_control_flow_machine(flows, flow.name)
+        flows.global_control_flow_machine = machine
         # Set off the request here.
         try:
-            await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            await machine.start_flow(start_node, debug_mode=debug_mode)
         except Exception:
-            await self._abandon_running_flow()
+            await self._abandon_running_flow(flows)
             raise
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
 
-    @handles(ExtractFlowCommandsFromImageMetadataRequest)
-    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
-        self, request: ExtractFlowCommandsFromImageMetadataRequest
-    ) -> ResultPayload:
-        """Extract flow commands from PNG image metadata.
+    async def start_run(self, spec: RunSpec) -> ResultPayload:
+        """Run `spec` once the current workflow's runs ahead of it end, returning what its request returns.
 
-        Args:
-            request: ExtractFlowCommandsFromImageMetadataRequest with file path or URL
-
-        Returns:
-            ExtractFlowCommandsFromImageMetadataResultSuccess if successful
-            ExtractFlowCommandsFromImageMetadataResultFailure if any step fails
-        """
-        file_url_or_path = request.file_url_or_path
-
-        # Check if input is a URL or file path
-        is_url = file_url_or_path.startswith(("http://", "https://"))
-
-        if is_url:
-            # Handle URL: download the image
-            try:
-                response = httpx2.get(file_url_or_path, timeout=30.0)
-                response.raise_for_status()
-                pil_image = Image.open(BytesIO(response.content))
-            except Exception as e:
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Failed to download or open image from URL: {e}",
-                    file_path=file_url_or_path,
-                )
-        else:
-            # Handle file path: validate and open
-            path_obj = Path(file_url_or_path)
-            if not path_obj.exists():
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"File not found: {file_url_or_path}",
-                    file_path=file_url_or_path,
-                )
-
-            if not path_obj.is_file():
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Path is not a file: {file_url_or_path}",
-                    file_path=file_url_or_path,
-                )
-
-            # Read PNG image and extract metadata
-            try:
-                pil_image = Image.open(file_url_or_path)
-            except Exception as e:
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Failed to open image file: {e}",
-                    file_path=file_url_or_path,
-                )
-
-        # An image without embedded flow commands is a valid state, not an error.
-        metadata = pil_image.info if hasattr(pil_image, "info") else {}
-        # Closed now: a failure reading the commands can keep this frame, and the open file, alive
-        # until garbage collection, and Windows won't delete or replace an open file.
-        pil_image.close()
-        if not metadata:
-            return ExtractFlowCommandsFromImageMetadataResultSuccess(
-                result_details=f"Image has no metadata: {file_url_or_path}",
-                serialized_flow_commands=None,
-                altered_workflow_state=False,
-            )
-
-        metadata_keys = [str(key) for key in metadata]
-
-        if FLOW_COMMANDS_KEY not in metadata:
-            return ExtractFlowCommandsFromImageMetadataResultSuccess(
-                result_details=f"No flow commands metadata found in image. Available keys: {metadata_keys}",
-                serialized_flow_commands=None,
-                altered_workflow_state=False,
-            )
-
-        try:
-            serialized_flow_commands = self._read_image_flow_commands(metadata[FLOW_COMMANDS_KEY])
-        except ImageFlowCommandsError as error:
-            return ExtractFlowCommandsFromImageMetadataResultFailure(
-                result_details=f"Attempted to read the workflow saved in image '{file_url_or_path}'. Failed because {error}.",
-                file_path=file_url_or_path,
-            )
-
-        # Check if we should also deserialize the flow
-        if request.deserialize:
-            # Deserialize the flow
-            deserialize_request = DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized_flow_commands)
-            deserialize_result = self.engine.handle_request(deserialize_request)
-
-            # Validation: Check if deserialization succeeded
-            if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Failed to deserialize flow from image metadata: {deserialize_result.result_details}",
-                    file_path=file_url_or_path,
-                )
-
-            # Success path: Return with deserialization info
-            return ExtractFlowCommandsFromImageMetadataResultSuccess(
-                result_details=f"Successfully extracted and deserialized flow '{deserialize_result.flow_name}' from image metadata",
-                serialized_flow_commands=serialized_flow_commands,
-                flow_name=deserialize_result.flow_name,
-                node_name_mappings=deserialize_result.node_name_mappings,
-                altered_workflow_state=True,
-            )
-
-        # Success path: Return the extracted commands for user inspection (no deserialization)
-        return ExtractFlowCommandsFromImageMetadataResultSuccess(
-            result_details="Successfully extracted flow commands from image metadata",
-            serialized_flow_commands=serialized_flow_commands,
-            altered_workflow_state=False,
-        )
-
-    def _read_image_flow_commands(self, text: str) -> SerializedFlowCommands:
-        """Read the flow commands an image's metadata holds as JSON, or as pickle from earlier engines.
+        A request made from inside the run in progress belongs to that run, so it executes at once:
+        queueing it would wait on itself.
 
         Raises:
-            ImageFlowCommandsError: The text holds no readable flow commands.
+            NoOpenWorkflowError: No workflow is current.
         """
+        flows = self._current_flows()
+        if self._is_inside_run_in_progress(flows):
+            return await self.join_run_in_progress(spec)
+        run = self.submit_run(spec)
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            try:
-                return read_legacy_image_flow_commands(
-                    text, self.engine.library_manager.module_loading.stable_module_names()
+            return await asyncio.shield(run.outcome)
+        except asyncio.CancelledError:
+            # Nothing will wait for this run any more, so if it has not started it never should.
+            self._turn_away(run.flows, [run], "its request was cancelled.")
+            raise
+
+    async def join_run_in_progress(self, spec: RunSpec) -> ResultPayload:
+        """Execute `spec` at once as part of the current workflow's run in progress, returning what its request returns."""
+        run_id = None
+        flows = self._current_flows_or_none()
+        if flows is not None and flows.run_in_progress is not None:
+            run_id = flows.run_in_progress.run_id
+        return self._of_run(await spec.execute(self.engine), run_id)
+
+    def submit_run(self, spec: RunSpec) -> Run:
+        """Queue a run of `spec` in the current workflow, starting it at once if no run of it is in progress.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        # The run keeps its workflow's flows, so it waits, starts and ends in that workflow's line
+        # even if another workflow is current when it does.
+        flows = self._current_flows()
+        run = Run(
+            run_id=str(uuid4()),
+            spec=spec,
+            flow_name=spec.flow_name,
+            flows=flows,
+            queued_at=datetime.now(tz=UTC),
+            state=RunState.QUEUED,
+            outcome=asyncio.get_running_loop().create_future(),
+            ended=asyncio.get_running_loop().create_future(),
+            context=copy_context(),
+            request_id=current_request_id(),
+        )
+        flows.run_queue.enqueue(run)
+        self._start_next_run_if_idle(flows)
+        self._report_places_in_line(flows)
+        return run
+
+    async def cancel_run(self, run_id: str) -> bool:
+        """Cancel a run of the current workflow, returning whether there was one.
+
+        A waiting run leaves the line, the run in progress stops.
+        """
+        flows = self._current_flows_or_none()
+        if flows is None:
+            return False
+        waiting = [run for run in flows.run_queue.snapshot() if run.run_id == run_id]
+        if waiting:
+            self._turn_away(flows, waiting, "it was cancelled.")
+            return True
+        run = flows.run_in_progress
+        if run is None or run.run_id != run_id:
+            return False
+        run.state = RunState.CANCELLED
+        # A run whose flow has not started stops itself before starting it.
+        if self._flow_is_running(flows):
+            await self._cancel_run(flows)
+        return True
+
+    async def cancel_all_runs(self) -> None:
+        """Cancel every waiting run of the current workflow, then its run in progress, without starting another.
+
+        With no workflow current there is nothing to cancel.
+        """
+        flows = self._current_flows_or_none()
+        if flows is None:
+            return
+        # The waiting runs go first: cancelling the run in progress would otherwise start the next one.
+        self._turn_away(flows, flows.run_queue.snapshot(), "it was cancelled.")
+        if flows.run_in_progress is not None:
+            flows.run_in_progress.state = RunState.CANCELLED
+        flows.cancelling_all = True
+        try:
+            if self._flow_is_running(flows):
+                await self._cancel_run(flows)
+        finally:
+            flows.cancelling_all = False
+        # Runs submitted while the cancel awaited were held, so they go too.
+        self._turn_away(flows, flows.run_queue.snapshot(), "it was cancelled.")
+
+    def current_run(self) -> Run | None:
+        """The run in progress, if the code executing now belongs to it, or None."""
+        flows = self._current_flows_or_none()
+        if flows is None or not self._is_inside_run_in_progress(flows):
+            return None
+        return flows.run_in_progress
+
+    def report_run_waiting_for_engine(self, run_id: str, position: int) -> None:
+        """Report that the run in progress waits at `position` for another engine, or no longer waits at 0.
+
+        Its node there waits while another run has that engine, so it is reported, and listed, as a run
+        waiting here would be. Another engine's report reaches this bound to no workflow, so the run is
+        found by its id in whichever open workflow runs it.
+        """
+        run = self._run_in_progress_with_id(run_id)
+        if run is None or run.position == position:
+            return
+        run.position = position
+        self._put_run_queued_event(run, position)
+
+    def _run_in_progress_with_id(self, run_id: str) -> Run | None:
+        for workflow in self.engine.open_workflows.all_open():
+            run = workflow.flows.run_in_progress
+            if run is not None and run.run_id == run_id:
+                return run
+        return None
+
+    def _turn_away(self, flows: WorkflowFlows, runs: list[Run], reason: str) -> None:
+        """Take waiting runs out of `flows`' line without executing them; each one's request returns `reason`."""
+        for run in runs:
+            if flows.run_queue.remove(run.run_id) is None:
+                continue
+            run.state = RunState.CANCELLED
+            self._leave_line(run)
+            self._on_run_loop(run, self._end_without_executing, run, f"The run did not start: {reason}")
+        self._report_places_in_line(flows)
+
+    def _end_without_executing(self, run: Run, details: str) -> None:
+        """End a run that left the line without executing; its request returns `details`."""
+        self._fail_unexecuted(run, details)
+        run.ended.set_result(None)
+
+    def _fail_unexecuted(self, run: Run, details: str) -> None:
+        run.spec.on_turned_away(details)
+        run.outcome.set_result(self._of_run(run.spec.failure(details), run.run_id))
+
+    def _raise_if_run_cancelled(self, flows: WorkflowFlows) -> None:
+        """Stop a run cancelled before its flow started, just before it would start it.
+
+        Raises:
+            RuntimeError: The run in progress in `flows` was cancelled.
+        """
+        run = flows.run_in_progress
+        if run is not None and run.state is RunState.CANCELLED:
+            raise RuntimeError(_CANCELLED_BEFORE_STARTING)
+
+    @staticmethod
+    def _of_run(result: ResultPayload, run_id: str | None) -> ResultPayload:
+        """`result`, naming the run its request started or joined."""
+        if isinstance(result, RunIdMixin):
+            result.run_id = run_id
+        return result
+
+    def _start_next_run_if_idle(self, flows: WorkflowFlows) -> None:
+        if flows.run_in_progress is not None or flows.cancelling_all:
+            return
+        run = flows.run_queue.pop_next()
+        if run is None:
+            return
+        self._leave_line(run)
+        run.state = RunState.RUNNING
+        flows.run_in_progress = run
+        flows.driving = True
+        # The run that just ended may have ended on a short-lived loop, such as a synchronous request's.
+        self._on_run_loop(run, self._create_driver, run)
+
+    def _create_driver(self, run: Run) -> None:
+        asyncio.get_running_loop().create_task(self._drive(run), context=run.context)
+
+    async def _drive(self, run: Run) -> None:
+        # run.context is the submitter's context copied, so this marks only the run's own tasks, and the run
+        # executes bound to the workflow its request was bound to.
+        _current_run_id.set(run.run_id)
+        flows = run.flows
+        if run.state is RunState.CANCELLED:
+            self._fail_unexecuted(run, _CANCELLED_BEFORE_STARTING)
+            flows.driving = False
+            self._finish_run(run)
+            return
+        try:
+            result = await run.spec.execute(self.engine)
+        except asyncio.CancelledError:
+            run.outcome.cancel()
+            flows.driving = False
+            self._finish_run(run)
+            raise
+        except Exception as e:
+            # The request awaiting the outcome reports the error, so the driver does not raise it again.
+            run.outcome.set_exception(e)
+            run.state = RunState.FAILED
+            flows.driving = False
+            self._finish_run(run)
+            return
+        run.outcome.set_result(self._of_run(result, run.run_id))
+        flows.driving = False
+        if self._flow_is_running(flows):
+            run.state = RunState.PAUSED
+            return
+        if run.state is RunState.RUNNING:
+            if result.succeeded():
+                run.state = RunState.FINISHED
+            else:
+                run.state = RunState.FAILED
+        self._finish_run(run)
+
+    def _finish_run_if_over(self, flows: WorkflowFlows) -> None:
+        """End the run in progress in `flows` if its flow has stopped, on the paths that can stop a paused run.
+
+        Wait while anything still holds the machines. For example, in debug mode the user steps a
+        node, presses Cancel while its check is still running, then presses Run: without this wait,
+        the new run starts before the old step has finished. `driving` only covers a normal Run;
+        `_run_is_advancing` also covers a step or continue. Each of those calls this again
+        when it finishes, so the run still ends.
+        """
+        run = flows.run_in_progress
+        if run is None or flows.driving or self._run_is_advancing(flows) or self._flow_is_running(flows):
+            return
+        if run.state is RunState.PAUSED:
+            run.state = RunState.FINISHED
+        self._finish_run(run)
+
+    def _finish_run(self, run: Run) -> None:
+        """End `run`, the run in progress in its workflow, and start that workflow's next. The only place a run ends."""
+        flows = run.flows
+        if flows.run_in_progress is not run:
+            return
+        flows.run_in_progress = None
+        self._on_run_loop(run, run.ended.set_result, None)
+        self._start_next_run_if_idle(flows)
+        self._report_places_in_line(flows)
+
+    @staticmethod
+    def _on_run_loop(run: Run, callback: Callable[..., object], *args: object) -> None:
+        """Call `callback` on the loop the run was submitted on, which owns its outcome."""
+        loop = run.outcome.get_loop()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            callback(*args)
+            return
+        loop.call_soon_threadsafe(callback, *args)
+
+    @staticmethod
+    def _is_inside_run_in_progress(flows: WorkflowFlows) -> bool:
+        run = flows.run_in_progress
+        return run is not None and _current_run_id.get() == run.run_id
+
+    def _leave_line(self, run: Run) -> None:
+        if run.position:
+            run.position = 0
+            self._report_place_in_line(run)
+
+    def _report_places_in_line(self, flows: WorkflowFlows) -> None:
+        for index, run in enumerate(flows.run_queue.snapshot()):
+            position = index + 1
+            if run.position != position:
+                run.position = position
+                self._report_place_in_line(run)
+
+    def _report_place_in_line(self, run: Run) -> None:
+        self._put_run_queued_event(run, run.position)
+        self._on_run_loop(run, run.spec.on_place_in_line, run)
+
+    def _put_run_queued_event(self, run: Run, position: int) -> None:
+        self.engine.event_manager.put_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(
+                    payload=RunQueuedEvent(
+                        run_id=run.run_id,
+                        flow_name=run.flow_name,
+                        position=position,
+                        request_id=run.request_id,
+                    )
                 )
-            except LegacyPickleError as error:
-                raise ImageFlowCommandsError(str(error)) from error
+            )
+        )
+
+    @contextlib.contextmanager
+    def _continuing_run_in_progress(self, flows: WorkflowFlows) -> Iterator[None]:
+        """Count what a step or continue request executes as part of the run in progress in `flows`."""
+        run = flows.run_in_progress
+        run_id = None
+        if run is not None:
+            run_id = run.run_id
+        token = _current_run_id.set(run_id)
         try:
-            return decode_commands(data, SerializedFlowCommands)
-        except CommandsFormatError as error:
-            raise ImageFlowCommandsError(str(error)) from error
+            yield
+        finally:
+            _current_run_id.reset(token)
+            self._finish_run_if_over(flows)
 
     def check_for_existing_running_flow(self) -> bool:
-        if self._global_control_flow_machine is None:
+        flows = self._current_flows_or_none()
+        if flows is None:
             return False
-        current_state = self._global_control_flow_machine.current_state
-        if current_state and current_state is not CompleteState:
-            # Flow already exists in progress
-            return True
-        return bool(
-            not self._global_control_flow_machine.context.resolution_machine.is_complete()
-            and self._global_control_flow_machine.context.resolution_machine.is_started()
-        )
+        return self._flow_is_running(flows)
 
     def running_flow_is_stopping_after_failure(self) -> bool:
         """True while the running flow has failed and is waiting for its other nodes to finish."""
-        if self._global_control_flow_machine is None:
+        flows = self._current_flows_or_none()
+        if flows is None or flows.global_control_flow_machine is None:
             return False
-        return self._global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+        return flows.global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
 
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
@@ -4692,31 +2512,34 @@ class FlowManager(EngineScoped):
         and stops when that node finishes -- which is why callers apply their
         debug-mode change before consulting this.
         """
-        if self._global_control_flow_machine is None:
+        flows = self._current_flows_or_none()
+        if flows is None:
             return False
-        return (
-            self._global_control_flow_machine.is_advancing
-            or self._global_control_flow_machine.resolution_machine.is_advancing
-        )
+        return self._run_is_advancing(flows)
 
     async def cancel_flow_run(self) -> None:
-        if not self.check_for_existing_running_flow():
+        await self._cancel_run(self._current_flows())
+
+    async def _cancel_run(self, flows: WorkflowFlows) -> None:
+        """Cancel the run in `flows`, the run state of the workflow the run belongs to."""
+        if not self._flow_is_running(flows):
             errormsg = "Flow has not yet been started. Cannot cancel flow that hasn't begun."
             raise RuntimeError(errormsg)
-        self._global_flow_queue.queue.clear()
+        flows.global_flow_queue.queue.clear()
 
         # Request cancellation on all nodes and wait for them to complete
         run_seconds = None
-        if self._global_control_flow_machine is not None:
-            await self._global_control_flow_machine.cancel_flow()
+        machine = flows.global_control_flow_machine
+        if machine is not None:
+            await machine.cancel_flow()
             # Read before the reset below clears the run's start time.
-            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
+            run_seconds = machine.context.seconds_since_run_started()
 
         # Reset control flow machine
-        if self._global_control_flow_machine is not None:
-            self._global_control_flow_machine.reset_machine(cancel=True)
-        self._global_single_node_resolution = False
-        self._global_dag_builder.clear()
+        if flows.global_control_flow_machine is not None:
+            flows.global_control_flow_machine.reset_machine(cancel=True)
+        flows.global_single_node_resolution = False
+        flows.global_dag_builder.clear()
         logger.debug("Cancelling flow run")
 
         self.engine.event_manager.put_event(
@@ -4727,8 +2550,9 @@ class FlowManager(EngineScoped):
                 wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
             )
         )
+        self._finish_run_if_over(flows)
 
-    async def _abandon_running_flow(self) -> None:
+    async def _abandon_running_flow(self, flows: WorkflowFlows) -> None:
         """Give up on a run that has already failed, leaving the engine able to start another.
 
         `FSM._advance` leaves `_current_state` pointing at the state that raised, and that state is
@@ -4742,9 +2566,9 @@ class FlowManager(EngineScoped):
         rather than raised, because the error worth reporting is the one that ended the run.
         """
         cancelled_gracefully = False
-        if self.check_for_existing_running_flow():
+        if self._flow_is_running(flows):
             try:
-                await self.cancel_flow_run()
+                await self._cancel_run(flows)
                 cancelled_gracefully = True
             except Exception:
                 # Cancelling awaits arbitrary node code, so there is no narrower type to catch.
@@ -4755,11 +2579,11 @@ class FlowManager(EngineScoped):
             return
 
         run_seconds = None
-        if self._global_control_flow_machine is not None:
-            run_seconds = self._global_control_flow_machine.context.seconds_since_run_started()
-            self._global_control_flow_machine.reset_machine(cancel=True)
-        self._global_single_node_resolution = False
-        self._global_dag_builder.clear()
+        if flows.global_control_flow_machine is not None:
+            run_seconds = flows.global_control_flow_machine.context.seconds_since_run_started()
+            flows.global_control_flow_machine.reset_machine(cancel=True)
+        flows.global_single_node_resolution = False
+        flows.global_dag_builder.clear()
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
@@ -4767,6 +2591,16 @@ class FlowManager(EngineScoped):
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
             )
+        )
+        self._finish_run_if_over(flows)
+
+    def _make_control_flow_machine(self, flows: WorkflowFlows, flow_name: str) -> ControlFlowMachine:
+        """A machine for a top-level run of `flow_name` over the run state in `flows`."""
+        return ControlFlowMachine(
+            flow_name,
+            dag_builder=flows.global_dag_builder,
+            flows=flows,
+            engine=self.engine,
         )
 
     def reset_global_execution_state(self) -> None:
@@ -4784,6 +2618,7 @@ class FlowManager(EngineScoped):
         self._connections.connections.clear()
         self._connections.outgoing_index.clear()
         self._connections.incoming_index.clear()
+        self._finish_run_if_over(self._current_flows())
 
         logger.debug("Reset global execution state")
 
@@ -4818,41 +2653,44 @@ class FlowManager(EngineScoped):
     # Internal execution queue helper methods to consolidate redundant operations
     async def _handle_flow_start_if_not_running(
         self,
+        flows: WorkflowFlows,
         flow: ControlFlow,
         *,
         debug_mode: bool,
         error_message: str,
     ) -> None:
         """Common logic for starting flow execution if not already running."""
-        if not self.check_for_existing_running_flow():
-            if self._global_flow_queue.empty():
+        if not self._flow_is_running(flows):
+            if flows.global_flow_queue.empty():
                 raise RuntimeError(error_message)
-            queue_item = self._global_flow_queue.get()
+            queue_item = flows.global_flow_queue.get()
             start_node = queue_item.node
-            self._global_flow_queue.task_done()
+            flows.global_flow_queue.task_done()
             # Get or create machine
-            if self._global_control_flow_machine is None:
-                self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
-            await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            if flows.global_control_flow_machine is None:
+                flows.global_control_flow_machine = self._make_control_flow_machine(flows, flow.name)
+            await flows.global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
 
-    async def _handle_post_execution_queue_processing(self, *, debug_mode: bool) -> None:
+    async def _handle_post_execution_queue_processing(self, flows: WorkflowFlows, *, debug_mode: bool) -> None:
         """Handle execution queue processing after execution completes."""
-        if not self.check_for_existing_running_flow() and not self._global_flow_queue.empty():
-            queue_item = self._global_flow_queue.get()
+        if not self._flow_is_running(flows) and not flows.global_flow_queue.empty():
+            queue_item = flows.global_flow_queue.get()
             start_node = queue_item.node
-            self._global_flow_queue.task_done()
-            machine = self._global_control_flow_machine
+            flows.global_flow_queue.task_done()
+            machine = flows.global_control_flow_machine
             if machine is not None:
                 await machine.start_flow(start_node, debug_mode=debug_mode)
 
     async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         # We are now going to have different behavior depending on how the node is behaving.
-        if self.check_for_existing_running_flow():
+        if self._flow_is_running(flows):
             # Now we know something is running, it's ParallelResolutionMachine, and that we are in single_node_resolution.
             # Nothing below awaits before inject_node: that is what lets the running driver
             # see this as one atomic change, rather than catching it half-applied or tearing
             # the DAG down between the check above and the mutation.
-            machine = self._global_control_flow_machine
+            machine = flows.global_control_flow_machine
             if machine is None:
                 msg = f"Attempted to run '{node.name}' as part of the workflow already in progress, but that workflow could not be found. Wait for it to finish and try again."
                 raise RuntimeError(msg)
@@ -4862,24 +2700,26 @@ class FlowManager(EngineScoped):
             node.prepare_to_run_again()
             machine.resolution_machine.inject_node(node)
             # Emit involved nodes update after adding node to DAG
-            involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
+            involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
             self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
                 )
             )
         else:
+            self._raise_if_run_cancelled(flows)
             # Set that we are only working on one node right now!
-            self._global_single_node_resolution = True
+            flows.global_single_node_resolution = True
             # Get or create machine
-            self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
-            self._global_control_flow_machine.context.current_nodes = [node]
-            resolution_machine = self._global_control_flow_machine.resolution_machine
+            machine = self._make_control_flow_machine(flows, flow.name)
+            flows.global_control_flow_machine = machine
+            machine.context.current_nodes = [node]
+            resolution_machine = machine.resolution_machine
             resolution_machine.change_debug_mode(debug_mode=debug_mode)
             node.state = NodeResolutionState.UNRESOLVED
             # Build the DAG for the node
-            self._global_dag_builder.add_node_with_dependencies(node)
-            resolution_machine.context.dag_builder = self._global_dag_builder
+            flows.global_dag_builder.add_node_with_dependencies(node)
+            resolution_machine.context.dag_builder = flows.global_dag_builder
 
             # In SEQUENTIAL mode, show all flow nodes as involved. In PARALLEL mode, show only DAG nodes.
             execution_type = self.engine.config_manager.get_config_value(
@@ -4888,7 +2728,7 @@ class FlowManager(EngineScoped):
             if execution_type == WorkflowExecutionMode.SEQUENTIAL:
                 involved_nodes = self.get_involved_node_names(flow)
             else:
-                involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
+                involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
             # Send a InvolvedNodesRequest
 
             self.engine.event_manager.put_event(
@@ -4897,20 +2737,18 @@ class FlowManager(EngineScoped):
                 )
             )
             try:
-                await self._global_control_flow_machine.start_flow(
-                    start_node=node, end_node=node, debug_mode=debug_mode
-                )
+                await machine.start_flow(start_node=node, end_node=node, debug_mode=debug_mode)
             except Exception as e:
                 logger.exception("Exception during single node resolution")
                 # Single-node mode was raised before the run began, so a run that never begins still
                 # has to drop it -- which is why this cleanup cannot be conditional on liveness.
-                await self._abandon_running_flow()
+                await self._abandon_running_flow(flows)
                 raise RuntimeError(e) from e
 
             if resolution_machine.is_errored():
                 error_message = resolution_machine.get_error_message()
-                self._global_single_node_resolution = False
-                self._global_control_flow_machine.context.current_nodes = []
+                flows.global_single_node_resolution = False
+                machine.context.current_nodes = []
                 self.engine.event_manager.put_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[]))
@@ -4920,75 +2758,93 @@ class FlowManager(EngineScoped):
                 raise RuntimeError(error_message or "Node resolution failed")
 
             if resolution_machine.is_complete():
-                self._global_single_node_resolution = False
-                self._global_control_flow_machine.context.current_nodes = []
+                flows.global_single_node_resolution = False
+                machine.context.current_nodes = []
             self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
             )
 
     async def single_execution_step(self, flow: ControlFlow, change_debug_mode: bool) -> None:  # noqa: FBT001
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         # do a granular step
         await self._handle_flow_start_if_not_running(
-            flow, debug_mode=True, error_message="Flow has not yet been started. Cannot step while no flow has begun."
+            flows,
+            flow,
+            debug_mode=True,
+            error_message="Flow has not yet been started. Cannot step while no flow has begun.",
         )
-        if not self.check_for_existing_running_flow():
+        if not self._flow_is_running(flows):
             return
-        if self._global_control_flow_machine is None:
+        machine = flows.global_control_flow_machine
+        if machine is None:
             return
         # The only path that pauses a live run, so it applies whether or not we go
         # on to drive.
         if change_debug_mode:
-            self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=True)
-        if self.execution_is_advancing():
+            machine.resolution_machine.change_debug_mode(debug_mode=True)
+        if self._run_is_advancing(flows):
             return
-        await self._global_control_flow_machine.granular_step()
-        if self._global_control_flow_machine.resolution_machine.is_complete():
-            self._global_single_node_resolution = False
+        await machine.granular_step()
+        if machine.resolution_machine.is_complete():
+            flows.global_single_node_resolution = False
 
     async def single_node_step(self, flow: ControlFlow) -> None:
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         # It won't call single_node_step without an existing flow running from US.
         await self._handle_flow_start_if_not_running(
-            flow, debug_mode=True, error_message="Flow has not yet been started. Cannot step while no flow has begun."
+            flows,
+            flow,
+            debug_mode=True,
+            error_message="Flow has not yet been started. Cannot step while no flow has begun.",
         )
-        if not self.check_for_existing_running_flow():
+        if not self._flow_is_running(flows):
             return
         # Step over a whole node
-        if self._global_single_node_resolution:
+        if flows.global_single_node_resolution:
             msg = "Cannot step through the Control Flow in Single Node Execution"
             raise RuntimeError(msg)
-        if self._global_control_flow_machine is None:
+        machine = flows.global_control_flow_machine
+        if machine is None:
             return
         # Clearing the paused flag is what resumes a paused run, so it applies
         # whether or not we go on to drive.
-        self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=False)
-        if self.execution_is_advancing():
+        machine.resolution_machine.change_debug_mode(debug_mode=False)
+        if self._run_is_advancing(flows):
             return
-        await self._global_control_flow_machine.node_step()
+        await machine.node_step()
         # Start the next resolution step now please.
-        await self._handle_post_execution_queue_processing(debug_mode=True)
+        await self._handle_post_execution_queue_processing(flows, debug_mode=True)
 
     async def continue_executing(self, flow: ControlFlow) -> None:
+        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
+        flows = self._current_flows()
         await self._handle_flow_start_if_not_running(
-            flow, debug_mode=False, error_message="Flow has not yet been started. Cannot step while no flow has begun."
+            flows,
+            flow,
+            debug_mode=False,
+            error_message="Flow has not yet been started. Cannot step while no flow has begun.",
         )
-        if not self.check_for_existing_running_flow():
+        if not self._flow_is_running(flows):
             return
         # Turn all debugging to false and continue on. This resumes a paused run,
         # so it applies whether or not we go on to drive.
-        if self._global_control_flow_machine is not None:
-            self._global_control_flow_machine.change_debug_mode(False)
-        if self.execution_is_advancing():
+        machine = flows.global_control_flow_machine
+        if machine is not None:
+            machine.change_debug_mode(False)
+        if self._run_is_advancing(flows):
             return
-        if self._global_control_flow_machine is not None:
-            if self._global_single_node_resolution:
-                if self._global_control_flow_machine.resolution_machine.is_complete():
-                    self._global_single_node_resolution = False
+        if machine is not None:
+            if flows.global_single_node_resolution:
+                if machine.resolution_machine.is_complete():
+                    flows.global_single_node_resolution = False
                 else:
-                    await self._global_control_flow_machine.resolution_machine.update()
+                    await machine.resolution_machine.update()
             else:
-                await self._global_control_flow_machine.node_step()
+                await machine.node_step()
         # Now it is done executing. make sure it's actually done?
-        await self._handle_post_execution_queue_processing(debug_mode=False)
+        await self._handle_post_execution_queue_processing(flows, debug_mode=False)
 
     def unresolve_whole_flow(self, flow: ControlFlow) -> None:
         for node in flow.nodes.values():
@@ -5373,3 +3229,25 @@ class FlowManager(EngineScoped):
                         node_list.append(input_node)
                         node_queue.put(input_node)
         return node_list
+
+    @staticmethod
+    def _flow_is_running(flows: WorkflowFlows) -> bool:
+        """True while the run in `flows` has started and not finished."""
+        machine = flows.global_control_flow_machine
+        if machine is None:
+            return False
+        current_state = machine.current_state
+        if current_state and current_state is not CompleteState:
+            # Flow already exists in progress
+            return True
+        return bool(
+            not machine.context.resolution_machine.is_complete() and machine.context.resolution_machine.is_started()
+        )
+
+    @staticmethod
+    def _run_is_advancing(flows: WorkflowFlows) -> bool:
+        """True while a coroutine is already driving the run in `flows`. See `execution_is_advancing`."""
+        machine = flows.global_control_flow_machine
+        if machine is None:
+            return False
+        return machine.is_advancing or machine.resolution_machine.is_advancing

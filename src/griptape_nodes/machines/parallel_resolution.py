@@ -37,12 +37,14 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultFailure,
 )
 from griptape_nodes.serialization.values import encode_for_display
+from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.machines.dag_builder import DagBuilder, DagNode
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -74,15 +76,21 @@ class ParallelResolutionContext(EngineScoped):
     task_to_node: dict[asyncio.Task, DagNode]
     node_priority_queue: NodePriorityQueue
     dag_builder: DagBuilder | None
+    # The run state of the workflow a top-level run belongs to. None for an isolated subflow.
+    flows: WorkflowFlows | None
+    is_isolated: bool
     last_resolved_node: BaseNode | None  # Track the last node that was resolved
     generation: int  # Bumped on reset so a resuming driver can tell its run was torn down
     new_work_event: asyncio.Event  # Set when the priority queue changes, so a parked driver wakes
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         flow_name: str,
         max_nodes_in_parallel: int | None = None,
         dag_builder: DagBuilder | None = None,
+        *,
+        flows: WorkflowFlows | None = None,
+        is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
         super().__init__(engine)
@@ -91,6 +99,8 @@ class ParallelResolutionContext(EngineScoped):
         self.error_message = None
         self.workflow_state = WorkflowState.NO_ERROR
         self.dag_builder = dag_builder
+        self.flows = flows
+        self.is_isolated = is_isolated
         self.last_resolved_node = None
         self.node_priority_queue = NodePriorityQueue(self)
 
@@ -339,16 +349,14 @@ class ExecuteDagState(State):
         flow_manager = context.engine.flow_manager
 
         # Early returns for various conditions
-        if ExecuteDagState._should_skip_control_flow(context, node, network_name, flow_manager):
+        if ExecuteDagState._should_skip_control_flow(context, node, network_name):
             return
         next_output = node.get_next_control_output()
         if next_output is not None:
             ExecuteDagState._process_next_control_node(context, node, next_output, network_name, flow_manager)
 
     @staticmethod
-    def _should_skip_control_flow(
-        context: ParallelResolutionContext, node: BaseNode, network_name: str, flow_manager: FlowManager
-    ) -> bool:
+    def _should_skip_control_flow(context: ParallelResolutionContext, node: BaseNode, network_name: str) -> bool:
         """Check if control flow processing should be skipped.
 
         A node that was only pulled into a graph to supply data must not advance control: it did
@@ -365,8 +373,9 @@ class ExecuteDagState(State):
         if network is None:
             msg = f"Network {network_name} not found in DAG builder"
             raise ValueError(msg)
-        is_isolated = context.dag_builder is not flow_manager.global_dag_builder
-        if flow_manager.global_single_node_resolution and not is_isolated:
+        # The run's own workflow decides, not whichever workflow is current when the run resumes.
+        single_node_resolution = context.flows is not None and context.flows.global_single_node_resolution
+        if single_node_resolution and not context.is_isolated:
             # Clean up nodes from emptied graphs in single node resolution mode
             if len(network) == 0 and context.dag_builder is not None:
                 context.dag_builder.cleanup_empty_graph_nodes(network_name)
@@ -713,7 +722,13 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            exceptions = node_reference.node_reference.validate_before_node_run()
+            # The check runs in a thread so a slow one doesn't freeze the editor. While it runs, the user
+            # can press Cancel. If they did, stop here: otherwise the node runs anyway (a provider node
+            # would submit its job) even though the run was cancelled.
+            exceptions = await async_utils.to_thread(node_reference.node_reference.validate_before_node_run)
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
@@ -1031,22 +1046,30 @@ class DagCompleteState(State):
 class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
     """State machine for building DAG structure without execution."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         flow_name: str,
         max_nodes_in_parallel: int | None = None,
         dag_builder: DagBuilder | None = None,
+        *,
+        flows: WorkflowFlows | None = None,
+        is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
         resolution_context = ParallelResolutionContext(
-            flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder, engine=engine
+            flow_name,
+            max_nodes_in_parallel=max_nodes_in_parallel,
+            dag_builder=dag_builder,
+            flows=flows,
+            is_isolated=is_isolated,
+            engine=engine,
         )
         super().__init__(resolution_context)
 
     async def resolve_node(self, node: BaseNode | None = None) -> None:  # noqa: ARG002
         """Execute the DAG structure using the existing DagBuilder."""
-        if self.context.dag_builder is None:
-            self.context.dag_builder = self.context.engine.flow_manager.global_dag_builder
+        if self.context.dag_builder is None and self.context.flows is not None:
+            self.context.dag_builder = self.context.flows.global_dag_builder
         await self.start(ExecuteDagState)
 
     def inject_node(self, node: BaseNode, graph_name: str | None = None) -> list[BaseNode]:

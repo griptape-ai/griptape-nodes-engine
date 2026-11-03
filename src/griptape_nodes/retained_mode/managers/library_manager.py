@@ -73,10 +73,11 @@ from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+    from collections.abc import Set as AbstractSet
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import Payload, RequestPayload, ResultPayload
@@ -338,7 +339,7 @@ class LibraryManager(EngineScoped):
         finally:
             self._libraries_loading_complete.set()
 
-    @handles(ReloadAllLibrariesRequest)
+    @handles(ReloadAllLibrariesRequest, scope=RequestScope.HOST)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
         # The heartbeat reports is_initializing during a mid-session reload too.
         with self.engine.lifecycle.reloading():
@@ -527,8 +528,13 @@ class LibraryManager(EngineScoped):
                     break
         return workflow_files
 
-    def register_library_workflow_node_workflows(self) -> None:
-        """List the workflows behind every registered library's workflow nodes in the workflow registry."""
+    def register_library_workflow_node_workflows(self, *, found_workflow_ids: AbstractSet[str]) -> list[str]:
+        """List the workflows behind every registered library's workflow nodes in the workflow registry.
+
+        `found_workflow_ids` are the entries the registry refresh calling this found already,
+        which keep their metadata. Returns the ids of the entries listed.
+        """
+        listed_workflow_ids = []
         current_sandbox_dir = self.sandbox.get_sandbox_directory()
         for library_info in self._library_file_path_to_info.values():
             # A project switch that keeps the libraries loaded can leave the old project's sandbox
@@ -537,7 +543,12 @@ class LibraryManager(EngineScoped):
             if library_info.is_sandbox and Path(library_info.library_path).parent != current_sandbox_dir:
                 continue
             for node_class in library_info.workflow_node_classes:
-                self.module_loading.list_workflow_node_workflow(node_class, library_info)
+                workflow_id = self.module_loading.list_workflow_node_workflow(
+                    node_class, library_info, found_workflow_ids=found_workflow_ids
+                )
+                if workflow_id is not None:
+                    listed_workflow_ids.append(workflow_id)
+        return listed_workflow_ids
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         # Start with a clean slate.

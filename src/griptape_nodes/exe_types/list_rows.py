@@ -66,11 +66,16 @@ class ListRows:
 
         - while the node is running, since rows it adds then don't reach the orchestrator's copy. Its
           result is recorded instead.
-        - while loading, which sets the rows next.
         - from a value hook on the list or one of its rows, which runs while a row is being set.
           Replacing the rows there would remove the one being set. To convert items, a list uses
           `item_converters` instead.
+
+        While loading, a whole list is stored as any value is, without asking whether the list is
+        connected: the connection may not be made yet. A save writes a whole list only for a list a
+        connection fed, and the rows of any other list arrive as their own values.
         """
+        if initial_setup:
+            return False
         if not self.holds_no_value(parameter):
             return False
         name = parameter.name
@@ -81,38 +86,16 @@ class ListRows:
         if name in self._in_hooks:
             self._warn_hook_write(parameter, value)
             return True
-        if initial_setup or name in self._being_replaced:
+        if name in self._being_replaced:
             return True
         self.set_as_rows_if_unconnected(parameter, value)
-        return True
-
-    def fill_copy(self, parameter: Parameter, value: Any) -> bool:
-        """Build the rows of a worker's copy of the node from the list it was sent. Returns whether it did.
-
-        Unlike `set_as_rows_if_unconnected`, this doesn't ask the orchestrator whether the list is
-        connected: a fresh copy has no rows to protect, and rows built from the list give the node the
-        same items either way.
-
-        A list over `max_items` can only have come over a connection, and doesn't fit in rows. It is
-        stored whole instead, so the node runs with every item as it does on the orchestrator.
-        """
-        if not isinstance(parameter, ParameterList) or not isinstance(value, list):
-            return False
-        if not _accepts_whole_list(parameter):
-            return False
-        max_items = parameter.max_items
-        if max_items is not None and _item_count(parameter, value) > max_items:
-            return False
-        if value != handle_container_parameter(self._node, parameter):
-            self._replace(parameter, value)
         return True
 
     def set_as_rows_if_unconnected(self, parameter: Parameter, value: Any) -> bool:
         """Write a whole list to the rows of an unconnected list. Returns whether it did.
 
-        The engine calls this where a value arrives from outside the node: a request, and a worker
-        copy receiving the list it runs with. An unconnected list is read from its rows, so a list
-        stored beside them would never be read.
+        The engine calls this where a value arrives from outside the node: a request. An unconnected
+        list is read from its rows, so a list stored beside them would never be read.
 
         Raises:
             TypeError: if `value` is not a list.
@@ -163,31 +146,17 @@ class ListRows:
         self.rows_changed(parameter_list)
 
     def rows_changed(self, container: ParameterContainer, *, initial_setup: bool = False) -> None:
-        """Tell the node a container's rows changed: a row was set, removed or moved."""
-        if container.name in self._being_replaced:
+        """Tell the node a container's rows changed: a row was set, removed or moved.
+
+        Not while loading: whether the rows are what the list holds depends on a connection the load
+        may not have made yet, and the list was checked when it was saved.
+        """
+        if container.name in self._being_replaced or initial_setup:
             return
         if not self.holds_no_value(container):
             # A connected list holds the value its connection delivered, which the rows don't change.
             return
-        self._notify(container, initial_setup=initial_setup)
-
-    def values_for_dispatch(self) -> dict[str, Any]:
-        """`parameter_values`, with each list as the node reads it and without its rows, to send with `ExecuteNodeRequest`.
-
-        A worker copy has no rows and builds its own, with new names, from the list.
-        """
-        node = self._node
-        values = dict(node.parameter_values)
-        for parameter in node.parameters:
-            if not isinstance(parameter, ParameterList):
-                continue
-            rows = parameter.get_child_parameters()
-            if parameter.name not in values and not rows:
-                continue
-            values[parameter.name] = node._get_raw_parameter_value(parameter.name)
-            for row in rows:
-                values.pop(row.name, None)
-        return values
+        self._notify(container)
 
     def has_connected_rows(self, parameter: Parameter) -> bool:
         """Whether `parameter` is a list with a row connected to another node, so its rows can't be replaced.
@@ -239,7 +208,7 @@ class ListRows:
             for item in items:
                 row = parameter_list.add_child_parameter()
                 node.set_parameter_value(row.name, item)
-            self._notify(parameter_list, initial_setup=False)
+            self._notify(parameter_list)
         except Exception:
             # Converters, validators and hooks may raise anything. Undo, then let it propagate unchanged.
             self._restore(parameter_list, old_rows, old_values)
@@ -263,7 +232,7 @@ class ListRows:
         # Restored without running hooks, which could raise again and hide the error being undone.
         node.parameter_values.update(values)
 
-    def _notify(self, container: ParameterContainer, *, initial_setup: bool) -> None:
+    def _notify(self, container: ParameterContainer) -> None:
         """Run the container's validators and hooks on the value its rows now build.
 
         Its converters don't run: each row ran them on its own item. The value isn't stored, since
@@ -274,11 +243,10 @@ class ListRows:
         for validator in container.validators:
             validator(container, value)
         node._also_record_as_result(container, value)
-        if initial_setup:
-            return
         with self.hooks_running(container.name):
             node.before_value_set(parameter=container, value=value)
-            node.after_value_set(parameter=container, value=value)
+            with node._reporting_state_set_by("after_value_set"):
+                node.after_value_set(parameter=container, value=value)
 
     def _warn_hook_write(self, parameter: ParameterList, value: Any) -> None:
         """Warn, once per list, that a hook's write to it was ignored. Silent when it wouldn't change anything."""

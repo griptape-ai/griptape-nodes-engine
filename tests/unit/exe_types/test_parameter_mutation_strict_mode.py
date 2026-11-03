@@ -156,17 +156,18 @@ class TestParameterMutationDetector:
         violation = scope.violations[0]
         assert violation.severity.value == "error"
 
-    def test_no_violation_during_hydration_under_runtime_execute(self, mock_node: MockNode) -> None:
-        """Hydration runs add_parameter under RUNTIME_EXECUTE without aprocess.
+    def test_no_violation_while_values_are_set_under_runtime_execute(self, mock_node: MockNode) -> None:
+        """Setting a node's values runs add_parameter under RUNTIME_EXECUTE without aprocess.
 
-        ``_hydrate_and_run_node_inner`` calls ``set_parameter_value``
-        (firing ``before_value_set`` / ``after_value_set``) inside the
-        ``RUNTIME_EXECUTE`` scope but before ``await node.aprocess()``.
+        ``_hydrate_and_run_node_inner`` calls ``set_parameter_value`` for the
+        values a request carried, and a worker loads its copy's values, both
+        inside the ``RUNTIME_EXECUTE`` scope but before ``await node.aprocess()``.
         Real nodes (e.g. dynamic-pipeline diffuser nodes) call
-        ``add_parameter`` from those hooks. The detector must stay silent
-        until the framework enters ``aprocess_scope()``.
+        ``add_parameter`` from their value hooks, and a worker's load adds
+        the parameters the orchestrator's node has. The detector must stay
+        silent until the framework enters ``aprocess_scope()``.
         """
-        param = Parameter(name="hydration_added", type="str")
+        param = Parameter(name="added_by_a_value_hook", type="str")
         with STRICT_MODE.open_scope(
             kind=StrictModeScopeKind.RUNTIME_EXECUTE,
             subject=mock_node.name,

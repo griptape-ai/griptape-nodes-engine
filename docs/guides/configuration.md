@@ -205,6 +205,10 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 
 A value of `0` scans only the top-level directory (no subdirectories).
 
+## Running a Library's Nodes on Another Computer
+
+To run a library's nodes on a different computer, such as one with a more powerful GPU, while you keep working in the editor on your own, list the library in `distributed_execution.library_engines` with that computer's engine ID. See [Running Nodes on Another Computer](run_nodes_on_another_computer.md) for the steps and requirements.
+
 ## Workspace Directory
 
 During `gtn init`, you specify a Workspace Directory. This is the root for your projects, saved flows, and potentially project-specific settings.
