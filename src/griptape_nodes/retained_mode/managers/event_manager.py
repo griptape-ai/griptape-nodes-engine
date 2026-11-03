@@ -1169,6 +1169,7 @@ class EventManager(EngineScoped):
             request_id=result_context.get("request_id"),
             result=result_payload,
             response_topic=result_context.get("response_topic"),
+            engine_id=self.engine.get_engine_id(),
         )
 
     async def request_engine_from_worker(self, engine_id: str, request: RequestPayload) -> ResultPayload:
@@ -1357,6 +1358,7 @@ class EventManager(EngineScoped):
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
                     open_workflow_id=context.get("open_workflow_id"),
+                    engine_id=self.engine.get_engine_id(),
                 )
             else:
                 result_event = EventResultFailure(
@@ -1366,6 +1368,7 @@ class EventManager(EngineScoped):
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
                     open_workflow_id=context.get("open_workflow_id"),
+                    engine_id=self.engine.get_engine_id(),
                 )
 
         # Fired here rather than in the two dispatch methods because every path that

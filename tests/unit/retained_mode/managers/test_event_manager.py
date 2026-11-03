@@ -322,6 +322,36 @@ class TestHandleRequestLoopSafety:
 
 
 @dataclass(kw_only=True)
+class _ProbeFailure(ResultPayloadFailure):
+    """Minimal failure payload paired with _ProbeRequest."""
+
+
+class TestResultEngineId:
+    """Every result dispatch builds names the engine that sent it."""
+
+    @pytest.mark.asyncio
+    async def test_a_success_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeResult(result_details="ok"))
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+    def test_a_failure_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeFailure(result_details="no"))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert not event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+
+@dataclass(kw_only=True)
 class _ForwardableProbeRequest(RequestPayload):
     """Minimal request used to drive the worker-forwarding path in tests."""
 

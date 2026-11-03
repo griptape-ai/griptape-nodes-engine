@@ -386,6 +386,9 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
             the request ran in. A result payload's own `workflow_id` is something else. For
             example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
             Save As is a copy that is not open.
+        engine_id: The engine that sent the result. A client that reached it through a session
+            topic learns from this which engine holds the session. None when the result was built
+            outside the engine's dispatch, such as by the MCP server or a bootstrap script.
     """
 
     request: P
@@ -394,6 +397,7 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     response_topic: str | None = None
     retained_mode: str | None = None
     open_workflow_id: str | None = None
+    engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""

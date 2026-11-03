@@ -51,7 +51,7 @@ def _events() -> dict[str, BaseEvent]:
         "EventRequest": EventRequest(request=_request(), request_id="r1", response_topic="t"),
         "EventRequestBatch": EventRequestBatch(requests=[EventRequest(request=_request(), request_id="a")]),
         "EventResultSuccess": EventResultSuccess(
-            request=_request(), result=_success(), request_id="r1", retained_mode="m"
+            request=_request(), result=_success(), request_id="r1", retained_mode="m", engine_id="e1"
         ),
         "EventResultFailure": EventResultFailure(
             request=_request(),
@@ -149,6 +149,7 @@ def test_non_payload_fields_survive_exclusion() -> None:
     serialized = converters.engine.unstructure(_events()["EventResultSuccess"])
     assert serialized["request_id"] == "r1"
     assert serialized["retained_mode"] == "m"
+    assert serialized["engine_id"] == "e1"
     assert "response_topic" in serialized
 
 
@@ -173,6 +174,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "response_topic",
         "retained_mode",
         "open_workflow_id",
+        "engine_id",
         "event_type",
         "request_type",
         "result_type",
