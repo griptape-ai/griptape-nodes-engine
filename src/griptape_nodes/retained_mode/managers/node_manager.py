@@ -3534,13 +3534,7 @@ class NodeManager(EngineScoped):
             if workflow is not None:
                 node = workflow.objects.get_as_type(request.node_name, BaseNode)
             if node is None:
-                return ExecuteNodeResultFailure(
-                    result_details=(
-                        f"Node '{request.node_name}' not found in ObjectManager on orchestrator. "
-                        "Refusing to fabricate a fresh node from metadata; the node was dropped "
-                        "from the live map and must be re-created via CreateNodeRequest."
-                    ),
-                )
+                return ExecuteNodeResultFailure(result_details=self._orchestrator_node_missing(request, workflow))
             library_name = node.metadata.get("library")
 
         # Forwarding to a worker exits the orchestrator's local code path before
@@ -4015,6 +4009,20 @@ class NodeManager(EngineScoped):
             EventRequest(request=cancel_request),
             worker_engine_id=worker_engine_id,
             worker_request_topic=worker_request_topic,
+        )
+
+    @staticmethod
+    def _orchestrator_node_missing(request: ExecuteNodeRequest, workflow: WorkflowRuntime | None) -> str:
+        """Why the orchestrator could not find the node `request` executes."""
+        if workflow is None:
+            return (
+                f"Attempted to execute node '{request.node_name}'. Failed because the request named no "
+                "workflow to find it in. Send it from the workflow the node belongs to."
+            )
+        return (
+            f"Node '{request.node_name}' not found in ObjectManager on orchestrator. "
+            "Refusing to fabricate a fresh node from metadata; the node was dropped "
+            "from the live map and must be re-created via CreateNodeRequest."
         )
 
     @handles(CancelExecuteNodeRequest)

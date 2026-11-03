@@ -20,6 +20,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
@@ -386,6 +387,18 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
             result = await engine.ahandle_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+
+    @pytest.mark.asyncio
+    async def test_naming_no_workflow_on_the_orchestrator_says_so(self, engine: Engine) -> None:
+        """OPTIONAL_WORKFLOW never falls back to the open workflow, so the node's workflow must be named."""
+        flow_name = _create_canvas(engine, _open_workflow(engine).workflow_id)
+        node_name = _create_node(engine, flow_name, "node")
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            result = await engine.ahandle_request(ExecuteNodeRequest(node_name=node_name, parameter_values={}))
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "named no workflow" in str(result.result_details)
 
 
 class TestExecuteNodeForwardedToAWorker:
