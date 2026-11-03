@@ -758,6 +758,26 @@ class Engine:
             return None
         return open_workflows[0]
 
+    def only_open_workflow_or_none(self) -> WorkflowRuntime | None:
+        """The engine's one open workflow, or None when none is open.
+
+        For the few OPTIONAL_WORKFLOW handlers whose clients name no workflow on the request
+        envelope yet and rely on the one open. Goes once clients send it.
+
+        Raises:
+            WorkflowNotNamedError: Several workflows are open.
+        """
+        open_workflows = self._open_workflows.all_open()
+        if len(open_workflows) > 1:
+            msg = (
+                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
+                "open and the request did not name one."
+            )
+            raise WorkflowNotNamedError(msg)
+        if not open_workflows:
+            return None
+        return open_workflows[0]
+
     def bound_live_workflow_or_none(self) -> WorkflowRuntime | None:
         """The workflow the current work is bound to, while it is still open here or kept by this worker.
 

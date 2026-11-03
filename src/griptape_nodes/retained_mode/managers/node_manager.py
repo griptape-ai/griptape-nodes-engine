@@ -1058,7 +1058,7 @@ class NodeManager(EngineScoped):
                     try:
                         existing_node = self.get_node_by_name_in(workflow, node_name)
                         nodes_to_add.append(existing_node)
-                    except KeyError:
+                    except ValueError:
                         warning_details = (
                             f"Attempted to add node '{node_name}' to NodeGroup '{node.name}'. "
                             f"Failed because node was not found."
@@ -3497,8 +3497,23 @@ class NodeManager(EngineScoped):
         return ResolveNodeResultSuccess(result_details=details)
 
     @handles(ExecuteNodeRequest)
-    async def on_execute_node_request(  # noqa: C901
+    async def on_execute_node_request(
         self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Execute a node in `workflow` (see `_execute_node`).
+
+        Clients, and the MCP server, name no workflow yet: until they do, the orchestrator looks the node up
+        in the only open workflow, bound while it runs as a named one would be.
+        """
+        if workflow is None and not self.engine.library_manager.is_worker:
+            fallback = self.engine.only_open_workflow_or_none()
+            if fallback is not None:
+                with self.engine.bind_workflow(fallback):
+                    return await self._execute_node(request, fallback)
+        return await self._execute_node(request, workflow)
+
+    async def _execute_node(  # noqa: C901
+        self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None
     ) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
 
@@ -5697,7 +5712,7 @@ class NodeManager(EngineScoped):
         else:
             try:
                 node = self.get_node_by_name_in(workflow, node_name)
-            except KeyError as err:
+            except ValueError as err:
                 details = f"Attempted to rename Parameter '{request.parameter_name}' on Node '{node_name}'. Failed because the Node could not be found. Error: {err}"
                 return RenameParameterResultFailure(result_details=details)
 
@@ -6582,7 +6597,7 @@ class NodeManager(EngineScoped):
         else:
             try:
                 node = self.get_node_by_name_in(workflow, node_name)
-            except KeyError as err:
+            except ValueError as err:
                 details = f"Attempted to reorder item in ParameterList '{request.parameter_list_name}' on Node '{node_name}'. Failed because the Node could not be found. Error: {err}"
                 return ReorderParameterListItemResultFailure(result_details=details)
 

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import DataNode
+from griptape_nodes.exe_types.node_types import BaseNode, DataNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -41,6 +41,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
     RemoveParameterFromNodeResultFailure,
     RemoveParameterFromNodeResultSuccess,
+    RenameParameterRequest,
+    RenameParameterResultFailure,
+    ReorderParameterListItemRequest,
+    ReorderParameterListItemResultFailure,
     SetParameterValueRequest,
     SetParameterValueResultFailure,
     SetParameterValueResultSuccess,
@@ -389,13 +393,49 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
 
     @pytest.mark.asyncio
-    async def test_naming_no_workflow_on_the_orchestrator_says_so(self, engine: Engine) -> None:
-        """OPTIONAL_WORKFLOW never falls back to the open workflow, so the node's workflow must be named."""
-        flow_name = _create_canvas(engine, _open_workflow(engine).workflow_id)
-        node_name = _create_node(engine, flow_name, "node")
+    async def test_an_unbound_request_runs_the_node_of_the_only_open_workflow(self, engine: Engine) -> None:
+        """As the MCP server sends it: no envelope id and no binding."""
+        workflow = _open_workflow(engine)
+        node_name = _create_node(engine, _create_canvas(engine), "node")
+        seen: list[WorkflowRuntime | None] = []
 
-        with engine.bind_workflow(NO_WORKFLOW):
+        def process(_node: BaseNode) -> None:
+            seen.append(engine.current_workflow_or_none())
+
+        with patch.object(_ValueNode, "process", process):
             result = await engine.ahandle_request(ExecuteNodeRequest(node_name=node_name, parameter_values={}))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert seen == [workflow]
+
+    @pytest.mark.parametrize(
+        ("request_payload", "failure_type"),
+        [
+            (
+                RenameParameterRequest(node_name="missing", parameter_name="x", new_parameter_name="y"),
+                RenameParameterResultFailure,
+            ),
+            (
+                ReorderParameterListItemRequest(
+                    node_name="missing", parameter_list_name="items", from_index=0, to_index=1
+                ),
+                ReorderParameterListItemResultFailure,
+            ),
+        ],
+    )
+    def test_a_missing_node_fails_with_the_requests_own_failure(
+        self, engine: Engine, request_payload: RequestPayload, failure_type: type[ResultPayload]
+    ) -> None:
+        _open_workflow(engine)
+
+        result = engine.handle_request(request_payload)
+
+        assert isinstance(result, failure_type), result.result_details
+        assert "could not be found" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_naming_no_workflow_with_none_open_says_so(self, engine: Engine) -> None:
+        result = await engine.ahandle_request(ExecuteNodeRequest(node_name="node", parameter_values={}))
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "named no workflow" in str(result.result_details)
