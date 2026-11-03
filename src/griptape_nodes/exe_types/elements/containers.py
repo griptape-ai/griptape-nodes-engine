@@ -293,6 +293,17 @@ class ParameterList(ParameterContainer):
         data["row_input_types"] = self.row_input_types
         return data
 
+    def save_dict(self) -> dict[str, Any]:
+        """Save the item types, which the setters take, rather than the list-shaped types the getters return.
+
+        Replaying `list[Thing]` through the setters would make the list a `list[list[Thing]]`.
+        """
+        data = super().save_dict()
+        data["type"] = super()._custom_getter_for_property_type()
+        data["input_types"] = super()._custom_getter_for_property_input_types()
+        data["output_type"] = super()._custom_getter_for_property_output_type()
+        return data
+
     def _custom_getter_for_property_type(self) -> str:
         base_type = super()._custom_getter_for_property_type()
         result = f"list[{base_type}]"
@@ -501,10 +512,11 @@ class ParameterList(ParameterContainer):
                 raise ValueError(msg)
 
         if isinstance(child, Parameter):
-            # Saved rows also need the container's item converters and input types.
+            # Saved rows also need the container's item converters and input types. A row keeps the
+            # input types it was saved with, since a node may type each row on its own.
             missing = [converter for converter in self._item_converters if converter not in child._converters]
             child._converters = [*missing, *child._converters]
-            self._widen_row_input_types(child)
+            child.input_types = list(dict.fromkeys([*child.input_types, *self.row_input_types]))
         super().add_child(child)
 
         # Mark the parent node as unresolved since the parameter structure changed
