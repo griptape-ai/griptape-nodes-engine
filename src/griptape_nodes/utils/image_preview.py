@@ -1,12 +1,13 @@
 """Image preview utilities for generating thumbnails and previews."""
 
 import base64
-import io
 from pathlib import Path
 
-from PIL import Image, ImageOps
-
+from griptape_nodes.image import GriptapeImage, normalize_format_name, open_image
 from griptape_nodes.retained_mode.griptape_nodes import logger
+
+# Color models that JPEG/WEBP previews are flattened out of before encoding
+_CONVERT_TO_RGB_FOR_LOSSY = {"RGBA", "Grayscale+Alpha", "Palette"}
 
 
 def create_image_preview(
@@ -32,33 +33,11 @@ def create_image_preview(
         return None
 
     try:
-        # Open and resize the image
-        with Image.open(image_path) as raw_img:
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            img = ImageOps.exif_transpose(raw_img)
-            # Convert to RGB if necessary (for WebP/JPEG output)
-            if image_format.upper() in ("WEBP", "JPEG") and img.mode in ("RGBA", "LA", "P"):
-                converted_img = img.convert("RGB")
-            else:
-                converted_img = img
-
-            # Calculate new size maintaining aspect ratio
-            converted_img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-
-            # Save to bytes buffer
-            buffer = io.BytesIO()
-            converted_img.save(buffer, format=image_format, quality=quality, optimize=True)
-            buffer.seek(0)
-
-            # Convert to base64
-            image_bytes = buffer.getvalue()
-            base64_data = base64.b64encode(image_bytes).decode("utf-8")
-
-            # Create data URL
-            mime_type = f"image/{image_format.lower()}"
-            data_url = f"data:{mime_type};base64,{base64_data}"
-
-            logger.debug(f"Created preview for {image_path}: {img.size} -> {len(image_bytes)} bytes")
+        with open_image(image_path) as source:
+            data_url = _render_preview_data_url(source, max_width, max_height, quality, image_format)
+            logger.debug(
+                f"Created preview for {image_path}: {source.width}x{source.height} -> {len(data_url)} characters"
+            )
             return data_url
 
     except Exception as e:
@@ -96,33 +75,9 @@ def create_image_preview_from_bytes(
             logger.debug("SVG file detected, cannot create preview with PIL (vector graphics not supported)")
             return None
 
-        # Open image from bytes
-        with Image.open(io.BytesIO(image_bytes)) as raw_img:
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            img = ImageOps.exif_transpose(raw_img)
-            # Convert to RGB if necessary (for WebP/JPEG output)
-            if image_format.upper() in ("WEBP", "JPEG") and img.mode in ("RGBA", "LA", "P"):
-                converted_img = img.convert("RGB")
-            else:
-                converted_img = img
-
-            # Calculate new size maintaining aspect ratio
-            converted_img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-
-            # Save to bytes buffer
-            buffer = io.BytesIO()
-            converted_img.save(buffer, format=image_format, quality=quality, optimize=True)
-            buffer.seek(0)
-
-            # Convert to base64
-            preview_bytes = buffer.getvalue()
-            base64_data = base64.b64encode(preview_bytes).decode("utf-8")
-
-            # Create data URL
-            mime_type = f"image/{image_format.lower()}"
-            data_url = f"data:{mime_type};base64,{base64_data}"
-
-            logger.debug(f"Created preview from bytes: {len(image_bytes)} -> {len(preview_bytes)} bytes")
+        with open_image(image_bytes) as source:
+            data_url = _render_preview_data_url(source, max_width, max_height, quality, image_format)
+            logger.debug(f"Created preview from bytes: {len(image_bytes)} bytes -> {len(data_url)} characters")
             return data_url
 
     except Exception as e:
@@ -143,18 +98,38 @@ def get_image_info(image_path: Path) -> dict | None:
         image_path: Path to the image file
 
     Returns:
-        Dictionary with image info (width, height, format, mode), or None if failed
+        Dictionary with image info (width, height, format, color_space), or None if failed
     """
     try:
-        with Image.open(image_path) as raw_img:
-            img = ImageOps.exif_transpose(raw_img)
+        with open_image(image_path) as source, source.exif_transposed() as img:
             return {
                 "width": img.width,
                 "height": img.height,
-                "format": img.format,
-                "mode": img.mode,
+                "format": source.format,
+                "color_space": img.color_space,
                 "size_bytes": image_path.stat().st_size,
             }
     except Exception as e:
         logger.warning(f"Failed to get image info for {image_path}: {e}")
         return None
+
+
+def _render_preview_data_url(
+    source: GriptapeImage, max_width: int, max_height: int, quality: int, image_format: str
+) -> str:
+    """Shrink ``source`` to fit the bounds and return it encoded as a base64 data URL."""
+    # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
+    with source.exif_transposed() as upright:
+        # Convert to RGB if necessary (for WebP/JPEG output)
+        if normalize_format_name(image_format) in ("WEBP", "JPEG") and upright.color_space in _CONVERT_TO_RGB_FOR_LOSSY:
+            converted = upright.to_rgb()
+        else:
+            converted = upright
+
+        # Calculate new size maintaining aspect ratio
+        with converted, converted.thumbnail(max_width, max_height) as preview:
+            preview_bytes = preview.encode(image_format, quality=quality, optimize=True)
+
+    base64_data = base64.b64encode(preview_bytes).decode("utf-8")
+    mime_type = f"image/{image_format.lower()}"
+    return f"data:{mime_type};base64,{base64_data}"
