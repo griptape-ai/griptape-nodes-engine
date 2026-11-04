@@ -111,8 +111,6 @@ RESERVED_BUNDLE_PATHS: tuple[Path, ...] = (
     Path("project.yml"),
 )
 
-# TODO: Read and write operations should all be using ReadtoFile and WriteToFile.  https://github.com/griptape-ai/griptape-nodes/issues/4397
-
 
 class ResolvedFileReference(NamedTuple):
     """A static file reference resolved for bundling.
