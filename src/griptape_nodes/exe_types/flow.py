@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from queue import Queue
@@ -12,13 +12,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("griptape_nodes")
-
-
-class CurrentNodes(NamedTuple):
-    """The two relevant nodes during flow execution."""
-
-    current_control_node: str | None
-    current_resolving_node: str | None
 
 
 # The flow will own all of the nodes
