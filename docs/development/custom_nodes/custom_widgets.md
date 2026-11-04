@@ -62,7 +62,7 @@ self.add_parameter(
 
 ## Widget JS Function Signature
 
-Widgets are ES module default exports. The function receives a container DOM element and a props object, and must return a cleanup function:
+Widgets are ES module default exports. The function receives a container DOM element and a props object, and must return a cleanup function. To also receive live updates, return an object instead (see [Live Parameter Sync](#live-parameter-sync)):
 
 ```javascript
 export default function MyWidget(container, props) {
@@ -87,6 +87,84 @@ export default function MyWidget(container, props) {
 | `onChange` | `function` | Callback to send updated value to the framework  |
 | `disabled` | `boolean`  | Whether the widget should be read-only           |
 | `height`   | `number`   | Suggested height in pixels (may be 0 or absent)  |
+
+## Live Parameter Sync
+
+By default a widget only sees a value change after it is committed to the backend. For a widget that mirrors other parameters on the node, such as a crop editor tied to `left`, `top`, `width` and `height` parameters, that is too late. The user drags a slider on the node and expects the widget to follow during the drag.
+
+The `synced_parameters` option on the `Widget` trait lists the parameters a widget should track in real time. Live values exist only in the editor. They are not sent to the backend during a drag. On commit (slider release, color picker mouse-up) the normal backend update takes over.
+
+### Declaring Synced Parameters
+
+```python
+from griptape_nodes.exe_types.param_types.parameter_dict import ParameterDict
+from griptape_nodes.traits.widget import Widget
+
+self.add_parameter(
+    ParameterDict(
+        name="my_editor",
+        default_value={"left": 0, "top": 0, "width": 100, "height": 100},
+        traits={
+            Widget(
+                name="MyEditorWidget",
+                library="My Library",
+                synced_parameters=["left", "top", "width", "height"],
+            )
+        },
+    )
+)
+```
+
+- Each name in `synced_parameters` must match a key in the widget's value dict.
+- If a parameter name differs from the widget's dict key, the widget does the mapping.
+- Nodes do not need connection hooks or locked-state handling. The editor works out which synced parameters are locked and passes that to the widget.
+
+### Receiving Updates in the Widget
+
+A widget opts into live updates by returning an object with `cleanup` and `update` instead of a bare cleanup function. The editor calls `update` whenever a synced parameter changes during interaction, or when its locked state changes.
+
+```javascript
+export default function MyEditorWidget(container, props) {
+  let mode = "idle"; // set to "dragging" etc. while the user interacts with the widget
+  let left = 0;
+  let top = 0;
+
+  function handleUpdate(newProps) {
+    const v = newProps.value || {};
+
+    // Parameters with incoming connections. Treat these as read-only.
+    const locked = v.locked || [];
+
+    // Ignore incoming values while the user is dragging inside the widget,
+    // otherwise the widget fights the live updates.
+    if (mode === "idle") {
+      if ("left" in v) left = v.left;
+      if ("top" in v) top = v.top;
+    }
+
+    updateLockedVisuals(locked);
+    render();
+  }
+
+  // ... setup, event listeners, render() ...
+
+  return { cleanup, update: handleUpdate };
+}
+```
+
+**Value passed to `update`:**
+
+| Key                    | Description                                                                          |
+| ---------------------- | ------------------------------------------------------------------------------------ |
+| Synced parameter names | Live value for parameters being dragged, otherwise the last committed backend value  |
+| `locked`               | `string[]` of synced parameters that have incoming connections. Always present.      |
+
+**Widget requirements:**
+
+1. **Return `{ cleanup, update }`.** A widget that returns only a cleanup function, or nothing, does not receive live updates.
+1. **Guard active interaction.** Skip incoming values while the user is dragging a handle or otherwise editing inside the widget.
+1. **Handle partial updates.** Only the parameters being dragged carry live values. The rest reflect the last committed state.
+1. **Respect `locked`.** Parameters in `locked` are driven by a connection. The editor never sends live overrides for them, and the widget should also disable direct manipulation of them, for example by showing a not-allowed cursor on a locked handle.
 
 ## Critical Patterns and Pitfalls
 
