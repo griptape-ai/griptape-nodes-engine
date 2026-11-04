@@ -520,8 +520,7 @@ class FileWriter(EngineScoped):
            THAT slot. Incrementing `_index` against the user's original macro produces
            consistent zero-padded width across the sequence (`v001 → v002 → v003`).
         2. Otherwise, synthesize an `{stem}_{_index}{ext}` macro from the resolved string.
-           This is the original behavior for plain string paths (`output.png` →
-           `output_1.png`). For seeded MacroPaths it would lose padding (`v003 → v003_1`),
+           This handles plain string paths (`output.png` → `output_1.png`). For seeded MacroPaths it would lose padding (`v003 → v003_1`),
            which is why path 1 catches them first.
         """
         walk = self._plan_index_walk(request, file_path, path_display)
