@@ -323,7 +323,6 @@ class ParameterList(ParameterContainer):
         super()._custom_setter_for_property_type(value)
 
     def _custom_setter_for_property_input_types(self, value: list[str] | None) -> None:
-        # If we are setting a type, we need to propagate this to our children as well.
         for child in self._children:
             if isinstance(child, Parameter):
                 child.input_types = value
@@ -509,7 +508,7 @@ class ParameterList(ParameterContainer):
             missing = [converter for converter in self._item_converters if converter not in child._converters]
             child._converters = [*missing, *child._converters]
             if child._input_types:
-                # Engine 0.105.0 and 0.106.0 saved rows with the list variants that the row now derives.
+                # Engine 0.105.0 and 0.106.0 saved rows with the list variants, which would otherwise repeat.
                 child._input_types = _without_list_variants(child._input_types)
         super().add_child(child)
 
