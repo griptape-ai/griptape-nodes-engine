@@ -819,7 +819,7 @@ class TestListDirectorySequencesRequest:
         (temp_dir / "subdir").mkdir()
 
         request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
-        result = os_manager.on_list_directory_sequences_request(request)
+        result = os_manager.sequences.on_list_directory_sequences_request(request)
 
         assert isinstance(result, ListDirectorySequencesResultSuccess)
         assert len(result.sequences) == 1
@@ -833,7 +833,7 @@ class TestListDirectorySequencesRequest:
         (temp_dir / "readme.txt").write_text("notes")
 
         request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
-        result = os_manager.on_list_directory_sequences_request(request)
+        result = os_manager.sequences.on_list_directory_sequences_request(request)
 
         assert isinstance(result, ListDirectorySequencesResultSuccess)
         assert result.sequences == []
@@ -851,7 +851,7 @@ class TestListDirectorySequencesRequest:
             workspace_only=False,
             sequence_options=SequenceScanOptions(padding=4),
         )
-        result = os_manager.on_list_directory_sequences_request(request)
+        result = os_manager.sequences.on_list_directory_sequences_request(request)
 
         assert isinstance(result, ListDirectorySequencesResultSuccess)
         assert len(result.sequences) == 1
@@ -863,7 +863,7 @@ class TestListDirectorySequencesRequest:
         request = ListDirectorySequencesRequest(directory_path=str(temp_dir / "nonexistent"), workspace_only=False)
         from griptape_nodes.retained_mode.events.os_events import ListDirectorySequencesResultFailure
 
-        result = os_manager.on_list_directory_sequences_request(request)
+        result = os_manager.sequences.on_list_directory_sequences_request(request)
 
         assert isinstance(result, ListDirectorySequencesResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
@@ -898,7 +898,7 @@ class TestDeduceSequencesFromFileListRequest:
         paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1
@@ -911,7 +911,7 @@ class TestDeduceSequencesFromFileListRequest:
         """An empty file list returns success with no sequences."""
         os_manager = engine.os_manager
         request = DeduceSequencesFromFileListRequest(file_paths=[])
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
@@ -927,7 +927,7 @@ class TestDeduceSequencesFromFileListRequest:
         request = DeduceSequencesFromFileListRequest(
             file_paths=["render.0001.exr", "render.0002.exr"],
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1
@@ -942,7 +942,7 @@ class TestDeduceSequencesFromFileListRequest:
         paths.append(str(temp_dir / "subdir"))  # bare name with no sequence token
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1  # subdir produces no sequence
@@ -958,7 +958,7 @@ class TestDeduceSequencesFromFileListRequest:
         paths_b = self._write_frames(dir_b, "comp", "exr", [10, 11])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths_a + paths_b)
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 2  # noqa: PLR2004
@@ -970,7 +970,7 @@ class TestDeduceSequencesFromFileListRequest:
         p.write_text("notes")
 
         request = DeduceSequencesFromFileListRequest(file_paths=[str(p)])
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
@@ -987,7 +987,7 @@ class TestDeduceSequencesFromFileListRequest:
             file_paths=paths_4 + paths_3,
             sequence_options=SequenceScanOptions(padding=4),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1
@@ -1006,7 +1006,7 @@ class TestDeduceSequencesFromFileListRequest:
                 end_number=4,
             ),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1
@@ -1030,7 +1030,7 @@ class TestDeduceSequencesFromFileListRequest:
             file_paths=paths,
             sequence_options=SequenceScanOptions(start_number=100),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
@@ -1044,7 +1044,7 @@ class TestDeduceSequencesFromFileListRequest:
             file_paths=paths,
             sequence_options=SequenceScanOptions(start_number=-1),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == SequenceScanFailureReason.INVALID_BOUNDS
@@ -1058,7 +1058,7 @@ class TestDeduceSequencesFromFileListRequest:
             file_paths=paths,
             sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
@@ -1074,7 +1074,7 @@ class TestDeduceSequencesFromFileListRequest:
             file_paths=paths,
             sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
@@ -1091,7 +1091,7 @@ class TestDeduceSequencesFromFileListRequest:
             file_paths=paths,
             sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
@@ -1104,10 +1104,10 @@ class TestDeduceSequencesFromFileListRequest:
 
         request = DeduceSequencesFromFileListRequest(file_paths=["render.0001.exr"])
         with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.scan_sequences_from_filenames",
+            "griptape_nodes.retained_mode.managers.filesystem.sequences.scan_sequences_from_filenames",
             side_effect=RuntimeError("boom"),
         ):
-            result = os_manager.on_deduce_sequences_from_file_list_request(request)
+            result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == FileIOFailureReason.UNKNOWN
@@ -1120,7 +1120,7 @@ class TestDeduceSequencesFromFileListRequest:
         paths = self._write_frames(temp_dir, "render", "exr", [1])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
@@ -1137,7 +1137,7 @@ class TestDeduceSequencesFromFileListRequest:
                 padding=0,  # only match zero-padded (token-less) sequences
             ),
         )
-        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+        result = os_manager.sequences.on_deduce_sequences_from_file_list_request(request)
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
 
@@ -2242,13 +2242,17 @@ class TestGetNextUnusedFilenameRequest:
         # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
         sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
         sequence_partial = partial_resolve(sequence_macro.template, sequence_macro.segments, {}, secrets_manager)
-        sequence_glob = os_manager._build_glob_pattern_from_partially_resolved(sequence_partial.segments, "_index")
+        sequence_glob = os_manager.indexed_filenames.build_glob_pattern_from_partially_resolved(
+            sequence_partial.segments, "_index"
+        )
         assert sequence_glob == "/anywhere/render_v*.png"
 
         # `NumericPaddingFormat` (legacy): fixed-width `???` (one `?` per digit).
         legacy_macro = ParsedMacro("/anywhere/render_v{_index:03}.png")
         legacy_partial = partial_resolve(legacy_macro.template, legacy_macro.segments, {}, secrets_manager)
-        legacy_glob = os_manager._build_glob_pattern_from_partially_resolved(legacy_partial.segments, "_index")
+        legacy_glob = os_manager.indexed_filenames.build_glob_pattern_from_partially_resolved(
+            legacy_partial.segments, "_index"
+        )
         assert legacy_glob == "/anywhere/render_v???.png"
 
 

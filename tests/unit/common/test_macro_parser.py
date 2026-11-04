@@ -1196,7 +1196,7 @@ class TestParseSequenceSlotShorthand:
         `{###}` shorthand creates a sequence slot; `{_index:03}` continues
         to parse as a plain padded variable. OSManager still treats it as
         a sequence slot via the legacy ``NumericPaddingFormat`` heuristic
-        (the OR-branch documented on ``_has_sequence_slot_marker``), but
+        (the OR-branch documented on ``has_sequence_slot_marker``), but
         that's an OSManager concern — the parser's output stays cleanly
         separated.
         """
