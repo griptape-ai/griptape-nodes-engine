@@ -1967,10 +1967,11 @@ class NodeManager(EngineScoped):
 
     @handles(GetConnectedFileDestinationRequest)
     def on_get_connected_file_destination_request(
-        self, request: GetConnectedFileDestinationRequest
+        self, request: GetConnectedFileDestinationRequest, workflow: WorkflowRuntime
     ) -> GetConnectedFileDestinationResultSuccess | GetConnectedFileDestinationResultFailure:
         try:
             found = self._read_connected_destination(
+                workflow,
                 request.node_name,
                 request.parameter_name,
                 FileDestinationProvider,
@@ -1982,10 +1983,11 @@ class NodeManager(EngineScoped):
 
     @handles(GetConnectedDirectoryDestinationRequest)
     def on_get_connected_directory_destination_request(
-        self, request: GetConnectedDirectoryDestinationRequest
+        self, request: GetConnectedDirectoryDestinationRequest, workflow: WorkflowRuntime
     ) -> GetConnectedDirectoryDestinationResultSuccess | GetConnectedDirectoryDestinationResultFailure:
         try:
             found = self._read_connected_destination(
+                workflow,
                 request.node_name,
                 request.parameter_name,
                 DirectoryDestinationProvider,
@@ -1997,10 +1999,11 @@ class NodeManager(EngineScoped):
 
     @handles(GetConnectedFileSequenceDestinationRequest)
     def on_get_connected_file_sequence_destination_request(
-        self, request: GetConnectedFileSequenceDestinationRequest
+        self, request: GetConnectedFileSequenceDestinationRequest, workflow: WorkflowRuntime
     ) -> GetConnectedFileSequenceDestinationResultSuccess | GetConnectedFileSequenceDestinationResultFailure:
         try:
             found = self._read_connected_destination(
+                workflow,
                 request.node_name,
                 request.parameter_name,
                 FileSequenceDestinationProvider,
@@ -2012,6 +2015,7 @@ class NodeManager(EngineScoped):
 
     def _read_connected_destination[ProviderT, SpecT](
         self,
+        workflow: WorkflowRuntime,
         node_name: str,
         parameter_name: str,
         provider_type: type[ProviderT],
@@ -2024,7 +2028,7 @@ class NodeManager(EngineScoped):
                 settings node has no destination set.
         """
         target = f"'{node_name}.{parameter_name}'"
-        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
+        node = workflow.objects.get_as_type(node_name, BaseNode)
         if node is None:
             msg = (
                 f"Attempted to read the output settings connected to {target}. "
@@ -2038,7 +2042,7 @@ class NodeManager(EngineScoped):
             )
             raise _ConnectedDestinationError(msg)
 
-        connection_mgr = self.engine.flow_manager.get_connections()
+        connection_mgr = workflow.flows.connections
         connection_ids = connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, [])
         sources = [connection_mgr.connections[connection_id].source_node for connection_id in connection_ids]
         provider = next((source for source in sources if isinstance(source, provider_type)), None)
