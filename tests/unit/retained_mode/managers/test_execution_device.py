@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 def _no_system_compute(engine: Engine) -> None:
     """Drop the real machine's compute instance so these tests describe a machine, not this one.
 
-    OSManager registers one system compute instance at boot advertising whatever this host has.
+    ResourceManager registers one system compute instance at boot advertising whatever this host has.
     A test that adds a second is not describing a second GPU -- there is one system instance, and
     standing in for it is the only way to assert the choice for a machine we do not have.
     """
