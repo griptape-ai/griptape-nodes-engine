@@ -958,7 +958,7 @@ class FlowManager(EngineScoped):
                 name_to_parent_name[flow_name] = new_name
 
         # Let the Node Manager know about the change, too.
-        self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
+        self.engine.node_manager.handle_flow_rename(workflow, old_name=old_name, new_name=new_name)
 
     def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
         """Connect two parameters in the open workflow, outside dispatch.
@@ -990,7 +990,7 @@ class FlowManager(EngineScoped):
             source_node_name = source_node.name
         if source_node is None:
             try:
-                source_node = self.engine.node_manager.get_node_by_name(source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError as err:
                 details = f'Connection failed: "{source_node_name}" does not exist. Error: {err}.'
 
@@ -1009,7 +1009,7 @@ class FlowManager(EngineScoped):
             target_node_name = target_node.name
         if target_node is None:
             try:
-                target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                target_node = self.engine.node_manager.get_node_by_name_in(workflow, target_node_name)
             except ValueError as err:
                 details = f'Connection failed: "{target_node_name}" does not exist. Error: {err}.'
                 return CreateConnectionResultFailure(result_details=details)
@@ -1018,7 +1018,7 @@ class FlowManager(EngineScoped):
         # Get the parent flows.
         source_flow_name = None
         try:
-            source_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(source_node_name)
+            source_flow_name = workflow.nodes.parent_flow_name(source_node_name)
             self.get_flow_by_name_in(workflow, source_flow_name)
         except KeyError as err:
             details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" failed: {err}.'
@@ -1026,7 +1026,7 @@ class FlowManager(EngineScoped):
 
         target_flow_name = None
         try:
-            target_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(target_node_name)
+            target_flow_name = workflow.nodes.parent_flow_name(target_node_name)
             self.get_flow_by_name_in(workflow, target_flow_name)
         except KeyError as err:
             details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" failed: {err}.'
@@ -1354,7 +1354,7 @@ class FlowManager(EngineScoped):
             source_node_name = source_node.name
         if source_node is None:
             try:
-                source_node = self.engine.node_manager.get_node_by_name(source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError as err:
                 details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1372,7 +1372,7 @@ class FlowManager(EngineScoped):
             target_node_name = target_node.name
         if target_node is None:
             try:
-                target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                target_node = self.engine.node_manager.get_node_by_name_in(workflow, target_node_name)
             except ValueError as err:
                 details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1382,7 +1382,7 @@ class FlowManager(EngineScoped):
         # Get the parent flows.
         source_flow_name = None
         try:
-            source_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(source_node_name)
+            source_flow_name = workflow.nodes.parent_flow_name(source_node_name)
             self.get_flow_by_name_in(workflow, source_flow_name)
         except KeyError as err:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
@@ -1391,7 +1391,7 @@ class FlowManager(EngineScoped):
 
         target_flow_name = None
         try:
-            target_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(target_node_name)
+            target_flow_name = workflow.nodes.parent_flow_name(target_node_name)
             self.get_flow_by_name_in(workflow, target_flow_name)
         except KeyError as err:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
@@ -1648,7 +1648,7 @@ class FlowManager(EngineScoped):
         flow_name = request.flow_name
         if not flow_name:
             try:
-                flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
+                flow_name = workflow.nodes.parent_flow_name(node_name)
             except KeyError as err:
                 details = f"Could not derive parent flow for node '{node_name}': {err}"
                 return StartFlowFromNodeResultFailure(validation_exceptions=[err], result_details=details)
@@ -1834,7 +1834,7 @@ class FlowManager(EngineScoped):
             return start_nodes[0]
 
         try:
-            return self.engine.node_manager.get_node_by_name(start_node_name)
+            return self.engine.node_manager.get_node_by_name_in(workflow, start_node_name)
         except ValueError as err:
             details = f"Cannot start subflow '{flow_name}'. Start node '{start_node_name}' not found: {err}"
             return StartLocalSubflowResultFailure(result_details=details)
@@ -2651,12 +2651,12 @@ class FlowManager(EngineScoped):
             return False
         return self._flow_is_running(flows)
 
-    def running_flow_is_stopping_after_failure(self) -> bool:
-        """True while the running flow has failed and is waiting for its other nodes to finish."""
-        flows = self._current_flows_or_none()
-        if flows is None or flows.global_control_flow_machine is None:
+    def running_flow_is_stopping_after_failure(self, workflow: WorkflowRuntime) -> bool:
+        """True while the workflow's running flow has failed and is waiting for its other nodes to finish."""
+        machine = workflow.flows.global_control_flow_machine
+        if machine is None:
             return False
-        return flows.global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+        return machine.context.resolution_machine.is_stopping_after_failure()
 
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
@@ -2792,9 +2792,21 @@ class FlowManager(EngineScoped):
         return queue_item.node
 
     def clear_execution_queue(self, flow: ControlFlow) -> None:
-        """Clear all nodes from the global execution queue."""
-        if self._global_control_flow_machine and self._global_control_flow_machine.context.flow_name == flow.name:
-            self._global_flow_queue.queue.clear()
+        """Clear all nodes from the global execution queue, nothing when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `clear_execution_queue_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return
+        self.clear_execution_queue_in(workflow, flow)
+
+    def clear_execution_queue_in(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
+        """Clear all nodes from the workflow's execution queue when `flow` is the one it is running."""
+        flows = workflow.flows
+        machine = flows.global_control_flow_machine
+        if machine and machine.context.flow_name == flow.name:
+            flows.global_flow_queue.queue.clear()
 
     def has_connection(
         self,
@@ -2844,15 +2856,10 @@ class FlowManager(EngineScoped):
             if machine is not None:
                 await machine.start_flow(start_node, debug_mode=debug_mode)
 
-    async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
-        """Run one node of the open workflow, joining the run in progress if there is one.
-
-        Edge method for code not handed a workflow.
-
-        Raises:
-            OpenWorkflowError: No workflow is open, or more than one is.
-        """
-        workflow = self.engine.current_workflow()
+    async def resolve_singular_node(
+        self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False
+    ) -> None:
+        """Run one node of the workflow, joining the run in progress if there is one."""
         flows = workflow.flows
         # We are now going to have different behavior depending on how the node is behaving.
         if self._flow_is_running(flows):
@@ -3450,35 +3457,50 @@ class FlowManager(EngineScoped):
 
         return boundary_nodes
 
-    def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:
+    def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:  # noqa: ARG002
+        """The node and its upstream nodes, only the node when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `get_node_dependencies_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return [node]
+        return self.get_node_dependencies_in(workflow, node)
+
+    def get_node_dependencies_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode]:
         """Get all upstream nodes that the given node depends on.
 
         This method performs a breadth-first search starting from the given node and working backwards through its non-control input connections to identify all nodes that must run before this node can be resolved.
         It ignores control connections, since we're only focusing on node dependencies.
 
-        Edge method for code not handed a workflow.
-
         Args:
-            flow (ControlFlow): The flow containing the node
+            workflow (WorkflowRuntime): The workflow whose connections are followed
             node (BaseNode): The node to find dependencies for
 
         Returns:
             list[BaseNode]: A list of all nodes that the given node depends on, including the node itself (as the first element)
         """
+        connections = workflow.flows.connections
         node_list = [node]
         node_queue = Queue()
         node_queue.put(node)
         while not node_queue.empty():
             curr_node = node_queue.get()
-            input_connections = self.get_connected_input_from_node(flow, curr_node)
-            if input_connections:
-                for input_node, input_parameter in input_connections:
-                    if (
-                        ParameterTypeBuiltin.CONTROL_TYPE.value != input_parameter.output_type
-                        and input_node not in node_list
-                    ):
-                        node_list.append(input_node)
-                        node_queue.put(input_node)
+            input_connection_ids = [
+                connection_id
+                for connection_ids in connections.incoming_index.get(curr_node.name, {}).values()
+                for connection_id in connection_ids
+            ]
+            for connection_id in input_connection_ids:
+                connection = connections.connections[connection_id]
+                input_node = connection.source_node
+                input_parameter = connection.source_parameter
+                if (
+                    ParameterTypeBuiltin.CONTROL_TYPE.value != input_parameter.output_type
+                    and input_node not in node_list
+                ):
+                    node_list.append(input_node)
+                    node_queue.put(input_node)
         return node_list
 
     @staticmethod

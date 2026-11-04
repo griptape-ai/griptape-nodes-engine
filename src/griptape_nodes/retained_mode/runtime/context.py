@@ -60,9 +60,8 @@ class WorkflowContextStack:
         finally:
             self.pop_flow()
 
-    @contextmanager
-    def node(self, node: BaseNode) -> Iterator[BaseNode]:
-        """Enter `node` in the current flow for the length of a `with` block.
+    def push_node(self, node: BaseNode) -> BaseNode:
+        """Enter `node` in the current flow.
 
         Raises:
             EmptyStackError: No flow is entered.
@@ -70,8 +69,29 @@ class WorkflowContextStack:
         if not self._flow_stack:
             msg = f"Cannot enter Node '{node.name}': no active Flow in Workflow"
             raise EmptyStackError(msg)
+        return self._flow_stack[-1].push_node(node)
+
+    def pop_node(self) -> BaseNode:
+        """Leave the current flow's current node.
+
+        Raises:
+            EmptyStackError: No flow is entered, or the current flow has no node entered.
+        """
+        if not self._flow_stack:
+            msg = "Cannot pop Node: no active Flow in Workflow"
+            raise EmptyStackError(msg)
+        return self._flow_stack[-1].pop_node()
+
+    @contextmanager
+    def node(self, node: BaseNode) -> Iterator[BaseNode]:
+        """Enter `node` in the current flow for the length of a `with` block.
+
+        Raises:
+            EmptyStackError: No flow is entered.
+        """
+        self.push_node(node)
+        # Leave the node in the flow it entered, even if the block changed which flow is current.
         flow_context = self._flow_stack[-1]
-        flow_context.push_node(node)
         try:
             yield node
         finally:
