@@ -145,7 +145,7 @@ class ProjectOutputParameter(abc.ABC):
         Raises:
             ValueError: If a connected provider returns None.
         """
-        result = self._node.engine.handle_request(
+        result = self._node._handle_request_in_workflow(
             connection_events.ListConnectionsForNodeRequest(node_name=self._node.name)
         )
         if not isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
@@ -154,7 +154,7 @@ class ProjectOutputParameter(abc.ABC):
         for conn in result.incoming_connections:
             if conn.target_parameter_name != self._name:
                 continue
-            source_node = self._node.engine.object_manager.attempt_get_object_by_name(conn.source_node_name)
+            source_node = self._node._require_workflow().objects.get(conn.source_node_name)
             if not isinstance(source_node, provider_type):
                 continue
             destination = get_destination(source_node)
@@ -178,7 +178,9 @@ class ProjectOutputParameter(abc.ABC):
         node_name = self._node.name
 
         has_incoming = False
-        result = self._node.engine.handle_request(connection_events.ListConnectionsForNodeRequest(node_name=node_name))
+        result = self._node._handle_request_in_workflow(
+            connection_events.ListConnectionsForNodeRequest(node_name=node_name)
+        )
         if isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
             has_incoming = any(conn.target_parameter_name == self._name for conn in result.incoming_connections)
 
@@ -194,15 +196,17 @@ class ProjectOutputParameter(abc.ABC):
         # Replace with a non-RM utility for creating sibling nodes relative to a given node.
         # Until then this is the one remaining path from exe_types to the facade: RetainedMode is
         # a re-export, so the TID251 ban does not see it. It resolves the ambient engine, which is
-        # correct here only because button handlers run where the node lives.
-        create_result = retained_mode_mod.RetainedMode.create_node_relative_to(
-            reference_node_name=node_name,
-            new_node_type=self._settings_node_type,
-            offset_side="left",
-            offset_x=-750,
-            offset_y=0,
-            lock=False,
-        )
+        # correct here only because button handlers run where the node lives. Its requests name no
+        # workflow, so they are bound to the one this node is in.
+        with self._node.engine.bind_workflow(self._node._require_workflow()):
+            create_result = retained_mode_mod.RetainedMode.create_node_relative_to(
+                reference_node_name=node_name,
+                new_node_type=self._settings_node_type,
+                offset_side="left",
+                offset_x=-750,
+                offset_y=0,
+                lock=False,
+            )
 
         if not isinstance(create_result, str):
             return core_types.NodeMessageResult(
@@ -214,7 +218,9 @@ class ProjectOutputParameter(abc.ABC):
 
         configure_node_name = create_result
 
-        configure_node = self._node.engine.object_manager.attempt_get_object_by_name(configure_node_name)
+        configure_node = typing.cast(
+            "node_types.BaseNode | None", self._node._require_workflow().objects.get(configure_node_name)
+        )
         if configure_node is not None:
             configure_node.set_parameter_value("situation", self._situation_name)
             configure_node.publish_update_to_parameter("situation", self._situation_name)
@@ -228,7 +234,7 @@ class ProjectOutputParameter(abc.ABC):
         # facade re-export, so going through it resolves the ambient engine -- which the TID251
         # ban does not catch, and which would answer from a different engine than the request
         # above it.
-        connection_result = self._node.engine.handle_request(
+        connection_result = self._node._handle_request_in_workflow(
             connection_events.CreateConnectionRequest(
                 source_node_name=configure_node_name,
                 source_parameter_name=self._settings_source_param_name,

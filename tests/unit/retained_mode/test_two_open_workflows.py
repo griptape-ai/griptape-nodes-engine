@@ -819,12 +819,59 @@ class TestEventsNameTheirWorkflow:
         queue: asyncio.Queue = asyncio.Queue()
         engine.event_manager.initialize_queue(queue)
 
-        # Named by the node's workflow, not by whatever is bound, so a raw thread's chunks route too.
-        with engine.bind_workflow(NO_WORKFLOW):
-            node.append_value_to_parameter("value", "chunk")
+        # Nothing is bound, so an ambient read would fail with two open: node code finds its workflow from the node.
+        node.append_value_to_parameter("value", "chunk")
 
         progress = [e for e in _drain(queue) if isinstance(e, ProgressEvent)]
         assert [event.workflow_id for event in progress] == [b.workflow_id]
+
+
+class TestNodeCodeActsOnItsOwnWorkflow:
+    def test_node_code_with_nothing_bound_reads_its_own_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        for workflow in (a, b):
+            _make_node(engine, workflow, "_ValueNode", "n")
+        _make_node(engine, b, "_ValueNode", "source")
+        connected = _send(
+            engine,
+            CreateConnectionRequest(
+                source_node_name="source",
+                source_parameter_name="value",
+                target_node_name="n",
+                target_parameter_name="value",
+            ),
+            b,
+        )
+        assert connected.succeeded(), connected.result_details
+        node_in_b = engine.node_manager.get_node_by_name_in(b, "n")
+
+        # Nothing is bound, so an ambient read would fail with two open.
+        assert node_in_b._param_has_incoming_connection("value") is True
+
+    def test_a_flow_with_nothing_bound_reads_its_own_workflows_connections(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        _, b = two_open
+        for name in ("source", "n"):
+            _make_node(engine, b, "_ValueNode", name)
+        connected = _send(
+            engine,
+            CreateConnectionRequest(
+                source_node_name="source",
+                source_parameter_name="value",
+                target_node_name="n",
+                target_parameter_name="value",
+            ),
+            b,
+        )
+        assert connected.succeeded(), connected.result_details
+        canvas = engine.flow_manager.get_flow_by_name_in(b, "canvas")
+        node = engine.node_manager.get_node_by_name_in(b, "n")
+
+        # Nothing is bound, so an ambient read would fail with two open.
+        assert [source.name for source, _ in canvas.get_connected_input_from_node(node)] == ["source"]
 
 
 def _drain(queue: asyncio.Queue) -> list[Any]:

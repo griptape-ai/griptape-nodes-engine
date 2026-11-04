@@ -450,6 +450,13 @@ class FlowManager(EngineScoped):
         raise ValueError(msg)
 
     def reparent_flow(self, flow_name: str, new_parent_flow_name: str) -> None:
+        """Move a Flow of the open workflow under a different parent Flow; see `reparent_flow_in`.
+
+        Edge method for code not handed a workflow.
+        """
+        self.reparent_flow_in(self.engine.current_workflow(), flow_name, new_parent_flow_name)
+
+    def reparent_flow_in(self, workflow: WorkflowRuntime, flow_name: str, new_parent_flow_name: str) -> None:
         """Move a Flow under a different parent Flow.
 
         Used when a node group is nested inside another: the inner group's subflow has to become a
@@ -468,19 +475,18 @@ class FlowManager(EngineScoped):
         rather than from flow parentage. An editor feature that reads flow parentage directly would
         need this promoted to a request first.
 
-        Edge method for code not handed a workflow.
-
         Args:
+            workflow: The workflow both Flows are in
             flow_name: The Flow to move
             new_parent_flow_name: The Flow that should become its parent
 
         Raises:
             ValueError: If either Flow is unknown, or the move would create a cycle
         """
-        if flow_name not in self._name_to_parent_name:
+        if flow_name not in workflow.flows.name_to_parent_name:
             msg = f"Flow with name {flow_name} doesn't exist"
             raise ValueError(msg)
-        if new_parent_flow_name not in self._name_to_parent_name:
+        if new_parent_flow_name not in workflow.flows.name_to_parent_name:
             msg = f"Flow with name {new_parent_flow_name} doesn't exist"
             raise ValueError(msg)
         if flow_name == new_parent_flow_name:
@@ -489,16 +495,16 @@ class FlowManager(EngineScoped):
 
         # Walk up from the proposed parent: if we meet the flow being moved, the move would
         # detach that branch from the tree and make the ancestor walk loop forever.
-        ancestor = self._name_to_parent_name[new_parent_flow_name]
+        ancestor = workflow.flows.name_to_parent_name[new_parent_flow_name]
         while ancestor is not None:
             if ancestor == flow_name:
                 msg = (
                     f"Attempted to move Flow '{flow_name}' under '{new_parent_flow_name}', which is already inside it."
                 )
                 raise ValueError(msg)
-            ancestor = self._name_to_parent_name.get(ancestor)
+            ancestor = workflow.flows.name_to_parent_name.get(ancestor)
 
-        self._name_to_parent_name[flow_name] = new_parent_flow_name
+        workflow.flows.name_to_parent_name[flow_name] = new_parent_flow_name
 
     def is_referenced_workflow(self, workflow: WorkflowRuntime, flow: ControlFlow) -> bool:
         """Check if this flow was created by importing a referenced workflow.
@@ -686,7 +692,7 @@ class FlowManager(EngineScoped):
         # when serializing it. It may inform the editor to render it differently.
         workflow_manager = self.engine.workflow_manager
         flow = ControlFlow(name=final_flow_name, engine=self.engine, metadata=request.metadata)
-        workflow.objects.add(final_flow_name, flow)
+        self.engine.object_manager.add_object_by_name_in(workflow, final_flow_name, flow)
         flows = workflow.flows
         flows.name_to_parent_name[final_flow_name] = parent_name
 
@@ -3320,9 +3326,18 @@ class FlowManager(EngineScoped):
 
         return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes)
 
-    def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
+    def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:
         """Edge method for code not handed a workflow."""
-        global_connections = self.get_connections()
+        return self.get_connected_input_from_node_in(self.engine.current_workflow(), flow, node)
+
+    def get_connected_input_from_node_in(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,  # noqa: ARG002
+        node: BaseNode,
+    ) -> list[tuple[BaseNode, Parameter]]:
+        """See `get_connected_input_from_node`, for `workflow`'s connections."""
+        global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.incoming_index:
             connection_ids = [
@@ -3333,9 +3348,18 @@ class FlowManager(EngineScoped):
                 connections.append((connection.source_node, connection.source_parameter))
         return connections
 
-    def get_connected_output_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
+    def get_connected_output_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:
         """Edge method for code not handed a workflow."""
-        global_connections = self.get_connections()
+        return self.get_connected_output_from_node_in(self.engine.current_workflow(), flow, node)
+
+    def get_connected_output_from_node_in(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,  # noqa: ARG002
+        node: BaseNode,
+    ) -> list[tuple[BaseNode, Parameter]]:
+        """See `get_connected_output_from_node`, for `workflow`'s connections."""
+        global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.outgoing_index:
             connection_ids = [
@@ -3348,12 +3372,22 @@ class FlowManager(EngineScoped):
 
     def get_connected_input_parameters(
         self,
-        flow: ControlFlow,  # noqa: ARG002
+        flow: ControlFlow,
         node: BaseNode,
         param: Parameter,
     ) -> list[tuple[BaseNode, Parameter]]:
         """Edge method for code not handed a workflow."""
-        global_connections = self.get_connections()
+        return self.get_connected_input_parameters_in(self.engine.current_workflow(), flow, node, param)
+
+    def get_connected_input_parameters_in(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,  # noqa: ARG002
+        node: BaseNode,
+        param: Parameter,
+    ) -> list[tuple[BaseNode, Parameter]]:
+        """See `get_connected_input_parameters`, for `workflow`'s connections."""
+        global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.incoming_index:
             incoming_params = global_connections.incoming_index[node.name]
@@ -3365,7 +3399,11 @@ class FlowManager(EngineScoped):
 
     def get_connections_on_node(self, node: BaseNode) -> list[BaseNode] | None:
         """Edge method for code not handed a workflow."""
-        return self._connected_nodes(self.get_connections(), node)
+        return self.get_connections_on_node_in(self.engine.current_workflow(), node)
+
+    def get_connections_on_node_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode] | None:
+        """See `get_connections_on_node`, for `workflow`'s connections."""
+        return self._connected_nodes(workflow.flows.connections, node)
 
     def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:
         """Edge method for code not handed a workflow; engine code calls `get_all_connected_nodes_in`."""

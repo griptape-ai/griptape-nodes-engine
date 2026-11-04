@@ -58,9 +58,9 @@ def _make_param(
 ) -> _ConcreteParam:
     mock_node = mock.MagicMock()
     mock_node.name = "MyNode"
-    mock_node.engine.handle_request.return_value = connections_result
+    mock_node._handle_request_in_workflow.return_value = connections_result
     lookup = nodes_by_name or {}
-    mock_node.engine.object_manager.attempt_get_object_by_name.side_effect = lookup.get
+    mock_node._require_workflow.return_value.objects.get.side_effect = lookup.get
     return _ConcreteParam(mock_node, param_name, default_value="default.txt", situation="save_node_output")
 
 
