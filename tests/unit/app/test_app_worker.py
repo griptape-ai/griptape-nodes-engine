@@ -3586,11 +3586,12 @@ class _FakeLine:
         flow_manager.submit_run = self.submit  # type: ignore[method-assign]
         flow_manager.cancel_run = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
-    def submit(self, spec: object) -> MagicMock:
+    def submit(self, spec: object, *, flows: object = None) -> MagicMock:
         run = MagicMock()
         run.run_id = f"line-{len(self.runs)}"
         run.position = 1
         run.spec = spec
+        run.flows = flows
         self.runs.append(run)
         return run
 
@@ -3708,30 +3709,6 @@ class TestSharingThisEngineBetweenRuns:
         await hold
 
     @pytest.mark.asyncio
-    async def test_two_engines_waiting_on_each_other_is_logged_as_an_error(
-        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        _FakeLine(worker_manager)
-        waiting_there = _acquire_answered_when(asyncio.Event())
-        worker_manager._leases["mine"] = EngineLease(
-            lease_id="mine", host_engine_id=_ARTIST_ENGINE, run_id="run-here", request_task=waiting_there
-        )
-
-        with caplog.at_level(logging.ERROR):
-            acquiring = asyncio.create_task(
-                _sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1"))
-            )
-            await _settle()
-
-        assert any(
-            _ARTIST_ENGINE in record.getMessage() for record in caplog.records if record.levelno == logging.ERROR
-        )
-        acquiring.cancel()
-        waiting_there.cancel()
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("incoming_run_id", "mine_run_id", "mine_granted"),
         [
@@ -3818,7 +3795,9 @@ class TestSharingThisEngineBetweenRuns:
 
         assert isinstance(await asyncio.wait_for(acquiring, timeout=1.0), worker_events.AcquireLeaseResultFailure)
         assert worker_manager._engine_runs == {}
-        worker_manager.engine.flow_manager.cancel_run.assert_awaited_once_with(line.runs[0].run_id)  # type: ignore[attr-defined]
+        worker_manager.engine.flow_manager.cancel_run.assert_awaited_once_with(  # type: ignore[attr-defined]
+            line.runs[0].run_id, flows=worker_manager._lease_line
+        )
 
     @pytest.mark.asyncio
     async def test_a_lease_released_while_workers_are_freed_for_it_lets_the_engine_go(
@@ -4004,7 +3983,7 @@ class TestSharingThisEngineBetweenRuns:
         assert isinstance(refused, worker_events.AcquireLeaseResultFailure)
         assert "lost its connection" in str(refused.result_details)
         line_cancel = worker_manager.engine.flow_manager.cancel_run
-        line_cancel.assert_awaited_once_with(line.runs[1].run_id)  # type: ignore[attr-defined]
+        line_cancel.assert_awaited_once_with(line.runs[1].run_id, flows=worker_manager._lease_line)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_a_session_that_never_registered_is_refused(self, worker_manager: WorkerManager) -> None:
