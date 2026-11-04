@@ -1,8 +1,8 @@
 """Who opens the workflow a saved workflow file builds into.
 
 `build_workflow()` opens nothing: it builds into the workflow its caller opened or bound. The
-engine's load paths decide through `WorkflowRunner.run_workflow(opens_workflow=...)`, and a file
-run on its own opens itself in `aexecute_workflow()`.
+engine's load paths decide through `WorkflowRunner.run_workflow(path, workflow)`, where a None
+workflow opens the file as one, and a file run on its own opens itself in `aexecute_workflow()`.
 """
 
 from __future__ import annotations

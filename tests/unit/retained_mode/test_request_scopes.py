@@ -738,17 +738,17 @@ class TestHostWorkflowReads:
     def test_a_read_in_an_unscoped_request_a_host_handler_sends_is_not(
         self, engine: Engine, fail_on_host_workflow_reads: list[HostWorkflowRead]
     ) -> None:
-        """An unmigrated handler's reads are its own debt, not a dependence of the HOST handler that sent it."""
+        """An unscoped library handler's reads are its own, not a dependence of the HOST handler that sent it."""
         _open_workflow(engine)
 
-        def ambient_handler(request: _InnerProbeRequest) -> ResultPayload:  # noqa: ARG001
+        def library_handler(request: _InnerProbeRequest) -> ResultPayload:  # noqa: ARG001
             engine.current_workflow_or_none()
             return _ScopeProbeResult(result_details="ran")
 
         def host_handler(request: _ScopeProbeRequest) -> ResultPayload:  # noqa: ARG001
             return engine.handle_request(_InnerProbeRequest())
 
-        engine.event_manager.assign_manager_to_request_type(_InnerProbeRequest, ambient_handler, without_workflow=None)
+        engine.event_manager.assign_manager_to_request_type(_InnerProbeRequest, library_handler, without_workflow=None)
         engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, host_handler)
 
         engine.handle_request(_ScopeProbeRequest())

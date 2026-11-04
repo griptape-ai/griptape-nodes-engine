@@ -113,7 +113,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotNamedError
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotNamedError, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -1114,6 +1114,30 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert b not in open_now
         assert result.workflow_id == open_now[-1].workflow_id
         assert a.objects.has("canvas")
+
+    def test_a_load_from_scratch_stays_bound_to_the_workflow_it_opened_after_the_run(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        """Post-dispatch hooks act on the workflow the file opened, not the one the clean slate closed."""
+        file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+        assert file_path is not None
+        _allow_several_open(engine)
+        _open(engine, "A")
+        b = _open(engine, "B")
+        bound_in_hook: list[object] = []
+
+        def record_binding(_request: RunWorkflowFromScratchRequest, _result: ResultPayload) -> None:
+            bound_in_hook.append(bound_workflow.get())
+
+        engine.event_manager.add_post_dispatch_hook(RunWorkflowFromScratchRequest, record_binding)
+        try:
+            result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), b))
+        finally:
+            engine.event_manager.remove_post_dispatch_hook(RunWorkflowFromScratchRequest, record_binding)
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
+        assert result.workflow_id is not None
+        assert bound_in_hook == [engine.open_workflows.find(result.workflow_id)]
 
     def test_a_load_with_current_state_builds_into_the_workflow_it_names(
         self, engine: Engine, saved_workflow_name: str
