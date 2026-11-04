@@ -71,6 +71,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -545,11 +546,7 @@ class BaseNode(ABC):
             # Send an event to the GUI so it knows this node has changed resolution state.
             from griptape_nodes.retained_mode.events.execution_events import NodeUnresolvedEvent
 
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=NodeUnresolvedEvent(node_name=self.name))
-                )
-            )
+            self.engine.event_manager.put_event(self.execution_event(NodeUnresolvedEvent(node_name=self.name)))
         self.state = NodeResolutionState.UNRESOLVED
         # NOTE: _entry_control_parameter is NOT cleared here as it represents execution context
         # that should persist through the resolve/unresolve cycle during a single execution
@@ -588,6 +585,18 @@ class BaseNode(ABC):
     def _set_workflow(self, workflow: WorkflowRuntime) -> None:
         """Record the workflow whose objects this node joined. Only the ObjectManager calls this."""
         self._workflow = workflow
+
+    def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
+        """An execution event about this node, naming the workflow it joined (None when it never joined one)."""
+        return ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=payload, workflow_id=self._event_workflow_id())
+        )
+
+    def _event_workflow_id(self) -> str | None:
+        """The id of the workflow this node's events name: the one it joined, or None."""
+        if self._workflow is None:
+            return None
+        return self._workflow.workflow_id
 
     def _require_workflow(self) -> WorkflowRuntime:
         """The workflow this node joined, for engine code that acts on it.
@@ -1809,7 +1818,9 @@ class BaseNode(ABC):
 
         # Publish the event up!
         self.engine.event_manager.put_event(
-            ProgressEvent(value=value, node_name=self.name, parameter_name=parameter_name)
+            ProgressEvent(
+                value=value, node_name=self.name, parameter_name=parameter_name, workflow_id=self._event_workflow_id()
+            )
         )
 
     def publish_update_to_parameter(self, parameter_name: str, value: Any) -> None:
@@ -1829,9 +1840,7 @@ class BaseNode(ABC):
                 value=self.get_display_value_for_output(parameter_name, value),
             )
 
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
-            )
+            self.engine.event_manager.put_event(self.execution_event(payload))
         else:
             msg = f"Parameter '{parameter_name} doesn't exist on {self.name}'"
             raise RuntimeError(msg)
@@ -2231,15 +2240,11 @@ class BaseNode(ABC):
         """Emit an AlterElementEvent for parameter add/remove operations."""
         if not self.broadcasts_events:
             return
-        from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
         # Create event data using the parameter's to_event method
         if remove:
-            # Import logger here to avoid circular dependency
-            event = ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=RemoveElementEvent(element_id=parameter.element_id))
-            )
+            event = self.execution_event(RemoveElementEvent(element_id=parameter.element_id))
         else:
             event_data = parameter.to_event(self)
             # Display-preservation guard. Gated on _in_aprocess here, unlike
@@ -2250,9 +2255,7 @@ class BaseNode(ABC):
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
-            event = ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
-            )
+            event = self.execution_event(AlterElementEvent(element_details=event_data))
 
         self.engine.event_manager.put_event(event)
 
@@ -2499,7 +2502,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
             return
         parameter = self._node.get_parameter_by_name(parameter_name)
         if parameter is not None:
-            from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
             from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
             # Create event data using the parameter's to_event method
@@ -2529,9 +2531,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
             event_data["modification_type"] = "deleted" if deleted else "set"
 
             # Publish the event
-            event = ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
-            )
+            event = self._node.execution_event(AlterElementEvent(element_details=event_data))
 
             # This is a plain dict subclass, not a node, so the engine comes from the node it
             # belongs to.

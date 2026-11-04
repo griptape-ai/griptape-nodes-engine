@@ -32,8 +32,6 @@ from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachi
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories, NodeState
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
     ResultDetails,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -2369,9 +2367,7 @@ class FlowManager(EngineScoped):
         except Exception:
             await self._abandon_running_flow(flows)
             raise
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
+        self.engine.event_manager.put_event(workflow.execution_event(InvolvedNodesEvent(involved_nodes=[])))
 
     async def start_run(self, spec: RunSpec) -> ResultPayload:
         """Run `spec` once the current workflow's runs ahead of it end, returning what its request returns.
@@ -2650,14 +2646,12 @@ class FlowManager(EngineScoped):
 
     def _put_run_queued_event(self, run: Run, position: int) -> None:
         self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(
-                    payload=RunQueuedEvent(
-                        run_id=run.run_id,
-                        flow_name=run.flow_name,
-                        position=position,
-                        request_id=run.request_id,
-                    )
+            run.flows.execution_event(
+                RunQueuedEvent(
+                    run_id=run.run_id,
+                    flow_name=run.flow_name,
+                    position=position,
+                    request_id=run.request_id,
                 )
             )
         )
@@ -2733,14 +2727,8 @@ class FlowManager(EngineScoped):
         flows.global_dag_builder.clear()
         logger.debug("Cancelling flow run")
 
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
-            )
-        )
+        self.engine.event_manager.put_event(flows.execution_event(InvolvedNodesEvent(involved_nodes=[])))
+        self.engine.event_manager.put_event(flows.execution_event(ControlFlowCancelledEvent(run_seconds=run_seconds)))
         self._finish_run_if_over(flows)
 
     async def _abandon_running_flow(self, flows: WorkflowFlows) -> None:
@@ -2775,14 +2763,8 @@ class FlowManager(EngineScoped):
             flows.global_control_flow_machine.reset_machine(cancel=True)
         flows.global_single_node_resolution = False
         flows.global_dag_builder.clear()
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
-            )
-        )
+        self.engine.event_manager.put_event(flows.execution_event(InvolvedNodesEvent(involved_nodes=[])))
+        self.engine.event_manager.put_event(flows.execution_event(ControlFlowCancelledEvent(run_seconds=run_seconds)))
         self._finish_run_if_over(flows)
 
     def _make_control_flow_machine(self, workflow: WorkflowRuntime, flow_name: str) -> ControlFlowMachine:
@@ -2915,9 +2897,7 @@ class FlowManager(EngineScoped):
             # Emit involved nodes update after adding node to DAG
             involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
             self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
         else:
             self._raise_if_run_cancelled(flows)
@@ -2945,9 +2925,7 @@ class FlowManager(EngineScoped):
             # Send a InvolvedNodesRequest
 
             self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
             try:
                 await machine.start_flow(start_node=node, end_node=node, debug_mode=debug_mode)
@@ -2962,20 +2940,14 @@ class FlowManager(EngineScoped):
                 error_message = resolution_machine.get_error_message()
                 flows.global_single_node_resolution = False
                 machine.context.current_nodes = []
-                self.engine.event_manager.put_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[]))
-                    )
-                )
+                self.engine.event_manager.put_event(workflow.execution_event(InvolvedNodesEvent(involved_nodes=[])))
                 # Re-raise with the original error message
                 raise RuntimeError(error_message or "Node resolution failed")
 
             if resolution_machine.is_complete():
                 flows.global_single_node_resolution = False
                 machine.context.current_nodes = []
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-            )
+            self.engine.event_manager.put_event(workflow.execution_event(InvolvedNodesEvent(involved_nodes=[])))
 
     async def single_execution_step(
         self,

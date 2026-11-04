@@ -787,15 +787,6 @@ class TestEventsNameTheirWorkflow:
 
         assert event.open_workflow_id == a.workflow_id
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "FINDING e1: execution events (ExecutionEvent) and ProgressEvent "
-            "carry no workflow_id, only node names, and node names repeat across "
-            "workflows. Results of requests a run makes internally (Engine.handle_request) echo no "
-            "open_workflow_id either. The editor cannot route a run's events to its tab."
-        ),
-    )
     @pytest.mark.asyncio
     async def test_events_emitted_during_a_run_name_their_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
@@ -814,9 +805,33 @@ class TestEventsNameTheirWorkflow:
         execution_events = [e for e in events if isinstance(e, ExecutionGriptapeNodeEvent)]
         result_events = [e for e in events if isinstance(e, GriptapeNodeEvent)]
         assert execution_events, "the run emitted no execution events"
-        assert "workflow_id" in type(execution_events[0].wrapped_event).model_fields
-        assert "workflow_id" in ProgressEvent.__dataclass_fields__
-        assert all(e.wrapped_event.open_workflow_id == a.workflow_id for e in result_events)
+        assert {e.wrapped_event.workflow_id for e in execution_events} == {a.workflow_id}
+        assert result_events, "the run emitted no results"
+        assert {e.wrapped_event.open_workflow_id for e in result_events} == {a.workflow_id}
+
+    @pytest.mark.asyncio
+    async def test_a_nodes_streamed_progress_names_its_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        _, b = two_open
+        _make_node(engine, b, "_ValueNode", "streaming")
+        node = engine.node_manager.get_node_by_name_in(b, "streaming")
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+
+        # Node code runs bound to its workflow.
+        with engine.bind_workflow(b):
+            node.append_value_to_parameter("value", "chunk")
+
+        progress = [e for e in _drain(queue) if isinstance(e, ProgressEvent)]
+        assert [event.workflow_id for event in progress] == [b.workflow_id]
+
+
+def _drain(queue: asyncio.Queue) -> list[Any]:
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return events
 
 
 class TestHeldObjects:

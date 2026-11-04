@@ -58,7 +58,7 @@ def _events() -> dict[str, BaseEvent]:
             result=GetParameterValueResultFailure(result_details="nope"),
             request_id="r2",
         ),
-        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n")),
+        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n"), workflow_id="wf"),
         "AppEvent": AppEvent(payload=AppInitializationComplete()),
     }
 
@@ -182,6 +182,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "result",
     ]
     assert list(converters.engine.unstructure(_events()["ExecutionEvent"])) == [
+        "workflow_id",
         "event_type",
         "payload_type",
         "payload",

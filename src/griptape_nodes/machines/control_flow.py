@@ -15,7 +15,6 @@ from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
 from griptape_nodes.retained_mode.engine import EngineScoped, current_engine
-from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowResolvedEvent,
     CurrentControlNodeEvent,
@@ -123,9 +122,7 @@ class ResolveNodeState(State):
             current_node.prepare_to_run_again()
             # Now broadcast that we have a current control node.
             context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=current_node.name))
-                )
+                current_node.execution_event(CurrentControlNodeEvent(node_name=current_node.name))
             )
             logger.debug("Resolving %s", current_node.name)
         if not context.paused:
@@ -170,13 +167,11 @@ class CompleteState(State):
         # Broadcast completion events for any remaining current nodes
         for current_node in context.current_nodes:
             context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(
-                        payload=ControlFlowResolvedEvent(
-                            end_node_name=current_node.name,
-                            parameter_output_values=NodeManager.result_parameter_values(current_node),
-                            run_seconds=context.seconds_since_run_started(),
-                        )
+                context.workflow.execution_event(
+                    ControlFlowResolvedEvent(
+                        end_node_name=current_node.name,
+                        parameter_output_values=NodeManager.result_parameter_values(current_node),
+                        run_seconds=context.seconds_since_run_started(),
                     )
                 )
             )
@@ -261,9 +256,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             # including the group that is running the iteration (issue #5486).
             involved_nodes = flow_manager.get_involved_node_names(flow)
             self._context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                self._context.workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
         await self.start(ResolveNodeState)  # Begins the flow
 

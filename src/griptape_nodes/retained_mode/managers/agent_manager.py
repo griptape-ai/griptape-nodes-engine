@@ -928,11 +928,11 @@ class AgentManager(EngineScoped):
             payload = _run_event_to_payload(event, thread_id)
             if payload is None:
                 return
-            event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=payload),
-                ),
-            )
+            # A chat about a workflow belongs to it, so its events name that workflow.
+            if workflow is not None:
+                event_manager.put_event(workflow.execution_event(payload))
+                return
+            event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
 
         library_toolsets = self._library_toolsets(library_mcp_server_names)
         # Nothing may sit between this and the `async with` that releases

@@ -19,10 +19,6 @@ from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
-)
 from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -297,15 +293,13 @@ class ExecuteDagState(State):
             # _emit_parameter_change_event already set correctly during execution.
             display_value = current_node.get_display_value_for_output(parameter_name, value)
             await context.engine.event_manager.aput_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(
-                        payload=ParameterValueUpdateEvent(
-                            node_name=current_node.name,
-                            parameter_name=parameter_name,
-                            data_type=data_type,
-                            value=display_value,
-                        )
-                    ),
+                context.workflow.execution_event(
+                    ParameterValueUpdateEvent(
+                        node_name=current_node.name,
+                        parameter_name=parameter_name,
+                        data_type=data_type,
+                        value=display_value,
+                    )
                 )
             )
         # Output values should already be saved!
@@ -324,15 +318,13 @@ class ExecuteDagState(State):
             for param_name, val in current_node.parameter_output_values.items()
         }
         await context.engine.event_manager.aput_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(
-                    payload=NodeResolvedEvent(
-                        node_name=current_node.name,
-                        parameter_output_values=display_output_values,
-                        node_type=current_node.__class__.__name__,
-                        specific_library_name=library_name,
-                        run_seconds=done_node.run_seconds,
-                    )
+            context.workflow.execution_event(
+                NodeResolvedEvent(
+                    node_name=current_node.name,
+                    parameter_output_values=display_output_values,
+                    node_type=current_node.__class__.__name__,
+                    specific_library_name=library_name,
+                    run_seconds=done_node.run_seconds,
                 )
             )
         )
@@ -424,9 +416,7 @@ class ExecuteDagState(State):
             # Locked nodes are not becoming the current control node, so they get no event.
             if not next_node.lock:
                 context.engine.event_manager.put_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=next_node.name))
-                    )
+                    context.workflow.execution_event(CurrentControlNodeEvent(node_name=next_node.name))
                 )
             ExecuteDagState.add_and_queue_nodes(context, next_node, network_name)
 
@@ -436,9 +426,7 @@ class ExecuteDagState(State):
         if context.dag_builder is not None:
             involved_nodes = list(context.node_to_reference.keys())
             context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                context.workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
 
     @staticmethod
@@ -747,13 +735,11 @@ class ExecuteDagState(State):
                 logger.exception("Error collecting parameter values for node '%s'", node_reference.node_reference.name)
                 error_node_name = node_reference.node_reference.name
                 await context.engine.event_manager.aput_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(
-                            payload=NodeErrorEvent(
-                                node_name=error_node_name,
-                                error_message=str(e),
-                                error=node_error_details_for(error_node_name, e),
-                            )
+                    context.workflow.execution_event(
+                        NodeErrorEvent(
+                            node_name=error_node_name,
+                            error_message=str(e),
+                            error=node_error_details_for(error_node_name, e),
                         )
                     )
                 )
@@ -784,13 +770,11 @@ class ExecuteDagState(State):
                 msg = f"Node '{validation_node_name}' encountered problems: {exceptions}"
                 logger.error("Canceling flow run. %s", msg)
                 await context.engine.event_manager.aput_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(
-                            payload=NodeErrorEvent(
-                                node_name=validation_node_name,
-                                error_message=str(exceptions),
-                                error=build_node_error_details(validation_node_name, exceptions),
-                            )
+                    context.workflow.execution_event(
+                        NodeErrorEvent(
+                            node_name=validation_node_name,
+                            error_message=str(exceptions),
+                            error=build_node_error_details(validation_node_name, exceptions),
                         )
                     )
                 )
@@ -866,7 +850,7 @@ class ExecuteDagState(State):
             # Send an event that this is a current data node:
 
             await context.engine.event_manager.aput_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=CurrentDataNodeEvent(node_name=node)))
+                context.workflow.execution_event(CurrentDataNodeEvent(node_name=node))
             )
 
         # Wait for a running node to finish, or for work to be injected into this run -
@@ -928,14 +912,12 @@ class ExecuteDagState(State):
                         msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await context.engine.event_manager.aput_event(
-                        ExecutionGriptapeNodeEvent(
-                            wrapped_event=ExecutionEvent(
-                                payload=NodeErrorEvent(
-                                    node_name=node_name,
-                                    error_message=str(exc),
-                                    error=node_error_details_for(node_name, exc),
-                                    run_seconds=dag_node.run_seconds,
-                                )
+                        context.workflow.execution_event(
+                            NodeErrorEvent(
+                                node_name=node_name,
+                                error_message=str(exc),
+                                error=node_error_details_for(node_name, exc),
+                                run_seconds=dag_node.run_seconds,
                             )
                         )
                     )
@@ -1071,14 +1053,12 @@ class ErrorState(State):
             logger.debug("Node '%s' failed", node_name, exc_info=exc)
             # The run already reports the first failure; this one still reaches the node.
             await context.engine.event_manager.aput_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(
-                        payload=NodeErrorEvent(
-                            node_name=node_name,
-                            error_message=str(exc),
-                            error=node_error_details_for(node_name, exc),
-                            run_seconds=dag_node.run_seconds,
-                        )
+                context.workflow.execution_event(
+                    NodeErrorEvent(
+                        node_name=node_name,
+                        error_message=str(exc),
+                        error=node_error_details_for(node_name, exc),
+                        run_seconds=dag_node.run_seconds,
                     )
                 )
             )
