@@ -54,7 +54,6 @@ dependencies = [
   # the skills guide promises. agents/pydantic_ai/skills.py also relies on `Skills.load` skipping
   # a `SKILL.md` with bad frontmatter instead of failing the whole library (0.57).
   "pydantic-ai-harness[skills]>=0.58",
-  "pyyaml>=6.0.2",
 ]
 
 [project.optional-dependencies]
