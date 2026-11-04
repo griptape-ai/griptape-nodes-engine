@@ -227,14 +227,20 @@ class TestOnHandleDeclareModelInvocationRequest:
         # Reaching the handler means the pre-dispatch chain did not deny the
         # declaration, so the node is cleared to invoke the model itself.
         result = model_manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(
-                model_id="gtc_claude_opus_4_7",
-                node_name="Agent_1",
-            )
+            DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7")
         )
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)
         assert result.model_id == "gtc_claude_opus_4_7"
+
+    def test_a_node_with_no_workflow_to_find_it_in_is_denied(self, model_manager: ModelManager) -> None:
+        # Without the node, provider- and family-scoped rules could not gate the invocation.
+        result = model_manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7", node_name="Agent_1")
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultFailure)
+        assert "names no open workflow" in str(result.result_details)
 
     def test_a_denying_pre_dispatch_hook_short_circuits_before_the_handler(self) -> None:
         # End to end: enforcement lives in the pre-dispatch chain, not the
@@ -533,13 +539,13 @@ class TestDeclareModelInvocationCatalogEnrichment:
 
         assert seen["attributes"] == {"id": "gtc_not_declared"}
 
-    def test_a_node_not_in_the_only_open_workflow_falls_back_to_bare_id(self, engine: Engine) -> None:
+    def test_a_node_not_in_the_workflow_falls_back_to_bare_id(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
         )
 
-        self._register_node("Probe_1", engine)
+        workflow = self._register_node("Probe_1", engine)
         seen: dict[str, object] = {}
 
         def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
@@ -550,7 +556,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
         manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_2"), None
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_2"), workflow
         )
 
         assert seen["attributes"] == {"id": "gtc_gpt_image_1_mini"}

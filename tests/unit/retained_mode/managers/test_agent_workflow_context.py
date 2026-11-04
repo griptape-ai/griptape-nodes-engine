@@ -231,7 +231,7 @@ class TestWorkflowContext:
         created = engine.handle_request(CreateNodeRequest(node_type="_ContextNode", node_name="writer"))
         assert isinstance(created, CreateNodeResultSuccess), created
 
-        context = await chat_manager._workflow_context(None)
+        context = await chat_manager._workflow_context(engine.current_workflow())
 
         assert context.flow.startswith("Current flow: 'main',")
         assert f"  - writer (_ContextNode from '{_LIBRARY_NAME}')" in context.flow
@@ -252,7 +252,7 @@ class TestWorkflowContext:
         unnamed = await chat_manager._workflow_context(None)
 
         assert handed.flow.startswith("Current flow: 'main',")
-        # With several open, a request that names none describes none rather than guessing.
+        # Handed none, it describes none rather than guessing.
         assert unnamed.flow == _NO_FLOW_INSTRUCTION
 
     @pytest.mark.asyncio
@@ -271,6 +271,6 @@ class TestWorkflowContext:
 
         monkeypatch.setattr(f"{AgentManager.__module__}._render_flow", unrenderable)
 
-        context = await chat_manager._workflow_context(None)
+        context = await chat_manager._workflow_context(engine.current_workflow())
 
         assert context.flow == ""

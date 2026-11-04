@@ -1253,7 +1253,7 @@ class FlowSerialization(EngineScoped):
             raise FlowDeserializationError(msg)
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
-    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901, PLR0912
+    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
@@ -1340,9 +1340,6 @@ class FlowSerialization(EngineScoped):
         if request.deserialize:
             # Deserialize the flow
             deserialize_request = DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized_flow_commands)
-            if workflow is None:
-                # Clients name no workflow on the envelope yet; until they do, it loads into the only open one.
-                workflow = self.engine.only_open_workflow_or_none()
             if workflow is None:
                 return ExtractFlowCommandsFromImageMetadataResultFailure(
                     result_details="Failed to deserialize flow from image metadata: no workflow is open to load it into.",

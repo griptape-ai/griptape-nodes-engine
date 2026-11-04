@@ -13,10 +13,22 @@ Once every client names it, the entry goes.
 ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
     {
         # The editor and the MCP server name no workflow yet.
+        "CancelAllRunsRequest",
+        "CancelRunRequest",
         "EnsureWorkflowAndFlowRequest",
         "ExecuteNodeRequest",
+        "ExtractFlowCommandsFromImageMetadataRequest",
         "GetPublishOptionsRequest",
+        "GetTopLevelFlowRequest",
         "GetWorkflowRunCommandRequest",
+        "ListFlowsInFlowRequest",
+        "ListRunsRequest",
+        "ResolveToolApprovalsRequest",
+        "RunAgentRequest",
+        # Nodes calling from their own threads name no workflow yet.
+        "BudgetAccessRequest",
+        "DeclareModelInvocationRequest",
+        "ReportUsageRequest",
         # Paths, macros and file provenance resolve {workflow_dir} for the open workflow.
         "AttemptMapAbsolutePathToProjectRequest",
         "AttemptMatchPathAgainstMacroRequest",

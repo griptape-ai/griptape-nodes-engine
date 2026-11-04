@@ -179,7 +179,6 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import (
     GTN_MCP_SERVER_HOST,
@@ -1001,12 +1000,6 @@ class AgentManager(EngineScoped):
         return _render_node_types(libraries)
 
     async def _flow_context(self, workflow: WorkflowRuntime | None) -> str:
-        if workflow is None:
-            # The editor names no workflow on the envelope yet; until it does, the chat describes the only open one.
-            try:
-                workflow = self.engine.only_open_workflow_or_none()
-            except WorkflowNotNamedError:
-                workflow = None
         if workflow is None or not workflow.context.has_current_flow():
             return _NO_FLOW_INSTRUCTION
         summary = await workflow.ahandle_request(
