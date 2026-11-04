@@ -2846,6 +2846,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="declared_var", scope=VariableScope.CURRENT_FLOW_ONLY)},
@@ -2875,6 +2876,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references=set(),
@@ -2893,6 +2895,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="ghost", scope=VariableScope.CURRENT_FLOW_ONLY)},
@@ -2925,6 +2928,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="shared_name", scope=VariableScope.GLOBAL_ONLY)},
@@ -2973,6 +2977,7 @@ class TestWorkflowVariablePersistence:
         # Child flow should not claim the parent-owned variable.
         child_unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         child_commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=child_flow_name,
             unique_parameter_uuid_to_values=child_unique_values,
             variable_references={ref},
@@ -2982,6 +2987,7 @@ class TestWorkflowVariablePersistence:
         # Parent flow should claim it.
         parent_unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         parent_commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=parent_flow_name,
             unique_parameter_uuid_to_values=parent_unique_values,
             variable_references={ref},
@@ -3179,6 +3185,7 @@ class TestVariableReferenceAccess:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={
@@ -5708,8 +5715,8 @@ class TestReferencedWorkflowTagging:
 
         flow_x = flow_manager.get_flow_by_name(flow_x_name)
         flow_y = flow_manager.get_flow_by_name(flow_y_name)
-        assert flow_manager.get_referenced_workflow_name(flow_x) == "workflow_x"
-        assert flow_manager.get_referenced_workflow_name(flow_y) == "workflow_y"
+        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_x) == "workflow_x"
+        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_y) == "workflow_y"
 
     def test_imports_in_one_engine_do_not_leak_into_another(self, engine: Engine) -> None:
         """An import running in one engine does not tag flows created in another engine."""
@@ -5726,7 +5733,10 @@ class TestReferencedWorkflowTagging:
             )
             assert isinstance(result, CreateFlowResultSuccess)
             other_flow = other_engine.flow_manager.get_flow_by_name(result.flow_name)
-            assert other_engine.flow_manager.get_referenced_workflow_name(other_flow) is None
+            assert (
+                other_engine.flow_manager.get_referenced_workflow_name(other_engine.current_workflow(), other_flow)
+                is None
+            )
 
     def test_leaving_an_import_removes_the_variable_from_the_context(self, engine: Engine) -> None:
         """Leaving an import clears the stack and drops the variable from the Context."""

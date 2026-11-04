@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
     from griptape_nodes.serialization.values import JsonValue
 
 # Long enough for a typical prompt or path, short enough that a pasted document doesn't fill the summary.
@@ -63,23 +64,23 @@ class FlowSummarizer(EngineScoped):
         event_manager.register_request_handlers(self)
 
     @handles(GetFlowSummaryRequest)
-    def on_get_flow_summary_request(self, request: GetFlowSummaryRequest) -> ResultPayload:
-        context_manager = self.engine.context_manager
+    def on_get_flow_summary_request(self, request: GetFlowSummaryRequest, workflow: WorkflowRuntime) -> ResultPayload:
         if request.flow_name is None:
-            if not context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 details = "Attempted to summarize the Flow in the Current Context. Failed because the Current Context was empty."
                 return GetFlowSummaryResultFailure(result_details=details)
-            flow = context_manager.get_current_flow()
+            flow = workflow.context.get_current_flow()
         else:
-            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(request.flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(request.flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to summarize Flow '{request.flow_name}'. Failed because no Flow with that name could be found."
                 return GetFlowSummaryResultFailure(result_details=details)
 
         workflow_name = None
-        if context_manager.has_current_workflow():
-            workflow_name = context_manager.get_current_workflow_name()
-        summary = summarize_flow(flow, self.engine.flow_manager.get_connections())
+        entry = self.engine.workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None:
+            workflow_name = entry.name
+        summary = summarize_flow(flow, workflow.flows.connections)
         details = f"Successfully summarized Flow '{flow.name}': {len(summary.nodes)} Nodes and {len(summary.connections)} Connections."
         return GetFlowSummaryResultSuccess(
             workflow_name=workflow_name,

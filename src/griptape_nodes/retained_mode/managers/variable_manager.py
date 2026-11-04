@@ -193,28 +193,25 @@ class VariablesManager(EngineScoped):
             case _:
                 return None
 
-    def _get_starting_flow(self, starting_flow: str | None) -> str:
-        """Get the starting flow name, using Context Manager if None."""
+    def _get_starting_flow(self, workflow: WorkflowRuntime, starting_flow: str | None) -> str:
+        """Get the starting flow name, using the workflow's current flow if None."""
         if starting_flow is not None:
             # Validate that the specified flow exists
             flow_manager = self.engine.flow_manager
             try:
-                flow_manager.get_parent_flow(starting_flow)  # This will raise if flow doesn't exist
+                flow_manager.get_parent_flow_in(workflow, starting_flow)  # This will raise if flow doesn't exist
             except Exception as e:
                 msg = f"Specified starting flow '{starting_flow}' does not exist: {e}"
                 raise ValueError(msg) from e
             return starting_flow
 
-        # Get current flow from Context Manager
-        context_manager = self.engine.context_manager
-
-        if not context_manager.has_current_flow():
+        if not workflow.context.has_current_flow():
             msg = "No starting flow specified and no current flow in Context Manager"
             raise ValueError(msg)
 
-        return context_manager.get_current_flow().name
+        return workflow.context.get_current_flow().name
 
-    def _get_flow_hierarchy(self, starting_flow: str) -> list[str]:
+    def _get_flow_hierarchy(self, workflow: WorkflowRuntime, starting_flow: str) -> list[str]:
         """Get the flow hierarchy from starting flow up to root."""
         flow_manager = self.engine.flow_manager
 
@@ -224,7 +221,7 @@ class VariablesManager(EngineScoped):
         while current_flow:
             hierarchy.append(current_flow)
             try:
-                parent = flow_manager.get_parent_flow(current_flow)
+                parent = flow_manager.get_parent_flow_in(workflow, current_flow)
                 current_flow = parent
             except Exception:
                 # No parent flow found, we've reached the root
@@ -459,7 +456,7 @@ class VariablesManager(EngineScoped):
 
             case VariableScope.HIERARCHICAL:
                 # Flow chain → project layer → global.
-                for flow_name in self._get_flow_hierarchy(starting_flow):
+                for flow_name in self._get_flow_hierarchy(workflow, starting_flow):
                     variable = self._find_variable_in_flow(workflow, flow_name, variable_name)
                     if variable:
                         found_scope = (
@@ -593,7 +590,7 @@ class VariablesManager(EngineScoped):
 
         # Get the target flow
         try:
-            target_flow = self._get_starting_flow(request.owning_flow)
+            target_flow = self._get_starting_flow(workflow, request.owning_flow)
         except ValueError as e:
             return CreateVariableResultFailure(
                 result_details=f"Attempted to create variable '{request.name}'. Failed to determine target flow: {e}"
@@ -624,7 +621,7 @@ class VariablesManager(EngineScoped):
     def on_get_variable_request(self, request: GetVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Get a full variable by name."""
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return GetVariableResultFailure(
                 result_details=f"Attempted to get variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -649,7 +646,7 @@ class VariablesManager(EngineScoped):
     ) -> ResultPayload:
         """Get the value of a variable."""
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return GetVariableValueResultFailure(
                 result_details=f"Attempted to get value for variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -677,7 +674,7 @@ class VariablesManager(EngineScoped):
         Refuses writes to READ_ONLY variables (project builtins, template directories).
         """
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return SetVariableValueResultFailure(
                 result_details=f"Attempted to set value for variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -723,7 +720,7 @@ class VariablesManager(EngineScoped):
     def on_get_variable_type_request(self, request: GetVariableTypeRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Get the type of a variable."""
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return GetVariableTypeResultFailure(
                 result_details=f"Attempted to get type for variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -749,7 +746,7 @@ class VariablesManager(EngineScoped):
         Refuses type changes on READ_ONLY variables.
         """
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return SetVariableTypeResultFailure(
                 result_details=f"Attempted to set type for variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -797,7 +794,7 @@ class VariablesManager(EngineScoped):
         Refuses deletion of READ_ONLY variables.
         """
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return DeleteVariableResultFailure(
                 result_details=f"Attempted to delete variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -843,7 +840,7 @@ class VariablesManager(EngineScoped):
         Refuses renaming of READ_ONLY variables.
         """
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -927,7 +924,7 @@ class VariablesManager(EngineScoped):
     def on_has_variable_request(self, request: HasVariableRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """Check if a variable exists."""
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return HasVariableResultFailure(
                 result_details=f"Attempted to check existence of variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -1003,7 +1000,7 @@ class VariablesManager(EngineScoped):
         - Flow variables shadow project layer entries of the same name
         - Project layer entries shadow global variables of the same name
         """
-        hierarchy = self._get_flow_hierarchy(starting_flow)
+        hierarchy = self._get_flow_hierarchy(workflow, starting_flow)
         seen_names: set[str] = set()
         variables: list[ResolvedVariable] = []
 
@@ -1054,7 +1051,7 @@ class VariablesManager(EngineScoped):
     def on_list_variables_request(self, request: ListVariablesRequest, workflow: WorkflowRuntime) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return ListVariablesResultFailure(
                 result_details=f"Attempted to list variables. Failed to determine starting flow: {e}"
@@ -1088,7 +1085,7 @@ class VariablesManager(EngineScoped):
         from griptape_nodes.exe_types.variable_resolver import VariableResolver
 
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return ListSubstitutablesResultFailure(
                 result_details=f"Attempted to list substitutables. Failed to determine starting flow: {e}"
@@ -1139,7 +1136,7 @@ class VariablesManager(EngineScoped):
             )
 
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return GetVariablesResultFailure(
                 result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
@@ -1174,7 +1171,7 @@ class VariablesManager(EngineScoped):
         TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
         """
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return ResolveSubstitutionResultFailure(
                 result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
@@ -1220,7 +1217,7 @@ class VariablesManager(EngineScoped):
         TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
         """
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return SetVariablesResultFailure(
                 result_details=f"Attempted to set variables. Failed to determine starting flow: {e}"
@@ -1271,7 +1268,7 @@ class VariablesManager(EngineScoped):
     ) -> ResultPayload:
         """Get variable details (metadata only, no heavy values)."""
         try:
-            starting_flow = self._get_starting_flow(request.starting_flow)
+            starting_flow = self._get_starting_flow(workflow, request.starting_flow)
         except ValueError as e:
             return GetVariableDetailsResultFailure(
                 result_details=f"Attempted to get details for variable '{request.name}'. Failed to determine starting flow: {e}"
@@ -1307,12 +1304,11 @@ class VariablesManager(EngineScoped):
         from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
         from griptape_nodes.exe_types.variable_resolver import VariableResolver
 
-        flow_manager = self.engine.flow_manager
-        if flow_manager.check_for_existing_running_flow():
+        if self.engine.flow_manager.check_for_existing_running_flow_in(workflow):
             # Mid-run: downstream UNRESOLVED nodes pick up new values naturally via ResolveSubstitutionRequest.
             return
 
-        connections = flow_manager.get_connections()
+        connections = workflow.flows.connections
 
         for obj in workflow.objects.get_filtered_subset(type=BaseNode).values():
             if obj.state not in (NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING):

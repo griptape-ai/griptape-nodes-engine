@@ -246,7 +246,7 @@ class TestFlowManagerDagBuilderIntegration:
         mock_control_flow.context.flow_name = "test_flow"
         flow_manager._global_control_flow_machine = mock_control_flow
 
-        with patch.object(flow_manager, "check_for_existing_running_flow", return_value=True):
+        with patch.object(flow_manager, "_flow_is_running", return_value=True):
             await flow_manager.cancel_flow_run()
 
         assert flow_manager.global_dag_builder.node_to_reference == {}
