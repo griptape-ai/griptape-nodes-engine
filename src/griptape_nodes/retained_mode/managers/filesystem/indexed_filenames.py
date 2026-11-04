@@ -364,76 +364,6 @@ class IndexedFilenames(EngineScoped):
 
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
-    @staticmethod
-    def has_sequence_slot_marker(variable: ParsedVariable) -> bool:
-        """Return True when this variable should be treated as a sequence-allocated slot.
-
-        Two paths qualify, ORed together:
-
-        1. **Explicit ``SequenceFormat`` marker** — emitted by ``###`` shorthand in
-           the macro template (issue #4902). Unambiguously says "this slot is
-           system-allocated; OSManager fills it with a sequence number."
-        2. **Legacy ``NumericPaddingFormat`` heuristic** — a ``{x:NN}`` slot that
-           the macro author intended to bind, but which CREATE_NEW has historically
-           treated as auto-indexable when it's the lone unresolved required variable.
-           Kept for backward compatibility with shipping project templates and the
-           documented behavior in [macros.md], [situations.md], and the default
-           situation macros. The OR is the load-bearing piece of #4902's
-           "introduce explicit syntax without breaking existing macros" strategy.
-
-        A follow-up cleanup will retire the heuristic path once project templates
-        and docs migrate to ``###``; until then both routes are equivalent.
-        """
-        return any(isinstance(spec, (SequenceFormat, NumericPaddingFormat)) for spec in variable.format_specs)
-
-    @staticmethod
-    def find_padded_unresolved_required(parsed_macro: ParsedMacro, missing_required: set[str]) -> ParsedVariable | None:
-        """Find the single missing required variable that opts into auto-index seeding.
-
-        A macro author opts in by writing either ``###`` shorthand (parsed as a
-        sequence slot — see :class:`SequenceFormat`) or a single unresolved required
-        variable with a ``NumericPaddingFormat`` (``{x:NN}`` — legacy heuristic).
-        Either marker is the safety contract: without it, an unresolved ``{shot}``
-        could just as plausibly be a variable the user forgot to bind, and silently
-        filling it with ``1`` would write data under a name the user never intended.
-
-        Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
-        first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
-        that gets ``1`` stuffed into it for the retry.
-
-        Debugging: a ``None`` return is the most common reason a CREATE_NEW save with
-        what looks like a valid auto-index macro instead surfaces ``MISSING_REQUIRED``.
-        Walk the gates in order.
-        """
-        # Gate 1: heuristic only fires when there is exactly ONE missing required var.
-        # Two or more → ambiguous which is the index slot; refuse and let the caller
-        # surface MISSING_REQUIRED naming every unbound var.
-        if len(missing_required) != 1:
-            return None
-        [name] = missing_required
-
-        # Gate 2: walk the parsed segments to recover the variable's full ParsedVariable
-        # (we need its format_specs; the caller only has the name string from the
-        # failure). The same name can appear in multiple slots; first occurrence is
-        # fine since they all bind to the same value.
-        matching: list[ParsedVariable] = []
-        for segment in parsed_macro.segments:
-            if isinstance(segment, ParsedVariable) and segment.info.name == name:
-                matching.append(segment)  # noqa: PERF401  # explicit loop for breakpoint debugging
-        if not matching:
-            # Shouldn't happen — name came from the parser's own missing set — but
-            # guard so a corrupt failure result can't crash.
-            return None
-        candidate = matching[0]
-
-        # Gate 3: the slot must carry a sequence-allocation marker — either the
-        # explicit ``SequenceFormat`` (from ``###`` shorthand) or the legacy
-        # ``NumericPaddingFormat`` heuristic. Without it the macro author didn't opt in.
-        if not IndexedFilenames.has_sequence_slot_marker(candidate):
-            return None
-
-        return candidate
-
     def select_collision_walk_macro(
         self, request: WriteFileRequest, file_path: Path
     ) -> tuple[MacroPath, ParsedVariable | None]:
@@ -560,6 +490,76 @@ class IndexedFilenames(EngineScoped):
                 existing_indices.append(extracted_index)
 
         return self.find_next_index_with_gap_fill(existing_indices)
+
+    @staticmethod
+    def find_padded_unresolved_required(parsed_macro: ParsedMacro, missing_required: set[str]) -> ParsedVariable | None:
+        """Find the single missing required variable that opts into auto-index seeding.
+
+        A macro author opts in by writing either ``###`` shorthand (parsed as a
+        sequence slot — see :class:`SequenceFormat`) or a single unresolved required
+        variable with a ``NumericPaddingFormat`` (``{x:NN}`` — legacy heuristic).
+        Either marker is the safety contract: without it, an unresolved ``{shot}``
+        could just as plausibly be a variable the user forgot to bind, and silently
+        filling it with ``1`` would write data under a name the user never intended.
+
+        Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
+        first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
+        that gets ``1`` stuffed into it for the retry.
+
+        Debugging: a ``None`` return is the most common reason a CREATE_NEW save with
+        what looks like a valid auto-index macro instead surfaces ``MISSING_REQUIRED``.
+        Walk the gates in order.
+        """
+        # Gate 1: heuristic only fires when there is exactly ONE missing required var.
+        # Two or more → ambiguous which is the index slot; refuse and let the caller
+        # surface MISSING_REQUIRED naming every unbound var.
+        if len(missing_required) != 1:
+            return None
+        [name] = missing_required
+
+        # Gate 2: walk the parsed segments to recover the variable's full ParsedVariable
+        # (we need its format_specs; the caller only has the name string from the
+        # failure). The same name can appear in multiple slots; first occurrence is
+        # fine since they all bind to the same value.
+        matching: list[ParsedVariable] = []
+        for segment in parsed_macro.segments:
+            if isinstance(segment, ParsedVariable) and segment.info.name == name:
+                matching.append(segment)  # noqa: PERF401  # explicit loop for breakpoint debugging
+        if not matching:
+            # Shouldn't happen — name came from the parser's own missing set — but
+            # guard so a corrupt failure result can't crash.
+            return None
+        candidate = matching[0]
+
+        # Gate 3: the slot must carry a sequence-allocation marker — either the
+        # explicit ``SequenceFormat`` (from ``###`` shorthand) or the legacy
+        # ``NumericPaddingFormat`` heuristic. Without it the macro author didn't opt in.
+        if not IndexedFilenames.has_sequence_slot_marker(candidate):
+            return None
+
+        return candidate
+
+    @staticmethod
+    def has_sequence_slot_marker(variable: ParsedVariable) -> bool:
+        """Return True when this variable should be treated as a sequence-allocated slot.
+
+        Two paths qualify, ORed together:
+
+        1. **Explicit ``SequenceFormat`` marker** — emitted by ``###`` shorthand in
+           the macro template (issue #4902). Unambiguously says "this slot is
+           system-allocated; OSManager fills it with a sequence number."
+        2. **Legacy ``NumericPaddingFormat`` heuristic** — a ``{x:NN}`` slot that
+           the macro author intended to bind, but which CREATE_NEW has historically
+           treated as auto-indexable when it's the lone unresolved required variable.
+           Kept for backward compatibility with shipping project templates and the
+           documented behavior in [macros.md], [situations.md], and the default
+           situation macros. The OR is the load-bearing piece of #4902's
+           "introduce explicit syntax without breaking existing macros" strategy.
+
+        A follow-up cleanup will retire the heuristic path once project templates
+        and docs migrate to ``###``; until then both routes are equivalent.
+        """
+        return any(isinstance(spec, (SequenceFormat, NumericPaddingFormat)) for spec in variable.format_specs)
 
     @staticmethod
     def _is_single_variable_group(group: str, variable_name: str) -> bool:
