@@ -9,6 +9,7 @@ import pytest
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
@@ -20,14 +21,14 @@ from griptape_nodes.retained_mode.events.node_events import (
     DeleteNodeRequest,
     DeleteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest, RenameObjectResultSuccess
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 _LIBRARY_NAME = "Node Workflow Library"
 
@@ -113,3 +114,21 @@ class TestNodeWorkflow:
 
         assert isinstance(result, DescribeNodeTypeResultSuccess), result.result_details
         assert [node.workflow for node in _ValueNode.built] == [None]
+
+    def test_a_renamed_node_keeps_naming_its_workflow(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        node = _create_node(engine, workflow)
+
+        result = workflow.handle_request(RenameObjectRequest(object_name=node.name, requested_name="renamed"))
+
+        assert isinstance(result, RenameObjectResultSuccess), result.result_details
+        assert node.workflow is workflow
+
+    def test_walking_a_node_stops_at_its_workflow(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """Publishing walks each node for the classes it holds, which must not reach the engine."""
+        node = _create_node(engine, workflow)
+        reached: list[type] = []
+
+        engine.workflow_manager.codegen.walk_object_tree(node, lambda cls, _instance: reached.append(cls))
+
+        assert _ValueNode in reached
+        assert not any(issubclass(cls, (Engine, WorkflowRuntime)) for cls in reached)
