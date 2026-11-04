@@ -62,6 +62,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
+from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.variable_types import VariableScope  # noqa: TC001 - read at runtime by the converter
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
@@ -587,6 +588,17 @@ class BaseNode(ABC):
     def _set_workflow(self, workflow: WorkflowRuntime) -> None:
         """Record the workflow whose objects this node joined. Only the ObjectManager calls this."""
         self._workflow = workflow
+
+    def _require_workflow(self) -> WorkflowRuntime:
+        """The workflow this node joined, for engine code that acts on it.
+
+        Raises:
+            WorkflowContextError: The node never joined a workflow.
+        """
+        if self._workflow is None:
+            msg = f"Attempted to use node '{self.name}' in its workflow. Failed because the node isn't in a workflow."
+            raise WorkflowContextError(msg)
+        return self._workflow
 
     def set_change_listener(self, listener: Callable[[BaseNode], None] | None) -> None:
         """Call ``listener`` whenever this node queues a change, and now if one is already queued."""

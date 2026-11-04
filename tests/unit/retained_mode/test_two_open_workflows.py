@@ -497,6 +497,24 @@ class TestRunInOneEditTheOther:
         assert _get(engine, a, "park_a", "result") == "done:a"
         assert _get(engine, b, "park_b", "result") == "done:b"
 
+    @pytest.mark.asyncio
+    async def test_a_run_started_with_nothing_bound_runs_in_the_workflow_it_is_handed(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """The machines and the node executor find their workflow from the run, never from the binding."""
+        a, b = two_open
+        _make_node(engine, b, "_ParkNode", "park")
+        _set(engine, b, "park", "b")
+        flow = engine.flow_manager.get_flow_by_name_in(b, "canvas")
+        node = engine.node_manager.get_node_by_name_in(b, "park")
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            await asyncio.wait_for(engine.flow_manager.start_flow(b, flow, node), 5)
+
+        assert _ParkNode.ran_in == {"park": b}
+        assert _get(engine, b, "park", "result") == "done:b"
+        assert a.flows.global_control_flow_machine is None
+
 
 class TestCloseOneWhileTheOtherRuns:
     """Scenario (c)."""

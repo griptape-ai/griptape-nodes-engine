@@ -13,10 +13,16 @@ from griptape_nodes.common.directed_graph import DirectedGraph
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionContext
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 def _context() -> ParallelResolutionContext:
-    context = ParallelResolutionContext(flow_name="flow", dag_builder=DagBuilder(MagicMock()), engine=MagicMock())
+    context = ParallelResolutionContext(
+        workflow=WorkflowRuntime("wf", MagicMock()),
+        flow_name="flow",
+        dag_builder=DagBuilder(MagicMock()),
+        engine=MagicMock(),
+    )
     context.engine.event_manager.aput_event = AsyncMock()
     return context
 

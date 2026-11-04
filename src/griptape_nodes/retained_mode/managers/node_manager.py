@@ -3999,6 +3999,13 @@ class NodeManager(EngineScoped):
         nodes = self._current_nodes_or_none()
         if nodes is None:
             return
+        await self._cancel_worker_execution_for(nodes, node_name)
+
+    async def cancel_worker_execution_in(self, workflow: WorkflowRuntime, node_name: str) -> None:
+        """Dispatch CancelExecuteNodeRequest to the worker running `workflow`'s node `node_name`, if one is."""
+        await self._cancel_worker_execution_for(workflow.nodes, node_name)
+
+    async def _cancel_worker_execution_for(self, nodes: WorkflowNodes, node_name: str) -> None:
         entry = nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return

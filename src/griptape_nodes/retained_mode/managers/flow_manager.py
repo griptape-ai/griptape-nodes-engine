@@ -1927,6 +1927,7 @@ class FlowManager(EngineScoped):
         subflow_machine = ControlFlowMachine(
             flow.name,
             dag_builder=DagBuilder(workflow.flows.connections),
+            workflow=workflow,
             is_isolated=True,
             engine=self.engine,
         )
@@ -2360,7 +2361,7 @@ class FlowManager(EngineScoped):
             flows.global_flow_queue.task_done()
 
         # Initialize global control flow machine and DAG builder
-        machine = self._make_control_flow_machine(flows, flow.name)
+        machine = self._make_control_flow_machine(workflow, flow.name)
         flows.global_control_flow_machine = machine
         # Set off the request here.
         try:
@@ -2784,12 +2785,12 @@ class FlowManager(EngineScoped):
         )
         self._finish_run_if_over(flows)
 
-    def _make_control_flow_machine(self, flows: WorkflowFlows, flow_name: str) -> ControlFlowMachine:
-        """A machine for a top-level run of `flow_name` over the run state in `flows`."""
+    def _make_control_flow_machine(self, workflow: WorkflowRuntime, flow_name: str) -> ControlFlowMachine:
+        """A machine for a top-level run of `flow_name` in `workflow`."""
         return ControlFlowMachine(
             flow_name,
-            dag_builder=flows.global_dag_builder,
-            flows=flows,
+            dag_builder=workflow.flows.global_dag_builder,
+            workflow=workflow,
             engine=self.engine,
         )
 
@@ -2862,13 +2863,14 @@ class FlowManager(EngineScoped):
     # Internal execution queue helper methods to consolidate redundant operations
     async def _handle_flow_start_if_not_running(
         self,
-        flows: WorkflowFlows,
+        workflow: WorkflowRuntime,
         flow: ControlFlow,
         *,
         debug_mode: bool,
         error_message: str,
     ) -> None:
         """Common logic for starting flow execution if not already running."""
+        flows = workflow.flows
         if not self._flow_is_running(flows):
             if flows.global_flow_queue.empty():
                 raise RuntimeError(error_message)
@@ -2877,7 +2879,7 @@ class FlowManager(EngineScoped):
             flows.global_flow_queue.task_done()
             # Get or create machine
             if flows.global_control_flow_machine is None:
-                flows.global_control_flow_machine = self._make_control_flow_machine(flows, flow.name)
+                flows.global_control_flow_machine = self._make_control_flow_machine(workflow, flow.name)
             await flows.global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
 
     async def _handle_post_execution_queue_processing(self, flows: WorkflowFlows, *, debug_mode: bool) -> None:
@@ -2922,7 +2924,7 @@ class FlowManager(EngineScoped):
             # Set that we are only working on one node right now!
             flows.global_single_node_resolution = True
             # Get or create machine
-            machine = self._make_control_flow_machine(flows, flow.name)
+            machine = self._make_control_flow_machine(workflow, flow.name)
             flows.global_control_flow_machine = machine
             machine.context.current_nodes = [node]
             resolution_machine = machine.resolution_machine
@@ -2984,7 +2986,7 @@ class FlowManager(EngineScoped):
         flows = workflow.flows
         # do a granular step
         await self._handle_flow_start_if_not_running(
-            flows,
+            workflow,
             flow,
             debug_mode=True,
             error_message="Flow has not yet been started. Cannot step while no flow has begun.",
@@ -3008,7 +3010,7 @@ class FlowManager(EngineScoped):
         flows = workflow.flows
         # It won't call single_node_step without an existing flow running from US.
         await self._handle_flow_start_if_not_running(
-            flows,
+            workflow,
             flow,
             debug_mode=True,
             error_message="Flow has not yet been started. Cannot step while no flow has begun.",
@@ -3034,7 +3036,7 @@ class FlowManager(EngineScoped):
     async def continue_executing(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
         flows = workflow.flows
         await self._handle_flow_start_if_not_running(
-            flows,
+            workflow,
             flow,
             debug_mode=False,
             error_message="Flow has not yet been started. Cannot step while no flow has begun.",

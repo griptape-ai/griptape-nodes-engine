@@ -1,6 +1,7 @@
 # Control flow machine
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from queue import Queue
 
     from griptape_nodes.exe_types.core_types import Parameter
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.flow_manager import QueueItem
     from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 @dataclass
@@ -54,6 +57,8 @@ class ControlFlowContext(EngineScoped):
     flow_name: str
     end_node: BaseNode | None = None
     is_isolated: bool
+    # The workflow the run is in.
+    workflow: WorkflowRuntime
     # The run state of the workflow a top-level run belongs to, whose queue it takes its start nodes
     # from. None for an isolated subflow.
     flows: WorkflowFlows | None
@@ -66,7 +71,7 @@ class ControlFlowContext(EngineScoped):
         max_nodes_in_parallel: int,
         *,
         dag_builder: DagBuilder,
-        flows: WorkflowFlows | None,
+        workflow: WorkflowRuntime,
         is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
@@ -78,13 +83,14 @@ class ControlFlowContext(EngineScoped):
             flow_name,
             max_nodes_in_parallel,
             dag_builder=dag_builder,
-            flows=flows,
+            workflow=workflow,
             is_isolated=is_isolated,
             engine=self.engine,
         )
         self.current_nodes = []
         self.is_isolated = is_isolated
-        self.flows = flows
+        self.workflow = workflow
+        self.flows = None if is_isolated else workflow.flows
 
     def reset(self, *, cancel: bool = False) -> None:
         if self.current_nodes is not None:
@@ -189,11 +195,11 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         flow_name: str,
         *,
         dag_builder: DagBuilder,
-        flows: WorkflowFlows | None = None,
+        workflow: WorkflowRuntime,
         is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
-        """Make the machine for one run, given the run state of the workflow it runs in.
+        """Make the machine for one run of a flow in `workflow`.
 
         The run keeps the DagBuilder and run state it was given, so it acts on its own workflow even
         if that workflow closes and another opens while it waits on a node.
@@ -202,13 +208,11 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             flow_name: The flow to run.
             dag_builder: The workflow's DagBuilder for a top-level run, or a fresh one over the
                 workflow's connections for an isolated subflow.
-            flows: The workflow's run state, holding its queue of start nodes. A top-level run needs it.
+            workflow: The workflow the run is in. A top-level run takes its start nodes from the
+                workflow's queue.
             is_isolated: True for a subflow that runs apart from the top-level run.
             engine: The engine to run in.
         """
-        if flows is None and not is_isolated:
-            msg = f"Attempted to run flow '{flow_name}'. Failed because a top-level run needs its workflow's queue of start nodes."
-            raise ValueError(msg)
         # Resolve the engine once, before the context exists, so the execution-mode config and the
         # context that runs the flow come from the same engine. Reading config off whatever engine
         # happened to be ambient is how a run could pick up another engine's settings.
@@ -226,7 +230,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             flow_name,
             max_nodes_in_parallel,
             dag_builder=dag_builder,
-            flows=flows,
+            workflow=workflow,
             is_isolated=is_isolated,
             engine=resolved_engine,
         )
@@ -246,7 +250,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         # Set up to debug
         self._context.paused = debug_mode
         flow_manager = self._context.engine.flow_manager
-        flow = flow_manager.get_flow_by_name(self._context.flow_name)
+        flow = flow_manager.get_flow_by_name_in(self._context.workflow, self._context.flow_name)
         if start_node != end_node and not self._context.is_isolated:
             # This blocks all nodes in the entire flow from running. If we're just resolving one node, we don't want to block that.
             #
@@ -330,7 +334,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         flows = self._context.flows
 
         if self._context.is_isolated or flows is None:
-            subflow = flow_manager.get_flow_by_name(self._context.flow_name)
+            subflow = flow_manager.get_flow_by_name_in(self._context.workflow, self._context.flow_name)
             # Scope is this subflow's own direct nodes. Do NOT apply exclude_subflow_group_children
             # here (unlike get_start_node_queue): a node carries a parent_group only when it belongs
             # to the group that owns this exact subflow, so its "group children" are precisely the
@@ -338,12 +342,17 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             # own members live in the nested group's subflow, so excluding here would strand this
             # group's independent nodes and let only the start node run.
             scope_nodes = list(subflow.nodes.values())
-            categories = flow_manager.classify_nodes_for_dag(scope_nodes)
+            categories = flow_manager.classify_nodes_for_dag_in(self._context.workflow, scope_nodes)
             logger.debug("Seeding isolated subflow '%s' DAG from its own nodes", self._context.flow_name)
         else:
             categories = self._drain_global_flow_queue(flows.global_flow_queue)
 
-        return self._seed_dag_from_categories(start_node, categories, dag_builder, node_manager)
+        return self._seed_dag_from_categories(
+            start_node,
+            categories,
+            dag_builder,
+            functools.partial(node_manager.get_node_by_name_in, self._context.workflow),
+        )
 
     @staticmethod
     def _drain_global_flow_queue(flow_queue: Queue[QueueItem]) -> DagNodeCategories:
@@ -374,7 +383,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         start_node: BaseNode,
         categories: DagNodeCategories,
         dag_builder: DagBuilder,
-        node_manager: NodeManager,
+        get_node: Callable[[str], BaseNode],
     ) -> list[BaseNode]:
         """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
@@ -405,7 +414,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             may_be_stale.update(DagBuilder.collect_nodes_in_forward_control_path(entry_node, None, connections))
         visited: set[str] = set()
         for name in list(may_be_stale):
-            may_be_stale.update(connections.collect_downstream_data_nodes(node_manager.get_node_by_name(name), visited))
+            may_be_stale.update(connections.collect_downstream_data_nodes(get_node(name), visited))
 
         # PASS 2: data sinks.
         for node in categories.data_sink_nodes:
