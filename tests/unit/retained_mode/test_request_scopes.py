@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from griptape_nodes.app.worker_routing import RemoteHandler
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
@@ -21,14 +23,16 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetWorkspaceRequest,
     ListBetaFeaturesRequest,
 )
-from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
+from griptape_nodes.retained_mode.events.generic_events import (
+    WorkflowNotNamedResultFailure,
+    WorkflowNotOpenResultFailure,
+)
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
-from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest, RenameObjectResultFailure
+from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
-    CreateVariableResultFailure,
     CreateVariableResultSuccess,
     DeleteVariableRequest,
     GetVariableDetailsRequest,
@@ -195,7 +199,7 @@ class TestScopesThatTakeAWorkflow:
                 _ScopeProbeRequest(failure_log_level=logging.DEBUG)
             )
 
-        assert isinstance(result_event.result, GenericResultFailure)
+        assert isinstance(result_event.result, WorkflowNotNamedResultFailure)
         records = [record for record in caplog.records if "none is open" in record.getMessage()]
         assert [record.levelno for record in records] == [logging.DEBUG]
 
@@ -249,7 +253,7 @@ class TestWorkflowScope:
 
         result = engine.handle_request(_ScopeProbeRequest())
 
-        assert isinstance(result, GenericResultFailure)
+        assert isinstance(result, WorkflowNotNamedResultFailure)
         assert "names no workflow and none is open" in str(result.result_details)
         assert calls.workflows == []
 
@@ -259,7 +263,7 @@ class TestWorkflowScope:
 
         result = engine.handle_request(_ScopeProbeRequest())
 
-        assert isinstance(result, GenericResultFailure)
+        assert isinstance(result, WorkflowNotNamedResultFailure)
         assert "2 workflows are open" in str(result.result_details)
         assert calls.workflows == []
 
@@ -270,7 +274,7 @@ class TestWorkflowScope:
         with engine.bind_workflow(NO_WORKFLOW):
             result = engine.handle_request(_ScopeProbeRequest())
 
-        assert isinstance(result, GenericResultFailure)
+        assert isinstance(result, WorkflowNotNamedResultFailure)
         assert str(result.result_details) == (
             "Attempted to run _ScopeProbeRequest. Failed because the request names no workflow."
         )
@@ -487,34 +491,22 @@ class TestObjectAndVariableRequests:
         assert isinstance(result, WorkflowNotOpenResultFailure)
         assert not workflow.variables.global_layer.has("greeting")
 
-    def test_naming_no_workflow_while_several_are_open_fails_with_the_requests_own_failure(
+    def test_naming_no_workflow_while_several_are_open_reaches_the_requests_own_failure_subscribers(
         self, engine: Engine
     ) -> None:
-        """The editor undoes an optimistic edit on the request's own failure type."""
+        """The editor undoes an optimistic edit on the request's failure type, which the bridge reads from `request_type`."""
         a, b = _open_two(engine)
 
-        result = engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
+        result_event = engine.event_manager.handle_request(
+            CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi")
+        )
 
-        assert isinstance(result, CreateVariableResultFailure)
-        assert "2 workflows are open" in str(result.result_details)
+        assert isinstance(result_event.result, WorkflowNotNamedResultFailure)
+        assert "2 workflows are open" in str(result_event.result.result_details)
+        sent = json.loads(converters.engine.dumps_result(result_event).text)
+        assert sent["request_type"] == "CreateVariableRequest"
         assert not a.variables.global_layer.has("greeting")
         assert not b.variables.global_layer.has("greeting")
-
-    def test_a_rename_that_names_no_workflow_fails_with_its_own_failure(self, engine: Engine) -> None:
-        result = engine.handle_request(RenameObjectRequest(object_name="Flow_1", requested_name="Flow_2"))
-
-        assert isinstance(result, RenameObjectResultFailure)
-        assert result.next_available_name is None
-
-    def test_naming_no_workflow_fails_generically_for_a_request_with_no_failure_type(
-        self, engine: Engine, calls: _Calls
-    ) -> None:
-        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
-
-        result = engine.handle_request(_ScopeProbeRequest())
-
-        assert isinstance(result, GenericResultFailure)
-        assert "none is open" in str(result.result_details)
 
 
 class _FlippingRemoteHandler(RemoteHandler):

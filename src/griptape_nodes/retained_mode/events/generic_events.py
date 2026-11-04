@@ -30,3 +30,14 @@ class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     whatever the request, so a client can tell it apart and reopen the workflow or refresh what is
     open. HOST requests (`RequestScope`) ignore the id, so they never fail with it.
     """
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowNotNamedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The request names no workflow it can act on, so it was not handled.
+
+    The one failure for every request that acts on a workflow (`RequestScope.WORKFLOW`) but names
+    none, or names nothing while none or several are open. A client subscribed to the request's own failure type
+    still receives it: the result envelope carries `request_type`, and the bridge routes on that.
+    """
