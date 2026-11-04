@@ -90,6 +90,7 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
 
     def get_var(
         _self: object,
+        _workflow: object,
         name: str,
         *,
         project_id: str | None = None,  # noqa: ARG001
@@ -883,9 +884,9 @@ class TestListProjectVariablesRealBody:
         real_resolve = project_manager_type._resolve_workflow_dir
         calls: list[object] = []
 
-        def counting_resolve(pm_self: object, project_info: object) -> str:
+        def counting_resolve(pm_self: object, project_info: object, workflow: object) -> str:
             calls.append(project_info)
-            return real_resolve(pm_self, project_info)  # type: ignore[arg-type]
+            return real_resolve(pm_self, project_info, workflow)  # type: ignore[arg-type]
 
         with patch.object(project_manager_type, "_resolve_workflow_dir", counting_resolve):
             result = engine.handle_request(

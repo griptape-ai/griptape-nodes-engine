@@ -14,8 +14,9 @@ async dispatch path.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +38,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def _stub_listing(directory: str, filenames: list[str]) -> Any:
@@ -67,6 +72,18 @@ def _stub_listing(directory: str, filenames: list[str]) -> Any:
         raise AssertionError(msg)
 
     return handle_request
+
+
+@contextmanager
+def _stub_dispatch(handle_request: Any) -> Iterator[None]:
+    """Answer requests with `handle_request`, including the macro the scan resolves directly with no workflow."""
+    with (
+        patch.object(Engine, "handle_request", side_effect=handle_request),
+        patch.object(
+            ProjectManager, "get_path_for_macro_in", side_effect=lambda _workflow, request: handle_request(request)
+        ),
+    ):
+        yield
 
 
 def _stub_listing_with_macro(
@@ -637,14 +654,12 @@ class TestPathRoundTrip:
         resolved_directory = "/Users/me/project/inputs/xyz"
         filenames = [f"abc{n:03d}.png" for n in [1, 2, 3]]
         path = f"{macro_directory}/abc###.png"
-        with patch.object(
-            Engine,
-            "handle_request",
-            side_effect=_stub_listing_with_macro(
+        with _stub_dispatch(
+            _stub_listing_with_macro(
                 macro_directory=macro_directory,
                 resolved_directory=resolved_directory,
                 filenames=filenames,
-            ),
+            )
         ):
             result = await engine.ahandle_request(ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT))
         assert isinstance(result, ScanSequencesResultSuccess)
@@ -789,14 +804,12 @@ class TestNoTokenBehavior:
         # Five siblings on disk; SINGLE_FILE should ignore all but the named one.
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
         path = f"{macro_directory}/render.0002.png"
-        with patch.object(
-            Engine,
-            "handle_request",
-            side_effect=_stub_listing_with_macro(
+        with _stub_dispatch(
+            _stub_listing_with_macro(
                 macro_directory=macro_directory,
                 resolved_directory=resolved_directory,
                 filenames=filenames,
-            ),
+            )
         ):
             result = await engine.ahandle_request(ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT))
         assert isinstance(result, ScanSequencesResultSuccess)

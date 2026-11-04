@@ -30,13 +30,14 @@ from griptape_nodes.common.project_templates.situation import SituationFilePolic
 from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
-from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayloadFailure
+from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload, ResultPayloadFailure
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
+    WriteTempFileRequest,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
@@ -53,11 +54,24 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
-from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
+from griptape_nodes.retained_mode.managers.os_manager import OSManager, StagingFailedError
+from tests.workflow_context import unsaved_workflow_open
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
 WINDOWS_MAX_PATH = 260
+
+
+def _write_temp_in_open_workflow(os_manager: OSManager, request: WriteTempFileRequest) -> ResultPayload:
+    """Hand the handler the workflow `unsaved_workflow` opened, as dispatch would."""
+    return os_manager.on_write_temp_file_request(request, os_manager.engine.current_workflow())
+
+
+@pytest.fixture(autouse=True)
+def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
+    """The default project's directories use `{workflow_dir?:/}`, which needs a workflow to resolve."""
+    with unsaved_workflow_open(engine):
+        yield
 
 
 class TestCreateNewWarningLevelResultDetails:
@@ -541,6 +555,25 @@ class TestMetadataInjection:
         mock_lookup.assert_called_once_with("image.png")
         provider.collect_metadata_for_write.assert_called_once_with("image.png")
         provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
+
+    def test_metadata_is_collected_for_the_open_workflow_when_the_request_names_none(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """The embedded metadata describes the workflow the sidecar records, not none."""
+        workflow = engine.current_workflow()
+        seen = []
+
+        def collect(file_name: str) -> dict[str, str]:  # noqa: ARG001
+            seen.append(engine.current_workflow_or_none())
+            return {}
+
+        provider = MagicMock()
+        provider.collect_metadata_for_write.side_effect = collect
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
+            result = engine.handle_request(WriteFileRequest(file_path=str(temp_dir / "image.png"), content=b"png"))
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert seen == [workflow]
 
     def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""
@@ -2078,11 +2111,12 @@ class TestWriteTempFileRequest:
         os_manager = engine.os_manager
         payload = b"probe target bytes"
 
-        result = os_manager.on_write_temp_file_request(
+        result = _write_temp_in_open_workflow(
+            os_manager,
             WriteTempFileRequest(
                 content=payload,
                 variables={"file_name_base": "probe", "file_extension": "mp4"},
-            )
+            ),
         )
 
         assert isinstance(result, WriteTempFileResultSuccess)
@@ -2111,11 +2145,13 @@ class TestWriteTempFileRequest:
 
         os_manager = engine.os_manager
 
-        result_a = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"})
+        result_a = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"}),
         )
-        result_b = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"b", variables={"file_name_base": "unique-b", "file_extension": "mp4"})
+        result_b = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"b", variables={"file_name_base": "unique-b", "file_extension": "mp4"}),
         )
 
         assert isinstance(result_a, WriteTempFileResultSuccess)
@@ -2139,8 +2175,9 @@ class TestWriteTempFileRequest:
 
         os_manager = engine.os_manager
 
-        result = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        result = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"}),
         )
 
         assert isinstance(result, WriteTempFileResultSuccess)
@@ -2165,7 +2202,7 @@ class TestWriteTempFileRequest:
         )
 
         os_manager = engine.os_manager
-        result = os_manager.on_write_temp_file_request(WriteTempFileRequest(content=b"payload", variables={}))
+        result = _write_temp_in_open_workflow(os_manager, WriteTempFileRequest(content=b"payload", variables={}))
 
         assert isinstance(result, WriteTempFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
@@ -2198,8 +2235,9 @@ class TestWriteTempFileRequest:
         monkeypatch.setitem(registry, GetSituationRequest, situation_missing_handler)
 
         os_manager = engine.os_manager
-        result = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        result = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"}),
         )
 
         assert isinstance(result, WriteTempFileResultFailure)

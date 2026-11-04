@@ -357,13 +357,15 @@ class DiagnosticsManager(EngineScoped):
     def _write_bundle_to_static_files(
         self, file_name: str, data: bytes, manifest: DiagnosticsBundleManifest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
-        """Write a bundle to the engine's static files and return a link to it.
+        """Write a bundle to the workspace's static files folder and return a link to it.
 
         Goes through the static files manager rather than writing a path directly, so a
         bundle collected from an engine running on another machine is still downloadable.
+        The bundle describes the engine, not a workflow, so it goes to the workspace's folder
+        whether or not a workflow is open.
         """
         try:
-            url = self.engine.static_files_manager.save_static_file(
+            url = self.engine.static_files_manager.save_workspace_static_file(
                 data,
                 file_name,
                 ExistingFilePolicy.CREATE_NEW,

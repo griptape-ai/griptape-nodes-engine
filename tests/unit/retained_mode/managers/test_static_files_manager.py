@@ -12,7 +12,11 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
-from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedStaticFilePath, StaticFilesManager
+from griptape_nodes.retained_mode.managers.static_files_manager import (
+    ResolvedStaticFilePath,
+    StaticFilePathFailure,
+    StaticFilesManager,
+)
 
 # pyright: reportAttributeAccessIssue=false
 
@@ -20,6 +24,17 @@ from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedS
 TEST_FILE_DATA = b"test image content"
 TEST_FILE_NAME = "test_image.jpg"
 TEST_ALTERNATIVE_NAME = "test_image_1.jpg"
+
+
+def _route_resolution_through_dispatch(engine: Mock) -> Mock:
+    """Send the stand-in engine's resolve-for-a-workflow helpers through its dispatch, which the tests patch."""
+    engine.project_manager.get_path_for_macro_in.side_effect = lambda _workflow, request: engine.handle_request(request)
+
+    async def get_preview(_workflow: object, request: object) -> object:
+        return await engine.ahandle_request(request)
+
+    engine.artifact_manager.get_preview_for_artifact_in.side_effect = get_preview
+    return engine
 
 
 class TestStaticFilesManagerSaveStaticFile:
@@ -59,10 +74,11 @@ class TestStaticFilesManagerSaveStaticFile:
         self,
         mock_static_files_manager: StaticFilesManager,
     ) -> None:
-        """Raises RuntimeError when the save_static_file situation is not in the project template."""
+        """Raises RuntimeError saying why, when the save_static_file situation's path cannot be resolved."""
+        failure = StaticFilePathFailure(reason="the project template is missing the 'save_static_file' situation")
         with (
-            patch.object(mock_static_files_manager, "_resolve_static_file_path", return_value=None),
-            pytest.raises(RuntimeError, match="save_static_file"),
+            patch.object(mock_static_files_manager, "_resolve_static_file_path", return_value=failure),
+            pytest.raises(RuntimeError, match="Failed because the project template is missing the 'save_static_file'"),
         ):
             mock_static_files_manager.save_static_file(
                 TEST_FILE_DATA,
@@ -374,7 +390,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
                 config_manager=mock_config_manager,
                 secrets_manager=mock_secrets_manager,
                 event_manager=None,
-                engine=Mock(),
+                engine=_route_resolution_through_dispatch(Mock()),
             )
             manager.storage_driver = Mock()
             return manager
@@ -825,7 +841,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         registry = mock_static_files_manager.engine.artifact_manager._registry
         registry.get_provider_classes_by_format.return_value = []
 
-        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file, None)
 
         assert resolution.path_to_serve == source_file
         assert resolution.preview_failure_reason is None
@@ -1049,7 +1065,10 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config.workspace_path = Path("/mock/workspace")
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
-                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=Mock()
+                config_manager=mock_config,
+                secrets_manager=Mock(),
+                event_manager=None,
+                engine=_route_resolution_through_dispatch(Mock()),
             )
         return manager
 
@@ -1097,40 +1116,29 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_static_files_manager.config_manager = mock_config_manager
 
         with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is not None
+        assert isinstance(result, ResolvedStaticFilePath)
         assert result.path == expected_relative_path
         assert result.policy == ExistingFilePolicy.OVERWRITE
 
-    def test_resolve_returns_none_and_warns_when_situation_not_found(
-        self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Returns None and logs a warning when the save_static_file situation is missing."""
-        import logging
-
+    def test_resolve_fails_when_situation_not_found(self, mock_static_files_manager: StaticFilesManager) -> None:
+        """Says the save_static_file situation is missing when the project template has none."""
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultFailure
 
-        with (
-            patch.object(
-                mock_static_files_manager.engine,
-                "handle_request",
-                return_value=GetSituationResultFailure(result_details="situation not found"),
-            ),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        with patch.object(
+            mock_static_files_manager.engine,
+            "handle_request",
+            return_value=GetSituationResultFailure(result_details="situation not found"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is None
-        assert "save_static_file" in caplog.text
-        assert "StaticFilesManager.save_static_file" in caplog.text
+        assert result == StaticFilePathFailure(
+            reason="the project template is missing the 'save_static_file' situation"
+        )
 
-    def test_resolve_returns_none_and_warns_when_macro_parsing_fails(
-        self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Returns None and logs a warning when the situation macro cannot be parsed."""
-        import logging
-
+    def test_resolve_fails_when_macro_parsing_fails(self, mock_static_files_manager: StaticFilesManager) -> None:
+        """Says the situation's path is not valid when its macro cannot be parsed."""
         from griptape_nodes.common.macro_parser import MacroSyntaxError
         from griptape_nodes.common.project_templates.situation import (
             SituationFilePolicy,
@@ -1155,19 +1163,17 @@ class TestStaticFilesManagerResolveStaticFilePath:
                 "griptape_nodes.retained_mode.managers.static_files_manager.ParsedMacro",
                 side_effect=MacroSyntaxError("bad macro"),
             ),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is None
-        assert "save_static_file" in caplog.text
+        assert isinstance(result, StaticFilePathFailure)
+        assert result.reason.startswith("the 'save_static_file' situation's path ")
+        assert result.reason.endswith("is not valid: bad macro")
 
-    def test_resolve_returns_none_and_warns_when_path_resolution_fails(
-        self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
+    def test_resolve_fails_with_the_resolvers_reason_when_path_resolution_fails(
+        self, mock_static_files_manager: StaticFilesManager
     ) -> None:
-        """Returns None and logs a warning when macro path resolution fails."""
-        import logging
-
+        """Passes on the resolver's message, which names the cause, rather than blaming the situation."""
         from griptape_nodes.common.project_templates.situation import (
             SituationFilePolicy,
             SituationPolicy,
@@ -1202,14 +1208,12 @@ class TestStaticFilesManagerResolveStaticFilePath:
             msg = f"Unexpected request: {request}"
             raise AssertionError(msg)
 
-        with (
-            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+        with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is None
-        assert "save_static_file" in caplog.text
+        assert result == StaticFilePathFailure(
+            reason="the 'save_static_file' situation's path could not be resolved. could not resolve"
+        )
 
     def test_resolve_falls_back_to_workspace_staticfiles_when_path_is_outside_workspace(
         self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
@@ -1264,9 +1268,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
             patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is not None
+        assert isinstance(result, ResolvedStaticFilePath)
         assert result.path == Path("staticfiles/output.png")
         assert result.policy == ExistingFilePolicy.OVERWRITE
         assert "outside workspace" in caplog.text
@@ -1660,7 +1664,7 @@ class TestStaticFilesManagerWatchesMintedFiles:
         mock_config = Mock()
         mock_config.get_config_value.side_effect = lambda key, default=None, **_kwargs: config_values.get(key, default)
         mock_config.workspace_path = Path("/mock/workspace")
-        engine = Mock()
+        engine = _route_resolution_through_dispatch(Mock())
         engine.library_manager.is_worker = is_worker
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
