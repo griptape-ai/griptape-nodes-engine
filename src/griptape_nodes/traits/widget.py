@@ -36,7 +36,9 @@ class Widget(Trait):
 
     @classmethod
     def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
-        return state_from_rendered_keys(ui_options, {"widget": "name", "library": "library"})
+        return state_from_rendered_keys(
+            ui_options, {"widget": "name", "library": "library", "synced_parameters": "synced_parameters"}
+        )
 
     def ui_options_for_trait(self) -> dict:
         options: dict = {
