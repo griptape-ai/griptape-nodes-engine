@@ -13664,7 +13664,7 @@ class TestRefreshProjectTemplates:
         mock_engine.ahandle_request = AsyncMock(side_effect=read_file)
         return mock_engine
 
-    def _register(self, pm: ProjectManager, entries: list[str]) -> None:
+    def _register(self, pm: ProjectManager, entries: list[str | dict]) -> None:
         from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
 
         def get_config_value_side_effect(key: str, default: object = None, **_: object) -> object:
@@ -13787,3 +13787,24 @@ class TestRefreshProjectTemplates:
             await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
 
         assert unregistered in pm._registered_template_status
+
+    @pytest.mark.asyncio
+    async def test_invalid_entry_warns_once_per_refresh(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Refresh selects the registered entries once, so an invalid entry's warning is logged once."""
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        self._register(pm, [str(tmp_path / "drive"), {"not_a_platform": "x"}])
+        mock_engine = self._engine_reading_disk()
+
+        with (
+            patch.object(pm, "_engine", mock_engine),
+            patch.object(pm, "_register_project_path"),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        skipped = [r for r in caplog.records if r.getMessage().startswith("Skipping")]
+        assert len(skipped) == 1

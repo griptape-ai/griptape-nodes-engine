@@ -1557,8 +1557,9 @@ class ProjectManager(EngineScoped):
         registered_entries: list[str | dict | PerPlatformProjectPath] = (
             self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
         )
+        selected_paths = self._select_registered_entry_paths(registered_entries)
         registered_roots: set[Path] = set()
-        for path_str in self._select_registered_entry_paths(registered_entries):
+        for path_str in selected_paths:
             registered_roots.add(canonicalize_for_identity(path_str))
             registered_roots.add(canonicalize_for_identity_preserving_symlinks(path_str))
         loaded_paths = {
@@ -1577,7 +1578,7 @@ class ProjectManager(EngineScoped):
             del self._registered_template_status[stale_path]
 
         loaded_before = len(self._successfully_loaded_project_templates)
-        await self._load_registered_projects()
+        await self._load_registered_projects(selected_paths)
         return len(self._successfully_loaded_project_templates) - loaded_before
 
     async def _build_loaded_template_info(
@@ -5406,7 +5407,7 @@ class ProjectManager(EngineScoped):
         finally:
             self._clear_boot_id_index()
 
-    async def _load_registered_projects(self) -> None:
+    async def _load_registered_projects(self, selected_paths: list[str] | None = None) -> None:
         """Load project templates from paths persisted in user config.
 
         Called after workspace project loading so that user-registered paths
@@ -5418,11 +5419,17 @@ class ProjectManager(EngineScoped):
         id -> file path index, so an id-based parent can be located even when its
         child is registered (and loaded) before it. The index is cleared once the
         load loop finishes; at runtime the live registry serves single-file loads.
+
+        `selected_paths` are the active-platform path strings already picked by
+        `_select_registered_entry_paths`, for a caller that needs them too; they
+        default to selecting from the persisted entries.
         """
-        registered_entries: list[str | dict | PerPlatformProjectPath] = (
-            self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
-        )
-        resolved_paths = self._resolve_registered_entry_paths(registered_entries)
+        if selected_paths is None:
+            registered_entries: list[str | dict | PerPlatformProjectPath] = (
+                self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
+            )
+            selected_paths = self._select_registered_entry_paths(registered_entries)
+        resolved_paths = self._canonicalize_selected_paths(selected_paths)
 
         # A directory entry is recursively scanned for project files (each loaded
         # without persisting), mirroring how libraries_to_register expands a
@@ -5512,9 +5519,13 @@ class ProjectManager(EngineScoped):
         follow symlinks) so different spellings of the same file collide.
         Duplicate canonical paths are de-duplicated so each file is processed once.
         """
+        return self._canonicalize_selected_paths(self._select_registered_entry_paths(registered_entries))
+
+    def _canonicalize_selected_paths(self, selected_paths: list[str]) -> list[Path]:
+        """Canonicalize selected projects_to_register path strings, de-duplicating by canonical path."""
         resolved: list[Path] = []
         seen: set[Path] = set()
-        for path_str in self._select_registered_entry_paths(registered_entries):
+        for path_str in selected_paths:
             canonical_path = canonicalize_for_identity(path_str)
             if canonical_path in seen:
                 continue
