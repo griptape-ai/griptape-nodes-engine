@@ -4159,7 +4159,7 @@ class NodeExecutor(EngineScoped):
             replacement_node_name: The node left in the outer DAG to carry packaged nodes'
                 outside-facing data edges once the package's real values land on it
         """
-        flow_manager = self.engine.flow_manager
+        flows = workflow.flows
         node_manager = self.engine.node_manager
 
         # Get the nodes from the names
@@ -4170,13 +4170,13 @@ class NodeExecutor(EngineScoped):
                 packaged_nodes.add(node)
 
         # Remove matching queue items from global queue
-        items_to_remove = [item for item in flow_manager.global_flow_queue.queue if item.node in packaged_nodes]
+        items_to_remove = [item for item in flows.global_flow_queue.queue if item.node in packaged_nodes]
 
         for item in items_to_remove:
-            flow_manager.global_flow_queue.queue.remove(item)
+            flows.global_flow_queue.queue.remove(item)
 
         # Remove from DAG builder to prevent parallel execution in parent flow
-        dag_builder = flow_manager.global_dag_builder
+        dag_builder = flows.global_dag_builder
         if dag_builder:
             for node_name in packaged_node_names:
                 # Remove from node_to_reference

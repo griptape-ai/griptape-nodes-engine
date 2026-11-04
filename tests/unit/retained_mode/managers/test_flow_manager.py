@@ -785,7 +785,7 @@ class TestGetInvolvedNodeNames:
 
 
 class TestClassifyNodesForDag:
-    """Tests for FlowManager.classify_nodes_for_dag.
+    """Tests for FlowManager.classify_nodes_for_dag_in.
 
     The classifier is scope-agnostic: it buckets an arbitrary list of nodes into start /
     control-entry / data-sink roles based purely on the connection graph. It backs both the

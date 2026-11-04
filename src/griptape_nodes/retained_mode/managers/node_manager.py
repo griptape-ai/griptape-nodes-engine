@@ -3937,7 +3937,7 @@ class NodeManager(EngineScoped):
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
         # registration, keeping both sides in sync. The id is what
-        # cancel_worker_execution dispatches as CancelExecuteNodeRequest.target_request_id.
+        # cancel_worker_execution_in dispatches as CancelExecuteNodeRequest.target_request_id.
         if not request.request_id:
             request.request_id = str(uuid4())
         target_request_id = request.request_id
@@ -3983,8 +3983,8 @@ class NodeManager(EngineScoped):
             return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
         return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
 
-    async def cancel_worker_execution(self, node_name: str) -> None:
-        """Dispatch CancelExecuteNodeRequest to the worker running node_name.
+    async def cancel_worker_execution_in(self, workflow: WorkflowRuntime, node_name: str) -> None:
+        """Dispatch CancelExecuteNodeRequest to the worker running `workflow`'s node `node_name`.
 
         No-op when the node is not currently routed to a worker (either because
         it runs locally or because no ExecuteNodeRequest is in flight). The
@@ -3993,20 +3993,8 @@ class NodeManager(EngineScoped):
         cooperative cancellation is signalled via task.cancel() on the
         orchestrator's own route_to_worker await, which unblocks here as soon
         as the cancel event has been put on the wire.
-
-        Edge method for code not handed a workflow.
         """
-        nodes = self._current_nodes_or_none()
-        if nodes is None:
-            return
-        await self._cancel_worker_execution_for(nodes, node_name)
-
-    async def cancel_worker_execution_in(self, workflow: WorkflowRuntime, node_name: str) -> None:
-        """Dispatch CancelExecuteNodeRequest to the worker running `workflow`'s node `node_name`, if one is."""
-        await self._cancel_worker_execution_for(workflow.nodes, node_name)
-
-    async def _cancel_worker_execution_for(self, nodes: WorkflowNodes, node_name: str) -> None:
-        entry = nodes.orch_worker_requests.get(node_name)
+        entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry

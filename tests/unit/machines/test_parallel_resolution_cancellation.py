@@ -94,7 +94,8 @@ class TestStaleCancellationDoesNotLeakIntoTheNextRun:
 
         node, flag = cancellable_node_stub("running_then_cancelled")
         # cancel_all_nodes awaits this per node; a bare MagicMock attribute is not awaitable.
-        machine.context.engine.node_manager.cancel_worker_execution_in = AsyncMock()
+        cancel_worker_execution_in = AsyncMock()
+        machine.context.engine.node_manager.cancel_worker_execution_in = cancel_worker_execution_in
 
         driver = asyncio.create_task(machine.resolve_node())
         await asyncio.sleep(0)
@@ -109,5 +110,7 @@ class TestStaleCancellationDoesNotLeakIntoTheNextRun:
         await machine.cancel_all_nodes()
 
         assert flag.is_set(), "a cancel arriving after dispatch must still reach the node it is meant to stop"
+        # A worker running the node is told through the run's workflow, not the current one.
+        cancel_worker_execution_in.assert_any_await(machine.context.workflow, "running_then_cancelled")
 
         await let_the_run_finish(driver, release, held_node_execution)

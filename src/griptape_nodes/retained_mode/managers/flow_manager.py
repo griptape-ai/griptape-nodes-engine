@@ -3236,7 +3236,7 @@ class FlowManager(EngineScoped):
     def exclude_subflow_group_children(nodes: list[BaseNode]) -> list[BaseNode]:
         """Drop nodes owned by a SubflowNodeGroup; they run inside their group's own subflow.
 
-        This is a scope/ownership decision kept out of classify_nodes_for_dag so the classifier
+        This is a scope/ownership decision kept out of classify_nodes_for_dag_in so the classifier
         stays scope-agnostic. Only the top-level run (get_start_node_queue) applies it, to keep a
         group's members from being seeded into the cross-flow DAG (they run when the group's proxy
         node executes its subflow). The isolated-subflow path must NOT apply it: inside a group's
@@ -3244,17 +3244,6 @@ class FlowManager(EngineScoped):
         strand the members and seed only the start node.
         """
         return [node for node in nodes if not isinstance(node.parent_group, SubflowNodeGroup)]
-
-    def classify_nodes_for_dag(self, nodes: list[BaseNode]) -> DagNodeCategories:
-        """Bucket nodes of the open workflow into start / control-entry / data-sink roles for DAG seeding.
-
-        Edge method for code not handed a workflow; engine code calls `classify_nodes_for_dag_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        workflow = self.engine.current_workflow()
-        return self.classify_nodes_for_dag_in(workflow, nodes)
 
     def classify_nodes_for_dag_in(self, workflow: WorkflowRuntime, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
         """Bucket a scope of nodes into start / control-entry / data-sink roles for DAG seeding.
