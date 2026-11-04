@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
@@ -45,13 +46,14 @@ class ImageArtifactProvider(BaseArtifactProvider):
     (e.g., PIL/Pillow) that are loaded lazily when the provider is instantiated.
     """
 
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         """Initialize the image artifact provider.
 
         Args:
             registry: The ProviderRegistry that manages this provider
+            engine: The engine this provider belongs to
         """
-        super().__init__(registry)
+        super().__init__(registry, engine)
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -135,13 +137,11 @@ class ImageArtifactProvider(BaseArtifactProvider):
         return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
 
     @classmethod
-    def detect_format(cls, data: bytes) -> str | None:  # noqa: C901, PLR0911
+    def detect_format(cls, data: bytes) -> str | None:  # noqa: PLR0911
         """Magic-byte sniff for common image formats.
 
         Pure prefix checks; no PIL parsing or decompression-bomb scans, so this
-        is safe to run on every byte write regardless of payload type. HEIC and
-        AVIF are recognized directly via their ISO BMFF brands so their writes
-        don't depend on optional Pillow plugins (e.g. ``pillow-heif``).
+        is safe to run on every byte write regardless of payload type.
         """
         if len(data) < cls._SNIFF_MIN_HEADER_BYTES:
             return None
@@ -158,13 +158,6 @@ class ImageArtifactProvider(BaseArtifactProvider):
             return "bmp"
         if head[:4] in (b"II*\x00", b"MM\x00*"):
             return "tiff"
-        if head[:4] == b"\x00\x00\x01\x00":
-            return "ico"
-        # ISO BMFF image brands (HEIC / HEIF / AVIF).
-        if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1"):
-            return "heic"
-        if head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis"):
-            return "avif"
         return None
 
     @classmethod
@@ -176,22 +169,23 @@ class ImageArtifactProvider(BaseArtifactProvider):
         """
         return {"png"}
 
-    def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:  # noqa: PLR0911
+    def collect_metadata_for_write(self, file_name: str) -> dict[str, str]:
         ext = Path(file_name).suffix.lstrip(".").lower()
         if ext not in self.get_metadata_formats():
+            return {}
+
+        try:
+            return collect_workflow_metadata(self.engine)
+        except Exception as e:
+            logger.warning("Attempted to collect workflow metadata for %s. Failed because: %s", file_name, e)
+            return {}
+
+    def prepare_content_for_write(self, data: bytes, file_name: str, metadata: dict[str, str]) -> bytes:  # noqa: PLR0911
+        if not metadata:
             return data
 
         if not data:
             logger.warning("Cannot inject metadata: empty data")
-            return data
-
-        try:
-            metadata = collect_workflow_metadata()
-        except Exception as e:
-            logger.warning("Attempted to collect workflow metadata for %s. Failed because: %s", file_name, e)
-            return data
-
-        if not metadata:
             return data
 
         try:

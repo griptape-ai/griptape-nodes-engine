@@ -60,6 +60,9 @@ class TestStaticServerFileDriver:
         """Test that driver handles localhost URLs on different ports."""
         assert driver.can_handle("http://localhost:3000/workspace/static_files/test.png") is True
 
+    def test_can_handle_localhost_external(self, driver: StaticServerFileDriver) -> None:
+        assert driver.can_handle("http://localhost:8124/external/Users/artist/cat.png") is True
+
     def test_cannot_handle_localhost_without_workspace(self, driver: StaticServerFileDriver) -> None:
         """Test that driver rejects localhost URLs without /workspace/ path."""
         assert driver.can_handle("http://localhost:8124/api/health") is False
@@ -86,14 +89,32 @@ class TestStaticServerFileDriver:
     ) -> None:
         """Test reading an existing file from localhost URL."""
         with patch(
-            "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
         ):
             content = await driver.read(
                 "http://localhost:8124/workspace/static_files/test.png",
                 timeout=10.0,
             )
         assert content == b"fake image data"
+
+    @pytest.mark.asyncio
+    async def test_read_external_file_from_disk(
+        self,
+        driver: StaticServerFileDriver,
+        mock_config_manager: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        external_file = tmp_path / "outside" / "cat.png"
+        external_file.parent.mkdir()
+        external_file.write_bytes(b"cat")
+        url = f"http://localhost:8124/external/{external_file.as_posix().removeprefix('/')}?v=1"
+        with patch(
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
+        ):
+            content = await driver.read(url, timeout=10.0)
+        assert content == b"cat"
 
     @pytest.mark.asyncio
     async def test_read_strips_query_params(
@@ -103,8 +124,8 @@ class TestStaticServerFileDriver:
     ) -> None:
         """Test that query parameters (cachebuster) are stripped before resolving."""
         with patch(
-            "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
         ):
             content = await driver.read(
                 "http://localhost:8124/workspace/static_files/test.png?t=1234567890",
@@ -121,8 +142,8 @@ class TestStaticServerFileDriver:
         """Test reading a non-existent file raises FileNotFoundError."""
         with (
             patch(
-                "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
+                "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+                return_value=MagicMock(config_manager=mock_config_manager),
             ),
             pytest.raises(FileNotFoundError, match="file not found"),
         ):
@@ -140,8 +161,8 @@ class TestStaticServerFileDriver:
         """Test reading a directory raises IsADirectoryError."""
         with (
             patch(
-                "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
+                "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+                return_value=MagicMock(config_manager=mock_config_manager),
             ),
             pytest.raises(IsADirectoryError, match="directory"),
         ):
@@ -153,7 +174,7 @@ class TestStaticServerFileDriver:
     @pytest.mark.asyncio
     async def test_read_invalid_url_no_workspace(self, driver: StaticServerFileDriver) -> None:
         """Test reading from localhost URL without /workspace/ raises ValueError."""
-        with pytest.raises(ValueError, match="/workspace/ not found"):
+        with pytest.raises(ValueError, match="/workspace/ nor /external/ found"):
             await driver.read(
                 "http://localhost:8124/api/health",
                 timeout=10.0,
@@ -169,8 +190,8 @@ class TestStaticServerFileDriver:
     ) -> None:
         """Test exists returns True for existing file."""
         with patch(
-            "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
         ):
             result = await driver.exists("http://localhost:8124/workspace/static_files/test.png")
         assert result is True
@@ -183,8 +204,8 @@ class TestStaticServerFileDriver:
     ) -> None:
         """Test exists returns False for non-existent file."""
         with patch(
-            "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
         ):
             result = await driver.exists("http://localhost:8124/workspace/static_files/nonexistent.png")
         assert result is False
@@ -204,8 +225,8 @@ class TestStaticServerFileDriver:
     ) -> None:
         """Test get_size returns the correct file size."""
         with patch(
-            "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+            return_value=MagicMock(config_manager=mock_config_manager),
         ):
             size = driver.get_size("http://localhost:8124/workspace/static_files/test.png")
         assert size == len(b"fake image data")
@@ -218,8 +239,8 @@ class TestStaticServerFileDriver:
         """Test get_size raises FileNotFoundError for non-existent file."""
         with (
             patch(
-                "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
+                "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+                return_value=MagicMock(config_manager=mock_config_manager),
             ),
             pytest.raises(FileNotFoundError, match="file not found"),
         ):
@@ -233,8 +254,8 @@ class TestStaticServerFileDriver:
         """Test get_size raises IsADirectoryError for directories."""
         with (
             patch(
-                "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
+                "griptape_nodes.files.drivers.static_server_file_driver.current_engine",
+                return_value=MagicMock(config_manager=mock_config_manager),
             ),
             pytest.raises(IsADirectoryError, match="directory"),
         ):

@@ -12,19 +12,34 @@ flow through the standard client.
 
 from __future__ import annotations
 
-import os
+from typing import TYPE_CHECKING, cast
 
+import httpx
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    join_cloud_url,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+)
 from griptape_nodes.drivers.cloud_models import (
     LM_STUDIO_DEFAULT_BASE_URL,
     OLLAMA_DEFAULT_BASE_URL,
     ProviderID,
+    model_settings_for,
 )
 
-GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
-"""Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
+if TYPE_CHECKING:
+    from pydantic_ai.settings import ModelSettings
+
+# The read timeout matches the OpenAI SDK's default. The connect timeout covers
+# the TLS handshake, which a TLS-inspecting proxy can hold for tens of seconds
+# on a fresh connection; the SDK's 5s default fails every attempt there.
+# `ModelSettings.timeout` is typed against the legacy httpx `Timeout`;
+# pydantic-ai converts it for the SDK.
+DEFAULT_REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=60.0)
 
 
 def build_griptape_cloud_model(
@@ -32,30 +47,46 @@ def build_griptape_cloud_model(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    settings: ModelSettings | None = None,
 ) -> OpenAIChatModel:
     """Return an :class:`OpenAIChatModel` bound to Griptape Cloud's ``/api/v1`` endpoint.
 
     Args:
         model_name: The Griptape Cloud model id (e.g. ``"gpt-4o"``). Cloud picks
             the underlying provider from this name server-side.
-        api_key: Griptape Cloud API key. Falls back to the ``GT_CLOUD_API_KEY``
-            environment variable. Sent as ``Authorization: Bearer <key>``.
+        api_key: Griptape Cloud credential. Falls back to the Griptape Nodes
+            License, then the ``GT_CLOUD_API_KEY`` environment variable, per
+            :func:`resolve_cloud_credential`. Sent as ``Authorization: Bearer <key>``.
         base_url: Griptape Cloud root URL (no ``/api/v1`` suffix). Falls back to
-            the ``GT_CLOUD_BASE_URL`` environment variable, then to
-            :data:`GRIPTAPE_CLOUD_BASE_URL`.
+            :func:`resolve_cloud_base_url`.
+        settings: Default :class:`ModelSettings` for the returned model. ``None``
+            falls back to the catalog preset for ``model_name`` via
+            :func:`model_settings_for`; pass a dict to override it. Without
+            either, no ``max_tokens`` reaches the wire and the upstream
+            provider's own default caps the response — 4096 tokens for
+            Anthropic models, well under what the catalog intends.
 
     Raises:
-        ValueError: If no API key is available.
+        ValueError: If neither a license nor an API key is available.
     """
-    resolved_key = api_key or os.environ.get("GT_CLOUD_API_KEY")
+    resolved_key = api_key or resolve_cloud_credential()
     if not resolved_key:
-        msg = "Griptape Cloud API key is required. Pass `api_key=` or set the GT_CLOUD_API_KEY environment variable."
+        msg = f"Attempted to reach Griptape Cloud. Failed because {MISSING_CREDENTIAL_MESSAGE}"
         raise ValueError(msg)
 
-    cloud_root = (base_url or os.environ.get("GT_CLOUD_BASE_URL", GRIPTAPE_CLOUD_BASE_URL)).rstrip("/")
+    resolved_settings = settings
+    if resolved_settings is None:
+        preset = model_settings_for(model_name)
+        # `cloud_models` is a plain catalog and stays free of pydantic-ai types,
+        # so the preset arrives as a plain dict. Its keys are constrained to
+        # ModelSettings fields there and asserted in the catalog's tests, so this
+        # is the boundary where that guarantee becomes the static type.
+        resolved_settings = cast("ModelSettings", preset) if preset is not None else None
+    cloud_root = base_url or resolve_cloud_base_url()
     return OpenAIChatModel(
         model_name,
-        provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),
+        provider=OpenAIProvider(base_url=join_cloud_url(cloud_root, "/api/v1"), api_key=resolved_key),
+        settings=_with_request_timeout(resolved_settings),
     )
 
 
@@ -65,6 +96,7 @@ def build_model(
     provider: str = ProviderID.GRIPTAPE_CLOUD,
     api_key: str | None = None,
     base_url: str | None = None,
+    settings: ModelSettings | None = None,
 ) -> OpenAIChatModel:
     """Return an :class:`OpenAIChatModel` for the given provider.
 
@@ -73,14 +105,20 @@ def build_model(
         provider: One of ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``,
             or ``"custom"``.
         api_key: API key for the target endpoint. Required for
-            ``"griptape_cloud"`` (falls back to ``GT_CLOUD_API_KEY``) and
-            ``"custom"``. Ignored for ``"ollama"`` and ``"lmstudio"``
-            (no auth needed).
+            ``"griptape_cloud"`` (falls back to the license, then
+            ``GT_CLOUD_API_KEY``) and ``"custom"``. Ignored for ``"ollama"``
+            and ``"lmstudio"`` (no auth needed).
         base_url: Base URL of the endpoint. For ``"griptape_cloud"`` the
             ``/api/v1`` suffix is appended automatically. For ``"ollama"``
             defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. For ``"lmstudio"``
             defaults to :data:`LM_STUDIO_DEFAULT_BASE_URL`. Required for
             ``"custom"``.
+        settings: Default :class:`ModelSettings` for the returned model, e.g.
+            ``{"max_tokens": 64000}``. For ``"griptape_cloud"``, ``None`` falls
+            back to the catalog preset for ``model_name``. The other providers
+            serve arbitrary model ids that only coincidentally collide with
+            catalog names, so they apply ``settings`` verbatim and default to
+            sending none.
 
     Raises:
         ValueError: If required credentials or URLs are missing.
@@ -89,13 +127,14 @@ def build_model(
     # branch either raises or returns — case _: is exhaustive. Pyright agrees.
     match provider:
         case ProviderID.GRIPTAPE_CLOUD:
-            return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
+            return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url, settings=settings)
         case ProviderID.OLLAMA:
             resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
             # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
+                settings=_with_request_timeout(settings),
             )
         case ProviderID.LMSTUDIO:
             resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
@@ -103,6 +142,7 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
+                settings=_with_request_timeout(settings),
             )
         case _:
             # "custom" or any future provider: caller must supply both url and key.
@@ -115,4 +155,17 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
+                settings=_with_request_timeout(settings),
             )
+
+
+def _with_request_timeout(settings: ModelSettings | None) -> ModelSettings:
+    """Return ``settings`` with :data:`DEFAULT_REQUEST_TIMEOUT` unless it sets its own ``timeout``.
+
+    The timeout is client-side only and never reaches the wire, so it applies to
+    every provider, including those that otherwise send no settings.
+    """
+    resolved: ModelSettings = {"timeout": DEFAULT_REQUEST_TIMEOUT}
+    if settings is not None:
+        resolved.update(settings)
+    return resolved

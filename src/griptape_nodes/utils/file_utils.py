@@ -2,63 +2,193 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
-import tempfile
+import stat
+import uuid
 from dataclasses import dataclass
 from fnmatch import fnmatch
+from functools import partial
 from pathlib import Path
 
 import anyio
+import anyio.to_thread
+from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 logger = logging.getLogger(__name__)
 
-# Fallback ceiling on how deep recursive discovery walks, used only when the
-# `discovery_max_depth` engine setting cannot be read. Bounds boot-time scans
-# against pathologically deep trees and symlink loops without a visited-set.
+# Fallback ceiling on how deep recursive discovery walks when a caller has no
+# operator-configured value of its own. Bounds boot-time scans against
+# pathologically deep trees and symlink loops without a visited-set.
 DEFAULT_MAX_SEARCH_DEPTH = 5
 
+# Filesystems and transfer tools do not preserve mtime exactly: FAT stores 2-second
+# resolution, and rsync/cloud-sync/cross-volume copies round-trip timestamps through
+# varying precisions. Exact float equality therefore brands two observations of the
+# same unchanged file as different after any sync or copy. Drift within this window
+# is treated as "same file state"; a real edit moves mtime beyond it. Callers should
+# always compare file SIZE exactly alongside this — sizes don't drift.
+MTIME_MATCH_TOLERANCE_SECONDS = 2.0
 
-def _resolve_discovery_max_depth() -> int:
-    """Read the operator-configured ``discovery_max_depth`` ceiling for recursive discovery.
 
-    Returns the live `discovery_max_depth` engine setting (overridable via the
-    `GTN_CONFIG_DISCOVERY_MAX_DEPTH` env var), falling back to
-    DEFAULT_MAX_SEARCH_DEPTH only when the setting is absent.
+def mtimes_match(mtime_a: float, mtime_b: float) -> bool:
+    """Whether two file modification times plausibly describe the same file state.
+
+    Use for staleness decisions that compare a recorded mtime against a fresh
+    ``stat()`` — never exact float equality, which breaks across filesystems and
+    sync tools (see MTIME_MATCH_TOLERANCE_SECONDS).
+
+    Args:
+        mtime_a: One modification time (Unix seconds, e.g. ``st_mtime``).
+        mtime_b: The other modification time.
+
+    Returns:
+        True when the two times are within the tolerance window.
     """
-    # Lazy import: file_utils is a leaf util imported by the managers, so reaching
-    # GriptapeNodes/ConfigManager at module top-level would create a cycle
-    # (file_utils <- managers <- griptape_nodes). config_manager.py breaks the
-    # same cycle the same way.
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-    from griptape_nodes.retained_mode.managers.settings import DISCOVERY_MAX_DEPTH_KEY
+    return abs(mtime_a - mtime_b) <= MTIME_MATCH_TOLERANCE_SECONDS
 
-    return GriptapeNodes.ConfigManager().get_config_value(
-        DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int
-    )
+
+# Windows denies a rename while another handle holds the destination open: a
+# competing promote clears in microseconds, a reader serving the old file clears
+# when its response completes. Ride out the transient cases; a persistent holder
+# still raises. POSIX never denies a rename for an open handle; a PermissionError
+# there (unwritable parent directory) is permanent, so it spends the bounded
+# retry before reporting the same failure.
+# Captured by the decorator at import; not runtime tunables.
+_PROMOTE_MAX_ATTEMPTS = 3
+_PROMOTE_RETRY_WAIT_SECONDS = 0.05
+
+# One decorator for both promote forms, so the policy cannot drift between
+# them; tenacity applies AsyncRetrying automatically to the coroutine form.
+_retry_transient_rename_denials = retry(
+    retry=retry_if_exception_type(PermissionError),
+    stop=stop_after_attempt(_PROMOTE_MAX_ATTEMPTS),
+    wait=wait_fixed(_PROMOTE_RETRY_WAIT_SECONDS),
+    before_sleep=before_sleep_log(logger, logging.DEBUG),
+    reraise=True,
+)
+
+
+@_retry_transient_rename_denials
+def promote_scratch_file(scratch: Path, destination: Path) -> None:
+    """Rename a finished scratch file onto the destination it was staged for.
+
+    Same-directory rename, so it is atomic: a reader sees either the previous
+    destination content or the complete new content. Retries transiently denied
+    renames; re-raises ``PermissionError`` when the denial persists. The
+    scratch file is left in place on failure — its disposal policy belongs to
+    the caller that created it.
+
+    Under contention this form sleeps up to ~100ms (two 50ms waits) on the
+    calling thread; a caller on an event loop should offload it (or the whole
+    write) to a worker thread, as with any blocking filesystem call.
+
+    Args:
+        scratch: The completed scratch file, in the destination's directory.
+        destination: The served path to promote onto.
+    """
+    scratch.replace(destination)
+
+
+@_retry_transient_rename_denials
+async def promote_scratch_file_async(scratch: Path, destination: Path) -> None:
+    """Async form of :func:`promote_scratch_file`; same contract, loop-safe waits."""
+    await anyio.Path(scratch).replace(destination)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write ``data`` to ``path`` atomically.
 
     Writes to a temp file in the same directory and renames it into place via
-    ``Path.replace`` (an atomic rename on the same filesystem), so a crash
-    mid-write leaves the previous file intact rather than a truncated one. The
-    temp file is removed if the write or rename fails.
+    ``Path.replace`` (an atomic rename on the same filesystem), so neither a
+    crash mid-write nor a concurrent reader ever observes a truncated file —
+    the destination holds either its prior content or the full new content.
+    The temp file is removed if the write or rename fails.
+
+    The temp file MUST live in the destination's directory: rename is only
+    atomic within one filesystem, and workstations with small local disks rely
+    on large assets (and therefore their in-flight bytes) staying on the
+    volume that already holds the destination — never ``$TMPDIR``.
 
     Args:
         path: Destination file path. Its parent directory must already exist.
         data: Bytes to write.
     """
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    tmp_path = Path(tmp_name)
+    # Write THROUGH a symlinked destination, matching in-place open(mode="w")
+    # semantics: the link survives and its target gets the new content. Without
+    # this, the rename would replace the link itself with a regular file and
+    # leave the target stale. A dangling link creates its target, as open() would.
+    if path.is_symlink():
+        path = path.resolve()
+
+    # Dot-prefixed and self-identifying: hidden from artists browsing the
+    # directory, and if a power loss strands one, the name says what left it
+    # there. The fixed ".partial" terminator matters as much as the dot:
+    # pathlib.glob matches dotfiles, and pollers glob extension patterns over
+    # directories this function writes into — a scratch name ending in the
+    # destination's own suffix would read as a second record mid-write.
+    tmp_path = path.parent / f".gtn-write-partial-{uuid.uuid4().hex}{path.suffix}.partial"
+
+    # The scratch must never expose content at a looser mode than the
+    # destination it replaces, even for the duration of the write — think a
+    # 0600 .env of API keys. So: create at a 0600 floor, align to the
+    # destination's exact mode while the scratch is still EMPTY, and only then
+    # write bytes. A brand-new destination instead gets 0o666 with the kernel
+    # applying the process umask — the same default open(mode="w") produces.
+    try:
+        destination_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        destination_mode = None
+    creation_mode = 0o600 if destination_mode is not None else 0o666
+    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    tmp_fd = os.open(tmp_path, open_flags, mode=creation_mode)
     try:
         with os.fdopen(tmp_fd, "wb") as tmp_file:
+            if destination_mode is not None:
+                # chmod is not umask-masked the way os.open's mode is, so this
+                # is what preserves a destination mode looser than the 0600
+                # creation floor. No content has been written yet.
+                tmp_path.chmod(destination_mode)
             tmp_file.write(data)
-        tmp_path.replace(path)
+            # flush() drains Python's userspace BufferedWriter into the kernel;
+            # fsync() then pushes the kernel's buffers to disk. fsync alone is
+            # not enough — it only syncs what the kernel has, and write() may
+            # have left bytes sitting in Python's buffer that fsync never sees.
+            # Both together guarantee the full payload is durable before the
+            # rename can promote the temp file into the destination name.
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        promote_scratch_file(tmp_path, path)
     except OSError:
         tmp_path.unlink(missing_ok=True)
         raise
+    _fsync_directory_best_effort(path.parent)
+
+
+def _fsync_directory_best_effort(directory: Path) -> None:
+    """Sync a directory's entries to disk, never raising.
+
+    The rename in ``atomic_write_bytes`` lives in the directory entry, which the
+    file's own fsync does not cover, so a crash right after ``replace()`` can
+    forget the rename on some filesystems. Readers are unaffected either way
+    (the rename is atomic regardless); this only firms up crash durability.
+    Best-effort because directories cannot be opened for sync on some
+    platforms/filesystems (Windows among them), and a failed sync must not fail
+    a write that already completed.
+    """
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError as e:
+        logger.debug("Could not open directory %s for fsync: %s", directory, e)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as e:
+        logger.debug("Could not fsync directory %s: %s", directory, e)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(dir_fd)
 
 
 def find_file_in_directory(directory: Path, pattern: str) -> Path | None:
@@ -163,58 +293,109 @@ class _AsyncWalkParams:
     matches: list[Path]
 
 
-async def _arecurse_find(path: anyio.Path, depth: int, params: _AsyncWalkParams) -> None:
+@dataclass(frozen=True)
+class _ScannedEntry:
+    """One directory entry, classified while its ``scandir`` iterator was still open.
+
+    A ``DirEntry``'s cached stat is tied to the ``scandir`` iterator that produced it,
+    so it cannot outlive the ``with`` block. Copying the three fields the walk needs
+    lets the classification happen in the worker thread while the recursion stays on
+    the event loop.
+    """
+
+    name: str
+    path: str
+    is_file: bool
+    is_dir: bool
+
+
+def _scan_directory(path: Path, *, skip_hidden: bool) -> list[_ScannedEntry]:
+    """List one directory, classifying each entry, for a single thread hop.
+
+    Uses os.scandir rather than Path.iterdir + is_file/is_dir: scandir carries the
+    entry type along with the directory read, so classifying an entry costs no extra
+    stat call. Hidden entries are dropped here so they are never classified.
+
+    Symlinked directories are reported as directories (matching the DirEntry.is_dir
+    default), because a workspace may reach its libraries or workflows through a link.
+    """
+    entries = []
+    with os.scandir(path) as scan:
+        for entry in scan:
+            if skip_hidden and entry.name.startswith("."):
+                continue
+
+            # is_file/is_dir may still stat when the entry is a symlink, which can raise
+            # on protected paths (e.g. macOS system caches). Skip the offending entry
+            # rather than aborting the whole directory.
+            try:
+                entry_is_file = entry.is_file()
+                entry_is_dir = entry.is_dir()
+            except (PermissionError, OSError) as e:
+                logger.debug("Cannot access entry %s: %s", entry.path, e)
+                continue
+
+            entries.append(_ScannedEntry(name=entry.name, path=entry.path, is_file=entry_is_file, is_dir=entry_is_dir))
+
+    return sorted(entries, key=lambda entry: entry.name)
+
+
+async def _arecurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> None:
     """Depth-bounded async walk that appends matching files into ``params.matches``.
 
-    Manual recursion via iterdir, because anyio.Path.rglob cannot express a
-    max_depth limit.
+    Offloads one thread hop per directory rather than per entry. The per-entry variant
+    (anyio.Path.iterdir plus an await pair per entry) dispatched two hops for every
+    entry, which dominated boot-time discovery on large trees; hopping per directory
+    recovers nearly all of that while keeping the walk a coroutine, so a caller can
+    still bound discovery with a timeout and cancellation lands at a directory edge.
+
+    max_depth is what bounds a symlink loop, so there is no visited-set.
     """
+    # abandon_on_cancel: a cancelled await returns immediately instead of waiting for the
+    # in-flight scandir, which is what makes the timeout above a real bound -- on a hung
+    # mount, waiting for the thread would leave discovery unbounded. Safe here because the
+    # scan is read-only; the shielding in async_utils.to_thread exists to protect a
+    # partially-completed write, which this is not. run_sync is positional-only, hence the
+    # partial for the keyword argument.
     try:
-        entries = [entry async for entry in path.iterdir()]
+        entries = await anyio.to_thread.run_sync(
+            partial(_scan_directory, path, skip_hidden=params.skip_hidden),
+            abandon_on_cancel=True,
+        )
     except (PermissionError, OSError) as e:
         logger.debug("Cannot access directory %s: %s", path, e)
         return
 
-    for item in sorted(entries):
+    for item in entries:
         if params.max_files is not None and len(params.matches) >= params.max_files:
             return
-        if params.skip_hidden and item.name.startswith("."):
-            continue
 
-        # is_file/is_dir stat the entry, which can raise on protected paths
-        # (e.g. macOS system caches). Skip the offending entry rather than
-        # aborting the whole directory.
-        try:
-            item_is_file = await item.is_file()
-            item_is_dir = await item.is_dir()
-        except (PermissionError, OSError) as e:
-            logger.debug("Cannot access entry %s: %s", item, e)
-            continue
-
-        if item_is_file:
+        if item.is_file:
             if fnmatch(item.name, params.pattern):
-                params.matches.append(Path(item))
-        elif item_is_dir and depth < params.max_depth:
-            await _arecurse_find(item, depth + 1, params)
+                params.matches.append(Path(item.path))
+        elif item.is_dir and depth < params.max_depth:
+            await _arecurse_find(Path(item.path), depth + 1, params)
 
 
 async def find_files_recursive(
     directory: Path,
     pattern: str,
     *,
+    max_depth: int,
     skip_hidden: bool = True,
     max_files: int | None = None,
 ) -> list[Path]:
     """Asynchronously search directory recursively for files matching pattern.
 
-    Depth-bounded async finder suitable for the engine boot path: it walks via
-    anyio so it yields to the event loop instead of blocking it, and the
-    `discovery_max_depth` setting bounds recursion so a pathologically deep tree
-    or symlink loop can't stall startup.
+    Depth-bounded async finder suitable for the engine boot path: each directory read is
+    offloaded to a worker thread so it never blocks the event loop, and `max_depth`
+    bounds recursion so a pathologically deep tree or symlink loop can't stall startup.
 
     Args:
         directory: Directory to search in
         pattern: Glob pattern to match file names against (e.g., '*.json')
+        max_depth: Ceiling on recursion depth, supplied by the caller (e.g. an
+            operator-configured setting).
         skip_hidden: If True, skip hidden directories (those starting with .).
             This avoids descending into large hidden trees like .git or .venv.
         max_files: If set, stop and return as soon as this many matches are found.
@@ -234,11 +415,11 @@ async def find_files_recursive(
     params = _AsyncWalkParams(
         pattern=pattern,
         skip_hidden=skip_hidden,
-        max_depth=_resolve_discovery_max_depth(),
+        max_depth=max_depth,
         max_files=max_files,
         matches=matches,
     )
-    await _arecurse_find(anyio.Path(directory), 0, params)
+    await _arecurse_find(Path(directory), 0, params)
 
     if not matches:
         logger.debug("No files matching pattern '%s' found in directory: %s", pattern, directory)

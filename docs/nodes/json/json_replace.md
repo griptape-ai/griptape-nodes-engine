@@ -36,7 +36,7 @@ The JSON Replace node allows you to modify JSON data by replacing values at spec
 
 ```python
 # Replace nested object properties
-path = "user.name"           # Replace user's name
+path = "user.name"  # Replace user's name
 path = "user.profile.email"  # Replace nested email
 ```
 
@@ -44,9 +44,9 @@ path = "user.profile.email"  # Replace nested email
 
 ```python
 # Replace array elements
-path = "items[0]"            # Replace first item
-path = "items[0].title"      # Replace title of first item
-path = "users[2].name"       # Replace name of third user
+path = "items[0]"  # Replace first item
+path = "items[0].title"  # Replace title of first item
+path = "users[2].name"  # Replace name of third user
 ```
 
 ### Complex Path Replacement

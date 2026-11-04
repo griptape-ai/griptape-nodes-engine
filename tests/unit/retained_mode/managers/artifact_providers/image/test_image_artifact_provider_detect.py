@@ -2,6 +2,7 @@
 
 from io import BytesIO
 
+import pytest
 from PIL import Image
 
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
@@ -27,16 +28,6 @@ def _gif_bytes() -> bytes:
     return _pil_bytes("GIF", mode="P")
 
 
-def _heic_bytes() -> bytes:
-    """Minimal HEIC ftyp box; Pillow can't generate HEIC without pillow-heif."""
-    return b"\x00\x00\x00\x18ftypheic" + b"\x00" * 16
-
-
-def _avif_bytes() -> bytes:
-    """Minimal AVIF ftyp box; Pillow can't generate AVIF natively."""
-    return b"\x00\x00\x00\x18ftypavif" + b"\x00" * 16
-
-
 class TestImageDetectFormat:
     def test_png(self) -> None:
         assert ImageArtifactProvider.detect_format(_png_bytes()) == "png"
@@ -56,20 +47,22 @@ class TestImageDetectFormat:
     def test_tiff(self) -> None:
         assert ImageArtifactProvider.detect_format(_pil_bytes("TIFF")) == "tiff"
 
-    def test_ico(self) -> None:
+    def test_ico_not_claimed(self) -> None:
+        """ICO is not in get_supported_formats(), so it must not be sniffed either (GH#5614)."""
         buf = BytesIO()
         Image.new("RGBA", (16, 16)).save(buf, format="ICO")
-        assert ImageArtifactProvider.detect_format(buf.getvalue()) == "ico"
+        assert ImageArtifactProvider.detect_format(buf.getvalue()) is None
 
-    def test_heic_via_iso_bmff_brand(self) -> None:
-        """HEIC is claimed via the ISO BMFF brand without depending on pillow-heif."""
-        assert ImageArtifactProvider.detect_format(_heic_bytes()) == "heic"
+    def test_heic_via_iso_bmff_brand_not_claimed(self) -> None:
+        """HEIC is not in get_supported_formats(), so it must not be sniffed either (GH#5614)."""
+        assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypheic" + b"\x00" * 16) is None
 
-    def test_heif_mif1_brand_returns_heic(self) -> None:
-        assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypmif1" + b"\x00" * 16) == "heic"
+    def test_heif_mif1_brand_not_claimed(self) -> None:
+        assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypmif1" + b"\x00" * 16) is None
 
-    def test_avif_via_iso_bmff_brand(self) -> None:
-        assert ImageArtifactProvider.detect_format(_avif_bytes()) == "avif"
+    def test_avif_via_iso_bmff_brand_not_claimed(self) -> None:
+        """AVIF is not in get_supported_formats(), so it must not be sniffed either (GH#5614)."""
+        assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypavif" + b"\x00" * 16) is None
 
     def test_riff_without_webp_marker_returns_none(self) -> None:
         """A RIFF header alone (e.g. WAV / AVI) must not be claimed as WebP."""
@@ -80,3 +73,29 @@ class TestImageDetectFormat:
 
     def test_short_data_returns_none(self) -> None:
         assert ImageArtifactProvider.detect_format(b"\x89PNG") is None
+
+
+class TestDetectFormatContract:
+    """Every *sampled* return value of detect_format() must be a declared format.
+
+    This does not catch a new sniffing branch that returns an undeclared format
+    with no sample here to exercise it - that shape of drift (GH#5614's heic /
+    avif / ico sniffing) is guarded by the *_not_claimed tests above instead.
+    """
+
+    @pytest.mark.parametrize(
+        "byte_sample",
+        [
+            _png_bytes(),
+            _jpeg_bytes(),
+            _gif_bytes(),
+            _pil_bytes("WEBP"),
+            _pil_bytes("BMP"),
+            _pil_bytes("TIFF"),
+        ],
+        ids=["png", "jpeg", "gif", "webp", "bmp", "tiff"],
+    )
+    def test_detect_format_return_values_are_all_supported(self, byte_sample: bytes) -> None:
+        detected = ImageArtifactProvider.detect_format(byte_sample)
+        assert detected is not None
+        assert detected in ImageArtifactProvider.get_supported_formats()

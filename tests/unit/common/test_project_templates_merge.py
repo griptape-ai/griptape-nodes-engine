@@ -2,11 +2,14 @@
 
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
+    DEFAULT_PROJECT_TEMPLATE_V0,
+    DEFAULT_PROJECT_TEMPLATE_V1,
     ProjectOverrideAction,
     ProjectOverrideCategory,
     ProjectTemplate,
     ProjectValidationInfo,
     ProjectValidationStatus,
+    default_template_for_version,
     load_partial_project_template,
     load_project_template_from_yaml,
 )
@@ -1215,6 +1218,22 @@ class TestWorkspaceDir:
         # The default has workspace_dir=None; an unset field must not be written.
         assert "workspace_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
 
+    def test_workspace_dir_emitted_even_when_equal_to_base(self) -> None:
+        # Regression: workspace_dir is OWN-node (not merge-inherited), so it must be emitted
+        # whenever set, even when it equals the base's value. A child self-contained project
+        # (workspace_dir "./") whose parent also declares "./" must still write its own "./";
+        # if it were diffed away as "same as base", the child would resolve to NO declared
+        # workspace and fall through to the global workspace -- causing it to scan the whole
+        # workspace tree for workflows instead of just its own folder.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "./"})
+        child = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "./", "name": "Child"})
+
+        overlay_yaml = child.to_overlay_yaml(base)
+        assert "workspace_dir" in overlay_yaml
+
+        merged = self._roundtrip(child, base=base)
+        assert merged.workspace_dir == "./"
+
     def test_explicit_null_tombstones_inherited_workspace_dir(self) -> None:
         # An explicit `workspace_dir: null` overlay clears an inherited value.
         base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/inherited/ws"})
@@ -1264,6 +1283,132 @@ workspace_dir: 42
 
         assert validation.status != ProjectValidationStatus.GOOD
         assert any("workspace_dir" in problem.field_path for problem in validation.problems)
+
+
+class TestSchemaVersionSavePolicy:
+    """Version stamped on save: roll forward to the latest WITHIN a major, never cross one.
+
+    A save advances the version to the latest known version in its own major (additive
+    minor/patch bumps), but never crosses to the next major (which carries a different
+    defaults baseline). The bump is one-directional. Tested against the real registered
+    majors: v0 latest is DEFAULT_PROJECT_TEMPLATE_V0's version, v1 latest is V1's.
+    """
+
+    V0_LATEST = DEFAULT_PROJECT_TEMPLATE_V0.project_template_schema_version
+    V1_LATEST = DEFAULT_PROJECT_TEMPLATE_V1.project_template_schema_version
+
+    def _template(self, version: str) -> ProjectTemplate:
+        return DEFAULT_PROJECT_TEMPLATE.model_copy(update={"project_template_schema_version": version})
+
+    def test_old_v0_rolls_forward_to_latest_v0_on_overlay(self) -> None:
+        overlay_yaml = self._template("0.3.0").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE_V0)
+        assert f'"project_template_schema_version": "{self.V0_LATEST}"' in overlay_yaml
+
+    def test_v0_never_crosses_to_v1_on_overlay(self) -> None:
+        # A v0 project rolls up only within major 0; it must not become 1.x.
+        overlay_yaml = self._template("0.3.0").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE_V0)
+        assert f'"project_template_schema_version": "{self.V1_LATEST}"' not in overlay_yaml
+
+    def test_latest_v0_is_unchanged_on_overlay(self) -> None:
+        overlay_yaml = self._template(self.V0_LATEST).to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE_V0)
+        assert f'"project_template_schema_version": "{self.V0_LATEST}"' in overlay_yaml
+
+    def test_old_v0_rolls_forward_on_full_yaml(self) -> None:
+        yaml_str = self._template("0.1.0").to_yaml()
+        assert f'"project_template_schema_version": "{self.V0_LATEST}"' in yaml_str
+
+    def test_latest_v1_is_unchanged_on_full_yaml(self) -> None:
+        yaml_str = self._template(self.V1_LATEST).to_yaml()
+        assert f'"project_template_schema_version": "{self.V1_LATEST}"' in yaml_str
+
+    def test_never_downgrades_a_newer_in_major_version(self) -> None:
+        # A version already beyond the registered latest-for-its-major is left untouched.
+        assert ProjectTemplate._version_to_write("0.99.0") == "0.99.0"
+
+    def test_unknown_major_is_preserved(self) -> None:
+        assert ProjectTemplate._version_to_write("9.9.9") == "9.9.9"
+
+
+class TestDefaultTemplateByMajor:
+    """default_template_for_version selects the merge-base default by schema MAJOR.
+
+    A v0 project merges onto the frozen v0 baseline (workspace-root-relative dirs); a v1
+    project merges onto the v1 baseline (workflow-relative dirs, file_extension_directory
+    routing, 3d/splat categories). This is what lets the breaking default change land under
+    a new major without moving existing v0 projects.
+    """
+
+    def test_latest_version_matches_latest_default_template(self) -> None:
+        # LATEST_SCHEMA_VERSION (what saves/upgrades stamp) and the latest-major default
+        # template's own version (what latest_version_for_major derives roll-forward and the
+        # load warning from) are two sources of truth that MUST agree. If they drift, a saved
+        # project gets stamped a version the loader then flags as "behind latest" -- a spurious
+        # FLAWED warning on a project that is actually current.
+        assert DEFAULT_PROJECT_TEMPLATE.project_template_schema_version == ProjectTemplate.LATEST_SCHEMA_VERSION
+
+    def test_v0_version_selects_v0_default(self) -> None:
+        assert default_template_for_version("0.5.1") is DEFAULT_PROJECT_TEMPLATE_V0
+
+    def test_v1_version_selects_v1_default(self) -> None:
+        assert default_template_for_version("1.0.0") is DEFAULT_PROJECT_TEMPLATE_V1
+
+    def test_latest_alias_is_v1(self) -> None:
+        assert DEFAULT_PROJECT_TEMPLATE is DEFAULT_PROJECT_TEMPLATE_V1
+
+    def test_unknown_future_major_falls_back_to_latest(self) -> None:
+        # A project declaring a not-yet-known major still loads against the newest baseline.
+        assert default_template_for_version("9.9.9") is DEFAULT_PROJECT_TEMPLATE
+
+    def test_v0_default_is_workspace_root_relative(self) -> None:
+        # The frozen v0 layout: dirs are NOT workflow-relative and routing is absent.
+        assert DEFAULT_PROJECT_TEMPLATE_V0.directories["inputs"].path_macro == "inputs"
+
+    def test_v0_sequence_macros_use_legacy_index_syntax(self) -> None:
+        # v0 is a FROZEN baseline: its sequence slots must stay the legacy `{_index:NN}` spelling
+        # exactly as shipped in v0.90.0, never the `{###}` shorthand (which is v1's syntax). Although
+        # `{###}` parses to the same `_index` variable, migrating v0's literal macros would change the
+        # frozen baseline and shift the to_overlay_yaml diff base for existing v0 projects. This guards
+        # against an accidental v0 -> `###` migration.
+        for name, situation in DEFAULT_PROJECT_TEMPLATE_V0.situations.items():
+            assert "###" not in situation.macro, f"v0 situation '{name}' must not use the ### shorthand"
+        # The known sequence situations must carry the padded legacy slot verbatim.
+        assert "{_index?:03}" in DEFAULT_PROJECT_TEMPLATE_V0.situations["save_node_output"].macro
+        assert "_v{_index:03}" in DEFAULT_PROJECT_TEMPLATE_V0.situations["create_versioned_workflow"].macro
+
+    def test_v1_default_is_workflow_relative(self) -> None:
+        assert DEFAULT_PROJECT_TEMPLATE_V1.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
+
+    def test_v0_project_merges_onto_v0_layout(self) -> None:
+        # A v0 overlay with no directory override inherits the v0 (workspace-root) layout,
+        # NOT the v1 workflow-relative one.
+        yaml_text = """
+project_template_schema_version: "0.5.1"
+name: "Legacy Project"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, validation)
+        assert overlay is not None
+        merged = ProjectTemplate.merge(
+            base=default_template_for_version(overlay.project_template_schema_version),
+            overlay=overlay,
+            validation_info=validation,
+        )
+        assert merged.directories["inputs"].path_macro == "inputs"
+
+    def test_v1_project_merges_onto_v1_layout(self) -> None:
+        yaml_text = """
+project_template_schema_version: "1.0.0"
+name: "Modern Project"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, validation)
+        assert overlay is not None
+        merged = ProjectTemplate.merge(
+            base=default_template_for_version(overlay.project_template_schema_version),
+            overlay=overlay,
+            validation_info=validation,
+        )
+        assert merged.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
 
 
 class TestLibrariesDir:
@@ -1321,6 +1466,20 @@ class TestLibrariesDir:
 
     def test_unset_libraries_dir_not_emitted(self) -> None:
         assert "libraries_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+    def test_libraries_dir_emitted_even_when_equal_to_base(self) -> None:
+        # Regression, mirror of the workspace_dir case: libraries_dir is OWN-node (not
+        # merge-inherited), so it must be emitted whenever set, even when it equals the base's
+        # value -- otherwise a child whose libraries_dir matches the parent's would be diffed away
+        # and resolve incorrectly.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "./libraries"})
+        child = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "./libraries", "name": "Child"})
+
+        overlay_yaml = child.to_overlay_yaml(base)
+        assert "libraries_dir" in overlay_yaml
+
+        merged = self._roundtrip(child, base=base)
+        assert merged.libraries_dir == "./libraries"
 
     def test_explicit_null_tombstones_inherited_libraries_dir(self) -> None:
         base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/inherited/lib"})

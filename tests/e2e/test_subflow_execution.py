@@ -9,16 +9,15 @@ This guards the serialization/deserialization path exercised by
 NodeExecutor._extract_parameter_output_values and
 NodeExecutor._apply_parameter_values_to_node - the code fixed in
 fix/subprocess-cattrs-bytes-deserialization - without requiring the cloud
-WebSocket relay that the Private Execution (SubprocessWorkflowExecutor) path needs.
+WebSocket relay that the Isolated Execution (SubprocessWorkflowExecutor) path needs.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -36,7 +35,14 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
+
+# Timeout with thread dump.
+pytestmark = pytest.mark.timeout(300, method="thread")
 
 FIXTURE_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "subflow_library"
 FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.json"
@@ -44,55 +50,23 @@ FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.js
 _EXPECTED_TEXT = "hello from subflow"
 
 
-def _materialize_library(target_dir: Path) -> Path:
-    from griptape_nodes.utils.version_utils import engine_version
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    schema = json.loads(FIXTURE_LIBRARY_JSON_TEMPLATE.read_text())
-    schema["metadata"]["engine_version"] = engine_version
-    library_json = target_dir / "griptape_nodes_library.json"
-    library_json.write_text(json.dumps(schema, indent=2))
-    node_file = FIXTURE_LIBRARY_DIR / "subflow_echo_node.py"
-    (target_dir / node_file.name).write_text(node_file.read_text())
-    return library_json
-
-
-def _write_isolated_config(config_root: Path, *, workspace: Path, library_path: Path) -> None:
-    config_dir = config_root / "griptape_nodes"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / "griptape_nodes_config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "workspace_directory": str(workspace),
-                "log_level": "WARNING",
-                "app_events": {
-                    "on_app_initialization_complete": {
-                        "libraries_to_register": [str(library_path)],
-                    },
-                },
-            }
-        )
-    )
-
-
-def _generate_subflow_workflow_source(library_json: Path) -> str:
+def _generate_subflow_workflow_source(engine: Engine, library_json: Path) -> str:
     """Build a flow with a SubflowGroupNode containing an EchoNode and serialize it."""
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="subflow_e2e_workflow")
+    engine.context_manager.push_workflow(workflow_name="subflow_e2e_workflow")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
     flow_name = flow_result.flow_name
 
-    with GriptapeNodes.ContextManager().flow(flow_name):
-        group_result = GriptapeNodes.handle_request(
+    with engine.context_manager.flow(flow_name):
+        group_result = engine.handle_request(
             CreateNodeRequest(
                 node_type="SubflowGroupNode",
                 specific_library_name="Subflow Library",
@@ -105,7 +79,7 @@ def _generate_subflow_workflow_source(library_json: Path) -> str:
             f"Expected SubflowGroupNode, got {group_result.node_type!r}"
         )
 
-        echo_result = GriptapeNodes.handle_request(
+        echo_result = engine.handle_request(
             CreateNodeRequest(
                 node_type="EchoNode",
                 specific_library_name="Subflow Library",
@@ -116,7 +90,7 @@ def _generate_subflow_workflow_source(library_json: Path) -> str:
         )
         assert isinstance(echo_result, CreateNodeResultSuccess), echo_result
 
-    GriptapeNodes.handle_request(
+    engine.handle_request(
         SetParameterValueRequest(
             parameter_name="text",
             value=_EXPECTED_TEXT,
@@ -124,7 +98,7 @@ def _generate_subflow_workflow_source(library_json: Path) -> str:
         )
     )
 
-    serialize_result = GriptapeNodes.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
+    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     metadata = WorkflowMetadata(
@@ -134,7 +108,7 @@ def _generate_subflow_workflow_source(library_json: Path) -> str:
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
         workflow_shape=None,
     )
-    return GriptapeNodes.WorkflowManager()._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
@@ -169,6 +143,7 @@ def _ensure_workflow_context() -> None:
 
 
 async def _e2e_run() -> None:
+    _E2EGriptapeNodes.ContextManager().push_workflow(file_path=__file__)
     await build_workflow()  # noqa: F821 - defined by the generated workflow source above
     _ensure_workflow_context()
     workflow_executor = _E2ELocalWorkflowExecutor(
@@ -203,7 +178,13 @@ if __name__ == "__main__":
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
     reason=f"Subflow Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
 )
-def test_subflow_node_group_propagates_output_values(tmp_path: Path) -> None:
+def test_subflow_node_group_propagates_output_values(
+    tmp_path: Path,
+    engine: Engine,
+    engine_subprocess_env: Callable[..., dict[str, str]],
+    materialize_library: Callable[..., Path],
+    write_isolated_config: Callable[..., None],
+) -> None:
     """A SubflowNodeGroup must propagate child node outputs back to the parent flow.
 
     Drives the real serializer + LocalWorkflowExecutor so a regression in
@@ -211,20 +192,27 @@ def test_subflow_node_group_propagates_output_values(tmp_path: Path) -> None:
     parameter-value round-trip fails this test.
     """
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    # The engine's ConfigManager creates the configured workspace on init, so this only has to
+    # cover the case where it has not.
+    workspace.mkdir(exist_ok=True)
     config_root = tmp_path / "xdg_config"
-    library_json = _materialize_library(tmp_path / "library")
-    _write_isolated_config(config_root, workspace=workspace, library_path=library_json)
+    library_json = materialize_library(
+        tmp_path / "library",
+        template=FIXTURE_LIBRARY_JSON_TEMPLATE,
+        node_file=FIXTURE_LIBRARY_DIR / "subflow_echo_node.py",
+    )
+    write_isolated_config(config_root, workspace=workspace, library_path=library_json)
 
-    workflow_source = _generate_subflow_workflow_source(library_json)
+    workflow_source = _generate_subflow_workflow_source(engine, library_json)
     runnable_source = _wrap_with_runtime_assertions(workflow_source)
 
     workflow_path = tmp_path / "subflow_workflow.py"
     workflow_path.write_text(runnable_source)
 
-    env = os.environ.copy()
-    env["XDG_CONFIG_HOME"] = str(config_root)
-    env.setdefault("GT_CLOUD_API_KEY", "fake-test-key-for-bootstrap")
+    # Isolated config dir + the GT_CLOUD_API_KEY placeholder the bootstrap needs. The child
+    # runs hermetically in LOCAL storage because conftest.py's _isolated_engine_env keeps real
+    # cloud secrets out of os.environ.
+    env = engine_subprocess_env(XDG_CONFIG_HOME=str(config_root))
 
     result = subprocess.run(  # noqa: S603
         [sys.executable, str(workflow_path)],

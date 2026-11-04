@@ -46,85 +46,87 @@ class StrictModeRule:
 
 
 RULES: dict[str, StrictModeRule] = {
-    "reentrant-bus-in-init": StrictModeRule(
-        rule_id="reentrant-bus-in-init",
-        default_severity=StrictModeSeverity.ERROR,
-        correctness=True,
-        description=(
-            "A node issued an event-bus request from inside its __init__. "
-            "The worker library probe runs __init__ to extract a schema; "
-            "re-entering the bus there deadlocks the worker."
-        ),
-        remediation_template=(
-            "Issued '{request_type}' during __init__. "
-            "Move the call into aprocess (or a lifecycle hook that runs after "
-            "construction)."
-        ),
-    ),
-    "parameter-behaviors-dropped-in-schema": StrictModeRule(
-        rule_id="parameter-behaviors-dropped-in-schema",
-        default_severity=StrictModeSeverity.WARNING,
-        correctness=False,
-        description=(
-            "A Parameter attached converters, validators, or traits that "
-            "are not captured in the worker schema. Orchestrator-side UI "
-            "behavior and worker-side execution diverge."
-        ),
-        remediation_template=(
-            "Parameter '{parameter_name}' carries {dropped_attributes} that "
-            "are not serialized into the worker schema. These will not "
-            "execute on the orchestrator stub; behavior may differ from "
-            "a local-library node."
-        ),
-        # Reported during library load on the worker; escalating to ERROR
-        # would cause the class to be skipped entirely, which is too harsh
-        # for an ergonomics warning.
-        worker_escalation=False,
-    ),
     "parameter-mutation-during-aprocess": StrictModeRule(
         rule_id="parameter-mutation-during-aprocess",
         default_severity=StrictModeSeverity.WARNING,
         correctness=False,
         description=(
             "A node called add_parameter or remove_parameter during "
-            "aprocess. On the worker these changes are local to the "
-            "transient node and do not sync back to the orchestrator."
+            "aprocess. In a worker, each execution runs on a copy "
+            "rebuilt from the orchestrator's node, so a direct mutation "
+            "during aprocess is local to that copy and never syncs. The "
+            "request-driven path syncs to the orchestrator's node, but "
+            "is not readable back on the executing copy until the next "
+            "execution rebuilds it."
         ),
         remediation_template=(
             "Node '{node_name}' (type '{node_class}') mutated parameter "
             "'{parameter_name}' during aprocess via {mutation}. Emit "
             "AddParameterToNodeRequest or RemoveParameterFromNodeRequest "
-            "to propagate the change to the orchestrator."
+            "to propagate the change to the orchestrator. Note that the "
+            "change reaches the orchestrator's node, not this one: do "
+            "not read the parameter back locally. Each execution rebuilds "
+            "its copy from the orchestrator's node, so the parameter "
+            "exists here from the next execution on."
         ),
     ),
-    "worker-reach-into-orchestrator": StrictModeRule(
-        rule_id="worker-reach-into-orchestrator",
+    "graph-access-while-loading": StrictModeRule(
+        rule_id="graph-access-while-loading",
         default_severity=StrictModeSeverity.WARNING,
         correctness=False,
         description=(
-            "A node running on a worker issued a request whose "
-            "authoritative state lives on the orchestrator (flow "
-            "graph, connections, parameter registry, config, or "
-            "secrets). The request was forwarded to the orchestrator "
-            "over the WebSocket bus; each call is a network round-"
-            "trip and the returned view is stale-by-call. Events are "
-            "the sanctioned cross-side boundary, but authors are "
-            "often unaware they are paying for it. Detection runs at "
-            "the RemoteHandler dispatch site, which covers both input "
-            "hydration (before/after_value_set) and aprocess. "
-            "Violations issued from library-internal helper threads "
-            "(e.g. ThreadPoolExecutor inside diffusers/transformers) "
-            "are not reported because the strict-mode reporter is "
-            "task-local; the forward still proceeds normally."
+            "A node sent a request that reads or changes connections, its "
+            "flow, or another node while it was being created or having "
+            "its saved state applied: in before_value_set or "
+            "set_parameter_value with initial_setup, or as its creation "
+            "set its state. The graph around a "
+            "loading node is incomplete -- a workflow load makes "
+            "connections before values, a paste after them, and a "
+            "worker's copy of the node has no connections or other nodes "
+            "at all -- so the answer depends on how the node was loaded."
         ),
         remediation_template=(
-            "Worker-side node issued '{request_type}' during node "
-            "execution. If this is an intentional write (e.g. "
-            "publishing a parameter value), ignore. If this is a read "
-            "of flow / connection state, consider whether the data "
-            "could be passed in via parameters instead of fetched "
-            "per-call."
+            "Node '{node_name}' sent {request_type} while it was loading. "
+            "While initial_setup is set, change the node itself (its "
+            "parameters, types and visibility) and leave connections and "
+            "other nodes alone: the loader makes the connections. Do the "
+            "graph work when the value is edited instead."
         ),
-        worker_escalation=False,
+    ),
+    "state-read-bypassing-requests": StrictModeRule(
+        rule_id="state-read-bypassing-requests",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node read engine state through a manager while it ran, "
+            "instead of asking with a request. In a worker the manager "
+            "holds that process's own copy of the state, not the "
+            "orchestrator's, so the answer would be wrong; a request is "
+            "answered by whichever process owns the state."
+        ),
+        remediation_template=(
+            "Node '{node_name}' used {manager_name} while it ran. Use "
+            "GriptapeNodes.handle_request({request_hint}) instead, which "
+            "gives the same answer in-process and in a worker."
+        ),
+    ),
+    "state-outside-parameters": StrictModeRule(
+        rule_id="state-outside-parameters",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node's after_value_set or connection hook set an attribute "
+            "on the node. after_value_set doesn't run when a node loads, "
+            "so a reopened workflow never has that attribute, and neither "
+            "hook runs for the copy a worker builds to run the node, which "
+            "has no connections: anything that reads the attribute "
+            "behaves differently there."
+        ),
+        remediation_template=(
+            "Node '{node_name}' set attribute(s) {attribute_names} in "
+            "{hook_name}. Keep that state in a parameter (hidden if it "
+            "isn't for the user), or derive it from the node's values "
+            "where it is needed."
+        ),
     ),
 }

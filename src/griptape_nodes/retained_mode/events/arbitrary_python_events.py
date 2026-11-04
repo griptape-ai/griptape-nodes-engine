@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -9,6 +8,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue
 
 # Eyes open about this one, yessir.
 # THIS IS CONFIGURABLE BEHAVIOR. CUSTOMERS NOT WISHING TO ENABLE IT CAN DISABLE IT.
@@ -46,7 +46,7 @@ class RunArbitraryPythonStringResultSuccess(ResultPayloadSuccess):
     """
 
     python_output: str
-    found_variable_values: dict[str, Any] = field(default_factory=dict)
+    found_variable_values: dict[str, DisplayValue] = field(default_factory=dict)
     missing_variables: list[str] = field(default_factory=list)
 
 

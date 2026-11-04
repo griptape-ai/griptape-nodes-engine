@@ -1,0 +1,36 @@
+{
+  "name": "Worker Dep Library",
+  "library_schema_version": "0.10.0",
+  "advanced_library_path": "worker_dep_library_advanced.py",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Library whose advanced module imports a manifest pip dependency (the pygit2 pattern)",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "DepNode",
+      "file_path": "dep_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Minimal fixture node",
+        "display_name": "Dep Node"
+      }
+    }
+  ]
+}

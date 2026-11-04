@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PIL import Image, ImageDraw, ImageOps
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
@@ -16,7 +16,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
     WriteFileResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
     BaseArtifactPreviewGenerator,
 )
@@ -24,6 +23,10 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     BaseGeneratorParameters,
     Field,
 )
+from griptape_nodes.utils.async_utils import to_thread
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class PILRoundedParameters(BaseGeneratorParameters):
@@ -59,13 +62,15 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
     for PNG/WEBP output formats, or composited onto white background for JPEG.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         source_file_location: str,
         preview_format: str,
         destination_preview_directory: str,
         destination_preview_file_name: str,
         params: dict[str, Any],
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the rounded preview generator.
 
@@ -75,6 +80,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             destination_preview_directory: Directory where the preview should be saved
             destination_preview_file_name: Filename for the preview
             params: Generator-specific parameters
+            engine: The engine whose request bus this generator reads and writes files through
 
         Raises:
             ValidationError: If parameters are invalid
@@ -85,6 +91,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             destination_preview_directory,
             destination_preview_file_name,
             params,
+            engine=engine,
         )
 
         # Validate and convert dict -> Pydantic model
@@ -142,7 +149,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             workspace_only=False,
             should_transform_image_content_to_thumbnail=False,
         )
-        read_result = await GriptapeNodes.ahandle_request(read_request)
+        read_result = await self.engine.ahandle_request(read_request)
 
         if not isinstance(read_result, ReadFileResultSuccess):
             msg = f"Failed to read source image: {read_result.result_details}"
@@ -154,7 +161,28 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             msg = "Source file is text, not binary image data"
             raise TypeError(msg)
 
-        # Step 3: Process image with PIL
+        # Step 3: Process image with PIL, off the event loop
+        output_bytes = await to_thread(self._render_rounded_preview, image_data)
+
+        # Step 4: Write output file
+        destination_path = str(Path(self.destination_preview_directory) / self.destination_preview_file_name)
+
+        write_request = WriteFileRequest(
+            file_path=destination_path,
+            content=output_bytes,
+            create_parents=True,
+            existing_file_policy=ExistingFilePolicy.OVERWRITE,
+        )
+        write_result = await self.engine.ahandle_request(write_request)
+
+        if not isinstance(write_result, WriteFileResultSuccess):
+            msg = f"Failed to write preview image: {write_result.result_details}"
+            raise OSError(msg)
+
+        return self.destination_preview_file_name
+
+    def _render_rounded_preview(self, image_data: bytes) -> bytes:
+        """Decode, shrink, round the corners of and re-encode the image. CPU-bound, so callers run it off the event loop."""
         with Image.open(BytesIO(image_data)) as raw_img:
             # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
             img = ImageOps.exif_transpose(raw_img)
@@ -187,23 +215,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             pil_format = "JPEG" if self.preview_format.lower() == "jpg" else self.preview_format.upper()
             final_img.save(output_buffer, format=pil_format)
             output_bytes = output_buffer.getvalue()
-
-        # Step 4: Write output file
-        destination_path = str(Path(self.destination_preview_directory) / self.destination_preview_file_name)
-
-        write_request = WriteFileRequest(
-            file_path=destination_path,
-            content=output_bytes,
-            create_parents=True,
-            existing_file_policy=ExistingFilePolicy.OVERWRITE,
-        )
-        write_result = await GriptapeNodes.ahandle_request(write_request)
-
-        if not isinstance(write_result, WriteFileResultSuccess):
-            msg = f"Failed to write preview image: {write_result.result_details}"
-            raise OSError(msg)
-
-        return self.destination_preview_file_name
+        return output_bytes
 
     def _apply_rounded_corners(self, img: Image.Image) -> Image.Image:
         """Apply rounded corners to image using alpha mask.

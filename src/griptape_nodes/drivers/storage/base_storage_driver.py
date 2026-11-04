@@ -1,14 +1,17 @@
-import logging
-from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import TypedDict
+from __future__ import annotations
 
-import httpx
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, TypedDict
+
+import httpx2
 
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
 
-logger = logging.getLogger("griptape_nodes")
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 
 class CreateSignedUploadUrlResponse(TypedDict):
@@ -28,26 +31,22 @@ class BaseStorageDriver(ABC):
     converting absolute paths to workspace-relative before calling driver methods.
     """
 
-    def __init__(self, workspace_directory: Path) -> None:  # noqa: B027
-        """Initialize the storage driver with a workspace directory.
+    def __init__(self, config_manager: ConfigManager) -> None:
+        """Initialize the storage driver.
 
         Args:
-            workspace_directory: The base workspace directory path (unused, kept for API compatibility).
-                Drivers now fetch the current workspace dynamically via the workspace_directory property.
+            config_manager: Reports the current workspace directory.
         """
-        # workspace_directory parameter is ignored - the property reads from ConfigManager instead.
-        # This ensures drivers always use the current workspace, even if it changes after initialization.
+        self._config_manager = config_manager
 
     @property
     def workspace_directory(self) -> Path:
-        """Get the current workspace directory from ConfigManager.
+        """Get the workspace directory in force right now.
 
         Returns the workspace path fresh on each access to handle dynamic workspace
         changes (e.g., project switches, workspace_dir overrides).
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        return GriptapeNodes.ConfigManager().workspace_path
+        return self._config_manager.workspace_path
 
     @abstractmethod
     def create_signed_upload_url(
@@ -84,6 +83,10 @@ class BaseStorageDriver(ABC):
     @abstractmethod
     def delete_file(self, path: Path) -> None:
         """Delete a file from storage.
+
+        Deleting a path that is already absent is a successful no-op: the requested end
+        state already holds, so implementations must return normally rather than raising.
+        Real failures (permission denied, server errors, timeouts) still raise.
 
         Args:
             path: Workspace-relative path of the file (e.g., ``outputs/image.png``).
@@ -153,7 +156,7 @@ class BaseStorageDriver(ABC):
             path: Workspace-relative path of the file (e.g., ``outputs/image.png``).
             file_content: The file content as bytes.
             existing_file_policy: How to handle existing files. Defaults to OVERWRITE for backward compatibility.
-            timeout: Optional timeout in seconds for upload request, None falls back to the httpx default.
+            timeout: Optional timeout in seconds for upload request, None falls back to the httpx2 default.
 
         Returns:
             The URL where the file can be accessed.
@@ -166,7 +169,7 @@ class BaseStorageDriver(ABC):
             upload_response = self.create_signed_upload_url(path, existing_file_policy)
 
             # Upload the file using the signed URL
-            response = httpx.request(
+            response = httpx2.request(
                 upload_response["method"],
                 upload_response["url"],
                 content=file_content,
@@ -177,13 +180,11 @@ class BaseStorageDriver(ABC):
 
             # Return the download URL
             return self.create_signed_download_url(path)
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             msg = f"Failed to upload file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         except Exception as e:
             msg = f"Unexpected error uploading file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
     def download_file(self, path: Path, timeout: float | None = None) -> bytes:
@@ -191,7 +192,7 @@ class BaseStorageDriver(ABC):
 
         Args:
             path: Workspace-relative path of the file (e.g., ``outputs/image.png``).
-            timeout: Optional timeout in seconds for download request, None falls back to the httpx default.
+            timeout: Optional timeout in seconds for download request, None falls back to the httpx2 default.
 
         Returns:
             The file content as bytes.
@@ -204,15 +205,13 @@ class BaseStorageDriver(ABC):
             download_url = self.create_signed_download_url(path)
 
             # Download the file
-            response = httpx.get(download_url, timeout=timeout)
+            response = httpx2.get(download_url, timeout=timeout)
             response.raise_for_status()
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             msg = f"Failed to download file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         except Exception as e:
             msg = f"Unexpected error downloading file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         else:
             return response.content

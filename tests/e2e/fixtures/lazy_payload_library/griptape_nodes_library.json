@@ -1,0 +1,35 @@
+{
+  "name": "Lazy Payload Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library used by lazy-loading stable-namespace e2e tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "LazyPayloadNode",
+      "file_path": "lazy_payload_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Holds a LazyPayload object in its `payload` parameter",
+        "display_name": "Lazy Payload"
+      }
+    }
+  ]
+}

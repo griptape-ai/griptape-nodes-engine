@@ -1,0 +1,301 @@
+# Troubleshooting
+
+This page collects the issues and states people run into most often, along with what causes them and how to recover. If you hit something that isn't here, check the [FAQ](faq.md) or reach out through one of the channels at the bottom of the [FAQ](faq.md#where-can-i-provide-feedback-or-ask-questions).
+
+## Images or videos aren't showing in the editor
+
+**Symptoms**
+
+- Load Image, Save Image, or a media preview node shows an empty area instead of the image.
+
+- The file clearly exists on disk (for example in `{outputs}/images/...`), but the editor won't display it.
+
+- Uploading a new image fails with an error like:
+
+    ```
+    Error: CreateStaticFileUploadUrl Failed
+    Description: Failed to create presigned URL for file ...: Client error
+    '404 Not Found' for url 'http://localhost:8124/static-upload-urls'
+    ```
+
+**Cause**
+
+Media in the editor is served by a local **static file server** that the engine starts on port `8124`. If that port is already taken, usually by a **second (or stray) Griptape Nodes engine that is still running**, the new engine's static server falls back to a different, OS-assigned port. Media requests then end up split across the two engines, with the stray engine holding the default port while the engine you're actually working with serves from another one, so previews fail to load and uploads fail with `404` errors.
+
+**Fix**
+
+1. Refresh the editor first with Ctrl+R (Windows/Linux) or Cmd+R (macOS). This clears simple display glitches.
+1. If media still won't show, make sure **only one engine is running**. Fully quit Griptape Nodes, then look for a leftover engine process:
+    - **Windows**: Open Task Manager and look for a stray `Python` process. End it.
+    - **macOS / Linux**: In a terminal, run `pgrep -fl griptape` (or look for `python` running the engine) and stop the leftover process.
+1. If you can't find or stop the stray process, **restart your computer**. This reliably clears any leftover engine holding the port.
+1. Start Griptape Nodes again. On a clean start there should be a single engine process, and media will display normally.
+
+!!! tip
+
+    After restarting, confirm there is only one engine process before reopening your workflow. A single leftover engine from a previous session, especially after an update, is the most common cause of this issue.
+
+!!! note "Running the engine on a remote machine?"
+
+    If your engine runs on a different machine than the editor (or behind a tunnel or reverse proxy), missing media is expected until you point the editor at the right address. Set `static_server_base_url` as described in [Static File Server Configuration](guides/configuration.md#static-file-server-configuration).
+
+## Imported images or videos are 0 bytes
+
+**Symptoms**
+
+- Imported images and videos land in `{inputs}/images/` or `{inputs}/videos/` as **0 bytes** (File Explorer shows `0 KB`).
+- The media doesn't display in the editor, and reopening the workflow shows no media.
+- Quitting and reopening Griptape Nodes doesn't help.
+
+**Cause**
+
+Bringing a file into a project happens in two steps. The engine first reserves the destination filename by creating an empty file, then the editor sends the file's contents to the local static file server the engine runs on port `8124`. When that second step doesn't complete, the reserved empty file is all that's left.
+
+This has been traced to a browser-level fault on the machine, and has only been seen on Windows 10. Restarting the application doesn't clear it.
+
+**Fix**
+
+- Restart your computer. Restarting Griptape Nodes on its own is not enough.
+
+## "Address already in use" / the engine won't start
+
+**Symptoms**
+
+You see a startup error similar to:
+
+```
+The 'websocket_direct' driver could not start: its address is already in use.
+Another Griptape Nodes engine is probably already running.
+Stop the other engine (or change this driver's port) and try again.
+```
+
+**Cause**
+
+Another Griptape Nodes engine is already running and holding the port this engine needs.
+
+**Fix**
+
+1. Stop the other engine. Quit any other Griptape Nodes windows and check for stray engine processes using the steps in the [media section above](#images-or-videos-arent-showing-in-the-editor).
+1. If you intentionally want to run more than one engine on the same machine, see [Running multiple engines on one machine](#running-multiple-engines-on-one-machine).
+
+## Running multiple engines on one machine
+
+**Symptoms**
+
+With two or more engines running on the same machine, you see lots of weird, seemingly unrelated errors: requests answered by the wrong engine (or answered twice), workflows and state crossed between editor sessions, engines that look like one engine in the editor, port errors like the [address-in-use error above](#address-already-in-use-the-engine-wont-start), or media failing to load like the [images issue above](#images-or-videos-arent-showing-in-the-editor).
+
+**Cause**
+
+Two separate problems stack here:
+
+- **Shared identity.** When `GTN_ENGINE_ID` isn't set, every engine launched on the machine resolves to the same default engine identity. Engines sharing an identity listen for the same requests and share the same session state, so they both try to answer requests meant for one of them. This is what produces the flood of strange errors.
+- **Port conflicts.** The first engine takes the default ports (such as `8124` for the static file server); later engines fall back to other ports, which breaks anything still pointing at the defaults.
+
+**Fix**
+
+Give every additional engine **its own identity and its own ports**:
+
+```bash
+GTN_ENGINE_ID=second-engine STATIC_SERVER_PORT=9000 GTN_MCP_SERVER_PORT=9928 gtn engine
+```
+
+If you never intended to run more than one engine, find and stop the extra one using the steps in the [media section above](#images-or-videos-arent-showing-in-the-editor).
+
+## "No sessions available" — the engine won't start for license users
+
+**Symptoms**
+
+You activated with a license (rather than logging in through Griptape Cloud), and on launch the engine fails license allocation with an error like `No sessions available`.
+
+**Cause**
+
+Your organization has a fixed pool of license sessions (seats). A seat is held for as long as an engine is running and is released when the engine shuts down cleanly. `No sessions available` means every seat in the pool is currently held — either legitimately (everyone is using theirs) or by a **stale session**: an engine that crashed, was force-killed, or is still running orphaned in the background keeps holding (and renewing) its seat.
+
+**Fix**
+
+1. Check for an orphaned engine on your own machine, especially after a crash or a force-quit, using the steps in the [media section above](#images-or-videos-arent-showing-in-the-editor). Stopping it releases your seat.
+1. If a seat is stuck, an organization owner can release it: in the [Admin Dashboard](enterprise/admin_dashboard.md#sessions), open the **Sessions** modal and **Release** the stale session to free the seat.
+1. Otherwise, a stale session frees itself once it expires — seats time out when they stop being renewed, so waiting a few minutes and trying again also works.
+
+!!! note
+
+    A related error, `No session pool configured`, means your organization isn't set up with license sessions at all — contact whoever administers your Griptape Nodes licenses.
+
+## The editor is black or blank
+
+**Symptoms**
+
+The editor window goes black or blank, often after the machine has been idle or asleep, or after a brief network interruption.
+
+**Fix**
+
+- Refresh the editor with Ctrl+Shift+R (Windows/Linux) or Cmd+Shift+R (macOS). A hard refresh reloads the editor and reconnects to the engine.
+
+## Libraries or nodes are missing, or you see errors from another engine
+
+**Symptoms**
+
+- No libraries show up, or a node you expect (such as the Agent node) is gone.
+- The editor shows errors that reference a different engine or workflow than the one you're looking at.
+
+**Cause**
+
+Usually one of two things:
+
+- **Something prevented a library from loading.** When a library fails to load (a missing dependency, a broken node file, an import error, and so on), its nodes silently won't appear. **The logs are the source of truth here.** Export or open the engine logs and look for errors around library loading at startup.
+- **The Libraries To Register setting isn't what you think.** The engine only loads the libraries listed in the **Libraries To Register** setting (**Configuration Editor → Libraries → Library Registration**, stored as `app_events.on_app_initialization_complete.libraries_to_register` in `griptape_nodes_config.json`). If a library isn't in that list, is toggled off, or its entry is stale, its nodes won't show up.
+- You may also simply be connected to a different engine than you think, and it surfaces that engine's libraries and errors.
+
+**Fix**
+
+1. **Check the logs first.** Look for errors emitted while libraries load on startup. The reported error usually names the library and the reason it failed. See [Exporting engine logs](#exporting-engine-logs).
+1. Confirm which engine the editor is connected to. If you have engines on multiple machines, the editor may have connected to the wrong one.
+1. Open the **Configuration Editor**, go to the **Libraries** view, and check **Library Registration → Libraries To Register**. If the library you expect is missing, toggled off, or points somewhere stale, fix the entry, or re-add the library via **Manage → Library Management → Add Library**. See [Toggling and removing libraries](guides/libraries.md#toggling-and-removing-libraries) and [Installing a library](guides/editor/managing_models_and_libraries.md#installing-a-library).
+1. Check the **Libraries** panel with the filter set to **Errors** for libraries that failed to install or load. See ["I installed the library but I don't see its nodes"](guides/libraries.md#i-installed-the-library-but-i-dont-see-its-nodes).
+1. Make sure your libraries are up to date. Open **Manage → Library Management**, expand the library, and click **Check for Updates**, then **Update** when one is offered. See [Updating a library](guides/editor/managing_models_and_libraries.md#updating-a-library). To update the engine itself, see the [FAQ](faq.md#how-do-i-update-griptape-nodes).
+
+## "failed to locate pyvenv.cfg" / the engine won't start
+
+**Symptoms**
+
+On launch, the engine fails to start with:
+
+```
+failed to locate pyvenv.cfg: The system cannot find the file specified.
+```
+
+**Cause**
+
+A previous uninstall didn't fully complete, leaving Griptape Nodes' virtual environment in a broken state.
+
+**Fix**
+
+1. Uninstall Griptape Nodes again to clear the broken install:
+
+    ```bash
+    griptape-nodes self uninstall
+    ```
+
+    The broken virtual environment can also stop `griptape-nodes` itself from starting, since the command runs out of that same environment. If you get the same error trying to uninstall, remove the install by hand using the steps in [Uninstalling Griptape Nodes](uninstalling.md#manual-engine-install).
+
+1. Reinstall by following the [installation](installation.md) instructions.
+
+## "Attempted to create a Flow with a parent 'None'" / usually harmless
+
+**Symptoms**
+
+You see this error, often while loading or building a workflow:
+
+```
+Attempted to create a Flow with a parent 'None', but no parent with that name could be found.
+```
+
+**Cause**
+
+A known, elusive bug. In almost all cases it's harmless and doesn't affect your work.
+
+**Fix**
+
+1. You can usually disregard it and keep working.
+1. If it's blocking you, restart the engine and it should clear up.
+1. If you can reproduce it, we'd be grateful if you'd [log a bug](https://github.com/griptape-ai/griptape-nodes/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) with any context about what led to it.
+
+## "ssl.SSLCertVerificationError" / the engine won't run
+
+**Symptoms**
+
+When you try to run Griptape Nodes, you see:
+
+```
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1000)
+```
+
+**Cause**
+
+The Python installation on your machine doesn't have access to verified SSL certificates.
+
+**Fix**
+
+1. Reinstall Python using the [python.org](https://www.python.org/downloads/) installer. Griptape Nodes requires Python 3.12.
+1. At the end of installation, choose to **Install Certificates**.
+    - If the installer doesn't offer it, run `/Applications/Python\ 3.12/Install\ Certificates.command`.
+
+## Exporting engine logs
+
+When you report an issue (or dig into one yourself), the engine logs are usually the first thing to look at. On their own, though, logs rarely explain what happened — which libraries loaded, which settings were in effect, and which API keys were set all matter too. A diagnostics bundle collects all of it in one step.
+
+### Collecting everything at once
+
+A **diagnostics bundle** is one zip file holding:
+
+| Inside the bundle  | What it tells whoever reads it                                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `logs/*.log`       | The log files kept on disk, newest first. The top one covers the session you made the bundle in                                |
+| `logs/session.log` | Everything the engine logged this session, from memory. Only when none of it reached a log file                                |
+| `report.json`      | Which engine version was running, on what machine, with which settings, and how every library and project fared when it loaded |
+| `doctor.json`      | The [`doctor`](reference/command_line_interface.md#doctor) health checks: what is wrong and what to do about each one          |
+| `workflow/`        | The workflow that was open, as it was last saved. Only when the editor made the bundle                                         |
+| `manifest.json`    | Every file above, and a count of everything that was removed for safety                                                        |
+| `README.md`        | A plain-language guide to all of it                                                                                            |
+
+To make one:
+
+```bash
+gtn diagnostics collect
+```
+
+A bundle made this way has no `workflow/` folder: the command starts an engine of its own, and that engine has no workflow open. To include the workflow you are working on, make the bundle from the editor instead.
+
+That writes `griptape-nodes-diagnostics-<version>-<timestamp>.zip` into the current directory. To put it somewhere easier to find:
+
+```bash
+gtn diagnostics collect --output ~/Desktop
+```
+
+Attach the file to your bug report. Nothing is uploaded anywhere — the bundle is written to your machine, and sharing it is your call.
+
+!!! note "What is taken out, and what to check before you share it"
+
+    The bundle is written by the engine, which knows its own API keys, so it searches every file it collects and takes them out — along with anything else shaped like a credential. Home directory paths become `~` and your username becomes `<user>`; pass `--show-identity` if you would rather keep them. Anything removed shows up as `<redacted>`, and `manifest.json` counts every removal, so a setting that looks empty can be told apart from one that was hidden.
+
+    What it cannot find is a secret it was never told about that is not shaped like one — a password typed into a node's text field, or a token a library wrote to its own log in its own format. Skim the files under `logs/` and the workflow file before attaching the bundle to anything public, because what is left depends on what was on your machine.
+
+If you only want the health checks and not a file to send, run:
+
+```bash
+gtn doctor
+```
+
+It prints a table of what it found, with a fix for anything that needs one.
+
+### From the desktop application
+
+The desktop application keeps its own log files for the local engine it manages, and can export logs for a time range, not just the current session. This is especially useful when the problem happened a while ago or spans an engine restart.
+
+1. Click **Engine** in the header (the button that shows the engine status) to open the engine popover.
+1. Under **Managed Engine**, click **Logs** to open the engine logs window.
+1. Click **Export**.
+1. In the **Export Logs** dialog, choose:
+    - **Current Engine Session** — logs since the engine was last started.
+    - **Time Range** — logs between specific timestamps, with a **From** time and either a **To** time or a **Now** checkbox. When an issue just happened, exporting the last half hour or so is usually more useful than the whole session.
+1. Choose where to save the `.txt` file.
+
+!!! note
+
+    Exporting requires the **Write engine logs to file** setting, found in the desktop application's [App Settings](guides/desktop/app_settings.md#logging-and-diagnostics). It is enabled by default; if the **Export** button is disabled, use the **Manage** link next to it to jump to that setting.
+
+### From the terminal
+
+If you run the engine manually (with `gtn` or `gtn engine`), logs print directly to that terminal. Scroll back and copy the relevant portion from there.
+
+The engine also keeps its own log files, so you don't have to catch a problem while the terminal is still open. Each engine process writes one file in the `logs` folder of the engine state directory (`<XDG_STATE_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_STATE_DIR` when that is set), rolls it over at 10 MB, and deletes files that haven't been touched for a week. Three settings control this: `logging.log_to_file`, `logging.log_directory`, and `logging.log_retention_days` (see the [Configuration Reference](reference/configuration_reference.md)). `gtn diagnostics collect` gathers these files for you.
+
+If the logs don't show enough detail, raise the engine's log level: open the Configuration Editor (**Settings → All Settings**), search for "log level", set it to `DEBUG`, and reproduce the issue (see [Editing Settings in the Editor](guides/configuration.md#editing-settings-in-the-editor)). When running headless with no editor attached, you can set it through an environment variable instead:
+
+```bash
+GTN_CONFIG_LOG_LEVEL=DEBUG gtn
+```
+
+!!! tip
+
+    The engine keeps the most recent 5,000 log lines in memory, so making a bundle right after a problem captures it even if log files are turned off — they arrive as `logs/session.log`. When the engine did write a log file, that file already holds the same lines and more, so the bundle ships the file instead and leaves `session.log` out. Either way the lines carry whatever the log level allows, so set the log level to `DEBUG` before reproducing the problem if you need debug detail. `logging.session_log_buffer_lines` controls how many lines are kept.

@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from griptape_nodes.common.macro_parser import MacroVariables
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.retained_mode.events.base_events import (
+    AppPayload,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -146,6 +147,9 @@ class CreateStaticFileDownloadUrlFromPathRequest(RequestPayload):
             Ignored for non-macro paths.
         preview: If True, generates and returns preview(s) rather than the original file.
             Defaults to False.
+        metadata_only: If True, extracts and returns artifact_metadata for the original file
+            without generating a preview. The returned URL points to the original full-quality
+            file. Takes precedence over preview. Defaults to False.
 
     Results: CreateStaticFileDownloadUrlResultSuccess (with URL) | CreateStaticFileDownloadUrlResultFailure (URL creation error)
     """
@@ -153,6 +157,7 @@ class CreateStaticFileDownloadUrlFromPathRequest(RequestPayload):
     file_path: str
     macro_variables: MacroVariables = field(default_factory=dict)
     preview: bool = False
+    metadata_only: bool = False
 
 
 @dataclass
@@ -176,11 +181,19 @@ class CreateStaticFileDownloadUrlFromPathResultSuccess(CreateStaticFileDownloadU
 
     Args:
         artifact_metadata: Original properties extracted from the source file header.
-            Only populated when preview=True and the file is a local image.
-            Contains: width, height, format, channels, color_space, file_size.
+            Populated when preview=True or metadata_only=True and the file format has
+            a registered provider. Contains a subset of: width, height, format, channels,
+            color_space, file_size, duration_seconds, codec, frame_rate.
+        preview_failure_reason: Why a requested preview could not be served, when the
+            URL points at the original file instead of a preview. None when the preview
+            was served, or when no preview was requested. Editors should surface this
+            instead of rendering an unexplained full-size image or empty frame. The
+            text is human-readable and NOT machine-parseable — do not branch on its
+            contents; only its presence/absence is contract.
     """
 
     artifact_metadata: dict | None = None
+    preview_failure_reason: str | None = None
 
 
 @dataclass
@@ -193,3 +206,26 @@ class CreateStaticFileDownloadUrlResultFailure(WorkflowNotAlteredMixin, ResultPa
     """
 
     error: str
+
+
+@dataclass
+@PayloadRegistry.register
+class StaticFileChanged(AppPayload):
+    """A local file a client minted a download URL for changed on disk.
+
+    Sent while the `refresh_previews_on_file_change` setting is on, which it is by default. The engine watches
+    each local file passed to CreateStaticFileDownloadUrlFromPathRequest and sends this event when
+    one is saved or replaced, whether by a node or by another app. Clients respond by sending the
+    request again: the new URL carries a new `?v=` version, and a requested preview is regenerated.
+
+    Not sent for Griptape Cloud files, under the Griptape Cloud storage backend, or by workers.
+
+    Args:
+        file_path: Absolute path of the file that changed.
+        requested_file_paths: The `file_path` of every CreateStaticFileDownloadUrlFromPathRequest
+            that resolved to this file, exactly as the client sent it (macro path, file:// URL,
+            absolute or workspace-relative path). Clients match their previews against these.
+    """
+
+    file_path: str
+    requested_file_paths: list[str]

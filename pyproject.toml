@@ -1,45 +1,65 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.91.0"
+version = "0.107.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12.0, <3.13"
+requires-python = ">=3.12.0, <3.16"
 dependencies = [
   "griptape>=1.10.2",
   "pydantic>=2.10.6",
   "python-dotenv>=1.0.1",
   "xdg-base-dirs>=6.0.2",
+  # huggingface-hub 1.x raises httpx errors; node libraries import httpx without declaring it
   "httpx>=0.28.0,<1.0.0",
-  "websockets>=15.0.1,<17.0.0",
+  "httpx2>=2.12.0,<3.0.0",
+  "websockets>=15.0.1,<18.0.0",
   "tomlkit>=0.13.2",
   # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/833
   "uv>=0.6.16",
   "fastapi>=0.115.12",
   "uvicorn>=0.34.2",
   "packaging>=25.0",
-  "python-multipart>=0.0.20",
   "json-repair>=0.46.1",
-  "mcp[ws]>=1.10.1",
-  "binaryornot>=0.4.4",
+  # 2.x is required, not just preferred: servers/mcp.py uses the constructor-registered
+  # on_list_tools/on_call_tool handlers that replaced the 1.x decorators. Ceiling is deliberate
+  # so a 3.0 release cannot silently kill the MCP server thread again (see issue 5216).
+  "mcp>=2.0,<3",
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
   "watchfiles>=1.1.0",
-  "typer>=0.15.0",
-  "huggingface-hub>=1.9.0",
+  # Ceiling: default libraries pin transformers/tokenizers that need huggingface-hub<2. Library
+  # installs floor at the engine's version, so 2.x here fails them and marks them FLAWED (issue 5752).
+  "huggingface-hub>=1.9.0,<2",
   "rich>=14.1.0",
   "semver>=3.0.4",
   "anyio>=4.0",
   "ruamel.yaml>=0.18.15",
   "asyncio-thread-runner>=1.0",
   "portalocker>=2.10.0",
-  "pygit2>=1.19.0",
   "send2trash>=2.1.0",
   "tenacity>=9.0.0",
   "truststore>=0.10.1",
   "cattrs>=26.1.0",
+  "attrs>=25.4.0",
   "fileseq>=3.2.0",
-  "pydantic-ai-slim[mcp,openai]>=1.95.1",
-  "pydantic-ai-skills>=0.11.0",
+  # Floor at 2.29.0: that release ("Support FastMCP 4 and MCP SDK v2 in `MCPToolset` alongside
+  # FastMCP 3", pydantic/pydantic-ai#6738) is the first where the `[mcp]` extra's `fastmcp-slim`
+  # floor supports the mcp 2.x module layout our own `mcp>=2.0,<3` pin (above) resolves to.
+  # Below this, `pydantic_ai/mcp.py` imports symbols (e.g. `mcp.shared.context.RequestContext`)
+  # that mcp 2.x moved/renamed, so `agent_manager` fails to import at construction time.
+  # PR #5449 raised the `mcp` ceiling without checking this; PR #5493 papered over the fallout
+  # for pydantic-ai-skills but left this one. Lift no lower than this floor.
+  "pydantic-ai-slim[mcp,openai]>=2.29.0",
+  # Floor at 2.0: agents/pydantic_ai/runner.py builds a SkillsCapability with the 2.x
+  # arguments (`scripts`, `include`) that replaced 1.x's `exclude_tools`/`auto_reload`.
+  # Ceiling below 3.0 so the next major cannot silently break the sidebar agent at
+  # construction time the way 2.0.0 did (see issue 5491).
+  "pydantic-ai-skills>=2.0,<3",
+  # Ceiling below 0.52: from 0.52 harness reads skills from a workspace on each run, and
+  # pydantic-ai-skills 2.1 answers that with `LocalWorkspaceBackend`, which raises on Windows.
+  # Lift once pydantic-ai-skills reads skills without a POSIX-only backend and the runner
+  # validates skills at run time (see issue 5881).
+  "pydantic-ai-harness>=0.28,<0.52",
 ]
 
 [project.optional-dependencies]
@@ -48,21 +68,24 @@ profiling = ["austin-dist>=3.7.0"]
 [dependency-groups]
 dev = [
   "griptape-cloud-client",
+  # Markdown: the toc extension's slugify, so scripts/generate_settings_reference.py anchors
+  # match the heading ids mkdocs renders.
+  "markdown>=3.5",
   "mdformat>=0.7.22",
   "mdformat-gfm>=0.4.1",
   "mdformat-frontmatter>=2.0.8",
   "mdformat-footnote>=0.1.1",
   "mdformat-mkdocs>=4.1.2",
   "pyright>=1.1.396",
-  "ruff>=0.11.0",
+  "ruff>=0.16.0",
   "typos>=1.30.2",
 ]
 docs = [
   "mkdocs-material>=9.6.9",
   "mkdocs>=1.5.2",
   "mkdocstrings[python]>=0.29.1",
-  "mkdocs-mermaid2-plugin>=1.2.2",
   "mkdocs-llmstxt>=0.5.0",
+  "mkdocs-redirects>=1.2.2,<1.2.4",
   "pymdown-extensions>=10.17",
 ]
 test = [
@@ -71,11 +94,12 @@ test = [
   "pytest-mock>=3.14.0",
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
-  "coverage>=7.0.0",
+  "pytest-timeout>=2.4.0",
+  "coverage>=7.9.0",
 ]
 
 [build-system]
-requires = ["uv_build>=0.7.2,<0.12"]
+requires = ["uv_build>=0.7.2,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -84,13 +108,24 @@ module-name = "griptape_nodes"
 [tool.uv.sources]
 griptape-cloud-client = { git = "https://github.com/griptape-ai/griptape-cloud-python-client", rev = "main" }
 
+[tool.coverage.run]
+# sys.monitoring stops tracing a line once it has run, unlike the default tracer on 3.12 that
+# traces every line every time. It does not support branch coverage on 3.12.
+core = "sysmon"
+
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 pythonpath = ["libraries/griptape_nodes_library"]
 
 [tool.ruff]
 line-length = 120
-extend-exclude = ["libraries/**/templates/*.py"]
+# Engine-generated workflow files. Their formatting is whatever the workflow generator emits, so
+# reformatting them would mean the committed copy no longer matches a real save.
+extend-exclude = [
+  "libraries/**/templates/*.py",
+  "tests/e2e/fixtures/**/*_workflow.py",
+  "tests/unit/**/fixtures/**/*_workflow.py",
+]
 
 
 [tool.ruff.lint]
@@ -105,10 +140,10 @@ ignore = [
   "ANN003",  # Intentional
   "ANN401",  # Intentional
   "COM812",  # Intentional
-  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834 
-  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835 
+  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834
+  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835
   "BLE001",  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/839
-  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838 
+  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838
   "SIM108",  # Intentional
   "SIM110",  # Intentional
   "D105",    # Intentional
@@ -117,6 +152,7 @@ ignore = [
   "FBT003",  # Intentional
   "RET504",  # Intentional
   "PLC0415", # Intentional
+  "CPY001",  # Intentional
 ]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -124,11 +160,64 @@ ignore = [
 "libraries.griptape_nodes_library".msg = "Import from griptape_nodes_library instead of libraries.griptape_nodes_library"
 "libraries.griptape_nodes_advanced_media_library".msg = "Import from griptape_nodes_advanced_media_library instead of libraries.griptape_nodes_advanced_media_library"
 "libraries.griptape_cloud".msg = "Import from griptape_cloud instead of libraries.griptape_cloud"
+"pickle".msg = "Values cross process and file boundaries as plain data through griptape_nodes.serialization. Pickle runs code from whatever produced the bytes, and ties saved data to one Python process's class layout."
+"griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes".msg = "Engine-internal code should take an injected Engine (see griptape_nodes.retained_mode.engine) and reach peers via self.engine, not the process-wide GriptapeNodes facade. The facade exists for saved workflow files, node libraries, and process entry points; those are allowlisted in per-file-ignores."
+"griptape_nodes.node_library.workflow_registry.WorkflowRegistry".msg = "Engine-internal code should use engine.workflow_registry. WorkflowRegistry is the shim node libraries call without an engine reference."
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "D104"]
+# Fixture node libraries and saved workflow files under the e2e suite. Node libraries and
+# generated workflows are the intended facade audience, exactly as the ban message says.
+"tests/e2e/fixtures/**" = ["TID251"]
+"src/griptape_nodes/testing/libraries/**" = ["TID251"]
+# These assert the facade's and the WorkflowRegistry shim's own behavior, so they have to name them.
+"tests/unit/retained_mode/test_engine.py" = ["TID251"]
+"tests/unit/retained_mode/managers/test_griptape_nodes.py" = ["TID251"]
+"tests/unit/node_library/test_workflow_registry.py" = ["TID251"]
+# Asserts the pickle-era reader's own behavior, so it has to build pickles to feed it.
+"tests/unit/serialization/test_legacy_pickle.py" = ["TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
+# Example libraries and nodes shipped with the custom node docs. Authors copy these files
+# verbatim, so the exemptions live here rather than as noqa noise in the examples.
+# INP001: a docs folder is not an importable package.
+# N807: the dunder-named locals are the point -- module-level `__getattr__` is PEP 562,
+# and the `__init__` built inside the class factory has to be named `__init__`.
+# TID251: node libraries are the intended audience for the GriptapeNodes facade, as the
+# ban message itself says.
+# ARG002: a hook override keeps the base class's signature even where the example doesn't
+# use every argument.
+"docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
+"docs/development/custom_nodes/example_node_timing_library/**" = ["INP001", "ARG002"]
+"docs/development/custom_nodes/example_request_handler_library/**" = [
+  "INP001",
+  "TID251",
+]
+"docs/development/custom_nodes/example_node_error_node.py" = ["INP001", "TID251"]
+
+# The one reader of pickle-era data. Delete it, and this entry, to drop that support.
+"src/griptape_nodes/serialization/legacy_pickle.py" = ["TID251"]
+
+# TID251 allowlist for the GriptapeNodes facade. These are process entry points or the public
+# surface that separately-versioned callers bind to, so they have no Engine to be handed.
+"src/griptape_nodes/retained_mode/griptape_nodes.py" = ["TID251"]
+"src/griptape_nodes/retained_mode/retained_mode.py" = ["TID251"]
+"src/griptape_nodes/retained_mode/managers/model_download_process.py" = ["TID251"]
+"src/griptape_nodes/api_client/**" = ["TID251"]
+"src/griptape_nodes/servers/**" = ["TID251"]
+"src/griptape_nodes/bootstrap/**" = ["TID251"]
+"src/griptape_nodes/app/**" = ["TID251"]
+# WorkflowPackager is constructed by node libraries, not by the engine: the standard library's
+# publish_workflow/local_publisher.py does `WorkflowPackager(workflow_name)` off the public
+# `retained_mode.publishing` re-export. Nothing inside src/ constructs it, so there is no Engine
+# to hand it and it belongs on this side of the split.
+"src/griptape_nodes/retained_mode/publishing/workflow_packager.py" = ["TID251"]
+# The File/Directory/FileSequence/ProjectFileDestination API is what node libraries import to
+# read and write files: the shipped libraries construct `File` in ~280 places and
+# `ProjectFileDestination` in ~50, and docs/development/custom_nodes/examples.md teaches both.
+# A library has no Engine to pass to those constructors, so the facade read inside them is the
+# engine lookup the caller cannot do itself.
+"src/griptape_nodes/files/**" = ["TID251"]
 
 [tool.ruff.lint.flake8-type-checking]
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]
@@ -158,6 +247,10 @@ venv = ".venv"
 include = ["."]
 exclude = [
   "libraries/**/templates/*",
+  # Engine-generated workflow files. The generator emits untyped request/result chains, so these are
+  # checked by running them, not by pyright.
+  "tests/e2e/fixtures/**/*_workflow.py",
+  "tests/unit/**/fixtures/**/*_workflow.py",
   ".venv",
   "GriptapeNodes",
   "**/node_modules",

@@ -9,8 +9,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin, WebSocketMessage
+from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.base_events import (
+        BaseEvent,
+        EventResultFailure,
+        EventResultSuccess,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +49,13 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
 
     async def _start_websocket_connection(self) -> None:
         """Start WebSocket client and sender background task."""
-        logger.info("Starting WebSocket sender for session %s", self._session_id)
+        logger.debug("Starting WebSocket sender for session %s", self._session_id)
 
         self._ws_shutdown_event.clear()
         await self._start_websocket_client()
         self._create_websocket_task(self._ws_send_loop())
 
-        logger.info("WebSocket sender started for session %s", self._session_id)
+        logger.debug("WebSocket sender started for session %s", self._session_id)
 
     async def _ws_send_loop(self) -> None:
         """Background task to send queued messages."""
@@ -95,15 +105,36 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
         except asyncio.QueueFull:
             logger.error("WebSocket queue full, event dropped: %s", event_type)
 
+    def _send_event(self, event_type: str, event: BaseEvent) -> EventSerializationError | None:
+        """Send an event, logging and skipping it if it holds a value with no JSON form.
+
+        Returns:
+            The error when the event was skipped, for callers that cannot let it go.
+        """
+        try:
+            payload = converters.engine.dumps(event)
+        except EventSerializationError as error:
+            logger.error("Could not send %s: %s", event_type, error)
+            return error
+        self.send_event(event_type, payload)
+        return None
+
+    def _send_result(self, event_type: str, event: EventResultSuccess | EventResultFailure) -> None:
+        """Send a result, or a GenericResultFailure naming why it could not be sent, so the requester hears back."""
+        result_json = converters.engine.dumps_result(event)
+        if result_json.error is not None:
+            event_type = "failure_result"
+        self.send_event(event_type, result_json.text)
+
     async def _stop_websocket_connection(self) -> None:
         """Stop the sender task and close client."""
-        logger.info("Stopping WebSocket sender for session %s", self._session_id)
+        logger.debug("Stopping WebSocket sender for session %s", self._session_id)
 
         self._ws_shutdown_event.set()
         await self._stop_websocket_task()
         await self._stop_websocket_client()
 
-        logger.info("WebSocket sender stopped for session %s", self._session_id)
+        logger.debug("WebSocket sender stopped for session %s", self._session_id)
 
     async def _wait_for_websocket_queue_flush(self, timeout_seconds: float = 5.0) -> None:
         """Wait for all queued messages to be sent.

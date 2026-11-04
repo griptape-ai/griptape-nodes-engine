@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
+from griptape_nodes.retained_mode.beta_features import find_beta_feature_date_issues, parse_library_beta_features
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -23,9 +25,11 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.deprecated_node_warning_problem import (
     DeprecatedNodeWarningProblem,
+)
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries.invalid_beta_feature_problem import (
+    InvalidBetaFeatureProblem,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows.deprecated_node_in_workflow_problem import (
     DeprecatedNodeInWorkflowProblem,
@@ -39,6 +43,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.parameter_events import (
         SetParameterValueResultFailure,
         SetParameterValueResultSuccess,
@@ -57,7 +62,7 @@ class LibraryVersionCompatibilityIssue(NamedTuple):
     severity: LibraryManager.LibraryFitness
 
 
-class LibraryVersionCompatibilityCheck(ABC):
+class LibraryVersionCompatibilityCheck(EngineScoped, ABC):
     """Abstract base class for library version compatibility checks."""
 
     @abstractmethod
@@ -76,7 +81,7 @@ class WorkflowVersionCompatibilityIssue(NamedTuple):
     severity: WorkflowStatus
 
 
-class WorkflowVersionCompatibilityCheck(ABC):
+class WorkflowVersionCompatibilityCheck(EngineScoped, ABC):
     """Abstract base class for workflow version compatibility checks."""
 
     @abstractmethod
@@ -88,7 +93,7 @@ class WorkflowVersionCompatibilityCheck(ABC):
         """Perform the workflow compatibility check."""
 
 
-class SetParameterVersionCompatibilityCheck(ABC):
+class SetParameterVersionCompatibilityCheck(EngineScoped, ABC):
     """Abstract base class for runtime parameter set version compatibility checks."""
 
     @staticmethod
@@ -132,10 +137,11 @@ class SetParameterVersionCompatibilityCheck(ABC):
         """
 
 
-class VersionCompatibilityManager:
+class VersionCompatibilityManager(EngineScoped):
     """Manages version compatibility checks for libraries and other components."""
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self._event_manager = event_manager
         self._compatibility_checks: list[LibraryVersionCompatibilityCheck] = []
         self._workflow_compatibility_checks: list[WorkflowVersionCompatibilityCheck] = []
@@ -196,15 +202,15 @@ class VersionCompatibilityManager:
 
             # Register based on which base class it inherits from
             if issubclass(attr, LibraryVersionCompatibilityCheck):
-                check_instance = attr()
+                check_instance = attr(engine=self.engine)
                 self._compatibility_checks.append(check_instance)
                 logger.debug("Registered library version compatibility check: %s", attr_name)
             elif issubclass(attr, WorkflowVersionCompatibilityCheck):
-                check_instance = attr()
+                check_instance = attr(engine=self.engine)
                 self._workflow_compatibility_checks.append(check_instance)
                 logger.debug("Registered workflow version compatibility check: %s", attr_name)
             elif issubclass(attr, SetParameterVersionCompatibilityCheck):
-                check_instance = attr()
+                check_instance = attr(engine=self.engine)
                 self._set_parameter_compatibility_checks.append(check_instance)
                 logger.debug("Registered set parameter version compatibility check: %s", attr_name)
 
@@ -226,6 +232,24 @@ class VersionCompatibilityManager:
             if node.metadata.deprecation is not None
         ] or []
 
+    def _check_library_for_beta_feature_problems(
+        self, library_data: LibrarySchema
+    ) -> list[LibraryVersionCompatibilityIssue]:
+        """Check the beta features a library declares.
+
+        Entries that can't be parsed, expired features, and features whose remove_by is too far
+        out are warnings. The library still loads, and a problem feature uses its default.
+        """
+        parsed = parse_library_beta_features(library_data.name, library_data.beta_features or [])
+        issues = parsed.issues + find_beta_feature_date_issues(list(parsed.features.values()))
+        return [
+            LibraryVersionCompatibilityIssue(
+                problem=InvalidBetaFeatureProblem(feature_id=issue.feature_id, reason=issue.reason),
+                severity=LibraryManager.LibraryFitness.FLAWED,
+            )
+            for issue in issues
+        ]
+
     def check_library_version_compatibility(
         self, library_data: LibrarySchema
     ) -> list[LibraryVersionCompatibilityIssue]:
@@ -239,13 +263,21 @@ class VersionCompatibilityManager:
                 version_issues.extend(issues)
 
         version_issues.extend(self._check_library_for_deprecated_nodes(library_data))
+        version_issues.extend(self._check_library_for_beta_feature_problems(library_data))
 
         return version_issues
 
     async def check_workflow_version_compatibility(
-        self, workflow_metadata: WorkflowMetadata
+        self, workflow_metadata: WorkflowMetadata, *, registered_libraries: list[str] | None = None
     ) -> list[WorkflowVersionCompatibilityIssue]:
-        """Check a workflow for version compatibility issues."""
+        """Check a workflow for version compatibility issues.
+
+        Args:
+            workflow_metadata: The workflow metadata to check.
+            registered_libraries: Pre-fetched registered-library names. Pass this when the
+                caller is scanning many workflows in one pass and already fetched the list
+                once, so this doesn't re-fetch it per workflow.
+        """
         version_issues: list[WorkflowVersionCompatibilityIssue] = []
 
         # Run all discovered workflow compatibility checks
@@ -255,12 +287,16 @@ class VersionCompatibilityManager:
                 version_issues.extend(issues)
 
         # Check for deprecated nodes in the workflow
-        version_issues.extend(await self._check_workflow_for_deprecated_nodes(workflow_metadata))
+        version_issues.extend(
+            await self._check_workflow_for_deprecated_nodes(
+                workflow_metadata, registered_libraries=registered_libraries
+            )
+        )
 
         return version_issues
 
     async def _check_workflow_for_deprecated_nodes(  # noqa: C901
-        self, workflow_metadata: WorkflowMetadata
+        self, workflow_metadata: WorkflowMetadata, *, registered_libraries: list[str] | None = None
     ) -> list[WorkflowVersionCompatibilityIssue]:
         """Check a workflow for deprecated nodes.
 
@@ -269,12 +305,13 @@ class VersionCompatibilityManager:
         """
         issues: list[WorkflowVersionCompatibilityIssue] = []
 
-        list_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+        if registered_libraries is None:
+            list_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
 
-        if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
-            return issues
+            if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
+                return issues
 
-        registered_libraries = list_result.libraries
+            registered_libraries = list_result.libraries
 
         for library_name_and_node_type in workflow_metadata.node_types_used:
             library_name = library_name_and_node_type.library_name
@@ -287,7 +324,7 @@ class VersionCompatibilityManager:
 
             # Get library metadata to get version
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
                 library_metadata_request
             )
 
@@ -306,7 +343,7 @@ class VersionCompatibilityManager:
 
             # Check if node type exists in library (silent check - no error logging)
             list_node_types_request = ListNodeTypesInLibraryRequest(library=library_name)
-            list_node_types_result = GriptapeNodes.LibraryManager().on_list_node_types_in_library_request(
+            list_node_types_result = self.engine.library_manager.catalog.on_list_node_types_in_library_request(
                 list_node_types_request
             )
 
@@ -331,7 +368,7 @@ class VersionCompatibilityManager:
 
             # Get node metadata from library (we know the node exists now)
             node_metadata_request = GetNodeMetadataFromLibraryRequest(library=library_name, node_type=node_type)
-            node_metadata_result = GriptapeNodes.LibraryManager().get_node_metadata_from_library_request(
+            node_metadata_result = self.engine.library_manager.catalog.get_node_metadata_from_library_request(
                 node_metadata_request
             )
 
@@ -388,7 +425,7 @@ class VersionCompatibilityManager:
 
     def _get_current_engine_version(self) -> semver.VersionInfo:
         """Get the current engine version."""
-        result = GriptapeNodes.handle_request(GetEngineVersionRequest())
+        result = self.engine.handle_request(GetEngineVersionRequest())
         if isinstance(result, GetEngineVersionResultSuccess):
             return semver.VersionInfo(major=result.major, minor=result.minor, patch=result.patch)
         msg = "Failed to get engine version"

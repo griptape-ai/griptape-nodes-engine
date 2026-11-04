@@ -1,26 +1,41 @@
 """Test EventManager functionality including sync/async event broadcasting."""
 
 import asyncio
+import inspect
 import logging
 import threading
-from dataclasses import dataclass
-from unittest.mock import AsyncMock
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from griptape_nodes.app.worker_routing import RemoteHandler
+from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
+from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    EventRequest,
+    EventResultFailure,
     EventResultSuccess,
+    ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
+    ExecutionPayload,
+    ProgressEvent,
     RequestPayload,
+    RequestSender,
     ResultDetail,
     ResultDetails,
+    ResultPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
     StrictModeViolationDetail,
 )
+from griptape_nodes.retained_mode.events.execution_events import NodeFinishProcessEvent, NodeProcessOutcome
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.worker_events import CheckLeaseRequest, CheckLeaseResultSuccess
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -29,7 +44,42 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.event_manager import (
+    EventManager,
+    EventTranslationContext,
+    ResultContext,
+    current_request_sender,
+    current_request_type,
+    require_request_sender,
+)
+from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+class TestEventsWhileRebuildingACopy:
+    """A worker building or discarding its copy of a node changes only its own graph, so nothing it does is published."""
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_queued_inside_a_rebuild(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        with event_manager.rebuild_scope("Copied Node"):
+            event_manager.put_event("from the rebuild")
+            await event_manager.aput_event("from the rebuild, async")
+
+        assert event_manager.event_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_events_are_queued_again_once_the_rebuild_ends(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        with event_manager.rebuild_scope("Copied Node"):
+            pass
+
+        event_manager.put_event("after the rebuild")
+
+        assert event_manager.event_queue.get_nowait() == "after the rebuild"
 
 
 class TestEventManagerBroadcasting:
@@ -98,8 +148,8 @@ class TestEventManagerBroadcasting:
         event_manager.broadcast_app_event(event)
 
     @pytest.mark.asyncio
-    async def test_abroadcast_app_event_handles_listener_exceptions(self) -> None:
-        """Test that abroadcast_app_event raises ExceptionGroup when a listener raises an exception."""
+    async def test_abroadcast_app_event_contains_listener_exceptions(self) -> None:
+        """Test that abroadcast_app_event contains a listener failure instead of propagating it."""
         event_manager = EventManager()
 
         # Create listeners where one raises an exception
@@ -111,9 +161,12 @@ class TestEventManagerBroadcasting:
 
         event = ConfigChanged(key="test_key", old_value="old", new_value="new")
 
-        # TaskGroup raises ExceptionGroup when a task fails
-        with pytest.raises(ExceptionGroup):
-            await event_manager.abroadcast_app_event(event)
+        # The failure is logged per listener, so the broadcast completes and the
+        # surviving listener still sees the event.
+        await event_manager.abroadcast_app_event(event)
+
+        listener1.assert_awaited_once_with(event)
+        listener2.assert_awaited_once_with(event)
 
     @pytest.mark.asyncio
     async def test_abroadcast_app_event_with_mixed_listener_types(self) -> None:
@@ -269,6 +322,36 @@ class TestHandleRequestLoopSafety:
 
 
 @dataclass(kw_only=True)
+class _ProbeFailure(ResultPayloadFailure):
+    """Minimal failure payload paired with _ProbeRequest."""
+
+
+class TestResultEngineId:
+    """Every result dispatch builds names the engine that sent it."""
+
+    @pytest.mark.asyncio
+    async def test_a_success_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeResult(result_details="ok"))
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+    def test_a_failure_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeFailure(result_details="no"))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert not event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+
+@dataclass(kw_only=True)
 class _ForwardableProbeRequest(RequestPayload):
     """Minimal request used to drive the worker-forwarding path in tests."""
 
@@ -323,7 +406,7 @@ class TestHandleRequestForwardingFromRunningLoop:
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
         try:
-            with event_manager.worker_node_execution_scope():
+            with event_manager.node_execution_scope():
                 result = event_manager.handle_request(_ForwardableProbeRequest())
         finally:
             ws_loop.call_soon_threadsafe(ws_loop.stop)
@@ -356,6 +439,72 @@ class TestBroadcastAppEventLoopSafety:
 
         assert "listener_loop" in captured
         assert captured["listener_loop"] is not caller_loop
+
+
+class TestBroadcastAppEventListenerIsolation:
+    """One failing listener must not cancel the siblings sharing its TaskGroup."""
+
+    @pytest.mark.asyncio
+    async def test_async_broadcast_runs_siblings_after_a_listener_raises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A failing listener must not abort the broadcast.
+
+        Regression guard: a PermissionError in ModelManager's AppInitializationComplete
+        listener aborted the whole broadcast, so every other subsystem silently skipped
+        its startup work.
+        """
+        event_manager = EventManager()
+        completed: list[str] = []
+        failed = asyncio.Event()
+
+        async def failing_listener(_event: ConfigChanged) -> None:
+            failed.set()
+            msg = "listener blew up"
+            raise PermissionError(msg)
+
+        async def surviving_listener(_event: ConfigChanged) -> None:
+            # Resumes only after the sibling raised, so it completes only if that failure
+            # did not cancel the TaskGroup. Listeners are stored in a set, so this cannot
+            # rely on creation order.
+            await failed.wait()
+            completed.append("survivor")
+
+        def sync_listener(_event: ConfigChanged) -> None:
+            completed.append("sync")
+
+        event_manager.add_listener_to_app_event(ConfigChanged, failing_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, surviving_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, sync_listener)
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            await event_manager.abroadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+
+        assert sorted(completed) == ["survivor", "sync"]
+        assert "failing_listener" in caplog.text
+        assert "ConfigChanged" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sync_broadcast_runs_siblings_after_a_listener_raises(self) -> None:
+        event_manager = EventManager()
+        completed: list[str] = []
+        failed = asyncio.Event()
+
+        async def failing_listener(_event: ConfigChanged) -> None:
+            failed.set()
+            msg = "listener blew up"
+            raise PermissionError(msg)
+
+        async def surviving_listener(_event: ConfigChanged) -> None:
+            await failed.wait()
+            completed.append("survivor")
+
+        event_manager.add_listener_to_app_event(ConfigChanged, failing_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, surviving_listener)
+
+        event_manager.broadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+
+        assert completed == ["survivor"]
 
 
 class TestLogResultDetailsSkipsStrictModeViolations:
@@ -657,6 +806,1177 @@ class TestPreDispatchHooks:
         assert handler_calls == []
 
 
+@dataclass(kw_only=True)
+class _SubProbeRequest(_ProbeRequest):
+    """Subclass of the probe request, for asserting hooks match the exact type only."""
+
+
+@dataclass(kw_only=True)
+class _CycleProbeRequest(RequestPayload):
+    """A second request type, for hooks that issue each other's requests."""
+
+
+@dataclass(kw_only=True)
+class _OmitFieldProbeRequest(RequestPayload):
+    """Carries a field the engine must null out before any hook sees the request."""
+
+    secret: str | None = field(default=None, metadata={"omit_from_result": True})
+
+
+@dataclass
+class _RecordingHook:
+    """A callable object rather than a function.
+
+    Deliberately an ordinary ``@dataclass``, which sets ``__hash__ = None``, so
+    registering it would raise if the hook store were a set. ``RemoteHandler`` has
+    exactly this shape.
+    """
+
+    seen: list[ResultPayload]
+
+    def __call__(self, _request: RequestPayload, result: ResultPayload) -> None:
+        self.seen.append(result)
+
+
+@dataclass
+class _AsyncRecordingHook:
+    """A callable object whose ``__call__`` is async, as ``RemoteHandler``'s is.
+
+    ``inspect.iscoroutinefunction`` returns False for an *instance* of this class, so it
+    is the shape that distinguishes a correct async-callable check from a naive one.
+    """
+
+    seen: list[ResultPayload]
+
+    async def __call__(self, _request: RequestPayload, result: ResultPayload) -> None:
+        self.seen.append(result)
+
+
+# The re-entrancy guard is what actually bounds _ReissuingHook; this only keeps a
+# regression from wedging the test run.
+_REISSUE_SAFETY_CAP = 20
+
+
+@dataclass
+class _ReissuingHook:
+    """A hook that re-dispatches its own request type, and can be field-equal to a peer.
+
+    Both fields hold shared objects, so two instances compare equal while staying
+    distinct registrations. That is the shape that tells an identity-based re-entrancy
+    guard apart from an equality-based one.
+    """
+
+    event_manager: EventManager
+    seen: list[ResultPayload]
+
+    def __call__(self, _request: RequestPayload, result: ResultPayload) -> None:
+        self.seen.append(result)
+        if len(self.seen) > _REISSUE_SAFETY_CAP:
+            return
+        self.event_manager.handle_request(_ProbeRequest())
+
+
+# Hooks reach the loop via call_soon_threadsafe, so the asyncio.Task does not exist yet
+# when the dispatch call returns. Ticking the loop creates it; gathering waits it out.
+_HOOK_DRAIN_TICKS = 50
+
+
+async def _drain_post_dispatch_hooks(event_manager: EventManager) -> None:
+    """Run the loop until every detached hook task has finished."""
+    for _ in range(_HOOK_DRAIN_TICKS):
+        await asyncio.sleep(0)
+        pending = list(event_manager._inflight_post_dispatch_hook_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+class TestPostDispatchHooks:
+    """Post-dispatch hooks observe a completed request without being able to affect it.
+
+    Most cases run against a bare ``EventManager``, whose ``_event_loop`` is None, so
+    hooks take the inline fallback and complete before the dispatch call returns. That
+    keeps the assertions deterministic. The loop path -- where the hook is detached and
+    the result comes back first -- has its own tests below.
+    """
+
+    @staticmethod
+    def _manager_with_handler(handler: Callable[[_ProbeRequest], ResultPayload]) -> EventManager:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        return event_manager
+
+    def test_reentrancy_guard_skips_only_the_hook_that_is_actually_up_chain(self) -> None:
+        """The guard scans by identity, so it must not suppress a field-equal peer.
+
+        Two libraries can register field-equal hook objects on one request type. With an
+        equality-based scan, one of them running up-chain silently swallows the other's
+        re-entrant invocation, and that library's telemetry just goes missing.
+
+        Registration order is [a, b], so with the guard scanning by identity: a fires,
+        re-issues, and inside that nested dispatch a is skipped while b fires; then b
+        fires at the outer level, re-issues, and inside *that* nesting a fires while b is
+        skipped. Four invocations. An equality-based scan skips a's field-equal peer in
+        both nestings and yields two.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        shared_seen: list[ResultPayload] = []
+        hook_a = _ReissuingHook(event_manager, shared_seen)
+        hook_b = _ReissuingHook(event_manager, shared_seen)
+        assert hook_a == hook_b
+        assert hook_a is not hook_b
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook_a)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook_b)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(shared_seen) == 4  # noqa: PLR2004
+
+    def test_hook_fires_for_a_result_a_pre_dispatch_hook_short_circuited(self) -> None:
+        """Hooks fire from `_handle_request_core`, which is also the short-circuit's exit.
+
+        A request a pre-dispatch hook denied never reaches the manager callback, and a
+        denial is exactly what a library's audit hook wants to see. Moving the fire site
+        into the two dispatch methods would silence this path.
+        """
+        handler_calls: list[RequestPayload] = []
+
+        def handler(request: _ProbeRequest) -> _ProbeResult:
+            handler_calls.append(request)
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        def pre_dispatch(_request: RequestPayload, _context: object) -> _DeniedResult:
+            return _DeniedResult(result_details="denied")
+
+        event_manager.add_pre_dispatch_hook(pre_dispatch)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert event.result.failed()
+        assert handler_calls == []
+        assert len(seen) == 1
+        assert isinstance(seen[0], _DeniedResult)
+
+    def test_hook_receives_the_request_and_result_after_the_handler(self) -> None:
+        order: list[str] = []
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            order.append("handler")
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen_requests: list[RequestPayload] = []
+        seen_results: list[ResultPayload] = []
+
+        def hook(request: RequestPayload, result: ResultPayload) -> None:
+            order.append("hook")
+            seen_requests.append(request)
+            seen_results.append(result)
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        request = _ProbeRequest()
+        event = event_manager.handle_request(request)
+
+        assert event.result.succeeded()
+        assert order == ["handler", "hook"]
+        assert seen_requests == [request]
+        assert seen_results == [event.result]
+
+    def test_hook_fires_for_a_failure_result(self) -> None:
+        def handler(_request: _ProbeRequest) -> _DeniedResult:
+            return _DeniedResult(result_details="denied")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert event.result.failed()
+        assert len(seen) == 1
+        assert seen[0].failed()
+
+    def test_hook_fires_when_the_handler_raises(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert event.result.failed()
+        assert len(seen) == 1
+        failure = seen[0]
+        assert failure.failed()
+        assert isinstance(failure, GenericResultFailure)
+        assert isinstance(failure.exception, RuntimeError)
+        # Hooks see the very payload the client receives, not an equivalent copy.
+        assert failure is event.result
+
+    @pytest.mark.asyncio
+    async def test_hook_fires_when_an_async_handler_raises(self) -> None:
+        event_manager = EventManager()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "async handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert event.result.failed()
+        assert len(seen) == 1
+        assert seen[0].failed()
+
+    def test_raising_handler_logs_its_failure_exactly_once_with_the_traceback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One record carrying both the message and the frames.
+
+        The traceback is often the only thing identifying a failure raised deep inside an
+        unrelated import, so it must survive without the message being logged twice.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            event_manager.handle_request(_ProbeRequest())
+
+        records = [r for r in caplog.records if "handler exploded" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert "RuntimeError: handler exploded" in caplog.text
+
+    def test_unhandled_crash_ignores_the_caller_s_failure_log_level(self, caplog: pytest.LogCaptureFixture) -> None:
+        """`failure_log_level` silences failures the caller expects, not crashes.
+
+        Callers pass DEBUG to keep a routine miss (an absent config key, a probe) out of the
+        log. Honoring it for a synthesized failure would hide an unhandled exception and its
+        traceback behind a level chosen for something else entirely.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            event_manager.handle_request(_ProbeRequest(failure_log_level=logging.DEBUG))
+
+        records = [r for r in caplog.records if "handler exploded" in r.getMessage()]
+        assert [r.levelno for r in records] == [logging.ERROR]
+
+    def test_raising_handler_still_addresses_its_result_to_the_waiting_client(self) -> None:
+        """The IPC ingress replies on these, so a failure missing them is a dropped reply."""
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        event = event_manager.handle_request(
+            _ProbeRequest(),
+            result_context=ResultContext(request_id="req-1", response_topic="topic-1"),
+        )
+
+        assert isinstance(event, EventResultFailure)
+        assert event.request_id == "req-1"
+        assert event.response_topic == "topic-1"
+
+    def test_hook_is_not_invoked_for_a_subclass_of_its_request_type(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+        event_manager.assign_manager_to_request_type(_SubProbeRequest, handler)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        event_manager.handle_request(_SubProbeRequest())
+
+        assert seen == []
+
+    def test_async_hook_is_awaited(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+
+        async def hook(_request: RequestPayload, result: ResultPayload) -> None:
+            await asyncio.sleep(0)
+            seen.append(result)
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(seen) == 1
+
+    def test_raising_hook_leaves_the_result_intact_and_siblings_still_run(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        def boom(_request: RequestPayload, _result: ResultPayload) -> None:
+            msg = "hook exploded"
+            raise RuntimeError(msg)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, boom)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert event.result.succeeded()
+        assert len(seen) == 1
+
+    def test_unhashable_callable_registers_and_fires(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        hook = _RecordingHook(seen)
+        with pytest.raises(TypeError):
+            hash(hook)  # Guards the premise: a set-backed store could not hold this.
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(seen) == 1
+
+        event_manager.remove_post_dispatch_hook(_ProbeRequest, hook)
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(seen) == 1
+
+    def test_add_post_dispatch_hook_dedupes(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        hook = _RecordingHook(seen)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(seen) == 1
+
+    def test_remove_post_dispatch_hook_stops_invocation(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        hook = _RecordingHook(seen)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+        event_manager.remove_post_dispatch_hook(_ProbeRequest, hook)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert seen == []
+
+    def test_remove_unregistered_post_dispatch_hook_is_noop(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+        seen: list[ResultPayload] = []
+        registered = _RecordingHook(seen)
+        other = _RecordingHook([])
+
+        # Neither an unknown request type nor an unknown callback may raise.
+        event_manager.remove_post_dispatch_hook(_ProbeRequest, other)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, registered)
+        event_manager.remove_post_dispatch_hook(_ProbeRequest, other)
+        event_manager.remove_post_dispatch_hook(_SubProbeRequest, registered)
+
+        # And none of it may have disturbed the hook that *is* registered. Without this
+        # the test passes even when `other` removes `registered`: the two are separate
+        # objects but a `@dataclass` compares by field, and both were built empty.
+        assert other == registered
+        event_manager.handle_request(_ProbeRequest())
+        assert len(seen) == 1
+
+    def test_field_equal_hooks_from_two_libraries_are_kept_apart(self) -> None:
+        """Hooks are matched by identity, never by `__eq__`.
+
+        Two libraries can register callable objects that happen to compare equal -- a
+        `@dataclass` hook with the same field values is the obvious case. If the store
+        matched by equality the second registration would be silently dropped, and either
+        library's teardown would disarm the other's live hook.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        shared_log: list[ResultPayload] = []
+        hook_a = _RecordingHook(shared_log)
+        hook_b = _RecordingHook(shared_log)
+        assert hook_a == hook_b
+        assert hook_a is not hook_b
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook_a)
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook_b)
+        event_manager.handle_request(_ProbeRequest())
+
+        # Both registered, so both fired.
+        assert len(shared_log) == 2  # noqa: PLR2004
+
+        # Removing one leaves the other armed.
+        event_manager.remove_post_dispatch_hook(_ProbeRequest, hook_b)
+        shared_log.clear()
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(shared_log) == 1
+        assert event_manager._post_dispatch_hooks[_ProbeRequest] == [hook_a]
+        assert event_manager._post_dispatch_hooks[_ProbeRequest][0] is hook_a
+
+    def test_hook_reissuing_its_own_request_type_does_not_recurse(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        calls: list[RequestPayload] = []
+
+        def hook(request: RequestPayload, _result: ResultPayload) -> None:
+            calls.append(request)
+            # Hooks are told not to do this, but it must terminate if one does.
+            event_manager.handle_request(_ProbeRequest())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(calls) == 1
+
+    def test_hook_cycle_across_two_request_types_terminates(self) -> None:
+        """The re-entrancy marker has to survive from one hook generation to the next.
+
+        Each hook runs in a *fresh* context, which resets every ContextVar -- so the
+        accumulated chain is threaded in explicitly rather than read from the context
+        inside the hook. Without that, this pair alternates forever: each new task starts
+        from an empty chain, matches nothing, and schedules the other hook again.
+        """
+
+        def handler(_request: RequestPayload) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        event_manager.assign_manager_to_request_type(_CycleProbeRequest, handler)
+
+        calls: list[str] = []
+        # Bounded so a regression fails the assertion instead of hanging the suite.
+        cap = 20
+
+        def hook_on_probe(_request: RequestPayload, _result: ResultPayload) -> None:
+            calls.append("probe")
+            if len(calls) < cap:
+                event_manager.handle_request(_CycleProbeRequest())
+
+        def hook_on_cycle(_request: RequestPayload, _result: ResultPayload) -> None:
+            calls.append("cycle")
+            if len(calls) < cap:
+                event_manager.handle_request(_ProbeRequest())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook_on_probe)
+        event_manager.add_post_dispatch_hook(_CycleProbeRequest, hook_on_cycle)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert calls == ["probe", "cycle"]
+
+    def test_async_callable_object_hook_is_awaited(self) -> None:
+        """A hook whose `__call__` is async must be awaited, not handed to a thread.
+
+        `inspect.iscoroutinefunction` says False for an instance of such a class, so
+        without the `type(callback).__call__` check the coroutine it returns is dropped on
+        the floor and the hook silently does nothing. `RemoteHandler` has this shape.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        hook = _AsyncRecordingHook(seen)
+        assert not inspect.iscoroutinefunction(hook)  # Guards the premise.
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(seen) == 1
+
+    def test_omitted_request_fields_are_scrubbed_on_the_ordinary_path(self) -> None:
+        """The guarantee is stated unconditionally, so pin it where most requests go.
+
+        On this path it rests entirely on the fire site sitting *after* the scrub in
+        `_handle_request_core`. Moving the fire earlier keeps every result-event test
+        green while handing hooks the secret on every success.
+        """
+
+        def handler(_request: _OmitFieldProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_OmitFieldProbeRequest, handler)
+
+        # Sampled inside the hook, not by holding the request: the scrub mutates the
+        # object in place, so a saved reference reads post-scrub state whenever the
+        # assertion runs and would pass even if the hook had been handed the secret.
+        seen: list[str | None] = []
+
+        def hook(request: RequestPayload, _result: ResultPayload) -> None:
+            assert isinstance(request, _OmitFieldProbeRequest)
+            seen.append(request.secret)
+
+        event_manager.add_post_dispatch_hook(_OmitFieldProbeRequest, hook)
+
+        event = event_manager.handle_request(_OmitFieldProbeRequest(secret="super-secret"))  # noqa: S106
+
+        assert event.result.succeeded()
+        assert seen == [None]
+
+    def test_hook_runs_outside_the_dispatching_operation_depth(self) -> None:
+        """Fired after the operation-depth context closes, so a hook does not inflate it.
+
+        `OperationDepthManager._depth` is a plain counter -- neither thread-local nor
+        context-local -- so a hook fired from inside the block would still be at depth 1.
+        A request the hook then issued would reach depth 2, `is_top_level()` would be
+        False, and its retained-mode echo would be silently suppressed.
+
+        Uses its own `Engine` so the depth counter starts from a known zero.
+        """
+        engine = Engine()
+        event_manager = engine.event_manager
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        depths: list[int] = []
+
+        def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            depths.append(engine.operation_depth_manager.get_depth())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert depths == [0]
+
+    def test_omitted_request_fields_are_scrubbed_when_the_handler_raises(self) -> None:
+        """The scrub lives on the result-building path, which a raising handler also takes.
+
+        `omit_from_result` exists to keep sensitive and bulky values out of anything
+        downstream, so the exception path -- the one this feature advertises as its most
+        interesting case -- must not be the hole that leaks them to a library or a client.
+        """
+
+        def handler(_request: _OmitFieldProbeRequest) -> _ProbeResult:
+            msg = "handler blew up"
+            raise RuntimeError(msg)
+
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_OmitFieldProbeRequest, handler)
+
+        # Sampled inside the hook for the reason given in the test above.
+        seen: list[str | None] = []
+
+        def hook(request: RequestPayload, _result: ResultPayload) -> None:
+            assert isinstance(request, _OmitFieldProbeRequest)
+            seen.append(request.secret)
+
+        event_manager.add_post_dispatch_hook(_OmitFieldProbeRequest, hook)
+
+        event = event_manager.handle_request(_OmitFieldProbeRequest(secret="super-secret"))  # noqa: S106
+
+        assert seen == [None]
+        assert isinstance(event.request, _OmitFieldProbeRequest)
+        assert event.request.secret is None
+
+    def test_hook_runs_inline_when_the_stored_loop_is_open_but_never_driven(self) -> None:
+        """`create_task` on an undriven loop returns a task that never executes.
+
+        `asyncio.run` closes the loop it created, and nothing clears `_event_loop`, so a
+        stale loop reference is a real possibility. Scheduling onto one must fall back to
+        inline rather than silently dropping the hook.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        stale_loop = asyncio.new_event_loop()
+        try:
+            event_manager._event_loop = stale_loop
+            event_manager.handle_request(_ProbeRequest())
+        finally:
+            stale_loop.close()
+
+        assert len(seen) == 1
+
+    def test_hook_runs_inline_when_the_stored_loop_is_closed(self) -> None:
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager = self._manager_with_handler(handler)
+
+        seen: list[ResultPayload] = []
+        event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
+
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        event_manager._event_loop = closed_loop
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert len(seen) == 1
+
+    def test_hook_completes_when_sync_dispatch_runs_inside_a_running_loop(self) -> None:
+        """Regression guard for scheduling onto `asyncio.get_running_loop()`.
+
+        Sync `handle_request` drives async work on a transient `ThreadRunner` side loop
+        that stops as soon as the handler returns. A hook detached onto that loop would
+        lose the race with teardown, so the inline path awaits it instead. An `AsyncMock`
+        resolves synchronously and would mask the bug; this hook yields many times.
+        """
+        event_manager = EventManager()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen: list[ResultPayload] = []
+
+        async def hook(_request: RequestPayload, result: ResultPayload) -> None:
+            for _ in range(50):
+                await asyncio.sleep(0)
+            seen.append(result)
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        async def driver() -> None:
+            # A running loop on this thread makes `handle_request` take the ThreadRunner
+            # branch -- the same branch a sync handler hits in production.
+            event_manager.handle_request(_ProbeRequest())
+
+        asyncio.run(driver())
+
+        assert len(seen) == 1
+
+    @pytest.mark.asyncio
+    async def test_hook_does_not_delay_the_result(self) -> None:
+        """The point of the feature: the result comes back before the hook runs."""
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen: list[ResultPayload] = []
+
+        async def hook(_request: RequestPayload, result: ResultPayload) -> None:
+            await asyncio.sleep(0)
+            seen.append(result)
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert event.result.succeeded()
+        assert seen == []
+
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert len(seen) == 1
+
+    @pytest.mark.asyncio
+    async def test_detached_hook_task_is_retained_then_released(self) -> None:
+        """A detached task needs a strong reference, because asyncio keeps only a weak one.
+
+        Nothing else in the process references a detached hook task, so without the
+        in-flight set it can be garbage collected mid-await and the hook silently stops
+        part-way through. The set also must not grow without bound, hence the second half.
+        """
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            await asyncio.sleep(0)
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        await event_manager.ahandle_request(_ProbeRequest())
+
+        # The task is created by a call_soon_threadsafe callback, so it does not exist
+        # until the loop turns once.
+        await asyncio.sleep(0)
+        assert len(event_manager._inflight_post_dispatch_hook_tasks) == 1
+
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert event_manager._inflight_post_dispatch_hook_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_of_inflight_hooks_logs_a_warning(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Back-pressure is unbounded by design, so this log is the only signal of a backlog.
+
+        Nothing is dropped or coalesced, which means a hook slower than its request rate
+        accumulates silently unless this fires.
+        """
+        monkeypatch.setattr(
+            "griptape_nodes.retained_mode.managers.event_manager.POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD",
+            2,
+        )
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        release = asyncio.Event()
+
+        async def blocked_hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            await release.wait()
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, blocked_hook)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            for _ in range(3):
+                await event_manager.ahandle_request(_ProbeRequest())
+            await asyncio.sleep(0)
+
+            # Guards the test itself: without three live tasks there is no backlog to warn
+            # about and the assertion below would pass or fail for the wrong reason.
+            assert len(event_manager._inflight_post_dispatch_hook_tasks) == 3  # noqa: PLR2004
+            warnings = [r for r in caplog.records if "post-dispatch hooks are still running" in r.getMessage()]
+
+        release.set()
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert warnings
+
+    @pytest.mark.asyncio
+    async def test_hook_sees_the_engine_that_dispatched_the_request(self) -> None:
+        """The fresh context drops the engine binding, so the hook re-establishes it.
+
+        Without it a hook reaching the engine through the `GriptapeNodes` facade -- which
+        is how a library gets at managers -- would silently operate on the process-root
+        engine instead of the one whose request it is observing.
+        """
+        engine = Engine()
+        event_manager = engine.event_manager
+        event_manager.initialize_queue(asyncio.Queue())
+
+        # Not the ambient engine, so resolving to the process root would be visible.
+        assert current_engine() is not engine
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen_engines: list[Engine] = []
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_engines.append(current_engine())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        await event_manager.ahandle_request(_ProbeRequest())
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert seen_engines == [engine]
+
+    @pytest.mark.asyncio
+    async def test_hook_sees_the_workflow_its_request_acted_on(self) -> None:
+        """The fresh context drops the workflow binding, so the hook gets the request's back.
+
+        Without it a hook reading the current workflow would see none, or, with several
+        open, fail to choose one, though the request it observes acted on a named workflow.
+        """
+        engine = Engine()
+        event_manager = engine.event_manager
+        event_manager.initialize_queue(asyncio.Queue())
+        workflow = WorkflowRuntime("bound")
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen_workflows: list[WorkflowRuntime | None] = []
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_workflows.append(engine.current_workflow_or_none())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with engine.bind_workflow(workflow):
+            await event_manager.ahandle_request(_ProbeRequest())
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert seen_workflows == [workflow]
+
+    @pytest.mark.asyncio
+    async def test_every_dispatch_gets_its_own_hook_invocation(self) -> None:
+        """Nothing is dropped or coalesced, however slow the hook is relative to dispatch."""
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        seen: list[ResultPayload] = []
+
+        async def slow_hook(_request: RequestPayload, result: ResultPayload) -> None:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            seen.append(result)
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, slow_hook)
+
+        dispatch_count = 12
+        for _ in range(dispatch_count):
+            await event_manager.ahandle_request(_ProbeRequest())
+
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert len(seen) == dispatch_count
+
+    @pytest.mark.asyncio
+    async def test_sync_hook_does_not_run_on_the_engine_loop(self) -> None:
+        """A blocking sync hook would stall the event queue, so it is handed to a thread."""
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        engine_loop_thread = threading.get_ident()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        hook_threads: list[int] = []
+
+        def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            hook_threads.append(threading.get_ident())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        await event_manager.ahandle_request(_ProbeRequest())
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert len(hook_threads) == 1
+        assert hook_threads[0] != engine_loop_thread
+
+
+class TestPostDispatchHookContextIsolation:
+    """A post-dispatch hook must not inherit the dispatching task's strict-mode scope.
+
+    Hook tasks are created with a *fresh* ``contextvars.Context()`` rather than a copy of
+    the caller's. The scope stack holds mutable ``StrictModeScope`` objects, so a hook
+    that inherited a node's ``RUNTIME_EXECUTE`` scope could append to ``scope.violations``
+    after the node's own scope had already been evaluated, and on a worker an
+    ERROR-severity violation promotes ``ExecuteNodeResultSuccess`` to a failure. A
+    library's telemetry hook must not be able to fail a user's node.
+
+    The fresh context also clears the dispatching request type, so
+    ``current_request_type()`` does not lie inside the hook.
+    """
+
+    @staticmethod
+    def _manager_with_handler() -> EventManager:
+        event_manager = EventManager()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        return event_manager
+
+    @pytest.mark.asyncio
+    async def test_detached_hook_cannot_report_into_the_dispatching_scope(self) -> None:
+        event_manager = self._manager_with_handler()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        seen_request_types: list[type | None] = []
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_request_types.append(current_request_type())
+            STRICT_MODE.report(rule_id="parameter-mutation-during-aprocess", message="from the hook")
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with STRICT_MODE.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="MyNode",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            await event_manager.ahandle_request(_ProbeRequest())
+            await _drain_post_dispatch_hooks(event_manager)
+
+        assert seen_request_types == [None]
+        assert scope.violations == []
+
+    def test_inline_hook_cannot_report_into_the_dispatching_scope(self) -> None:
+        """Same guarantee on the fallback path, which blocks the caller until the hook returns.
+
+        The hook does not run *on* the caller's thread: a sync callback goes through
+        ``to_thread``, onto a worker of the transient loop ``asyncio.run`` creates here.
+        The isolation has to survive that hop, which is why the fresh context is entered
+        before the loop is started rather than inside the callback.
+        """
+        event_manager = self._manager_with_handler()
+
+        seen_request_types: list[type | None] = []
+
+        def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_request_types.append(current_request_type())
+            STRICT_MODE.report(rule_id="parameter-mutation-during-aprocess", message="from the hook")
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with STRICT_MODE.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="MyNode",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            event_manager.handle_request(_ProbeRequest())
+
+        assert seen_request_types == [None]
+        assert scope.violations == []
+
+    @pytest.mark.asyncio
+    async def test_inline_hook_on_the_side_loop_cannot_report_into_the_dispatching_scope(self) -> None:
+        """The inline fallback has two sub-branches; this covers the one taken inside a loop.
+
+        Running the hook on another thread is not isolation by itself. ``ThreadRunner.run``
+        hands the coroutine over with ``run_coroutine_threadsafe``, which has no
+        ``context=`` parameter, and the ``call_soon_threadsafe`` underneath it captures
+        ``copy_context()`` on the *submitting* thread, so without an explicit fresh
+        context the hook inherits this scope and a library hook can fail a user's node.
+        The sync-callback hop to a worker thread does not save it either, because
+        ``to_thread`` propagates the context it was called in.
+
+        A bare ``EventManager`` has no ``_event_loop``, so a sync dispatch from inside this
+        test's running loop takes the fallback and then its ThreadRunner sub-branch.
+        """
+        event_manager = self._manager_with_handler()
+        assert event_manager._event_loop is None
+
+        seen_request_types: list[type | None] = []
+
+        def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_request_types.append(current_request_type())
+            STRICT_MODE.report(rule_id="parameter-mutation-during-aprocess", message="from the hook")
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with STRICT_MODE.open_scope(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject="MyNode",
+            library_name="libA",
+            is_worker=True,
+        ) as scope:
+            event_manager.handle_request(_ProbeRequest())
+
+        assert seen_request_types == [None]
+        assert scope.violations == []
+
+
+class TestTheRequestSender:
+    """A handler reads which engine, and which of its sessions, sent the request from its envelope."""
+
+    @staticmethod
+    def _manager_recording_senders(
+        seen: list[RequestSender | None], sender: RequiredSender | None = RequiredSender.ENGINE
+    ) -> EventManager:
+        event_manager = EventManager()
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            seen.append(current_request_sender())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=sender)
+        return event_manager
+
+    @pytest.mark.asyncio
+    async def test_another_engine_may_send_only_requests_whose_handler_admits_it(self) -> None:
+        handled: list[_ProbeRequest] = []
+        event_manager = EventManager()
+
+        async def handler(request: _ProbeRequest) -> _ProbeResult:
+            handled.append(request)
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        refused = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist")}
+        )
+        local = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert not refused.succeeded()
+        assert local.succeeded()
+        assert len(handled) == 1
+
+    @pytest.mark.parametrize(("sender", "runs"), [("artist", True), ("impostor", False)])
+    @pytest.mark.asyncio
+    async def test_a_request_naming_what_another_engine_owns_runs_only_for_that_engine(
+        self, sender: str, *, runs: bool
+    ) -> None:
+        class _Owner:
+            @handles(_ProbeRequest, sender=RequiredSender.ENGINE, owner=lambda _manager, _request, _sender: "artist")
+            async def handle(self, _request: _ProbeRequest) -> _ProbeResult:
+                return _ProbeResult(result_details="ok")
+
+        event_manager = EventManager()
+        event_manager.register_request_handlers(_Owner())
+
+        result = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id=sender)}
+        )
+
+        assert result.succeeded() == runs
+
+    @pytest.mark.asyncio
+    async def test_a_request_another_engine_sent_names_its_engine_and_session(self) -> None:
+        seen: list[RequestSender | None] = []
+        event_manager = self._manager_recording_senders(seen)
+
+        await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist", session_id="s1")}
+        )
+
+        assert seen == [RequestSender(engine_id="artist", session_id="s1")]
+        assert current_request_sender() is None
+
+    @pytest.mark.parametrize(
+        ("required", "context", "runs"),
+        [
+            (RequiredSender.ENGINE, {}, False),
+            (RequiredSender.ENGINE, {"sender": RequestSender(engine_id="artist")}, True),
+            (RequiredSender.ANY_SESSION, {}, False),
+            (RequiredSender.ANY_SESSION, {"sender": RequestSender(engine_id="artist")}, False),
+            (RequiredSender.ANY_SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+            (RequiredSender.SESSION, {}, False),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist")}, False),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="unknown")}, False),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_handler_marked_with_a_sender_runs_only_for_requests_from_it(
+        self, required: RequiredSender, context: ResultContext, *, runs: bool
+    ) -> None:
+        handled: list[RequestSender] = []
+
+        class _Owner:
+            @handles(_ProbeRequest, sender=required)
+            async def handle(self, _request: _ProbeRequest) -> _ProbeResult:
+                handled.append(require_request_sender())
+                return _ProbeResult(result_details="ok")
+
+        event_manager = EventManager()
+        event_manager.register_request_handlers(_Owner())
+        event_manager.recognize_sessions(lambda sender: sender.session_id == "s1")
+
+        result = await event_manager.ahandle_request(_ProbeRequest(), result_context=context)
+
+        assert bool(handled) == runs
+        assert result.succeeded() == runs
+
+    @pytest.mark.asyncio
+    async def test_a_session_request_is_refused_while_nothing_recognizes_sessions(self) -> None:
+        event_manager = self._manager_recording_senders([], sender=RequiredSender.SESSION)
+
+        result = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist", session_id="s1")}
+        )
+
+        assert not result.succeeded()
+        assert "has not registered with this engine" in str(result.result.result_details)
+
+    def test_only_one_manager_may_recognize_sessions(self) -> None:
+        event_manager = EventManager()
+        event_manager.recognize_sessions(lambda _sender: True)
+
+        with pytest.raises(ValueError, match="already has one"):
+            event_manager.recognize_sessions(lambda _sender: True)
+
+    @pytest.mark.asyncio
+    async def test_a_request_no_engine_sent_has_no_sender(self) -> None:
+        seen: list[RequestSender | None] = []
+        event_manager = self._manager_recording_senders(seen, sender=None)
+
+        await event_manager.ahandle_request(_ProbeRequest(), result_context=ResultContext(request_id="r1"))
+
+        assert seen == [None]
+
+
 class TestAuthorizationCheckpointHooks:
     """The engine-side hook mechanism the app registers a policy into."""
 
@@ -746,3 +2066,356 @@ class TestAuthorizationCheckpointHooks:
         second = manager.evaluate_authorization_checkpoint(self._checkpoint())
         assert second is None
         assert len(calls) == 2  # noqa: PLR2004
+
+
+@dataclass
+class _FakeStreamEvent(ExecutionPayload):
+    """Minimal ExecutionPayload for exercising the execution-event feed."""
+
+    text: str = ""
+
+
+@dataclass
+class _OtherExecEvent(ExecutionPayload):
+    """A second ExecutionPayload type to prove type-scoped delivery."""
+
+    value: int = 0
+
+
+class TestExecutionEventSubscription:
+    """Nodes can tap the live execution-event feed via add_listener_to_execution_event."""
+
+    @staticmethod
+    def _wrap(payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
+        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+
+    @pytest.mark.asyncio
+    async def test_listener_receives_matching_payloads_in_order(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="he")))
+        manager.put_event(self._wrap(_FakeStreamEvent(text="llo")))
+
+        assert received == ["he", "llo"]
+
+    @pytest.mark.asyncio
+    async def test_only_subscribed_payload_type_is_delivered(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        manager.put_event(self._wrap(_OtherExecEvent(value=1)))
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_remove_listener_stops_delivery(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+
+        def callback(payload: _FakeStreamEvent) -> None:
+            received.append(payload.text)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+        manager.remove_listener_for_execution_event(_FakeStreamEvent, callback)
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="x")))
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_listener_exception_does_not_break_delivery(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+
+        def boom(_payload: _FakeStreamEvent) -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, boom)
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="ok")))
+
+        assert received == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_aput_event_dispatches_to_listener(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        await manager.aput_event(self._wrap(_FakeStreamEvent(text="async")))
+
+        assert received == ["async"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_add_is_idempotent(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+
+        def callback(payload: _FakeStreamEvent) -> None:
+            received.append(payload.text)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="once")))
+
+        assert received == ["once"]
+
+    @pytest.mark.asyncio
+    async def test_remove_unregistered_callback_is_noop(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+
+        # Removing a callback that was never registered (and an unknown type) must not raise.
+        manager.remove_listener_for_execution_event(_FakeStreamEvent, lambda _p: None)
+        manager.remove_listener_for_execution_event(_OtherExecEvent, lambda _p: None)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_emit_and_subscribe_is_thread_safe(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        received_lock = threading.Lock()
+
+        def callback(payload: _FakeStreamEvent) -> None:
+            with received_lock:
+                received.append(payload.text)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+
+        stop = threading.Event()
+
+        def emit() -> None:
+            while not stop.is_set():
+                manager.put_event(self._wrap(_FakeStreamEvent(text="t")))
+
+        # A worker thread emits continuously (the production path) while the main thread
+        # churns subscribe/unsubscribe. This must never raise "dict changed size during
+        # iteration" or corrupt the listener registry.
+        emitter = threading.Thread(target=emit)
+        emitter.start()
+        try:
+            for _ in range(500):
+                extra = lambda _p: None  # noqa: E731
+                manager.add_listener_to_execution_event(_FakeStreamEvent, extra)
+                manager.remove_listener_for_execution_event(_FakeStreamEvent, extra)
+        finally:
+            stop.set()
+            emitter.join()
+
+        # The originally-registered callback survives the churn and keeps receiving.
+        with received_lock:
+            baseline = len(received)
+        manager.put_event(self._wrap(_FakeStreamEvent(text="final")))
+        with received_lock:
+            assert len(received) == baseline + 1
+            assert received[-1] == "final"
+
+    @pytest.mark.asyncio
+    async def test_base_class_subscription_does_not_receive_subclasses(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[ExecutionPayload] = []
+        # Only the exact payload type is matched; subscribing to the base ExecutionPayload
+        # must not receive concrete subclasses like _FakeStreamEvent.
+        manager.add_listener_to_execution_event(ExecutionPayload, received.append)
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="x")))
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_async_callback_is_rejected(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+
+        async def async_callback(_payload: _FakeStreamEvent) -> None:
+            pass
+
+        with pytest.raises(TypeError, match="coroutine"):
+            manager.add_listener_to_execution_event(_FakeStreamEvent, async_callback)  # pyright: ignore[reportArgumentType]
+
+    @pytest.mark.asyncio
+    async def test_async_callable_object_is_rejected(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+
+        class AsyncCallable:
+            async def __call__(self, _payload: _FakeStreamEvent) -> None:
+                pass
+
+        with pytest.raises(TypeError, match="coroutine"):
+            manager.add_listener_to_execution_event(_FakeStreamEvent, AsyncCallable())  # pyright: ignore[reportArgumentType]
+
+    @pytest.mark.asyncio
+    async def test_reentrant_emission_is_enqueued_after_trigger(self) -> None:
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+
+        # A callback that re-enters put_event (as a node writing a streamed token would)
+        # must enqueue its follow-up event *after* the event that triggered it.
+        def on_stream(_payload: _FakeStreamEvent) -> None:
+            manager.put_event(self._wrap(_OtherExecEvent(value=99)))
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, on_stream)
+
+        trigger = self._wrap(_FakeStreamEvent(text="a"))
+        manager.put_event(trigger)
+
+        first = queue.get_nowait()
+        second = queue.get_nowait()
+        assert first is trigger
+        assert isinstance(second.wrapped_event.payload, _OtherExecEvent)
+
+    @pytest.mark.asyncio
+    async def test_non_execution_events_are_ignored(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[ExecutionPayload] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, received.append)
+
+        # A ProgressEvent is not an ExecutionGriptapeNodeEvent; it must neither crash
+        # dispatch nor be delivered to execution listeners.
+        manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output"))
+
+        assert received == []
+
+
+class TestAppEventListenerRemoval:
+    """Removing app event listeners is safe to repeat, so a library always unloads cleanly."""
+
+    def test_removing_a_listener_that_is_not_subscribed_does_nothing(self) -> None:
+        event_manager = EventManager()
+        listener = AsyncMock()
+
+        event_manager.remove_listener_for_app_event(ConfigChanged, listener)
+
+        event_manager.add_listener_to_app_event(ConfigChanged, listener)
+        event_manager.remove_listener_for_app_event(ConfigChanged, listener)
+        event_manager.remove_listener_for_app_event(ConfigChanged, listener)
+
+        event_manager.broadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+        listener.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_listener_added_during_a_broadcast_does_not_disturb_it(self) -> None:
+        event_manager = EventManager()
+        late_listener = AsyncMock()
+        heard: list[str] = []
+
+        async def listener_that_subscribes_another(event: ConfigChanged) -> None:
+            heard.append(event.key)
+            event_manager.add_listener_to_app_event(ConfigChanged, late_listener)
+
+        event_manager.add_listener_to_app_event(ConfigChanged, listener_that_subscribes_another)
+
+        await event_manager.abroadcast_app_event(ConfigChanged(key="first", old_value="a", new_value="b"))
+
+        assert heard == ["first"]
+        late_listener.assert_not_called()
+        await event_manager.abroadcast_app_event(ConfigChanged(key="second", old_value="b", new_value="c"))
+        late_listener.assert_awaited_once()
+
+
+class TestNodeProcessEventTranslation:
+    """Loop-body event translation leaves the node events' canvas names and other fields alone."""
+
+    @pytest.mark.asyncio
+    async def test_translation_keeps_every_field_of_a_finish_event(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[NodeFinishProcessEvent] = []
+        manager.add_listener_to_execution_event(NodeFinishProcessEvent, received.append)
+        error = NodeErrorDetails(message="boom", exception_type="builtins.RuntimeError")
+        finish = NodeFinishProcessEvent(
+            node_name="Body",
+            node_type="LoopBodyControlNode",
+            specific_library_name="Library",
+            flow_name="Canvas Flow",
+            execution_id="run-1",
+            parent_execution_id="group-run",
+            outcome=NodeProcessOutcome.FAILED,
+            error_message="boom",
+            error=error,
+        )
+
+        with EventTranslationContext(manager, {"Body_1": "Body", "Start_Package_MultiNode_1": "Start"}):
+            manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish)))
+            # A copy's name is translated; everything else on the event survives the copy it makes.
+            manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=replace(finish, node_name="Body_1")))
+            )
+
+        assert received == [finish, finish]
+
+
+class _RecordingWorkerRequestClient:
+    """Stands in for a worker's RequestClient, recording where each request goes and answering it."""
+
+    def __init__(self, answer: dict) -> None:
+        self.answer = answer
+        self.sent: list[dict] = []
+
+    async def request_from_worker(
+        self,
+        event_request: EventRequest,
+        request_topic: str,
+        worker_response_topic: str,
+        timeout_ms: int | None = None,
+    ) -> dict:
+        self.sent.append(
+            {
+                "request": event_request.request,
+                "request_topic": request_topic,
+                "response_topic": worker_response_topic,
+                "timeout_ms": timeout_ms,
+            }
+        )
+        return self.answer
+
+
+class TestAWorkerRequestingAnotherEngine:
+    """A worker another engine runs reaches that engine, not its orchestrator, as one of that engine's clients."""
+
+    @pytest.mark.asyncio
+    async def test_publishes_on_that_engine_s_topic_and_hears_back_on_its_own(self, engine: Engine) -> None:
+        client = _RecordingWorkerRequestClient(
+            {
+                "event_type": "EventResultSuccess",
+                "result_type": CheckLeaseResultSuccess.__name__,
+                "result": {"result_details": "held"},
+            }
+        )
+        engine.event_manager.configure_worker_forwarding(
+            request_client=client,  # type: ignore[arg-type]
+            orchestrator_request_topic="sessions/artist-sess/request",
+            worker_response_topic="sessions/artist-sess/workers/w1/response",
+            websocket_event_loop=asyncio.get_running_loop(),
+            timeout_ms=5000,
+        )
+        request = CheckLeaseRequest(lease_id="lease-1", worker_engine_id="w1")
+
+        with patch.object(engine, "get_engine_id", return_value="w1"):
+            result = await engine.event_manager.request_engine_from_worker("gpu-01", request)
+
+        assert isinstance(result, CheckLeaseResultSuccess)
+        assert client.sent == [
+            {
+                "request": request,
+                "request_topic": "engines/gpu-01/request",
+                "response_topic": "engines/w1/response",
+                "timeout_ms": 5000,
+            }
+        ]

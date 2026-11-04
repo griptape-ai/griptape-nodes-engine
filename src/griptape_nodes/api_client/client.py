@@ -77,7 +77,6 @@ class Client:
         self._sending_task: asyncio.Task | None = None
         self._websocket: Any = None
         self._connection_ready = asyncio.Event()
-        self._reconnect_delay = 2.0
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: connect to WebSocket server."""
@@ -192,7 +191,6 @@ class Client:
             await asyncio.wait_for(self._connection_ready.wait(), timeout=10.0)
             logger.debug("WebSocket client connected")
         except TimeoutError as e:
-            logger.error("Failed to connect WebSocket client: timeout")
             msg = "Connection timeout - failed to connect to Nodes API."
             raise ConnectionError(msg) from e
 
@@ -212,7 +210,7 @@ class Client:
         # Close websocket connection
         if self._websocket:
             await self._websocket.close()
-        logger.info("WebSocket client disconnected")
+        logger.debug("WebSocket client disconnected")
 
     async def _manage_connection(self) -> None:
         """Manage WebSocket connection lifecycle with automatic reconnection.

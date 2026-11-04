@@ -10,6 +10,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 
 
@@ -39,13 +40,14 @@ class AudioArtifactProvider(BaseArtifactProvider):
     # sits at offset 8-12; RIFF/Ogg/FLAC/MPEG headers fit inside 12 bytes.
     _SNIFF_MIN_HEADER_BYTES: ClassVar[int] = 12
 
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         """Initialize the audio artifact provider.
 
         Args:
             registry: The ProviderRegistry that manages this provider
+            engine: The engine this provider belongs to
         """
-        super().__init__(registry)
+        super().__init__(registry, engine)
 
     @classmethod
     def get_friendly_name(cls) -> str:

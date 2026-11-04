@@ -1,13 +1,14 @@
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import BaseModel
 
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -15,11 +16,22 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import ExecutionPayload
+from griptape_nodes.retained_mode.events.flow_events import (
+    # Re-exported: saved workflows and node libraries import it from here.
+    ImportWorkflowAsReferencedSubFlowRequest as ImportWorkflowAsReferencedSubFlowRequest,  # noqa: PLC0414
+)
+from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
-if TYPE_CHECKING:
-    # Circular import: flow_events <-> workflow_events
-    from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+
+class WorkflowStatus(StrEnum):
+    """The status of a workflow that was attempted to be loaded."""
+
+    GOOD = "GOOD"
+    FLAWED = "FLAWED"
+    UNUSABLE = "UNUSABLE"
+    MISSING = "MISSING"
 
 
 @dataclass
@@ -42,7 +54,18 @@ class RunWorkflowFromScratchRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
-    """Workflow loaded and started successfully from file."""
+    """Workflow loaded and started successfully from file.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+        workflow_id: Id of the workflow now open.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -56,13 +79,20 @@ class RunWorkflowFromScratchResultFailure(ResultPayloadFailure):
 class RunWorkflowWithCurrentStateRequest(RequestPayload):
     """Run a workflow from file, preserving current state.
 
-    Use when: Loading workflows while keeping existing node values, updating workflow structure
-    without losing progress, iterative workflow development.
+    Use when: Loading workflows into a prepared but unpopulated workflow context,
+    loading unregistered workflows.
+
+    Fails if any flow is active on the current context. A current workflow with no
+    flow on it -- the state SetWorkflowContextRequest leaves behind -- is fine; a
+    current flow is not. Use DeleteFlowRequest, ClearAllObjectStateRequest, or similar
+    first to remove any active flow.
 
     Args:
         file_path: Path to the workflow file to load while preserving current state
 
-    Results: RunWorkflowWithCurrentStateResultSuccess | RunWorkflowWithCurrentStateResultFailure (file not found, merge error)
+    Results: RunWorkflowWithCurrentStateResultSuccess |
+        RunWorkflowWithCurrentStateResultFailure (flow already active, file not found,
+        merge error)
     """
 
     file_path: str
@@ -71,13 +101,28 @@ class RunWorkflowWithCurrentStateRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Workflow loaded successfully while preserving current state."""
+    """Workflow loaded successfully while preserving current state.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+        workflow_id: Id of the workflow now open.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
+    workflow_id: str | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
-    """Workflow execution with current state failed. Common causes: file not found, state merge conflict, load error."""
+    """Workflow execution with current state failed.
+
+    Common causes: a flow is already active on the current context, file not found,
+    state merge conflict, load error.
+    """
 
 
 @dataclass
@@ -90,9 +135,10 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to start with a clean state (default: True)
+        run_with_clean_slate: Whether to clear the open workflow first (default: True). With False, the
+            request fails while a workflow is open.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
 
     workflow_name: str
@@ -102,7 +148,18 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
-    """Workflow from registry started successfully."""
+    """Workflow from registry started successfully.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+        workflow_id: Id of the workflow now open.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -137,9 +194,11 @@ class RegisterWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
 
     Args:
         workflow_name: Name assigned to the registered workflow
+        workflow_id: Id of the registered workflow
     """
 
     workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -172,9 +231,11 @@ class ImportWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 
     Args:
         workflow_name: Name of the imported workflow
+        workflow_id: Id of the imported workflow
     """
 
     workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -220,15 +281,68 @@ class ListCallableWorkflowsRequest(RequestPayload):
 
 
 @dataclass
+class CallableWorkflow:
+    """A workflow listed by ListCallableWorkflowsRequest."""
+
+    workflow_id: str
+    workflow_name: str
+
+
+@dataclass
 @PayloadRegistry.register
 class ListCallableWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Workflows that have a Start and End shape and so can be called from another workflow.
+
+    Args:
+        workflow_names: Registry names of the callable workflows.
+        callable_workflows: The same workflows, each with its id.
+    """
+
     workflow_names: list[str]
+    callable_workflows: list[CallableWorkflow] = field(default_factory=list)
 
 
 @dataclass
 @PayloadRegistry.register
 class ListCallableWorkflowsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Callable workflow listing failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetWorkflowShapeRequest(RequestPayload, GraphAccessMixin):
+    """Get the inputs and outputs of a workflow's flow, read from its Start and End nodes as they are now.
+
+    Use when: Running a workflow imported as a subflow, whose Start and End nodes may have been
+    renamed on import, so the shape saved with the workflow no longer names them.
+
+    Args:
+        workflow_name: Registry key of the workflow, used in error messages
+        flow_name: Flow to read the shape from (None for the top-level flow)
+
+    Results: GetWorkflowShapeResultSuccess (with the shape) | GetWorkflowShapeResultFailure (flow not found, no Start or End node)
+    """
+
+    workflow_name: str
+    flow_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetWorkflowShapeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Workflow shape read successfully.
+
+    Args:
+        workflow_shape: Parameters of each Start node (inputs) and End node (outputs), by node name
+    """
+
+    workflow_shape: WorkflowShape
+
+
+@dataclass
+@PayloadRegistry.register
+class GetWorkflowShapeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Workflow shape read failed. Common causes: flow not found, flow has no Start or End node."""
 
 
 @dataclass
@@ -260,6 +374,28 @@ class DeleteWorkflowResultFailure(ResultPayloadFailure):
     """Workflow deletion failed. Common causes: workflow not found, deletion not allowed, registry error."""
 
 
+class RenameDisplayNameBehavior(StrEnum):
+    """Controls what happens to ``WorkflowMetadata.name`` (the human-facing display name) on rename.
+
+    Rename is always a file-name operation; the display name is independent metadata. This enum
+    lets callers decide whether the rename should touch it.
+
+    Values:
+        MATCH_FILE_NAME: Overwrite the display name with the (unsanitized) requested new name.
+            Historical behavior and the default so on-the-wire parity with existing callers is
+            preserved.
+        PRESERVE_EXISTING: Leave the current display name untouched. Opt-in; the file moves but
+            ``metadata.name`` stays put. Use this to fix the "renaming a workflow silently rewrites
+            its display name" corruption path (engine #4992).
+        OVERRIDE: Set the display name to the caller-supplied ``display_name`` value, independent
+            of the file name. Requires ``display_name`` to be non-empty.
+    """
+
+    PRESERVE_EXISTING = "preserve_existing"
+    MATCH_FILE_NAME = "match_file_name"
+    OVERRIDE = "override"
+
+
 @dataclass
 @PayloadRegistry.register
 class RenameWorkflowRequest(RequestPayload):
@@ -270,13 +406,22 @@ class RenameWorkflowRequest(RequestPayload):
 
     Args:
         workflow_name: Current name of the workflow
-        requested_name: New name for the workflow
+        requested_name: New name for the workflow (drives the on-disk filename)
+        display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
+            ``MATCH_FILE_NAME`` to preserve historical wire behavior — callers who want the
+            display name preserved on rename must opt in with ``PRESERVE_EXISTING``. See
+            :class:`RenameDisplayNameBehavior`.
+        display_name: New display name. Required (non-empty) when ``display_name_behavior`` is
+            ``OVERRIDE``. MUST be ``None`` for the other behaviors — supplying it there is
+            rejected up front to catch callers who set it thinking it will take effect.
 
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
     workflow_name: str
     requested_name: str
+    display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
+    display_name: str | None = None
 
 
 @dataclass
@@ -286,9 +431,11 @@ class RenameWorkflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 
     Args:
         new_workflow_name: The sanitized registry key of the renamed workflow (file stem).
+        workflow_id: Id of the renamed workflow, which a rename never changes.
     """
 
     new_workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -308,11 +455,12 @@ class SaveWorkflowRequest(RequestPayload):
     Args:
         file_name: Name of the file to save the workflow to (None for auto-generated)
         image_path: Path to save workflow image/thumbnail (None for no image)
-        pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
+        overwrite_existing: When False and ``file_name`` exactly matches the registry key of a *different* already-registered workflow, the save fails with ``FileIOFailureReason.POLICY_NO_OVERWRITE`` instead of clobbering that workflow's file. When True (default), proceed with the overwrite. Re-saving the workflow that is currently open always succeeds regardless of this flag. Scope is deliberately narrow — the guard covers exact registered registry keys only, so it does not catch a key that differs by case on a case-insensitive filesystem, nor an unregistered stray ``.py`` file sitting at the computed save path; those paths defer to the ``save_workflow`` situation's own collision policy. Also has no effect when ``create_versioned=True``, since versioned saves write a new file rather than overwriting in place.
 
-    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error)
+    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error or refused overwrite)
     """
 
     file_name: str | None = None
@@ -320,23 +468,7 @@ class SaveWorkflowRequest(RequestPayload):
     pickle_control_flow_result: bool | None = None
     display_name: str | None = None
     create_versioned: bool = False
-
-
-@dataclass
-@PayloadRegistry.register
-class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload):
-    """Import a workflow as a referenced sub-flow.
-
-    Use when: Reusing workflows as components, creating modular workflows,
-    importing workflow templates, building composite workflows.
-
-    Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
-    """
-
-    workflow_name: str
-    flow_name: str | None = None  # If None, import into current context flow
-    imported_flow_metadata: dict | None = None  # Metadata to apply to the imported flow
-    track_as_referenced: bool = True  # If False, the flow serializes as inline content instead of an import command
+    overwrite_existing: bool = True
 
 
 @dataclass
@@ -346,9 +478,13 @@ class ImportWorkflowAsReferencedSubFlowResultSuccess(WorkflowAlteredMixin, Resul
 
     Args:
         created_flow_name: Name of the created sub-flow
+        status: Fitness of the imported subflow's own load. FLAWED means placeholders stand in
+            for nodes whose library could not be registered -- editable, but not runnable.
+            Callers that import in order to RUN the subflow should refuse anything but GOOD.
     """
 
     created_flow_name: str
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -365,16 +501,28 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Args:
         file_path: Path where the workflow was saved
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
+        workflow_id: Id of the saved workflow. A Save As or versioned save
+            writes a copy, with a new id.
     """
 
     file_path: str
     workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class SaveWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow save failed. Common causes: file system error, permission denied, invalid path."""
+    """Workflow save failed.
+
+    Common causes: file system error, permission denied, invalid path, workflow conflict.
+
+    Attributes:
+        failure_reason: Classification of why the save failed
+        result_details: Human-readable error message (inherited from ResultPayloadFailure)
+    """
+
+    failure_reason: FileIOFailureReason | None = None
 
 
 @dataclass
@@ -504,11 +652,14 @@ class GetPublishOptionsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
         fields: Ordered list of fields to render in the publish dialog
         title: Optional dialog title (e.g. "Update Published Gizmo"). None uses the frontend default.
         button_label: Optional publish button label (e.g. "Update"). None uses the frontend default.
+        loading_label: Optional label shown while publishing is in progress (e.g. "Updating"). None
+            lets the frontend derive it from button_label automatically.
     """
 
     fields: list[PublishOptionField]
     title: str | None = None
     button_label: str | None = None
+    loading_label: str | None = None
 
 
 @dataclass
@@ -519,13 +670,35 @@ class GetPublishOptionsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 class PublishWorkflowRegisteredEventData:
-    """Data specific to registering a PublishWorkflowRequest event handler."""
+    """Data specific to registering a PublishWorkflowRequest event handler.
+
+    Args:
+        start_flow_node_type: Node type used as the start of the published flow.
+        start_flow_node_library_name: Library that provides the start node type.
+        end_flow_node_type: Node type used as the end of the published flow.
+        end_flow_node_library_name: Library that provides the end node type.
+        get_publish_options: Optional callable returning custom publish options for this target.
+        display_name: Optional human-readable name for the publishing target. When set, the GUI
+            should show this in the publish menu/dialog instead of the raw library name. When None,
+            the frontend falls back to the library name, preserving today's behavior.
+        description: Optional short description of the publishing target. When set, the GUI may show
+            it alongside the target in the publish menu/dialog (e.g. as a subtitle or tooltip). When
+            None, no description is shown, preserving today's behavior.
+        icon: Optional icon identifier for the publishing target. When set, the GUI may render it
+            next to the target in the publish menu/dropdown. The value is either a Lucide icon name
+            (e.g. "rocket") or a path/URL to an image the frontend renders as-is (e.g.
+            "logos/my-target.svg" or "https://example.com/logo.png") — not raw image data. When
+            None, the GUI uses its default/no icon, preserving today's behavior.
+    """
 
     start_flow_node_type: str
     start_flow_node_library_name: str
     end_flow_node_type: str
     end_flow_node_library_name: str
     get_publish_options: Callable[["GetPublishOptionsRequest"], GetPublishOptionsResultSuccess] | None = None
+    display_name: str | None = None
+    description: str | None = None
+    icon: str | None = None
 
 
 @dataclass
@@ -544,6 +717,7 @@ class PublishWorkflowRequest(RequestPayload):
     # This can be removed after GUI release
     execute_on_publish: bool | None = None
     published_workflow_file_name: str | None = None
+    # Deprecated and ignored. Flow results always travel as plain data.
     pickle_control_flow_result: bool = False
     metadata: dict | None = None
 
@@ -592,13 +766,17 @@ class BranchWorkflowRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow to branch
-        branched_workflow_name: Name for the branched workflow (None for auto-generated)
+        branched_workflow_name: Registry key for the branched workflow (None for auto-generated)
+        branched_workflow_display_name: Human-readable label (``metadata.name``) for the branch.
+            None derives one from the source workflow's display name, e.g. branching
+            "Shot 010 Comp" yields "Shot 010 Comp (branch 1)". Must not be blank when provided.
 
     Results: BranchWorkflowResultSuccess (with branch name) | BranchWorkflowResultFailure (branch error)
     """
 
     workflow_name: str
     branched_workflow_name: str | None = None
+    branched_workflow_display_name: str | None = None
 
 
 @dataclass
@@ -609,10 +787,14 @@ class BranchWorkflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     Args:
         branched_workflow_name: Name of the created branch
         original_workflow_name: Name of the original workflow
+        branched_workflow_id: Id of the created branch
+        original_workflow_id: Id of the original workflow
     """
 
     branched_workflow_name: str
     original_workflow_name: str
+    branched_workflow_id: str | None = None
+    original_workflow_id: str | None = None
 
 
 @dataclass
@@ -649,10 +831,12 @@ class CreateWorkflowFromTemplateResultSuccess(WorkflowAlteredMixin, ResultPayloa
     Args:
         workflow_name: Registry name of the created workflow
         file_path: Path where the workflow file was written
+        workflow_id: Id of the created workflow
     """
 
     workflow_name: str
     file_path: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -685,9 +869,11 @@ class MergeWorkflowBranchResultSuccess(WorkflowAlteredMixin, ResultPayloadSucces
 
     Args:
         merged_workflow_name: Name of the source workflow after merge
+        workflow_id: Id of the source workflow, which keeps its id
     """
 
     merged_workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -720,9 +906,11 @@ class ResetWorkflowBranchResultSuccess(WorkflowAlteredMixin, ResultPayloadSucces
 
     Args:
         reset_workflow_name: Name of the branch workflow after reset
+        workflow_id: Id of the branch workflow, which keeps its id
     """
 
     reset_workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -805,10 +993,12 @@ class MoveWorkflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     Args:
         moved_file_path: New file path after the move
         new_workflow_name: New registry key for the workflow after the move
+        workflow_id: Id of the moved workflow, which a move never changes
     """
 
     moved_file_path: str
     new_workflow_name: str
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -837,15 +1027,6 @@ class GetWorkflowMetadataResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class GetWorkflowMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Workflow metadata retrieval failed. Common causes: workflow not found, registry error, file load error."""
-
-
-class WorkflowStatus(StrEnum):
-    """The status of a workflow that was attempted to be loaded."""
-
-    GOOD = "GOOD"
-    FLAWED = "FLAWED"
-    UNUSABLE = "UNUSABLE"
-    MISSING = "MISSING"
 
 
 class WorkflowDependencyStatus(StrEnum):
@@ -904,6 +1085,7 @@ class GetWorkflowInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
         workflow_path: Absolute file path to the workflow file
         problems: List of human-readable problem descriptions, one entry per problem group
         workflow_dependencies: List of library dependency details
+        workflow_id: Id of the workflow
     """
 
     status: WorkflowStatus
@@ -911,6 +1093,7 @@ class GetWorkflowInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     workflow_path: str
     problems: list[str]
     workflow_dependencies: list[WorkflowDependencyInfo]
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -929,6 +1112,7 @@ class WorkflowInfoSummary:
         workflow_path: Absolute file path to the workflow file
         problems: List of human-readable problem descriptions, one entry per problem group
         workflow_dependencies: List of library dependency details
+        workflow_id: Id of the workflow
     """
 
     status: WorkflowStatus
@@ -936,6 +1120,7 @@ class WorkflowInfoSummary:
     workflow_path: str
     problems: list[str]
     workflow_dependencies: list[WorkflowDependencyInfo]
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -1070,12 +1255,12 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
         branched_from: Optional branched from information to preserve workflow lineage
         workflow_shape: Optional workflow shape defining inputs and outputs for external callers
         file_path: Optional specific file path to use (defaults to workspace path if not provided)
-        pickle_control_flow_result: Whether to pickle control flow results in generated execution code (defaults to False)
+        pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
 
     Results: SaveWorkflowFileFromSerializedFlowResultSuccess (with file path) | SaveWorkflowFileFromSerializedFlowResultFailure (save error)
     """
 
-    serialized_flow_commands: "SerializedFlowCommands"
+    serialized_flow_commands: SerializedFlowCommands
     file_name: str
     file_path: str | None = None
     creation_date: datetime | None = None
@@ -1105,7 +1290,16 @@ class SaveWorkflowFileFromSerializedFlowResultSuccess(WorkflowNotAlteredMixin, R
 @dataclass
 @PayloadRegistry.register
 class SaveWorkflowFileFromSerializedFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow file save failed. Common causes: file system error, permission denied, invalid serialized commands."""
+    """Workflow file save failed.
+
+    Common causes: file system error, permission denied, invalid serialized commands,
+    refused overwrite.
+
+    Attributes:
+        failure_reason: Classification of why the save failed
+    """
+
+    failure_reason: FileIOFailureReason | None = None
 
 
 @dataclass
@@ -1145,6 +1339,33 @@ class SaveSubflowToWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 @PayloadRegistry.register
 class SaveSubflowToWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Subflow save to workflow file failed. Common causes: serialization error, file system error, invalid flow name."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariableSubstitutionEnabledRequest(RequestPayload):
+    """Get whether inline variable substitution is enabled for the current workflow.
+
+    Results: GetVariableSubstitutionEnabledResultSuccess | GetVariableSubstitutionEnabledResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariableSubstitutionEnabledResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variable substitution enabled state retrieved successfully.
+
+    Args:
+        enabled: True if {VAR} tokens are substituted at execution time, False otherwise.
+    """
+
+    enabled: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariableSubstitutionEnabledResultFailure(ResultPayloadFailure):
+    """Variable substitution enabled state retrieval failed. Common cause: no active workflow context."""
 
 
 @dataclass

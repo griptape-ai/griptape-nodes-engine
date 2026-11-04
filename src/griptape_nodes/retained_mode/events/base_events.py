@@ -1,50 +1,19 @@
 from __future__ import annotations
 
-import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from griptape_nodes.retained_mode.events.event_converter import (
-    converter,
-    register_polymorphic_dataclass,
-    safe_unstructure,
-)
 
-if TYPE_CHECKING:
-    import builtins
+@dataclass(frozen=True)
+class RequestSender:
+    """The engine, and its session, that sent a request, when another engine sent it."""
 
-
-def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
-    """Resolve a payload type from a type-name field in the event data.
-
-    Args:
-        event_data: The event dictionary (mutated: the type-name key is popped if used).
-        type_key: The key in event_data that holds the payload type name (e.g. "request_type").
-
-    Returns:
-        The resolved concrete type.
-
-    Raises:
-        ValueError: If the type cannot be resolved.
-    """
-    # Lazy import to avoid circular dependency: payload_registry imports Payload from this module.
-    from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-
-    type_name = event_data.pop(type_key, None)
-    if type_name is None:
-        msg = f"Cannot resolve payload type: '{type_key}' not found in event data."
-        raise ValueError(msg)
-
-    resolved = PayloadRegistry.get_type(type_name)
-    if resolved is None:
-        msg = f"Cannot resolve payload type: '{type_name}' is not registered."
-        raise ValueError(msg)
-
-    return resolved
+    engine_id: str
+    session_id: str | None = None
 
 
 @dataclass
@@ -124,14 +93,6 @@ class ResultDetails:
 class Payload(ABC):  # noqa: B024
     """Base class for all payload types. Customers will derive from this."""
 
-    def to_json(self, **kwargs) -> str:
-        """Serialize this payload to JSON string.
-
-        Returns:
-            JSON string representation of the payload
-        """
-        return json.dumps(safe_unstructure(self), default=str, **kwargs)
-
 
 # Request payload base class with optional request ID
 @dataclass(kw_only=True)
@@ -143,17 +104,40 @@ class RequestPayload(Payload, ABC):
         failure_log_level: If set, override the log level for failure results.
                           Use logging.DEBUG (10) or logging.INFO (20) to suppress error toasts.
                           Default: None (use handler's default, typically ERROR).
-
         broadcast_result: Whether handle_request should queue the result event for broadcast
                           (e.g. to connected WebSocket clients). Defaults to True. Request types
                           whose results are large or only relevant to the direct caller can
                           default this to False on the subclass to avoid unnecessary serialization
                           and transmission. Can also be set per-instance at construction time.
+        fields: **Wire-only** dot-path filter applied to the broadcast JSON before it is sent
+                over the WebSocket. Has no effect on in-process/retained-mode callers, which
+                always receive the full result object. Like broadcast_result and failure_log_level,
+                this is a transport-layer concern, not part of the request logic.
+
+                Syntax:
+                  - ``None`` (default) — return all fields.
+                  - ``[]`` (empty list) — return only framework fields (result_details,
+                    altered_workflow_state). Useful to trigger side effects without caring
+                    about the result payload.
+                  - ``["a", "a.b.c"]`` — dot-paths select nested fields. An empty list
+                    entry keeps the whole value; a more-specific sibling narrows it.
+                    Prefix-wins: if both ``"workflows"`` and ``"workflows.name"`` are
+                    listed, the full ``workflows`` value is kept.
+                  - ``"*"`` wildcard — for ``dict[str, SomeObject]`` where keys are
+                    arbitrary (e.g. file paths). ``"workflows.*.name"`` plucks ``name``
+                    from each value without knowing the keys in advance. Prefer ``"*"``
+                    over a concrete key for such maps: naming a specific key warns
+                    "not found" whenever that key is legitimately absent.
+
+                Framework fields (result_details, altered_workflow_state) are always
+                included regardless of what fields specifies. Filtering is skipped
+                entirely on failure results.
     """
 
     broadcast_result: bool = True
     request_id: str | None = None
     failure_log_level: int | None = None
+    fields: list[str] | None = None
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -190,6 +174,15 @@ class WorkflowNotAlteredMixin:
     """Mixin for a ResultPayload that guarantees that a workflow was NOT altered."""
 
     altered_workflow_state: bool = field(default=False, init=False)
+
+
+class GraphAccessMixin:
+    """Marks a request that reads or changes connections, flows, flow variables, or node group membership.
+
+    A node must not send one while it is being created or having its saved state applied (strict-mode
+    rule ``graph-access-while-loading``): the graph around a loading node is incomplete, so the answer
+    would depend on how the node was loaded.
+    """
 
 
 class SkipTheLineMixin:
@@ -300,42 +293,21 @@ A = TypeVar("A", bound=AppPayload)
 class BaseEvent(BaseModel, ABC):
     """Abstract base class for all events."""
 
-    # Instance fields for engine and session identification
-    _engine_id: ClassVar[str | None] = None
-    _session_id: ClassVar[str | None] = None
-
-    engine_id: str | None = Field(default_factory=lambda: BaseEvent._engine_id)
-    session_id: str | None = Field(default_factory=lambda: BaseEvent._session_id)
-
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization and add event_type."""
-        result = super().dict(*args, **kwargs)
+    def json(self, *_args: Any, **_kwargs: Any) -> NoReturn:
+        msg = (
+            f"'{type(self).__name__}.json()' is not the wire format. "
+            "Use 'converters.client.dumps(event)' from 'griptape_nodes.retained_mode.events'."
+        )
+        raise TypeError(msg)
 
-        # Add event type based on class name
-        result["event_type"] = self.__class__.__name__
-
-        # Include payload type information in serialized output
-        for field_name, field_value in self.__dict__.items():
-            if isinstance(field_value, Payload):
-                result[f"{field_name}_type"] = field_value.__class__.__name__
-
-        return result
-
-    def json(self, **kwargs) -> str:
-        """Serialize to JSON string."""
-        logger = logging.getLogger(__name__)
-
-        def _default(obj: Any) -> str:
-            logger.debug(
-                "json.dumps fallback hit: type=%s, value=%r",
-                type(obj).__name__,
-                obj,
-            )
-            return str(obj)
-
-        return json.dumps(self.dict(), default=_default, **kwargs)
+    def dict(self, *_args: Any, **_kwargs: Any) -> NoReturn:
+        msg = (
+            f"'{type(self).__name__}.dict()' is not the wire format. "
+            "Use 'converters.engine.unstructure(event)' from 'griptape_nodes.retained_mode.events'."
+        )
+        raise TypeError(msg)
 
     @abstractmethod
     def get_request(self) -> Payload:
@@ -347,22 +319,33 @@ class BaseEvent(BaseModel, ABC):
 
 
 class EventRequest[P: Payload](BaseEvent):
-    """Request event."""
+    """Request event.
+
+    Args:
+        request: The request payload.
+        request_id: Id the caller matches the result by. Echoed on the result.
+        response_topic: Where the result is sent. Echoed on the result.
+        open_workflow_id: Id of the open workflow the request runs in. Echoed on the result. The
+            handler, and every task it starts, acts on that workflow. An id that names no open
+            workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
+            handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
+            Left out, the request acts on the engine's only open workflow, unless another engine
+            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
+            else: the workflow the request is about.
+    """
 
     request: P
     request_id: str | None = None
     response_topic: str | None = None
+    # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
+    # `require_request_sender()`.
+    sender: RequestSender | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
         # Call the parent class initializer
         super().__init__(**data)
-
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
-        result["request"] = safe_unstructure(self.request)
-        return result
 
     def get_request(self) -> P:
         """Get the request payload for this event.
@@ -371,16 +354,6 @@ class EventRequest[P: Payload](BaseEvent):
             P: The request payload
         """
         return self.request
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> EventRequest:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        request_data = event_data.pop("request", {})
-        resolved_type = _resolve_payload_type(event_data, "request_type")
-
-        request_payload = converter.structure(request_data, resolved_type)
-        return cls(request=request_payload, **event_data)
 
 
 class EventRequestBatch(BaseEvent):
@@ -399,48 +372,37 @@ class EventRequestBatch(BaseEvent):
 
     requests: list[EventRequest] = Field(default_factory=list)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Serialize the envelope, recursing into each inner request's own serializer."""
-        result = super().dict(*args, **kwargs)
-        result["requests"] = [inner.dict() for inner in self.requests]
-        return result
-
     def get_request(self) -> Payload:
         """EventRequestBatch is a transport envelope; inspect .requests instead."""
         msg = "EventRequestBatch is a transport envelope; inspect .requests instead."
         raise NotImplementedError(msg)
 
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> EventRequestBatch:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create a batch envelope by deserializing each inner request individually."""
-        event_data = data.copy()
-        raw_requests = event_data.pop("requests", [])
-        requests = [EventRequest.from_dict(raw) for raw in raw_requests]
-        return cls(requests=requests, **event_data)
-
 
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
-    """Abstract base class for result events."""
+    """Abstract base class for result events.
+
+    Args:
+        open_workflow_id: The request envelope's `open_workflow_id`, echoed back: the open workflow
+            the request ran in. A result payload's own `workflow_id` is something else. For
+            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
+            Save As is a copy that is not open.
+        engine_id: The engine that sent the result. A client that reached it through a session
+            topic learns from this which engine holds the session. None when the result was built
+            outside the engine's dispatch, such as by the MCP server or a bootstrap script.
+    """
 
     request: P
     result: R
     request_id: str | None = None
     response_topic: str | None = None
     retained_mode: str | None = None
+    open_workflow_id: str | None = None
+    engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""
         # Call the parent class initializer
         super().__init__(**data)
-
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
-        result["request"] = safe_unstructure(self.request)
-        result["result"] = safe_unstructure(self.result)
-        if self.retained_mode:
-            result["retained_mode"] = self.retained_mode
-        return result
 
     def get_request(self) -> P:
         """Get the request payload for this event.
@@ -465,20 +427,6 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         Returns:
             bool: True if success, False if failure
         """
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> EventResult:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        request_data = event_data.pop("request", {})
-        result_data = event_data.pop("result", {})
-
-        resolved_req_type = _resolve_payload_type(event_data, "request_type")
-        resolved_res_type = _resolve_payload_type(event_data, "result_type")
-
-        request_payload = converter.structure(request_data, resolved_req_type)
-        result_payload = converter.structure(result_data, resolved_res_type)
-        return cls(request=request_payload, result=result_payload)
 
 
 class EventResultSuccess(EventResult[P, R]):
@@ -505,6 +453,12 @@ class EventResultFailure(EventResult[P, R]):
         return False
 
 
+# The `event_type` values that carry an answer to a request. Derived from the classes so a rename
+# cannot leave a transport matching on a name nothing sends. Both carry the request they answer, so a
+# dispatcher that only understands requests reads one as a malformed request rather than a response.
+RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.__name__})
+
+
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     payload: E
@@ -514,12 +468,6 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
         # Call the parent class initializer
         super().__init__(**data)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
-        result["payload"] = safe_unstructure(self.payload)
-        return result
-
     def get_request(self) -> E:
         """Get the payload for this event.
 
@@ -527,16 +475,6 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
             E: The execution payload
         """
         return self.payload
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> ExecutionEvent:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        payload_data = event_data.pop("payload", {})
-        resolved_type = _resolve_payload_type(event_data, "payload_type")
-
-        event_payload = converter.structure(payload_data, resolved_type)
-        return cls(payload=event_payload, **event_data)
 
 
 # Events sent as part of the lifecycle of the Griptape Nodes application.
@@ -548,12 +486,6 @@ class AppEvent[A: AppPayload](BaseEvent):
         # Call the parent class initializer
         super().__init__(**data)
 
-    def dict(self, *args, **kwargs) -> dict[str, Any]:
-        """Override dict to handle payload serialization."""
-        result = super().dict(*args, **kwargs)
-        result["payload"] = safe_unstructure(self.payload)
-        return result
-
     def get_request(self) -> A:
         """Get the payload for this event.
 
@@ -561,16 +493,6 @@ class AppEvent[A: AppPayload](BaseEvent):
             A: The app event payload
         """
         return self.payload
-
-    @classmethod
-    def from_dict(cls, data: builtins.dict[str, Any]) -> AppEvent:  # pyright: ignore[reportIncompatibleMethodOverride]
-        """Create an event from a dictionary."""
-        event_data = data.copy()
-        payload_data = event_data.pop("payload", {})
-        resolved_type = _resolve_payload_type(event_data, "payload_type")
-
-        event_payload = converter.structure(payload_data, resolved_type)
-        return cls(payload=event_payload, **event_data)
 
 
 class GriptapeNodeEvent(BaseEvent):
@@ -594,11 +516,3 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
-
-
-# Register ResultDetail subclasses (e.g. StrictModeViolationDetail) with the
-# converter so a ``list[ResultDetail]`` round-trip preserves subclass identity
-# and subclass-only fields (rule_id, severity, subject, library_name) instead
-# of degrading every entry to a bare ResultDetail. Must run after every
-# subclass is defined.
-register_polymorphic_dataclass(ResultDetail)

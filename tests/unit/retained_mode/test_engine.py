@@ -1,0 +1,391 @@
+"""Tests for the Engine object graph and how the current engine is resolved.
+
+These pin the guarantees the refactor away from a process-wide singleton was for: engines
+are independent, managers are wired to the engine that built them, and the current engine
+can be rebound for a scope without leaking into the rest of the process.
+"""
+
+import asyncio
+import logging
+import threading
+from collections.abc import Iterator
+from unittest.mock import patch
+
+import pytest
+
+from griptape_nodes.retained_mode.engine import (
+    Engine,
+    EngineScoped,
+    current_engine,
+    engine_scope,
+    has_current_engine,
+    reset_root_engine,
+)
+from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
+from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
+from griptape_nodes.retained_mode.events.secrets_events import SetSecretValueRequest
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+def _engine_scoped_children(path: str, value: object) -> Iterator[tuple[str, EngineScoped]]:
+    """Yield the engine-scoped objects held directly by one attribute value."""
+    if isinstance(value, EngineScoped):
+        yield path, value
+    elif isinstance(value, (list, tuple, set)):
+        for index, item in enumerate(value):
+            if isinstance(item, EngineScoped):
+                yield f"{path}[{index}]", item
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, EngineScoped):
+                yield f"{path}[{key!r}]", item
+
+
+def _unbound_engine_scoped_descendants(root: EngineScoped, engine: Engine, path: str) -> list[str]:
+    """Report every engine-scoped object reachable from `root` that is not bound to `engine`."""
+    unbound: list[str] = []
+    visited: set[int] = set()
+    pending: list[tuple[str, EngineScoped]] = [(path, root)]
+
+    while pending:
+        owner_path, owner = pending.pop()
+        if id(owner) in visited:
+            continue
+        visited.add(id(owner))
+
+        for attribute_name, value in vars(owner).items():
+            for child_path, child in _engine_scoped_children(f"{owner_path}.{attribute_name}", value):
+                if child._engine is not engine:
+                    unbound.append(f"{child_path} ({type(child).__name__})")
+                pending.append((child_path, child))
+
+    return unbound
+
+
+class TestEngineIndependence:
+    def test_engines_do_not_share_managers(self) -> None:
+        first = Engine()
+        second = Engine()
+
+        assert first.object_manager is not second.object_manager
+        assert first.event_manager is not second.event_manager
+        assert first.flow_manager is not second.flow_manager
+
+    def test_managers_are_wired_to_their_own_engine(self) -> None:
+        first = Engine()
+        second = Engine()
+
+        assert first.flow_manager.engine is first
+        assert second.flow_manager.engine is second
+
+    def test_every_engine_scoped_manager_is_bound(self) -> None:
+        """No manager should be left resolving the engine through the module-level fallback."""
+        engine = Engine()
+
+        unbound = [
+            name
+            for name in dir(Engine)
+            if name.endswith("_manager")
+            and isinstance(manager := getattr(engine, name), EngineScoped)
+            and manager._engine is not engine
+        ]
+
+        assert unbound == []
+
+    def test_every_engine_scoped_object_owned_by_a_manager_is_bound(self) -> None:
+        """Managers must inject their engine into the engine-scoped objects they build.
+
+        The manager-level check stops at `Engine`'s own attributes, so a registry or helper
+        constructed bare inside a manager's `__init__` still falls back to `current_engine()`
+        and runs its whole subtree on whatever engine happens to be ambient at call time.
+        """
+        engine = Engine()
+        unbound: list[str] = []
+
+        for attribute_name in dir(Engine):
+            if not attribute_name.endswith("_manager"):
+                continue
+
+            manager = getattr(engine, attribute_name)
+            if not isinstance(manager, EngineScoped):
+                continue
+
+            unbound.extend(_unbound_engine_scoped_descendants(manager, engine, attribute_name))
+
+        assert unbound == []
+
+    def test_object_registered_in_one_engine_is_invisible_to_the_other(self) -> None:
+        first = Engine()
+        second = Engine()
+
+        first.open_workflows.open("first")
+        first.object_manager.add_object_by_name("shared_name", object())
+
+        assert first.object_manager.has_object_with_name("shared_name")
+        assert not second.object_manager.has_object_with_name("shared_name")
+
+
+class TestEngineScopedFallback:
+    def test_manager_built_without_an_engine_falls_back_to_the_current_engine(self) -> None:
+        scoped = EngineScoped()
+
+        assert scoped.engine is current_engine()
+
+    def test_manager_built_with_an_engine_ignores_the_current_engine(self) -> None:
+        explicit = Engine()
+        scoped = EngineScoped(explicit)
+
+        assert scoped.engine is explicit
+        assert scoped.engine is not current_engine()
+
+
+class TestEngineScope:
+    def test_scope_binds_and_restores(self) -> None:
+        root = current_engine()
+        scoped = Engine()
+
+        with engine_scope(scoped) as bound:
+            assert bound is scoped
+            assert current_engine() is scoped
+
+        assert current_engine() is root
+
+    def test_scope_without_an_argument_builds_a_fresh_engine(self) -> None:
+        root = current_engine()
+
+        with engine_scope() as bound:
+            assert bound is not root
+            assert current_engine() is bound
+
+        assert current_engine() is root
+
+    def test_scopes_nest_and_unwind_in_order(self) -> None:
+        outer = Engine()
+        inner = Engine()
+
+        with engine_scope(outer):
+            assert current_engine() is outer
+            with engine_scope(inner):
+                assert current_engine() is inner
+            assert current_engine() is outer
+
+    def test_scope_restores_when_the_body_raises(self) -> None:
+        root = current_engine()
+
+        def explode() -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="boom"), engine_scope(Engine()):
+            explode()
+
+        assert current_engine() is root
+
+    def test_facade_follows_the_scoped_engine(self) -> None:
+        """The `GriptapeNodes` facade must resolve the scoped engine, not the root."""
+        scoped = Engine()
+
+        with engine_scope(scoped):
+            assert GriptapeNodes() is scoped
+            assert GriptapeNodes.get_instance() is scoped
+            assert GriptapeNodes.FlowManager() is scoped.flow_manager
+            assert GriptapeNodes.ObjectManager() is scoped.object_manager
+            assert GriptapeNodes.BudgetManager() is scoped.budget_manager
+
+    @pytest.mark.asyncio
+    async def test_task_created_inside_the_scope_inherits_the_binding(self) -> None:
+        """Asyncio tasks copy the context at creation, so work spawned in a scope stays bound."""
+        scoped = Engine()
+
+        async def read_engine() -> Engine:
+            await asyncio.sleep(0)
+            return current_engine()
+
+        with engine_scope(scoped):
+            task = asyncio.create_task(read_engine())
+            observed = await task
+
+        assert observed is scoped
+
+    @pytest.mark.asyncio
+    async def test_scope_survives_an_await_in_its_body(self) -> None:
+        """Entering and exiting around an await must not trip the ContextVar token reset."""
+        root = current_engine()
+        scoped = Engine()
+
+        with engine_scope(scoped):
+            await asyncio.sleep(0)
+            assert current_engine() is scoped
+
+        assert current_engine() is root
+
+    @pytest.mark.asyncio
+    async def test_concurrent_tasks_can_hold_different_engines(self) -> None:
+        """The point of a ContextVar: two concurrent flows of control, two engines."""
+        first = Engine()
+        second = Engine()
+
+        async def observe(engine: Engine) -> Engine:
+            with engine_scope(engine):
+                await asyncio.sleep(0)
+                return current_engine()
+
+        observed = await asyncio.gather(observe(first), observe(second))
+
+        assert observed == [first, second]
+
+
+class TestRootEngine:
+    def test_root_engine_is_cached(self) -> None:
+        assert current_engine() is current_engine()
+
+    def test_reset_root_engine_builds_a_fresh_one(self) -> None:
+        first = current_engine()
+        reset_root_engine()
+
+        assert current_engine() is not first
+
+    def test_has_current_engine_does_not_build_one(self) -> None:
+        reset_root_engine()
+
+        assert has_current_engine() is False
+
+        current_engine()
+
+        assert has_current_engine() is True
+
+    def test_has_current_engine_is_true_inside_a_scope(self) -> None:
+        reset_root_engine()
+
+        with engine_scope(Engine()):
+            assert has_current_engine() is True
+
+    def test_racing_threads_share_one_root_engine(self) -> None:
+        """The lazy build is locked, so a cold start under load cannot orphan an engine."""
+        racer_count = 8
+        reset_root_engine()
+        observed: list[Engine] = []
+        start = threading.Barrier(racer_count)
+
+        def resolve() -> None:
+            start.wait()
+            observed.append(current_engine())
+
+        threads = [threading.Thread(target=resolve) for _ in range(racer_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(observed) == racer_count
+        assert all(engine is observed[0] for engine in observed)
+
+
+class TestFailedRequestLogging:
+    """A request that fails outside its handler is logged by type and ID, never by its contents.
+
+    A handler that raises is caught by the event manager. The engine's own ``except`` runs when
+    dispatch or the result broadcast fails, and a request's repr can carry a secret value, as a
+    ``SetSecretValueRequest`` does.
+    """
+
+    SECRET_VALUE = "sk-test-0123456789abcdef"  # noqa: S105 - a fake value the test proves is not logged
+
+    def _request(self) -> SetSecretValueRequest:
+        return SetSecretValueRequest(key="TEST_SERVICE_API_KEY", value=self.SECRET_VALUE, request_id="req-42")
+
+    def test_sync_failure_does_not_log_the_secret_value(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def _fail(**_kwargs: object) -> None:
+            msg = "dispatch failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(engine.event_manager, "handle_request", _fail)
+
+        with caplog.at_level(logging.ERROR):
+            result = engine.handle_request(self._request())
+
+        assert isinstance(result, ResultPayloadFailure)
+        self._assert_logged_without_the_secret(caplog)
+
+    @pytest.mark.asyncio
+    async def test_async_failure_does_not_log_the_secret_value(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def _fail(**_kwargs: object) -> None:
+            msg = "dispatch failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(engine.event_manager, "ahandle_request", _fail)
+
+        with caplog.at_level(logging.ERROR):
+            result = await engine.ahandle_request(self._request())
+
+        assert isinstance(result, ResultPayloadFailure)
+        self._assert_logged_without_the_secret(caplog)
+
+    def _assert_logged_without_the_secret(self, caplog: pytest.LogCaptureFixture) -> None:
+        records = [record for record in caplog.records if "Unhandled exception" in record.getMessage()]
+        assert len(records) == 1
+        record = records[0]
+        assert "SetSecretValueRequest" in record.getMessage()
+        assert "req-42" in record.getMessage()
+        assert record.exc_info is not None
+        assert self.SECRET_VALUE not in caplog.text
+
+
+class _Links:
+    """Answers every request with a fixed result, and records the lost-link callback it is given."""
+
+    def __init__(self) -> None:
+        self.asked: list[tuple[str, object, float | None]] = []
+        self.link_lost: object = None
+
+    async def request(self, engine_id: str, request: object, *, timeout_s: float | None) -> object:
+        self.asked.append((engine_id, request, timeout_s))
+        return ResultPayloadFailure(result_details="answered")
+
+    def on_engine_lost(self, callback: object) -> None:
+        self.link_lost = callback
+
+
+class TestRequestingAnotherEngine:
+    @pytest.mark.asyncio
+    async def test_without_links_a_request_fails_saying_so(self) -> None:
+        engine = Engine()
+
+        with pytest.raises(EngineNotFoundError, match="no connections to other engines"):
+            await engine.request("gpu-01", SetSecretValueRequest(key="k", value="v"), timeout_s=1.0)
+
+        assert not engine.can_reach_other_engines
+
+    @pytest.mark.asyncio
+    async def test_a_request_goes_through_the_attached_links(self) -> None:
+        engine = Engine()
+        links = _Links()
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
+        request = SetSecretValueRequest(key="k", value="v")
+
+        result = await engine.request("gpu-01", request, timeout_s=1.0)
+
+        assert isinstance(result, ResultPayloadFailure)
+        assert links.asked == [("gpu-01", request, 1.0)]
+        assert links.link_lost is not None
+        assert engine.can_reach_other_engines
+
+    @pytest.mark.asyncio
+    async def test_a_link_lost_on_the_transports_loop_is_settled_on_the_engine_loop(self) -> None:
+        engine = Engine()
+        engine.event_manager.initialize_queue()
+        links = _Links()
+        engine.attach_engine_transports(links)  # type: ignore[arg-type]
+        settled_on: list[asyncio.AbstractEventLoop] = []
+
+        async def record_loop(_engine_id: str) -> None:
+            settled_on.append(asyncio.get_running_loop())
+
+        with patch.object(engine.worker_manager, "on_engine_lost", side_effect=record_loop):
+            await asyncio.to_thread(asyncio.run, links.link_lost("artist"))  # type: ignore[operator]
+
+        assert settled_on == [asyncio.get_running_loop()]

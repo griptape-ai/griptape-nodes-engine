@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import pickle
+import uuid
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -11,14 +12,22 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import anyio
 
+from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketUnavailableError
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
+from griptape_nodes.common.isolated_execution_scope import isolated_execution_scope
+from griptape_nodes.common.loop_body_scope import (
+    LoopBodyScope,
+    current_loop_body_scope,
+    entered_loop_body_scope,
+    loop_body_scope_for,
+)
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
 )
-from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import ParameterList, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
     BaseWhileNodeGroup,
@@ -28,20 +37,27 @@ from griptape_nodes.exe_types.node_groups import (
 )
 from griptape_nodes.exe_types.node_types import (
     CONTROL_INPUT_PARAMETER,
+    ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
-    PRIVATE_EXECUTION,
     BaseNode,
     EndNode,
     NodeResolutionState,
     StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
-from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
-from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
+from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
+    ExecutionPayload,
+    ForwardedException,
+    ProgressEvent,
+    ResultPayload,
+)
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
@@ -54,11 +70,13 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
     ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
     GriptapeEvent,
     InvolvedNodesEvent,
     NodeFinishProcessEvent,
     NodeMetadata,
+    NodeProcessOutcome,
     NodeResolvedEvent,
     NodeStartProcessEvent,
     NodeUnresolvedEvent,
@@ -78,11 +96,19 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeserializeFlowFromCommandsRequest,
     DeserializeFlowFromCommandsResultFailure,
     DeserializeFlowFromCommandsResultSuccess,
+    OriginalNodeParameter,
     PackagedNodeParameterMapping,
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import (
+    NodeErrorDetails,
+    build_engine_error_details,
+    build_node_error_details,
+)
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeResultFailure,
+    CreateNodeResultSuccess,
     DeserializeNodeFromCommandsResultFailure,
     DeserializeNodeFromCommandsResultSuccess,
     SetLockNodeStateResultFailure,
@@ -96,8 +122,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.variable_events import (
-    GetVariablesRequest,
-    GetVariablesResultSuccess,
+    ListVariablesRequest,
+    ListVariablesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -112,7 +138,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import (
     EventSuppressionContext,
     EventTranslationContext,
@@ -122,7 +147,8 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+    from griptape_nodes.common.directed_graph import DirectedGraph
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 logger = logging.getLogger("griptape_nodes")
@@ -130,6 +156,10 @@ logger = logging.getLogger("griptape_nodes")
 # Tracks the name of the node currently being executed in this async context.
 # Each asyncio task gets its own copy, so parallel node execution is safe.
 current_executing_node_name: ContextVar[str | None] = ContextVar("current_executing_node_name", default=None)
+
+# The execution_id of the node run in progress in this async context, sent as parent_execution_id
+# on the node events of every run nested inside it.
+current_node_execution_id: ContextVar[str | None] = ContextVar("current_node_execution_id", default=None)
 
 
 class IterationControlAction(StrEnum):
@@ -140,7 +170,52 @@ class IterationControlAction(StrEnum):
     BREAK = "break"  # Break out of loop immediately
 
 
+@dataclass(frozen=True)
+class IterationFailure:
+    """One loop iteration that did not finish, with the reason it gave.
+
+    ``iteration_index`` is zero-based to match the executor's internal indexing;
+    everything shown to an artist adds one, because a loop's first pass is
+    iteration 1 to the person who built it.
+    """
+
+    iteration_index: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class IterationOutcome:
+    """What one parallel loop iteration did, as reported back by its task.
+
+    A bool would be enough to route the iteration, but not enough to explain it: the reason a
+    parallel iteration failed is only available inside the task that ran it, so the verdict and
+    the reason have to travel together or the reason is lost.
+    """
+
+    iteration_index: int
+    succeeded: bool
+    detail: str
+
+
+# How many distinct failure reasons a loop error message names before deferring to the log.
+MAX_REPORTED_ITERATION_FAILURES = 5
+
+# How many individual iteration numbers to name before switching to "(+N more)". Only reached when
+# the failed iterations are not a contiguous run, which is already summarised as "first-last".
+MAX_ENUMERATED_ITERATION_NUMBERS = 6
+
+# Results the engine produces while rebuilding a loop body into a transient flow. They describe
+# node copies the artist never placed, in a flow that is deleted before the run ends, so an editor
+# that hears about them asks the engine for a flow that no longer exists and reports an error.
+#
+# CreateNodeResultSuccess/Failure are here because node_manager.on_deserialize_node_from_commands
+# dispatches a nested CreateNodeRequest whose result names the transient flow as the node's parent
+# -- the specific leak behind the "no Flow with that name exists" toast on every loop run.
+# _silence_packaged_node_creation_broadcasts covers the same leak at the source; this set is the
+# backstop for any future creation path that escapes it.
 LOOP_EVENTS_TO_SUPPRESS = {
+    CreateNodeResultSuccess,
+    CreateNodeResultFailure,
     CreateFlowResultSuccess,
     CreateFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
@@ -155,8 +230,20 @@ LOOP_EVENTS_TO_SUPPRESS = {
     SetLockNodeStateResultFailure,
     DeserializeFlowFromCommandsResultSuccess,
     DeserializeFlowFromCommandsResultFailure,
+    # Everything else the bookkeeping dispatches (connection listings, parameter additions, deletes), by
+    # base class: should_suppress_event matches by isinstance.
+    ResultPayload,
+    # Element events of the packaged copies. These cannot be translated to the real node: the editor
+    # matches elements by id, and a copy's ids are its own.
+    AlterElementEvent,
+    RemoveElementEvent,
 }
 
+# Execution events from a parallel loop's iteration flows. The editor has no node by those names.
+# Don't use in the sequential path: it relies on EventTranslationContext to highlight the real node.
+# Execution-event listeners hear every parallel iteration either way. NodeStartProcessEvent and
+# NodeFinishProcessEvent are not here: the loop body scope reports them under canvas names (#5950).
+# Only ExecutionPayload members belong here; request results go in LOOP_EVENTS_TO_SUPPRESS.
 EXECUTION_EVENTS_TO_SUPPRESS = {
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -167,16 +254,12 @@ EXECUTION_EVENTS_TO_SUPPRESS = {
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
     NodeUnresolvedEvent,
-    NodeStartProcessEvent,
-    NodeFinishProcessEvent,
     InvolvedNodesEvent,
     GriptapeEvent,
     PublishWorkflowProgressEvent,
     AgentStreamEvent,
     AlterElementEvent,
     RemoveElementEvent,
-    StartLocalSubflowResultSuccess,
-    StartLocalSubflowResultFailure,
     ProgressEvent,
 }
 
@@ -213,12 +296,32 @@ class LoopBodyNodes(NamedTuple):
     node_group_name: str | None
 
 
-class NodeExecutor:
-    """Singleton executor that executes nodes dynamically."""
+class ExecuteNodeFailedError(RuntimeError):
+    """Raised by ``NodeExecutor`` when an ``ExecuteNodeRequest`` fails.
+
+    The message is the flattened text that ends up in ``NodeErrorEvent.error_message``, and
+    ``details`` is what goes in ``NodeErrorEvent.error``. The node's exception, if any, is chained
+    as ``__cause__``.
+    """
+
+    def __init__(self, message: str, *, details: NodeErrorDetails) -> None:
+        super().__init__(message)
+        self.details = details
+
+
+def node_error_details_for(node_name: str, exc: BaseException) -> NodeErrorDetails:
+    """Use the details built where the node failed, or build them from an engine exception that never became a result."""
+    if isinstance(exc, ExecuteNodeFailedError):
+        return exc.details
+    return build_node_error_details(node_name, exc)
+
+
+class NodeExecutor(EngineScoped):
+    """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
     def get_workflow_handler(self, library_name: str) -> LibraryManager.RegisteredEventHandler:
         """Get the PublishWorkflowRequest handler for a library, or None if not available."""
-        library_manager = GriptapeNodes.LibraryManager()
+        library_manager = self.engine.library_manager
         registered_handlers = library_manager.get_registered_event_handlers(PublishWorkflowRequest)
         if library_name in registered_handlers:
             return registered_handlers[library_name]
@@ -226,11 +329,43 @@ class NodeExecutor:
         raise ValueError(msg)
 
     async def execute(self, node: BaseNode) -> None:
-        """Execute the given node.
+        """Execute the given node, sending NodeStartProcessEvent before it runs and NodeFinishProcessEvent after.
+
+        The events use the synchronous put_event so the finish event still goes out from a cancelled
+        task. Nodes the engine added to a loop body run without either event.
 
         Args:
             node: The BaseNode to execute
-            library_name: The library that the execute method should come from.
+        """
+        loop_body_scope = current_loop_body_scope.get()
+        if loop_body_scope is not None and loop_body_scope.is_engine_node(node.name):
+            await self._run_node(node)
+            return
+
+        start_event = self._node_start_process_event(node, loop_body_scope)
+        self._put_execution_event(start_event)
+        outcome = NodeProcessOutcome.FAILED
+        failure: Exception | None = None
+        token = current_node_execution_id.set(start_event.execution_id)
+        try:
+            await self._run_node(node)
+            outcome = self._outcome_after_return(node)
+        except asyncio.CancelledError:
+            outcome = NodeProcessOutcome.CANCELLED
+            raise
+        except Exception as err:
+            # Broad by design: only recorded for the finish event, then re-raised unchanged.
+            failure = err
+            raise
+        finally:
+            current_node_execution_id.reset(token)
+            self._put_execution_event(self._node_finish_process_event(start_event, outcome=outcome, failure=failure))
+
+    async def _run_node(self, node: BaseNode) -> None:
+        """Run the given node by the path its type and execution environment call for.
+
+        Args:
+            node: The BaseNode to execute
         """
         token = current_executing_node_name.set(node.name)
         try:
@@ -248,13 +383,16 @@ class NodeExecutor:
 
             if isinstance(node, SubflowNodeGroup):
                 execution_type = node.get_parameter_value(node.execution_environment.name)
-                if execution_type == LOCAL_EXECUTION:
-                    # Just execute the node normally! This means we aren't doing any special packaging.
-                    await node.aprocess()
+                if self._runs_locally(execution_type):
+                    # Just execute the node normally! This means we aren't doing any special packaging,
+                    # so there is no subprocess state to clear. Isolated Execution in the worker runs here
+                    # too, inside the scope that sends each of the group's nodes to the worker.
+                    with self._local_execution_scope(execution_type, node.name):
+                        await node.aprocess()
                     return
                 # Clear execution state before subprocess execution starts
                 node.subflow_execution_component.clear_execution_state()
-                if execution_type == PRIVATE_EXECUTION:
+                if execution_type == ISOLATED_EXECUTION:
                     # Package the flow and run it in a subprocess.
                     await self._execute_private_workflow(node)
                     return
@@ -267,21 +405,30 @@ class NodeExecutor:
                 await self.handle_loop_execution(node)
                 return
 
+            # Resolved here because only this process has workflow context to resolve it FROM;
+            # a worker would answer from an empty context and silently degrade the paths its node
+            # writes to. Harmless on the local route, where these are this process's own values.
+            workflow_context = self.engine.project_manager.workflow_context_for_dispatch()
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
-            result = await GriptapeNodes.ahandle_request(
+            result = await self.engine.ahandle_request(
                 ExecuteNodeRequest(
                     node_name=node.name,
-                    parameter_values=dict(node.parameter_values),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
                     variables=self._resolve_variables_for_node(node.name),
+                    local_object_source=node.local_object_source,
+                    orchestrator_workflow_id=workflow_context.workflow_id,
+                    workflow_name=workflow_context.name,
+                    workflow_file_path=workflow_context.file_path,
+                    workflow_working_directory=workflow_context.working_directory,
+                    # The failure is raised below and reported by whoever started the run.
+                    failure_log_level=logging.DEBUG,
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
                 exc = getattr(result, "exception", None)
-                msg = self._format_node_failure_message(node.name, result, exc)
-                raise RuntimeError(msg) from exc  # noqa: TRY004
+                raise self._execute_node_failed_error(node.name, result, exc) from exc
             # Copy outputs back onto the in-memory node. Write directly into
             # parameter_output_values (not through set_parameter_value, which
             # targets parameter_values and re-fires before/after_value_set and
@@ -296,27 +443,103 @@ class NodeExecutor:
                 node.parameter_output_values[name] = value
         finally:
             current_executing_node_name.reset(token)
+            # A connection torn down while this node was running left its input value in place so the
+            # node could finish on it. Now that it has, drop it.
+            node.reset_deferred_input_values()
+
+    def _node_start_process_event(self, node: BaseNode, loop_body_scope: LoopBodyScope | None) -> NodeStartProcessEvent:
+        """Describe the node about to run as the artist placed it, with a fresh execution_id.
+
+        Everything is captured here, before the run, so the finish event can describe a node that
+        was deleted while it ran.
+        """
+        canvas_node_name = node.name
+        if loop_body_scope is not None:
+            scoped_node_name = loop_body_scope.canvas_name_for(node.name)
+            if scoped_node_name is not None:
+                canvas_node_name = scoped_node_name
+        return NodeStartProcessEvent(
+            node_name=canvas_node_name,
+            node_type=node.__class__.__name__,
+            specific_library_name=node.metadata.get("library"),
+            flow_name=self._parent_flow_name(canvas_node_name),
+            execution_id=uuid.uuid4().hex,
+            parent_execution_id=current_node_execution_id.get(),
+        )
+
+    def _node_finish_process_event(
+        self,
+        start_event: NodeStartProcessEvent,
+        *,
+        outcome: NodeProcessOutcome,
+        failure: Exception | None,
+    ) -> NodeFinishProcessEvent:
+        """Describe how the run that start_event announced ended."""
+        error_message = None
+        error = None
+        if failure is not None:
+            error_message = str(failure)
+            error = node_error_details_for(start_event.node_name, failure)
+        return NodeFinishProcessEvent(
+            node_name=start_event.node_name,
+            node_type=start_event.node_type,
+            specific_library_name=start_event.specific_library_name,
+            flow_name=start_event.flow_name,
+            execution_id=start_event.execution_id,
+            parent_execution_id=start_event.parent_execution_id,
+            outcome=outcome,
+            error_message=error_message,
+            error=error,
+        )
+
+    def _parent_flow_name(self, node_name: str) -> str | None:
+        """The flow the node is in, or None when no node by that name exists."""
+        try:
+            return self.engine.node_manager.get_node_parent_flow_by_name(node_name)
+        except KeyError:
+            return None
+
+    def _put_execution_event(self, payload: ExecutionPayload) -> None:
+        self.engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
 
     @staticmethod
-    def _resolve_variables_for_node(node_name: str) -> dict[str, str | int]:
+    def _outcome_after_return(node: BaseNode) -> NodeProcessOutcome:
+        """A node that returned after a cancel was requested stopped early on purpose: it was cancelled."""
+        if node.is_cancellation_requested:
+            return NodeProcessOutcome.CANCELLED
+        return NodeProcessOutcome.SUCCEEDED
+
+    def _execute_node_failed_error(self, node_name: str, result: Any, exc: Exception | None) -> ExecuteNodeFailedError:
+        message = self._format_node_failure_message(node_name, result, exc)
+        details = None
+        if isinstance(result, ExecuteNodeResultFailure):
+            details = result.error
+        if details is None:
+            # No node-built details means the engine wrote result_details, so its words are kept.
+            result_details = str(getattr(result, "result_details", result))
+            details = build_engine_error_details(node_name, result_details, exc)
+        return ExecuteNodeFailedError(message, details=details)
+
+    def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.
 
         Workers run transient nodes that are never added to ObjectManager, so the
         lazy fetch inside VariableResolver.get_variables_if_enabled fails with
         KeyError. Pre-seeding here lets the worker skip that path entirely.
         """
-        if not VariableResolver.is_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled(self.engine):
             return {}
         try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(node_name)
+            flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
         except KeyError:
             return {}
-        var_result = GriptapeNodes.handle_request(
-            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+        var_result = self.engine.handle_request(
+            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
-        if not isinstance(var_result, GetVariablesResultSuccess):
+        if not isinstance(var_result, ListVariablesResultSuccess):
+            logger.debug("Variable substitution skipped for node %s: %s", node_name, var_result.result_details)
             return {}
-        return VariableResolver._filter_for_substitution(var_result.variables)
+        return VariableResolver._filter_for_substitution({v.name: v.value for v in var_result.variables})
 
     @staticmethod
     def _format_node_failure_message(node_name: str, result: Any, exc: BaseException | None) -> str:
@@ -332,6 +555,13 @@ class NodeExecutor:
         ``original_traceback`` here is what actually puts the worker
         frames in front of the user.
         """
+        # A node that declined to run did not fail while running, and saying so sends the reader looking
+        # for a crash that never happened. Matched on the type rather than on the attribute's presence:
+        # `result` is typed `Any` here, and anything at all answers a `getattr`.
+        if isinstance(result, ExecuteNodeResultFailure) and result.validation_exceptions:
+            reasons = "; ".join(str(exception) for exception in result.validation_exceptions)
+            return f"Node '{node_name}' did not run because it failed validation: {reasons}"
+
         type_prefix = ""
         tb_suffix = ""
         if isinstance(exc, ForwardedException):
@@ -342,6 +572,128 @@ class NodeExecutor:
         return (
             f"Node '{node_name}' execution failed: {type_prefix}{getattr(result, 'result_details', result)}{tb_suffix}"
         )
+
+    @staticmethod
+    def _format_loop_failure_message(
+        loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]
+    ) -> str:
+        """Compose the RuntimeError message for a loop that lost iterations.
+
+        This lands on the artist's node via the execution machine, so it leads with what was
+        attempted and how much was lost, then names the iterations and their reasons.
+        """
+        summary = (
+            f"Attempted to run all {total_iterations} iterations of loop '{loop_name}'. "
+            f"Failed because {len(iteration_failures)} of them did not finish."
+        )
+        detail_lines = NodeExecutor._format_iteration_failure_lines(
+            iteration_failures, total_iterations=total_iterations
+        )
+        if not detail_lines:
+            return summary
+        return "\n".join([summary, *detail_lines])
+
+    @staticmethod
+    def _format_iteration_failure_lines(
+        iteration_failures: list[IterationFailure],
+        *,
+        total_iterations: int | None = None,
+        max_lines: int = MAX_REPORTED_ITERATION_FAILURES,
+    ) -> list[str]:
+        """Render one indented line per distinct failure reason.
+
+        Iterations that failed for the same reason share a line: the common case is every
+        iteration failing identically, and repeating one sentence dozens of times buries it.
+        At most ``max_lines`` reasons are rendered so a long loop cannot produce an unreadable
+        wall of text; the engine log has already recorded every iteration individually, so the
+        tail line points there.
+
+        ``total_iterations`` is optional only because the parallel path logs these lines without a
+        summary above them; pass it whenever it is known so a wholly-failed loop can say so.
+        """
+        if not iteration_failures:
+            return []
+
+        iterations_by_detail: dict[str, list[int]] = {}
+        for iteration_failure in iteration_failures:
+            iterations_by_detail.setdefault(iteration_failure.detail, []).append(iteration_failure.iteration_index + 1)
+
+        reported = list(iterations_by_detail.items())[:max_lines]
+        unreported = list(iterations_by_detail.items())[max_lines:]
+
+        lines = []
+        for detail, iteration_numbers in reported:
+            label = NodeExecutor._describe_failed_iterations(iteration_numbers, total_iterations)
+            lines.append(f"  {label}: {detail}")
+
+        if unreported:
+            # Count the iterations behind the omitted reasons, not just the reasons: the lines above
+            # are phrased in iterations, so a bare reason count reads as one and can undersell the
+            # tail by two orders of magnitude.
+            unreported_iterations = sum(len(iteration_numbers) for _, iteration_numbers in unreported)
+            lines.append(
+                f"  ... and {len(unreported)} more reason(s) affecting {unreported_iterations} iteration(s). "
+                f"See the engine log for every iteration."
+            )
+        return lines
+
+    @staticmethod
+    def _describe_failed_iterations(iteration_numbers: list[int], total_iterations: int | None) -> str:
+        """Name a group of failed iterations in a handful of characters, however many there are.
+
+        Capping the number of *reasons* is not enough on its own: a 500-iteration loop that fails
+        identically every time collapses to a single line, and enumerating all 500 numbers pushes
+        the reason -- the part worth reading -- kilobytes to the right.
+        """
+        sorted_numbers = sorted(iteration_numbers)
+        count = len(sorted_numbers)
+
+        # Naming the single iteration comes first: "Every iteration" is only more informative than
+        # a number when there is more than one, and a one-item loop satisfies both tests.
+        if count == 1:
+            return f"Iteration {sorted_numbers[0]}"
+        if total_iterations is not None and count >= total_iterations:
+            return "Every iteration"
+
+        spans_a_contiguous_run = sorted_numbers[-1] - sorted_numbers[0] == count - 1
+        if spans_a_contiguous_run:
+            return f"Iterations {sorted_numbers[0]}-{sorted_numbers[-1]}"
+        if count <= MAX_ENUMERATED_ITERATION_NUMBERS:
+            return f"Iterations {', '.join(str(number) for number in sorted_numbers)}"
+
+        shown = ", ".join(str(number) for number in sorted_numbers[:MAX_ENUMERATED_ITERATION_NUMBERS])
+        return f"Iterations {shown} (+{count - MAX_ENUMERATED_ITERATION_NUMBERS} more)"
+
+    @staticmethod
+    def _silence_packaged_node_creation_broadcasts(
+        package_result: PackageNodesAsSerializedFlowResultSuccess,
+    ) -> None:
+        """Keep editors from ever hearing about the nodes inside a packaged loop body.
+
+        A loop body is rebuilt into a transient child flow on every run and torn down
+        afterwards. Each rebuild dispatches a nested CreateNodeRequest whose success result
+        names that transient flow, and an editor that receives it turns around and asks the
+        engine for the flow's details -- by which time the flow is gone, so the artist gets an
+        error toast naming a flow they never made. Marking the creation commands non-broadcast
+        keeps the rebuild entirely inside the engine: in-process callers still get the full
+        result, only the queued broadcast is skipped.
+
+        Call this at the boundary that deserializes in-process, not at the one that packages.
+        Generated workflow files are emitted by reflecting over each create command's non-default
+        fields (WorkflowCodeGenerator._generate_node_creation_code), so a command carrying
+        broadcast_result=False writes that transport detail into the saved artifact. Packaging runs
+        before the execution-environment branch, and the private and cloud-publisher branches hand
+        the very same serialized_flow_commands to SaveWorkflowFileFromSerializedFlowRequest -- so
+        silencing at packaging time reaches a file on disk, and on the publisher branch a file in a
+        library. The local deserialization sites are the only ones that both need the flag and never
+        save; they also already own the EventSuppressionContext window that backs this up, which
+        puts the two halves of the fix in one place.
+
+        The mutation is in place and permanent for the lifetime of the package_result, which is safe
+        here only because these callers do not save it.
+        """
+        for serialized_node in package_result.serialized_flow_commands.serialized_node_commands:
+            serialized_node.create_node_command.broadcast_result = False
 
     async def _execute_and_apply_workflow(
         self,
@@ -363,6 +715,24 @@ class NodeExecutor:
         my_subprocess_result = await self._execute_subprocess(workflow_path, file_name, node=subflow_node)
         parameter_output_values = self._extract_parameter_output_values(my_subprocess_result)
         self._apply_parameter_values_to_node(node, parameter_output_values, package_result)
+
+    def _runs_isolated_execution_in_worker(self, execution_type: str) -> bool:
+        """Whether an Isolated Execution run sends its nodes to the worker rather than starting a process."""
+        if execution_type != ISOLATED_EXECUTION:
+            return False
+        return is_beta_enabled(ISOLATED_EXECUTION_IN_WORKER, self.engine.config_manager)
+
+    def _runs_locally(self, execution_type: str) -> bool:
+        """Whether a run goes through the local path: Local Execution, or Isolated Execution in the worker."""
+        if execution_type == LOCAL_EXECUTION:
+            return True
+        return self._runs_isolated_execution_in_worker(execution_type)
+
+    def _local_execution_scope(self, execution_type: str, owner_name: str) -> AbstractContextManager[None]:
+        """The scope a local run executes in: for Isolated Execution, the one sending its nodes to the worker."""
+        if execution_type == ISOLATED_EXECUTION:
+            return isolated_execution_scope(owner_name)
+        return nullcontext()
 
     async def _execute_private_workflow(self, node: BaseNode) -> None:
         """Execute node in private subprocess environment.
@@ -425,7 +795,6 @@ class NodeExecutor:
         try:
             self.get_workflow_handler(library_name)
         except ValueError as e:
-            logger.error("Library execution failed for node '%s' via library '%s': %s", node.name, library_name, e)
             msg = f"Failed to execute node '{node.name}' via library '{library_name}': {e}"
             raise RuntimeError(msg) from e
 
@@ -559,7 +928,7 @@ class NodeExecutor:
             entry_control_parameter_name=None,
             node_group_name=node_group_name,
         )
-        package_result = GriptapeNodes.handle_request(request)
+        package_result = self.engine.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package node '{node.name}'. Error: {package_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -569,10 +938,9 @@ class NodeExecutor:
             file_name=file_name,
             serialized_flow_commands=package_result.serialized_flow_commands,
             workflow_shape=package_result.workflow_shape,
-            pickle_control_flow_result=True,
         )
 
-        workflow_result = await GriptapeNodes.ahandle_request(workflow_file_request)
+        workflow_result = await self.engine.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to Save Workflow File from Serialized Flow for node '{node.name}'. Error: {workflow_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -598,7 +966,7 @@ class NodeExecutor:
 
         subprocess_workflow_publisher = SubprocessWorkflowPublisher(on_event=on_event)
         published_filename = f"{Path(workflow_result.file_path).stem}_published"
-        published_workflow_filename = GriptapeNodes.ConfigManager().workspace_path / (published_filename + ".py")
+        published_workflow_filename = self.engine.config_manager.workspace_path / (published_filename + ".py")
 
         async with subprocess_workflow_publisher:
             await subprocess_workflow_publisher.arun(
@@ -606,7 +974,6 @@ class NodeExecutor:
                 workflow_path=workflow_result.file_path,
                 publisher_name=library_name,
                 published_workflow_file_name=published_filename,
-                pickle_control_flow_result=True,
             )
 
         if not await anyio.Path(published_workflow_filename).exists():
@@ -619,16 +986,14 @@ class NodeExecutor:
         self,
         published_workflow_filename: Path,
         file_name: str,
-        pickle_control_flow_result: bool = True,  # noqa: FBT001, FBT002
         flow_input: dict[str, Any] | None = None,
         node: SubflowNodeGroup | None = None,
-    ) -> dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]:
+    ) -> dict[str, dict[str, Any]]:
         """Execute the published workflow in a subprocess.
 
         Args:
             published_workflow_filename: Path to the workflow file to execute
             file_name: Name of the workflow for logging
-            pickle_control_flow_result: Whether to pickle control flow results (defaults to True)
             flow_input: Optional dictionary of parameter values to pass to the workflow's StartFlow node
             node: Optional SubflowNodeGroup to receive real-time event updates
 
@@ -648,27 +1013,15 @@ class NodeExecutor:
             workflow_path=str(published_workflow_filename),
             on_event=on_event,
         )
-        try:
-            async with subprocess_executor as executor:
-                await executor.arun(
-                    flow_input=flow_input or {},
-                    storage_backend=await self._get_storage_backend(),
-                    pickle_control_flow_result=pickle_control_flow_result,
-                )
-        except RuntimeError as e:
-            # Subprocess returned non-zero exit code
-            logger.error(
-                "Subprocess execution failed for workflow '%s' at path '%s'. Error: %s",
-                file_name,
-                published_workflow_filename,
-                e,
+        async with subprocess_executor as executor:
+            await executor.arun(
+                flow_input=flow_input or {},
+                storage_backend=await self._get_storage_backend(),
             )
-            raise
 
         my_subprocess_result = subprocess_executor.output
         if my_subprocess_result is None:
             msg = f"Subprocess completed but returned no output for workflow '{file_name}'"
-            logger.error(msg)
             raise ValueError(msg)
         return my_subprocess_result
 
@@ -737,7 +1090,7 @@ class NodeExecutor:
         all_nodes: set[str] = set()
         visited_deps: set[str] = set()
 
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         # Exclude the start node from packaging. And, we don't want their dependencies.
         nodes_in_control_flow.discard(start_node.name)
         for node_name in nodes_in_control_flow:
@@ -783,8 +1136,12 @@ class NodeExecutor:
         Returns:
             PackageNodesAsSerializedFlowResultSuccess if successful, None if empty loop body
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
+
+        # Data dependency collection skips RESOLVED nodes. A node fed by the start node's per-pass
+        # outputs is still RESOLVED from the previous run, and must be packaged to re-evaluate per pass.
+        connections.unresolve_future_nodes(start_node)
 
         # Collect all nodes in the forward control path from start to end
         nodes_in_control_flow = DagBuilder.collect_nodes_in_forward_control_path(start_node, end_node, connections)
@@ -805,12 +1162,11 @@ class NodeExecutor:
         entry_control_parameter_name = entry_node_parameter.entry_parameter
         # Determine library and node types based on execution_type
         library = None
-        if execution_type not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
+        if execution_type not in (LOCAL_EXECUTION, ISOLATED_EXECUTION):
             try:
                 library = LibraryRegistry.get_library(name=execution_type)
             except KeyError:
-                msg = "Could not find library '%s' for loop execution", execution_type
-                logger.error(msg)
+                msg = f"Could not find library '{execution_type}' for loop execution"
                 raise RuntimeError(msg)  # noqa: B904
 
             library_name = library.get_library_data().name
@@ -832,12 +1188,12 @@ class NodeExecutor:
             node_group_name=node_group_name,
         )
 
-        package_result = GriptapeNodes.handle_request(request)
+        package_result = self.engine.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package loop nodes for '{end_node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
-        logger.info(
+        logger.debug(
             "Successfully packaged %d nodes for loop execution from '%s' to '%s'",
             len(all_nodes),
             start_node.name,
@@ -847,14 +1203,16 @@ class NodeExecutor:
         # Mark all packaged nodes as RESOLVED to prevent them from executing in the outer flow.
         # This is critical for nested loops: when an inner loop's body is packaged, those nodes
         # exist in the outer flow but should not execute there - they only execute in the packaged iterations.
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         for node_name in all_nodes:
             node = node_manager.get_node_by_name(node_name)
             if node:
                 node.state = NodeResolutionState.RESOLVED
 
-        # Remove packaged nodes from global queue since they will be copied into loop iterations
-        self._remove_packaged_nodes_from_queue(all_nodes)
+        # Remove packaged nodes from global queue since they will be copied into loop iterations.
+        # end_node stays in the outer DAG and is where the real values land once copied back, so
+        # any outside consumer of a packaged node waits on end_node instead of losing the edge.
+        self._remove_packaged_nodes_from_queue(all_nodes, replacement_node_name=end_node.name)
 
         return package_result, execution_type
 
@@ -870,7 +1228,7 @@ class NodeExecutor:
             end_node: The BaseIterativeEndNode
         """
         total_iterations = start_node._get_total_iterations()
-        logger.info(
+        logger.debug(
             "No nodes found between '%s' and '%s'. Processing empty loop body.",
             start_node.name,
             end_node.name,
@@ -878,7 +1236,7 @@ class NodeExecutor:
 
         # Check if there are direct data connections from start to end
         list_connections_request = ListConnectionsForNodeRequest(node_name=start_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
 
         connected_source_param = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -887,7 +1245,7 @@ class NodeExecutor:
                     connected_source_param = conn.source_parameter_name
                     break
 
-        logger.info(
+        logger.debug(
             "Processing %d iterations for empty loop from '%s' to '%s' (connected param: %s)",
             total_iterations,
             start_node.name,
@@ -918,18 +1276,19 @@ class NodeExecutor:
     def _get_iteration_control_action(
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
     ) -> IterationControlAction:
         """Determine which control action was taken during an iteration.
 
-        Checks if any nodes whose control outputs connect to the loop end node's
-        skip_iteration, break_loop, or loop_complete inputs have fired. Works for both
-        the legacy BaseIterativeEndNode path and the BaseIterativeNodeGroup path —
-        both expose identically-named control inputs and the detection is purely
-        connection/name based.
+        Checks whether control left the body through a node output connected to the loop end
+        node's skip_iteration, break_loop, or loop_complete inputs. Works for both the legacy
+        BaseIterativeEndNode path and the BaseIterativeNodeGroup path — both expose
+        identically-named control inputs and the detection is purely connection/name based.
 
         Args:
             end_loop_node: The loop end node (BaseIterativeEndNode or BaseIterativeNodeGroup)
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
@@ -937,117 +1296,133 @@ class NodeExecutor:
         """
         # Get incoming connections to the end_loop_node (the iterative group)
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for node %s", end_loop_node.name)
             return IterationControlAction.ADD
 
         incoming_connections = list_connections_result.incoming_connections
 
-        # Check each control parameter to see if its source node has fired
-        # Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
-        break_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
-        skip_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
-        loop_complete_source = self._find_source_for_control_param(
+        source_that_reached_end = self._get_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
+        # Check each control parameter to see if one of its sources is the exit the body took.
+        # Several body paths can converge on one input, so every source is checked, not just the
+        # first wire drawn. Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
+        break_sources = self._find_sources_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
+        skip_sources = self._find_sources_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
+        loop_complete_sources = self._find_sources_for_control_param(
             incoming_connections, IterationControlParam.LOOP_COMPLETE
         )
 
         # Check if break was triggered
-        if self._check_control_source_fired(break_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in break_sources):
             return IterationControlAction.BREAK
 
         # Check if skip was triggered
-        if self._check_control_source_fired(skip_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in skip_sources):
             return IterationControlAction.SKIP
 
         # Check if loop_complete was triggered
-        if self._check_control_source_fired(loop_complete_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in loop_complete_sources):
             return IterationControlAction.ADD
 
         # If none of the control parameters were triggered, default to ADD
         # This preserves backward compatibility for workflows without explicit loop_complete connections
         return IterationControlAction.ADD
 
-    def _check_control_source_fired(
+    def _get_control_source_that_reached_end(
         self,
-        source: tuple[str, str] | None,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
-    ) -> bool:
-        """Check if a control source node has fired its control output.
+    ) -> OriginalNodeParameter | None:
+        """Return the body node and control output that handed control to the packaged End node.
+
+        The End node records the control input it was entered on, and the packager gives it one
+        control input per body control output that leaves the group, so that input names exactly
+        which exit the body took. A body node's own next control output cannot answer this: a
+        node on a branch that was not taken can still run, pulled in to supply the End node's
+        data, and it reports the output it would follow even though control never reached it.
 
         Args:
-            source: Tuple of (source_node_name, source_parameter_name) or None
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
-            True if the source node's next control output matches the specified parameter
+            The original node and control output that reached the End node, or None if control
+            never reached it
+        """
+        end_node = self._get_packaged_end_node(end_node_mapping, node_name_mappings)
+        if end_node is None:
+            return None
+
+        entry_parameter = end_node._entry_control_parameter
+        if entry_parameter is None:
+            return None
+
+        return end_node_mapping.parameter_mappings.get(entry_parameter.name)
+
+    def _forget_control_source_that_reached_end(
+        self,
+        end_node_mapping: PackagedNodeParameterMapping,
+        node_name_mappings: dict[str, str],
+    ) -> None:
+        """Clear the packaged End node's recorded entry before a pass runs.
+
+        Every pass reuses the same End node, and a pass whose control never reaches it leaves the
+        previous pass's entry in place, which would read as this pass taking the same exit.
+        """
+        end_node = self._get_packaged_end_node(end_node_mapping, node_name_mappings)
+        if end_node is None:
+            return
+
+        end_node.set_entry_control_parameter(None)
+
+    def _get_packaged_end_node(
+        self,
+        end_node_mapping: PackagedNodeParameterMapping,
+        node_name_mappings: dict[str, str],
+    ) -> BaseNode | None:
+        deserialized_end_node_name = node_name_mappings.get(end_node_mapping.node_name)
+        if deserialized_end_node_name is None:
+            logger.debug("No deserialized name for packaged End node '%s'", end_node_mapping.node_name)
+            return None
+
+        try:
+            return self.engine.node_manager.get_node_by_name(deserialized_end_node_name)
+        except ValueError:
+            logger.debug("Packaged End node '%s' not found", deserialized_end_node_name)
+            return None
+
+    def _check_control_source_fired(
+        self,
+        source: tuple[str, str] | None,
+        source_that_reached_end: OriginalNodeParameter | None,
+    ) -> bool:
+        """Check if control left the body through a given control output.
+
+        Args:
+            source: Tuple of (source_node_name, source_parameter_name) or None
+            source_that_reached_end: The node and control output that reached the packaged End
+                node, from _get_control_source_that_reached_end
+
+        Returns:
+            True if source is the control output that reached the End node
         """
         if source is None:
             return False
 
-        source_node_name, source_param_name = source
-        deserialized_source_name = node_name_mappings.get(source_node_name)
-        if deserialized_source_name is None:
-            logger.debug("_check_control_source_fired: no deserialized name for '%s'", source_node_name)
+        if source_that_reached_end is None:
             return False
 
-        node_manager = GriptapeNodes.NodeManager()
-        try:
-            deserialized_source_node = node_manager.get_node_by_name(deserialized_source_name)
-        except ValueError:
-            logger.debug("_check_control_source_fired: node '%s' not found", deserialized_source_name)
-            return False
+        return tuple(source_that_reached_end) == source
 
-        if deserialized_source_node is None:
-            return False
-
-        # Check if the node's next control output matches the source parameter
-        next_control_output = deserialized_source_node.get_next_control_output()
-        if next_control_output is None:
-            logger.debug(
-                "_check_control_source_fired: node '%s' next_control_output is None (state=%s, output_values=%s)",
-                deserialized_source_name,
-                deserialized_source_node.state,
-                deserialized_source_node.parameter_output_values,
-            )
-            return False
-
-        # Get the parameter object to compare
-        source_param = deserialized_source_node.get_parameter_by_name(source_param_name)
-        result = next_control_output == source_param
-        logger.debug(
-            "_check_control_source_fired: node '%s' next_control_output='%s' vs source_param='%s' -> %s",
-            deserialized_source_name,
-            next_control_output.name if next_control_output else None,
-            source_param.name if source_param else None,
-            result,
-        )
-        return result
-
-    def _find_source_for_control_param(
-        self,
-        incoming_connections: list,
-        control_param_name: str,
-    ) -> tuple[str, str] | None:
-        """Find the first source node and parameter that connects to a control parameter.
-
-        Args:
-            incoming_connections: List of incoming connections to the group
-            control_param_name: Name of the control parameter to find (e.g., "break_loop")
-
-        Returns:
-            Tuple of (source_node_name, source_parameter_name), or None if not found
-        """
-        sources = self._find_sources_for_control_param(incoming_connections, control_param_name)
-        return sources[0] if sources else None
-
-    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901, PLR0912
+    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
         parameter_values_per_iteration: dict[int, dict[str, Any]],
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
-    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[int]]:
+    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[IterationFailure]]:
         """Execute loop iterations sequentially by running one flow instance N times.
 
         Args:
@@ -1063,57 +1438,71 @@ class NodeExecutor:
             - last_iteration_values: Dict mapping parameter names -> values from last iteration
             - skipped_count: Number of iterations that were skipped via skip control signal
             - break_occurred: True if the loop exited early due to a break signal
-            - failed_iterations: List of iteration indices that raised a subflow error
+            - iteration_failures: One IterationFailure per iteration that raised a subflow error
         """
-        # Deserialize flow once
-        context_manager = GriptapeNodes.ContextManager()
-        event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
-            deserialize_request = DeserializeFlowFromCommandsRequest(
-                serialized_flow_commands=package_result.serialized_flow_commands
-            )
-            deserialize_result = GriptapeNodes.handle_request(deserialize_request)
-            if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
-                msg = f"Failed to deserialize flow for sequential loop. Error: {deserialize_result.result_details}"
-                raise TypeError(msg)
-
-            flow_name = deserialize_result.flow_name
-            node_name_mappings = deserialize_result.node_name_mappings
-
-            # Pop the deserialized flow from context stack
-            if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
-                context_manager.pop_flow()
-
-        logger.info("Successfully deserialized flow for sequential execution: %s", flow_name)
-        # Get node mappings
-        start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
-        start_node_name = start_node_mapping.node_name
-        packaged_start_node_name = node_name_mappings.get(start_node_name)
-
-        iteration_results: dict[int, Any] = {}
-        successful_iterations: list[int] = []
-        failed_iterations: list[int] = []
-        skipped_count = 0
-        break_occurred = False
-
-        # Build reverse mapping: packaged_name → original_name for event translation
-        reverse_node_mapping = {
-            packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
-        }
-
+        # Deserialize the loop body once and reuse it for every iteration.
+        # Everything from deserialization onward is inside the try so the finally deletes the
+        # iteration flow on ALL exit paths (success, exception, cancellation), closing the window
+        # where a raise after creation but before execution would leak the flow. deserialized_flows
+        # is populated the instant the flow is created. (The flow is also tagged transient at
+        # packaging time, so a mid-run save cannot bake it into the workflow regardless.)
+        context_manager = self.engine.context_manager
+        event_manager = self.engine.event_manager
+        deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
+        self._silence_packaged_node_creation_broadcasts(package_result)
         try:
+            with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+                deserialize_request = DeserializeFlowFromCommandsRequest(
+                    serialized_flow_commands=package_result.serialized_flow_commands
+                )
+                deserialize_result = self.engine.handle_request(deserialize_request)
+                if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
+                    msg = f"Failed to deserialize flow for sequential loop. Error: {deserialize_result.result_details}"
+                    raise TypeError(msg)
+
+                flow_name = deserialize_result.flow_name
+                node_name_mappings = deserialize_result.node_name_mappings
+                # Track for cleanup as soon as the flow exists (iteration index 0 is a placeholder;
+                # the single flow is reused across all iterations).
+                deserialized_flows.append((0, flow_name, node_name_mappings))
+
+                # Pop the deserialized flow from context stack
+                if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
+                    context_manager.pop_flow()
+
+            logger.debug("Successfully deserialized flow for sequential execution: %s", flow_name)
+            # Get node mappings
+            start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
+            start_node_name = start_node_mapping.node_name
+            packaged_start_node_name = node_name_mappings.get(start_node_name)
+            end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
+
+            iteration_results: dict[int, Any] = {}
+            successful_iterations: list[int] = []
+            iteration_failures: list[IterationFailure] = []
+            skipped_count = 0
+            break_occurred = False
+
+            # Build reverse mapping: packaged_name → original_name for event translation
+            reverse_node_mapping = {
+                packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
+            }
+            loop_body_scope = self._loop_body_scope(package_result, node_name_mappings)
+
             if packaged_start_node_name is None:
                 msg = f"Could not find deserialized Start node (original: '{start_node_name}') for sequential loop"
                 raise TypeError(msg)
 
             # Execute iterations one at a time
             for iteration_index in range(total_iterations):
-                logger.info(
+                logger.debug(
                     "Starting sequential iteration %d/%d for loop ending at '%s'",
                     iteration_index,
                     total_iterations,
                     end_loop_node.name,
                 )
+                self._forget_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
                 # Set input values for this iteration
                 parameter_values = parameter_values_per_iteration[iteration_index]
 
@@ -1123,7 +1512,7 @@ class NodeExecutor:
                         parameter_name=startflow_param_name,
                         value=value_to_set,
                     )
-                    set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
+                    set_value_result = await self.engine.ahandle_request(set_value_request)
                     if not isinstance(set_value_result, SetParameterValueResultSuccess):
                         logger.warning(
                             "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -1135,19 +1524,22 @@ class NodeExecutor:
 
                 # Execute this iteration with event translation instead of suppression
                 # This allows the UI to show the original nodes highlighting during loop execution
-                logger.info(
+                logger.debug(
                     "Executing subflow for iteration %d - flow: '%s', start_node: '%s'",
                     iteration_index,
                     flow_name,
                     packaged_start_node_name,
                 )
-                with EventTranslationContext(event_manager, reverse_node_mapping):
+                with (
+                    EventTranslationContext(event_manager, reverse_node_mapping),
+                    entered_loop_body_scope(loop_body_scope),
+                    EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+                ):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=packaged_start_node_name,
-                        pickle_control_flow_result=False,
                     )
-                    start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
+                    start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
                 if not isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
                     logger.warning(
@@ -1158,15 +1550,20 @@ class NodeExecutor:
                     )
                     # Don't immediately store None - try to extract results first in case there are partial results
                     # (e.g., nested loop that had some failures but still produced output)
-                    failed_iterations.append(iteration_index)
+                    iteration_failures.append(
+                        IterationFailure(
+                            iteration_index=iteration_index,
+                            detail=str(start_subflow_result.result_details),
+                        )
+                    )
                 else:
                     successful_iterations.append(iteration_index)
 
                 # Check control action to handle skip/break for both group and legacy end nodes
-                control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
+                control_action = self._get_iteration_control_action(end_loop_node, end_node_mapping, node_name_mappings)
 
                 if control_action == IterationControlAction.SKIP:
-                    logger.info(
+                    logger.debug(
                         "Skip detected at iteration %d/%d - skipping result collection",
                         iteration_index + 1,
                         total_iterations,
@@ -1175,17 +1572,17 @@ class NodeExecutor:
                     continue
 
                 if control_action == IterationControlAction.BREAK:
-                    logger.info(
+                    logger.debug(
                         "Break detected at iteration %d/%d - collecting result then stopping",
                         iteration_index + 1,
                         total_iterations,
                     )
                     # Extract result from this iteration before breaking
                     # (the work was done, so we should collect the result)
-                    deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
+                    single_flow_ref = [(iteration_index, flow_name, node_name_mappings)]
                     single_iteration_results = self.get_parameter_values_from_iterations(
                         end_loop_node=end_loop_node,
-                        deserialized_flows=deserialized_flows,
+                        deserialized_flows=single_flow_ref,
                         package_flow_result_success=package_result,
                     )
                     iteration_results.update(single_iteration_results)
@@ -1195,15 +1592,15 @@ class NodeExecutor:
                 # control_action == ADD: fall through to extract result
 
                 # Extract result from this iteration
-                deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
+                single_flow_ref = [(iteration_index, flow_name, node_name_mappings)]
                 single_iteration_results = self.get_parameter_values_from_iterations(
                     end_loop_node=end_loop_node,
-                    deserialized_flows=deserialized_flows,
+                    deserialized_flows=single_flow_ref,
                     package_flow_result_success=package_result,
                 )
                 iteration_results.update(single_iteration_results)
 
-                logger.info("Completed sequential iteration %d/%d", iteration_index + 1, total_iterations)
+                logger.debug("Completed sequential iteration %d/%d", iteration_index + 1, total_iterations)
 
                 if isinstance(end_loop_node, BaseIterativeEndNode) and end_loop_node.start_node is not None:
                     end_loop_node.start_node.advance_sequential_progress(iteration_index)
@@ -1213,9 +1610,9 @@ class NodeExecutor:
 
             # Extract last iteration values from the last successful iteration
             last_successful_iteration = successful_iterations[-1] if successful_iterations else 0
-            deserialized_flows = [(last_successful_iteration, flow_name, node_name_mappings)]
+            single_flow_ref = [(last_successful_iteration, flow_name, node_name_mappings)]
             last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
-                deserialized_flows=deserialized_flows,
+                deserialized_flows=single_flow_ref,
                 package_result=package_result,
                 total_iterations=len(successful_iterations),
             )
@@ -1226,20 +1623,12 @@ class NodeExecutor:
                 last_iteration_values,
                 skipped_count,
                 break_occurred,
-                failed_iterations,
+                iteration_failures,
             )
 
         finally:
-            # Cleanup - delete the flow
-            with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
-                delete_request = DeleteFlowRequest(flow_name=flow_name)
-                delete_result = await GriptapeNodes.ahandle_request(delete_request)
-                if not isinstance(delete_result, DeleteFlowResultSuccess):
-                    logger.warning(
-                        "Failed to delete sequential loop flow '%s': %s",
-                        flow_name,
-                        delete_result.result_details,
-                    )
+            # Cleanup - delete the iteration flow on ALL exit paths (success, exception, cancel).
+            await self._delete_iteration_flows(deserialized_flows, event_manager)
 
     async def _handle_sequential_loop_execution(  # noqa: C901
         self, start_node: BaseIterativeStartNode, end_node: BaseIterativeEndNode
@@ -1251,7 +1640,7 @@ class NodeExecutor:
             end_node: The BaseIterativeEndNode marking the end of the loop
         """
         total_iterations = start_node._get_total_iterations()
-        logger.info(
+        logger.debug(
             "Executing loop sequentially from '%s' to '%s' for %d iterations",
             start_node.name,
             end_node.name,
@@ -1268,7 +1657,7 @@ class NodeExecutor:
 
         # Handle empty loop body (no nodes between start and end)
         if package_result_and_execution is None:
-            logger.info("Empty loop body - results already set by _package_loop_body")
+            logger.debug("Empty loop body - results already set by _package_loop_body")
             return
         package_result, execution_type = package_result_and_execution
 
@@ -1290,22 +1679,23 @@ class NodeExecutor:
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
-        failed_iterations: list[int] = []
-        if execution_type == LOCAL_EXECUTION:
-            (
-                iteration_results,
-                successful_iterations,
-                last_iteration_values,
-                _skipped_count,
-                break_occurred,
-                failed_iterations,
-            ) = await self._execute_loop_iterations_sequentially(
-                package_result=package_result,
-                total_iterations=total_iterations,
-                parameter_values_per_iteration=parameter_values_per_iteration,
-                end_loop_node=end_node,
-            )
-        elif execution_type == PRIVATE_EXECUTION:
+        iteration_failures: list[IterationFailure] = []
+        if self._runs_locally(execution_type):
+            with self._local_execution_scope(execution_type, end_node.name):
+                (
+                    iteration_results,
+                    successful_iterations,
+                    last_iteration_values,
+                    _skipped_count,
+                    break_occurred,
+                    iteration_failures,
+                ) = await self._execute_loop_iterations_sequentially(
+                    package_result=package_result,
+                    total_iterations=total_iterations,
+                    parameter_values_per_iteration=parameter_values_per_iteration,
+                    end_loop_node=end_node,
+                )
+        elif execution_type == ISOLATED_EXECUTION:
             (
                 iteration_results,
                 successful_iterations,
@@ -1331,17 +1721,23 @@ class NodeExecutor:
             )
         # A break legitimately stops the loop early — not a failure.
         if break_occurred:
-            logger.info(
+            logger.debug(
                 "Loop '%s' broke early at %d of %d iterations (break signal)",
                 end_node.name,
                 len(successful_iterations),
                 total_iterations,
             )
-        elif failed_iterations:
-            msg = f"Loop execution failed: {len(failed_iterations)} of {total_iterations} iterations failed"
+        # Only the local sequential path reports per-iteration failures; private and cloud loops
+        # leave this empty and fall through to the short-count branch below.
+        elif iteration_failures:
+            msg = self._format_loop_failure_message(
+                loop_name=end_node.name,
+                total_iterations=total_iterations,
+                iteration_failures=iteration_failures,
+            )
             raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
-            logger.info(
+            logger.debug(
                 "Loop execution stopped early at %d of %d iterations",
                 len(successful_iterations),
                 total_iterations,
@@ -1353,7 +1749,7 @@ class NodeExecutor:
             value = iteration_results[iteration_index]
             end_node._results_list.append(value)
 
-        logger.info(
+        logger.debug(
             "Loop '%s': Built results list with %d items from sequential iterations",
             end_node.name,
             len(end_node._results_list),
@@ -1361,16 +1757,16 @@ class NodeExecutor:
 
         # Output final results to the results parameter
         end_node._output_results_list()
-        logger.info("Loop '%s': Outputted final results list", end_node.name)
+        logger.debug("Loop '%s': Outputted final results list", end_node.name)
 
         # Apply last iteration values to the original packaged nodes
         self._apply_last_iteration_to_packaged_nodes(
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
-        logger.info("Loop '%s': Applied last iteration values to packaged nodes", end_node.name)
+        logger.debug("Loop '%s': Applied last iteration values to packaged nodes", end_node.name)
 
-        logger.info(
+        logger.debug(
             "Completed sequential loop execution from '%s' to '%s' with %d results",
             start_node.name,
             end_node.name,
@@ -1403,7 +1799,7 @@ class NodeExecutor:
                 for param_name, param_value in resolved_upstream_values.items():
                     if param_name not in parameter_values_per_iteration[iteration_index]:
                         parameter_values_per_iteration[iteration_index][param_name] = param_value
-            logger.info(
+            logger.debug(
                 "Added %d resolved upstream values to %d iterations",
                 len(resolved_upstream_values),
                 len(parameter_values_per_iteration),
@@ -1430,7 +1826,7 @@ class NodeExecutor:
 
         total_iterations = start_node._get_total_iterations()
         if total_iterations == 0:
-            logger.info("No iterations for empty loop from '%s' to '%s'", start_node.name, node.name)
+            logger.debug("No iterations for empty loop from '%s' to '%s'", start_node.name, node.name)
             return
 
         # Check if we should run in order (default is in order / True)
@@ -1446,7 +1842,7 @@ class NodeExecutor:
 
         # Handle empty loop body (no nodes between start and end)
         if package_result_and_execution_type is None:
-            logger.info("Empty loop body - results already set by _package_loop_body")
+            logger.debug("Empty loop body - results already set by _package_loop_body")
             return
         package_result, execution_type = package_result_and_execution_type
         # Get parameter values for each iteration
@@ -1455,18 +1851,19 @@ class NodeExecutor:
         )
 
         # Step 5: Execute all iterations based on execution environment
-        if execution_type == LOCAL_EXECUTION:
-            (
-                iteration_results,
-                successful_iterations,
-                last_iteration_values,
-            ) = await self._execute_loop_iterations_locally(
-                package_result=package_result,
-                total_iterations=total_iterations,
-                parameter_values_per_iteration=parameter_values_to_set_before_run,
-                end_loop_node=node,
-            )
-        elif execution_type == PRIVATE_EXECUTION:
+        if self._runs_locally(execution_type):
+            with self._local_execution_scope(execution_type, node.name):
+                (
+                    iteration_results,
+                    successful_iterations,
+                    last_iteration_values,
+                ) = await self._execute_loop_iterations_locally(
+                    package_result=package_result,
+                    total_iterations=total_iterations,
+                    parameter_values_per_iteration=parameter_values_to_set_before_run,
+                    end_loop_node=node,
+                )
+        elif execution_type == ISOLATED_EXECUTION:
             (
                 iteration_results,
                 successful_iterations,
@@ -1499,7 +1896,7 @@ class NodeExecutor:
                 total_iterations,
             )
 
-        logger.info(
+        logger.debug(
             "Completed execution of %d iterations for loop '%s' (%d successful, %d failed)",
             total_iterations,
             start_node.name,
@@ -1525,7 +1922,7 @@ class NodeExecutor:
             package_result=package_result,
         )
 
-        logger.info(
+        logger.debug(
             "Successfully aggregated %d results for loop '%s' to '%s'",
             len(iteration_results),
             start_node.name,
@@ -1572,6 +1969,7 @@ class NodeExecutor:
         iteration_startflow_params = self._get_while_iteration_param_mappings(
             node, start_node_mapping.parameter_mappings
         )
+        end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
 
         # Deserialize the flow once for sequential re-execution
         flow_name, node_name_mappings, packaged_start_node_name = self._deserialize_while_flow(
@@ -1586,17 +1984,19 @@ class NodeExecutor:
         condition_met = False
         last_iteration_values: dict[str, Any] = {}
         total_iterations = max_iterations + 1  # first iteration + re-iterations
-        event_manager = GriptapeNodes.EventManager()
+        event_manager = self.engine.event_manager
 
         try:
             condition_met = await self._run_while_loop_iterations(
                 node=node,
                 flow_name=flow_name,
                 node_name_mappings=node_name_mappings,
+                end_node_mapping=end_node_mapping,
                 packaged_start_node_name=packaged_start_node_name,
                 resolved_upstream_values=resolved_upstream_values,
                 iteration_startflow_params=iteration_startflow_params,
                 reverse_node_mapping=reverse_node_mapping,
+                loop_body_scope=self._loop_body_scope(package_result, node_name_mappings),
                 event_manager=event_manager,
                 max_iterations=max_iterations,
                 total_iterations=total_iterations,
@@ -1614,7 +2014,7 @@ class NodeExecutor:
             # Clean up the deserialized flow
             with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
                 delete_request = DeleteFlowRequest(flow_name=flow_name)
-                delete_result = GriptapeNodes.handle_request(delete_request)
+                delete_result = self.engine.handle_request(delete_request)
                 if isinstance(delete_result, DeleteFlowResultFailure):
                     logger.warning("Failed to clean up while group flow '%s': %s", flow_name, delete_result)
 
@@ -1652,13 +2052,14 @@ class NodeExecutor:
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
         """
-        context_manager = GriptapeNodes.ContextManager()
-        event_manager = GriptapeNodes.EventManager()
+        context_manager = self.engine.context_manager
+        event_manager = self.engine.event_manager
+        self._silence_packaged_node_creation_broadcasts(package_result)
         with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
             deserialize_request = DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=package_result.serialized_flow_commands
             )
-            deserialize_result = GriptapeNodes.handle_request(deserialize_request)
+            deserialize_result = self.engine.handle_request(deserialize_request)
             if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                 msg = f"Failed to deserialize flow for while group. Error: {deserialize_result.result_details}"
                 raise TypeError(msg)
@@ -1682,10 +2083,12 @@ class NodeExecutor:
         node: BaseWhileNodeGroup,
         flow_name: str,
         node_name_mappings: dict[str, str],
+        end_node_mapping: PackagedNodeParameterMapping,
         packaged_start_node_name: str,
         resolved_upstream_values: dict[str, Any],
         iteration_startflow_params: list[str],
         reverse_node_mapping: dict[str, str],
+        loop_body_scope: LoopBodyScope,
         event_manager: Any,
         max_iterations: int,
         total_iterations: int,
@@ -1707,6 +2110,8 @@ class NodeExecutor:
             if iteration > 0:
                 node._before_loop_iteration(iteration, flow_name)
 
+            self._forget_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
             await self._set_while_iteration_parameters(
                 packaged_start_node_name=packaged_start_node_name,
                 resolved_upstream_values=resolved_upstream_values,
@@ -1715,13 +2120,16 @@ class NodeExecutor:
             )
 
             # Execute the subflow
-            with EventTranslationContext(event_manager, reverse_node_mapping):
+            with (
+                EventTranslationContext(event_manager, reverse_node_mapping),
+                entered_loop_body_scope(loop_body_scope),
+                EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            ):
                 start_subflow_request = StartLocalSubflowRequest(
                     flow_name=flow_name,
                     start_node=packaged_start_node_name,
-                    pickle_control_flow_result=False,
                 )
-                start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
+                start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
             execution_failed = isinstance(start_subflow_result, StartLocalSubflowResultFailure)
 
@@ -1737,6 +2145,7 @@ class NodeExecutor:
                 node=node,
                 execution_failed=execution_failed,
                 node_name_mappings=node_name_mappings,
+                end_node_mapping=end_node_mapping,
                 iteration=iteration,
                 max_iterations=max_iterations,
             )
@@ -1767,7 +2176,7 @@ class NodeExecutor:
                 parameter_name=startflow_param_name,
                 value=value_to_set,
             )
-            set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
+            set_value_result = await self.engine.ahandle_request(set_value_request)
             if not isinstance(set_value_result, SetParameterValueResultSuccess):
                 logger.warning(
                     "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -1777,12 +2186,13 @@ class NodeExecutor:
                     set_value_result.result_details,
                 )
 
-    def _evaluate_while_iteration_result(
+    def _evaluate_while_iteration_result(  # noqa: PLR0913
         self,
         *,
         node: BaseWhileNodeGroup,
         execution_failed: bool,
         node_name_mappings: dict[str, str],
+        end_node_mapping: PackagedNodeParameterMapping,
         iteration: int,
         max_iterations: int,
     ) -> bool | None:
@@ -1804,7 +2214,7 @@ class NodeExecutor:
                     total_iterations,
                 )
                 return None
-            logger.info(
+            logger.debug(
                 "While group '%s': execution error on iteration %d/%d, no iterations remaining",
                 node.name,
                 iteration + 1,
@@ -1813,10 +2223,10 @@ class NodeExecutor:
             return False
 
         # Check which control input was triggered
-        loop_action = self._get_while_control_action(node, node_name_mappings)
+        loop_action = self._get_while_control_action(node, end_node_mapping, node_name_mappings)
 
         if loop_action == WhileControlParam.DONE:
-            logger.info("While group '%s': done on iteration %d/%d", node.name, iteration + 1, total_iterations)
+            logger.debug("While group '%s': done on iteration %d/%d", node.name, iteration + 1, total_iterations)
             return True
 
         if loop_action == WhileControlParam.CONTINUE:
@@ -1828,7 +2238,7 @@ class NodeExecutor:
                     total_iterations,
                 )
                 return None
-            logger.info(
+            logger.debug(
                 "While group '%s': continue requested on iteration %d/%d, no iterations remaining",
                 node.name,
                 iteration + 1,
@@ -1837,7 +2247,7 @@ class NodeExecutor:
             return False
 
         # Neither done nor continue was triggered and execution didn't error - treat as done
-        logger.info(
+        logger.debug(
             "While group '%s': completed without control signal on iteration %d, treating as done",
             node.name,
             iteration + 1,
@@ -1861,7 +2271,7 @@ class NodeExecutor:
         Returns:
             Tuple of (resolved_node_name, resolved_param_name)
         """
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         try:
             target_node = node_manager.get_node_by_name(target_node_name)
         except ValueError:
@@ -1870,7 +2280,7 @@ class NodeExecutor:
         if not isinstance(target_node, SubflowNodeGroup):
             return (target_node_name, target_param_name)
 
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
         proxy_param = target_node.get_parameter_by_name(target_param_name)
         if proxy_param:
@@ -1901,7 +2311,7 @@ class NodeExecutor:
         iteration_params: list[str] = []
 
         list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for while group node %s", node.name)
             return iteration_params
@@ -1928,23 +2338,25 @@ class NodeExecutor:
     def _get_while_control_action(
         self,
         while_node: BaseWhileNodeGroup,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
     ) -> WhileControlParam | None:
         """Determine which control action was taken during while group execution.
 
-        Checks if internal nodes have triggered the 'done' or 'continue_loop' control
-        inputs on the while group. Multiple nodes may connect to the same control input,
-        so all sources are checked.
+        Checks whether control left the body through a node output connected to the 'done' or
+        'continue_loop' control inputs on the while group. Multiple nodes may connect to the
+        same control input, so all sources are checked.
 
         Args:
             while_node: The BaseWhileNodeGroup being executed
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
             WhileControlParam.DONE, WhileControlParam.CONTINUE, or None
         """
         list_connections_request = ListConnectionsForNodeRequest(node_name=while_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for while group node %s", while_node.name)
             return None
@@ -1955,11 +2367,13 @@ class NodeExecutor:
         done_sources = self._find_sources_for_control_param(incoming_connections, WhileControlParam.DONE)
         continue_sources = self._find_sources_for_control_param(incoming_connections, WhileControlParam.CONTINUE)
 
+        source_that_reached_end = self._get_control_source_that_reached_end(end_node_mapping, node_name_mappings)
+
         # Check if any done source fired
-        done_fired = any(self._check_control_source_fired(source, node_name_mappings) for source in done_sources)
+        done_fired = any(self._check_control_source_fired(source, source_that_reached_end) for source in done_sources)
         # Check if any continue source fired
         continue_fired = any(
-            self._check_control_source_fired(source, node_name_mappings) for source in continue_sources
+            self._check_control_source_fired(source, source_that_reached_end) for source in continue_sources
         )
 
         logger.debug(
@@ -1986,9 +2400,9 @@ class NodeExecutor:
     ) -> list[tuple[str, str]]:
         """Find all source nodes and parameters that connect to a control parameter.
 
-        Returns all matching sources. Used by retry groups where multiple nodes
-        may connect to the same control input, and by iterative groups (via
-        _find_source_for_control_param) which only need the first match.
+        Returns all matching sources, in the order their connections were made. Several body
+        nodes can connect to the same control input, so callers check every source rather than
+        trusting the first.
 
         Args:
             incoming_connections: List of incoming connections to the group
@@ -1997,7 +2411,7 @@ class NodeExecutor:
         Returns:
             List of (source_node_name, source_parameter_name) tuples
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
         sources: list[tuple[str, str]] = []
 
@@ -2009,7 +2423,7 @@ class NodeExecutor:
             source_param_name = conn.source_parameter_name
 
             # If source is a SubflowNodeGroup, follow the internal connection to get the actual source
-            node_manager = GriptapeNodes.NodeManager()
+            node_manager = self.engine.node_manager
             try:
                 source_node = node_manager.get_node_by_name(source_node_name)
             except ValueError:
@@ -2037,7 +2451,7 @@ class NodeExecutor:
         # on_each only exists on iterative groups; non-iterative subflows fall back to implicit child-discovery.
         if not isinstance(node, BaseIterativeNodeGroup):
             return None, None
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
         # Use node.on_each.name instead of a literal so renames stay in sync.
         # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
@@ -2080,12 +2494,12 @@ class NodeExecutor:
         execution_type = node.get_parameter_value(node.execution_environment.name)
 
         library = None
-        if execution_type not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
+        if execution_type not in (LOCAL_EXECUTION, ISOLATED_EXECUTION):
             try:
                 library = LibraryRegistry.get_library(name=execution_type)
-            except KeyError:
-                logger.error("Could not find library '%s' for %s execution", execution_type, label)
-                raise
+            except KeyError as err:
+                msg = f"Could not find library '{execution_type}' for {label} execution"
+                raise RuntimeError(msg) from err
 
         workflow_start_end_nodes = await self._get_workflow_start_end_nodes(library)
 
@@ -2106,12 +2520,12 @@ class NodeExecutor:
             node_group_name=node.name,
         )
 
-        package_result = GriptapeNodes.handle_request(request)
+        package_result = self.engine.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package {label} '{node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
-        logger.info(
+        logger.debug(
             "Successfully packaged %d nodes for %s '%s'",
             len(node_names),
             label,
@@ -2119,13 +2533,15 @@ class NodeExecutor:
         )
 
         # Mark packaged nodes as RESOLVED to prevent outer flow execution
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         for node_name in node_names:
             node_reference = node_manager.get_node_by_name(node_name)
             if node_reference:
                 node_reference.state = NodeResolutionState.RESOLVED
 
-        self._remove_packaged_nodes_from_queue(set(node_names))
+        # node (the group) stays in the outer DAG, so an outside consumer of a packaged child
+        # waits on it instead of losing the edge -- see _remove_packaged_nodes_from_queue.
+        self._remove_packaged_nodes_from_queue(set(node_names), replacement_node_name=node.name)
 
         return package_result
 
@@ -2145,7 +2561,7 @@ class NodeExecutor:
 
         total_iterations = node._get_total_iterations()
         if total_iterations == 0:
-            logger.info("No iterations for empty iterative group '%s'", node.name)
+            logger.debug("No iterations for empty iterative group '%s'", node.name)
             node._output_results_list()
             return
 
@@ -2169,7 +2585,7 @@ class NodeExecutor:
 
         # Handle empty group (no child nodes)
         if package_result is None:
-            logger.info("Empty iterative group '%s' - no child nodes to execute", node.name)
+            logger.debug("Empty iterative group '%s' - no child nodes to execute", node.name)
             node._output_results_list()
             return
 
@@ -2178,18 +2594,19 @@ class NodeExecutor:
 
         # Execute all iterations based on execution environment
         match execution_type:
-            case node_types.LOCAL_EXECUTION:
-                (
-                    iteration_results,
-                    successful_iterations,
-                    last_iteration_values,
-                ) = await self._execute_loop_iterations_locally(
-                    package_result=package_result,
-                    total_iterations=total_iterations,
-                    parameter_values_per_iteration=parameter_values_to_set_before_run,
-                    end_loop_node=node,
-                )
-            case node_types.PRIVATE_EXECUTION:
+            case _ if self._runs_locally(execution_type):
+                with self._local_execution_scope(execution_type, node.name):
+                    (
+                        iteration_results,
+                        successful_iterations,
+                        last_iteration_values,
+                    ) = await self._execute_loop_iterations_locally(
+                        package_result=package_result,
+                        total_iterations=total_iterations,
+                        parameter_values_per_iteration=parameter_values_to_set_before_run,
+                        end_loop_node=node,
+                    )
+            case node_types.ISOLATED_EXECUTION:
                 (
                     iteration_results,
                     successful_iterations,
@@ -2219,7 +2636,7 @@ class NodeExecutor:
             msg = f"Iterative group execution failed: {failed_count} of {total_iterations} iterations failed"
             raise RuntimeError(msg)
 
-        logger.info(
+        logger.debug(
             "Successfully completed parallel execution of %d iterations for iterative group '%s'",
             total_iterations,
             node.name,
@@ -2240,7 +2657,7 @@ class NodeExecutor:
             package_result=package_result,
         )
 
-        logger.info(
+        logger.debug(
             "Successfully aggregated %d results for iterative group '%s'",
             len(iteration_results),
             node.name,
@@ -2256,7 +2673,7 @@ class NodeExecutor:
             execution_type: The execution environment type
         """
         total_iterations = node._get_total_iterations()
-        logger.info(
+        logger.debug(
             "Executing iterative group '%s' sequentially for %d iterations",
             node.name,
             total_iterations,
@@ -2267,7 +2684,7 @@ class NodeExecutor:
 
         # Handle empty group (no child nodes)
         if package_result is None:
-            logger.info("Empty iterative group '%s' - no child nodes to execute", node.name)
+            logger.debug("Empty iterative group '%s' - no child nodes to execute", node.name)
             node._output_results_list()
             return
 
@@ -2276,23 +2693,24 @@ class NodeExecutor:
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
-        failed_iterations: list[int] = []
+        iteration_failures: list[IterationFailure] = []
         match execution_type:
-            case node_types.LOCAL_EXECUTION:
-                (
-                    iteration_results,
-                    successful_iterations,
-                    last_iteration_values,
-                    _skipped_count,
-                    break_occurred,
-                    failed_iterations,
-                ) = await self._execute_loop_iterations_sequentially(
-                    package_result=package_result,
-                    total_iterations=total_iterations,
-                    parameter_values_per_iteration=parameter_values_per_iteration,
-                    end_loop_node=node,
-                )
-            case node_types.PRIVATE_EXECUTION:
+            case _ if self._runs_locally(execution_type):
+                with self._local_execution_scope(execution_type, node.name):
+                    (
+                        iteration_results,
+                        successful_iterations,
+                        last_iteration_values,
+                        _skipped_count,
+                        break_occurred,
+                        iteration_failures,
+                    ) = await self._execute_loop_iterations_sequentially(
+                        package_result=package_result,
+                        total_iterations=total_iterations,
+                        parameter_values_per_iteration=parameter_values_per_iteration,
+                        end_loop_node=node,
+                    )
+            case node_types.ISOLATED_EXECUTION:
                 (
                     iteration_results,
                     successful_iterations,
@@ -2319,16 +2737,22 @@ class NodeExecutor:
 
         # Check if execution stopped early
         if break_occurred:
-            logger.info(
+            logger.debug(
                 "Iterative group execution stopped early at %d of %d iterations (break signal)",
                 len(successful_iterations),
                 total_iterations,
             )
-        elif failed_iterations:
-            msg = f"Iterative group execution failed: {len(failed_iterations)} of {total_iterations} iterations failed"
+        # Only the local sequential path reports per-iteration failures; private and cloud loops
+        # leave this empty and fall through to the short-count branch below.
+        elif iteration_failures:
+            msg = self._format_loop_failure_message(
+                loop_name=node.name,
+                total_iterations=total_iterations,
+                iteration_failures=iteration_failures,
+            )
             raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
-            logger.info(
+            logger.debug(
                 "Iterative group execution stopped early at %d of %d iterations",
                 len(successful_iterations),
                 total_iterations,
@@ -2340,7 +2764,7 @@ class NodeExecutor:
             value = iteration_results[iteration_index]
             node._results_list.append(value)
 
-        logger.info(
+        logger.debug(
             "Iterative group '%s': Built results list with %d items from sequential iterations",
             node.name,
             len(node._results_list),
@@ -2355,7 +2779,7 @@ class NodeExecutor:
             package_result=package_result,
         )
 
-        logger.info(
+        logger.debug(
             "Completed sequential iterative group execution for '%s' with %d results",
             node.name,
             len(iteration_results),
@@ -2387,7 +2811,7 @@ class NodeExecutor:
                 for param_name, param_value in resolved_upstream_values.items():
                     if param_name not in parameter_values_per_iteration[iteration_index]:
                         parameter_values_per_iteration[iteration_index][param_name] = param_value
-            logger.info(
+            logger.debug(
                 "Added %d resolved upstream values to %d iterations for group '%s'",
                 len(resolved_upstream_values),
                 len(parameter_values_per_iteration),
@@ -2452,7 +2876,7 @@ class NodeExecutor:
         index_values = iteration_source.get_all_iteration_values()
 
         list_connections_request = ListConnectionsForNodeRequest(node_name=iteration_source.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             msg = (
                 f"Failed to list connections for node {iteration_source.name}: {list_connections_result.result_details}"
@@ -2516,9 +2940,9 @@ class NodeExecutor:
         Returns:
             Dict mapping startflow_param_name -> value from resolved upstream node
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
 
         # Get Start node's parameter mappings (index 0 in the list)
         start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
@@ -2566,7 +2990,7 @@ class NodeExecutor:
                         upstream_value,
                     )
 
-        logger.info("Collected %d resolved upstream values for loop execution", len(resolved_upstream_values))
+        logger.debug("Collected %d resolved upstream values for loop execution", len(resolved_upstream_values))
         return resolved_upstream_values
 
     def _get_upstream_connection_value(
@@ -2600,7 +3024,7 @@ class NodeExecutor:
         if upstream_param.name in upstream_node.parameter_output_values:
             return upstream_node.parameter_output_values[upstream_param.name]
 
-        return upstream_node.get_parameter_value(upstream_param.name)
+        return upstream_node._get_raw_parameter_value(upstream_param.name)
 
     def _get_value_through_subflow_group_proxy(
         self,
@@ -2625,7 +3049,7 @@ class NodeExecutor:
         Returns:
             The value from the resolved external source, or None if not found
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
 
         # Find the incoming connection TO the proxy parameter on the group
@@ -2659,7 +3083,7 @@ class NodeExecutor:
             if source_param.name in source_node.parameter_output_values:
                 value = source_node.parameter_output_values[source_param.name]
             else:
-                value = source_node.get_parameter_value(source_param.name)
+                value = source_node._get_raw_parameter_value(source_param.name)
 
             logger.debug(
                 "Traced through proxy: %s.%s -> %s.%s (value type: %s)",
@@ -2714,8 +3138,8 @@ class NodeExecutor:
                 source_param_name = conn.source_parameter_name
 
                 # If source is a NodeGroup, follow the internal connection to get the actual source
-                node_manager = GriptapeNodes.NodeManager()
-                flow_manager = GriptapeNodes.FlowManager()
+                node_manager = self.engine.node_manager
+                flow_manager = self.engine.flow_manager
                 try:
                     source_node = node_manager.get_node_by_name(source_node_name)
                 except ValueError:
@@ -2755,6 +3179,24 @@ class NodeExecutor:
         msg = f"start_or_end must be 'start' or 'end', got {start_or_end}"
         raise ValueError(msg)
 
+    def _loop_body_scope(
+        self, package_result: PackageNodesAsSerializedFlowResultSuccess, node_name_mappings: dict[str, str]
+    ) -> LoopBodyScope:
+        """The scope naming one deserialized copy of a loop body by the canvas nodes it stands for.
+
+        Entered around each iteration, so the node events it sends name canvas nodes rather than
+        the copies, and leave out the Start and End nodes the engine adds to the body.
+        """
+        engine_made_node_names = {
+            self.get_node_parameter_mappings(package_result, "start").node_name,
+            self.get_node_parameter_mappings(package_result, "end").node_name,
+        }
+        return loop_body_scope_for(
+            node_name_mappings,
+            engine_made_node_names=engine_made_node_names,
+            enclosing_scope=current_loop_body_scope.get(),
+        )
+
     def get_parameter_values_from_iterations(
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
@@ -2778,7 +3220,7 @@ class NodeExecutor:
         """
         # Step 1: Get incoming connections TO the end_loop_node
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             msg = f"Failed to list connections for node {end_loop_node.name}: {list_connections_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -2803,7 +3245,7 @@ class NodeExecutor:
         # Step 4: Extract values from each iteration's EndFlow node
         packaged_end_node_name = end_node_mapping.node_name
         iteration_results = {}
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
 
         for iteration_index, flow_name, node_name_mappings in deserialized_flows:
             deserialized_end_node_name = node_name_mappings.get(packaged_end_node_name)
@@ -2882,7 +3324,7 @@ class NodeExecutor:
             return {}
 
         # Get the End node instance
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         try:
             deserialized_end_node = node_manager.get_node_by_name(deserialized_end_node_name)
         except Exception as e:
@@ -2905,6 +3347,43 @@ class NodeExecutor:
         )
 
         return last_iteration_values
+
+    def _parallel_iteration_gate(self, total_iterations: int) -> asyncio.Semaphore:
+        """Semaphore sized by `max_loop_iterations_in_parallel`; 0 or unset means no limit."""
+        configured_limit = self.engine.config_manager.get_config_value("max_loop_iterations_in_parallel", default=0)
+        if configured_limit is None or configured_limit <= 0:
+            return asyncio.Semaphore(max(total_iterations, 1))
+        return asyncio.Semaphore(configured_limit)
+
+    async def _delete_iteration_flows(
+        self,
+        deserialized_flows: list[tuple[int, str, dict[str, str]]],
+        event_manager: EventManager,
+    ) -> None:
+        """Delete every per-iteration flow, tolerating already-gone flows and surfacing real failures.
+
+        Called from a finally so it runs on all exit paths (success, exception, cancellation). A
+        delete that reports failure because the flow no longer exists is expected during cleanup and
+        is logged at debug; any other failure is logged at error so a genuinely stuck flow is
+        surfaced rather than silently leaked. We never raise here — a raise from finally would mask
+        an in-flight exception (including CancelledError).
+        """
+        # Suppress events during deletion to prevent sending them to websockets.
+        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+            for iteration_index, flow_name, _ in deserialized_flows:
+                # Skip flows already torn down (e.g. a partially-run iteration cleaned itself up).
+                if self.engine.object_manager.attempt_get_object_by_name(flow_name) is None:
+                    continue
+                delete_result = await self.engine.ahandle_request(DeleteFlowRequest(flow_name=flow_name))
+                if not isinstance(delete_result, DeleteFlowResultSuccess):
+                    logger.error(
+                        "Failed to delete iteration flow '%s' (iteration %d): %s. This flow may leak into a "
+                        "subsequent save; it is tagged transient so it will not be serialized, but it remains "
+                        "in engine memory.",
+                        flow_name,
+                        iteration_index,
+                        delete_result.result_details,
+                    )
 
     async def _execute_loop_iterations_locally(  # noqa: C901, PLR0912, PLR0915
         self,
@@ -2933,180 +3412,218 @@ class NodeExecutor:
         """
         # Step 1: Deserialize N flow instances from the serialized flow
         # Save the current context and restore it after each deserialization to prevent
-        # iteration flows from becoming children of each other
+        # iteration flows from becoming children of each other.
+        #
+        # The deserialize loop runs INSIDE the try so its finally tears down every iteration flow
+        # already created even if a later deserialization raises. Each flow is appended to
+        # deserialized_flows the instant it is created, so the cleanup set is always complete —
+        # if deserialization of iteration k raises, flows 0..k-1 are still deleted. (The iteration
+        # flows are also tagged transient at packaging time, so a mid-run save can never bake them
+        # into the workflow even in the window before cleanup runs.)
         deserialized_flows = []
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         saved_context_flow = context_manager.get_current_flow() if context_manager.has_current_flow() else None
+        self._silence_packaged_node_creation_broadcasts(package_result)
 
-        # Suppress events during deserialization to prevent sending them to websockets
-        event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
-            for iteration_index in range(total_iterations):
-                # Restore context before each deserialization to ensure all iteration flows
-                # are created at the same level (not as children of each other)
-                if saved_context_flow is not None:
-                    # Pop any flows that were pushed during previous iteration
-                    while (
-                        context_manager.has_current_flow() and context_manager.get_current_flow() != saved_context_flow
+        # Everything about the iteration flows stays off the wire, from the first deserialize to the last
+        # delete: the bookkeeping and, since nothing here can be translated to a canvas node, the
+        # execution events of the copies too.
+        event_manager = self.engine.event_manager
+        with (
+            EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS),
+        ):
+            try:
+                for iteration_index in range(total_iterations):
+                    # Restore context before each deserialization to ensure all iteration flows
+                    # are created at the same level (not as children of each other)
+                    if saved_context_flow is not None:
+                        # Pop any flows that were pushed during previous iteration
+                        while (
+                            context_manager.has_current_flow()
+                            and context_manager.get_current_flow() != saved_context_flow
+                        ):
+                            context_manager.pop_flow()
+
+                    deserialize_request = DeserializeFlowFromCommandsRequest(
+                        serialized_flow_commands=package_result.serialized_flow_commands
+                    )
+                    deserialize_result = self.engine.handle_request(deserialize_request)
+                    if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
+                        msg = f"Failed to deserialize flow for iteration {iteration_index}. Error: {deserialize_result.result_details}"
+                        raise TypeError(msg)
+
+                    deserialized_flows.append(
+                        (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
+                    )
+
+                    # Pop the deserialized flow from the context stack to prevent it from staying there
+                    # Deserialization pushes the flow onto the stack, but we don't want iteration flows
+                    # to remain on the stack after deserialization
+                    if (
+                        context_manager.has_current_flow()
+                        and context_manager.get_current_flow().name == deserialize_result.flow_name
                     ):
                         context_manager.pop_flow()
+                logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
+                # Step 2: Define the per-iteration coroutine
+                packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
+                # All tasks are created up front so a cancel reaches them; the gate limits how many run.
+                concurrency_gate = self._parallel_iteration_gate(total_iterations)
 
-                deserialize_request = DeserializeFlowFromCommandsRequest(
-                    serialized_flow_commands=package_result.serialized_flow_commands
-                )
-                deserialize_result = GriptapeNodes.handle_request(deserialize_request)
-                if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
-                    msg = f"Failed to deserialize flow for iteration {iteration_index}. Error: {deserialize_result.result_details}"
-                    raise TypeError(msg)
+                async def run_single_iteration(
+                    flow_name: str, iteration_index: int, start_node_name: str, loop_body_scope: LoopBodyScope
+                ) -> IterationOutcome:
+                    """Run a single iteration flow and report whether it finished, and why not."""
+                    async with concurrency_gate:
+                        with entered_loop_body_scope(loop_body_scope):
+                            start_subflow_request = StartLocalSubflowRequest(
+                                flow_name=flow_name,
+                                start_node=start_node_name,
+                            )
+                            start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
+                            if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
+                                return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
+                            # The reason travels out with the verdict: this closure is the only place that
+                            # holds it, so anything narrower than IterationOutcome loses it for good.
+                            return IterationOutcome(
+                                iteration_index=iteration_index,
+                                succeeded=False,
+                                detail=str(start_subflow_result.result_details),
+                            )
 
-                deserialized_flows.append(
-                    (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
-                )
+                # Step 3: Set input values on start nodes for each iteration
+                for iteration_index, _, node_name_mappings in deserialized_flows:
+                    parameter_values = parameter_values_per_iteration[iteration_index]
 
-                # Pop the deserialized flow from the context stack to prevent it from staying there
-                # Deserialization pushes the flow onto the stack, but we don't want iteration flows
-                # to remain on the stack after deserialization
-                if (
-                    context_manager.has_current_flow()
-                    and context_manager.get_current_flow().name == deserialize_result.flow_name
-                ):
-                    context_manager.pop_flow()
-        logger.info("Successfully deserialized %d flow instances for parallel execution", total_iterations)
-        # Step 2: Define the per-iteration coroutine
-        packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
+                    # Get Start node mapping (index 0 in the list)
+                    start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
+                    start_node_name = start_node_mapping.node_name
+                    start_params = start_node_mapping.parameter_mappings
 
-        async def run_single_iteration(flow_name: str, iteration_index: int, start_node_name: str) -> tuple[int, bool]:
-            """Run a single iteration flow and return success status."""
-            # Suppress execution events during parallel iteration to prevent flooding websockets
-            with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
-                start_subflow_request = StartLocalSubflowRequest(
-                    flow_name=flow_name,
-                    start_node=start_node_name,
-                    pickle_control_flow_result=False,
-                )
-                start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
-                success = isinstance(start_subflow_result, StartLocalSubflowResultSuccess)
-                return iteration_index, success
-
-        try:
-            # Step 3: Set input values on start nodes for each iteration
-            for iteration_index, _, node_name_mappings in deserialized_flows:
-                parameter_values = parameter_values_per_iteration[iteration_index]
-
-                # Get Start node mapping (index 0 in the list)
-                start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
-                start_node_name = start_node_mapping.node_name
-                start_params = start_node_mapping.parameter_mappings
-
-                # Find the deserialized name for the Start node
-                deserialized_start_node_name = node_name_mappings.get(start_node_name)
-                if deserialized_start_node_name is None:
-                    logger.warning(
-                        "Could not find deserialized Start node (original: '%s') for iteration %d",
-                        start_node_name,
-                        iteration_index,
-                    )
-                    continue
-
-                # Set all parameter values on the deserialized Start node
-                for startflow_param_name in start_params:
-                    if startflow_param_name not in parameter_values:
+                    # Find the deserialized name for the Start node
+                    deserialized_start_node_name = node_name_mappings.get(start_node_name)
+                    if deserialized_start_node_name is None:
+                        logger.warning(
+                            "Could not find deserialized Start node (original: '%s') for iteration %d",
+                            start_node_name,
+                            iteration_index,
+                        )
                         continue
 
-                    value_to_set = parameter_values[startflow_param_name]
+                    # Set all parameter values on the deserialized Start node
+                    for startflow_param_name in start_params:
+                        if startflow_param_name not in parameter_values:
+                            continue
 
-                    set_value_request = SetParameterValueRequest(
-                        node_name=deserialized_start_node_name,
-                        parameter_name=startflow_param_name,
-                        value=value_to_set,
-                    )
-                    set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
-                    if not isinstance(set_value_result, SetParameterValueResultSuccess):
-                        logger.warning(
-                            "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
-                            startflow_param_name,
-                            deserialized_start_node_name,
-                            iteration_index,
-                            set_value_result.result_details,
+                        value_to_set = parameter_values[startflow_param_name]
+
+                        set_value_request = SetParameterValueRequest(
+                            node_name=deserialized_start_node_name,
+                            parameter_name=startflow_param_name,
+                            value=value_to_set,
                         )
+                        set_value_result = await self.engine.ahandle_request(set_value_request)
+                        if not isinstance(set_value_result, SetParameterValueResultSuccess):
+                            logger.warning(
+                                "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
+                                startflow_param_name,
+                                deserialized_start_node_name,
+                                iteration_index,
+                                set_value_result.result_details,
+                            )
 
-            logger.info("Successfully set input values for %d iterations", total_iterations)
-            # Step 4: Run all iterations concurrently
-            iteration_tasks = [
-                run_single_iteration(
-                    flow_name,
-                    iteration_index,
-                    node_name_mappings.get(packaged_start_node_name),
-                )
-                for iteration_index, flow_name, node_name_mappings in deserialized_flows
-            ]
-            iteration_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
-
-            # Step 5: Collect successful and failed iterations
-            successful_iterations = []
-            failed_iteration_indices = []
-            failed_iteration_errors = {}  # Map iteration_index -> error
-
-            for idx, result in enumerate(iteration_results):
-                if isinstance(result, Exception):
-                    # Exception doesn't include iteration_index, use enumerate index
-                    failed_iteration_indices.append(idx)
-                    failed_iteration_errors[idx] = str(result)
-                    continue
-                if isinstance(result, tuple):
-                    iteration_index, success = result
-                    if success:
-                        successful_iterations.append(iteration_index)
-                    else:
-                        failed_iteration_indices.append(iteration_index)
-                        failed_iteration_errors[iteration_index] = "Iteration failed"
-
-            if failed_iteration_indices:
-                logger.warning(
-                    "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed iterations. Errors: %s",
-                    len(failed_iteration_indices),
-                    total_iterations,
-                    failed_iteration_errors,
-                )
-
-            # Step 6: Extract parameter values from iterations BEFORE cleanup
-            iteration_results = self.get_parameter_values_from_iterations(
-                end_loop_node=end_loop_node,
-                deserialized_flows=deserialized_flows,
-                package_flow_result_success=package_result,
-            )
-
-            # Add None values for failed iterations that didn't produce any results
-            # (e.g., nested loops may fail but still produce partial output)
-            for failed_idx in failed_iteration_indices:
-                if failed_idx not in iteration_results:
-                    iteration_results[failed_idx] = None
-
-            # Step 7: Extract last iteration values BEFORE cleanup (flows deleted in finally block)
-            last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
-                deserialized_flows=deserialized_flows,
-                package_result=package_result,
-                total_iterations=total_iterations,
-            )
-
-            return iteration_results, successful_iterations, last_iteration_values
-
-        finally:
-            # Step 8: Cleanup - delete all iteration flows
-            # Suppress events during deletion to prevent sending them to websockets
-            with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
-                for iteration_index, flow_name, _ in deserialized_flows:
-                    delete_request = DeleteFlowRequest(flow_name=flow_name)
-                    delete_result = await GriptapeNodes.ahandle_request(delete_request)
-                    if not isinstance(delete_result, DeleteFlowResultSuccess):
-                        logger.warning(
-                            "Failed to delete iteration flow '%s' (iteration %d): %s",
+                logger.debug("Successfully set input values for %d iterations", total_iterations)
+                # Step 4: Run all iterations concurrently.
+                # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
+                # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
+                # falling through to the finally that deletes the iteration flows. Each iteration unwinds
+                # its isolated subflow machine on cancellation (see on_start_local_subflow_request), so
+                # awaiting them here guarantees no body-node task is still running when its flow is
+                # deleted. gather(return_exceptions=True) alone would not await the children on cancel.
+                iteration_tasks = [
+                    asyncio.ensure_future(
+                        run_single_iteration(
                             flow_name,
                             iteration_index,
-                            delete_result.result_details,
+                            node_name_mappings.get(packaged_start_node_name),
+                            self._loop_body_scope(package_result, node_name_mappings),
                         )
+                    )
+                    for iteration_index, flow_name, node_name_mappings in deserialized_flows
+                ]
+                try:
+                    iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    for task in iteration_tasks:
+                        task.cancel()
+                    # Let every iteration finish unwinding (tearing down its isolated machine) before the
+                    # finally deletes the flows out from under them.
+                    await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                    raise
 
-    async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913
+                # Step 5: Collect successful and failed iterations
+                successful_iterations = []
+                failed_iteration_indices = []
+                iteration_failures: list[IterationFailure] = []
+
+                for idx, result in enumerate(iteration_task_results):
+                    if isinstance(result, Exception):
+                        # Exception doesn't include iteration_index, use enumerate index
+                        failed_iteration_indices.append(idx)
+                        iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
+                        continue
+                    if isinstance(result, IterationOutcome):
+                        if result.succeeded:
+                            successful_iterations.append(result.iteration_index)
+                        else:
+                            failed_iteration_indices.append(result.iteration_index)
+                            iteration_failures.append(
+                                IterationFailure(
+                                    iteration_index=result.iteration_index,
+                                    detail=result.detail or "The iteration reported failure without a reason.",
+                                )
+                            )
+
+                if failed_iteration_indices:
+                    logger.warning(
+                        "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
+                        "iterations.\n%s",
+                        len(failed_iteration_indices),
+                        total_iterations,
+                        "\n".join(
+                            self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
+                        ),
+                    )
+
+                # Step 6: Extract parameter values from iterations BEFORE cleanup
+                iteration_results = self.get_parameter_values_from_iterations(
+                    end_loop_node=end_loop_node,
+                    deserialized_flows=deserialized_flows,
+                    package_flow_result_success=package_result,
+                )
+
+                # Add None values for failed iterations that didn't produce any results
+                # (e.g., nested loops may fail but still produce partial output)
+                for failed_idx in failed_iteration_indices:
+                    if failed_idx not in iteration_results:
+                        iteration_results[failed_idx] = None
+
+                # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
+                last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
+                    deserialized_flows=deserialized_flows,
+                    package_result=package_result,
+                    total_iterations=total_iterations,
+                )
+
+                return iteration_results, successful_iterations, last_iteration_values
+            finally:
+                # Cleanup - delete every iteration flow created above, on ALL exit paths
+                # (success, raise, cancellation). deserialized_flows is complete because each flow is
+                # appended immediately after creation, inside this try.
+                await self._delete_iteration_flows(deserialized_flows, event_manager)
+
+    async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
@@ -3138,9 +3655,9 @@ class NodeExecutor:
         Returns:
             Tuple of (iteration_results, successful_iterations, last_iteration_values)
         """
-        # if it's private execution, we aren't republishing it in a library.
+        # if it's isolated execution, we aren't republishing it in a library.
         # So our original package is what is running, and we can count on using these mappings
-        if execution_type == PRIVATE_EXECUTION:
+        if execution_type == ISOLATED_EXECUTION:
             start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
             start_node_name = start_node_mapping.node_name
         # For published libraries, we need to get the new Start Node name, based on what their registered nodes are.
@@ -3152,7 +3669,7 @@ class NodeExecutor:
             start_node_name = node_metadata.display_name
 
         mode_str = "sequentially" if run_sequentially else "concurrently"
-        logger.info(
+        logger.debug(
             "Executing %d iterations %s in %s for loop '%s'",
             total_iterations,
             mode_str,
@@ -3167,7 +3684,7 @@ class NodeExecutor:
                 for iteration_index in range(total_iterations):
                     try:
                         flow_input = {start_node_name: parameter_values_per_iteration[iteration_index]}
-                        logger.info(
+                        logger.debug(
                             "Executing iteration %d/%d for loop '%s'",
                             iteration_index + 1,
                             total_iterations,
@@ -3179,11 +3696,12 @@ class NodeExecutor:
                         subprocess_result = await self._execute_subprocess(
                             published_workflow_filename=workflow_path,
                             file_name=f"{file_name_prefix}_iteration_{iteration_index}",
-                            pickle_control_flow_result=True,
                             flow_input=flow_input,
                             node=subflow_node,
                         )
                         iteration_outputs.append((iteration_index, True, subprocess_result))
+                    except SubprocessWebSocketUnavailableError:
+                        raise
                     except Exception:
                         logger.exception("Iteration %d failed for loop '%s'", iteration_index, end_loop_node.name)
                         iteration_outputs.append((iteration_index, False, None))
@@ -3195,7 +3713,7 @@ class NodeExecutor:
                 async def run_single_iteration(iteration_index: int) -> tuple[int, bool, dict[str, Any] | None]:
                     try:
                         flow_input = {start_node_name: parameter_values_per_iteration[iteration_index]}
-                        logger.info(
+                        logger.debug(
                             "Executing iteration %d/%d for loop '%s'",
                             iteration_index + 1,
                             total_iterations,
@@ -3205,10 +3723,11 @@ class NodeExecutor:
                         subprocess_result = await self._execute_subprocess(
                             published_workflow_filename=workflow_path,
                             file_name=f"{file_name_prefix}_iteration_{iteration_index}",
-                            pickle_control_flow_result=True,
                             flow_input=flow_input,
                             node=subflow_node,
                         )
+                    except SubprocessWebSocketUnavailableError:
+                        raise
                     except Exception:
                         logger.exception("Iteration %d failed for loop '%s'", iteration_index, end_loop_node.name)
                         return iteration_index, False, None
@@ -3227,7 +3746,7 @@ class NodeExecutor:
                 )
             )
 
-            logger.info(
+            logger.debug(
                 "Successfully completed %d/%d iterations %s in %s for loop '%s'",
                 len(successful_iterations),
                 total_iterations,
@@ -3252,7 +3771,6 @@ class NodeExecutor:
         workflow_path, workflow_result = await self._save_workflow_file_for_loop(
             end_loop_node=end_loop_node,
             package_result=package_result,
-            pickle_control_flow_result=True,
         )
         sanitized_loop_name = end_loop_node.name.replace(" ", "_")
         file_name_prefix = f"{sanitized_loop_name}_private_sequential_loop_flow"
@@ -3266,7 +3784,7 @@ class NodeExecutor:
                 workflow_path=workflow_path,
                 workflow_result=workflow_result,
                 file_name_prefix=file_name_prefix,
-                execution_type=PRIVATE_EXECUTION,
+                execution_type=ISOLATED_EXECUTION,
                 run_sequentially=True,
             )
         finally:
@@ -3286,7 +3804,6 @@ class NodeExecutor:
         workflow_path, workflow_result = await self._save_workflow_file_for_loop(
             end_loop_node=end_loop_node,
             package_result=package_result,
-            pickle_control_flow_result=True,
         )
         sanitized_loop_name = end_loop_node.name.replace(" ", "_")
         file_name_prefix = f"{sanitized_loop_name}_private_loop_flow"
@@ -3300,7 +3817,7 @@ class NodeExecutor:
                 workflow_path=workflow_path,
                 workflow_result=workflow_result,
                 file_name_prefix=file_name_prefix,
-                execution_type=PRIVATE_EXECUTION,
+                execution_type=ISOLATED_EXECUTION,
                 run_sequentially=False,
             )
         finally:
@@ -3313,15 +3830,12 @@ class NodeExecutor:
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
-        *,
-        pickle_control_flow_result: bool,
     ) -> tuple[Path, Any]:
         """Save workflow file for loop execution.
 
         Args:
             end_loop_node: The end loop node
             package_result: The packaged flow
-            pickle_control_flow_result: Whether to pickle the control flow result
 
         Returns:
             Tuple of (workflow_path, workflow_result)
@@ -3333,16 +3847,15 @@ class NodeExecutor:
             file_name=file_name,
             serialized_flow_commands=package_result.serialized_flow_commands,
             workflow_shape=package_result.workflow_shape,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
 
-        workflow_result = await GriptapeNodes.ahandle_request(workflow_file_request)
+        workflow_result = await self.engine.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to save workflow file for private loop execution: {workflow_result.result_details}"
             raise TypeError(msg)
 
         workflow_path = Path(workflow_result.file_path)
-        logger.info("Saved workflow to '%s'", workflow_path)
+        logger.debug("Saved workflow to '%s'", workflow_path)
 
         return workflow_path, workflow_result
 
@@ -3376,7 +3889,7 @@ class NodeExecutor:
 
         # Find which EndFlow parameter corresponds to new_item_to_add
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
 
         endflow_param_name = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -3516,10 +4029,9 @@ class NodeExecutor:
             file_name=file_name,
             serialized_flow_commands=package_result.serialized_flow_commands,
             workflow_shape=package_result.workflow_shape,
-            pickle_control_flow_result=True,
         )
 
-        workflow_result = await GriptapeNodes.ahandle_request(workflow_file_request)
+        workflow_result = await self.engine.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to save workflow file for loop: {workflow_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004 - This is a runtime failure, not a type validation error
@@ -3550,53 +4062,35 @@ class NodeExecutor:
         except Exception as e:
             logger.warning("Failed to cleanup workflow files: %s", e)
 
-    def set_parameter_output_values_for_loops(
-        self, subprocess_result: dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]
-    ) -> None:
-        pass
-
-    def _extract_parameter_output_values(
-        self, subprocess_result: dict[str, dict[str | SerializedNodeCommands.UniqueParameterValueUUID, Any] | None]
-    ) -> dict[str, Any]:
-        """Extract and deserialize parameter output values from subprocess result.
-
-        Returns:
-            Dictionary of parameter names to their deserialized values
-        """
+    def _extract_parameter_output_values(self, subprocess_result: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Merge the output values of every end node in a subprocess result."""
         parameter_output_values = {}
-        for result_dict in subprocess_result.values():
-            # Handle backward compatibility: old flat structure
-            if not isinstance(result_dict, dict) or "parameter_output_values" not in result_dict:
-                parameter_output_values.update(result_dict)  # type: ignore[arg-type]
-                continue
-
-            param_output_vals = result_dict["parameter_output_values"]
-            unique_uuid_to_values = result_dict.get("unique_parameter_uuid_to_values")
-
-            # No UUID mapping - use values directly
-            if not unique_uuid_to_values:
-                parameter_output_values.update(param_output_vals)
-                continue
-
-            # Deserialize UUID-referenced values
-            for param_name, param_value in param_output_vals.items():
-                parameter_output_values[param_name] = self._deserialize_parameter_value(
-                    param_name, param_value, unique_uuid_to_values
-                )
+        for end_node_values in subprocess_result.values():
+            parameter_output_values.update(end_node_values)
         return parameter_output_values
 
-    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str]) -> None:
+    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str], replacement_node_name: str) -> None:
         """Remove nodes from global flow queue after they've been packaged for loop execution.
 
         When nodes are packaged for For Each loops, they will be deserialized into separate
         flow instances. We need to remove them from the global queue to prevent them from
         being executed in the main flow while also being copied into loop iterations.
 
+        A packaged node can still have a data consumer outside the package (a loose sink, or a
+        node pulled in only because it reads one of these nodes). Dropping the packaged node from
+        a network drops that edge too, so the consumer's in-degree reaches zero and it can run
+        before this node's real value is copied back onto ``replacement_node_name`` (the node that
+        stays in the outer DAG standing in for the whole package -- the loop's End node, or the
+        group node itself). Re-pointing the edge at that stand-in instead keeps the consumer
+        waiting until the copy-back has happened.
+
         Args:
             packaged_node_names: Set of node names that were packaged
+            replacement_node_name: The node left in the outer DAG to carry packaged nodes'
+                outside-facing data edges once the package's real values land on it
         """
-        flow_manager = GriptapeNodes.FlowManager()
-        node_manager = GriptapeNodes.NodeManager()
+        flow_manager = self.engine.flow_manager
+        node_manager = self.engine.node_manager
 
         # Get the nodes from the names
         packaged_nodes = set()
@@ -3619,36 +4113,28 @@ class NodeExecutor:
                 if node_name in dag_builder.node_to_reference:
                     dag_builder.node_to_reference.pop(node_name)
 
-                # Remove from all networks and check if any become empty
-                for network in list(dag_builder.graphs.values()):
-                    if node_name in network.nodes():
-                        network.remove_node(node_name)
+            for network in list(dag_builder.graphs.values()):
+                self._redirect_packaged_edges_and_remove(network, packaged_node_names, replacement_node_name)
 
-    def _deserialize_parameter_value(self, param_name: str, param_value: Any, unique_uuid_to_values: dict) -> Any:
-        """Deserialize a single parameter value, handling UUID references and pickling.
+    @staticmethod
+    def _redirect_packaged_edges_and_remove(
+        network: DirectedGraph, packaged_node_names: set[str], replacement_node_name: str
+    ) -> None:
+        """Drop every packaged node from one network, keeping its outside-facing edges alive.
 
-        Args:
-            param_name: Parameter name for logging
-            param_value: Either a direct value or UUID reference
-            unique_uuid_to_values: Mapping of UUIDs to pickled values
-
-        Returns:
-            Deserialized parameter value
+        An outside consumer's edge from a packaged node is re-pointed to `replacement_node_name`
+        instead of being dropped, so the consumer still waits for the real value. An edge whose
+        successor is the replacement node itself is left alone rather than turned into a self-loop
+        that would never clear -- that is simply the replacement node's own existing dependency.
         """
-        # Direct value (not a UUID reference)
-        if param_value not in unique_uuid_to_values:
-            return param_value
-
-        stored_value = unique_uuid_to_values[param_value]
-        try:
-            return pickle.loads(stored_value)  # noqa: S301
-        except pickle.UnpicklingError as e:
-            logger.warning(
-                "Attempted to unpickle stored value for parameter '%s'. Failed because: %s",
-                param_name,
-                e,
-            )
-            raise
+        for node_name in packaged_node_names:
+            if node_name not in network.nodes():
+                continue
+            for successor in network.get_successors(node_name):
+                if successor in packaged_node_names or successor == replacement_node_name:
+                    continue
+                network.add_edge(replacement_node_name, successor)
+            network.remove_node(node_name)
 
     def _apply_parameter_values_to_node(
         self,
@@ -3708,15 +4194,30 @@ class NodeExecutor:
             # Provide source node/parameter to bypass connection conflict validation
             # These values are coming from execution results, treat as upstream values
             if target_param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                GriptapeNodes.NodeManager().on_set_parameter_value_request(
-                    SetParameterValueRequest(
-                        node_name=target_node_name,
-                        parameter_name=target_param_name,
-                        value=param_value,
-                        incoming_connection_source_node_name=node.name,
-                        incoming_connection_source_parameter_name=target_param_name,
+                # Skip the request entirely when the parameter holds a {VAR} template:
+                # param_value is the resolved text, and the handler would route it into
+                # parameter_values, destroying the template the user typed rather than
+                # merely hiding it. The output write below still hands downstream nodes
+                # the resolved value.
+                #
+                # is_output=True is not a substitute for skipping. The handler gates
+                # unresolve_future_nodes on `modified`, and for an output write that is
+                # only true when the key *already* held a different value; an absent key
+                # yields False. parallel_resolution calls parameter_output_values
+                # .silent_clear() before executing a node, so the key is routinely absent
+                # and downstream invalidation would quietly stop firing on this path.
+                if target_node.should_preserve_stored_template(target_param_name, param_value):
+                    self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
+                else:
+                    self.engine.node_manager.on_set_parameter_value_request(
+                        SetParameterValueRequest(
+                            node_name=target_node_name,
+                            parameter_name=target_param_name,
+                            value=param_value,
+                            incoming_connection_source_node_name=node.name,
+                            incoming_connection_source_parameter_name=target_param_name,
+                        )
                     )
-                )
             target_node.parameter_output_values[target_param_name] = param_value
 
             logger.debug(
@@ -3724,6 +4225,38 @@ class NodeExecutor:
                 target_param_name,
                 target_node_name,
                 param_value,
+            )
+
+    def _unresolve_future_nodes_for_skipped_write(self, target_node: BaseNode, target_param_name: str) -> None:
+        """Invalidate downstream nodes for a copy-back that bypassed the request handler.
+
+        ``SetParameterValueRequest`` unresolves future nodes whenever the value it set
+        actually changed. Preserving a {VAR} template means not sending that request,
+        so the same bookkeeping has to happen here or downstream nodes keep stale
+        results from before the group ran.
+
+        Unconditional, because the request this stands in for was too: the handler
+        compares the *stored* value, and on this path that is the template while the
+        value is the resolved text (``_differs`` is a precondition of
+        ``should_preserve_stored_template``), so it always saw a change. Skipping when
+        the resolved output happens to match the previous run's would be a new
+        optimisation, and getting it wrong leaves a node resolved against stale input.
+
+        Two other things the handler's ``modified`` flag drives are not reproduced.
+        ``make_node_unresolved`` on the target would be overwritten immediately -- the
+        resolution machine marks the node RESOLVED once the executor returns. The
+        downstream property pass-through is redundant because delivery is pull-based:
+        ``collect_values_from_upstream_nodes`` re-reads upstream
+        ``parameter_output_values`` before each node runs.
+        """
+        try:
+            self.engine.flow_manager.get_connections().unresolve_future_nodes(target_node)
+        except Exception:
+            logger.warning(
+                "Could not unresolve nodes downstream of '%s' after preserving the variable template on '%s'",
+                target_node.name,
+                target_param_name,
+                exc_info=True,
             )
 
     def _apply_last_iteration_to_packaged_nodes(
@@ -3749,7 +4282,7 @@ class NodeExecutor:
         end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
         end_node_param_mappings = end_node_mapping.parameter_mappings
 
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
 
         # For each parameter in the End node, map it back to the original node and set the value
         for sanitized_param_name, param_value in last_iteration_values.items():
@@ -3783,8 +4316,30 @@ class NodeExecutor:
                 logger.debug("Skipping control parameter '%s' on node '%s'", target_param_name, target_node_name)
                 continue
 
-            # Set the value on the target node
-            target_node.set_parameter_value(target_param_name, param_value)
+            # Set the value on the target node.
+            #
+            # Skip the stored-value write when the parameter holds a {VAR} template:
+            # param_value is the last iteration's resolved text, and writing it into
+            # parameter_values would destroy the template the user typed rather than
+            # merely hiding it. The output value below still reflects the last
+            # iteration for downstream consumers and artifacts.
+            #
+            # Skip it as well for a list whose rows are connected to other nodes. A whole
+            # list written to a node becomes its rows, and replacing a connected row would
+            # remove its connection, which the list refuses. Those rows belong to their
+            # connections; the output value below still carries the iteration's list.
+            #
+            # And for a list connected to as a whole: the value here is the connected items
+            # followed by the list's own entries, and storing it as the connected value would
+            # read the entries twice, and save them twice. The connection is checked itself, since
+            # a body node the loop never fed holds no stored value yet on the first run.
+            preserves_template = target_node.should_preserve_stored_template(target_param_name, param_value)
+            rows_are_connected = target_node._list_rows.has_connected_rows(target_param)
+            whole_list_is_connected = isinstance(
+                target_param, ParameterList
+            ) and target_node._param_has_incoming_connection(target_param.name)
+            if not preserves_template and not rows_are_connected and not whole_list_is_connected:
+                target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
 
             logger.debug(
@@ -3793,49 +4348,39 @@ class NodeExecutor:
                 target_param_name,
             )
 
-        logger.info(
+        logger.debug(
             "Successfully applied %d parameter values from last iteration to packaged nodes",
             len(last_iteration_values),
         )
 
     async def _delete_workflow(self, workflow_path: Path) -> None:
-        # Derive the registry key from the workflow path using workspace-relative logic so it
-        # matches the key used during registration (push_workflow(file_path=__file__) in the workflow).
-        workspace_path = await anyio.Path(GriptapeNodes.ConfigManager().workspace_path).resolve()
-        resolved = await anyio.Path(workflow_path).resolve()
-        if resolved.is_relative_to(workspace_path):
-            path_for_key = str(resolved.relative_to(workspace_path))
-        else:
-            path_for_key = str(resolved)
-        workflow_name = derive_registry_key(path_for_key)
-
-        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+        workflow = self.engine.workflow_registry.find_by_path(workflow_path)
+        if workflow is None:
             # Register the workflow so DeleteWorkflowRequest can find and remove it.
             # A subprocess may have registered it in its own process but not in the main process.
+            # Unlisted: it is registered only to be deleted.
             load_workflow_metadata_request = LoadWorkflowMetadata(file_name=workflow_path.name)
-            result = await GriptapeNodes.ahandle_request(load_workflow_metadata_request)
-            if isinstance(result, LoadWorkflowMetadataResultSuccess):
-                WorkflowRegistry.generate_new_workflow(
-                    registry_key=workflow_name, metadata=result.metadata, file_path=path_for_key
-                )
+            result = await self.engine.ahandle_request(load_workflow_metadata_request)
+            if not isinstance(result, LoadWorkflowMetadataResultSuccess):
+                logger.debug("Could not read workflow '%s' to clean it up: %s", workflow_path, result.result_details)
+                return
+            try:
+                workflow = self.engine.workflow_registry.register_file(workflow_path, result.metadata, listed=False)
+            except ValueError as err:
+                logger.debug("Could not register workflow '%s' to clean it up: %s", workflow_path, err)
+                return
 
-        delete_request = DeleteWorkflowRequest(name=workflow_name)
-        delete_result = await GriptapeNodes.ahandle_request(delete_request)
-        if isinstance(delete_result, DeleteWorkflowResultFailure):
-            logger.error(
-                "Failed to delete workflow '%s'. Error: %s",
-                workflow_name,
-                delete_result.result_details,
-            )
-        else:
-            logger.info(
+        delete_request = DeleteWorkflowRequest(name=workflow.name)
+        delete_result = await self.engine.ahandle_request(delete_request)
+        if not isinstance(delete_result, DeleteWorkflowResultFailure):
+            logger.debug(
                 "Cleanup result for workflow '%s': %s",
-                workflow_name,
+                workflow.name,
                 delete_result.result_details,
             )
 
     async def _get_storage_backend(self) -> StorageBackend:
-        storage_backend_str = GriptapeNodes.ConfigManager().get_config_value("storage_backend")
+        storage_backend_str = self.engine.config_manager.get_config_value("storage_backend")
         # Convert string to StorageBackend enum
         try:
             storage_backend = StorageBackend(storage_backend_str)

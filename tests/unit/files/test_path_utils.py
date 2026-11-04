@@ -10,18 +10,27 @@ import pytest
 from griptape_nodes.files.path_utils import (
     FilenameParts,
     _apply_windows_long_path_prefix,
+    canonicalize_expanded_for_identity,
     canonicalize_for_identity,
+    canonicalize_for_identity_preserving_symlinks,
     canonicalize_for_io,
     canonicalize_to_posix,
     decompose_source_path,
     expand_path,
+    expand_path_fully,
+    expansion_introduced_quoting,
+    is_url,
     normalize_path_for_platform,
     parse_file_uri,
+    parse_static_server_url,
     path_needs_expansion,
+    relative_to_keeping_or_following_links,
     resolve_file_path,
     resolve_path_safely,
     sanitize_path_string,
     strip_surrounding_quotes,
+    strip_windows_long_path_prefix,
+    unexpanded_references,
 )
 
 
@@ -63,6 +72,91 @@ class TestFilenameParts:
         """Directory is Path('.') when the input has no directory component."""
         parts = FilenameParts.from_filename("output.png")
         assert parts.directory == Path()
+
+
+class TestSanitizePathStringWindowsSeparators:
+    r"""On a backslash-separated path, ``\`` is a separator, not a shell escape.
+
+    Stripping it wholesale turns ``C:\outputs\!final\render.png`` into
+    ``C:\outputs!final\render.png``, silently retargeting the path at a sibling of the
+    intended directory whenever a component starts with a shell-special character
+    (griptape-ai/internal#178).
+
+    The discriminator is the path's SHAPE, not ``sys.platform`` -- a path can be authored
+    on one OS and consumed on another -- so every case here runs on every platform. No
+    ``skipif``, no patched ``is_windows``: a regression fails on the developer's machine
+    rather than waiting for the Windows CI job.
+
+    ``\ `` is the one escape still honored on a Windows-shaped path, because a Windows
+    path component cannot begin with a space, so ``\ `` is unambiguous.
+    """
+
+    @pytest.mark.parametrize(
+        "component",
+        ["!final", "[wip]", "{batch}", "$tmp", "(draft)", "&more", "*glob", ";semi", "'quote"],
+    )
+    def test_preserves_separator_before_special_component(self, component: str) -> None:
+        """Every shell-special leading character must keep its preceding separator."""
+        path_str = f"C:\\outputs\\{component}\\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_unc_path(self) -> None:
+        r"""UNC roots (``\\server\share``) are backslash-separated too."""
+        path_str = r"\\server\share\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_extended_length_unc_path(self) -> None:
+        r"""The ``\\?\UNC\`` form is Windows-shaped despite its unusual remainder.
+
+        After the ``\\?\`` prefix is stripped, ``UNC\server\...`` matches neither the
+        drive-letter nor the ``\\`` root, so shape detection must key on the prefix
+        itself. ``_apply_windows_long_path_prefix`` emits exactly this form, and
+        ``on_write_file_request`` re-sanitizes on the way in, so a UNC path that
+        round-trips through normalization lands here.
+        """
+        path_str = r"\\?\UNC\server\share\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_extended_length_drive_path(self) -> None:
+        r"""The ``\\?\C:\`` form must keep separators before special components."""
+        path_str = r"\\?\C:\outputs\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_still_unescapes_spaces_on_extended_length_unc_path(self) -> None:
+        r"""``\ `` remains the one honored escape under the ``\\?\UNC\`` prefix too."""
+        assert sanitize_path_string(r"\\?\UNC\server\share\my\ file.txt") == r"\\?\UNC\server\share\my file.txt"
+
+    def test_still_unescapes_spaces_on_windows_path(self) -> None:
+        r"""``\ `` remains an escape: a Windows component cannot start with a space.
+
+        LocalFileDriver relies on this to read a Finder/shell-escaped path whose
+        directory happens to be a real Windows temp dir.
+        """
+        assert sanitize_path_string(r"C:\dir\test\ file.txt") == r"C:\dir\test file.txt"
+
+    def test_still_removes_newlines_on_windows_path(self) -> None:
+        """The newline cleanup (WinError 123) applies regardless of shape."""
+        assert sanitize_path_string("C:\\Users\\file\n\n.txt") == "C:\\Users\\file.txt"
+
+    def test_still_strips_quotes_on_windows_path(self) -> None:
+        """Quote stripping is shape-independent."""
+        assert sanitize_path_string('"C:\\Users\\my file.txt"') == "C:\\Users\\my file.txt"
+
+    def test_posix_shaped_path_keeps_full_unescaping(self) -> None:
+        """A POSIX-shaped path has no separator ambiguity, so every escape is stripped."""
+        assert sanitize_path_string(r"/Downloads/Dragon\'s\ Curse/x.jpg") == "/Downloads/Dragon's Curse/x.jpg"
+
+    def test_relative_backslash_path_keeps_full_unescaping(self) -> None:
+        r"""Only a drive/UNC root marks a Windows path; a bare relative string does not.
+
+        A relative POSIX filename may legitimately contain an escaped backslash, and it
+        must not be misread as a Windows path.
+        """
+        assert sanitize_path_string(r"sub/dir\ name/file.txt") == "sub/dir name/file.txt"
 
 
 class TestSanitizePathString:
@@ -145,6 +239,34 @@ class TestStripSurroundingQuotes:
         assert strip_surrounding_quotes("test'") == "test'"
 
 
+class TestExpansionIntroducedQuoting:
+    """Tests for expansion_introduced_quoting: quoting a variable brought in, not the author."""
+
+    def test_quoted_variable_used_as_a_prefix_is_flagged(self) -> None:
+        """The case strip_surrounding_quotes cannot see: the quotes end up interior."""
+        assert expansion_introduced_quoting("${ROOT}/libs", '"/mnt/studio"/libs') is True
+
+    def test_single_quoted_variable_used_as_a_prefix_is_flagged(self) -> None:
+        """A leading `'` flips is_absolute() exactly as `"` does, so it is refused too."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "'/mnt/studio'/libs") is True
+
+    def test_apostrophe_from_a_variable_value_is_not_flagged(self) -> None:
+        """`/mnt/Dragon's Curse` is a real directory, so an interior apostrophe must survive."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "/mnt/Dragon's Curse/libs") is False
+
+    def test_apostrophe_the_author_declared_is_not_flagged(self) -> None:
+        """Quotes in the declared text are the author's intent, wherever they sit."""
+        assert expansion_introduced_quoting("'/mnt/studio'/libs", "'/mnt/studio'/libs") is False
+
+    def test_unquoted_expansion_is_not_flagged(self) -> None:
+        """The ordinary case stays ordinary."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "/mnt/studio/libs") is False
+
+    def test_additional_double_quote_is_flagged_even_when_the_author_wrote_one(self) -> None:
+        """Counted rather than tested for presence, so an author's quote cannot mask a new one."""
+        assert expansion_introduced_quoting('/mnt/say"hi/${ROOT}', '/mnt/say"hi/"/opt"') is True
+
+
 class TestExpandPath:
     """Tests for expand_path function."""
 
@@ -166,6 +288,70 @@ class TestExpandPath:
         """Test that function returns a Path object."""
         result = expand_path("~/test")
         assert isinstance(result, Path)
+
+
+class TestExpandPathFully:
+    """Tests for expand_path_fully: expansion repeated until the value stops changing."""
+
+    def test_expands_a_reference_that_expands_to_another_reference(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A variable whose VALUE contains a reference resolves all the way, which one pass cannot do."""
+        monkeypatch.setenv("GTN_TEST_INNER", "/studio")
+        monkeypatch.setenv("GTN_TEST_OUTER", "${GTN_TEST_INNER}/projects")
+
+        result = expand_path_fully("${GTN_TEST_OUTER}/libs")
+
+        assert result.path.as_posix() == "/studio/projects/libs"
+        assert result.stabilized is True
+        # The single-pass version stops one level short; that gap is the whole reason this exists.
+        assert "GTN_TEST_INNER" in str(expand_path("${GTN_TEST_OUTER}/libs"))
+
+    def test_reports_a_reference_cycle_instead_of_looping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mutually referencing variables terminate and come back as not stabilized."""
+        monkeypatch.setenv("GTN_TEST_PING", "${GTN_TEST_PONG}")
+        monkeypatch.setenv("GTN_TEST_PONG", "${GTN_TEST_PING}")
+
+        result = expand_path_fully("${GTN_TEST_PING}/libs")
+
+        assert result.stabilized is False
+
+    def test_self_reference_is_not_a_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`A=${A}` is left alone by expandvars, so it stabilizes as an ordinary unresolved reference."""
+        monkeypatch.setenv("GTN_TEST_SELF", "${GTN_TEST_SELF}")
+
+        result = expand_path_fully("${GTN_TEST_SELF}/libs")
+
+        assert result.stabilized is True
+        assert unexpanded_references(result.path).variables == ["GTN_TEST_SELF"]
+
+    def test_plain_path_stabilizes_unchanged(self) -> None:
+        """A value with nothing to expand comes back untouched on the first pass."""
+        result = expand_path_fully("/studio/libraries")
+
+        assert result.path.as_posix() == "/studio/libraries"
+        assert result.stabilized is True
+
+    def test_expands_tilde(self) -> None:
+        """Tilde expansion still happens, same as expand_path."""
+        result = expand_path_fully("~/Documents")
+
+        assert str(result.path).startswith(str(Path.home()))
+        assert result.stabilized is True
+
+    def test_bare_dollar_name_stays_literal(self) -> None:
+        """`$Recycle.Bin` is a real Windows directory; looping must not start eating it."""
+        result = expand_path_fully("$Recycle.Bin/libs")
+
+        assert result.path.as_posix() == "$Recycle.Bin/libs"
+        assert result.stabilized is True
+
+    def test_unset_variable_is_left_in_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unset reference is not a cycle: it stops changing immediately and stays reportable."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = expand_path_fully("${GTN_TEST_MISSING}/libs")
+
+        assert result.stabilized is True
+        assert unexpanded_references(result.path).variables == ["GTN_TEST_MISSING"]
 
 
 class TestPathNeedsExpansion:
@@ -195,6 +381,73 @@ class TestPathNeedsExpansion:
     def test_relative_path_no_expansion(self) -> None:
         """Test that relative paths without special chars don't need expansion."""
         assert path_needs_expansion("relative/path") is False
+
+
+class TestUnexpandedReferences:
+    """Tests for unexpanded_references: what `expand_path` could not supply a value for."""
+
+    def test_fully_expanded_path_reports_nothing(self) -> None:
+        """A path with no delimited references left comes back with both lists empty."""
+        result = unexpanded_references("/studio/libraries")
+
+        assert result.variables == []
+        assert result.macro_tokens == []
+
+    def test_reports_braced_variable_left_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `${NAME}` that expand_path could not resolve is reported by name."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = unexpanded_references(expand_path("${GTN_TEST_MISSING}/libs"))
+
+        assert result.variables == ["GTN_TEST_MISSING"]
+        assert result.macro_tokens == []
+
+    def test_reports_nothing_once_the_variable_is_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same value expands cleanly when the variable has a value."""
+        monkeypatch.setenv("GTN_TEST_PRESENT", "/studio")
+
+        result = unexpanded_references(expand_path("${GTN_TEST_PRESENT}/libs"))
+
+        assert result.variables == []
+
+    def test_reports_macro_tokens_separately(self) -> None:
+        """A `{NAME}` token is reported as a macro token, which expand_path never touches."""
+        result = unexpanded_references("{outputs}/libs")
+
+        assert result.variables == []
+        assert result.macro_tokens == ["outputs"]
+
+    def test_braced_variable_is_not_double_reported_as_a_macro_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`${NAME}` contains `{NAME}`, so the macro scan must skip what the env scan already claimed."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = unexpanded_references(expand_path("${GTN_TEST_MISSING}/libs"))
+
+        assert result.variables == ["GTN_TEST_MISSING"]
+        assert result.macro_tokens == []
+
+    def test_bare_dollar_name_is_not_reported(self) -> None:
+        """A bare `$NAME` stays literal: it is indistinguishable from a real folder like `$Recycle.Bin`."""
+        result = unexpanded_references("$Recycle.Bin/libs")
+
+        assert result.variables == []
+        assert result.macro_tokens == []
+
+    def test_reports_every_reference_in_one_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A value with several problems reports all of them, so a caller can show the whole picture."""
+        monkeypatch.delenv("GTN_TEST_ONE", raising=False)
+        monkeypatch.delenv("GTN_TEST_TWO", raising=False)
+
+        result = unexpanded_references("${GTN_TEST_ONE}/{outputs}/${GTN_TEST_TWO}")
+
+        assert result.variables == ["GTN_TEST_ONE", "GTN_TEST_TWO"]
+        assert result.macro_tokens == ["outputs"]
+
+    def test_accepts_a_path_object(self) -> None:
+        """expand_path returns a Path, so the helper takes one without the caller stringifying it."""
+        result = unexpanded_references(Path("{outputs}/libs"))
+
+        assert result.macro_tokens == ["outputs"]
 
 
 class TestResolvePathSafely:
@@ -262,6 +515,18 @@ class TestNormalizePathForPlatform:
         # Check for actual newline and carriage return characters, not the string sequences
         assert "\n" not in result
         assert "\r" not in result
+
+    @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific separator test")
+    def test_preserves_windows_separator_before_special_characters(self) -> None:
+        r"""Windows separators must survive even when the next component starts specially.
+
+        ``C:\outputs\!final\render.png`` must not become ``C:\outputs!final\render.png`` --
+        de-escaping would eat the separator and redirect the write to a sibling directory.
+        """
+        result = normalize_path_for_platform(Path(r"C:\outputs\!final\render.png"))
+
+        assert "\\!final" in result
+        assert "outputs!final" not in result
 
 
 class TestApplyWindowsLongPathPrefix:
@@ -334,6 +599,53 @@ class TestApplyWindowsLongPathPrefix:
         """
         monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
         assert _apply_windows_long_path_prefix("C:/x/file.txt") == "C:/x/file.txt"
+
+
+class TestStripWindowsLongPathPrefix:
+    r"""Tests for strip_windows_long_path_prefix, the inverse of the apply helper.
+
+    Like ``sanitize_path_string``, the discriminator is the path's SHAPE, not
+    ``sys.platform``: a ``\\?\`` path can be written on Windows into project
+    metadata and read back on macOS. So none of these are skipped per-platform --
+    a regression fails on any developer's machine.
+    """
+
+    def test_drive_prefix_is_stripped(self) -> None:
+        assert strip_windows_long_path_prefix(r"\\?\C:\ws\file.png") == r"C:\ws\file.png"
+
+    def test_unc_prefix_is_stripped(self) -> None:
+        assert strip_windows_long_path_prefix(r"\\?\UNC\server\share\file.png") == r"\\server\share\file.png"
+
+    def test_unc_prefix_is_case_insensitive(self) -> None:
+        r"""``\\?\unc\`` is as valid as ``\\?\UNC\``; both must strip to the same UNC root."""
+        assert strip_windows_long_path_prefix(r"\\?\unc\server\share\file.png") == r"\\server\share\file.png"
+
+    def test_forward_slash_drive_prefix_is_stripped(self) -> None:
+        """``//?/`` is the same prefix; only Windows pathlib rewrites it to backslashes."""
+        assert strip_windows_long_path_prefix("//?/C:/ws/file.png") == "C:/ws/file.png"
+
+    def test_forward_slash_unc_prefix_is_stripped(self) -> None:
+        """Separator style is preserved, so the result never comes back mixed."""
+        assert strip_windows_long_path_prefix("//?/UNC/server/share/file.png") == "//server/share/file.png"
+
+    def test_unprefixed_windows_path_is_unchanged(self) -> None:
+        assert strip_windows_long_path_prefix(r"C:\ws\file.png") == r"C:\ws\file.png"
+
+    def test_posix_path_is_unchanged(self) -> None:
+        assert strip_windows_long_path_prefix("/Users/james/ws/file.png") == "/Users/james/ws/file.png"
+
+    def test_bare_unc_path_is_unchanged(self) -> None:
+        """A plain UNC path has no long-path prefix to remove."""
+        assert strip_windows_long_path_prefix(r"\\server\share\file.png") == r"\\server\share\file.png"
+
+    def test_accepts_path_object(self) -> None:
+        assert strip_windows_long_path_prefix(Path("/Users/james/file.png")) == str(Path("/Users/james/file.png"))
+
+    def test_round_trips_with_apply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Apply -> strip returns the original, for both the drive and UNC forms."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        for original in (r"C:\ws\file.png", r"\\server\share\file.png"):
+            assert strip_windows_long_path_prefix(_apply_windows_long_path_prefix(original)) == original
 
 
 class TestResolveFilePath:
@@ -413,6 +725,30 @@ class TestParseFileUri:
         result = parse_file_uri(uri)
         assert result == "/path/to/file.txt"
 
+    def test_parse_localhost_percent_encoded(self) -> None:
+        """A percent-encoded localhost must decode before the comparison, not after.
+
+        Regression guard: decoding netloc only inside the (former) UNC branch meant
+        this literal-compared as "local%68ost" and missed the localhost collapse.
+        """
+        uri = "file://local%68ost/path/to/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "/path/to/file.txt"
+
+    def test_parse_file_scheme_case_insensitive(self) -> None:
+        """The file:// scheme match is case-insensitive, consistent with is_url() and RFC 3986."""
+        uri = "FILE:///path/to/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "/path/to/file.txt"
+
+    def test_bare_file_uri_with_no_path_returns_none(self) -> None:
+        """file:// alone names no file; returning "" would let a caller treat it as real."""
+        assert parse_file_uri("file://") is None
+
+    def test_bare_localhost_uri_with_no_path_returns_none(self) -> None:
+        """file://localhost alone names no file either."""
+        assert parse_file_uri("file://localhost") is None
+
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific test")
     def test_parse_windows_absolute_path(self) -> None:
         """Test parsing Windows absolute path file URI."""
@@ -439,11 +775,120 @@ class TestParseFileUri:
         result = parse_file_uri(uri)
         assert result == "/path/to/file!@#.txt"
 
-    def test_rejects_remote_host(self) -> None:
-        """Test that file URIs with non-localhost hosts are rejected."""
-        uri = "file://remote-server/path/to/file.txt"
+    def test_drive_letter_netloc_is_treated_as_local(self) -> None:
+        """A bare drive letter in the netloc slot (file://C:/...) names a local path, not a host.
+
+        Platform-independent: this is pure URI-spelling reinterpretation, not real UNC
+        resolution, so it doesn't need is_windows() patched.
+        """
+        uri = "file://C:/Users/test/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "C:/Users/test/file.txt"
+
+    def test_legacy_pipe_drive_letter_netloc_is_treated_as_local(self) -> None:
+        """The legacy file://c|/... spelling is the same drive-letter case, piped instead of colon."""
+        uri = "file://c|/Users/test/file.txt"
+        result = parse_file_uri(uri)
+        assert result == "c:/Users/test/file.txt"
+
+    def test_parses_unc_share_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A UNC network share resolves on Windows, where UNC paths are meaningful."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://server/share/render.exr"
+        result = parse_file_uri(uri)
+        assert result == "//server/share/render.exr"
+
+    def test_rejects_unc_share_off_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reject UNC shares off Windows.
+
+        POSIX has no UNC concept: Path("//server/share/f").resolve() silently returns a
+        real-looking but bogus local path, so a non-Windows host must reject this outright
+        rather than resolve it.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        uri = "file://server/share/render.exr"
         result = parse_file_uri(uri)
         assert result is None
+
+    def test_parses_unc_share_with_percent_encoding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test parsing a UNC network share file URI with percent-encoded characters."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://server/share/file%20with%20spaces.txt"
+        result = parse_file_uri(uri)
+        assert result == "//server/share/file with spaces.txt"
+
+    def test_rejects_unc_host_with_no_share(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A bare UNC host (no share) is not a path PureWindowsPath treats as absolute -- reject it."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server") is None
+
+    def test_rejects_unc_host_with_trailing_slash_and_no_share(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same as above: a trailing slash alone doesn't supply a share."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server/") is None
+
+    def test_parses_unc_host_preserves_case(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """UNC host and path casing is preserved, unlike the localhost check."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://Server/Share/File.txt"
+        result = parse_file_uri(uri)
+        assert result == "//Server/Share/File.txt"
+
+    def test_unc_result_is_not_classified_as_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A parsed UNC path must not be re-classified as a URL by is_url()."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://server/share/render.exr"
+        result = parse_file_uri(uri)
+        assert result is not None
+        assert is_url(result) is False
+
+    def test_rejects_path_traversal_as_unc_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """file://../../etc/passwd parses a netloc of ".." -- not a real host name."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://../../etc/passwd") is None
+
+    def test_rejects_userinfo_and_port_in_unc_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A UNC host is a bare NetBIOS/DNS name -- userinfo and a port aren't part of that."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://user:pass@host:445/share/f") is None
+
+    def test_rejects_ipv6_literal_as_unc_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Windows needs the [::1].ipv6-literal.net form; the bracket spelling can never open."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://[::1]/share/f") is None
+
+    def test_malformed_ipv6_does_not_raise(self) -> None:
+        """An unterminated "[" makes urlparse raise ValueError; this must return None, not propagate."""
+        assert parse_file_uri("file://[oops/path") is None
+
+    def test_rejects_unc_host_with_leading_dot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must start on an alphanumeric character, so a leading dot is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://.server/share/f") is None
+
+    def test_rejects_unc_host_with_trailing_dot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must end on an alphanumeric character, so a trailing dot is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server./share/f") is None
+
+    def test_rejects_unc_host_with_leading_hyphen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must start on an alphanumeric character, so a leading hyphen is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://-server/share/f") is None
+
+    def test_parses_unc_host_as_ip_literal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A bare (unbracketed) IPv4 address is a valid UNC host, unlike a bracketed IPv6 literal."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://192.168.1.5/share/f.txt"
+        result = parse_file_uri(uri)
+        assert result == "//192.168.1.5/share/f.txt"
+
+    def test_parses_unc_host_with_hyphen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hyphenated hostname (not at the start/end) is a valid UNC host."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://my-server/share/f.txt"
+        result = parse_file_uri(uri)
+        assert result == "//my-server/share/f.txt"
 
     def test_rejects_non_file_scheme(self) -> None:
         """Test that non-file:// URIs are rejected."""
@@ -477,6 +922,202 @@ class TestParseFileUri:
         uri = "file:///very/deeply/nested/directory/structure/file.txt"
         result = parse_file_uri(uri)
         assert result == "/very/deeply/nested/directory/structure/file.txt"
+
+
+class TestIsUrl:
+    """Tests for is_url function."""
+
+    def test_http_url(self) -> None:
+        assert is_url("http://example.com/clip.mp4") is True
+
+    def test_https_url(self) -> None:
+        assert is_url("https://example.com/clip.mp4") is True
+
+    def test_static_server_url_with_cachebuster(self) -> None:
+        """The form the engine hands node outputs around in."""
+        assert is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231") is True
+
+    def test_file_uri(self) -> None:
+        """file:// counts as a URL; parse_file_uri is what converts it to a path."""
+        assert is_url("file:///outputs/clip.mp4") is True
+
+    def test_non_http_scheme(self) -> None:
+        assert is_url("s3://bucket/clip.mp4") is True
+
+    def test_windows_drive_letter_is_not_a_url(self) -> None:
+        r"""`C:\...` must stay a path -- a one-char drive letter is not a scheme."""
+        assert is_url(r"C:\Users\artist\clip.mp4") is False
+
+    def test_windows_drive_letter_with_double_slash_is_not_a_url(self) -> None:
+        """`C://...` is the case a naive `://` check gets wrong."""
+        assert is_url("C://Users/artist/clip.mp4") is False
+
+    def test_windows_drive_letter_lowercase_is_not_a_url(self) -> None:
+        assert is_url("c://Users/artist/clip.mp4") is False
+
+    def test_unix_absolute_path(self) -> None:
+        assert is_url("/outputs/clip.mp4") is False
+
+    def test_relative_path(self) -> None:
+        assert is_url("outputs/clip.mp4") is False
+
+    def test_unc_path(self) -> None:
+        assert is_url(r"\\server\share\clip.mp4") is False
+
+    def test_windows_long_path_prefix(self) -> None:
+        assert is_url(r"\\?\C:\outputs\clip.mp4") is False
+
+    def test_macro_path(self) -> None:
+        assert is_url("{outputs}/clip.mp4") is False
+
+    def test_empty_string(self) -> None:
+        assert is_url("") is False
+
+    def test_data_uri_is_not_matched(self) -> None:
+        """`data:` has no `//`, so it is not a URL by this test.
+
+        Callers that must handle data URIs check for them separately; this
+        function exists to keep URLs out of the path helpers, and a data URI
+        would never be handed to one.
+        """
+        assert is_url("data:video/mp4;base64,AAAA") is False
+
+    def test_scheme_with_plus_and_dot(self) -> None:
+        """RFC 3986 allows `+`, `.`, `-` in schemes."""
+        assert is_url("svn+ssh://host/repo") is True
+        assert is_url("view-source://example.com") is True
+
+
+class TestParseStaticServerUrl:
+    """Tests for parse_static_server_url function."""
+
+    WORKSPACE = Path("/home/artist/GriptapeNodes")
+
+    def test_maps_static_server_url_to_workspace_file(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/staticfiles/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_strips_cachebuster_query(self) -> None:
+        """The `?t=` cachebuster is HTTP addressing, not part of the filename."""
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_https_localhost(self) -> None:
+        result = parse_static_server_url(
+            "https://localhost:8124/workspace/staticfiles/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_any_port(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:3000/workspace/staticfiles/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_nested_subdirectories(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/outputs/shots/010/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "outputs" / "shots" / "010" / "clip.mp4"
+
+    def test_does_not_percent_decode(self) -> None:
+        """URLs are built with `as_posix()` and no encoding, so the segment is literal.
+
+        Decoding here would disagree with the read path (StaticServerFileDriver)
+        and corrupt a filename that genuinely contains a `%`.
+        """
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/staticfiles/100%_final.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "100%_final.mp4"
+
+    def test_rejects_remote_host(self) -> None:
+        """A remote host may serve /workspace/ but its files are not on this machine."""
+        result = parse_static_server_url("https://example.com/workspace/clip.mp4", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_localhost_url_without_workspace_segment(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/api/health", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_localhost_url_with_empty_workspace_remainder(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/workspace/", self.WORKSPACE)
+        assert result is None
+
+    def test_maps_external_url_to_absolute_posix_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/Desktop/cat.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/Desktop/cat.png")
+
+    def test_maps_external_url_to_windows_drive_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/C:/Users/artist/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("C:/Users/artist/cat.png")
+
+    def test_maps_external_url_to_unc_path(self) -> None:
+        """`LocalStorageDriver` builds a UNC path's URL as `/external//server/share/...`."""
+        result = parse_static_server_url(
+            "http://localhost:8124/external//server/share/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("//server/share/cat.png")
+
+    def test_keeps_hash_in_external_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/shot#1.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/shot#1.png")
+
+    def test_keeps_semicolon_in_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/renders/clip;v2.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "renders" / "clip;v2.mp4"
+
+    def test_external_path_containing_workspace_segment(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/mnt/workspace/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("/mnt/workspace/cat.png")
+
+    def test_external_posix_dir_with_colon_is_not_a_drive(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/x:foo/bar.png", self.WORKSPACE)
+        assert result == Path("/x:foo/bar.png")
+
+    def test_rejects_localhost_url_with_empty_external_remainder(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_127_0_0_1(self) -> None:
+        """Only the `localhost` spelling is recognized, matching StaticServerFileDriver."""
+        result = parse_static_server_url("http://127.0.0.1:8124/workspace/clip.mp4", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_plain_path(self) -> None:
+        result = parse_static_server_url("/outputs/clip.mp4", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_path_containing_workspace_segment(self) -> None:
+        """A local path that happens to contain /workspace/ is not a URL."""
+        result = parse_static_server_url("/var/workspace/clip.mp4", self.WORKSPACE)
+        assert result is None
 
 
 class TestDecomposeSourcePath:
@@ -715,6 +1356,40 @@ class TestDecomposeSourcePath:
         assert result.source_relative_path is None
         assert result.source_file_name == "file.txt"
 
+    def test_long_path_prefixed_workspace_file_stays_inside_workspace(self) -> None:
+        r"""A prefixed in-workspace path must decompose exactly like the clean spelling.
+
+        Regression: the containment check compared the raw ``absolute_path`` against the
+        raw ``workspace_dir``, and ``\\?\`` changes a path's anchor rather than just its
+        spelling, so ``relative_to`` reported a file sitting inside the workspace as
+        outside it. The file then got an absolute-form preview cache key
+        (``C/Users/james/workspace/images/photo.png``) instead of the relative one, and a
+        second key for the same file appeared as soon as some caller happened to pass the
+        path through ``canonicalize_for_io`` -- which applies the prefix unconditionally
+        on Windows.
+        """
+        workspace = Path("C:/Users/james/workspace")
+        prefixed = Path("//?/C:/Users/james/workspace/images/photo.png")
+
+        result = decompose_source_path(prefixed, workspace)
+
+        # No drive component: that is what "inside the workspace" means here.
+        assert result.drive_volume_mount is None
+        assert result.source_relative_path == "images"
+        assert result.source_file_name == "photo.png"
+        assert result == decompose_source_path(Path("C:/Users/james/workspace/images/photo.png"), workspace)
+
+    def test_long_path_prefixed_workspace_dir_stays_inside_workspace(self) -> None:
+        r"""The workspace side carries the prefix just as often as the file side does."""
+        prefixed_workspace = Path("//?/C:/Users/james/workspace")
+        source = Path("C:/Users/james/workspace/images/photo.png")
+
+        result = decompose_source_path(source, prefixed_workspace)
+
+        assert result.drive_volume_mount is None
+        assert result.source_relative_path == "images"
+        assert result.source_file_name == "photo.png"
+
     def test_complex_filename_preserved(self) -> None:
         """Test that complex filenames with multiple extensions are preserved."""
         workspace = Path("/Users/james/workspace")
@@ -813,6 +1488,184 @@ class TestCanonicalizeForIdentity:
 
         result = canonicalize_for_identity(link)
         assert result == target.resolve()
+
+
+class TestCanonicalizeForIdentityPreservingSymlinks:
+    """Tests for canonicalize_for_identity_preserving_symlinks."""
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_a_link_keeps_its_own_path(self, tmp_path: Path) -> None:
+        """A link is named by where it sits, not by what it points at."""
+        target = tmp_path / "outside" / "real.txt"
+        target.parent.mkdir()
+        target.touch()
+        link = tmp_path / "inside" / "link.txt"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        assert canonicalize_for_identity_preserving_symlinks(link) == link
+
+    def test_expands_tilde(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows
+
+        result = canonicalize_for_identity_preserving_symlinks("~/project.yml")
+
+        assert result == tmp_path / "project.yml"
+
+    def test_anchors_relative_to_base(self, tmp_path: Path) -> None:
+        result = canonicalize_for_identity_preserving_symlinks("sub/file.txt", base=tmp_path)
+
+        assert result == tmp_path / "sub" / "file.txt"
+
+    def test_normalizes_dot_and_dotdot(self, tmp_path: Path) -> None:
+        result = canonicalize_for_identity_preserving_symlinks(f"{tmp_path}/a/../b/./c.txt")
+
+        assert result == tmp_path / "b" / "c.txt"
+
+    def test_matches_canonicalize_for_identity_when_no_links_are_involved(self, tmp_path: Path) -> None:
+        """The two agree on any path with no link along it; only symlink handling differs."""
+        target = tmp_path / "sub" / "project.yml"
+
+        assert canonicalize_for_identity_preserving_symlinks(target) == canonicalize_for_identity(target)
+
+    def test_carries_no_windows_long_path_prefix(self, tmp_path: Path) -> None:
+        """Unlike canonicalize_for_io the result is fit to be a key, so it keeps no prefix."""
+        result = canonicalize_for_identity_preserving_symlinks(tmp_path / "file.txt")
+
+        assert not str(result).startswith("\\\\?\\")
+
+
+class TestRelativeToKeepingOrFollowingLinks:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        root = tmp_path / "root"
+        root.mkdir()
+        return root
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_file_in_linked_subfolder_is_inside_by_the_link(self, root: Path, tmp_path: Path) -> None:
+        """A file reached through a link inside the root is named by the link."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (root / "link").symlink_to(elsewhere, target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "link" / "f.py", root)
+
+        assert result == Path("link/f.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_file_under_the_real_location_of_a_linked_root(self, root: Path, tmp_path: Path) -> None:
+        """A file under the real location of a root reached through a link is inside."""
+        linked_root = tmp_path / "linked_root"
+        linked_root.symlink_to(root, target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "sub" / "f.py", linked_root)
+
+        assert result == Path("sub/f.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_file_really_inside_but_reached_through_a_link_elsewhere(self, root: Path, tmp_path: Path) -> None:
+        """A link outside the root that points into it still finds the file inside."""
+        (root / "sub").mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "link").symlink_to(root / "sub", target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(outside / "link" / "f.py", root)
+
+        assert result == Path("sub/f.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_linked_folder_above_the_root_does_not_hide_a_file_really_inside(self, tmp_path: Path) -> None:
+        """Both sides are followed together, so a link above the root cannot make them disagree."""
+        real = tmp_path / "real"
+        (real / "ws" / "libs" / "mylib").mkdir(parents=True)
+        linked_parent = tmp_path / "linked"
+        linked_parent.symlink_to(real, target_is_directory=True)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "lib").symlink_to(real / "ws" / "libs" / "mylib", target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(elsewhere / "lib" / "f.py", linked_parent / "ws")
+
+        assert result == Path("libs/mylib/f.py")
+
+    def test_file_outside_the_root_returns_none(self, root: Path, tmp_path: Path) -> None:
+        """A file outside the root, links or not, has no relative path."""
+        assert relative_to_keeping_or_following_links(tmp_path / "other" / "f.py", root) is None
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_dot_dot_after_a_link_is_removed_as_text(self, root: Path, tmp_path: Path) -> None:
+        """`link/../x.py` is `x.py` in the root, because `..` goes before any link is followed."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (root / "link").symlink_to(elsewhere, target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "link" / ".." / "x.py", root)
+
+        assert result == Path("x.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_dot_dot_after_a_link_cannot_escape_the_root(self, root: Path) -> None:
+        """`link/../../x.py` is outside the root, because `..` goes before any link is followed.
+
+        Following `link` (to `a/b`) first would make it `<root>/x.py`, inside the root.
+        """
+        (root / "a" / "b").mkdir(parents=True)
+        (root / "link").symlink_to(root / "a" / "b", target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "link" / ".." / ".." / "x.py", root)
+
+        assert result is None
+
+    def test_relative_path_anchors_to_base(self, root: Path) -> None:
+        """A relative path is taken from `base`, not from the working directory."""
+        result = relative_to_keeping_or_following_links("sub/f.py", root, base=root)
+
+        assert result == Path("sub/f.py")
+
+
+class TestCanonicalizeExpandedForIdentity:
+    """Tests for canonicalize_expanded_for_identity: the same tail, without expanding again."""
+
+    def test_does_not_expand_variables(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A reference that survived the caller's own expansion is left alone, not expanded here.
+
+        The point of the function: a caller that VALIDATED its expansion must get back a path built
+        from the string it checked. Expanding again would return a different path than was validated.
+        """
+        monkeypatch.setenv("GTN_TEST_LATE", "/somewhere/else")
+
+        result = canonicalize_expanded_for_identity(tmp_path / "${GTN_TEST_LATE}")
+
+        assert result.name == "${GTN_TEST_LATE}"
+        # canonicalize_for_identity, given the same value, would expand it -- hence the two functions.
+        assert canonicalize_for_identity(tmp_path / "${GTN_TEST_LATE}") != result
+
+    def test_anchors_relative_paths_to_base(self, tmp_path: Path) -> None:
+        """Relative values are placed under `base`, same as canonicalize_for_identity."""
+        result = canonicalize_expanded_for_identity(Path("sub/file.txt"), base=tmp_path)
+
+        assert result == (tmp_path / "sub" / "file.txt").resolve()
+
+    def test_defaults_relative_paths_to_cwd(self) -> None:
+        """With no `base`, a relative value lands under CWD."""
+        result = canonicalize_expanded_for_identity(Path("file.txt"))
+
+        assert result == (Path.cwd() / "file.txt").resolve()
+
+    def test_normalizes_dot_segments(self, tmp_path: Path) -> None:
+        """`.` and `..` are collapsed so two spellings of one path compare equal."""
+        result = canonicalize_expanded_for_identity(tmp_path / "a" / ".." / "b" / "." / "c.txt")
+
+        assert result == (tmp_path / "b" / "c.txt").resolve()
+
+    def test_matches_canonicalize_for_identity_when_nothing_needs_expanding(self, tmp_path: Path) -> None:
+        """The two agree on any value with nothing left to expand; only the leading steps differ."""
+        already_expanded = tmp_path / "sub" / "project.yml"
+
+        assert canonicalize_expanded_for_identity(already_expanded) == canonicalize_for_identity(already_expanded)
 
 
 class TestCanonicalizeForIo:

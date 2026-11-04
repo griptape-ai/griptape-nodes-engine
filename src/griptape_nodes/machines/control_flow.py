@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -12,20 +13,24 @@ from griptape_nodes.exe_types.node_types import (
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
+from griptape_nodes.retained_mode.engine import EngineScoped, current_engine
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowResolvedEvent,
     CurrentControlNodeEvent,
     InvolvedNodesEvent,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
 if TYPE_CHECKING:
+    from queue import Queue
+
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.flow import ControlFlow
-    from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.managers.flow_manager import QueueItem
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 
 
 @dataclass
@@ -40,41 +45,46 @@ logger = logging.getLogger("griptape_nodes")
 
 
 # This is the control flow context. Owns the Resolution Machine
-class ControlFlowContext:
+class ControlFlowContext(EngineScoped):
     flow: ControlFlow
     current_nodes: list[BaseNode]
     resolution_machine: ParallelResolutionMachine
     selected_output: Parameter | None
     paused: bool = False
     flow_name: str
-    pickle_control_flow_result: bool
     end_node: BaseNode | None = None
     is_isolated: bool
+    # The run state of the workflow a top-level run belongs to, whose queue it takes its start nodes
+    # from. None for an isolated subflow.
+    flows: WorkflowFlows | None
+    # perf_counter() when the current run started, for the run_seconds the run's end events carry.
+    run_started_at: float | None = None
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         flow_name: str,
         max_nodes_in_parallel: int,
         *,
-        pickle_control_flow_result: bool = False,
+        dag_builder: DagBuilder,
+        flows: WorkflowFlows | None,
         is_isolated: bool = False,
+        engine: Engine | None = None,
     ) -> None:
+        super().__init__(engine)
         self.flow_name = flow_name
 
         # ALWAYS create ParallelResolutionMachine (SEQUENTIAL mode now maps to PARALLEL with max_nodes_in_parallel=1)
-        # Get the global DagBuilder from FlowManager
-
-        # Create isolated DagBuilder for independent subflows
-        if is_isolated:
-            dag_builder = DagBuilder()
-            logger.debug("Created isolated DagBuilder for flow '%s'", flow_name)
-        else:
-            dag_builder = GriptapeNodes.FlowManager().global_dag_builder
-
-        self.resolution_machine = ParallelResolutionMachine(flow_name, max_nodes_in_parallel, dag_builder=dag_builder)
+        self.resolution_machine = ParallelResolutionMachine(
+            flow_name,
+            max_nodes_in_parallel,
+            dag_builder=dag_builder,
+            flows=flows,
+            is_isolated=is_isolated,
+            engine=self.engine,
+        )
         self.current_nodes = []
-        self.pickle_control_flow_result = pickle_control_flow_result
         self.is_isolated = is_isolated
+        self.flows = flows
 
     def reset(self, *, cancel: bool = False) -> None:
         if self.current_nodes is not None:
@@ -84,6 +94,13 @@ class ControlFlowContext:
         self.resolution_machine.reset_machine(cancel=cancel)
         self.selected_output = None
         self.paused = False
+        self.run_started_at = None
+
+    def seconds_since_run_started(self) -> float | None:
+        """Seconds since the current run started, or None when no run is being timed."""
+        if self.run_started_at is None:
+            return None
+        return time.perf_counter() - self.run_started_at
 
 
 # GOOD!
@@ -97,19 +114,14 @@ class ResolveNodeState(State):
 
         # Mark all current nodes unresolved and broadcast events
         for current_node in context.current_nodes:
-            if not current_node.lock:
-                current_node.make_node_unresolved(
-                    current_states_to_trigger_change_event=set(
-                        {NodeResolutionState.UNRESOLVED, NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
-                    )
-                )
+            current_node.prepare_to_run_again()
             # Now broadcast that we have a current control node.
-            GriptapeNodes.EventManager().put_event(
+            context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=current_node.name))
                 )
             )
-            logger.info("Resolving %s", current_node.name)
+            logger.debug("Resolving %s", current_node.name)
         if not context.paused:
             # Call the update. Otherwise wait
             return ResolveNodeState
@@ -137,26 +149,32 @@ class ResolveNodeState(State):
 class CompleteState(State):
     @staticmethod
     async def on_enter(context: ControlFlowContext) -> type[State] | None:
+        context.end_node = None
+
+        # An isolated flow is a packaged copy of a loop body, entered once per iteration, and it is
+        # not the run anyone is watching. ControlFlowResolvedEvent means "the run is over" to every
+        # listener -- the editor clears its running-node sets on it, LocalWorkflowExecutor treats
+        # the first one as the workflow finishing -- and it carries no flow identity to say which
+        # run ended, so an isolated flow must not send it (issue #5486). Nothing needs it either:
+        # a subflow's completion is detected by `await subflow_machine.start_flow(...)` returning.
+        if context.is_isolated:
+            logger.debug("Isolated subflow '%s' is complete.", context.flow_name)
+            return None
+
         # Broadcast completion events for any remaining current nodes
         for current_node in context.current_nodes:
-            # Use pickle-based serialization for complex parameter output values
-
-            parameter_output_values, unique_uuid_to_values = NodeManager.serialize_parameter_output_values(
-                current_node, use_pickling=context.pickle_control_flow_result
-            )
-            GriptapeNodes.EventManager().put_event(
+            context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(
                         payload=ControlFlowResolvedEvent(
                             end_node_name=current_node.name,
-                            parameter_output_values=parameter_output_values,
-                            unique_parameter_uuid_to_values=unique_uuid_to_values or None,
+                            parameter_output_values=NodeManager.result_parameter_values(current_node),
+                            run_seconds=context.seconds_since_run_started(),
                         )
                     )
                 )
             )
-        context.end_node = None
-        logger.info("Flow is complete.")
+        logger.debug("Flow is complete.")
         return None
 
     @staticmethod
@@ -170,13 +188,35 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         self,
         flow_name: str,
         *,
-        pickle_control_flow_result: bool = False,
+        dag_builder: DagBuilder,
+        flows: WorkflowFlows | None = None,
         is_isolated: bool = False,
+        engine: Engine | None = None,
     ) -> None:
-        execution_type = GriptapeNodes.ConfigManager().get_config_value(
+        """Make the machine for one run, given the run state of the workflow it runs in.
+
+        The run keeps the DagBuilder and run state it was given, so it acts on its own workflow even
+        if that workflow closes and another opens while it waits on a node.
+
+        Args:
+            flow_name: The flow to run.
+            dag_builder: The workflow's DagBuilder for a top-level run, or a fresh one over the
+                workflow's connections for an isolated subflow.
+            flows: The workflow's run state, holding its queue of start nodes. A top-level run needs it.
+            is_isolated: True for a subflow that runs apart from the top-level run.
+            engine: The engine to run in.
+        """
+        if flows is None and not is_isolated:
+            msg = f"Attempted to run flow '{flow_name}'. Failed because a top-level run needs its workflow's queue of start nodes."
+            raise ValueError(msg)
+        # Resolve the engine once, before the context exists, so the execution-mode config and the
+        # context that runs the flow come from the same engine. Reading config off whatever engine
+        # happened to be ambient is how a run could pick up another engine's settings.
+        resolved_engine = engine if engine is not None else current_engine()
+        execution_type = resolved_engine.config_manager.get_config_value(
             "workflow_execution_mode", default=WorkflowExecutionMode.SEQUENTIAL
         )
-        max_nodes_in_parallel = GriptapeNodes.ConfigManager().get_config_value("max_nodes_in_parallel", default=5)
+        max_nodes_in_parallel = resolved_engine.config_manager.get_config_value("max_nodes_in_parallel", default=5)
 
         # SEQUENTIAL mode uses ParallelResolutionMachine with max_nodes_in_parallel=1
         if execution_type == WorkflowExecutionMode.SEQUENTIAL:
@@ -185,14 +225,17 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         context = ControlFlowContext(
             flow_name,
             max_nodes_in_parallel,
-            pickle_control_flow_result=pickle_control_flow_result,
+            dag_builder=dag_builder,
+            flows=flows,
             is_isolated=is_isolated,
+            engine=resolved_engine,
         )
         super().__init__(context)
 
     async def start_flow(
         self, start_node: BaseNode, end_node: BaseNode | None = None, *, debug_mode: bool = False
     ) -> None:
+        self._context.run_started_at = time.perf_counter()
         # If using DAG resolution, process data_nodes from queue first
         current_nodes = await self._process_nodes_for_dag(start_node)
         self._context.current_nodes = current_nodes
@@ -202,12 +245,18 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             node.set_entry_control_parameter(None)
         # Set up to debug
         self._context.paused = debug_mode
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self._context.engine.flow_manager
         flow = flow_manager.get_flow_by_name(self._context.flow_name)
-        if start_node != end_node:
+        if start_node != end_node and not self._context.is_isolated:
             # This blocks all nodes in the entire flow from running. If we're just resolving one node, we don't want to block that.
-            involved_nodes = list(flow.nodes.keys())
-            GriptapeNodes.EventManager().put_event(
+            #
+            # An isolated flow is excluded because it is a packaged copy of a loop body, whose node
+            # names exist only inside the engine. InvolvedNodesEvent carries no flow identity and
+            # the editor keeps one involved-node set that it replaces wholesale, so an isolated
+            # flow announcing itself overwrites that set with names the canvas cannot draw --
+            # including the group that is running the iteration (issue #5486).
+            involved_nodes = flow_manager.get_involved_node_names(flow)
+            self._context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
                 )
@@ -224,11 +273,10 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         self._context.paused = debug_mode
         self._context.resolution_machine.change_debug_mode(debug_mode=debug_mode)
 
-    async def granular_step(self, change_debug_mode: bool) -> None:  # noqa: FBT001
+    async def granular_step(self) -> None:
+        """Advance one step. The caller owns the debug-mode change, if any."""
         resolution_machine = self._context.resolution_machine
 
-        if change_debug_mode:
-            resolution_machine.change_debug_mode(debug_mode=True)
         await resolution_machine.update()
 
         # Tick the control flow if the current machine isn't busy
@@ -240,9 +288,8 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
                 await self.update()
 
     async def node_step(self) -> None:
+        """Advance one whole node. The caller owns the debug-mode change."""
         resolution_machine = self._context.resolution_machine
-
-        resolution_machine.change_debug_mode(debug_mode=False)
 
         # If we're in the resolution phase, step the resolution machine
         if self._current_state is ResolveNodeState:
@@ -278,11 +325,11 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         # Build with the first node (it should already be the proxy if it's part of a group)
         dag_builder.add_node_with_dependencies(start_node, start_node.name)
 
-        flow_manager = GriptapeNodes.FlowManager()
-        node_manager = GriptapeNodes.NodeManager()
-        is_isolated = dag_builder is not flow_manager.global_dag_builder
+        flow_manager = self._context.engine.flow_manager
+        node_manager = self._context.engine.node_manager
+        flows = self._context.flows
 
-        if is_isolated:
+        if self._context.is_isolated or flows is None:
             subflow = flow_manager.get_flow_by_name(self._context.flow_name)
             # Scope is this subflow's own direct nodes. Do NOT apply exclude_subflow_group_children
             # here (unlike get_start_node_queue): a node carries a parent_group only when it belongs
@@ -294,12 +341,12 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             categories = flow_manager.classify_nodes_for_dag(scope_nodes)
             logger.debug("Seeding isolated subflow '%s' DAG from its own nodes", self._context.flow_name)
         else:
-            categories = self._drain_global_flow_queue(flow_manager)
+            categories = self._drain_global_flow_queue(flows.global_flow_queue)
 
-        return self._seed_dag_from_categories(start_node, categories, dag_builder, flow_manager, node_manager)
+        return self._seed_dag_from_categories(start_node, categories, dag_builder, node_manager)
 
     @staticmethod
-    def _drain_global_flow_queue(flow_manager: FlowManager) -> DagNodeCategories:
+    def _drain_global_flow_queue(flow_queue: Queue[QueueItem]) -> DagNodeCategories:
         """Consume the global flow queue into categorized node lists for seeding.
 
         The queue is populated (and scoped) by get_start_node_queue before a top-level run. Draining
@@ -312,14 +359,14 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         start_nodes: list[BaseNode] = []
         control_nodes: list[BaseNode] = []
         data_sink_nodes: list[BaseNode] = []
-        for item in list(flow_manager.global_flow_queue.queue):
+        for item in list(flow_queue.queue):
             if item.dag_execution_type == DagExecutionType.START_NODE:
                 start_nodes.append(item.node)
             elif item.dag_execution_type == DagExecutionType.CONTROL_NODE:
                 control_nodes.append(item.node)
             elif item.dag_execution_type == DagExecutionType.DATA_NODE:
                 data_sink_nodes.append(item.node)
-            flow_manager.global_flow_queue.queue.remove(item)
+            flow_queue.queue.remove(item)
         return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=data_sink_nodes)
 
     @staticmethod
@@ -327,19 +374,22 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         start_node: BaseNode,
         categories: DagNodeCategories,
         dag_builder: DagBuilder,
-        flow_manager: FlowManager,
         node_manager: NodeManager,
     ) -> list[BaseNode]:
         """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
-        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 adds data
-        sink (terminal/leaf) nodes. A sink that is only data-connected gets its own graph so its
-        dependencies resolve unconditionally; a sink reachable from a graph's forward control
-        path is instead registered as a control-gated candidate so branches stay gated. The
-        current classifier only routes control-disconnected nodes into data_sink_nodes, so the
-        gated branch is a defensive fallback and the data-connected case is what runs in practice.
+        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 handles the data
+        sinks (terminal/leaf nodes with no control wires). A sink that sits downstream of this run's
+        control path is marked stale and put off: seeded now, its upstream walk would stop at a node
+        still RESOLVED from the previous run and never add an edge to the control node about to
+        re-run above it, so it would run beside that node on its old output. The driver seeds the
+        deferred sinks once every control graph has finished
+        (``ExecuteDagState._seed_deferred_data_sinks``), when the control nodes have run and marked
+        their downstream stale, so the walk adopts exactly what must recompute. A sink with nothing
+        from the control path above it is seeded now and runs alongside everything else.
         """
         start_nodes = [start_node]
+        connections = dag_builder.connections
 
         # PASS 1: control/start entries build the control-flow graphs.
         for node in (*categories.start_nodes, *categories.control_nodes):
@@ -349,22 +399,22 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
                 if node not in start_nodes:
                     start_nodes.append(node)
 
-        # PASS 2: data sinks, after the control graphs exist.
+        # Everything this run's control walk will re-run, and every data node fed by any of it.
+        may_be_stale: set[str] = set()
+        for entry_node in start_nodes:
+            may_be_stale.update(DagBuilder.collect_nodes_in_forward_control_path(entry_node, None, connections))
+        visited: set[str] = set()
+        for name in list(may_be_stale):
+            may_be_stale.update(connections.collect_downstream_data_nodes(node_manager.get_node_by_name(name), visited))
+
+        # PASS 2: data sinks.
         for node in categories.data_sink_nodes:
             node.state = NodeResolutionState.UNRESOLVED
             if node.name in dag_builder.node_to_reference:
                 continue
-            disconnected = True
-            for graph_start_node_name in list(dag_builder.graphs):
-                graph_start_node = node_manager.get_node_by_name(graph_start_node_name)
-                boundary_nodes = flow_manager.is_node_connected(graph_start_node, node)
-                if boundary_nodes:
-                    disconnected = False
-                    if node.name not in dag_builder.start_node_candidates:
-                        dag_builder.start_node_candidates[node.name] = {}
-                    dag_builder.start_node_candidates[node.name][graph_start_node_name] = set(boundary_nodes)
-            if disconnected:
-                # Not gated by any control graph - resolve it (and its dependencies) on its own.
+            if node.name in may_be_stale:
+                dag_builder.deferred_data_sinks.append(node)
+            else:
                 dag_builder.add_node_with_dependencies(node, node.name)
 
         return start_nodes

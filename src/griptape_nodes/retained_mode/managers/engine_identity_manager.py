@@ -16,7 +16,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineNameRequest,
@@ -27,11 +26,12 @@ from griptape_nodes.retained_mode.events.app_events import (
     SetEngineNameResultSuccess,
 )
 from griptape_nodes.retained_mode.events.base_events import (
-    BaseEvent,
     ResultDetails,
     ResultPayload,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.utils.name_generator import generate_engine_name
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -73,8 +73,7 @@ class EngineIdentityManager:
         self._current_engine_data = self._get_or_initialize_engine_data()
 
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(GetEngineNameRequest, self.handle_get_engine_name_request)
-            event_manager.assign_manager_to_request_type(SetEngineNameRequest, self.handle_set_engine_name_request)
+            event_manager.register_request_handlers(self)
 
     @property
     def active_engine_id(self) -> str | None:
@@ -126,7 +125,7 @@ class EngineIdentityManager:
 
         # Save updated engine data
         self._add_or_update_engine(self._current_engine_data)
-        logger.info("Updated engine name to: %s", engine_name)
+        logger.debug("Updated engine name to: %s", engine_name)
 
     @property
     def all_engines(self) -> list[EngineData]:
@@ -137,6 +136,7 @@ class EngineIdentityManager:
         """
         return self._engines_data.engines
 
+    @handles(GetEngineNameRequest)
     def handle_get_engine_name_request(self, request: GetEngineNameRequest) -> ResultPayload:  # noqa: ARG002
         """Handle requests to get the current engine name."""
         try:
@@ -146,15 +146,14 @@ class EngineIdentityManager:
             )
         except Exception as err:
             error_message = f"Failed to get engine name: {err}"
-            logger.error(error_message)
             return GetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
+    @handles(SetEngineNameRequest)
     def handle_set_engine_name_request(self, request: SetEngineNameRequest) -> ResultPayload:
         """Handle requests to set a new engine name."""
         try:
             if not request.engine_name or not request.engine_name.strip():
                 error_message = "Engine name cannot be empty"
-                logger.warning(error_message)
                 return SetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
             self.engine_name = request.engine_name.strip()
@@ -166,7 +165,6 @@ class EngineIdentityManager:
 
         except Exception as err:
             error_message = f"Failed to set engine name: {err}"
-            logger.error(error_message)
             return SetEngineNameResultFailure(error_message=error_message, result_details=error_message)
 
     def _get_or_initialize_engine_data(self) -> EngineData:
@@ -205,8 +203,6 @@ class EngineIdentityManager:
             )
             self._add_or_update_engine(engine_data)
 
-        # Register engine with BaseEvent
-        BaseEvent._engine_id = engine_data.id
         self._active_engine_id = engine_data.id
         logger.debug("Initialized engine ID: %s", engine_data.id)
         return engine_data
@@ -272,8 +268,8 @@ class EngineIdentityManager:
 
     @staticmethod
     def _get_engine_data_dir() -> Path:
-        """Get the XDG data directory for engine identity storage."""
-        return xdg_data_home() / "griptape_nodes"
+        """Get the engine data directory for engine identity storage."""
+        return engine_data_dir()
 
     @staticmethod
     def _get_engine_data_file() -> Path:

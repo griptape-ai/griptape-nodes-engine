@@ -44,6 +44,8 @@ class BuiltInSituation(StrEnum):
     COPY_EXTERNAL_FILE = "copy_external_file"
     DOWNLOAD_URL = "download_url"
     SAVE_NODE_OUTPUT = "save_node_output"
+    SAVE_OUTPUT_DIRECTORY = "save_output_directory"
+    SAVE_FILE_SEQUENCE = "save_file_sequence"
     SAVE_GRIPTAPE_NODES_PREVIEW = "save_griptape_nodes_preview"
     SAVE_STATIC_FILE = "save_static_file"
     SAVE_GRIPTAPE_NODES_METADATA = "save_griptape_nodes_metadata"
@@ -52,6 +54,7 @@ class BuiltInSituation(StrEnum):
     SAVE_WORKFLOW_THUMBNAIL = "save_workflow_thumbnail"
     SAVE_FAILED_WORKFLOW = "save_failed_workflow"
     SAVE_TEMP_FILE = "save_temp_file"
+    SAVE_WORKFLOW_BACKUP = "save_workflow_backup"
 
 
 class SituationPolicy(BaseModel):

@@ -1,10 +1,16 @@
 import tempfile
+import threading
+import time
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedStaticFilePath, StaticFilesManager
 
@@ -365,7 +371,10 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         """Create StaticFilesManager instance with mocked dependencies."""
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
-                config_manager=mock_config_manager, secrets_manager=mock_secrets_manager, event_manager=None
+                config_manager=mock_config_manager,
+                secrets_manager=mock_secrets_manager,
+                event_manager=None,
+                engine=Mock(),
             )
             manager.storage_driver = Mock()
             return manager
@@ -471,7 +480,9 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             )
 
             assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
-            assert "GT_CLOUD_API_KEY secret is not available" in result.error
+            # Names both credentials: a license-only user has no API key to set.
+            assert "no Griptape Cloud credential was found" in result.error
+            assert "GT_CLOUD_API_KEY" in result.error
 
     @pytest.mark.asyncio
     async def test_create_download_url_from_path_non_cloud_url(
@@ -542,7 +553,6 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             CreateStaticFileDownloadUrlFromPathRequest,
             CreateStaticFileDownloadUrlResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         resolved_path = Path("/mock/workspace/outputs/file.png")
 
@@ -552,7 +562,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png")
 
         with patch.object(
-            GriptapeNodes,
+            mock_static_files_manager.engine,
             "handle_request",
             return_value=GetPathForMacroResultSuccess(
                 result_details="resolved",
@@ -582,12 +592,11 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             CreateStaticFileDownloadUrlFromPathRequest,
             CreateStaticFileDownloadUrlResultFailure,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png")
 
         with patch.object(
-            GriptapeNodes,
+            mock_static_files_manager.engine,
             "handle_request",
             return_value=GetPathForMacroResultFailure(
                 result_details="missing variables",
@@ -620,6 +629,414 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
         assert "invalid macro syntax" in result.error
 
+    @pytest.mark.asyncio
+    async def test_create_download_url_from_path_metadata_only(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """Test metadata_only extracts provider metadata, serves the original file, and skips preview generation."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "clip.mov"
+        source_file.write_bytes(b"not a real video")
+
+        extract_metadata = AsyncMock(return_value={"width": 1920, "height": 1080, "codec": "prores"})
+        mock_static_files_manager.engine.artifact_manager.extract_artifact_metadata = extract_metadata
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        # preview=True alongside metadata_only proves metadata_only takes precedence
+        request = CreateStaticFileDownloadUrlFromPathRequest(
+            file_path=str(source_file), preview=True, metadata_only=True
+        )
+
+        with patch.object(mock_static_files_manager, "_generate_preview_if_needed") as mock_generate_preview:
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata == {"width": 1920, "height": 1080, "codec": "prores"}
+        extract_metadata.assert_awaited_once_with(str(source_file))
+        mock_generate_preview.assert_not_called()
+        # The original file is served, not a preview
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_from_path_metadata_only_workspace_relative(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """Test metadata_only resolves workspace-relative paths to the file the driver serves."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "outputs" / "clip.mov"
+        source_file.parent.mkdir()
+        source_file.write_bytes(b"not a real video")
+        mock_static_files_manager.config_manager.workspace_path = tmp_path
+
+        extract_metadata = AsyncMock(return_value={"codec": "prores"})
+        mock_static_files_manager.engine.artifact_manager.extract_artifact_metadata = extract_metadata
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="outputs/clip.mov", metadata_only=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata == {"codec": "prores"}
+        # The probe targets the workspace-resolved path, not the CWD-relative one
+        extract_metadata.assert_awaited_once_with(str(source_file))
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_from_path_metadata_only_extraction_error_still_succeeds(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """Test the never-fail policy: a raising provider must not break URL creation."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "clip.mov"
+        source_file.write_bytes(b"not a real video")
+
+        extract_metadata = AsyncMock(side_effect=RuntimeError("third-party provider exploded"))
+        mock_static_files_manager.engine.artifact_manager.extract_artifact_metadata = extract_metadata
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), metadata_only=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata is None
+        assert result.url == "http://signed-url.com"
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_from_path_metadata_only_missing_file(
+        self, mock_static_files_manager: StaticFilesManager
+    ) -> None:
+        """Test metadata_only on a non-local path still succeeds with no metadata and no provider probe."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        extract_metadata = AsyncMock()
+        mock_static_files_manager.engine.artifact_manager.extract_artifact_metadata = extract_metadata
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="/does/not/exist/clip.mov", metadata_only=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata is None
+        extract_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_preview_failure_serves_original_with_reason_and_warning(
+        self,
+        mock_static_files_manager: StaticFilesManager,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failed preview falls back to the original file, names why, and logs at WARNING.
+
+        Without the reason and a visible log line, the editor renders an
+        unexplained full-size image or an empty frame and the engine says nothing.
+        """
+        import logging
+
+        from griptape_nodes.retained_mode.events.artifact_events import GetPreviewForArtifactResultFailure
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultFailure(result_details="source file not found")
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is not None
+        assert "source file not found" in result.preview_failure_reason
+        # The ORIGINAL file is served, not a preview path
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Preview unavailable" in m for m in warning_messages)
+
+    @pytest.mark.asyncio
+    async def test_extensionless_file_serves_original_without_preview(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A file with no extension has no preview pipeline; the original is served, no reason set."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "README"
+        source_file.write_bytes(b"plain text")
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is None
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+
+    @pytest.mark.asyncio
+    async def test_unsupported_format_serves_original_without_preview(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A format with no registered provider is not a failure; the original is served."""
+        source_file = tmp_path / "notes.txt"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = []
+
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+
+        assert resolution.path_to_serve == source_file
+        assert resolution.preview_failure_reason is None
+
+    @pytest.mark.asyncio
+    async def test_missing_source_fallback_logs_debug_not_warning(
+        self,
+        mock_static_files_manager: StaticFilesManager,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A vanished source stays at DEBUG — it's routine and fires once per component.
+
+        The reason still reaches the editor via preview_failure_reason; only the
+        log level distinguishes the unactionable case from real failures.
+        """
+        import logging
+
+        from griptape_nodes.retained_mode.events.artifact_events import GetPreviewForArtifactResultFailure
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultFailure(
+                result_details="source file not found", source_file_missing=True
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is not None
+        fallback_records = [r for r in caplog.records if "Preview unavailable" in r.message]
+        assert fallback_records
+        assert all(r.levelno == logging.DEBUG for r in fallback_records)
+
+    @pytest.mark.asyncio
+    async def test_preview_generation_exception_falls_back_with_reason(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """An exception escaping preview generation still serves the original, with the reason."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        with patch.object(
+            mock_static_files_manager,
+            "_generate_preview_if_needed",
+            AsyncMock(side_effect=RuntimeError("provider blew up")),
+        ):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason == "provider blew up"
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+
+    @pytest.mark.asyncio
+    async def test_preview_success_has_no_failure_reason(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A served preview carries no failure reason."""
+        from griptape_nodes.retained_mode.events.artifact_events import GetPreviewForArtifactResultSuccess
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+        preview_path = tmp_path / ".griptape-nodes-previews" / "image.png.webp"
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                result_details="ok", paths_to_preview=str(preview_path), artifact_metadata={"width": 100}
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is None
+        assert result.artifact_metadata == {"width": 100}
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(preview_path)
+
+    @pytest.mark.asyncio
+    async def test_preview_request_carries_original_macro(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """The preview request preserves the caller's macro template.
+
+        Preview metadata records the macro template as source_macro_path; re-wrapping
+        the resolved absolute path bakes a machine-specific path into a file that
+        lives inside the project (griptape-ai/internal#240, Lead 1).
+        """
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetPreviewForArtifactRequest,
+            GetPreviewForArtifactResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetPathForMacroResultSuccess
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        resolved_path = tmp_path / "outputs" / "file.png"
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.handle_request = Mock(
+            return_value=GetPathForMacroResultSuccess(
+                result_details="resolved",
+                resolved_path=Path("outputs/file.png"),
+                absolute_path=resolved_path,
+            )
+        )
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                result_details="ok", paths_to_preview=str(tmp_path / "file.png.webp")
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png", preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        await_args = mock_static_files_manager.engine.ahandle_request.await_args
+        assert await_args is not None
+        preview_request = await_args.args[0]
+        assert isinstance(preview_request, GetPreviewForArtifactRequest)
+        assert preview_request.macro_path.parsed_macro.template == "{outputs}/file.png"
+
+    @pytest.mark.asyncio
+    async def test_preview_request_wraps_plain_path_when_no_macro(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A plain path request (no macro variables) keeps today's resolved-path wrap."""
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetPreviewForArtifactRequest,
+            GetPreviewForArtifactResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                result_details="ok", paths_to_preview=str(tmp_path / "image.png.webp")
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        await_args = mock_static_files_manager.engine.ahandle_request.await_args
+        assert await_args is not None
+        preview_request = await_args.args[0]
+        assert isinstance(preview_request, GetPreviewForArtifactRequest)
+        assert preview_request.macro_path.parsed_macro.template == str(source_file)
+
 
 class TestStaticFilesManagerResolveStaticFilePath:
     """Test StaticFilesManager._resolve_static_file_path() method."""
@@ -631,7 +1048,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config.get_config_value.return_value = "local"
         mock_config.workspace_path = Path("/mock/workspace")
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
-            manager = StaticFilesManager(config_manager=mock_config, secrets_manager=Mock(), event_manager=None)
+            manager = StaticFilesManager(
+                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=Mock()
+            )
         return manager
 
     def test_resolve_returns_path_and_policy_on_success(self, mock_static_files_manager: StaticFilesManager) -> None:
@@ -645,7 +1064,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetPathForMacroResultSuccess,
             GetSituationResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -676,11 +1094,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config_manager = Mock()
         mock_config_manager.get_config_value.return_value = str(workspace_dir)
         mock_config_manager.workspace_path = workspace_dir
+        mock_static_files_manager.config_manager = mock_config_manager
 
-        with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=mock_config_manager),
-        ):
+        with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
 
         assert result is not None
@@ -694,11 +1110,10 @@ class TestStaticFilesManagerResolveStaticFilePath:
         import logging
 
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultFailure
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         with (
             patch.object(
-                GriptapeNodes,
+                mock_static_files_manager.engine,
                 "handle_request",
                 return_value=GetSituationResultFailure(result_details="situation not found"),
             ),
@@ -723,7 +1138,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             SituationTemplate,
         )
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -733,7 +1147,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
 
         with (
             patch.object(
-                GriptapeNodes,
+                mock_static_files_manager.engine,
                 "handle_request",
                 return_value=GetSituationResultSuccess(situation=situation, result_details="ok"),
             ),
@@ -764,7 +1178,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetSituationResultSuccess,
             PathResolutionFailureReason,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -790,7 +1203,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             raise AssertionError(msg)
 
         with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
+            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
@@ -813,7 +1226,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetPathForMacroResultSuccess,
             GetSituationResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -849,8 +1261,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_static_files_manager.config_manager = mock_config_manager
 
         with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=mock_config_manager),
+            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
@@ -912,7 +1323,12 @@ class TestStaticFilesManagerCreateUploadUrl:
 
 
 class TestStaticFilesManagerBaseUrlTrailingSlash:
-    """Test that static_server_base_url trailing slashes are stripped."""
+    """Test that static_server_base_url trailing slashes are stripped.
+
+    Normalizing at construction keeps a configured override from reaching the storage driver as
+    `https://host//workspace`. The resolved URL is only settled once initialization completes,
+    so that is asserted in TestStaticFilesManagerOnAppInitializationComplete.
+    """
 
     @pytest.fixture
     def mock_secrets_manager(self) -> Mock:
@@ -931,7 +1347,7 @@ class TestStaticFilesManagerBaseUrlTrailingSlash:
     def test_init_strips_trailing_slashes(
         self, mock_secrets_manager: Mock, configured_url: str, expected_url: str
     ) -> None:
-        """Trailing slashes on static_server_base_url are stripped during init."""
+        """Trailing slashes on static_server_base_url are stripped before the driver sees it."""
         mock_config = Mock()
         mock_config.get_config_value.side_effect = lambda key, default=None: {
             "storage_backend": "local",
@@ -939,21 +1355,19 @@ class TestStaticFilesManagerBaseUrlTrailingSlash:
         }.get(key, default)
         mock_config.workspace_path = Path("/mock/workspace")
 
-        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
-            manager = StaticFilesManager(
-                config_manager=mock_config, secrets_manager=mock_secrets_manager, event_manager=None
-            )
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver") as driver_cls:
+            StaticFilesManager(config_manager=mock_config, secrets_manager=mock_secrets_manager, event_manager=None)
 
-        assert manager.static_server_base_url == expected_url
+        assert driver_cls.call_args.kwargs["base_url"] == f"{expected_url}/workspace"
 
 
 class TestStaticFilesManagerOnAppInitializationComplete:
-    """Test port handling in on_app_initialization_complete.
+    """Where on_app_initialization_complete points the storage driver.
 
-    The engine binds a free port at startup and may rewrite `static_server_base_url`
-    to reflect the OS-assigned port. That rewrite must only happen when the user has
-    not provided an explicit override, otherwise it clobbers tunnel configurations
-    (e.g. `ssh -L 8888:localhost:8124`, ngrok, reverse proxies).
+    The engine serves nothing itself. A host process that serves the workspace sets
+    `static_server_base_url` on the initialization payload, and the engine points there. With no
+    host-provided server it assumes a configured override, or else where the host's server listens
+    by default.
     """
 
     @pytest.fixture
@@ -977,56 +1391,28 @@ class TestStaticFilesManagerOnAppInitializationComplete:
             )
         return manager
 
-    def _invoke_initialization(self, manager: StaticFilesManager, actual_port: int) -> None:
+    def _invoke_initialization(self, manager: StaticFilesManager, host_base_url: str | None = None) -> None:
         from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 
-        mock_sock = Mock()
-        mock_sock.getsockname.return_value = ("127.0.0.1", actual_port)
+        manager.on_app_initialization_complete(AppInitializationComplete(static_server_base_url=host_base_url))
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.static_files_manager.bind_free_socket",
-                return_value=mock_sock,
-            ),
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.threading.Thread"),
-        ):
-            manager.on_app_initialization_complete(AppInitializationComplete())
-
-    def test_unset_base_url_rewritten_to_actual_port(self, mock_secrets_manager: Mock) -> None:
-        """When no override is configured, the OS-assigned port replaces the server's default port."""
+    def test_no_host_server_assumes_the_default_address(self, mock_secrets_manager: Mock) -> None:
+        """With nothing reported and no override, URLs point where the host's server listens by default."""
         manager = self._build_manager(mock_secrets_manager, None)
 
-        self._invoke_initialization(manager, actual_port=54321)
-
-        assert manager.static_server_base_url == "http://localhost:54321"
-        assert manager.storage_driver.base_url == "http://localhost:54321/workspace"
-
-    def test_custom_port_on_localhost_preserved(self, mock_secrets_manager: Mock) -> None:
-        """A custom port (e.g. from an `ssh -L 8888:localhost:8124` tunnel) must not be overwritten."""
-        manager = self._build_manager(mock_secrets_manager, "http://localhost:8888")
-
-        self._invoke_initialization(manager, actual_port=54321)
-
-        assert manager.static_server_base_url == "http://localhost:8888"
-        assert manager.storage_driver.base_url == "http://localhost:8888/workspace"
-
-    def test_custom_hostname_preserved(self, mock_secrets_manager: Mock) -> None:
-        """A custom host (e.g. an ngrok tunnel) must not be overwritten."""
-        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
-
-        self._invoke_initialization(manager, actual_port=54321)
-
-        assert manager.static_server_base_url == "https://my-tunnel.ngrok.io"
-        assert manager.storage_driver.base_url == "https://my-tunnel.ngrok.io/workspace"
-
-    def test_override_matching_defaults_is_still_preserved(self, mock_secrets_manager: Mock) -> None:
-        """An explicit override is respected even when it happens to equal the server defaults."""
-        manager = self._build_manager(mock_secrets_manager, "http://localhost:8124")
-
-        self._invoke_initialization(manager, actual_port=54321)
+        self._invoke_initialization(manager)
 
         assert manager.static_server_base_url == "http://localhost:8124"
         assert manager.storage_driver.base_url == "http://localhost:8124/workspace"
+
+    def test_no_host_server_uses_a_configured_override(self, mock_secrets_manager: Mock) -> None:
+        """A custom host (e.g. an ngrok tunnel) is advertised verbatim."""
+        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
+
+        self._invoke_initialization(manager)
+
+        assert manager.static_server_base_url == "https://my-tunnel.ngrok.io"
+        assert manager.storage_driver.base_url == "https://my-tunnel.ngrok.io/workspace"
 
     def test_access_before_initialization_complete_raises(self, mock_secrets_manager: Mock) -> None:
         """Reading the property before on_app_initialization_complete resolves it is a startup bug."""
@@ -1034,3 +1420,450 @@ class TestStaticFilesManagerOnAppInitializationComplete:
 
         with pytest.raises(RuntimeError, match="static_server_base_url accessed before"):
             _ = manager.static_server_base_url
+
+    def test_access_before_initialization_raises_even_with_an_override(self, mock_secrets_manager: Mock) -> None:
+        """A configured override does not count as resolved: the host may still report its own server.
+
+        The URL alone cannot answer "has initialization decided", because deciding there is no
+        server at all leaves it None -- which is why settledness is tracked separately. See
+        TestStaticServerUrlSettlement.
+        """
+        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
+
+        with pytest.raises(RuntimeError, match="static_server_base_url accessed before"):
+            _ = manager.static_server_base_url
+
+    @pytest.mark.parametrize(
+        ("configured_url", "expected_url"),
+        [
+            ("http://localhost:8124/", "http://localhost:8124"),
+            ("http://localhost:8124///", "http://localhost:8124"),
+            ("https://my-tunnel.ngrok.io/", "https://my-tunnel.ngrok.io"),
+        ],
+    )
+    def test_configured_url_trailing_slashes_are_stripped(
+        self, mock_secrets_manager: Mock, configured_url: str, expected_url: str
+    ) -> None:
+        """A trailing slash must not survive into the resolved URL or the workspace path."""
+        manager = self._build_manager(mock_secrets_manager, configured_url)
+
+        self._invoke_initialization(manager)
+
+        assert manager.static_server_base_url == expected_url
+        assert manager.storage_driver.base_url == f"{expected_url}/workspace"
+
+    def test_override_configured_after_construction_is_honored(self, mock_secrets_manager: Mock) -> None:
+        """Project activation can set the override after this manager is built, before app init."""
+        manager = self._build_manager(mock_secrets_manager, None)
+        manager.config_manager.get_config_value.side_effect = lambda key, default=None: {
+            "storage_backend": "local",
+            "static_server_base_url": "https://from-project.ngrok.io",
+        }.get(key, default)
+
+        self._invoke_initialization(manager)
+
+        assert manager.static_server_base_url == "https://from-project.ngrok.io"
+        assert manager.storage_driver.base_url == "https://from-project.ngrok.io/workspace"
+
+    def test_host_provided_server_is_adopted(self, mock_secrets_manager: Mock) -> None:
+        """When the host serves the workspace, the engine points at it."""
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        self._invoke_initialization(manager, host_base_url="http://localhost:54321/")
+
+        assert manager.static_server_base_url == "http://localhost:54321"
+        assert manager.storage_driver.base_url == "http://localhost:54321/workspace"
+
+    def test_host_provided_server_wins_over_a_configured_override(self, mock_secrets_manager: Mock) -> None:
+        """The host resolves its own URL, including any override, so its answer is final."""
+        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
+
+        self._invoke_initialization(manager, host_base_url="http://localhost:54321")
+
+        assert manager.static_server_base_url == "http://localhost:54321"
+
+    def test_repeat_initialization_keeps_the_host_url(self, mock_secrets_manager: Mock) -> None:
+        """A workflow executor completes initialization again without a URL; the host's answer stands."""
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        self._invoke_initialization(manager, host_base_url="http://localhost:54321")
+        self._invoke_initialization(manager)
+
+        assert manager.static_server_base_url == "http://localhost:54321"
+        assert manager.storage_driver.base_url == "http://localhost:54321/workspace"
+
+
+class TestStaticFilesManagerCloudCredential:
+    """The `StorageBackend.GTC` arm takes a license, and refuses a missing credential.
+
+    Without these, reverting the credential resolution (or dropping the
+    no-credential guard) leaves the suite green while either breaking
+    license-only users or sending `Bearer None` to Cloud on every upload.
+    """
+
+    _BUCKET_ID = "bucket-123"
+    _LICENSE = "eyJhbGciOiJFZERTQSJ9.eyJvcmdfaWQiOiJvIn0.sig"
+
+    @pytest.fixture
+    def gtc_config_manager(self) -> Mock:
+        """A ConfigManager configured for the Griptape Cloud storage backend."""
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/mock/workspace")
+        mock_config.get_config_value.side_effect = lambda key, default=None: {
+            "storage_backend": StorageBackend.GTC,
+            "static_files_directory": "staticfiles",
+            "static_server_base_url": None,
+        }.get(key, default)
+        return mock_config
+
+    def _secrets(self, secrets: dict[str, str | None]) -> Mock:
+        manager = Mock()
+        manager.get_secret.side_effect = lambda name, **_kwargs: secrets.get(name)
+        return manager
+
+    def _build(self, config_manager: Mock, secrets: dict[str, str | None]) -> StaticFilesManager:
+        return StaticFilesManager(
+            config_manager=config_manager,
+            secrets_manager=self._secrets(secrets),
+            event_manager=None,
+        )
+
+    def test_license_only_builds_cloud_driver(self, gtc_config_manager: Mock) -> None:
+        """The reported bug: a license with no GT_CLOUD_API_KEY must still reach Cloud."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GRIPTAPE_NODES_LICENSE": self._LICENSE},
+        )
+
+        assert isinstance(manager.storage_driver, GriptapeCloudStorageDriver)
+        assert manager.storage_driver.api_key == self._LICENSE
+
+    def test_api_key_only_builds_cloud_driver(self, gtc_config_manager: Mock) -> None:
+        """Today's common setup is unchanged."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GT_CLOUD_API_KEY": "gt-the-key"},
+        )
+
+        assert isinstance(manager.storage_driver, GriptapeCloudStorageDriver)
+        assert manager.storage_driver.api_key == "gt-the-key"
+
+    def test_no_credential_falls_back_to_local_storage(self, gtc_config_manager: Mock) -> None:
+        """A bucket but no credential must not yield a driver that sends "Bearer None"."""
+        manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
+
+        assert isinstance(manager.storage_driver, LocalStorageDriver)
+
+    def test_no_bucket_falls_back_to_local_storage(self, gtc_config_manager: Mock) -> None:
+        """Pre-existing behavior: no bucket means local storage regardless of credential."""
+        manager = self._build(gtc_config_manager, {"GRIPTAPE_NODES_LICENSE": self._LICENSE})
+
+        assert isinstance(manager.storage_driver, LocalStorageDriver)
+
+    def test_download_url_driver_accepts_a_license(self, gtc_config_manager: Mock) -> None:
+        """`_create_cloud_storage_driver` backs the download-URL path for cloud assets."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GRIPTAPE_NODES_LICENSE": self._LICENSE},
+        )
+
+        driver = manager._create_cloud_storage_driver(self._BUCKET_ID)
+
+        assert driver is not None
+        assert driver.api_key == self._LICENSE
+
+    def test_download_url_driver_is_none_without_a_credential(self, gtc_config_manager: Mock) -> None:
+        """No credential yields no driver, so the caller reports the missing credential."""
+        manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
+
+        assert manager._create_cloud_storage_driver(self._BUCKET_ID) is None
+
+
+class TestStaticServerUrlSettlement:
+    """The URL decision is awaited, not sampled.
+
+    Resolution and its consumers (worker spawn) are both listeners on AppInitializationComplete,
+    which fan out as unordered concurrent tasks -- so a consumer sampling the property races the
+    resolver. `wait_for_static_server_base_url` is the ordering guarantee: it returns the decision,
+    including the decision that no server will exist here.
+    """
+
+    @pytest.fixture
+    def manager(self) -> StaticFilesManager:
+        mock_config = Mock()
+        mock_config.get_config_value.return_value = "local"
+        mock_config.workspace_path = Path("/mock/workspace")
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
+            return StaticFilesManager(config_manager=mock_config, secrets_manager=Mock(), event_manager=None)
+
+    def test_a_waiter_gets_the_url_decided_after_it_started_waiting(self, manager: StaticFilesManager) -> None:
+        """The spawn-side shape: ask first, resolve second, still get the URL."""
+        manager.storage_driver = Mock(spec=LocalStorageDriver)
+
+        def resolve() -> None:
+            # Deliberately not is_worker: that branch adopts GTN_ORCHESTRATOR_STATIC_SERVER_BASE_URL
+            # from the ambient environment, which nothing here scrubs, so anyone with it exported
+            # would fail on their own value. The host-provided branch is what this test wants.
+            manager.on_app_initialization_complete(AppInitializationComplete(static_server_base_url="http://host:4242"))
+
+        timer = threading.Timer(0.05, resolve)
+        timer.start()
+        try:
+            assert manager.wait_for_static_server_base_url(5.0) == "http://host:4242"
+        finally:
+            timer.cancel()
+
+    def test_no_server_is_a_decision_too(self, manager: StaticFilesManager) -> None:
+        """Cloud storage resolves to no URL, and a waiter learns that immediately, not by timeout."""
+        manager.storage_driver = Mock(spec=GriptapeCloudStorageDriver)
+
+        manager.on_app_initialization_complete(AppInitializationComplete())
+
+        started = time.monotonic()
+        assert manager.wait_for_static_server_base_url(5.0) is None
+        assert time.monotonic() - started < 1.0
+
+    def test_a_failed_resolution_settles_as_no_url(self, manager: StaticFilesManager) -> None:
+        """A raising resolution counts as a decision, so waiters do not hold their full timeout.
+
+        It also has to read as "decided: no server" rather than "still deciding" -- the spawn path
+        words its warning off that, and pointing an operator at slow initialization when resolution
+        failed costs them the actual lead.
+        """
+        manager.storage_driver = Mock(spec=LocalStorageDriver)
+        assert manager.static_server_base_url_settled is False
+
+        with (
+            patch.object(manager, "_resolve_static_server", side_effect=RuntimeError("resolution failed")),
+            pytest.raises(RuntimeError, match="resolution failed"),
+        ):
+            manager.on_app_initialization_complete(AppInitializationComplete())
+
+        assert manager.static_server_base_url_settled is True
+        started = time.monotonic()
+        assert manager.wait_for_static_server_base_url(5.0) is None
+        assert time.monotonic() - started < 1.0
+
+
+class TestStaticFilesManagerWatchesMintedFiles:
+    """Local files a client mints a URL for are watched while the refresh_previews_on_file_change setting is on."""
+
+    def _build_manager(
+        self, *, setting_on: bool | None = None, is_worker: bool = False, max_files: object = None
+    ) -> StaticFilesManager:
+        # None leaves a setting out of the config, as for a user who never changed it.
+        config_values: dict[str, object] = {"storage_backend": "local"}
+        if setting_on is not None:
+            config_values["refresh_previews_on_file_change"] = setting_on
+        if max_files is not None:
+            config_values["refresh_previews_max_files"] = max_files
+        mock_config = Mock()
+        mock_config.get_config_value.side_effect = lambda key, default=None, **_kwargs: config_values.get(key, default)
+        mock_config.workspace_path = Path("/mock/workspace")
+        engine = Mock()
+        engine.library_manager.is_worker = is_worker
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
+            manager = StaticFilesManager(
+                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=engine
+            )
+        manager.storage_driver = Mock(spec=LocalStorageDriver)
+        manager.storage_driver.create_signed_download_url.return_value = "http://localhost/plate.png?v=a"
+        manager.storage_driver.get_asset_url.return_value = "file:///plate.png"
+        manager.file_watcher = Mock()
+        return manager
+
+    async def _mint(self, manager: StaticFilesManager, file_path: str) -> None:
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        result = await manager.on_handle_create_static_file_download_url_from_path_request(
+            CreateStaticFileDownloadUrlFromPathRequest(file_path=file_path)
+        )
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_watches_the_file_with_the_path_the_client_sent(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager()
+
+        await self._mint(manager, image.as_uri())
+
+        manager.file_watcher.watch_file.assert_called_once()
+        watched_path, requested_file_path = manager.file_watcher.watch_file.call_args.args
+        # Compared as files: the path round-trips through a URI, and Windows may change its spelling.
+        assert watched_path.samefile(image)
+        assert requested_file_path == image.as_uri()
+
+    @pytest.mark.asyncio
+    async def test_watches_the_resolved_file_for_a_macro_path(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.project_events import GetPathForMacroResultSuccess
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager()
+        manager.engine.handle_request = Mock(
+            return_value=GetPathForMacroResultSuccess(resolved_path=image, absolute_path=image, result_details="ok")
+        )
+
+        await self._mint(manager, "{inputs}/plate.png")
+
+        manager.file_watcher.watch_file.assert_called_once()
+        assert manager.file_watcher.watch_file.call_args.args == (image, "{inputs}/plate.png")
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_with_the_setting_off(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(setting_on=False)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_in_a_worker(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(is_worker=True)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_under_cloud_storage(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager()
+        manager.storage_driver = Mock(spec=GriptapeCloudStorageDriver)
+        manager.storage_driver.create_signed_download_url.return_value = "https://signed.example/plate.png"
+        manager.storage_driver.get_asset_url.return_value = "https://cloud.example/plate.png"
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_a_missing_file(self, tmp_path: Path) -> None:
+        manager = self._build_manager()
+
+        await self._mint(manager, str(tmp_path / "missing.png"))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    def test_a_change_is_sent_to_clients_as_an_app_event(self) -> None:
+        from griptape_nodes.retained_mode.events.base_events import AppEvent
+        from griptape_nodes.retained_mode.events.static_file_events import StaticFileChanged
+        from griptape_nodes.retained_mode.managers.static_file_watcher import WatchedFileChange
+
+        manager = self._build_manager()
+
+        manager._on_watched_file_changed(
+            WatchedFileChange(path=Path("/work/plate.png"), requested_file_paths=["{inputs}/plate.png"])
+        )
+
+        event = manager.engine.event_manager.put_event.call_args.args[0]
+        assert isinstance(event, AppEvent)
+        assert event.payload == StaticFileChanged(
+            file_path=str(Path("/work/plate.png")), requested_file_paths=["{inputs}/plate.png"]
+        )
+
+    def test_a_change_is_not_sent_after_the_setting_is_turned_off(self) -> None:
+        from griptape_nodes.retained_mode.managers.static_file_watcher import WatchedFileChange
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_watched_file_changed(
+            WatchedFileChange(path=Path("/work/plate.png"), requested_file_paths=["{inputs}/plate.png"])
+        )
+
+        manager.engine.event_manager.put_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_applies_the_configured_file_limit(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(max_files=250)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.set_max_files.assert_called_with(250)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_files", [None, "abc", 0, -5, True, 12.5])
+    async def test_an_unusable_file_limit_falls_back_to_the_default(self, tmp_path: Path, max_files: object) -> None:
+        from griptape_nodes.retained_mode.managers.settings import DEFAULT_REFRESH_PREVIEWS_MAX_FILES
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(max_files=max_files)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.set_max_files.assert_called_with(DEFAULT_REFRESH_PREVIEWS_MAX_FILES)
+        manager.file_watcher.watch_file.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reads_the_baseline_before_minting_the_url(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.managers.static_file_watcher import StaticFileWatcher
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        before_mint = StaticFileWatcher.read_fingerprint(image)
+        manager = self._build_manager()
+
+        def mint_while_the_file_is_saved(_path: Path) -> str:
+            image.write_bytes(b"saved during the mint")
+            return "http://localhost/plate.png?v=a"
+
+        manager.storage_driver.create_signed_download_url.side_effect = mint_while_the_file_is_saved
+
+        await self._mint(manager, str(image))
+
+        baseline = manager.file_watcher.watch_file.call_args.kwargs["baseline"]
+        assert baseline == before_mint
+        assert baseline != StaticFileWatcher.read_fingerprint(image)
+
+    def test_turning_the_setting_off_stops_watching(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_config_changed(
+            ConfigChanged(key="refresh_previews_on_file_change", old_value=True, new_value=False)
+        )
+
+        manager.file_watcher.clear.assert_called_once()
+        manager.file_watcher.set_max_files.assert_not_called()
+
+    def test_a_changed_file_limit_applies_at_once(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(max_files=50)
+
+        manager._on_config_changed(ConfigChanged(key="refresh_previews_max_files", old_value=1000, new_value=50))
+
+        manager.file_watcher.set_max_files.assert_called_once_with(50)
+        manager.file_watcher.clear.assert_not_called()
+
+    def test_a_replaced_config_is_applied(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_config_changed(ConfigChanged(key="", old_value=None, new_value={}))
+
+        manager.file_watcher.clear.assert_called_once()
+
+    def test_other_config_changes_are_ignored(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_config_changed(ConfigChanged(key="log_level", old_value="INFO", new_value="DEBUG"))
+
+        manager.file_watcher.clear.assert_not_called()
+        manager.file_watcher.set_max_files.assert_not_called()

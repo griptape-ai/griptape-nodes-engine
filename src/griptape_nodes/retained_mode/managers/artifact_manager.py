@@ -11,9 +11,13 @@ from pydantic import BaseModel, ValidationError
 
 from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
-from griptape_nodes.files.path_utils import decompose_source_path
+from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
+    CheckArtifactReadPermissionRequest,
+    CheckArtifactReadPermissionResultFailure,
+    CheckArtifactReadPermissionResultSuccess,
     GeneratePreviewFromDefaultsRequest,
     GeneratePreviewFromDefaultsResultFailure,
     GeneratePreviewFromDefaultsResultSuccess,
@@ -78,7 +82,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     AudioArtifactProvider,
     BaseArtifactPreviewGenerator,
@@ -87,6 +90,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     ImageArtifactProvider,
     ProviderRegistry,
     VideoArtifactProvider,
+    WriteVettingPolicy,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_models import (
     ArtifactSchemas,
@@ -101,8 +105,13 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
 )
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.async_utils import to_thread
+from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
+from griptape_nodes.utils.file_utils import mtimes_match
+from griptape_nodes.utils.keyed_mutex import KeyedMutex
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -134,7 +143,10 @@ class PreviewMetadata(BaseModel):
         preview_generator_parameters: Parameters supplied to preview generator
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.1.0"
+    # Raising this is the only thing that invalidates previews already on disk, since the sidecar
+    # records a generator's parameters but nothing about how it encoded. Raise it when a generator's
+    # output changes; every media type's previews then rebuild once.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.2.0"
 
     version: str
     source_macro_path: str
@@ -160,53 +172,34 @@ class PreviewSettings(BaseModel):
     generator_params: BaseGeneratorParameters  # Will be a specific BaseGeneratorParameters subclass
 
 
-class ArtifactManager:
+class ArtifactManager(EngineScoped):
     """Manages artifact operations including preview generation.
 
     Coordinates artifact type providers to handle different media formats.
     Providers are looked up by file extension for efficient routing.
     """
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         """Initialize the ArtifactManager.
 
         Args:
             event_manager: Optional event manager for handling artifact events
+            engine: The owning Engine, used to resolve peer managers.
         """
+        super().__init__(engine)
         # Provider registry for managing artifact providers
-        self._registry = ProviderRegistry()
+        self._registry = ProviderRegistry(engine=engine)
+
+        # Per-source single-flight lock for preview lookup/regeneration, keyed on the
+        # canonicalized source path. Must be a KeyedMutex, not asyncio.Locks: request
+        # handlers run on arbitrary threads and the sync handle_request path drives
+        # async handlers on a transient event loop per call, which asyncio primitives
+        # do not survive. Cross-process races are made non-destructive by the atomic
+        # OVERWRITE write in OSManager.
+        self._preview_mutex = KeyedMutex()
 
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(
-                GeneratePreviewRequest, self.on_handle_generate_preview_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GeneratePreviewFromDefaultsRequest, self.on_handle_generate_preview_from_defaults_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetPreviewForArtifactRequest, self.on_handle_get_preview_for_artifact_request
-            )
-            event_manager.assign_manager_to_request_type(
-                RegisterArtifactProviderRequest, self.on_handle_register_artifact_provider_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListArtifactProvidersRequest, self.on_handle_list_artifact_providers_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetArtifactProviderDetailsRequest, self.on_handle_get_artifact_provider_details_request
-            )
-            event_manager.assign_manager_to_request_type(
-                RegisterPreviewGeneratorRequest, self.on_handle_register_preview_generator_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListPreviewGeneratorsRequest, self.on_handle_list_preview_generators_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetPreviewGeneratorDetailsRequest, self.on_handle_get_preview_generator_details_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetArtifactSchemasRequest, self.on_handle_get_artifact_schemas_request
-            )
+            event_manager.register_request_handlers(self)
 
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
@@ -235,39 +228,152 @@ class ArtifactManager:
                 return sniffed
         return None
 
-    def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:
-        """Process content before writing to disk by dispatching to the appropriate provider.
+    def provider_for_write(self, file_name: str) -> BaseArtifactProvider | None:
+        """The provider that collects and embeds write metadata for `file_name`, or None.
 
-        Looks up the artifact provider for the file's extension and delegates
-        to that provider's prepare_content_for_write for format-specific processing.
+        Reads the provider registry, so call it on the event loop. The caller collects metadata
+        with the provider on the loop and runs its `prepare_content_for_write` on a worker thread.
 
         Args:
-            data: Raw file bytes
             file_name: Filename including extension
+        """
+        return self._provider_for_format(Path(file_name).suffix.lstrip(".").lower())
+
+    def get_write_vetting_policy(self, detected_format: str) -> WriteVettingPolicy | None:
+        """Return the vetting mode the format's provider needs, or ``None``.
+
+        Resolves the provider that claims ``detected_format`` and returns the
+        result of ``get_write_vetting_policy``. Returns ``None`` when no
+        provider handles the format -- OSManager treats that identically to a
+        provider opting out.
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.get_write_vetting_policy()
+
+    def check_write_format_from_bytes(
+        self,
+        data: bytes,
+        detected_format: str,
+    ) -> CheckpointDenial | None:
+        """Route a from-bytes write vet through the format's provider.
+
+        Called by OSManager when the provider's ``get_write_vetting_policy``
+        returned ``FROM_BYTES``. Providers without a policy (or no provider at
+        all) fall through to ``None`` (allow).
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.check_write_format_from_bytes(data, detected_format)
+
+    def check_write_format_from_path(
+        self,
+        source_path: str,
+        detected_format: str,
+    ) -> CheckpointDenial | None:
+        """Route a from-path write vet through the format's provider.
+
+        Called by OSManager after staging the pending bytes at ``source_path``.
+        The provider is trusted to read ``source_path`` but must not write to
+        or delete it -- OSManager owns the staged file's lifecycle. Providers
+        without a policy (or no provider at all) fall through to ``None``
+        (allow).
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.check_write_format_from_path(source_path, detected_format)
+
+    def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
+        """Route a pending read through the format's provider for permission checking.
+
+        Resolves the provider from the file's extension and asks its
+        ``check_read_permission`` hook whether the read is allowed. Providers
+        without a policy fall through to the default ``None`` (allow), as does
+        an unrecognized extension.
+
+        Callers should reach this via ``CheckArtifactReadPermissionRequest``
+        rather than calling here directly, so library code stays request-driven.
+
+        Args:
+            source_path: Absolute path to the source file.
 
         Returns:
-            Processed bytes, or original bytes if no provider handles this extension
+            A ``CheckpointDenial`` if the provider refuses the read, or
+            ``None`` when the read is permitted (including when no provider
+            handles this extension).
         """
-        extension = Path(file_name).suffix.lstrip(".").lower()
+        extension = Path(source_path).suffix.lstrip(".").lower()
         if not extension:
-            return data
-        provider_classes = self._registry.get_provider_classes_by_format(extension)
+            return None
+        provider = self._provider_for_format(extension)
+        if provider is None:
+            return None
+        return provider.check_read_permission(source_path)
+
+    async def extract_artifact_metadata(self, source_path: str) -> dict | None:
+        """Extract source-file metadata via the format's provider, off the event loop.
+
+        Resolves the provider through ``_provider_for_format`` so the
+        multi-provider-per-format policy stays centralized. Returns None when no
+        provider claims the extension or the provider cannot extract metadata
+        (built-in providers return None rather than raise on unreadable files).
+        Exceptions from third-party providers propagate; callers own their
+        failure policy.
+
+        Args:
+            source_path: Absolute path to the source file.
+
+        Returns:
+            The provider's metadata as a dict, or None.
+        """
+        extension = Path(source_path).suffix.lstrip(".").lower()
+        if not extension:
+            return None
+        provider = self._provider_for_format(extension)
+        if provider is None:
+            return None
+        metadata = await to_thread(provider.get_artifact_metadata, source_path)
+        return metadata.model_dump() if metadata else None
+
+    def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
+        """Resolve the registered provider that handles ``fmt`` (empty → None).
+
+        Centralizes the "which class wins when multiple providers claim the
+        same format" decision so ``check_write_format_from_bytes``,
+        ``check_write_format_from_path``, ``check_read_permission``, and
+        ``provider_for_write`` don't drift on it.
+        Currently just "first registered class wins" per the provider
+        registry order; ambiguity handling is tracked at
+        https://github.com/griptape-ai/griptape-nodes/issues/4027.
+        """
+        if not fmt:
+            return None
+        provider_classes = self._registry.get_provider_classes_by_format(fmt)
         if not provider_classes:
-            return data
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
-        # Handle ambiguity when multiple providers support the same extension
-        # (e.g., .mp4 could be handled by both video and audio providers).
-        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
-        return provider.prepare_content_for_write(data, file_name)
+            return None
+        return self._registry.get_or_create_provider_instance(provider_classes[0])
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
 
-        Registers default artifact providers after the system is fully initialized.
+        Installs the process-wide ffmpeg cache redirect, then registers default artifact
+        providers, after the system is fully initialized.
 
         Args:
             _payload: App initialization complete payload
         """
+        # Move ffmpeg's lock file and downloaded binaries out of `static_ffmpeg`'s own package
+        # directory, which is read-only when the engine runs from a packaged app (notably the
+        # Linux AppImage's FUSE mount). Lives here rather than in engine boot because the video
+        # artifact provider is what depends on `static_ffmpeg`, and every process that can run
+        # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
+        # installed once; later broadcasts (and later engines)
+        # no-op. See utils/ffmpeg_cache.py.
+        install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
+
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()
         failures = []
@@ -284,9 +390,9 @@ class ArtifactManager:
                 f"Attempted to register default artifact providers during initialization. "
                 f"Failed due to: {failure_details}"
             )
-            logger.error(error_message)
             raise RuntimeError(error_message)
 
+    @handles(GeneratePreviewRequest)
     async def on_handle_generate_preview_request(  # noqa: PLR0911, C901, PLR0912, PLR0915
         self, request: GeneratePreviewRequest
     ) -> GeneratePreviewResultSuccess | GeneratePreviewResultFailure:
@@ -300,7 +406,7 @@ class ArtifactManager:
         """
         # FAILURE CASE: Resolve source path from MacroPath
         resolve_request = ResolveMacroPathRequest(macro_path=request.macro_path)
-        resolve_result = GriptapeNodes.handle_request(resolve_request)
+        resolve_result = self.engine.handle_request(resolve_request)
 
         if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
             return GeneratePreviewResultFailure(
@@ -311,7 +417,7 @@ class ArtifactManager:
 
         # FAILURE CASE: Verify file exists
         file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False)
-        file_info_result = GriptapeNodes.handle_request(file_info_request)
+        file_info_result = self.engine.handle_request(file_info_request)
 
         if not isinstance(file_info_result, GetFileInfoResultSuccess):
             return GeneratePreviewResultFailure(
@@ -323,6 +429,10 @@ class ArtifactManager:
             return GeneratePreviewResultFailure(
                 result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: file not found"
             )
+
+        # The pre-generation stat recorded in the metadata; the generate-then-verify
+        # loop below refreshes it when a retry re-stats the source.
+        source_file_entry = file_info_result.file_entry
 
         # FAILURE CASE: Extract file extension
         file_extension = Path(source_path).suffix[1:].lower()
@@ -386,20 +496,68 @@ class ArtifactManager:
         destination_dir = resolved_path.destination_dir
         preview_file_name = resolved_path.file_name
 
-        # FAILURE CASE: Call provider and get returned filenames
-        try:
-            preview_file_names = await provider_instance.attempt_generate_preview(
-                preview_generator_friendly_name=generator_name,
-                source_file_location=source_path,
-                preview_format=preview_format,
-                destination_preview_directory=str(destination_dir),
-                destination_preview_file_name=preview_file_name,
-                params=request.preview_generator_parameters,
+        # FAILURE CASE: Call provider and get returned filenames.
+        #
+        # Generate-then-verify loop: if the source changed while the preview was
+        # rendering, the preview depicts the old content — retry once with a fresh
+        # pre-generation stat. If the source is STILL changing after the retry
+        # (e.g. a render writing frames), stop and keep the pre-generation stat.
+        # The verify compares mtime EXACTLY, unlike the staleness check's
+        # mtimes_match tolerance: that tolerance absorbs drift a recorded mtime
+        # picks up from syncs and cross-volume copies, but both stats here come
+        # from the same filesystem seconds apart, where any difference is a real
+        # write. A tolerant compare would make a same-size in-place rewrite (a
+        # re-rendered frame, cp over the file) invisible to this loop — and the
+        # staleness check is blind to that same rewrite for the same reason, so
+        # this is the only place it can be caught.
+        max_generation_attempts = 2
+        generation_attempt = 1
+        while True:
+            try:
+                preview_file_names = await provider_instance.attempt_generate_preview(
+                    preview_generator_friendly_name=generator_name,
+                    source_file_location=source_path,
+                    preview_format=preview_format,
+                    destination_preview_directory=str(destination_dir),
+                    destination_preview_file_name=preview_file_name,
+                    params=request.preview_generator_parameters,
+                )
+            except Exception as e:
+                return GeneratePreviewResultFailure(
+                    result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {e}"
+                )
+
+            post_generation_info_result = self.engine.handle_request(
+                GetFileInfoRequest(path=source_path, workspace_only=False)
             )
-        except Exception as e:
-            return GeneratePreviewResultFailure(
-                result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {e}"
+            if (
+                not isinstance(post_generation_info_result, GetFileInfoResultSuccess)
+                or post_generation_info_result.file_entry is None
+            ):
+                # Can't verify (file vanished mid-flight?); keep what we generated.
+                break
+
+            source_unchanged = (
+                post_generation_info_result.file_entry.size == source_file_entry.size
+                and post_generation_info_result.file_entry.modified_time == source_file_entry.modified_time
             )
+            if source_unchanged:
+                break
+
+            if generation_attempt >= max_generation_attempts:
+                logger.info(
+                    "Source file '%s' is still changing; its preview may briefly show older content until it settles.",
+                    source_path,
+                )
+                break
+
+            logger.debug(
+                "Source file '%s' changed while its preview was being generated; regenerating from the new content.",
+                source_path,
+            )
+            # The post-generation stat becomes the retry's pre-generation stat.
+            source_file_entry = post_generation_info_result.file_entry
+            generation_attempt += 1
 
         # OPTIONAL: Generate metadata if requested
         metadata_path = None
@@ -409,7 +567,7 @@ class ArtifactManager:
                 if isinstance(preview_file_names, str):
                     preview_path = str(destination_dir / preview_file_names)
                     delete_request = DeleteFileRequest(path=preview_path, workspace_only=False)
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
 
                     if delete_result.failed():
                         error_details += (
@@ -420,22 +578,26 @@ class ArtifactManager:
                     for filename in preview_file_names.values():
                         preview_path = str(destination_dir / filename)
                         delete_request = DeleteFileRequest(path=preview_path, workspace_only=False)
-                        delete_result = GriptapeNodes.handle_request(delete_request)
+                        delete_result = self.engine.handle_request(delete_request)
 
                         if delete_result.failed():
                             error_details += f". Additionally, failed to delete preview file {filename}: {delete_result.result_details}"
 
                 return GeneratePreviewResultFailure(result_details=error_details)
 
-            # Step 1: Create metadata object
+            # Step 1: Create metadata object. The recorded stat is deliberately the
+            # PRE-generation one from the last generation attempt: if the source
+            # changed during that attempt, recording the old stat is what makes the
+            # next request see the preview as stale and regenerate. Recording a
+            # post-generation stat would brand a preview of old content as fresh.
             # Run in a thread because video providers shell out to ffprobe synchronously,
             # which would otherwise block the event loop.
             _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, source_path)
             metadata = PreviewMetadata(
                 version=PreviewMetadata.LATEST_SCHEMA_VERSION,
                 source_macro_path=request.macro_path.parsed_macro.template,
-                source_file_size=file_info_result.file_entry.size,
-                source_file_modified_time=file_info_result.file_entry.modified_time,
+                source_file_size=source_file_entry.size,
+                source_file_modified_time=source_file_entry.modified_time,
                 preview_file_names=preview_file_names,
                 preview_generator_name=generator_name,
                 preview_generator_parameters=deepcopy(request.preview_generator_parameters),
@@ -460,7 +622,7 @@ class ArtifactManager:
                 existing_file_policy=ExistingFilePolicy.OVERWRITE,
                 file_metadata=None,
             )
-            metadata_write_result = GriptapeNodes.handle_request(metadata_write_request)
+            metadata_write_result = self.engine.handle_request(metadata_write_request)
 
             if not isinstance(metadata_write_result, WriteFileResultSuccess):
                 return fail_with_cleanup(
@@ -480,6 +642,7 @@ class ArtifactManager:
 
         return GeneratePreviewResultSuccess(result_details=result_message, paths_to_preview=paths_to_preview)
 
+    @handles(GeneratePreviewFromDefaultsRequest)
     async def on_handle_generate_preview_from_defaults_request(
         self, request: GeneratePreviewFromDefaultsRequest
     ) -> GeneratePreviewFromDefaultsResultSuccess | GeneratePreviewFromDefaultsResultFailure:
@@ -538,7 +701,8 @@ class ArtifactManager:
             result_details=result.result_details, paths_to_preview=result.paths_to_preview
         )
 
-    async def on_handle_get_preview_for_artifact_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    @handles(GetPreviewForArtifactRequest)
+    async def on_handle_get_preview_for_artifact_request(
         self, request: GetPreviewForArtifactRequest
     ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
         """Handle get preview for artifact request with policy-based generation.
@@ -551,7 +715,7 @@ class ArtifactManager:
         """
         # FAILURE CASE: Resolve source path from MacroPath
         resolve_request = ResolveMacroPathRequest(macro_path=request.macro_path)
-        resolve_result = GriptapeNodes.handle_request(resolve_request)
+        resolve_result = self.engine.handle_request(resolve_request)
 
         if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -560,9 +724,34 @@ class ArtifactManager:
 
         source_path = resolve_result.resolved_path
 
+        # Single-flight guard: the editor renders one image per component and each
+        # fires its own preview request, so a stale preview arrives as several
+        # concurrent requests. Without the lock they all judge the preview stale and
+        # regenerate the same file simultaneously. The staleness check must run under
+        # the same lock as regeneration so waiters re-read the freshly written
+        # metadata and return the cached preview instead of regenerating again.
+        lock_key = str(canonicalize_for_identity(source_path))
+        async with self._preview_mutex.locked(lock_key):
+            return await self._get_preview_for_artifact_locked(request, source_path)
+
+    async def _get_preview_for_artifact_locked(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self, request: GetPreviewForArtifactRequest, source_path: str
+    ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
+        """Look up, validate, and (per policy) regenerate a preview for one source.
+
+        Runs under the per-source lock from on_handle_get_preview_for_artifact_request;
+        do not call directly.
+
+        Args:
+            request: Contains macro_path, artifact_provider_name, and preview_generation_policy
+            source_path: The macro-resolved absolute path of the source artifact
+
+        Returns:
+            Success with path_to_preview string, or failure with details
+        """
         # FAILURE CASE: Verify source file exists and get its metadata
-        file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False)
-        file_info_result = GriptapeNodes.handle_request(file_info_request)
+        file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False, broadcast_result=False)
+        file_info_result = self.engine.handle_request(file_info_request)
 
         if not isinstance(file_info_result, GetFileInfoResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -571,7 +760,8 @@ class ArtifactManager:
 
         if file_info_result.file_entry is None:
             return GetPreviewForArtifactResultFailure(
-                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: source file not found"
+                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: source file not found",
+                source_file_missing=True,
             )
 
         # FAILURE CASE: Validate provider
@@ -602,7 +792,7 @@ class ArtifactManager:
 
         # Check if metadata file exists
         metadata_info_request = GetFileInfoRequest(path=metadata_path, workspace_only=False)
-        metadata_info_result = GriptapeNodes.handle_request(metadata_info_request)
+        metadata_info_result = self.engine.handle_request(metadata_info_request)
 
         metadata_exists = (
             isinstance(metadata_info_result, GetFileInfoResultSuccess) and metadata_info_result.file_entry is not None
@@ -648,7 +838,7 @@ class ArtifactManager:
             workspace_only=False,
             should_transform_image_content_to_thumbnail=False,
         )
-        read_metadata_result = await GriptapeNodes.ahandle_request(read_metadata_request)
+        read_metadata_result = await self.engine.ahandle_request(read_metadata_request)
 
         if not isinstance(read_metadata_result, ReadFileResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -691,7 +881,7 @@ class ArtifactManager:
             # Single file case
             preview_file_path = str(destination_dir / metadata.preview_file_names)
             preview_info_request = GetFileInfoRequest(path=preview_file_path, workspace_only=False)
-            preview_info_result = GriptapeNodes.handle_request(preview_info_request)
+            preview_info_result = self.engine.handle_request(preview_info_request)
 
             if not isinstance(preview_info_result, GetFileInfoResultSuccess) or preview_info_result.file_entry is None:
                 preview_files_missing = True
@@ -700,7 +890,7 @@ class ArtifactManager:
             for filename in metadata.preview_file_names.values():
                 file_path = str(destination_dir / filename)
                 preview_file_check_request = GetFileInfoRequest(path=file_path, workspace_only=False)
-                preview_file_check_result = GriptapeNodes.handle_request(preview_file_check_request)
+                preview_file_check_result = self.engine.handle_request(preview_file_check_request)
 
                 if (
                     not isinstance(preview_file_check_result, GetFileInfoResultSuccess)
@@ -808,6 +998,32 @@ class ArtifactManager:
             artifact_metadata=metadata.artifact_metadata,
         )
 
+    @handles(CheckArtifactReadPermissionRequest)
+    def on_check_artifact_read_permission_request(
+        self, request: CheckArtifactReadPermissionRequest
+    ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
+        """Handle a read-permission check request by dispatching to the provider.
+
+        Whether the provider actually does any work is the provider's call:
+        the base ``check_read_permission`` returns ``None`` (allow), so
+        providers that don't opt in pay nothing.
+        """
+        if not request.source_path:
+            return CheckArtifactReadPermissionResultFailure(
+                result_details="Attempted to check read permission. Failed because no source path was provided."
+            )
+        denial = self.check_read_permission(request.source_path)
+        if denial is None:
+            return CheckArtifactReadPermissionResultSuccess(
+                denial=None,
+                result_details=f"Read allowed for '{request.source_path}'.",
+            )
+        return CheckArtifactReadPermissionResultSuccess(
+            denial=denial,
+            result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
+        )
+
+    @handles(ListArtifactProvidersRequest)
     def on_handle_list_artifact_providers_request(
         self, _request: ListArtifactProvidersRequest
     ) -> ListArtifactProvidersResultSuccess | ListArtifactProvidersResultFailure:
@@ -820,6 +1036,7 @@ class ArtifactManager:
             result_details="Successfully listed artifact providers", friendly_names=friendly_names
         )
 
+    @handles(GetArtifactProviderDetailsRequest)
     def on_handle_get_artifact_provider_details_request(
         self, request: GetArtifactProviderDetailsRequest
     ) -> GetArtifactProviderDetailsResultSuccess | GetArtifactProviderDetailsResultFailure:
@@ -843,6 +1060,7 @@ class ArtifactManager:
             registered_preview_generators=preview_generator_names,
         )
 
+    @handles(RegisterArtifactProviderRequest)
     def on_handle_register_artifact_provider_request(
         self, request: RegisterArtifactProviderRequest
     ) -> RegisterArtifactProviderResultSuccess | RegisterArtifactProviderResultFailure:
@@ -869,6 +1087,7 @@ class ArtifactManager:
         # NOTE: Provider is NOT instantiated here - lazy instantiation happens on first use
         return RegisterArtifactProviderResultSuccess(result_details="Artifact provider registered successfully")
 
+    @handles(RegisterPreviewGeneratorRequest)
     def on_handle_register_preview_generator_request(
         self, request: RegisterPreviewGeneratorRequest
     ) -> RegisterPreviewGeneratorResultSuccess | RegisterPreviewGeneratorResultFailure:
@@ -907,6 +1126,7 @@ class ArtifactManager:
             result_details=f"Preview generator '{generator_name}' registered successfully"
         )
 
+    @handles(ListPreviewGeneratorsRequest)
     def on_handle_list_preview_generators_request(
         self, request: ListPreviewGeneratorsRequest
     ) -> ListPreviewGeneratorsResultSuccess | ListPreviewGeneratorsResultFailure:
@@ -934,6 +1154,7 @@ class ArtifactManager:
             preview_generator_names=preview_generator_names,
         )
 
+    @handles(GetPreviewGeneratorDetailsRequest)
     def on_handle_get_preview_generator_details_request(
         self, request: GetPreviewGeneratorDetailsRequest
     ) -> GetPreviewGeneratorDetailsResultSuccess | GetPreviewGeneratorDetailsResultFailure:
@@ -991,6 +1212,7 @@ class ArtifactManager:
             parameters=parameters_dict,
         )
 
+    @handles(GetArtifactSchemasRequest)
     def on_handle_get_artifact_schemas_request(
         self,
         request: GetArtifactSchemasRequest,  # noqa: ARG002
@@ -1136,7 +1358,7 @@ class ArtifactManager:
         key_prefix = generator_class.get_config_key_prefix(provider_class.get_friendly_name())
 
         request = GetConfigCategoryRequest(category=key_prefix, failure_log_level=logging.DEBUG)
-        result = GriptapeNodes.handle_request(request)
+        result = self.engine.handle_request(request)
 
         # Config category doesn't exist - no settings written yet
         if not isinstance(result, GetConfigCategoryResultSuccess):
@@ -1164,7 +1386,7 @@ class ArtifactManager:
 
         # Single batched write for all parameters
         request = SetConfigCategoryRequest(category=key_prefix, contents=params)
-        GriptapeNodes.handle_request(request)
+        self.engine.handle_request(request)
 
     def _write_provider_default_settings(self, provider_class: type[BaseArtifactProvider]) -> None:
         """Write provider-level default settings (format and generator name) in one batch.
@@ -1180,7 +1402,7 @@ class ArtifactManager:
 
         category = provider_class.get_config_key_prefix()
         request = SetConfigCategoryRequest(category=category, contents=settings)
-        GriptapeNodes.handle_request(request)
+        self.engine.handle_request(request)
 
     def _validate_and_register_generator_settings(
         self, provider_class: type[BaseArtifactProvider], generator_class: type[BaseArtifactPreviewGenerator]
@@ -1258,7 +1480,7 @@ class ArtifactManager:
         generator_key = provider_class.get_preview_generator_config_key()
 
         # Check format validity
-        format_result = GriptapeNodes.handle_request(
+        format_result = self.engine.handle_request(
             GetConfigValueRequest(category_and_key=format_key, failure_log_level=logging.DEBUG)
         )
         format_valid = (
@@ -1267,7 +1489,7 @@ class ArtifactManager:
         )
 
         # Check generator validity
-        generator_result = GriptapeNodes.handle_request(
+        generator_result = self.engine.handle_request(
             GetConfigValueRequest(category_and_key=generator_key, failure_log_level=logging.DEBUG)
         )
         registered_generators = self._registry.get_preview_generators_for_provider(provider_class)
@@ -1313,7 +1535,7 @@ class ArtifactManager:
         # Step 1: Read format from config (or use default if missing)
         format_config_key = provider_class.get_preview_format_config_key()
         format_request = GetConfigValueRequest(category_and_key=format_config_key, failure_log_level=logging.DEBUG)
-        format_result = GriptapeNodes.handle_request(format_request)
+        format_result = self.engine.handle_request(format_request)
 
         if isinstance(format_result, GetConfigValueResultSuccess):
             # Config exists - use it (provider will validate later)
@@ -1327,7 +1549,7 @@ class ArtifactManager:
         generator_request = GetConfigValueRequest(
             category_and_key=generator_config_key, failure_log_level=logging.DEBUG
         )
-        generator_result = GriptapeNodes.handle_request(generator_request)
+        generator_result = self.engine.handle_request(generator_request)
 
         registered_generators = self._registry.get_preview_generators_for_provider(provider_class)
         registered_generator_names = [gen.get_friendly_name() for gen in registered_generators]
@@ -1369,7 +1591,7 @@ class ArtifactManager:
                 f"{provider_class.get_config_key_prefix()}.preview_generator_configurations.{generator_key}"
             )
             params_request = GetConfigValueRequest(category_and_key=params_config_key, failure_log_level=logging.DEBUG)
-            params_result = GriptapeNodes.handle_request(params_request)
+            params_result = self.engine.handle_request(params_request)
 
             if isinstance(params_result, GetConfigValueResultSuccess):
                 # Params exist in config - validate them through Pydantic
@@ -1413,7 +1635,9 @@ class ArtifactManager:
         Returns:
             True if source file has changed (stale), False otherwise
         """
-        return metadata.source_file_size != source_size or metadata.source_file_modified_time != source_mtime
+        if metadata.source_file_size != source_size:
+            return True
+        return not mtimes_match(metadata.source_file_modified_time, source_mtime)
 
     def _does_preview_match_current_settings(
         self,
@@ -1469,7 +1693,7 @@ class ArtifactManager:
         """
         # Get current project
         get_project_request = GetCurrentProjectRequest()
-        project_result = GriptapeNodes.handle_request(get_project_request)
+        project_result = self.engine.handle_request(get_project_request)
 
         if not isinstance(project_result, GetCurrentProjectResultSuccess):
             msg = "No current project loaded"
@@ -1483,7 +1707,7 @@ class ArtifactManager:
 
         # Get save_griptape_nodes_preview situation template
         get_situation_request = GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW)
-        get_situation_result = GriptapeNodes.handle_request(get_situation_request)
+        get_situation_result = self.engine.handle_request(get_situation_request)
 
         if not isinstance(get_situation_result, GetSituationResultSuccess):
             msg = f"{BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW} situation not found in project template"
@@ -1506,7 +1730,7 @@ class ArtifactManager:
             parsed_macro=parsed_macro,
             variables=variables,
         )
-        path_result = GriptapeNodes.handle_request(path_request)
+        path_result = self.engine.handle_request(path_request)
 
         if not isinstance(path_result, GetPathForMacroResultSuccess):
             msg = f"Failed to resolve preview path macro: {path_result.result_details}"

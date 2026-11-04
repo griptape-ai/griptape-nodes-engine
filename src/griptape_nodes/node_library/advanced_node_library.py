@@ -1,12 +1,44 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from pydantic import TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from griptape_nodes.node_library.library_registry import Library, LibrarySchema
-    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+    from griptape_nodes.retained_mode.events.base_events import (
+        AppPayload,
+        ExecutionPayload,
+        RequestPayload,
+        ResultPayload,
+    )
+
+
+@dataclass(frozen=True)
+class MCPTool:
+    """A request type a library exposes as a tool on the engine's MCP server.
+
+    The tool is named after the request type, its description is the request's docstring, and
+    its input schema comes from the request's fields.
+
+    Attributes:
+        request_type: A request type this library handles, returned from get_request_handlers().
+        read_only: Whether the tool only reads state. Clients use this to decide which tools
+            need the user's approval and which to offer in read-only modes.
+    """
+
+    request_type: type[RequestPayload]
+    read_only: bool = False
+
+    def input_schema(self) -> dict[str, Any]:
+        """Return the JSON schema of the request's fields, which agents fill in to call the tool.
+
+        Raises pydantic.errors.PydanticUserError if a field's type has no JSON schema.
+        """
+        return TypeAdapter(self.request_type).json_schema()
 
 
 class AdvancedNodeLibrary:
@@ -57,7 +89,8 @@ class AdvancedNodeLibrary:
         """Called before the library is unregistered from the engine.
 
         Called before the engine deregisters any event listeners, pre-dispatch hooks,
-        or request handlers, and before the library is removed from LibraryRegistry.
+        post-dispatch hooks, or request handlers, and before the library is removed
+        from LibraryRegistry.
         Use it to release external resources acquired during load — Python bindings,
         GPU contexts, background threads, connection pools, etc.
 
@@ -90,11 +123,10 @@ class AdvancedNodeLibrary:
 
         Both sync and async handler callables are supported.
 
-        **Orchestrator process only.** Handlers registered via this method run in
-        the orchestrator process. Libraries loaded in worker processes will not have
-        their handlers forwarded to the orchestrator, so requests dispatched there
-        will result in "No manager found". Cross-worker handler support is tracked
-        in GH#4748.
+        **Registered per process.** Every library loads on the orchestrator, so its
+        handlers always serve requests dispatched there. A library whose nodes execute
+        in a worker also loads in that worker, which registers its own copy; the two
+        processes never forward handler requests to each other.
 
         **Singleton handlers only.** This mechanism is for services where exactly
         one library is the provider (e.g. colour conversion, ML inference). For
@@ -108,10 +140,10 @@ class AdvancedNodeLibrary:
         discover which request types it registered and inspect their field schemas
         using standard Python APIs::
 
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            from griptape_nodes.node_library.library_registry import LibraryRegistry
             import dataclasses, typing
 
-            library = GriptapeNodes.LibraryRegistry().get_library("My Library Name")
+            library = LibraryRegistry.get_library("My Library Name")
             for request_type in library.get_registered_request_handler_types():
                 hints = typing.get_type_hints(request_type)
                 fields = dataclasses.fields(request_type)
@@ -122,6 +154,169 @@ class AdvancedNodeLibrary:
             def get_request_handlers(self):
                 return [
                     (ConvertColorspaceRequest, self._handle_convert_colorspace),
+                ]
+        """
+        return []
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        """Return the request types to expose as tools on the engine's MCP server.
+
+        Each request type must also be returned from get_request_handlers(), so a library can
+        only expose requests it handles itself. A tool that breaks this rule is reported as an
+        MCPToolRegistrationProblem and none of the library's tools are exposed.
+
+        The engine registers the tools after get_request_handlers() and removes them when the
+        library is unloaded.
+
+        **Where the tools appear.** Library tools are kept apart from the engine's own tools, so
+        a client only pays for the products it uses. With the server at ``/mcp/``:
+
+        - ``/mcp/libraries/<slug>/`` serves only this library's tools.
+        - ``/mcp/?libraries=<slug>,<slug>`` serves the engine's tools plus the named libraries'.
+
+        The slug is the library name in lowercase, with each run of spaces and punctuation
+        replaced by one underscore, so "Acme Render Tools" becomes ``acme_render_tools``.
+
+        Example:
+            def get_mcp_tools(self):
+                return [
+                    MCPTool(ListRendersRequest, read_only=True),
+                    MCPTool(StartRenderRequest),
+                ]
+        """
+        return []
+
+    def get_post_dispatch_hooks(
+        self,
+    ) -> list[
+        tuple[
+            type[RequestPayload],
+            Callable[[RequestPayload, ResultPayload], None]
+            | Callable[[RequestPayload, ResultPayload], Awaitable[None]],
+        ]
+    ]:
+        """Return post-dispatch hooks to register with the engine.
+
+        Each entry is a (request_type, callback) pair. After the engine's own
+        handler for that request type produces a result, the callback is invoked
+        with (request, result). Unlike get_request_handlers(), this does not claim
+        the request type — any number of libraries may hook the same type, and the
+        engine's handler still runs normally.
+
+        The engine registers all returned hooks after after_library_nodes_loaded()
+        and deregisters them automatically when the library is unloaded.
+
+        Both sync and async callbacks are supported. Sync callbacks run in a worker
+        thread; async callbacks run on the engine's event loop and must not block it.
+
+        **Notification only.** The callback's return value is ignored and it cannot
+        alter the result or fail the operation. A callback that raises is logged and
+        otherwise ignored.
+
+        **Usually detached.** Whenever the engine has a live event loop the hook is
+        scheduled as a detached task, so the result reaches the client without waiting
+        for it. Some paths have no such loop — CLI commands, bootstrap workflow runs,
+        worker threads — and there the hook runs inline and blocks the caller until it
+        returns, on a transient loop rather than the engine's. Keep hooks quick, or move
+        slow work off-process, if they may fire on those paths.
+
+        **Both outcomes.** The callback is invoked for successes and failures alike,
+        including failures produced by an exception escaping the handler. Branch on
+        the result type to filter.
+
+        **Exact type matching.** A hook registered for a request type fires only for
+        that exact type, not for its subclasses.
+
+        **Read-only arguments.** Do not mutate the request or the result: both are
+        still referenced by the result event the engine is about to serialize. Fields
+        marked ``omit_from_result`` have already been cleared on the request the hook
+        receives.
+
+        **Do not issue engine requests from a hook.** The engine's operation-depth and
+        node-execution state is process-wide, so a request issued from a hook can
+        perturb an in-flight operation. Do external work (HTTP, file writes) instead.
+
+        **Registered per process.** Hooks are registered on the event manager of
+        whichever process loads the library. A library whose nodes execute in a worker
+        loads in both processes, so each copy observes only the requests its own
+        process handles.
+
+        **Not durable.** In-flight hooks are abandoned at process exit. Do not use
+        them where delivery must be guaranteed.
+
+        Example:
+            def get_post_dispatch_hooks(self):
+                return [
+                    (SaveWorkflowRequest, self._on_workflow_saved),
+                ]
+        """
+        return []
+
+    def get_execution_event_listeners(
+        self,
+    ) -> list[tuple[type[ExecutionPayload], Callable[[ExecutionPayload], None]]]:
+        """Return execution event listeners to register with the engine.
+
+        Each entry is an (event_type, callback) pair. While Griptape Nodes runs a workflow, it
+        calls the callback with the event each time one of that type happens. Where
+        get_post_dispatch_hooks() reacts to a request the engine handled, these react to what
+        happens during a run. ``NodeStartProcessEvent`` and ``NodeFinishProcessEvent`` report
+        every node a workflow runs.
+
+        The engine registers all returned listeners after after_library_nodes_loaded()
+        and deregisters them automatically when the library is unloaded.
+
+        **Keep it quick.** The workflow waits for the callback to return, so a slow one holds
+        it up. Hand slow work (network calls, file writes) to a background thread.
+
+        **Synchronous only.** Async callbacks are rejected and reported as a library problem.
+
+        **Notification only.** The return value is ignored. A callback that raises is logged
+        and otherwise ignored, and the workflow carries on.
+
+        **Exact type matching.** A listener registered for an event type fires only for that
+        exact type, not for its subclasses.
+
+        **Don't modify the event.** Other listeners receive the same one.
+
+        Example:
+            def get_execution_event_listeners(self):
+                return [
+                    (NodeStartProcessEvent, self._on_node_start),
+                    (NodeFinishProcessEvent, self._on_node_finish),
+                ]
+        """
+        return []
+
+    def get_app_event_listeners(
+        self,
+    ) -> list[
+        tuple[
+            type[AppPayload],
+            Callable[[AppPayload], None] | Callable[[AppPayload], Awaitable[None]],
+        ]
+    ]:
+        """Return app event listeners to register with the engine.
+
+        Each entry is an (event_type, callback) pair. App events are things that happen to
+        Griptape Nodes itself, such as a setting or the current project changing. The callback
+        is called with the event each time one of that type happens.
+
+        The engine registers all returned listeners after after_library_nodes_loaded()
+        and deregisters them automatically when the library is unloaded. Because libraries load
+        while Griptape Nodes starts up, a listener for ``AppInitializationComplete`` does not
+        hear the startup that loaded the library.
+
+        Both sync and async callbacks are supported. A callback that raises is logged and
+        otherwise ignored, and the other listeners still run.
+
+        **Exact type matching.** A listener registered for an event type fires only for that
+        exact type, not for its subclasses.
+
+        Example:
+            def get_app_event_listeners(self):
+                return [
+                    (ConfigChanged, self._on_config_changed),
                 ]
         """
         return []

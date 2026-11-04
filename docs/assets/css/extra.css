@@ -71,13 +71,13 @@ iframe {
   bottom: 80px !important;
 }
 .grid ul li a {
-  color: #29b6f6 !important;
+  color: var(--md-accent-fg-color) !important;
   text-decoration: none;
 }
 
 .grid ul li a:hover {
-  color: white !important;
-  /* text-decoration: underline; */
+  color: #fc8500 !important;
+  text-decoration: underline;
 }
 
 .grid > ul li > h1 > a::after {
@@ -90,4 +90,45 @@ iframe {
 
 .grid > ul li > h1 > a:hover::after {
   opacity: 1;
+}
+
+/* ===================================================================
+   Foundry brand palette — SIGGRAPH 2026 template
+   Amber   #fcb434  signature accent (Foundry "F." dot, bullets, highlights)
+   Orange  #fc8500  deeper orange for hover states
+   Burnt   #d35400  readable orange for links on light surfaces
+   Black   #0e0e0e  Foundry near-black surface / header
+   Cream   #f9f3ed  warm off-white
+   =================================================================== */
+
+/* Header / nav bar: Foundry near-black in both light and dark modes */
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color: #0e0e0e;
+  --md-primary-fg-color--light: #333333;
+  --md-primary-fg-color--dark: #000000;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.7);
+}
+
+/* Fallback accent, overridden per scheme below */
+[data-md-color-accent="custom"] {
+  --md-accent-fg-color: #fcb434;
+  --md-accent-fg-color--transparent: rgba(252, 180, 52, 0.1);
+}
+
+/* Dark variation: Foundry near-black canvas, amber accent + links */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #0e0e0e;
+  --md-default-bg-color--light: #1a1a1a;
+  --md-code-bg-color: #1a1a1a;
+  --md-accent-fg-color: #fcb434;
+  --md-accent-fg-color--transparent: rgba(252, 180, 52, 0.1);
+  --md-typeset-a-color: #fcb434;
+}
+
+/* Light variation: white canvas, burnt-orange links for AA contrast */
+[data-md-color-scheme="default"] {
+  --md-accent-fg-color: #d35400;
+  --md-accent-fg-color--transparent: rgba(211, 84, 0, 0.1);
+  --md-typeset-a-color: #d35400;
 }

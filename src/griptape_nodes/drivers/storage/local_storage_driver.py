@@ -1,44 +1,70 @@
+from __future__ import annotations
+
 import logging
 import time
+from hashlib import blake2b
+from http import HTTPStatus
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urljoin
 
-import httpx
+import httpx2
 
-from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
-from griptape_nodes.files.file import FileLoadError
-from griptape_nodes.files.project_file import ProjectFileDestination
+from griptape_nodes.files.path_utils import canonicalize_to_posix, strip_windows_long_path_prefix
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy, WriteFileRequest, WriteFileResultSuccess
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL
 from griptape_nodes.utils import resolve_workspace_path
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+    from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
 logger = logging.getLogger("griptape_nodes")
 
 
-class LocalStorageDriver(BaseStorageDriver):
-    """Stores files using the engine's local static server."""
+class FileFingerprint(NamedTuple):
+    """The file identity local download URLs are versioned by.
 
-    def __init__(self, workspace_directory: Path, base_url: str | None = None) -> None:
+    A new inode, size, or modification time gives the next minted URL a new ``?v=``. The preview
+    watcher compares the same fingerprint to decide whether a change is worth reporting, so both
+    stay in step when the identity changes.
+    """
+
+    inode: int
+    size: int
+    mtime_ns: int
+
+
+def fingerprint_file(path: Path) -> FileFingerprint | None:
+    """Read a file's fingerprint, or None when it can't be stat'ed (missing, unreachable mount)."""
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return FileFingerprint(inode=stat_result.st_ino, size=stat_result.st_size, mtime_ns=stat_result.st_mtime_ns)
+
+
+class LocalStorageDriver(BaseStorageDriver):
+    """Stores files in the local workspace, served by the host's static file server."""
+
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        os_manager: OSManager,
+        base_url: str | None = None,
+    ) -> None:
         """Initialize the LocalStorageDriver.
 
         Args:
-            workspace_directory: The base workspace directory path.
+            config_manager: Reports the current workspace directory.
+            os_manager: Performs the policy-aware writes this driver delegates to.
             base_url: The base URL for the static file server. If not provided, it will be constructed
         """
-        super().__init__(workspace_directory)
+        super().__init__(config_manager)
+        self._os_manager = os_manager
 
-        from griptape_nodes.servers.static import (
-            STATIC_SERVER_ENABLED,
-            STATIC_SERVER_HOST,
-            STATIC_SERVER_PORT,
-            STATIC_SERVER_URL,
-        )
-
-        if not STATIC_SERVER_ENABLED:
-            msg = "Static server is not enabled. Please set STATIC_SERVER_ENABLED to True."
-            raise ValueError(msg)
         if base_url is None:
             # Default to localhost - the storage driver creator can pass a proxy URL if needed
             self.base_url = f"http://{STATIC_SERVER_HOST}:{STATIC_SERVER_PORT}{STATIC_SERVER_URL}"
@@ -52,21 +78,20 @@ class LocalStorageDriver(BaseStorageDriver):
         *,
         file_metadata: SidecarContent | None = None,  # noqa: ARG002
     ) -> CreateSignedUploadUrlResponse:
-        # on_write_file_request seems to work most reliably with an absolute path.
+        # WriteFileRequest seems to work most reliably with an absolute path.
         absolute_path = resolve_workspace_path(path, self.workspace_directory)
 
-        # Always delegate to OSManager for file path resolution and policy handling.
+        # Always delegate the write for file path resolution and policy handling.
         # Creating an empty file before the upload url gives us a chance to claim ownership
         # of that particular file when creating the upload url. The file policy is not
         # checked when actually uploading the file, it will always overwrite.
-        os_manager = GriptapeNodes.OSManager()
         write_request = WriteFileRequest(
             file_path=str(absolute_path),
             content=b"",  # Empty content for URL generation
             existing_file_policy=existing_file_policy,
             skip_metadata_injection=True,
         )
-        result = os_manager.on_write_file_request(write_request)
+        result = self._os_manager.engine.handle_request(write_request)
 
         if not result.succeeded():
             msg = f"WriteFileRequest failed: {result.result_details}"
@@ -83,18 +108,16 @@ class LocalStorageDriver(BaseStorageDriver):
 
         static_url = urljoin(self.base_url, "/static-upload-urls")
         try:
-            response = httpx.post(static_url, json={"file_path": str(resolved_path)})
+            response = httpx2.post(static_url, json={"file_path": str(resolved_path)})
             response.raise_for_status()
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             msg = f"Failed to create upload URL for file {resolved_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
         url = response_data.get("url")
         if url is None:
             msg = f"Failed to get upload URL for file {resolved_path}: {response_data}"
-            logger.error(msg)
             raise ValueError(msg)
 
         return {
@@ -131,7 +154,7 @@ class LocalStorageDriver(BaseStorageDriver):
         """
         absolute_path = resolve_workspace_path(path, self.workspace_directory)
 
-        result = GriptapeNodes.OSManager().on_write_file_request(
+        result = self._os_manager.engine.handle_request(
             WriteFileRequest(
                 file_path=str(absolute_path),
                 content=file_content,
@@ -149,27 +172,63 @@ class LocalStorageDriver(BaseStorageDriver):
 
     def create_signed_download_url(self, path: Path) -> str:
         # Resolve path, treating relative paths as workspace-relative
-        absolute_path = resolve_workspace_path(path, self.workspace_directory)
+        resolved_path = resolve_workspace_path(path, self.workspace_directory)
+
+        # Drop the Windows \\?\ long-path prefix before it reaches either branch below.
+        # canonicalize_for_io applies it unconditionally on Windows, and it breaks both of them:
+        # relative_to() reads the prefix as a different anchor, so a file inside the workspace
+        # takes the /external/ branch; and the '?' then terminates the URL path, so the browser
+        # sends everything after it as a query string and the real path never reaches the server
+        # (`/external//?/C:/...` parses as path `/external//`). The result is a broken image.
+        stripped_path_str = strip_windows_long_path_prefix(resolved_path)
+        absolute_path = Path(stripped_path_str)
+        workspace_directory = Path(strip_windows_long_path_prefix(self.workspace_directory))
 
         # Automatically determine if the file is external to the workspace
         try:
-            workspace_relative_path = absolute_path.relative_to(self.workspace_directory.resolve())
+            workspace_relative_path = absolute_path.relative_to(workspace_directory.resolve())
             # Internal files: use workspace-relative path
             url = f"{self.base_url}/{workspace_relative_path.as_posix()}"
         except ValueError:
             # For external files, use /external path and strip leading slash from absolute path.
-            # Use as_posix() to normalize backslashes to forward slashes for URLs (important on Windows).
-            path_str = absolute_path.as_posix().removeprefix("/")
+            # Normalize backslashes to forward slashes for URLs via canonicalize_to_posix rather than
+            # Path(...).as_posix(): a Windows-shaped path can be stored in project metadata and read
+            # back on macOS/Linux, where Path() parses "C:\Users\foo\image.png" as one POSIX
+            # component and as_posix() hands the backslashes straight through into the URL.
+            # canonicalize_to_posix goes via PureWindowsPath, so it converts on any host OS.
+            path_str = canonicalize_to_posix(stripped_path_str).removeprefix("/")
             # Build URL with /external prefix, replacing the /workspace part of base_url
             base_without_workspace = self.base_url.rsplit("/workspace", 1)[0]
             url = f"{base_without_workspace}/external/{path_str}"
 
-        # Add a cache-busting query parameter to the URL so that the browser always reloads the file
-        cache_busted_url = f"{url}?t={int(time.time())}"
-        return cache_busted_url
+        # Version the URL by the served file's identity rather than by mint time:
+        # unchanged content yields the same URL on every mint, so the browser's
+        # cache HITS instead of refetching, and a rewrite changes the URL.
+        # mtime alone cannot carry that guarantee — kernels write timestamps from
+        # a coarse clock (millisecond-scale ticks on Linux, regardless of the
+        # nanosecond field ext4 stores), so a same-size rewrite lands inside one
+        # tick roughly half the time. st_ino closes that for the engine's own
+        # writes: every OVERWRITE promotes a scratch file by rename, which
+        # allocates a fresh inode per rewrite. The residual bound — an external
+        # tool rewriting IN PLACE, same size, within one clock tick — is what
+        # #5607's content-identity design exists to close.
+        # Stat the pre-strip path: on Windows, a >MAX_PATH file can only be
+        # stat'ed with the \\?\ prefix that the URL branches above had to drop.
+        fingerprint = fingerprint_file(resolved_path)
+        if fingerprint is None:
+            # Nothing to fingerprint yet (file still being staged, unreachable
+            # mount): fall back to mint time so the URL still busts caches.
+            return f"{url}?v={time.time_ns() // 1_000_000}"
+        identity = f"{fingerprint.inode}:{fingerprint.size}:{fingerprint.mtime_ns}"
+        version = blake2b(identity.encode(), digest_size=8).hexdigest()
+        return f"{url}?v={version}"
 
     def delete_file(self, path: Path) -> None:
         """Delete a file from local storage.
+
+        Deleting a file that is already absent is a successful no-op: the static server
+        answers 404 for a missing file, which means the requested end state already holds.
+        Any other HTTP error still raises.
 
         Args:
             path: The path of the file to delete.
@@ -178,11 +237,13 @@ class LocalStorageDriver(BaseStorageDriver):
         delete_url = urljoin(self.base_url, f"/static-files/{path.as_posix()}")
 
         try:
-            response = httpx.delete(delete_url)
+            response = httpx2.delete(delete_url)
             response.raise_for_status()
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
+            if e.response.status_code == HTTPStatus.NOT_FOUND:
+                logger.debug("File %s is already absent from local storage; nothing to delete", path)
+                return
             msg = f"Failed to delete file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
     def list_files(self) -> list[str]:
@@ -195,11 +256,10 @@ class LocalStorageDriver(BaseStorageDriver):
         list_url = urljoin(self.base_url, "/static-uploads/")
 
         try:
-            response = httpx.get(list_url)
+            response = httpx2.get(list_url)
             response.raise_for_status()
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             msg = f"Failed to list files: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
@@ -208,19 +268,15 @@ class LocalStorageDriver(BaseStorageDriver):
     def get_asset_url(self, path: Path) -> str:
         """Get the permanent URL for a local asset.
 
-        Builds the canonical path using the ``copy_external_file`` situation and returns
-        it as an absolute path string.  Falls back to the absolute path of the original
-        file if the situation cannot be resolved (e.g. no project loaded).
+        The caller hands in the file's actual location (already resolved via its
+        situation where one applies); this must not re-derive a location from a
+        write situation, which would point at where a hypothetical new file would
+        land rather than where this file is.
 
         Args:
-            path: The path of the file
+            path: The path of the file, workspace-relative or absolute
 
         Returns:
-            Absolute path string for the resolved asset path
+            Absolute path string for the asset
         """
-        destination = ProjectFileDestination.from_situation(path.name, BuiltInSituation.COPY_EXTERNAL_FILE)
-        try:
-            resolved_path = Path(destination.resolve())
-        except FileLoadError:
-            return str(resolve_workspace_path(path, self.workspace_directory))
-        return str(resolved_path)
+        return str(resolve_workspace_path(path, self.workspace_directory))

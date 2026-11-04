@@ -1,0 +1,32 @@
+{
+  "operations": [
+    {
+      "class_name": "DynamicAddNode",
+      "display_name": "Dynamic Add",
+      "description": "Adds two numbers. Class synthesized at runtime.",
+      "operator": "add",
+      "symbol": "+"
+    },
+    {
+      "class_name": "DynamicSubtractNode",
+      "display_name": "Dynamic Subtract",
+      "description": "Subtracts b from a. Class synthesized at runtime.",
+      "operator": "subtract",
+      "symbol": "-"
+    },
+    {
+      "class_name": "DynamicMultiplyNode",
+      "display_name": "Dynamic Multiply",
+      "description": "Multiplies two numbers. Class synthesized at runtime.",
+      "operator": "multiply",
+      "symbol": "*"
+    },
+    {
+      "class_name": "DynamicDivideNode",
+      "display_name": "Dynamic Divide",
+      "description": "Divides a by b. Class synthesized at runtime.",
+      "operator": "divide",
+      "symbol": "/"
+    }
+  ]
+}

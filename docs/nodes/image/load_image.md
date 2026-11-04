@@ -43,4 +43,4 @@ Imagine you've created an image with the CreateImage and now want to use it else
 ## Common Issues
 
 - **No Image Showing**: Make sure you've properly connected an image source to this node
-- **Wrong Image Type**: Make sure you're connecting an ImageArtifact or BlobArtifact to this node
+- **Wrong Image Type**: Make sure you're connecting an ImageUrlArtifact, ImageArtifact, or string path/URL to this node

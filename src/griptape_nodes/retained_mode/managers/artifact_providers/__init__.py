@@ -6,6 +6,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prev
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactProvider,
+    WriteVettingPolicy,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_parameters import (
     BaseGeneratorParameters,
@@ -27,5 +28,6 @@ __all__ = [
     "ImageArtifactProvider",
     "ProviderRegistry",
     "VideoArtifactProvider",
+    "WriteVettingPolicy",
     "normalize_friendly_name_to_key",
 ]

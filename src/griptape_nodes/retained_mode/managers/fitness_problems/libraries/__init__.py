@@ -4,6 +4,7 @@ from .advanced_library_load_failure_problem import AdvancedLibraryLoadFailurePro
 from .after_library_callback_problem import AfterLibraryCallbackProblem
 from .app_event_listener_registration_problem import AppEventListenerRegistrationProblem
 from .before_library_callback_problem import BeforeLibraryCallbackProblem
+from .beta_feature_settings_collision_problem import BetaFeatureSettingsCollisionProblem
 from .create_config_category_problem import CreateConfigCategoryProblem
 from .dependency_installation_failed_problem import DependencyInstallationFailedProblem
 from .deprecated_node_warning_problem import DeprecatedNodeWarningProblem
@@ -12,16 +13,20 @@ from .duplicate_model_id_problem import DuplicateModelIdProblem
 from .duplicate_node_registration_problem import DuplicateNodeRegistrationProblem
 from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationProblem
 from .engine_version_error_problem import EngineVersionErrorProblem
+from .execution_event_listener_registration_problem import ExecutionEventListenerRegistrationProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
+from .invalid_beta_feature_problem import InvalidBetaFeatureProblem
 from .invalid_version_string_problem import InvalidVersionStringProblem
 from .library_dependency_problem import LibraryDependencyProblem
 from .library_json_decode_problem import LibraryJsonDecodeProblem
 from .library_load_exception_problem import LibraryLoadExceptionProblem
 from .library_not_found_problem import LibraryNotFoundProblem
+from .library_not_provided_by_environment_problem import LibraryNotProvidedByEnvironmentProblem
 from .library_problem import LibraryProblem
 from .library_schema_exception_problem import LibrarySchemaExceptionProblem
 from .library_schema_validation_problem import LibrarySchemaValidationProblem
+from .mcp_tool_registration_problem import MCPToolRegistrationProblem
 from .modified_parameters_set_deprecation_warning_problem import ModifiedParametersSetDeprecationWarningProblem
 from .modified_parameters_set_removed_problem import ModifiedParametersSetRemovedProblem
 from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
@@ -30,23 +35,26 @@ from .node_module_import_problem import NodeModuleImportProblem
 from .node_permission_denied_problem import NodePermissionDeniedProblem
 from .old_xdg_location_warning_problem import OldXdgLocationWarningProblem
 from .permission_denied_problem import PermissionDeniedProblem
+from .post_dispatch_hook_registration_problem import PostDispatchHookRegistrationProblem
 from .pre_dispatch_hook_registration_problem import PreDispatchHookRegistrationProblem
 from .request_handler_registration_problem import RequestHandlerRegistrationProblem
-from .request_handlers_worker_incompatible_problem import RequestHandlersWorkerIncompatibleProblem
 from .retired_node_declaration_problem import RetiredNodeDeclarationProblem
 from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
+from .shadowed_engine_packages_problem import ShadowedEnginePackagesProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
 from .ui_options_field_modified_warning_problem import UiOptionsFieldModifiedWarningProblem
 from .unresolved_model_provider_usage_reference_problem import UnresolvedModelProviderUsageReferenceProblem
 from .unresolved_model_usage_reference_problem import UnresolvedModelUsageReferenceProblem
 from .update_config_category_problem import UpdateConfigCategoryProblem
 from .venv_creation_failed_problem import VenvCreationFailedProblem
+from .workflow_node_load_problem import WorkflowNodeLoadProblem
 
 __all__ = [
     "AdvancedLibraryLoadFailureProblem",
     "AfterLibraryCallbackProblem",
     "AppEventListenerRegistrationProblem",
     "BeforeLibraryCallbackProblem",
+    "BetaFeatureSettingsCollisionProblem",
     "CreateConfigCategoryProblem",
     "DependencyInstallationFailedProblem",
     "DeprecatedNodeWarningProblem",
@@ -55,16 +63,20 @@ __all__ = [
     "DuplicateNodeRegistrationProblem",
     "DuplicateWidgetRegistrationProblem",
     "EngineVersionErrorProblem",
+    "ExecutionEventListenerRegistrationProblem",
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
+    "InvalidBetaFeatureProblem",
     "InvalidVersionStringProblem",
     "LibraryDependencyProblem",
     "LibraryJsonDecodeProblem",
     "LibraryLoadExceptionProblem",
     "LibraryNotFoundProblem",
+    "LibraryNotProvidedByEnvironmentProblem",
     "LibraryProblem",
     "LibrarySchemaExceptionProblem",
     "LibrarySchemaValidationProblem",
+    "MCPToolRegistrationProblem",
     "ModifiedParametersSetDeprecationWarningProblem",
     "ModifiedParametersSetRemovedProblem",
     "NodeClassNotBaseNodeProblem",
@@ -73,15 +85,17 @@ __all__ = [
     "NodePermissionDeniedProblem",
     "OldXdgLocationWarningProblem",
     "PermissionDeniedProblem",
+    "PostDispatchHookRegistrationProblem",
     "PreDispatchHookRegistrationProblem",
     "RequestHandlerRegistrationProblem",
-    "RequestHandlersWorkerIncompatibleProblem",
     "RetiredNodeDeclarationProblem",
     "SandboxDirectoryMissingProblem",
+    "ShadowedEnginePackagesProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",
     "UiOptionsFieldModifiedWarningProblem",
     "UnresolvedModelProviderUsageReferenceProblem",
     "UnresolvedModelUsageReferenceProblem",
     "UpdateConfigCategoryProblem",
     "VenvCreationFailedProblem",
+    "WorkflowNodeLoadProblem",
 ]

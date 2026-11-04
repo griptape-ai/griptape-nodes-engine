@@ -20,30 +20,56 @@ Streaming tokens come straight off Pydantic AI's text deltas via the runner's
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
-import os
 import textwrap
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlsplit
 
-import httpx
-from pydantic_ai.messages import BinaryContent, ModelMessagesTypeAdapter
+import httpx2
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
+from pydantic_ai.tools import DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import UsageLimits
-from xdg_base_dirs import xdg_data_home
 
-from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
-from griptape_nodes.agents.pydantic_ai.mcp_servers import mcp_server_from_config, streamable_http_local
+from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
+from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    grant_keys_for_call,
+    streamable_http_library,
+    streamable_http_local,
+)
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
+    MCPToolsetCache,
+    MCPToolsetLease,
+)
 from griptape_nodes.agents.pydantic_ai.runner import (
+    DEFAULT_SKILLS_DIRECTORY,
+    AgentRunResult,
     PydanticAgentRunner,
     RunEvent,
     TextDelta,
     ThinkingDelta,
     ToolCall,
     ToolResult,
+)
+from griptape_nodes.agents.pydantic_ai.tool_approval import (
+    TOOL_DENIED_BY_NEW_MESSAGE,
+    TOOL_DENIED_BY_USER_MESSAGE,
+    ToolApprovalDeps,
+    pending_tool_calls,
+)
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    POLICY_DENIED_HINT,
+    is_license_credential,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+    resolve_cloud_host,
 )
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -56,7 +82,11 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import (
+    TOOL_APPROVAL_APPROVE_FOR_CONVERSATION,
+    TOOL_APPROVAL_DECISIONS,
+    TOOL_APPROVAL_DENY,
     AgentStreamEvent,
     AgentThinkingEvent,
     AgentToolCallEvent,
@@ -67,6 +97,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     CancelAgentRequest,
     CancelAgentResultFailure,
     CancelAgentResultSuccess,
+    ClearToolGrantsRequest,
+    ClearToolGrantsResultFailure,
+    ClearToolGrantsResultSuccess,
     ConfigureAgentRequest,
     ConfigureAgentResultFailure,
     ConfigureAgentResultSuccess,
@@ -87,6 +120,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     GetConversationMemoryRequest,
     GetConversationMemoryResultFailure,
     GetConversationMemoryResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -102,10 +138,13 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RenameThreadRequest,
     RenameThreadResultFailure,
     RenameThreadResultSuccess,
+    ResolveToolApprovalsRequest,
     RunAgentRequest,
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
+    RunRecord,
+    ToolApprovalDecision,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
@@ -115,20 +154,53 @@ from griptape_nodes.retained_mode.events.agent_events import (
 )
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextRequest,
+    GetAttributionContextResultSuccess,
+)
+from griptape_nodes.retained_mode.events.flow_events import (
+    FlowSummaryNode,
+    GetFlowSummaryRequest,
+    GetFlowSummaryResultSuccess,
+)
+from griptape_nodes.retained_mode.events.library_events import (
+    ListNodeTypesInLibraryRequest,
+    ListNodeTypesInLibraryResultSuccess,
+    ListRegisteredLibrariesRequest,
+    ListRegisteredLibrariesResultSuccess,
+)
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
+    LibraryMCPServer,
+    ListLibraryMCPServersRequest,
+    ListLibraryMCPServersResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers import bind_free_socket
-from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
+from griptape_nodes.servers.mcp import (
+    GTN_MCP_SERVER_HOST,
+    GTN_MCP_SERVER_PORT,
+    LIBRARIES_PATH_SEGMENT,
+    list_library_mcp_tools,
+    start_mcp_server,
+)
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
-    from pydantic_ai.messages import UserContent
+    from collections.abc import Mapping, Sequence
+
+    from pydantic_ai.messages import ModelMessage, ToolCallPart, UserContent
     from pydantic_ai.toolsets import AbstractToolset
 
+    from griptape_nodes.node_library.library_registry import NodeMetadata
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
@@ -157,18 +229,30 @@ _AGENT_INSTRUCTIONS_BASE = (
     "connections, save and run workflows.\n"
     "{image_tool_line}"
     "  - Additional MCP tools may be available, each prefixed with its server name.\n\n"
-    "Behavior rules (these are non-negotiable):\n"
-    "  1. NEVER respond with only a plan or a description of what you intend to do. If a "
-    "     task requires tool work, call the relevant tools in the SAME turn as your "
-    "     acknowledgment. A response of the form 'I'll do X' with no tool calls is wrong.\n"
-    "  2. When the user asks you to build, create, modify, inspect, or run something, "
-    "     start with discovery tool calls (e.g. GriptapeNodes_ListRegisteredLibrariesRequest, "
-    "     GriptapeNodes_ListNodeTypesInLibraryRequest) before doing anything that "
-    "     mutates state.\n"
-    "  3. Make multiple tool calls in parallel when they don't depend on each other.\n"
-    "  4. Only after you have actually completed the user's task should you produce a final "
-    "     text response. That final response should be a short summary of what you did, "
-    "     including the names of any nodes you created or changed.\n"
+    "Behavior rules:\n"
+    "  1. When a task needs tool work, call the tools in the same turn you acknowledge it, and keep "
+    "calling them until the task is done. Describe a plan only alongside the calls that carry it out.\n"
+    "  2. Work from the node types and the current flow given below; they are complete. Look up only the "
+    "parameters of the node types you will use: put one GriptapeNodes_DescribeNodeTypeRequest per type "
+    "in a single GriptapeNodes_EventRequestBatch call, covering every type in your plan, including list "
+    "and helper nodes.\n"
+    "  3. Plan the whole change, then apply it as one GriptapeNodes_EventRequestBatch call that creates the "
+    "nodes, sets their values, and connects them, in that order. The engine keeps each requested node "
+    "name unless another node already has it, and the results give every created node's name. Then send "
+    "one more batch with only the calls that failed, using the returned names, and delete any "
+    "placeholder node a failed create left.\n"
+    "  4. An input that takes a list (its type is list or list[...], such as MergeImages.Images or "
+    "Agent.rulesets) takes either a whole list or one item per slot. To connect single items, add a slot "
+    "for each with GriptapeNodes_AddParameterToNodeRequest, setting parent_container_name to the input, "
+    "then connect each item to a slot name those calls return.\n"
+    "  5. A model sees an image only through an input whose input types include an image type. To have a "
+    "model look at, describe, or critique an image, use a node with such an input, such as DescribeImage, "
+    "which answers a prompt about the images it is given, even when the user calls it an agent. Text "
+    "inputs, such as an Agent's prompt or additional_context, receive an image only as text.\n"
+    "  6. Build and edit workflows; run, resolve, or save them when the user asks for that.\n"
+    "  7. Make independent tool calls in parallel when they cannot go in one batch.\n"
+    "  8. When the task is done, reply with a short summary of what you did, including the names of any "
+    "nodes you created or changed.\n"
 )
 
 _IMAGE_TOOL_INSTRUCTION = (
@@ -178,9 +262,259 @@ _IMAGE_TOOL_INSTRUCTION = (
 )
 
 
+_NO_FLOW_INSTRUCTION = "No flow is open yet. Call GriptapeNodes_EnsureWorkflowAndFlowRequest before creating nodes."
+
+_NODE_TYPES_NOT_LISTED_INSTRUCTION = (
+    "The node types are not listed here. To get them, call GriptapeNodes_ListRegisteredLibrariesRequest, then "
+    "put one GriptapeNodes_ListNodeTypesInLibraryRequest per library, with include_metadata set, in a single "
+    "GriptapeNodes_EventRequestBatch call. GriptapeNodes_ListRegisteredLibrariesRequest answers once libraries "
+    "finish loading."
+)
+
+# Long enough for a node's one-line purpose, short enough that the node type list stays a few tokens per node.
+_MAX_NODE_DESCRIPTION_LENGTH = 160
+
+
+_TOOL_APPROVAL_INSTRUCTIONS = (
+    "Tool approval rules:\n"
+    "  - Some tools need the user's approval before they run. The user sees each such call and "
+    "decides whether it runs.\n"
+    "  - When the user asks a question (how, why, what), answer in text. Do not build or run "
+    "workflows unless the user asks you to.\n"
+    "  - If the user declines a tool call, do not retry it on your own or work around it with a "
+    "different tool. If the user later asks for it again, call it again; they will be asked to approve it.\n"
+)
+
+
 def _build_agent_instructions(*, include_image_tool: bool) -> str:
     image_tool_line = _IMAGE_TOOL_INSTRUCTION if include_image_tool else ""
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
+
+
+def _compose_server_rules(configs: Sequence[Mapping[str, Any]]) -> str:
+    """Collect the per-server guidance for the MCP servers attached to one run.
+
+    Composed per run rather than baked into the agent so editing a server's
+    rules changes what the model is told on the very next message. Pydantic AI
+    appends run-level instructions to the agent's own, so the result reads the
+    same as when these were concatenated at construction time.
+    """
+    parts = [
+        f"Rules for MCP server '{config['name']}':\n{config['rules'].strip()}"
+        for config in configs
+        if isinstance(config.get("rules"), str) and config["rules"].strip()
+    ]
+    return "\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class _WorkflowContext:
+    """The parts of a run's instructions that describe the engine's current state."""
+
+    node_types: str
+    flow: str
+
+
+def _compose_run_instructions(workflow_context: _WorkflowContext, server_rules: str) -> str:
+    """Join the instructions that apply to one run.
+
+    The text that changes least comes first, and the flow, which changes with almost every
+    message, comes last.
+    """
+    parts = [workflow_context.node_types, server_rules, _TOOL_APPROVAL_INSTRUCTIONS, workflow_context.flow]
+    return "\n\n".join(part for part in parts if part)
+
+
+def _render_node_types(libraries: Mapping[str, Mapping[str, NodeMetadata]]) -> str:
+    """The available node types as compact text: one line per type, grouped by library and category.
+
+    Categories keep the order their first node type was registered in.
+    """
+    lines = ["Node types. These are all the node types you can create; use these exact type and library names."]
+    for library_name, node_metadata in libraries.items():
+        lines.append(f"Library '{library_name}':")
+        by_category: dict[str, list[str]] = {}
+        for node_type, metadata in node_metadata.items():
+            by_category.setdefault(metadata.category, []).append(_render_node_type(node_type, metadata))
+        for category, node_lines in by_category.items():
+            lines.append(f"  {category}:")
+            lines.extend(f"    - {line}" for line in node_lines)
+    return "\n".join(lines)
+
+
+def _render_node_type(node_type: str, metadata: NodeMetadata) -> str:
+    label = node_type
+    if metadata.deprecation is not None:
+        label = f"{label} (deprecated, do not use for new work)"
+    description = " ".join(metadata.description.split())
+    if len(description) > _MAX_NODE_DESCRIPTION_LENGTH:
+        description = f"{description[: _MAX_NODE_DESCRIPTION_LENGTH - 3]}..."
+    if not description:
+        return label
+    return f"{label}: {description}"
+
+
+def _render_flow(summary: GetFlowSummaryResultSuccess) -> str:
+    """The flow summary as compact text: one line per node, then one per connection."""
+    lines = [
+        (
+            f"Current flow: '{summary.flow_name}', read when this run started (a new message or "
+            "an answered approval). Changes you make after that are not shown. Values not listed are the defaults. "
+            "New nodes go into this flow."
+        )
+    ]
+    if not summary.nodes:
+        lines.append("The flow is empty.")
+        return "\n".join(lines)
+    lines.append("Nodes:")
+    lines.extend(f"  - {_render_flow_node(node)}" for node in summary.nodes)
+    if summary.connections:
+        lines.append("Connections:")
+        lines.extend(f"  - {connection.source} -> {connection.target}" for connection in summary.connections)
+    return "\n".join(lines)
+
+
+def _render_flow_node(node: FlowSummaryNode) -> str:
+    parts = [f"{node.name} ({node.type} from '{node.library}')"]
+    if node.group is not None:
+        parts.append(f"in group '{node.group}'")
+    if node.position is not None:
+        parts.append(f"at ({node.position['x']}, {node.position['y']})")
+    if node.values:
+        parts.append(f"values {json.dumps(node.values, default=str)}")
+    if node.multi_inputs:
+        parts.append(f"list inputs {', '.join(node.multi_inputs)}")
+    return " ".join(parts)
+
+
+def _plan_tool_approvals(
+    waiting: Sequence[ToolCallPart],
+    decisions: Sequence[ToolApprovalDecision],
+    granted: frozenset[str],
+) -> _ApprovalPlan:
+    """Turn the user's decisions on a paused turn into answers for every waiting call.
+
+    "Approve for conversation" grants are applied first, so a call the user left
+    undecided still runs when those grants now cover all of its grant keys.
+
+    Raises:
+        ValueError: A decision names a call the turn is not waiting on, or is not
+            one of the known choices, or a waiting call is left with no answer.
+            The message is meant for the user.
+    """
+    waiting_by_id = {call.tool_call_id: call for call in waiting}
+    decided: dict[str, str] = {}
+    for decision in decisions:
+        if decision.tool_call_id not in waiting_by_id:
+            msg = (
+                f"Attempted to answer the approval request for tool call '{decision.tool_call_id}'. Failed because "
+                "the agent is not waiting on that call. It may already have been answered."
+            )
+            raise ValueError(msg)
+        if decision.decision not in TOOL_APPROVAL_DECISIONS:
+            msg = (
+                f"Attempted to answer the approval request for tool call '{decision.tool_call_id}'. Failed because "
+                f"'{decision.decision}' is not a choice. Use one of: {', '.join(sorted(TOOL_APPROVAL_DECISIONS))}."
+            )
+            raise ValueError(msg)
+        decided[decision.tool_call_id] = decision.decision
+
+    updated_grants = set(granted)
+    for tool_call_id, choice in decided.items():
+        if choice == TOOL_APPROVAL_APPROVE_FOR_CONVERSATION:
+            call = waiting_by_id[tool_call_id]
+            updated_grants.update(grant_keys_for_call(call.tool_name, call.args_as_dict()))
+
+    approvals: dict[str, bool | ToolApproved | ToolDenied] = {}
+    for call in waiting:
+        choice = decided.get(call.tool_call_id)
+        if choice is None:
+            grant_keys = grant_keys_for_call(call.tool_name, call.args_as_dict())
+            if not grant_keys or not updated_grants.issuperset(grant_keys):
+                msg = (
+                    f"Attempted to continue the conversation. Failed because '{call.tool_name}' is still waiting "
+                    "for you to approve or deny it."
+                )
+                raise ValueError(msg)
+            approvals[call.tool_call_id] = ToolApproved()
+        elif choice == TOOL_APPROVAL_DENY:
+            approvals[call.tool_call_id] = ToolDenied(TOOL_DENIED_BY_USER_MESSAGE)
+        else:
+            approvals[call.tool_call_id] = ToolApproved()
+
+    return _ApprovalPlan(results=DeferredToolResults(approvals=approvals), granted=frozenset(updated_grants))
+
+
+def _reply_in_progress_failure(attempted: str) -> RunAgentResultFailure:
+    """The failure for a request that arrives while another turn is running in its thread."""
+    details = f"Attempted to {attempted}. Failed because a reply is already in progress in this conversation."
+    return RunAgentResultFailure(error={"message": details}, result_details=details)
+
+
+def _cloud_http_status_of(exc: BaseException, cloud_host: str) -> int | None:
+    """Return the HTTP status of a Griptape Cloud failure, or None if it isn't one.
+
+    Two unrelated shapes reach this code: Pydantic AI's ``ModelHTTPError`` carries
+    ``status_code`` directly (the chat path), while ``httpx2.HTTPStatusError`` keeps
+    it on ``response`` (the image path). The image toolset also wraps its failure in
+    ``ModelRetry`` with ``raise ... from exc``, so follow the cause chain.
+
+    Only errors from ``cloud_host`` count. An agent turn also talks to remote MCP
+    servers, which raise the same ``httpx2.HTTPStatusError``; attributing their 403
+    to Griptape licensing would send the user to their Griptape administrator over
+    an expired token on their own MCP server.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx2.HTTPStatusError):
+            if current.request.url.host == cloud_host:
+                return current.response.status_code
+            return None
+        # ModelHTTPError has no URL, but the model is the Cloud provider whenever
+        # the caller has already confirmed the active provider is Griptape Cloud.
+        if isinstance(current, ModelHTTPError):
+            return current.status_code
+        current = current.__cause__
+    return None
+
+
+def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | None:
+    """Return a user-facing message when listing a provider's models fails.
+
+    Scoped to the model-listing path only: that request's whole job is "reach
+    this one endpoint and list its models", so a connection-class failure here
+    unambiguously means *that* provider is unreachable. A custom/local provider
+    (LMStudio, Ollama, any OpenAI-compatible endpoint) is commonly offline — the
+    app is closed, the machine slept, the port changed — and the raw transport
+    error ("All connection attempts failed") means nothing to the person who
+    configured it. Map connection-class failures to plain language that names
+    the endpoint and points at the likely cause.
+
+    Returns ``None`` when the error isn't a recognizable connection failure, so
+    the caller falls back to its existing (raw) message for other error classes
+    (e.g. an HTTP status error or a bad JSON body — those aren't "server down").
+    """
+    where = f" at '{base_url}'" if base_url else ""
+    if isinstance(exc, (httpx2.ConnectError, httpx2.ConnectTimeout)):
+        return (
+            f"Couldn't reach the model provider{where}. Is the local server "
+            "(e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    if isinstance(exc, (httpx2.ReadTimeout, httpx2.WriteTimeout, httpx2.PoolTimeout)):
+        return (
+            f"The model provider{where} didn't respond in time. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    # Other httpx2.RequestError subclasses (DNS failures, connection drops, etc.)
+    # are still connection-shaped from the user's perspective.
+    if isinstance(exc, httpx2.RequestError):
+        return (
+            f"Couldn't connect to the model provider{where}. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    return None
 
 
 # Cap each chat-sidebar turn so a runaway loop can't burn through credits or
@@ -193,7 +527,44 @@ DEFAULT_AGENT_USAGE_LIMITS = UsageLimits(request_limit=60)
 # inlining it for the model, and the media type to assume when neither the
 # response header nor the URL extension identifies one.
 _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+# History images are re-fetched from the local static-file server (loopback), so
+# a much shorter timeout applies: it bounds the per-turn stall when that server
+# is unreachable (e.g. its port shifted across restarts) instead of the 30s an
+# external attachment warrants.
+_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS = 5.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
+# Stands in for a replayed user turn whose only content was image attachments
+# that all failed to re-download, so the turn is never sent to the model as an
+# empty message (which some providers reject).
+_UNAVAILABLE_IMAGE_PLACEHOLDER = "[An image attached to this earlier message is no longer available.]"
+
+# Written into the workspace skills directory the first time a runner is
+# built, so users discovering the folder know what belongs in it.
+_SKILLS_README = """\
+# Agent Skills
+
+Skills placed in this directory are loaded automatically by the Griptape Nodes
+agent. Each skill lives in its own subdirectory containing a `SKILL.md` file:
+
+    .agents/skills/
+        my-skill/
+            SKILL.md
+
+`SKILL.md` starts with YAML frontmatter declaring `name` (which must match the
+directory name) and `description`, followed by the skill's instructions:
+
+    ---
+    name: my-skill
+    description: When to use this skill and what it does.
+    ---
+
+    Step-by-step guidance for the agent goes here.
+
+The agent re-scans this directory before each run, so new or edited skills
+take effect without restarting the engine.
+
+Skills here follow the Agent Skills specification: https://agentskills.io
+"""
 
 
 @dataclass
@@ -210,10 +581,71 @@ class _ActiveRun:
     loop: asyncio.AbstractEventLoop
 
 
-class AgentManager:
+class _RunnerCacheKey(NamedTuple):
+    """Everything baked into an agent at construction time.
+
+    MCP servers are deliberately absent: they are attached per run from
+    :class:`MCPToolsetCache`, so two runs differing only in which servers they
+    use share one agent - and one conversation-shaped agent no longer has to be
+    rebuilt when a server's config changes.
+    """
+
+    provider_type: str
+    model_name: str
+    image_model_name: str
+    base_url: str
+    api_key: str
+
+
+@dataclass
+class _MCPAttachment:
+    """The MCP toolsets and guidance to attach to a single agent run.
+
+    ``lease`` must be released once the run is done - use it as an async context
+    manager - or the servers it names can never be torn down.
+    """
+
+    lease: MCPToolsetLease
+    instructions: str
+
+
+@dataclass(frozen=True)
+class _ApprovalPlan:
+    """How to answer a paused turn's tool calls, and the thread grants that result.
+
+    ``granted`` already includes the grant keys of every "Approve for
+    conversation" decision, so it is what gets saved and what the resumed run
+    checks later calls against.
+    """
+
+    results: DeferredToolResults
+    granted: frozenset[str]
+
+
+@dataclass
+class _RehydratedMessage:
+    """A history message copy plus how many of its images were re-inlined.
+
+    ``attempted`` counts the ``ImageUrl`` parts found; ``succeeded`` counts those
+    whose bytes were re-downloaded, so the caller can log the aggregate.
+    """
+
+    message: ModelRequest
+    attempted: int
+    succeeded: int
+
+
+class AgentManager(EngineScoped):
     """Owns the chat-sidebar agent runner and the engine-bundled MCP server."""
 
-    def __init__(self, static_files_manager: StaticFilesManager, event_manager: EventManager | None = None) -> None:
+    def __init__(
+        self,
+        static_files_manager: StaticFilesManager,
+        event_manager: EventManager | None = None,
+        *,
+        engine: Engine | None = None,
+    ) -> None:
+        super().__init__(engine)
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
 
@@ -224,51 +656,24 @@ class AgentManager:
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
 
-        self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
+        self._threads_dir: Path = engine_data_dir() / "threads"
         self._thread_storage: LocalThreadStorageDriver = LocalThreadStorageDriver(
             self._threads_dir, config_manager, secrets_manager
         )
 
-        # Cache one runner per (provider-type, model, image-model, base-url, api-key, mcp-set).
-        self._runner_cache: dict[tuple[str, str, str, str, str, tuple[str, ...]], PydanticAgentRunner] = {}
+        # Cache one runner per model identity; see `_RunnerCacheKey`.
+        self._runner_cache: dict[_RunnerCacheKey, PydanticAgentRunner] = {}
+
+        # Live MCP toolsets, shared by every runner and rebuilt per server when
+        # that server's config changes. Held here rather than on a runner so
+        # clearing `_runner_cache` cannot orphan a running MCP subprocess.
+        self._mcp_toolsets = MCPToolsetCache()
 
         # Cancel handles for in-flight runs, keyed by thread_id.
         self._active_runs: dict[str, _ActiveRun] = {}
 
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(RunAgentRequest, self.on_handle_run_agent_request)
-            event_manager.assign_manager_to_request_type(CancelAgentRequest, self.on_handle_cancel_agent_request)
-            event_manager.assign_manager_to_request_type(ConfigureAgentRequest, self.on_handle_configure_agent_request)
-            event_manager.assign_manager_to_request_type(
-                GetConversationMemoryRequest, self.on_handle_get_conversation_memory_request
-            )
-            event_manager.assign_manager_to_request_type(CreateThreadRequest, self.on_handle_create_thread_request)
-            event_manager.assign_manager_to_request_type(ListThreadsRequest, self.on_handle_list_threads_request)
-            event_manager.assign_manager_to_request_type(DeleteThreadRequest, self.on_handle_delete_thread_request)
-            event_manager.assign_manager_to_request_type(RenameThreadRequest, self.on_handle_rename_thread_request)
-            event_manager.assign_manager_to_request_type(ArchiveThreadRequest, self.on_handle_archive_thread_request)
-            event_manager.assign_manager_to_request_type(
-                UnarchiveThreadRequest, self.on_handle_unarchive_thread_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListAgentModelsRequest, self.on_handle_list_agent_models_request
-            )
-            event_manager.assign_manager_to_request_type(GetAgentConfigRequest, self.on_handle_get_agent_config_request)
-            event_manager.assign_manager_to_request_type(
-                ListProviderModelsRequest, self.on_handle_list_provider_models_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListAgentProvidersRequest, self.on_handle_list_agent_providers_request
-            )
-            event_manager.assign_manager_to_request_type(
-                CreateAgentProviderRequest, self.on_handle_create_agent_provider_request
-            )
-            event_manager.assign_manager_to_request_type(
-                UpdateAgentProviderRequest, self.on_handle_update_agent_provider_request
-            )
-            event_manager.assign_manager_to_request_type(
-                DeleteAgentProviderRequest, self.on_handle_delete_agent_provider_request
-            )
+            event_manager.register_request_handlers(self)
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
@@ -307,46 +712,99 @@ class AgentManager:
             self._load_providers_from_config()
             self._runner_cache.clear()
 
+    @handles(RunAgentRequest)
     async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
         try:
             return await self._run_agent(request)
         except Exception as e:
-            err_msg = f"Error running agent: {e}"
-            logger.exception(err_msg)
-            return RunAgentResultFailure(error={"message": str(e)}, result_details=err_msg)
+            return self._agent_run_failure(e, request.provider_name)
+
+    @handles(ResolveToolApprovalsRequest)
+    async def on_handle_resolve_tool_approvals_request(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
+        try:
+            return await self._resolve_tool_approvals(request)
+        except Exception as e:
+            return self._agent_run_failure(e, request.provider_name)
+
+    def _agent_run_failure(self, exc: Exception, provider_name: str | None) -> RunAgentResultFailure:
+        """Log a failed agent turn and turn it into the result the editor shows."""
+        message = self._explain_agent_run_error(exc, provider_name)
+        # Keep a budget halt's opening words, which the editor recognizes.
+        if message.startswith(BUDGET_REPLY_HALT_PREFIX):
+            err_msg = message
+        else:
+            err_msg = f"Error running agent: {message}"
+        logger.error(err_msg, exc_info=exc)
+        return RunAgentResultFailure(error={"message": message}, result_details=err_msg)
+
+    def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
+        """Return the user-facing text for a failed agent run.
+
+        A Cloud 403 is either a budget refusal, recognized from its body, or an
+        entitlement refusal. Both get a readable message instead of "Forbidden";
+        every other error keeps its text. A halt a tool already worded is
+        returned as is.
+        """
+        halt = budget_halt_message(exc)
+        if halt is not None:
+            return halt
+
+        if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
+            return str(exc)
+
+        cloud_host = resolve_cloud_host(secrets_manager)
+
+        refusal = refusal_from_exception(exc, cloud_host=cloud_host)
+        if refusal is not None:
+            logger.error(budget_log_line(refusal))
+            return describe_budget_refusal(refusal)
+
+        if _cloud_http_status_of(exc, cloud_host) != HTTPStatus.FORBIDDEN:
+            return str(exc)
+        if not is_license_credential(resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)):
+            return str(exc)
+        return f"Griptape Cloud refused the request because {POLICY_DENIED_HINT} ({exc})"
 
     async def _run_agent(self, request: RunAgentRequest) -> ResultPayload:
         thread_id = self._validate_thread_for_run(request.thread_id)
-        is_first_run = len(self._thread_storage.load_history(thread_id)) == 0
+        active = self._claim_thread(thread_id)
+        if active is None:
+            return _reply_in_progress_failure(f"send a message in conversation {thread_id}")
+        try:
+            return await self._run_agent_on_claimed_thread(request, thread_id, active)
+        finally:
+            self._release_thread(thread_id, active)
 
-        runner = self._build_runner(
-            request.additional_mcp_servers,
-            provider_name=request.provider_name,
-            model_name=request.model_name,
-        )
-        prompt = await _compose_prompt(request.input, request.url_artifacts)
+    async def _run_agent_on_claimed_thread(
+        self, request: RunAgentRequest, thread_id: str, active: _ActiveRun
+    ) -> ResultPayload:
+        history = self._thread_storage.load_history(thread_id)
+        is_first_run = len(history) == 0
 
-        event_manager = GriptapeNodes.EventManager()
-
-        def emit(event: RunEvent) -> None:
-            payload = _run_event_to_payload(event)
-            if payload is None:
-                return
-            event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=payload),
-                ),
+        # Sending a message instead of answering an approval card declines every
+        # call the card was asking about, in the same request as the message.
+        deferred_tool_results: DeferredToolResults | None = None
+        waiting = pending_tool_calls(history)
+        if waiting:
+            deferred_tool_results = DeferredToolResults(
+                approvals={call.tool_call_id: ToolDenied(TOOL_DENIED_BY_NEW_MESSAGE) for call in waiting}
             )
 
-        cancel_event = asyncio.Event()
-        self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())
-        try:
-            result = await runner.run(prompt, thread_id=thread_id, event_sink=emit, cancel_event=cancel_event)
-        finally:
-            # Only drop our own entry; a newer run for the same thread may have
-            # replaced it (shouldn't happen for the chat sidebar, but stay safe).
-            if (active := self._active_runs.get(thread_id)) is not None and active.cancel_event is cancel_event:
-                del self._active_runs[thread_id]
+        granted = frozenset(self._thread_storage.get_thread_metadata(thread_id).tool_grants)
+
+        composed = await _compose_prompt(request.input, request.url_artifacts)
+        result = await self._run_turn(
+            thread_id=thread_id,
+            active=active,
+            provider_name=request.provider_name,
+            model_name=request.model_name,
+            mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
+            prompt=composed.live,
+            persist_prompt=composed.persist,
+            approval=ToolApprovalDeps(granted=granted),
+            deferred_tool_results=deferred_tool_results,
+        )
 
         # A first run creates the thread; title it from the input even when the
         # turn is cancelled, so a quick send-then-cancel doesn't leave a
@@ -355,6 +813,236 @@ class AgentManager:
             self._thread_storage.update_thread_metadata(
                 result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
             )
+        return self._finish_turn(
+            result,
+            provider_name=request.provider_name,
+            model_name=request.model_name,
+            mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
+        )
+
+    async def _resolve_tool_approvals(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
+        thread_id = request.thread_id
+        if not self._thread_storage.thread_exists(thread_id):
+            details = f"Attempted to answer the approval request in conversation {thread_id}. Failed because the conversation does not exist."
+            return RunAgentResultFailure(error={"message": details}, result_details=details)
+        if self._thread_storage.is_archived(thread_id):
+            details = f"Attempted to answer the approval request in conversation {thread_id}. Failed because the conversation is archived. Unarchive it first."
+            return RunAgentResultFailure(error={"message": details}, result_details=details)
+
+        # Claimed before the first await so two answers to the same card, such as a
+        # double click, cannot both resume the turn and run a paid call twice.
+        active = self._claim_thread(thread_id)
+        if active is None:
+            return _reply_in_progress_failure(f"answer the approval request in conversation {thread_id}")
+        try:
+            return await self._resolve_tool_approvals_on_claimed_thread(request, thread_id, active)
+        finally:
+            self._release_thread(thread_id, active)
+
+    async def _resolve_tool_approvals_on_claimed_thread(
+        self, request: ResolveToolApprovalsRequest, thread_id: str, active: _ActiveRun
+    ) -> ResultPayload:
+        # Read from the saved conversation rather than anything held in memory, so
+        # an approval card still works after the engine restarts.
+        waiting = pending_tool_calls(self._thread_storage.load_history(thread_id))
+        if not waiting:
+            details = f"Attempted to answer the approval request in conversation {thread_id}. Failed because the agent is not waiting for approval there."
+            return RunAgentResultFailure(error={"message": details}, result_details=details)
+
+        granted_before = frozenset(self._thread_storage.get_thread_metadata(thread_id).tool_grants)
+        try:
+            plan = _plan_tool_approvals(waiting, request.decisions, granted_before)
+        except ValueError as e:
+            details = str(e)
+            return RunAgentResultFailure(error={"message": details}, result_details=details)
+
+        if plan.granted != granted_before:
+            self._thread_storage.update_thread_metadata(thread_id, tool_grants=sorted(plan.granted))
+
+        result = await self._run_turn(
+            thread_id=thread_id,
+            active=active,
+            provider_name=request.provider_name,
+            model_name=request.model_name,
+            mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
+            prompt=None,
+            persist_prompt=None,
+            approval=ToolApprovalDeps(granted=plan.granted),
+            deferred_tool_results=plan.results,
+        )
+        return self._finish_turn(
+            result,
+            provider_name=request.provider_name,
+            model_name=request.model_name,
+            mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
+        )
+
+    async def _run_turn(  # noqa: PLR0913
+        self,
+        *,
+        thread_id: str,
+        active: _ActiveRun,
+        provider_name: str | None,
+        model_name: str | None,
+        mcp_server_names: list[str],
+        library_mcp_server_names: list[str],
+        prompt: str | list[UserContent] | None,
+        persist_prompt: str | list[UserContent] | None,
+        approval: ToolApprovalDeps,
+        deferred_tool_results: DeferredToolResults | None,
+    ) -> AgentRunResult:
+        """Run one agent turn on ``thread_id``, streaming its events.
+
+        ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
+        is what ``CancelAgentRequest`` sets.
+        """
+        runner = self._build_runner(
+            provider_name=provider_name,
+            model_name=model_name,
+        )
+        attribution_headers = await self._attribution_headers(provider_name)
+        workflow_context = await self._workflow_context()
+
+        event_manager = self.engine.event_manager
+
+        def emit(event: RunEvent) -> None:
+            payload = _run_event_to_payload(event, thread_id)
+            if payload is None:
+                return
+            event_manager.put_event(
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=payload),
+                ),
+            )
+
+        library_toolsets = self._library_toolsets(library_mcp_server_names)
+        # Nothing may sit between this and the `async with` that releases
+        # it: a server left with a stray use count is never shut down.
+        mcp = await self._acquire_mcp_toolsets(mcp_server_names)
+        async with mcp.lease:
+            return await runner.run(
+                prompt,
+                thread_id=thread_id,
+                event_sink=emit,
+                cancel_event=active.cancel_event,
+                persist_prompt=persist_prompt,
+                history_rehydrator=_rehydrate_history,
+                extra_toolsets=[*mcp.lease.toolsets, *library_toolsets],
+                extra_instructions=_compose_run_instructions(workflow_context, mcp.instructions),
+                extra_headers=attribution_headers,
+                approval=approval,
+                deferred_tool_results=deferred_tool_results,
+            )
+
+    async def _workflow_context(self) -> _WorkflowContext:
+        """The available node types and the current flow, rendered for one run's instructions.
+
+        Read fresh every run rather than cached, so a library loaded or a node added
+        between messages shows up on the next one. Only this run reads them, so they
+        are not broadcast, and a failure costs the run some context rather than
+        showing the user an error.
+        """
+        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context())
+        return _WorkflowContext(node_types=node_types, flow=flow)
+
+    async def _node_types_context(self) -> str:
+        # Never wait for libraries that are still loading: no timeout fits both a normal startup and a
+        # library installing its dependencies. The instruction says how to get the node types, and
+        # ListRegisteredLibrariesRequest itself waits for loading to finish, so the agent's own call
+        # returns once they are ready.
+        if not self.engine.library_manager._libraries_loading_complete.is_set():
+            logger.info("Left the node types out of the chat's instructions because libraries are still loading.")
+            return _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        registered = await self.engine.ahandle_request(
+            ListRegisteredLibrariesRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
+        )
+        if not isinstance(registered, ListRegisteredLibrariesResultSuccess):
+            logger.info("Left the node types out of the chat's instructions: %s", registered.result_details)
+            return _NODE_TYPES_NOT_LISTED_INSTRUCTION
+        listed = await asyncio.gather(
+            *(
+                self.engine.ahandle_request(
+                    ListNodeTypesInLibraryRequest(
+                        library=library_name,
+                        include_metadata=True,
+                        broadcast_result=False,
+                        failure_log_level=logging.DEBUG,
+                    )
+                )
+                for library_name in registered.libraries
+            )
+        )
+        libraries: dict[str, dict[str, NodeMetadata]] = {}
+        for library_name, result in zip(registered.libraries, listed, strict=True):
+            if not isinstance(result, ListNodeTypesInLibraryResultSuccess) or result.node_metadata is None:
+                logger.info("Left library '%s' out of the chat's node types: %s", library_name, result.result_details)
+                continue
+            libraries[library_name] = result.node_metadata
+        return _render_node_types(libraries)
+
+    async def _flow_context(self) -> str:
+        if not self.engine.context_manager.has_current_flow():
+            return _NO_FLOW_INSTRUCTION
+        summary = await self.engine.ahandle_request(
+            GetFlowSummaryRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
+        )
+        if not isinstance(summary, GetFlowSummaryResultSuccess):
+            logger.info("Left the flow out of the chat's instructions: %s", summary.result_details)
+            return ""
+        try:
+            return _render_flow(summary)
+        except (TypeError, ValueError):
+            # A node's values or metadata can hold anything a workflow file or request put
+            # there; one that won't render must not stop every message on this flow.
+            logger.exception("Left the flow out of the chat's instructions because it could not be rendered.")
+            return ""
+
+    def _claim_thread(self, thread_id: str) -> _ActiveRun | None:
+        """Mark ``thread_id`` as running a turn, or return ``None`` when it already is.
+
+        One turn per thread: both a new message and an approval answer start from
+        the saved history, so two at once would resume the same paused calls twice.
+        Must be called with no ``await`` between it and the caller's check, and
+        released with :meth:`_release_thread` in a ``finally``.
+        """
+        if thread_id in self._active_runs:
+            return None
+        active = _ActiveRun(cancel_event=asyncio.Event(), loop=asyncio.get_running_loop())
+        self._active_runs[thread_id] = active
+        return active
+
+    def _release_thread(self, thread_id: str, active: _ActiveRun) -> None:
+        if self._active_runs.get(thread_id) is active:
+            del self._active_runs[thread_id]
+
+    def _finish_turn(
+        self,
+        result: AgentRunResult,
+        *,
+        provider_name: str | None,
+        model_name: str | None,
+        mcp_server_names: list[str],
+        library_mcp_server_names: list[str],
+    ) -> RunAgentResultSuccess:
+        """Record a finished turn and build the result the editor renders it from."""
+        # A cancelled run saves no model response, so there is no response to record.
+        if not result.cancelled:
+            resolved_provider = self._get_provider(provider_name)
+            self._thread_storage.append_run_record(
+                result.thread_id,
+                RunRecord(
+                    message_index=result.message_count - 1,
+                    provider_name=resolved_provider.name,
+                    model=model_name or resolved_provider.model,
+                    mcp_servers=mcp_server_names or [],
+                    library_mcp_servers=library_mcp_server_names or [],
+                ),
+            )
+
+        pending_approvals = [asdict(pending) for pending in result.pending_approvals]
 
         if result.cancelled:
             logger.info("Agent run for thread %s cancelled by request.", result.thread_id)
@@ -363,23 +1051,83 @@ class AgentManager:
                     "text": result.output,
                     "message_count": result.message_count,
                     "cancelled": True,
+                    # A cancelled turn is stopped before the model reports a
+                    # finish_reason, so this is False rather than unknown. Set on
+                    # every branch so a consumer can read `output.truncated`
+                    # without having to treat a missing key as False.
+                    "truncated": False,
                     "generated_image_urls": result.image_urls,
+                    "pending_approvals": pending_approvals,
                 },
                 thread_id=result.thread_id,
                 result_details="Agent run cancelled.",
             )
 
+        if result.truncated:
+            return RunAgentResultSuccess(
+                output={
+                    "text": result.output,
+                    "message_count": result.message_count,
+                    "cancelled": False,
+                    "truncated": True,
+                    "generated_image_urls": result.image_urls,
+                    "pending_approvals": pending_approvals,
+                },
+                thread_id=result.thread_id,
+                result_details=(
+                    "The model reached its output length limit before finishing, so this reply is incomplete. "
+                    "Ask it to continue to get the rest."
+                ),
+            )
+
+        result_details = "Agent execution completed successfully."
+        if pending_approvals:
+            result_details = "The agent is waiting for your approval before it continues."
         return RunAgentResultSuccess(
             output={
                 "text": result.output,
                 "message_count": result.message_count,
                 "cancelled": False,
+                "truncated": False,
                 "generated_image_urls": result.image_urls,
+                "pending_approvals": pending_approvals,
             },
             thread_id=result.thread_id,
-            result_details="Agent execution completed successfully.",
+            result_details=result_details,
         )
 
+    @handles(ListLibraryMCPServersRequest)
+    def on_handle_list_library_mcp_servers_request(self, _: ListLibraryMCPServersRequest) -> ResultPayload:
+        servers = [
+            LibraryMCPServer(
+                name=library.slug,
+                library_name=library.library_name,
+                url=self._library_mcp_url(library.slug),
+                tool_names=[tool.request_type.__name__ for tool in library.tools],
+            )
+            for library in list_library_mcp_tools()
+        ]
+        return ListLibraryMCPServersResultSuccess(
+            servers=servers, result_details=f"Listed {len(servers)} library MCP server(s)."
+        )
+
+    @handles(ClearToolGrantsRequest)
+    def on_handle_clear_tool_grants_request(self, request: ClearToolGrantsRequest) -> ResultPayload:
+        if not self._thread_storage.thread_exists(request.thread_id):
+            details = f"Attempted to forget the approvals given in conversation {request.thread_id}. Failed because the conversation does not exist."
+            return ClearToolGrantsResultFailure(result_details=details)
+        try:
+            self._thread_storage.update_thread_metadata(request.thread_id, tool_grants=[])
+        except OSError as e:
+            details = f"Attempted to forget the approvals given in conversation {request.thread_id}. Failed because the conversation could not be saved: {e}"
+            logger.exception(details)
+            return ClearToolGrantsResultFailure(result_details=details)
+        return ClearToolGrantsResultSuccess(
+            thread_id=request.thread_id,
+            result_details=f"Cleared the approvals given in conversation {request.thread_id}.",
+        )
+
+    @handles(CancelAgentRequest)
     def on_handle_cancel_agent_request(self, request: CancelAgentRequest) -> ResultPayload:
         """Signal cooperative cancellation to the in-flight run for a thread.
 
@@ -408,6 +1156,7 @@ class AgentManager:
             logger.exception(details)
             return CancelAgentResultFailure(result_details=details)
 
+    @handles(CreateThreadRequest)
     def on_handle_create_thread_request(self, request: CreateThreadRequest) -> ResultPayload:
         try:
             thread_id, meta = self._thread_storage.create_thread(title=request.title, local_id=request.local_id)
@@ -423,6 +1172,23 @@ class AgentManager:
             logger.exception(details)
             return CreateThreadResultFailure(result_details=details)
 
+    @handles(GetThreadMetadataRequest)
+    def on_handle_get_thread_metadata_request(self, request: GetThreadMetadataRequest) -> ResultPayload:
+        try:
+            if not self._thread_storage.thread_exists(request.thread_id):
+                details = f"Thread {request.thread_id} not found"
+                return GetThreadMetadataResultFailure(result_details=details)
+
+            thread = self._thread_storage.get_thread_metadata(request.thread_id)
+            return GetThreadMetadataResultSuccess(
+                thread=thread, result_details="Thread metadata retrieved successfully."
+            )
+        except Exception as e:
+            details = f"Error retrieving thread metadata: {e}"
+            logger.exception(details)
+            return GetThreadMetadataResultFailure(result_details=details)
+
+    @handles(ListThreadsRequest)
     def on_handle_list_threads_request(self, _: ListThreadsRequest) -> ResultPayload:
         try:
             threads = self._thread_storage.list_threads()
@@ -432,24 +1198,24 @@ class AgentManager:
             logger.exception(details)
             return ListThreadsResultFailure(result_details=details)
 
+    @handles(DeleteThreadRequest)
     def on_handle_delete_thread_request(self, request: DeleteThreadRequest) -> ResultPayload:
         try:
             self._thread_storage.delete_thread(request.thread_id)
             return DeleteThreadResultSuccess(thread_id=request.thread_id, result_details="Thread deleted successfully.")
         except ValueError as e:
             details = str(e)
-            logger.error(details)
             return DeleteThreadResultFailure(result_details=details)
         except Exception as e:
             details = f"Error deleting thread: {e}"
             logger.exception(details)
             return DeleteThreadResultFailure(result_details=details)
 
+    @handles(RenameThreadRequest)
     def on_handle_rename_thread_request(self, request: RenameThreadRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return RenameThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, title=request.new_title)
@@ -464,17 +1230,15 @@ class AgentManager:
             logger.exception(details)
             return RenameThreadResultFailure(result_details=details)
 
+    @handles(ArchiveThreadRequest)
     def on_handle_archive_thread_request(self, request: ArchiveThreadRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if meta.get("archived", False):
+            if self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is already archived"
-                logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, archived=True)
@@ -488,17 +1252,15 @@ class AgentManager:
             logger.exception(details)
             return ArchiveThreadResultFailure(result_details=details)
 
+    @handles(UnarchiveThreadRequest)
     def on_handle_unarchive_thread_request(self, request: UnarchiveThreadRequest) -> ResultPayload:
         try:
             if not self._thread_storage.thread_exists(request.thread_id):
                 details = f"Thread {request.thread_id} not found"
-                logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if not meta.get("archived", False):
+            if not self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is not archived"
-                logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
             updated_meta = self._thread_storage.update_thread_metadata(request.thread_id, archived=False)
@@ -512,6 +1274,7 @@ class AgentManager:
             logger.exception(details)
             return UnarchiveThreadResultFailure(result_details=details)
 
+    @handles(ConfigureAgentRequest)
     def on_handle_configure_agent_request(self, request: ConfigureAgentRequest) -> ResultPayload:
         """Update agent configuration from the chat sidebar.
 
@@ -565,6 +1328,7 @@ class AgentManager:
             changed = True
         return changed
 
+    @handles(ListAgentModelsRequest)
     def on_handle_list_agent_models_request(self, _: ListAgentModelsRequest) -> ResultPayload:
         return ListAgentModelsResultSuccess(
             prompt_models=list(MODEL_CHOICES),
@@ -574,6 +1338,7 @@ class AgentManager:
             result_details="Agent model lists retrieved successfully.",
         )
 
+    @handles(GetAgentConfigRequest)
     def on_handle_get_agent_config_request(self, _: GetAgentConfigRequest) -> ResultPayload:
         gc = self._get_provider(None)
         return GetAgentConfigResultSuccess(
@@ -585,6 +1350,7 @@ class AgentManager:
             result_details="Agent config retrieved successfully.",
         )
 
+    @handles(ListProviderModelsRequest)
     async def on_handle_list_provider_models_request(self, request: ListProviderModelsRequest) -> ResultPayload:
         try:
             if request.provider == ProviderID.GRIPTAPE_CLOUD:
@@ -603,7 +1369,7 @@ class AgentManager:
             if request.api_key:
                 headers["Authorization"] = f"Bearer {request.api_key}"
 
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx2.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"{base_url}/models", headers=headers)
                 response.raise_for_status()
 
@@ -613,11 +1379,15 @@ class AgentManager:
                 models=models,
                 result_details=f"Retrieved {len(models)} models from {base_url}.",
             )
-        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
-            details = f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
-            logger.warning(details)
+        except (httpx2.HTTPStatusError, httpx2.RequestError, ValueError) as e:
+            # Keep the raw exception in the logs for debugging, but surface a
+            # message the user can act on when the provider is simply offline.
+            logger.warning("Attempted to list models from '%s'. Failed with: %s", request.base_url, e)
+            friendly = _friendly_list_models_error(e, request.base_url)
+            details = friendly or f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
             return ListProviderModelsResultFailure(result_details=details)
 
+    @handles(GetConversationMemoryRequest)
     def on_handle_get_conversation_memory_request(self, request: GetConversationMemoryRequest) -> ResultPayload:
         try:
             history = self._thread_storage.load_history(request.thread_id)
@@ -632,26 +1402,46 @@ class AgentManager:
             logger.exception(details)
             return GetConversationMemoryResultFailure(result_details=details)
 
+    async def _attribution_headers(self, provider_name: str | None) -> dict[str, str]:
+        """Return the budget attribution header for a Griptape Cloud run, or ``{}``.
+
+        Cloud checks project budgets against this header, so without it a chat reply is
+        never charged to the open project. Only Griptape Cloud reads it; other providers get
+        nothing. A failure sends no header rather than failing the turn: not knowing which
+        project to bill is not a reason to refuse the reply, and the handler has already
+        logged why.
+        """
+        if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
+            return {}
+        result = await self.engine.ahandle_request(GetAttributionContextRequest())
+        if not isinstance(result, GetAttributionContextResultSuccess):
+            return {}
+        return {result.header_name: result.header_value}
+
     def _build_runner(
         self,
-        additional_mcp_servers: list[str],
         provider_name: str | None = None,
         model_name: str | None = None,
     ) -> PydanticAgentRunner:
+        """Return the cached agent for this provider/model, building it if needed.
+
+        The runner carries only what is fixed for the life of an agent: the
+        model, the engine's own MCP server, and the base instructions. Anything
+        the user can edit mid-session - their MCP servers and the rules attached
+        to them - is passed to :meth:`PydanticAgentRunner.run` instead, so an
+        edit takes effect on the next run rather than the next engine restart.
+        """
         provider = self._get_provider(provider_name)
         provider_type = provider.type
         model_name = model_name or provider.model
         base_url = provider.base_url or ""
 
         if provider_type == _PROTECTED_PROVIDER_NAME:
-            api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
+            api_key = resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)
             if not api_key:
-                msg = f"Secret '{API_KEY_ENV_VAR}' not found"
+                msg = f"Attempted to start the agent. Failed because {MISSING_CREDENTIAL_MESSAGE}"
                 raise ValueError(msg)
-            # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
-            # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
-            # malformed endpoint, so the chat and image paths agree.
-            cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
+            cloud_base_url = resolve_cloud_base_url()
             model_base_url: str | None = cloud_base_url
             image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
@@ -665,32 +1455,23 @@ class AgentManager:
             # Image generation is Griptape Cloud-specific; disable for other providers.
             image_config = None
 
-        cache_key = (
-            provider_type,
-            model_name,
-            self._image_model_name,
-            base_url,
-            api_key,
-            tuple(sorted(additional_mcp_servers)),
+        cache_key = _RunnerCacheKey(
+            provider_type=provider_type,
+            model_name=model_name,
+            image_model_name=self._image_model_name,
+            base_url=base_url,
+            api_key=api_key,
         )
         if (cached := self._runner_cache.get(cache_key)) is not None:
             return cached
 
         workspace_root = Path(config_manager.workspace_path)
+        self._ensure_skills_directory(workspace_root)
+        # The engine's own MCP server is the only one baked into the agent: the
+        # engine owns its lifetime and its address cannot change mid-session.
         mcp_servers: list[AbstractToolset[Any]] = [
-            streamable_http_local(
-                f"http://localhost:{self._mcp_server_port}/mcp/",
-                name="GriptapeNodes",
-            ),
+            streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/"),
         ]
-        server_rules: list[str] = []
-        for cfg in self._lookup_mcp_configs(additional_mcp_servers):
-            built = mcp_server_from_config(cfg["name"], cfg)
-            if built is not None:
-                mcp_servers.append(built)
-            rules = cfg.get("rules")
-            if isinstance(rules, str) and rules.strip():
-                server_rules.append(f"Rules for MCP server '{cfg['name']}':\n{rules.strip()}")
 
         runner = PydanticAgentRunner(
             model_name=model_name,
@@ -699,7 +1480,7 @@ class AgentManager:
             base_url=model_base_url,
             workspace_root=workspace_root,
             storage=self._thread_storage,
-            instructions=self._compose_instructions(server_rules, include_image_tool=image_config is not None),
+            instructions=_build_agent_instructions(include_image_tool=image_config is not None),
             system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
             image_config=image_config,
@@ -709,6 +1490,25 @@ class AgentManager:
         self._runner_cache[cache_key] = runner
         return runner
 
+    def _ensure_skills_directory(self, workspace_root: Path) -> None:
+        """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
+
+        Called before every runner construction: the runner builds its skills
+        capability from this directory on each run, so creating it here means a
+        skill added mid-session is picked up without an engine restart. Seeds a
+        README the first time so users discovering the folder know what belongs
+        in it. Failure to scaffold is logged but never blocks building the agent.
+        """
+        skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
+        try:
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            readme = skills_dir / "README.md"
+            if not readme.exists():
+                readme.write_text(_SKILLS_README, encoding="utf-8")
+        except OSError as e:
+            logger.warning("Attempted to scaffold skills directory at %s. Failed because of: %s", skills_dir, e)
+
+    @handles(ListAgentProvidersRequest)
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
             providers=list(self._providers),
@@ -716,6 +1516,7 @@ class AgentManager:
             result_details="Chat providers retrieved successfully.",
         )
 
+    @handles(CreateAgentProviderRequest)
     def on_handle_create_agent_provider_request(self, request: CreateAgentProviderRequest) -> ResultPayload:
         pd = request.provider
         name = pd.name.strip()
@@ -741,12 +1542,15 @@ class AgentManager:
             model=pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"),
             base_url=pd.base_url or None,
             api_key_secret_name=api_key_secret_name,
+            enabled=pd.enabled,
+            icon=pd.icon or None,
         )
         self._providers.append(provider)
         self._persist_providers()
         self._runner_cache.clear()
         return CreateAgentProviderResultSuccess(name=name, result_details=f"Provider '{name}' created successfully.")
 
+    @handles(UpdateAgentProviderRequest)
     def on_handle_update_agent_provider_request(self, request: UpdateAgentProviderRequest) -> ResultPayload:
         existing = next((p for p in self._providers if p.name == request.name), None)
         if existing is None:
@@ -758,6 +1562,10 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{pd.type}' is not a known preset id."
             )
+        if pd.enabled is False and request.name == _PROTECTED_PROVIDER_NAME:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because it is a protected provider and cannot be disabled."
+            )
         if pd.type is not None:
             existing.type = pd.type
         if pd.model is not None:
@@ -767,10 +1575,15 @@ class AgentManager:
         if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(existing.type):
             raw = pd.api_key_secret_name or ""
             existing.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
+        if pd.enabled is not None:
+            existing.enabled = pd.enabled
+        if "icon" in pd.model_fields_set:
+            existing.icon = pd.icon or None
         self._persist_providers()
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
 
+    @handles(DeleteAgentProviderRequest)
     def on_handle_delete_agent_provider_request(self, request: DeleteAgentProviderRequest) -> ResultPayload:
         if request.name == _PROTECTED_PROVIDER_NAME:
             return DeleteAgentProviderResultFailure(
@@ -865,35 +1678,105 @@ class AgentManager:
         if gc and gc.model != default_model:
             config_manager.set_config_value("agent.griptape_cloud_model", gc.model)
 
-    def _compose_instructions(self, server_rules: list[str], *, include_image_tool: bool) -> str:
-        """Compose the instructions string from base rules and per-MCP-server rules."""
-        parts = [_build_agent_instructions(include_image_tool=include_image_tool)]
-        parts.extend(server_rules)
-        return "\n\n".join(parts)
+    async def _acquire_mcp_toolsets(self, server_names: list[str]) -> _MCPAttachment:
+        """Lease a live toolset for each requested MCP server, plus its rules.
 
-    @staticmethod
-    def _lookup_mcp_configs(server_names: list[str]) -> list[dict[str, Any]]:
-        if not server_names:
-            return []
-        result = GriptapeNodes.handle_request(GetEnabledMCPServersRequest())
+        Runs on every agent run, and reads the servers' current configuration
+        each time, which is what lets an edit take effect without an engine
+        restart. Servers whose config is unchanged keep their warm connection;
+        an edited one is restarted, and one that has been deleted or disabled is
+        shut down here rather than lingering for the session.
+        """
+        enabled = self._lookup_enabled_mcp_servers()
+        if enabled is None:
+            return _MCPAttachment(lease=await self._mcp_toolsets.acquire([]), instructions="")
+
+        await self._mcp_toolsets.retain_only(enabled)
+
+        unavailable = [name for name in server_names if name not in enabled]
+        if unavailable:
+            logger.warning(
+                "Attempted to give the agent MCP server(s) %s. They are not enabled, so the agent will run without "
+                "them. Enable them in Settings to use their tools.",
+                ", ".join(sorted(unavailable)),
+            )
+
+        configs = [{**enabled[name], "name": name} for name in server_names if name in enabled]
+        lease = await self._mcp_toolsets.acquire(configs)
+        instructions = _compose_server_rules(configs)
+        # Config digests answer "my edit didn't take effect": a digest that moved
+        # between runs says the new config really was read. The rules text is
+        # never logged - free-text the user may have pasted anything into.
+        logger.debug(
+            "Agent run attached MCP server(s) %s",
+            ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
+        )
+        return _MCPAttachment(lease=lease, instructions=instructions)
+
+    def _library_toolsets(self, names: list[str]) -> list[AbstractToolset[Any]]:
+        """Build a toolset for each named library MCP server, skipping names no loaded library serves."""
+        read_only_by_slug: dict[str, set[str]] = {}
+        for library in list_library_mcp_tools():
+            read_only = read_only_by_slug.setdefault(library.slug, set())
+            read_only.update(tool.request_type.__name__ for tool in library.tools if tool.read_only)
+        unavailable = [name for name in names if name not in read_only_by_slug]
+        if unavailable:
+            logger.warning(
+                "Attempted to give the agent the tools of library %s. No loaded library with that name exposes "
+                "MCP tools, so the agent will run without them. Check the library is loaded.",
+                ", ".join(sorted(unavailable)),
+            )
+        toolsets: list[AbstractToolset[Any]] = []
+        for name in dict.fromkeys(names):
+            if name not in read_only_by_slug:
+                continue
+            read_only = frozenset(read_only_by_slug[name])
+            toolsets.append(streamable_http_library(name, self._library_mcp_url(name), read_only))
+        return toolsets
+
+    def _library_mcp_url(self, slug: str) -> str:
+        return f"http://localhost:{self._mcp_server_port}/mcp/{LIBRARIES_PATH_SEGMENT}/{slug}/"
+
+    def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
+        """Current config of every enabled MCP server, or ``None`` if unreadable.
+
+        ``None`` and an empty dict must stay distinguishable: an empty dict means
+        the user has no enabled servers and any cached ones should be shut down,
+        while ``None`` means we could not find out and must leave them alone.
+        """
+        # Not broadcast: the answer carries each server's `env` and `headers`
+        # verbatim, and nothing listens for this internal lookup's result.
+        result = self.engine.handle_request(GetEnabledMCPServersRequest(broadcast_result=False))
         if not isinstance(result, GetEnabledMCPServersResultSuccess):
             logger.warning("Could not load enabled MCP servers; agent will run without extras.")
-            return []
-        return [{**result.servers[name], "name": name} for name in server_names if name in result.servers]
+            return None
+        return dict(result.servers)
 
     def _validate_thread_for_run(self, thread_id: str | None) -> str:
         if thread_id is None or not self._thread_storage.thread_exists(thread_id):
             new_id, _ = self._thread_storage.create_thread()
             return new_id
 
-        meta = self._thread_storage.get_thread_metadata(thread_id)
-        if meta.get("archived", False):
+        if self._thread_storage.is_archived(thread_id):
             details = f"Cannot run agent on archived thread {thread_id}. Unarchive it first."
             raise ValueError(details)
         return thread_id
 
 
-async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact]) -> str | list[UserContent]:
+@dataclass
+class ComposedPrompt:
+    """A user prompt in two forms: raw bytes for the live call, URLs to persist.
+
+    ``live`` inlines ``BinaryContent`` so the provider sees pixels (it cannot
+    fetch the localhost static-file URLs). ``persist`` swaps each image for an
+    ``ImageUrl`` so saved history stays small and the GUI renders thumbnails.
+    """
+
+    live: str | list[UserContent]
+    persist: str | list[UserContent]
+
+
+async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact]) -> ComposedPrompt:
     """Combine the plain text input with any attached image artifacts.
 
     Image attachments are downloaded server-side and inlined as
@@ -901,31 +1784,139 @@ async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact
     The engine fetches the bytes itself, which is why this works even when the
     static file store hands out localhost URLs the model provider cannot reach.
 
-    Returns the plain ``text`` when there are no usable image attachments,
-    otherwise a ``[text, BinaryContent, ...]`` sequence for ``Agent.run``.
+    Returns two aligned forms of the prompt. ``live`` is the plain ``text`` (no
+    attachments) or a ``[text, BinaryContent, ...]`` sequence for ``Agent.run``.
+    ``persist`` mirrors it with each image as a lightweight ``ImageUrl`` so the
+    saved history stays small; a download that fails is dropped from both.
     """
     image_urls = [
         artifact.value for artifact in url_artifacts if artifact.type == "ImageUrlArtifact" and artifact.value
     ]
     if not image_urls:
-        return text
+        return ComposedPrompt(live=text, persist=text)
 
-    contents: list[UserContent] = []
+    live: list[UserContent] = []
+    persist: list[UserContent] = []
     if text:
-        contents.append(text)
-    async with httpx.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS) as client:
+        live.append(text)
+        persist.append(text)
+    async with httpx2.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS) as client:
         for url in image_urls:
             content = await _download_image_content(client, url)
-            if content is not None:
-                contents.append(content)
+            if content is None:
+                continue
+            live.append(content)
+            persist.append(ImageUrl(url=url))
 
     # Every download failed: fall back to plain text so the turn still runs.
-    if not any(isinstance(content, BinaryContent) for content in contents):
-        return text
-    return contents
+    if not any(isinstance(part, BinaryContent) for part in live):
+        return ComposedPrompt(live=text, persist=text)
+    return ComposedPrompt(live=live, persist=persist)
 
 
-async def _download_image_content(client: httpx.AsyncClient, url: str) -> BinaryContent | None:
+async def _rehydrate_history(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Return a copy of ``messages`` with ``ImageUrl`` attachments re-inlined.
+
+    History stores localhost static-file URLs the external provider cannot
+    fetch, so replayed turns need the raw bytes re-inlined. A part whose
+    download fails is dropped, matching ``_compose_prompt`` behavior.
+
+    The input is never mutated: rehydrated bytes belong only to the copy fed
+    to the model, so they can never be written back to disk. Messages that
+    carry no image are returned unchanged (same object). Downloads run
+    concurrently and against a short loopback timeout so an unreachable
+    static server bounds, rather than serializes, the per-turn stall.
+    """
+    # _message_has_image_url is True only for a ModelRequest, so every entry
+    # here is safe to hand to _rehydrate_message.
+    image_requests = [
+        (index, message)
+        for index, message in enumerate(messages)
+        if isinstance(message, ModelRequest) and _message_has_image_url(message)
+    ]
+    if not image_requests:
+        return messages
+    async with httpx2.AsyncClient(timeout=_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS) as client:
+        # Rehydrate every image-bearing message concurrently so a slow or
+        # unreachable static server bounds the whole turn's stall to one
+        # timeout, not one per message.
+        results = await asyncio.gather(*(_rehydrate_message(client, message) for _, message in image_requests))
+    result_by_position = {index: result for (index, _), result in zip(image_requests, results, strict=True)}
+    rehydrated_messages: list[ModelMessage] = []
+    attempted = 0
+    succeeded = 0
+    for index, message in enumerate(messages):
+        result = result_by_position.get(index)
+        if result is None:
+            rehydrated_messages.append(message)
+            continue
+        rehydrated_messages.append(result.message)
+        attempted += result.attempted
+        succeeded += result.succeeded
+    if succeeded < attempted:
+        logger.warning(
+            "Re-inlined %d/%d history image(s) for the chat turn; the rest could not be "
+            "downloaded from the local static-file server, so the model will not see them. "
+            "This usually means the static server moved to a different port across restarts.",
+            succeeded,
+            attempted,
+        )
+    return rehydrated_messages
+
+
+async def _rehydrate_message(client: httpx2.AsyncClient, message: ModelRequest) -> _RehydratedMessage:
+    """Return a copy of ``message`` with each user-prompt ``ImageUrl`` inlined.
+
+    Downloads for a message run concurrently. The result also carries how many
+    images were attempted versus successfully re-inlined so the caller can
+    report the aggregate.
+    """
+    attempted = 0
+    succeeded = 0
+    new_parts: list[Any] = []
+    for part in message.parts:
+        if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+            new_parts.append(part)
+            continue
+        images = [(index, item) for index, item in enumerate(part.content) if isinstance(item, ImageUrl)]
+        attempted += len(images)
+        downloads = await asyncio.gather(*(_download_image_content(client, image.url) for _, image in images))
+        downloaded_by_index = {index: content for (index, _), content in zip(images, downloads, strict=True)}
+        rehydrated: list[UserContent] = []
+        for index, item in enumerate(part.content):
+            if index not in downloaded_by_index:
+                rehydrated.append(item)
+                continue
+            content = downloaded_by_index[index]
+            if content is not None:
+                succeeded += 1
+                rehydrated.append(content)
+        # An image-only turn whose every image failed to re-download would
+        # otherwise become empty content, which some providers reject. Keep
+        # the turn present with a placeholder so replay still works.
+        if images and not rehydrated:
+            rehydrated.append(_UNAVAILABLE_IMAGE_PLACEHOLDER)
+        new_parts.append(replace(part, content=rehydrated))
+    return _RehydratedMessage(message=replace(message, parts=new_parts), attempted=attempted, succeeded=succeeded)
+
+
+def _message_has_image_url(message: ModelMessage) -> bool:
+    """Report whether ``message`` carries an ``ImageUrl`` in a user prompt.
+
+    Used to skip opening an HTTP client for text-only histories, the common
+    case, so rehydration only pays the download cost when there is an image.
+    """
+    if not isinstance(message, ModelRequest):
+        return False
+    for part in message.parts:
+        if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+            continue
+        if any(isinstance(item, ImageUrl) for item in part.content):
+            return True
+    return False
+
+
+async def _download_image_content(client: httpx2.AsyncClient, url: str) -> BinaryContent | None:
     """Download an image URL and wrap its bytes as inline ``BinaryContent``.
 
     Returns ``None`` when the download fails so the caller can drop the
@@ -934,13 +1925,13 @@ async def _download_image_content(client: httpx.AsyncClient, url: str) -> Binary
     try:
         response = await client.get(url)
         response.raise_for_status()
-    except httpx.HTTPError as e:
+    except httpx2.HTTPError as e:
         logger.warning("Attempted to attach image from %s. Skipping it because the download failed with %s.", url, e)
         return None
     return BinaryContent(data=response.content, media_type=_resolve_image_media_type(response, url))
 
 
-def _resolve_image_media_type(response: httpx.Response, url: str) -> str:
+def _resolve_image_media_type(response: httpx2.Response, url: str) -> str:
     """Determine the image media type from the response header, then the URL.
 
     Prefers the server's ``Content-Type`` and falls back to guessing from the
@@ -955,26 +1946,31 @@ def _resolve_image_media_type(response: httpx.Response, url: str) -> str:
     return _DEFAULT_IMAGE_MEDIA_TYPE
 
 
-def _run_event_to_payload(event: RunEvent) -> Any:
+def _run_event_to_payload(event: RunEvent, thread_id: str) -> Any:
     """Translate a runner event into the matching ExecutionPayload.
+
+    ``thread_id`` is stamped onto every payload so a client with several chat
+    surfaces open can route each delta to the conversation it belongs to.
 
     Returns ``None`` for event kinds that don't have a UI counterpart yet.
     """
     if isinstance(event, TextDelta):
-        return AgentStreamEvent(token=event.delta)
+        return AgentStreamEvent(thread_id=thread_id, token=event.delta)
     if isinstance(event, ToolCall):
         return AgentToolCallEvent(
+            thread_id=thread_id,
             tool_call_id=event.tool_call_id,
             tool_name=event.tool_name,
             args=event.args,
         )
     if isinstance(event, ToolResult):
         return AgentToolResultEvent(
+            thread_id=thread_id,
             tool_call_id=event.tool_call_id,
             tool_name=event.tool_name,
             content=event.content,
             is_error=event.is_error,
         )
     if isinstance(event, ThinkingDelta):
-        return AgentThinkingEvent(delta=event.delta)
+        return AgentThinkingEvent(thread_id=thread_id, delta=event.delta)
     return None

@@ -1,29 +1,36 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
+import dataclasses
+import json
 import logging
-import pickle
+from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
+    StrictModeScope,
     StrictModeScopeKind,
     StrictModeSeverity,
 )
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
+    from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
+from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
@@ -38,21 +45,26 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
+    Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
+from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
+from griptape_nodes.exe_types.node_loading import node_loading
 from griptape_nodes.exe_types.node_types import (
+    ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
-    PRIVATE_EXECUTION,
     BaseNode,
     ErrorProxyNode,
     NodeDependencies,
     NodeResolutionState,
     TransformedParameterValue,
+    _values_differ,
     aprocess_scope,
-    sanctioned_parameter_mutation,
 )
+from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -63,8 +75,11 @@ from griptape_nodes.node_library.library_declarations import (
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
+    RequestPayload,
     ResultDetails,
     ResultPayload,
     ResultPayloadFailure,
@@ -81,7 +96,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     CancelExecuteNodeResultSuccess,
@@ -95,14 +109,17 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartFlowResultFailure,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
+    PACKAGED_FLOW_BOUNDARY_KEY,
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
     ListNodesInFlowRequest,
     ListNodesInFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.library_events import (
     GetLibraryMetadataRequest,
-    GetLibraryMetadataResultFailure,
     GetLibraryMetadataResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupRequest,
     AddNodesToNodeGroupResultFailure,
@@ -163,6 +180,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsResultFailure,
     SerializeNodeToCommandsResultSuccess,
     SerializeSelectedNodesToCommandsRequest,
+    SerializeSelectedNodesToCommandsResultFailure,
     SerializeSelectedNodesToCommandsResultSuccess,
     SetLockNodeStateRequest,
     SetLockNodeStateResultFailure,
@@ -228,7 +246,7 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultFailure,
     ValidateNodeDependenciesResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -236,7 +254,38 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.run_queue import RunSpec
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.serialization.commands import (
+    ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES,
+    CommandsFormatError,
+    decode_commands,
+    encode_commands,
+)
+from griptape_nodes.serialization.legacy_pickle import (
+    LegacyPickleError,
+    read_legacy_clipboard_commands,
+    read_legacy_clipboard_value,
+)
+from griptape_nodes.serialization.values import (
+    JsonValue,
+    UndecodedValue,
+    Unencodable,
+    ValueEncodeError,
+    decode_value,
+    dump_json,
+    encodable_default,
+    try_encode,
+    value_key,
+)
+from griptape_nodes.traits.trait_resolver import resolve_trait
+from griptape_nodes.utils.budget_refusal import BudgetExceededError, BudgetRefusal, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
+from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -244,17 +293,44 @@ logger = logging.getLogger("griptape_nodes")
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
 
+# A worker's own top-level flow, under which each execution's copy of a node gets a flow of its own.
+# Nodes and flows share one namespace, so the name is one no node is given.
+_WORKER_COPIES_FLOW_NAME = "__worker_node_copies__"
 
-class SerializedParameterValues(NamedTuple):
-    """Result of serializing parameter output values.
+# A node in one of these states owes the running flow nothing further, so deleting it takes
+# nothing away from the run.
+_SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.ERRORED})
 
-    Attributes:
-        parameter_output_values: Either raw values or UUID references if pickling was used
-        unique_parameter_uuid_to_values: Dictionary of pickled values (None if no pickling needed)
+# A node in one of these states has not been dispatched yet. Dispatch is when a node collects
+# values from its upstream nodes (see ExecuteDagState.collect_values_from_upstream_nodes), so a
+# node still in one of these states has NOT received its inputs and would fall back to its
+# parameter defaults if an upstream disappeared first.
+_UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
+
+
+@dataclass
+class _FlowCancelOutcome:
+    """What deleting a node did to the workflow that was running, if any.
+
+    Both halves are worth reporting: a delete that could not stop the run has to fail, and a delete
+    that did stop it has to say so, or the run appears to stop for no stated reason.
     """
 
-    parameter_output_values: dict[str, Any]
-    unique_parameter_uuid_to_values: dict[Any, Any] | None
+    failure: ResultPayload | None = None
+    cancelled_for_node_name: str | None = None
+
+
+@dataclass
+class _NodeStructureCommands:
+    """The commands that rebuild a node's structure beyond its ``__init__`` shape.
+
+    Attributes:
+        commands: Group and parameter adds and alters, in the order they must run.
+        omitted_parameter_names: Parameters left out of the commands, whose values must be left out too.
+    """
+
+    commands: list[RequestPayload]
+    omitted_parameter_names: set[str]
 
 
 class CanResetResult(NamedTuple):
@@ -294,6 +370,10 @@ class SerializedGroupResult:
     child_uuids: list[SerializedNodeCommands.NodeUUID]
 
 
+class CopiedNodesError(Exception):
+    """Copied nodes could not be read for pasting. The message completes 'Failed because ...'."""
+
+
 class _NodeInstantiationDeniedError(Exception):
     """Raised inside node creation when the license policy denies the node type.
 
@@ -304,18 +384,35 @@ class _NodeInstantiationDeniedError(Exception):
     """
 
 
-class NodeManager:
-    _name_to_parent_flow_name: dict[str, str]
+@dataclass(frozen=True)
+class ResolveNodeSpec(RunSpec):
+    """A run of one node, from a `ResolveNodeRequest`."""
 
-    def __init__(self, event_manager: EventManager) -> None:
-        self._name_to_parent_flow_name = {}
+    request: ResolveNodeRequest
+    flow_name: str
+    node_name: str
 
-        # Orchestrator-side: node_name → (target_request_id, worker_engine_id, worker_request_topic)
-        # for ExecuteNodeRequests currently routed to a worker. Populated in
-        # _execute_node_via_worker, cleared in its finally. Used by
-        # cancel_worker_execution to dispatch a CancelExecuteNodeRequest to the
-        # correct worker.
-        self._orch_worker_requests: dict[str, tuple[str, str, str]] = {}
+    async def execute(self, engine: Engine) -> ResultPayload:
+        try:
+            node = engine.node_manager.get_node_by_name(self.node_name)
+        except ValueError as e:
+            return ResolveNodeResultFailure(
+                validation_exceptions=[e], result_details=f'Resolve failure. "{self.node_name}" does not exist. {e}'
+            )
+        flow = engine.object_manager.attempt_get_object_by_name_as_type(self.flow_name, ControlFlow)
+        if flow is None:
+            return self.failure(f'Failed to fetch parent flow for "{self.node_name}"')
+        return await engine.node_manager.execute_resolve_node(node, flow, debug_mode=self.request.debug_mode)
+
+    def failure(self, details: str) -> ResultPayload:
+        return ResolveNodeResultFailure(validation_exceptions=[], result_details=details)
+
+
+class NodeManager(EngineScoped):
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
+        # Each node's parent flow and the nodes routed to a worker belong to the open workflow and
+        # live on its runtime.
 
         # Worker-side: request_id → (asyncio.Task, BaseNode) for the aprocess
         # task currently handling an ExecuteNodeRequest. Populated in
@@ -324,96 +421,29 @@ class NodeManager:
         # task to cancel.
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
-        event_manager.assign_manager_to_request_type(CreateNodeRequest, self.on_create_node_request)
-        event_manager.assign_manager_to_request_type(
-            AddNodesToNodeGroupRequest, self.on_add_nodes_to_node_group_request
-        )
-        event_manager.assign_manager_to_request_type(
-            RemoveNodeFromNodeGroupRequest, self.on_remove_node_from_node_group_request
-        )
-        event_manager.assign_manager_to_request_type(DeleteNodeRequest, self.on_delete_node_request)
-        event_manager.assign_manager_to_request_type(MoveNodeToNewFlowRequest, self.on_move_node_to_new_flow_request)
-        event_manager.assign_manager_to_request_type(
-            GetNodeResolutionStateRequest, self.on_get_node_resolution_state_request
-        )
-        event_manager.assign_manager_to_request_type(GetNodeMetadataRequest, self.on_get_node_metadata_request)
-        event_manager.assign_manager_to_request_type(SetNodeMetadataRequest, self.on_set_node_metadata_request)
-        event_manager.assign_manager_to_request_type(
-            BatchSetNodeMetadataRequest, self.on_batch_set_node_metadata_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListConnectionsForNodeRequest, self.on_list_connections_for_node_request
-        )
-        event_manager.assign_manager_to_request_type(
-            GetConnectionsForParameterRequest, self.on_get_connections_for_parameter_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ListParametersOnNodeRequest, self.on_list_parameters_on_node_request
-        )
-        event_manager.assign_manager_to_request_type(AddParameterToNodeRequest, self.on_add_parameter_to_node_request)
-        event_manager.assign_manager_to_request_type(
-            AddParameterGroupToNodeRequest, self.on_add_parameter_group_to_node_request
-        )
-        event_manager.assign_manager_to_request_type(
-            AlterParameterGroupDetailsRequest, self.on_alter_parameter_group_details_request
-        )
-        event_manager.assign_manager_to_request_type(
-            RemoveParameterFromNodeRequest, self.on_remove_parameter_from_node_request
-        )
-        event_manager.assign_manager_to_request_type(GetParameterDetailsRequest, self.on_get_parameter_details_request)
-        event_manager.assign_manager_to_request_type(
-            AlterParameterDetailsRequest, self.on_alter_parameter_details_request
-        )
-        event_manager.assign_manager_to_request_type(GetParameterValueRequest, self.on_get_parameter_value_request)
-        event_manager.assign_manager_to_request_type(SetParameterValueRequest, self.on_set_parameter_value_request)
-        event_manager.assign_manager_to_request_type(RenameParameterRequest, self.on_rename_parameter_request)
-        event_manager.assign_manager_to_request_type(
-            ReorderParameterListItemRequest, self.on_reorder_parameter_list_item_request
-        )
-        event_manager.assign_manager_to_request_type(MigrateParameterRequest, self.on_migrate_parameter_request)
-        event_manager.assign_manager_to_request_type(ResolveNodeRequest, self.on_resolve_from_node_request)
-        event_manager.assign_manager_to_request_type(GetAllNodeInfoRequest, self.on_get_all_node_info_request)
-        event_manager.assign_manager_to_request_type(
-            GetCompatibleParametersRequest, self.on_get_compatible_parameters_request
-        )
-        event_manager.assign_manager_to_request_type(
-            ValidateNodeDependenciesRequest, self.on_validate_node_dependencies_request
-        )
-        event_manager.assign_manager_to_request_type(
-            GetNodeElementDetailsRequest, self.on_get_node_element_details_request
-        )
-        event_manager.assign_manager_to_request_type(SerializeNodeToCommandsRequest, self.on_serialize_node_to_commands)
-        event_manager.assign_manager_to_request_type(
-            DeserializeNodeFromCommandsRequest, self.on_deserialize_node_from_commands
-        )
-        event_manager.assign_manager_to_request_type(
-            SerializeSelectedNodesToCommandsRequest, self.on_serialize_selected_nodes_to_commands
-        )
-        event_manager.assign_manager_to_request_type(
-            DeserializeSelectedNodesFromCommandsRequest, self.on_deserialize_selected_nodes_from_commands
-        )
-        event_manager.assign_manager_to_request_type(DuplicateSelectedNodesRequest, self.on_duplicate_selected_nodes)
-        event_manager.assign_manager_to_request_type(SetLockNodeStateRequest, self.on_toggle_lock_node_request)
-        event_manager.assign_manager_to_request_type(GetFlowForNodeRequest, self.on_get_flow_for_node_request)
-        event_manager.assign_manager_to_request_type(SendNodeMessageRequest, self.on_send_node_message_request)
-        event_manager.assign_manager_to_request_type(
-            CanResetNodeToDefaultsRequest, self.on_can_reset_node_to_defaults_request
-        )
-        event_manager.assign_manager_to_request_type(ResetNodeToDefaultsRequest, self.on_reset_node_to_defaults_request)
-        event_manager.assign_manager_to_request_type(UnresolveNodeRequest, self.on_unresolve_node_request)
-        event_manager.assign_manager_to_request_type(
-            BatchSetNodeLockStateRequest, self.on_batch_set_lock_node_state_request
-        )
-        event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
-        event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
+        event_manager.register_request_handlers(self)
+
+    @property
+    def _name_to_parent_flow_name(self) -> dict[str, str]:
+        return self._current_nodes().name_to_parent_flow_name
+
+    @property
+    def _orch_worker_requests(self) -> dict[str, tuple[str, str, str]]:
+        """Orchestrator-side: node_name -> (target_request_id, worker_engine_id, worker_request_topic).
+
+        For ExecuteNodeRequests currently routed to a worker. Populated in _execute_node_via_worker,
+        cleared in its finally. Used by cancel_worker_execution to dispatch a CancelExecuteNodeRequest
+        to the correct worker.
+        """
+        return self._current_nodes().orch_worker_requests
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
         node = self.get_node_by_name(old_name)
         # Get all connections for this node and update them.
         flow_name = self.get_node_parent_flow_by_name(old_name)
-        flow = GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
-        connections = GriptapeNodes.FlowManager().get_connections()
+        flow = self.engine.flow_manager.get_flow_by_name(flow_name)
+        connections = self.engine.flow_manager.get_connections()
         # Get all incoming and outgoing connections and update them.
         if old_name in connections.incoming_index:
             incoming_connections = connections.incoming_index[old_name]
@@ -452,6 +482,21 @@ class NodeManager:
             if parent_flow_name == old_name:
                 self._name_to_parent_flow_name[node_name] = new_name
 
+    def _current_nodes(self) -> WorkflowNodes:
+        """The current workflow's node bookkeeping, which needs a workflow to hold it.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        return self.engine.current_workflow().nodes
+
+    def _current_nodes_or_none(self) -> WorkflowNodes | None:
+        """The current workflow's node bookkeeping, or None for lookups that find nothing without a workflow."""
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return None
+        return workflow.nodes
+
     def _cleanup_node_on_failed_deserialization(self, node_name: str) -> None:
         """Clean up a node that failed during deserialization.
 
@@ -461,7 +506,7 @@ class NodeManager:
             node_name: The name of the node to delete
         """
         delete_node_request = DeleteNodeRequest(node_name=node_name)
-        delete_result = GriptapeNodes.handle_request(delete_node_request)
+        delete_result = self.engine.handle_request(delete_node_request)
         if delete_result.failed():
             logger.warning(
                 "Failed to clean up node '%s' after deserialization failure: %s",
@@ -603,6 +648,7 @@ class NodeManager:
         node_type: str,
         node_declarations: Sequence[NodeDeclaration],
         library_declarations: Sequence[LibraryDeclaration],
+        event_manager: EventManager,
     ) -> CheckpointDenial | None:
         """Ask any registered authorization hook whether this node type may be instantiated.
 
@@ -610,7 +656,7 @@ class NodeManager:
         instantiation path (CreateNode) and the library-load fitness preview so both
         resolve the same action and facts from whatever declarations they hold.
         """
-        return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+        return event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.INSTANTIATE_NODE,
                 subject_type=CheckpointSubjectType.NODE_TYPE,
@@ -625,7 +671,7 @@ class NodeManager:
 
     @staticmethod
     def _evaluate_instantiation_checkpoint(
-        *, node_type: str, specific_library_name: str | None
+        *, node_type: str, specific_library_name: str | None, event_manager: EventManager
     ) -> CheckpointDenial | None:
         """Ask any registered authorization hook whether this node type may be instantiated."""
         library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
@@ -633,10 +679,13 @@ class NodeManager:
             node_type=node_type,
             node_declarations=library.get_node_metadata(node_type).declarations,
             library_declarations=library.get_metadata().declarations,
+            event_manager=event_manager,
         )
 
     @staticmethod
-    def _enforce_instantiation_checkpoint(*, node_type: str, specific_library_name: str | None) -> None:
+    def _enforce_instantiation_checkpoint(
+        *, node_type: str, specific_library_name: str | None, event_manager: EventManager
+    ) -> None:
         """Raise `_NodeInstantiationDeniedError` when the policy denies this node type.
 
         Raised rather than returned so a denial joins the Error Proxy substitution
@@ -644,14 +693,16 @@ class NodeManager:
         to load. The message lists every missing permission.
         """
         denial = NodeManager._evaluate_instantiation_checkpoint(
-            node_type=node_type, specific_library_name=specific_library_name
+            node_type=node_type, specific_library_name=specific_library_name, event_manager=event_manager
         )
         if denial is not None:
             message = denial.reason(separator="\n")
             raise _NodeInstantiationDeniedError(message)
 
     @staticmethod
-    def evaluate_schema_node_instantiation_denials(schema: LibrarySchema) -> dict[str, CheckpointDenial]:
+    def evaluate_schema_node_instantiation_denials(
+        schema: LibrarySchema, *, event_manager: EventManager
+    ) -> dict[str, CheckpointDenial]:
         """Denials that would block instantiating each node type a library schema declares.
 
         Lets library-load fitness preview the node-instantiation gate without
@@ -667,28 +718,83 @@ class NodeManager:
                 node_type=node.class_name,
                 node_declarations=node.metadata.declarations,
                 library_declarations=schema.metadata.declarations,
+                event_manager=event_manager,
             )
             if denial is not None:
                 denials[node.class_name] = denial
         return denials
 
+    def _describe_node_creation_failure(self, err: Exception, *, node_type: str, library_name: str | None) -> str:
+        """Explain why a node could not be created, in terms the artist can act on.
+
+        A library that loaded with problems still registers, so the raw exception is usually just
+        "node type not found" and says nothing about the real cause. The library's recorded problems
+        and any pending restart name what actually went wrong.
+
+        Args:
+            err: The exception raised while creating the node
+            node_type: Node type that was being created, used to find the library when unnamed
+            library_name: Library the node type was requested from, if the caller named one
+        """
+        message = readable_exception_message(err)
+
+        resolved_library_name = library_name
+        if resolved_library_name is None:
+            resolved_library_name = self.engine.library_manager.catalog.get_library_name_for_node_type(node_type)
+        if resolved_library_name is None:
+            return message
+
+        library_manager = self.engine.library_manager
+        parts = [message]
+
+        problems = library_manager.catalog.get_collated_problems_for_library(resolved_library_name)
+        if problems is not None:
+            parts.append(f"Library '{resolved_library_name}' reported problems when it loaded:\n{problems}")
+
+        stale_module_explanation = library_manager.catalog.explain_stale_module_failure(resolved_library_name)
+        if stale_module_explanation is not None:
+            parts.append(stale_module_explanation)
+
+        return "\n\n".join(parts)
+
+    @contextmanager
+    def _loading(self, node_name: str, library_name: str | None) -> Iterator[StrictModeScope]:
+        """Mark `node_name` as loading while its library's code creates it or applies its saved state.
+
+        Opens a strict-mode load scope that ``graph-access-while-loading`` reports against. Its findings
+        also reach an execution that encloses it, as a node's execution in a worker encloses loading
+        the copy it runs.
+        """
+        with (
+            node_loading(node_name),
+            STRICT_MODE.open_scope(
+                kind=StrictModeScopeKind.LOAD,
+                subject=node_name,
+                library_name=library_name,
+                is_worker=self.engine.library_manager.is_worker,
+                hand_to_enclosing=True,
+            ) as scope,
+        ):
+            yield scope
+
+    @handles(CreateNodeRequest)
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
         parent_flow = None
         if parent_flow_name is None:
             # Try to get the current context flow
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = (
                     "Attempted to create Node in the Current Context. Failed because the Current Context was empty."
                 )
                 return CreateNodeResultFailure(result_details=details)
-            parent_flow = GriptapeNodes.ContextManager().get_current_flow()
+            parent_flow = self.engine.context_manager.get_current_flow()
             parent_flow_name = parent_flow.name
 
         # Does this flow actually exist?
         if parent_flow is None:
-            flow_mgr = GriptapeNodes.FlowManager()
+            flow_mgr = self.engine.flow_manager
             try:
                 parent_flow = flow_mgr.get_flow_by_name(parent_flow_name)
             except KeyError as err:
@@ -713,7 +819,7 @@ class NodeManager:
                 # Fall back to the class name
                 requested_node_name = request.node_type
 
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         final_node_name = obj_mgr.generate_name_for_object(
             type_name=request.node_type, requested_name=requested_node_name
         )
@@ -730,7 +836,10 @@ class NodeManager:
             self._enforce_instantiation_checkpoint(
                 node_type=request.node_type,
                 specific_library_name=request.specific_library_name,
+                event_manager=self.engine.event_manager,
             )
+            # Not marked as loading: during __init__ a node is in no flow on any path, so whatever it asks
+            # about the graph gets the same answer however it is being created.
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,
@@ -739,8 +848,13 @@ class NodeManager:
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
-            logger.error(err)
-            details = f"Could not create Node '{final_node_name}' of type '{request.node_type}': {err}"
+            # A node's __init__ comes from a separately versioned library, so this renders whatever
+            # it raised rather than only exceptions the engine controls.
+            details = (
+                f"Could not create Node '{final_node_name}' of type '{request.node_type}': "
+                f"{readable_exception_message(err)}"
+            )
+            logger.error(details)
 
             # Check if we should create an Error Proxy node instead of failing
             if request.create_error_proxy_on_failure:
@@ -752,17 +866,9 @@ class NodeManager:
                     if denied_by_policy:
                         failure_reason = str(err)
                     else:
-                        # Use fitness problem details if available for a more actionable error message
-                        library_metadata_result = GriptapeNodes.handle_request(
-                            GetLibraryMetadataRequest(library=request.specific_library_name or "")
+                        failure_reason = self._describe_node_creation_failure(
+                            err, node_type=request.node_type, library_name=request.specific_library_name
                         )
-                        if (
-                            isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
-                            and library_metadata_result.problems is not None
-                        ):
-                            failure_reason = library_metadata_result.problems
-                        else:
-                            failure_reason = str(err)
 
                     # Create ErrorProxyNode directly since it needs special initialization
                     node = ErrorProxyNode(
@@ -798,11 +904,13 @@ class NodeManager:
             logger.warning(
                 "Node '%s' was created in a RESOLVING state. This is not allowed. Setting to UNRESOLVED.", node.name
             )
-        node.state = NodeResolutionState(state)
+        # A library may react to its node's state while it is being created, so this is part of creating it.
+        with self._loading(node.name, request.specific_library_name) as state_scope:
+            node.state = NodeResolutionState(state)
 
         # See if we want to push this into the context of the current flow.
         if request.set_as_new_context:
-            GriptapeNodes.ContextManager().push_node(node=node)
+            self.engine.context_manager.push_node(node=node)
 
         # Success message based on whether we used Current Context or explicit flow
         if request.override_parent_flow_name is None:
@@ -816,7 +924,66 @@ class NodeManager:
         if remapped_requested_node_name:
             details = f"{details}. Had to rename from original node name requested '{request.node_name}' as an object with this name already existed."
 
+        # Handle parent_group_name: add this node to an existing group.
+        # This must happen before the paired-node handling below so the auto-created
+        # End node can inherit the same group as its Start node.
+        if request.parent_group_name:
+            try:
+                # get_node_by_name raises ValueError for a missing node, not KeyError — unlike
+                # object_manager.get_object_by_name, which the _get_node_group helpers call directly.
+                parent_group = self.get_node_by_name(request.parent_group_name)
+            except ValueError:
+                parent_group = None
+                logger.warning(
+                    "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
+                    node.name,
+                    request.parent_group_name,
+                )
+
+            if parent_group is not None and not isinstance(parent_group, BaseNodeGroup):
+                logger.warning(
+                    "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
+                    node.name,
+                    request.parent_group_name,
+                )
+            elif isinstance(parent_group, BaseNodeGroup):
+                # add_nodes_to_group can fail mid-way (a SubflowNodeGroup raises RuntimeError when the
+                # per-node MoveNodeToNewFlowRequest fails). Keep node creation recoverable rather than
+                # letting that escape after the node is already registered, matching node_names_to_add below.
+                # Snapshot membership so a failure can release whatever the call actually joined: an add
+                # may take in more than it was handed (tethered companions, nodes detached from a
+                # previous owner), and the raise denies us its return value.
+                members_before_add = set(parent_group.nodes)
+                try:
+                    parent_group.add_nodes_to_group([node])
+                except Exception as err:
+                    group_failure = (
+                        f"Created the node, but could not add it to group '{request.parent_group_name}': {err}"
+                    )
+                    logger.warning(
+                        "Attempted to add node '%s' to parent group '%s'. Failed with error: %s",
+                        node.name,
+                        request.parent_group_name,
+                        err,
+                    )
+                    # A failed add leaves nodes listed as members without having been moved into the
+                    # group's subflow. Release them so they end up plainly ungrouped instead of
+                    # half-joined, and so the reported parent_group_name below matches reality.
+                    nodes_to_release = [n for name, n in parent_group.nodes.items() if name not in members_before_add]
+                    try:
+                        parent_group.remove_nodes_from_group(nodes_to_release)
+                    except Exception as cleanup_err:
+                        logger.error(
+                            "Attempted to release nodes '%s' from group '%s' after a failed add. Failed with error: %s. They may still be listed as members of the group.",
+                            [n.name for n in nodes_to_release],
+                            request.parent_group_name,
+                            cleanup_err,
+                        )
+                    details = f"{details}. {group_failure}"
+                    log_level = logging.WARNING
+
         # Special handling for paired classes (e.g., create a Start node and it automatically creates a corresponding End node already connected).
+        paired_node_name = None
         if isinstance(node, BaseIterativeStartNode) and not request.initial_setup:
             # If it's StartLoop, create an EndLoop and connect it to the StartLoop.
             # Get the class name of the node
@@ -832,14 +999,21 @@ class NodeManager:
                 msg = f"Attempted to create a paired set of nodes for Node '{final_node_name}'. Failed because paired class '{end_class_name}' does not exist for start class '{node_class_name}'. The corresponding node will have to be created by hand and attached manually."
                 logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
             else:
+                # Place the paired End node in the same group as the Start node (if any).
+                paired_parent_group_name = node.parent_group.name if node.parent_group else None
+                # Place the End node to the right of the Start node. A Start node created without a
+                # position (e.g. over the API) leaves the End node's placement to the client as well.
+                end_metadata = {}
+                start_position = node.metadata.get("position")
+                if start_position is not None:
+                    end_metadata["position"] = {"x": start_position["x"] + 650, "y": start_position["y"]}
                 # Create the EndNode
-                end_loop = GriptapeNodes.handle_request(
+                end_loop = self.engine.handle_request(
                     CreateNodeRequest(
                         node_type=end_class_name,
-                        metadata={
-                            "position": {"x": node.metadata["position"]["x"] + 650, "y": node.metadata["position"]["y"]}
-                        },
+                        metadata=end_metadata,
                         override_parent_flow_name=parent_flow_name,
+                        parent_group_name=paired_parent_group_name,
                     )
                 )
                 if not isinstance(end_loop, CreateNodeResultSuccess):
@@ -847,7 +1021,7 @@ class NodeManager:
                     logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
                 else:
                     # Create Loop between output and input to the start node.
-                    GriptapeNodes.handle_request(
+                    loop_connection = self.engine.handle_request(
                         CreateConnectionRequest(
                             source_node_name=node.name,
                             source_parameter_name="loop",
@@ -865,6 +1039,13 @@ class NodeManager:
                         # create the connection - only when we've confirmed correct types
                         node.end_node = end_node
                         end_node.start_node = node
+                        # Name the End node so clients use it instead of creating their own.
+                        paired_node_name = end_node.name
+                        if loop_connection.failed():
+                            details = f"{details}. Also created its End node '{paired_node_name}', but failed to connect '{node.name}.loop' to '{paired_node_name}.from_start'. Connect them by hand"
+                            log_level = logging.WARNING
+                        else:
+                            details = f"{details}. Also created its End node '{paired_node_name}' and connected it"
 
         # Handle subflow_name for BaseNodeGroup nodes
         if request.subflow_name:
@@ -907,43 +1088,27 @@ class NodeManager:
                 )
                 logger.warning(warning_details)
 
-        # Handle parent_group_name: add this node to an existing group
-        if request.parent_group_name:
-            try:
-                parent_group = self.get_node_by_name(request.parent_group_name)
-                if isinstance(parent_group, BaseNodeGroup):
-                    parent_group.add_nodes_to_group([node])
-                else:
-                    logger.warning(
-                        "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
-                        node.name,
-                        request.parent_group_name,
-                    )
-            except KeyError:
-                logger.warning(
-                    "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
-                    node.name,
-                    request.parent_group_name,
-                )
-
-        return CreateNodeResultSuccess(
+        result = CreateNodeResultSuccess(
             node_name=node.name,
             node_type=node.__class__.__name__,
             specific_library_name=request.specific_library_name,
             parent_flow_name=parent_flow_name,
             parent_group_name=node.parent_group.name if node.parent_group else None,
+            paired_node_name=paired_node_name,
             result_details=ResultDetails(message=details, level=log_level),
         )
+        STRICT_MODE.attach_violations_to_result(result, state_scope)
+        return result
 
     def _get_flow_for_node_group_operation(self, flow_name: str | None) -> AddNodesToNodeGroupResultFailure | None:
         """Get the flow for a node group operation."""
         if flow_name is None:
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = "Attempted to add node to NodeGroup in the Current Context. Failed because the Current Context was empty."
                 return AddNodesToNodeGroupResultFailure(result_details=details)
         else:
             try:
-                GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
+                self.engine.flow_manager.get_flow_by_name(flow_name)
             except KeyError as err:
                 details = (
                     f"Attempted to add node to NodeGroup. Failed when attempting to find the parent Flow. Error: {err}"
@@ -958,7 +1123,7 @@ class NodeManager:
 
         Collects all errors and returns them together if multiple nodes fail.
         """
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         nodes = []
         errors = []
 
@@ -986,7 +1151,7 @@ class NodeManager:
     ) -> BaseNodeGroup | AddNodesToNodeGroupResultFailure:
         """Get the NodeGroup node."""
         try:
-            node_group = GriptapeNodes.ObjectManager().get_object_by_name(node_group_name)
+            node_group = self.engine.object_manager.get_object_by_name(node_group_name)
         except KeyError:
             details = f"Attempted to add nodes '{node_names}' to NodeGroup '{node_group_name}'. Failed because NodeGroup was not found."
             return AddNodesToNodeGroupResultFailure(result_details=details)
@@ -997,8 +1162,17 @@ class NodeManager:
 
         return node_group
 
+    @handles(AddNodesToNodeGroupRequest)
     def on_add_nodes_to_node_group_request(self, request: AddNodesToNodeGroupRequest) -> ResultPayload:
-        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup."""
+        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup.
+
+        In a SubflowNodeGroup, tethered nodes travel together: adding an iterative Start node also
+        adds its paired End node (and vice versa), so the pair is never split across the subflow
+        boundary. The GUI sends only the node the user selected, so the group layer enforces this
+        rather than the caller. A plain BaseNodeGroup has no flow of its own and groups exactly what
+        it was asked for. Either way `node_names_added` reports what actually happened, which may be
+        more than was requested. Removal mirrors this — see on_remove_node_from_node_group_request.
+        """
         flow_result = self._get_flow_for_node_group_operation(request.flow_name)
         if isinstance(flow_result, AddNodesToNodeGroupResultFailure):
             return flow_result
@@ -1014,25 +1188,28 @@ class NodeManager:
         node_group = node_group_result
 
         try:
-            node_group.add_nodes_to_group(nodes)
+            nodes_added = node_group.add_nodes_to_group(nodes)
         except Exception as err:
-            details = f"Attempted to add node '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
+            details = f"Attempted to add nodes '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return AddNodesToNodeGroupResultFailure(result_details=details)
 
-        details = f"Successfully added node '{request.node_names}' to NodeGroup '{request.node_group_name}'"
+        node_names_added = [n.name for n in nodes_added]
+        details = f"Successfully added nodes '{node_names_added}' to NodeGroup '{request.node_group_name}'"
         return AddNodesToNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
+            node_names_added=node_names_added,
+            node_group_name=request.node_group_name,
         )
 
     def _get_flow_for_remove_operation(self, flow_name: str | None) -> RemoveNodeFromNodeGroupResultFailure | None:
         """Get the flow for a remove node from group operation."""
         if flow_name is None:
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = "Attempted to remove nodes from NodeGroup in the Current Context. Failed because the Current Context was empty."
                 return RemoveNodeFromNodeGroupResultFailure(result_details=details)
         else:
             try:
-                GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
+                self.engine.flow_manager.get_flow_by_name(flow_name)
             except KeyError as err:
                 details = f"Attempted to remove nodes from NodeGroup. Failed when attempting to find the parent Flow. Error: {err}"
                 return RemoveNodeFromNodeGroupResultFailure(result_details=details)
@@ -1045,7 +1222,7 @@ class NodeManager:
 
         Collects all errors and returns them together if multiple nodes fail.
         """
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         nodes = []
         errors = []
 
@@ -1073,7 +1250,7 @@ class NodeManager:
     ) -> BaseNodeGroup | RemoveNodeFromNodeGroupResultFailure:
         """Get the NodeGroup node for remove operation."""
         try:
-            node_group = GriptapeNodes.ObjectManager().get_object_by_name(node_group_name)
+            node_group = self.engine.object_manager.get_object_by_name(node_group_name)
         except KeyError:
             details = f"Attempted to remove nodes '{node_names}' from NodeGroup '{node_group_name}'. Failed because NodeGroup was not found."
             return RemoveNodeFromNodeGroupResultFailure(result_details=details)
@@ -1084,8 +1261,15 @@ class NodeManager:
 
         return node_group
 
+    @handles(RemoveNodeFromNodeGroupRequest)
     def on_remove_node_from_node_group_request(self, request: RemoveNodeFromNodeGroupRequest) -> ResultPayload:
-        """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup."""
+        """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup.
+
+        Mirrors the add path. In a SubflowNodeGroup, removing an iterative Start node also removes
+        its paired End node (and vice versa), so the pair never ends up split with one half still in
+        the group. A plain BaseNodeGroup removes exactly what it was asked for, skipping any node
+        that is not a member. `node_names_removed` reports what actually left the group.
+        """
         flow_result = self._get_flow_for_remove_operation(request.flow_name)
         if isinstance(flow_result, RemoveNodeFromNodeGroupResultFailure):
             return flow_result
@@ -1101,24 +1285,37 @@ class NodeManager:
         node_group = node_group_result
 
         try:
-            node_group.remove_nodes_from_group(nodes)
-        except ValueError as err:
+            nodes_removed = node_group.remove_nodes_from_group(nodes)
+        except (ValueError, RuntimeError, NodeGroupMembershipError) as err:
+            # ValueError: a requested node is not a member. NodeGroupMembershipError: a
+            # SubflowNodeGroup could not move a node back to the parent flow, which tether expansion
+            # makes likelier by doubling the moves per request. RuntimeError: raised by group code
+            # predating that specific type.
             details = f"Attempted to remove nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return RemoveNodeFromNodeGroupResultFailure(result_details=details)
 
-        details = f"Successfully removed nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'"
+        node_names_removed = [n.name for n in nodes_removed]
+        details = f"Successfully removed nodes '{node_names_removed}' from NodeGroup '{request.node_group_name}'"
         return RemoveNodeFromNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
+            node_names_removed=node_names_removed,
+            node_group_name=request.node_group_name,
         )
 
-    def cancel_conditionally(
+    async def cancel_conditionally(
         self, parent_flow: ControlFlow, parent_flow_name: str, node: BaseNode
-    ) -> ResultPayload | None:
-        """Conditionally cancels a parent flow if it's currently executing nodes are connected to the specified node.
+    ) -> _FlowCancelOutcome:
+        """Cancel the running flow if deleting this node would take unfinished work away from it.
 
-        This method checks if the parent flow is running, and if so, determines whether the currently
-        executing or resolving node is connected to the specified node. If a connection exists, the parent
-        flow is cancelled to prevent operations on the deleted node.
+        Only genuine entanglement cancels. Sharing a connected component with something live is not
+        enough: a node the run has already finished with, or one the run was never going to reach,
+        can be deleted while the run carries on.
+
+        The cancel is awaited rather than dispatched synchronously. `on_cancel_flow_request` is an async
+        handler that gathers the running node tasks, and those tasks belong to the engine's event loop.
+        Dispatching it from sync code bridges it onto a side loop instead, where the gather cannot bind to
+        the tasks it is waiting on -- so the cancel raised "attached to a different loop" and every delete
+        during a run was refused.
 
         Args:
             parent_flow: The control flow object that may need to be cancelled.
@@ -1126,72 +1323,180 @@ class NodeManager:
             node: The base node that is trying to be deleted.
 
         Returns:
-            ResultPayload: A DeleteNodeResultFailure if cancellation was attempted but failed.
-            None: If no cancellation was needed or cancellation succeeded.
+            An outcome carrying a DeleteNodeResultFailure if cancellation was attempted but failed,
+            and the name of the live node the cancellation was for if one happened. Both are empty
+            when the delete took nothing away from the run.
 
         Note:
             This method also clears the flow queue regardless of whether cancellation occurred,
             to ensure the specified node is not processed in the future.
         """
-        if GriptapeNodes.FlowManager().check_for_existing_running_flow():
-            # get the current node executing / resolving
-            # if it's in connected nodes, cancel flow.
-            # otherwise, leave it.
-            control_node_names, resolving_node_names, _ = GriptapeNodes.FlowManager().flow_state(parent_flow)
-            connected_nodes = parent_flow.get_all_connected_nodes(node)
-            cancelled = False
-            if control_node_names is not None:
-                for control_node_name in control_node_names:
-                    control_node = GriptapeNodes.ObjectManager().get_object_by_name(control_node_name)
-                    if control_node in connected_nodes:
-                        result = GriptapeNodes.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        cancelled = True
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-            if resolving_node_names is not None and not cancelled:
-                for resolving_node_name in resolving_node_names:
-                    resolving_node = GriptapeNodes.ObjectManager().get_object_by_name(resolving_node_name)
-                    if resolving_node in connected_nodes:
-                        result = GriptapeNodes.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-                        break  # Only need to cancel once
-            # Clear the execution queue, because we don't want to hit this node eventually.
-            parent_flow.clear_execution_queue()
+        if not self.engine.flow_manager.check_for_existing_running_flow():
+            return _FlowCancelOutcome()
+
+        entangled_node_name = self._find_entangled_live_node(node)
+        if entangled_node_name is not None:
+            result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
+            if result.failed():
+                details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
+                return _FlowCancelOutcome(failure=DeleteNodeResultFailure(result_details=details))
+
+        # Clear the execution queue, because we don't want to hit this node eventually.
+        parent_flow.clear_execution_queue()
+        return _FlowCancelOutcome(cancelled_for_node_name=entangled_node_name)
+
+    def _find_entangled_live_node(self, node: BaseNode) -> str | None:
+        """Name the live node that deleting `node` would damage, or None if nothing would be.
+
+        Three ways a delete can damage a run, and only these three:
+
+        1. The node is part of the live run and has not settled, so the run is still counting on it
+           to produce something.
+        2. A node in the live run has not been dispatched yet and is fed by this node -- directly, or
+           through data nodes in between that will be pulled in along with it. Dispatch is when a node
+           collects its inputs from upstream, so a consumer that has not been dispatched has not
+           received this node's outputs and would fall back to its parameter defaults -- finishing the
+           run with the wrong answer and no indication anything went wrong.
+        3. The run is gated on this node: a data node is registered as reachable only once this node
+           finishes, and would otherwise wait forever for something that is never coming.
+
+        A consumer that is already processing or done has its values, so it is not damaged. Control
+        connections count the same as data connections here: deleting a settled node whose control
+        output feeds a node that has not started truncates the chain and can strand it.
+
+        Absence from the DAG does not mean the run will never reach the node, for two separate
+        reasons. The DAG grows along the control chain as it executes: only control *entry* nodes are
+        seeded up front, and a chain member is added when its predecessor completes, so a consumer one
+        step further down the chain is legitimately absent while its predecessor runs. And a pure data
+        node is absent until the run reaches whatever consumes it, at which point it is pulled in as a
+        dependency. Case 2 asks `_run_will_reach` about both rather than reading absence as safety.
+
+        Scope: this reads the *global* DAG. A node executing inside an isolated subflow (a group body,
+        a ForEach iteration) runs on that subflow's own `DagBuilder` and never appears here, so
+        deleting one of those does not cancel. See `FlowManager._is_node_executing`, which has the
+        same blind spot.
+        """
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        dag_nodes = dag_builder.node_to_reference
+
+        own_dag_node = dag_nodes.get(node.name)
+        if own_dag_node is not None and own_dag_node.node_state not in _SETTLED_NODE_STATES:
+            return node.name
+
+        connections = self.engine.flow_manager.get_connections()
+        for connection in connections.get_all_outgoing_connections(node):
+            target_node = connection.target_node
+            target_dag_node = dag_nodes.get(target_node.name)
+            if target_dag_node is not None and target_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return target_node.name
+            if target_dag_node is None and self._run_will_reach(target_node):
+                return target_node.name
+
+        for gated_node_name, boundary_nodes_by_graph in dag_builder.start_node_candidates.items():
+            for boundary_node_names in boundary_nodes_by_graph.values():
+                if node.name in boundary_node_names:
+                    return gated_node_name
+
         return None
 
-    def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
+    def _run_will_reach(self, node: BaseNode, visited: set[str] | None = None) -> bool:
+        """Whether the live run is still going to arrive at a node that is not in the DAG yet.
+
+        A run arrives at a node in one of two ways, and both have to be asked about.
+
+        It walks into it along the control chain. That is answered by walking control connections
+        forward from the nodes the run has live right now. Anchoring on live nodes rather than on the
+        graphs' start nodes matters in both directions: a node further down the chain is correctly
+        reported as coming, while one the run has already gone past is not, because nothing live
+        leads back to it.
+
+        Or it pulls the node in as a *data dependency* of whatever consumes it, when it arrives at
+        that consumer. A node reached only by data connections has no control connections of its own,
+        so the walk above can never find it -- it is not on the control graph at all. For those, the
+        run arriving is a fact about their consumers rather than about the node, which is why this
+        recurses, asking each consumer the same pair of questions `_find_entangled_live_node` asks of
+        a direct target: already in the DAG and uncollected, or absent but still coming. Control
+        connections are excluded from that recursion on purpose: control reachability was already
+        answered exhaustively above, over every branch including untaken ones, so following a control
+        edge again could only add a false positive.
+
+        The recursion stops at any consumer the run has already placed in the DAG. Such a node is not
+        going to be pulled in again as somebody's dependency, and if it is not uncollected then it
+        took its inputs at its own dispatch -- so anything past it is reached through a value that was
+        never wrong.
+
+        One way to be here is conservative rather than necessary: an intermediate node absent because
+        it is already RESOLVED will not be rebuilt into this DAG, so the consumer would collect its
+        last-good value rather than a parameter default. Cancelling in the safe direction is the
+        policy, so that case cancels too.
+        """
+        if visited is None:
+            visited = set()
+        if node.name in visited:
+            return False
+        visited.add(node.name)
+
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        connections = self.engine.flow_manager.get_connections()
+
+        for dag_node in dag_builder.node_to_reference.values():
+            if dag_node.node_state in _SETTLED_NODE_STATES:
+                continue
+            if connections.is_node_in_forward_control_path(dag_node.node_reference, node):
+                return True
+
+        for connection in connections.get_all_outgoing_connections(node):
+            if connection.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+                continue
+            consumer = connection.target_node
+            consumer_dag_node = dag_builder.node_to_reference.get(consumer.name)
+            if consumer_dag_node is not None and consumer_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return True
+            if consumer_dag_node is None and self._run_will_reach(consumer, visited):
+                return True
+
+        return False
+
+    @handles(DeleteNodeRequest)
+    async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
         node_name = request.node_name
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to delete a Node from the Current Context. Failed because the Current Context is empty."
                 )
                 return DeleteNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
-        with GriptapeNodes.ContextManager().node(node=node):
+        # What this node owns, collected before the connections come down so a mid-teardown state cannot
+        # affect it.
+        releasable_handle_keys = self._cached_objects_owned_by(node)
+
+        with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
             try:
-                parent_flow = GriptapeNodes.FlowManager().get_flow_by_name(parent_flow_name)
+                parent_flow = self.engine.flow_manager.get_flow_by_name(parent_flow_name)
             except KeyError as err:
                 details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
                 return DeleteNodeResultFailure(result_details=details)
 
-            cancel_result = self.cancel_conditionally(parent_flow, parent_flow_name, node)
-            if cancel_result is not None:
-                return cancel_result
+            cancel_outcome = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
+            if cancel_outcome.failure is not None:
+                return cancel_outcome.failure
+
+            # The node is leaving, so the live DAG has to stop naming it: it is published to the
+            # editor as an involved node, iterated on cancel, and checked before a node is allowed
+            # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
+            self.engine.flow_manager.global_dag_builder.remove_node(node_name)
 
             # Call after_node_deleted hook for cleanup of a node, implemented by node author.
             try:
@@ -1206,7 +1511,7 @@ class NodeManager:
                 any_connections_remain = False
 
                 list_node_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
-                list_connections_result = GriptapeNodes.handle_request(request=list_node_connections_request)
+                list_connections_result = self.engine.handle_request(request=list_node_connections_request)
                 if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
                     details = f"Attempted to delete a Node '{node_name}'. Failed because it could not gather Connections to the Node."
                     return DeleteNodeResultFailure(result_details=details)
@@ -1221,7 +1526,7 @@ class NodeManager:
                         target_node_name=node_name,
                         target_parameter_name=connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, ResultPayloadFailure):
                         details = (
                             f"Attempted to delete a Node '{node_name}'. Failed when attempting to delete Connection."
@@ -1239,34 +1544,51 @@ class NodeManager:
                         target_node_name=connection.target_node_name,
                         target_parameter_name=connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, ResultPayloadFailure):
                         details = (
                             f"Attempted to delete a Node '{node_name}'. Failed when attempting to delete Connection."
                         )
                         return DeleteNodeResultFailure(result_details=details)
 
-        # Check if it's in a node group
-        if isinstance(node.parent_group, SubflowNodeGroup):
-            try:
-                node.parent_group.delete_nodes_from_group([node])
-            except ValueError as e:
-                details = f"Attempted to delete a Node '{node_name}'. Failed to remove it from the node group: {e}"
-                return DeleteNodeResultFailure(result_details=details)
-
-        parent_flow.remove_node(node.name)
+        for key in releasable_handle_keys:
+            node.local_objects.release_parked(key)
 
         # Now remove the record keeping
-        GriptapeNodes.ObjectManager().del_obj_by_name(node_name)
-        del self._name_to_parent_flow_name[node_name]
+        self._forget_node(node, parent_flow)
 
         # If we were part of the Current Context, pop it.
         if request.node_name is None:
-            GriptapeNodes.ContextManager().pop_node()
+            self.engine.context_manager.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
+        # Stopping a run the artist started is not something to do silently. Say it happened, and say
+        # which node still needed the deleted one, so the reason is not left to guesswork.
+        if cancel_outcome.cancelled_for_node_name == node_name:
+            details += " Cancelled the running workflow, because this Node was still running."
+        elif cancel_outcome.cancelled_for_node_name is not None:
+            details += (
+                f" Cancelled the running workflow, because Node '{cancel_outcome.cancelled_for_node_name}' "
+                f"was still waiting on it."
+            )
         return DeleteNodeResultSuccess(result_details=details)
 
+    def _forget_node(self, node: BaseNode, parent_flow: ControlFlow) -> None:
+        """Remove `node` from its group, its flow and the records.
+
+        The part of deleting a node that discarding a worker's copy shares.
+        """
+        # Every kind of group has to give up a node being deleted, not just a SubflowNodeGroup:
+        # a group that keeps naming a deleted child reports it as involved in the next run.
+        if isinstance(node.parent_group, BaseNodeGroup):
+            node.parent_group.delete_nodes_from_group([node])
+
+        parent_flow.remove_node(node.name)
+
+        self.engine.object_manager.del_obj_by_name(node.name)
+        del self._name_to_parent_flow_name[node.name]
+
+    @handles(MoveNodeToNewFlowRequest)
     def on_move_node_to_new_flow_request(self, request: MoveNodeToNewFlowRequest) -> ResultPayload:  # noqa: PLR0911
         """Move a node from one flow to another flow.
 
@@ -1283,15 +1605,15 @@ class NodeManager:
 
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to move a Node from the Current Context. Failed because the Current Context is empty."
                 )
                 return MoveNodeToNewFlowResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to move Node '{node_name}', but no such Node was found."
             return MoveNodeToNewFlowResultFailure(result_details=details)
@@ -1308,13 +1630,13 @@ class NodeManager:
             source_flow_name = self._name_to_parent_flow_name[node_name]
 
         try:
-            source_flow = GriptapeNodes.FlowManager().get_flow_by_name(source_flow_name)
+            source_flow = self.engine.flow_manager.get_flow_by_name(source_flow_name)
         except KeyError:
             details = f"Attempted to move Node '{node_name}' from Flow '{source_flow_name}'. Failed because source flow was not found."
             return MoveNodeToNewFlowResultFailure(result_details=details)
 
         try:
-            target_flow = GriptapeNodes.FlowManager().get_flow_by_name(request.target_flow_name)
+            target_flow = self.engine.flow_manager.get_flow_by_name(request.target_flow_name)
         except KeyError:
             details = f"Attempted to move Node '{node_name}' to Flow '{request.target_flow_name}'. Failed because target flow was not found."
             return MoveNodeToNewFlowResultFailure(result_details=details)
@@ -1335,21 +1657,22 @@ class NodeManager:
             result_details=details,
         )
 
+    @handles(GetNodeResolutionStateRequest)
     def on_get_node_resolution_state_request(self, request: GetNodeResolutionStateRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get resolution state for a Node from the Current Context. Failed because the Current Context is empty."
                 return GetNodeResolutionStateResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
             # Does this node exist?
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get resolution state for a Node '{node_name}', but no such Node was found."
@@ -1362,21 +1685,22 @@ class NodeManager:
         result = GetNodeResolutionStateResultSuccess(state=node_state.name, result_details=details)
         return result
 
+    @handles(GetNodeMetadataRequest)
     def on_get_node_metadata_request(self, request: GetNodeMetadataRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get metadata for a Node from the Current Context. Failed because the Current Context is empty."
                 return GetNodeMetadataResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
 
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
@@ -1390,21 +1714,22 @@ class NodeManager:
         result = GetNodeMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
+    @handles(SetNodeMetadataRequest)
     def on_set_node_metadata_request(self, request: SetNodeMetadataRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to set metadata for a Node from the Current Context. Failed because the Current Context is empty."
                 return SetNodeMetadataResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
 
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
@@ -1420,6 +1745,7 @@ class NodeManager:
         result = SetNodeMetadataResultSuccess(result_details=details)
         return result
 
+    @handles(BatchSetNodeMetadataRequest)
     def on_batch_set_node_metadata_request(self, request: BatchSetNodeMetadataRequest) -> ResultPayload:
         updated_nodes = []
         failed_nodes = {}
@@ -1429,17 +1755,17 @@ class NodeManager:
             node = None
             if node_name is None:
                 # Get from current context
-                if not GriptapeNodes.ContextManager().has_current_node():
+                if not self.engine.context_manager.has_current_node():
                     failed_nodes["current_context"] = "No current context node available"
                     continue
-                node = GriptapeNodes.ContextManager().get_current_node()
+                node = self.engine.context_manager.get_current_node()
                 actual_node_name = node.name
             else:
                 actual_node_name = node_name
 
             # Look up node if we don't have it yet
             if node is None:
-                obj_mgr = GriptapeNodes.ObjectManager()
+                obj_mgr = self.engine.object_manager
                 node = obj_mgr.attempt_get_object_by_name_as_type(actual_node_name, BaseNode)
                 if node is None:
                     failed_nodes[actual_node_name] = f"Node '{actual_node_name}' not found"
@@ -1464,21 +1790,22 @@ class NodeManager:
             result_details=f"Successfully updated metadata for {len(updated_nodes)} nodes.",
         )
 
+    @handles(ListConnectionsForNodeRequest)
     def on_list_connections_for_node_request(self, request: ListConnectionsForNodeRequest) -> ResultPayload:  # noqa: C901, PLR0912 Removed list comprehension
         node_name = request.node_name
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to list Connections for a Node from the Current Context. Failed because the Current Context is empty."
                 return ListConnectionsForNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
 
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
@@ -1489,7 +1816,7 @@ class NodeManager:
 
         parent_flow_name = self._name_to_parent_flow_name[node_name]
         try:
-            GriptapeNodes.FlowManager().get_flow_by_name(parent_flow_name)
+            self.engine.flow_manager.get_flow_by_name(parent_flow_name)
         except KeyError as err:
             details = f"Attempted to list Connections for a Node '{node_name}'. Error: {err}"
 
@@ -1497,7 +1824,7 @@ class NodeManager:
             return result
 
         # Kinda gross, but let's do it
-        connection_mgr = GriptapeNodes.FlowManager().get_connections()
+        connection_mgr = self.engine.flow_manager.get_connections()
         # get outgoing connections
         outgoing_connections_list = []
         if node_name in connection_mgr.outgoing_index:
@@ -1536,6 +1863,7 @@ class NodeManager:
         )
         return result
 
+    @handles(GetConnectionsForParameterRequest)
     def on_get_connections_for_parameter_request(
         self, request: GetConnectionsForParameterRequest
     ) -> GetConnectionsForParameterResultFailure | GetConnectionsForParameterResultSuccess:
@@ -1545,16 +1873,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get connections for a parameter from the Current Context. Failed because the Current Context is empty."
                 return GetConnectionsForParameterResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get connections for parameter '{parameter_name}' on node '{node_name}', but no such node was found."
@@ -1568,7 +1896,7 @@ class NodeManager:
 
         parent_flow_name = self._name_to_parent_flow_name[node_name]
         try:
-            GriptapeNodes.FlowManager().get_flow_by_name(parent_flow_name)
+            self.engine.flow_manager.get_flow_by_name(parent_flow_name)
         except KeyError as err:
             details = (
                 f"Attempted to get connections for parameter '{parameter_name}' on node '{node_name}'. Error: {err}"
@@ -1576,7 +1904,7 @@ class NodeManager:
             return GetConnectionsForParameterResultFailure(result_details=details)
 
         # Get connections for this specific parameter
-        connection_mgr = GriptapeNodes.FlowManager().get_connections()
+        connection_mgr = self.engine.flow_manager.get_connections()
 
         # Get outgoing connections for this parameter
         outgoing_connections_list = []
@@ -1614,22 +1942,23 @@ class NodeManager:
         )
         return result
 
+    @handles(ListParametersOnNodeRequest)
     def on_list_parameters_on_node_request(self, request: ListParametersOnNodeRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
 
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to list Parameters for a Node from the Current Context. Failed because the Current Context is empty."
                 return ListParametersOnNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to list Parameters for a Node '{node_name}', but no such Node was found."
@@ -1661,6 +1990,7 @@ class NodeManager:
             counter += 1
         return f"{base_name}_{counter}"
 
+    @handles(AddParameterToNodeRequest)
     def on_add_parameter_to_node_request(self, request: AddParameterToNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
@@ -1668,16 +1998,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to add Parameter to a Node from the Current Context. Failed because the Current Context is empty."
                 return AddParameterToNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to add Parameter '{request.parameter_name}' to a Node '{node_name}', but no such Node was found."
@@ -1790,7 +2120,13 @@ class NodeManager:
             parent_container_name=request.parent_container_name,
             parent_element_name=parent_group.name if parent_group is not None else None,
             settable=request.settable,
+            allow_variable_substitution=request.allow_variable_substitution,
+            serializable=request.serializable,
         )
+        # Hand saved state to the traits so their converters, validators, and rendered
+        # options match what was saved.
+        if request.traits:
+            NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -1818,6 +2154,7 @@ class NodeManager:
         )
         return result
 
+    @handles(AddParameterGroupToNodeRequest)
     def on_add_parameter_group_to_node_request(  # noqa: C901, PLR0911
         self, request: AddParameterGroupToNodeRequest
     ) -> ResultPayload:
@@ -1827,15 +2164,15 @@ class NodeManager:
         parent_group: ParameterGroup | None = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to add ParameterGroup to a Node from the Current Context. Failed because the Current Context is empty."
                 return AddParameterGroupToNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to add ParameterGroup '{request.group_name}' to a Node '{node_name}', but no such Node was found."
@@ -1884,24 +2221,25 @@ class NodeManager:
             group_name=new_group.name, node_name=node_name, result_details=details
         )
 
+    @handles(RemoveParameterFromNodeRequest)
     def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
 
         if node_name is None:
             # Get the Current Context
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to remove Parameter '{request.parameter_name}' from a Node, but no Current Context was found."
 
                 result = RemoveParameterFromNodeResultFailure(result_details=details)
                 return result
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to remove Parameter '{request.parameter_name}' from a Node '{node_name}', but no such Node was found."
@@ -1925,7 +2263,7 @@ class NodeManager:
         # If it's a ParameterGroup, we need to remove all the Parameters inside it.
         if isinstance(element, ParameterGroup):
             for child in element.find_elements_by_type(Parameter):
-                GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(child.name, node_name))
+                self.engine.handle_request(RemoveParameterFromNodeRequest(child.name, node_name))
             node.remove_node_element(element)
 
             return RemoveParameterFromNodeResultSuccess(
@@ -1950,7 +2288,7 @@ class NodeManager:
         # Get all the connections to/from this Parameter.
         if isinstance(element, Parameter):
             list_node_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
-            list_connections_result = GriptapeNodes.handle_request(request=list_node_connections_request)
+            list_connections_result = self.engine.handle_request(request=list_node_connections_request)
             if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
                 details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{node_name}'. Failed because we were unable to get a list of Connections for the Parameter's Node."
 
@@ -1968,7 +2306,7 @@ class NodeManager:
                         target_node_name=node_name,
                         target_parameter_name=incoming_connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, DeleteConnectionResultFailure):
                         details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{node_name}'. Failed because we were unable to delete a Connection for that Parameter."
 
@@ -1983,7 +2321,7 @@ class NodeManager:
                         target_node_name=outgoing_connection.target_node_name,
                         target_parameter_name=outgoing_connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, DeleteConnectionResultFailure):
                         details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{node_name}'. Failed because we were unable to delete a Connection for that Parameter."
 
@@ -1993,6 +2331,9 @@ class NodeManager:
         if element is not None:
             with sanctioned_parameter_mutation():
                 node.remove_parameter_element(element)
+            if isinstance(element, Parameter) and element.parent_container_name is not None:
+                # The list lost an item, so what reads it has to run again.
+                self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
         else:
             details = f"Attempted to remove Element '{request.parameter_name}' from Node '{node_name}'. Failed because element didn't exist."
 
@@ -2002,22 +2343,23 @@ class NodeManager:
         result = RemoveParameterFromNodeResultSuccess(result_details=details)
         return result
 
+    @handles(GetParameterDetailsRequest)
     def on_get_parameter_details_request(self, request: GetParameterDetailsRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to get details for Parameter '{request.parameter_name}' from a Node, but no Current Context was found."
 
                 result = GetParameterDetailsResultFailure(result_details=details)
                 return result
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get details for Parameter '{request.parameter_name}' from a Node '{node_name}', but no such Node was found."
@@ -2060,26 +2402,28 @@ class NodeManager:
             is_user_defined=getattr(element, "user_defined", False),
             settable=getattr(element, "settable", None),
             private=getattr(element, "private", False),
+            allow_variable_substitution=getattr(element, "allow_variable_substitution", True),
             ui_options=getattr(element, "ui_options", None),
             result_details=details,
         )
         return result
 
+    @handles(GetNodeElementDetailsRequest)
     def on_get_node_element_details_request(self, request: GetNodeElementDetailsRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to get element details for element '{request.specific_element_id}` from a Node, but no Current Context was found."
 
                 return GetNodeElementDetailsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get element details for Node '{node_name}', but no such Node was found."
@@ -2123,29 +2467,10 @@ class NodeManager:
                 value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
-                value = node.get_parameter_value(parameter.name)
+                value = node._get_raw_parameter_value(parameter.name)
             if value is not None:
-                element_id = parameter.element_id
-                # Check if the value is in builtins. If it isn't we need to handle it specially.
-                if value.__class__.__module__ != "builtins":
-                    # Enums (including StrEnum/IntEnum) are not builtins but serialize to
-                    # their underlying value. Without this, the __dict__ fallback below
-                    # would send the raw enum internals (e.g. {"_value_": ..., "_name_": ...})
-                    # to the GUI, which renders them as an object instead of the value.
-                    if isinstance(value, Enum):
-                        param_to_value[element_id] = value.value
-                        continue
-                    # Check if it has a to_dict method. Use that, if it's been implemented.
-                    if hasattr(value, "to_dict"):
-                        # If the object has a __dict__, use that
-                        param_to_value[element_id] = value.to_dict()
-                        continue
-                    # Otherwise use __dict__.
-                    if hasattr(value, "__dict__"):
-                        param_to_value[element_id] = value.__dict__
-                        continue
-                # Otherwise, just set it here. It'll be handled in .json() when we send it over.
-                param_to_value[element_id] = value
+                # Encoded where the result is sent; see ElementDocument.
+                param_to_value[parameter.element_id] = value
 
     def modify_alterable_fields(self, request: AlterParameterDetailsRequest, parameter: BaseNodeElement) -> None:
         if isinstance(parameter, Parameter):
@@ -2157,6 +2482,8 @@ class NodeManager:
                 parameter.tooltip_as_property = request.tooltip_as_property
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
+            if request.traits is not None:
+                NodeManager._apply_trait_states(parameter, request.traits)
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
@@ -2199,6 +2526,8 @@ class NodeManager:
                 parameter.allowed_modes.discard(ParameterMode.OUTPUT)
         if request.settable is not None:
             parameter.settable = request.settable
+        if request.allow_variable_substitution is not None:
+            parameter.allow_variable_substitution = request.allow_variable_substitution
 
     def _validate_and_break_invalid_connections(
         self, node_name: str, parameter: Parameter, request: AlterParameterDetailsRequest
@@ -2226,7 +2555,7 @@ class NodeManager:
                 source_node = self.get_node_by_name(conn.source_node_name)
                 source_param = source_node.get_parameter_by_name(conn.source_parameter_name)
                 if source_param and not parameter.is_incoming_type_allowed(source_param.output_type):
-                    delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=conn.source_node_name,
                             source_parameter_name=conn.source_parameter_name,
@@ -2244,7 +2573,7 @@ class NodeManager:
                 target_node = self.get_node_by_name(conn.target_node_name)
                 target_param = target_node.get_parameter_by_name(conn.target_parameter_name)
                 if target_param and not target_param.is_incoming_type_allowed(parameter.output_type):
-                    delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=node_name,
                             source_parameter_name=request.parameter_name,
@@ -2258,21 +2587,22 @@ class NodeManager:
 
         return None
 
+    @handles(AlterParameterDetailsRequest)
     def on_alter_parameter_details_request(self, request: AlterParameterDetailsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to alter details for Parameter '{request.parameter_name}' from node in the Current Context. Failed because there was no such Node."
 
                 return AlterParameterDetailsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to alter details for Parameter '{request.parameter_name}' from Node '{node_name}', but no such Node was found."
@@ -2293,7 +2623,7 @@ class NodeManager:
                 # Early return with warning - we're just preserving the original changes
                 details = f"Parameter '{request.parameter_name}' alteration recorded for ErrorProxyNode '{node_name}'. Original node '{node.original_node_type}' had loading errors - preserving changes for correct recreation when dependency '{node.original_library_name}' is resolved."
 
-                result_details = ResultDetails(message=details, level=logging.WARNING)
+                result_details = ResultDetails(message=details, level=logging.DEBUG)
                 return AlterParameterDetailsResultSuccess(result_details=result_details)
 
             # Reject runtime parameter alterations on ErrorProxy
@@ -2339,6 +2669,7 @@ class NodeManager:
         result = AlterParameterDetailsResultSuccess(result_details=details)
         return result
 
+    @handles(AlterParameterGroupDetailsRequest)
     def on_alter_parameter_group_details_request(  # noqa: PLR0911
         self, request: AlterParameterGroupDetailsRequest
     ) -> ResultPayload:
@@ -2347,14 +2678,14 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to alter details for ParameterGroup '{request.group_name}' from node in the Current Context. Failed because there was no such Node."
                 return AlterParameterGroupDetailsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to alter details for ParameterGroup '{request.group_name}' from Node '{node_name}', but no such Node was found."
@@ -2369,7 +2700,7 @@ class NodeManager:
             if request.initial_setup:
                 node.record_initialization_request(request)
                 details = f"ParameterGroup '{request.group_name}' alteration recorded for ErrorProxyNode '{node_name}'. Original node '{node.original_node_type}' had loading errors - preserving changes for correct recreation when dependency '{node.original_library_name}' is resolved."
-                result_details = ResultDetails(message=details, level=logging.WARNING)
+                result_details = ResultDetails(message=details, level=logging.DEBUG)
                 return AlterParameterGroupDetailsResultSuccess(result_details=result_details)
 
             details = f"Cannot modify ParameterGroup '{request.group_name}' on placeholder node '{node_name}'. This placeholder preserves your workflow structure but doesn't allow modifications."
@@ -2389,16 +2720,17 @@ class NodeManager:
         return AlterParameterGroupDetailsResultSuccess(result_details=details)
 
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
+    @handles(GetParameterValueRequest)
     def on_get_parameter_value_request(self, request: GetParameterValueRequest) -> ResultPayload:
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to get value for Parameter '{request.parameter_name}' from node in the Current Context. Failed because there was no such Node."
 
                 return GetParameterValueResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Parse the parameter name to check for list indexing
@@ -2406,7 +2738,7 @@ class NodeManager:
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f'"{node_name}" not found'
@@ -2421,6 +2753,9 @@ class NodeManager:
         # Output values take priority (they represent the result of execution).
         if param_name in node.parameter_output_values:
             data_value = node.parameter_output_values[param_name]
+        elif isinstance(parameter, ParameterContainer):
+            # A list is read from its rows, unless a connection handed it a whole list.
+            data_value = node._get_raw_parameter_value(param_name)
         elif param_name in node.parameter_values:
             data_value = node.parameter_values[param_name]
         else:
@@ -2432,7 +2767,7 @@ class NodeManager:
             input_types=parameter.input_types,
             type=parameter.type,
             output_type=parameter.output_type,
-            value=safe_unstructure(data_value),
+            value=data_value,
             result_details=details,
         )
         return result
@@ -2444,15 +2779,32 @@ class NodeManager:
         modified: bool
 
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
-    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    @handles(SetParameterValueRequest)
+    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
+        if not request.initial_setup:
+            return self._set_parameter_value(request)
+        # A value set with initial_setup is part of loading its node, and runs that node's library code.
+        node_name = request.node_name
+        if node_name is None and self.engine.context_manager.has_current_node():
+            node_name = self.engine.context_manager.get_current_node().name
+        if node_name is None:
+            return self._set_parameter_value(request)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
+        library_name = node.metadata.get("library") if node is not None else None
+        with self._loading(node_name, library_name) as scope:
+            result = self._set_parameter_value(request)
+        STRICT_MODE.attach_violations_to_result(result, scope)
+        return result
+
+    def _set_parameter_value(self, request: SetParameterValueRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to set parameter '{request.parameter_name}' value. Failed because no Node was found in the Current Context."
                 return SetParameterValueResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Parse the parameter name to check for list indexing
@@ -2460,7 +2812,7 @@ class NodeManager:
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to set parameter '{param_name}' value on node '{node_name}'. Failed because no such Node could be found."
@@ -2473,7 +2825,7 @@ class NodeManager:
 
         # Let versioning system potentially squelch removed parameters.
         # This check must run BEFORE we validate parameter existence, since removed parameters won't exist.
-        version_compat_result = GriptapeNodes.VersionCompatibilityManager().check_set_parameter_version_compatibility(
+        version_compat_result = self.engine.version_compatibility_manager.check_set_parameter_version_compatibility(
             node, param_name, request.value
         )
         if version_compat_result is not None:
@@ -2522,7 +2874,7 @@ class NodeManager:
             and ParameterMode.PROPERTY in parameter.allowed_modes
         ):
             # Check if this parameter has any incoming connections
-            connections = GriptapeNodes.FlowManager().get_connections()
+            connections = self.engine.flow_manager.get_connections()
             target_connections = connections.incoming_index.get(node_name)
             if target_connections is not None:
                 param_connections = target_connections.get(request.parameter_name)
@@ -2538,7 +2890,8 @@ class NodeManager:
 
         # Call before_value_set hook (allows nodes to modify values and temporarily control settable state)
         try:
-            modified_value = node.before_value_set(parameter, parameter_value)
+            with node._list_rows.hooks_running(parameter.parent_container_name):
+                modified_value = node.before_value_set(parameter, parameter_value)
             if modified_value is not None:
                 # Check if it's a TransformedParameterValue (value + type)
                 if isinstance(modified_value, TransformedParameterValue):
@@ -2580,7 +2933,7 @@ class NodeManager:
             details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because the node's parent flow does not exist. Could not unresolve future nodes."
             return SetParameterValueResultFailure(result_details=details)
 
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         parent_flow = obj_mgr.attempt_get_object_by_name_as_type(parent_flow_name, ControlFlow)
         if not parent_flow:
             details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because the node's parent flow does not exist. Could not unresolve future nodes."
@@ -2598,13 +2951,15 @@ class NodeManager:
             return SetParameterValueResultFailure(result_details=details)
         if not request.initial_setup and modified:
             try:
-                GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+                self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
             except Exception as err:
                 details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because Exception: {err}"
                 return SetParameterValueResultFailure(result_details=details)
         if request.initial_setup is False and not request.is_output and modified:
             # Mark node as unresolved, broadcast an event
             node.make_node_unresolved(current_states_to_trigger_change_event=set({NodeResolutionState.RESOLVED}))
+            if output_snapshot is not None:
+                self._discard_stale_output_value(node, request.parameter_name, output_snapshot)
             # Get the flow
             # Pass the value through to connected downstream parameters!
             # Set incoming_connection_source fields to identify this as legitimate upstream value propagation
@@ -2619,7 +2974,7 @@ class NodeManager:
                 )
                 is_dest_node_locked = target_node.lock
                 if (not is_control_parameter) and (not is_dest_node_locked):
-                    GriptapeNodes.handle_request(
+                    self.engine.handle_request(
                         SetParameterValueRequest(
                             parameter_name=target_parameter.name,
                             node_name=target_node.name,
@@ -2652,7 +3007,7 @@ class NodeManager:
                 for target_node, target_parameter in conn_targets:
                     if target_node.lock:
                         continue
-                    GriptapeNodes.handle_request(
+                    self.engine.handle_request(
                         SetParameterValueRequest(
                             parameter_name=target_parameter.name,
                             node_name=target_node.name,
@@ -2670,6 +3025,32 @@ class NodeManager:
         )
         return result
 
+    def _discard_stale_output_value(self, node: BaseNode, parameter_name: str, output_snapshot: dict[str, Any]) -> None:
+        """Discard the output value that the set we just applied has invalidated.
+
+        A PROPERTY+OUTPUT parameter stores the typed value and the produced value under one name, and
+        reads prefer the produced one, so a leftover output would mask the new value. Only that
+        parameter's own output value is discarded; the rest still reflect the last run.
+
+        This covers upstream propagation as well as manual edits -- an arriving connection value is a
+        set like any other, and the output recorded under that name predates it either way.
+
+        A value that changed since `output_snapshot` was taken was recomputed in `after_value_set`,
+        making it newer than the set, so it stays. A recompute landing on an equal value is not
+        detected; see `test_equal_value_recompute_is_not_yet_detected`.
+        """
+        if parameter_name not in node.parameter_output_values:
+            return
+        if parameter_name not in output_snapshot:
+            # Nothing was recorded here before the set, so whatever is here now was written during it.
+            return
+        recomputed_during_set = _values_differ(
+            output_snapshot[parameter_name], node.parameter_output_values[parameter_name]
+        )
+        if recomputed_during_set:
+            return
+        del node.parameter_output_values[parameter_name]
+
     def _set_and_pass_through_values(self, request: SetParameterValueRequest, node: BaseNode) -> ModifiedReturnValue:
         """Set the parameter value on the node according to the specifications."""
         modified = False
@@ -2686,38 +3067,53 @@ class NodeManager:
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        old_value = node.get_parameter_value(request.parameter_name)
-        node.set_parameter_value(
-            request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
-        )
+        old_value = node._get_raw_parameter_value(request.parameter_name)
+        if not self._set_whole_list_as_rows(request, node):
+            node.set_parameter_value(
+                request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
+            )
         # Get the "converted" value here.
-        finalized_value = node.get_parameter_value(request.parameter_name)
+        finalized_value = node._get_raw_parameter_value(request.parameter_name)
         if old_value != finalized_value:
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
         return NodeManager.ModifiedReturnValue(finalized_value, modified)
+
+    def _set_whole_list_as_rows(self, request: SetParameterValueRequest, node: BaseNode) -> bool:
+        """Turn a caller's whole list for an unconnected list into rows. Returns whether it did.
+
+        Loading leaves the rows to the saved file, which sets each row next. A whole list saved for
+        an unconnected list is dropped, and its items don't become rows.
+        """
+        if request.initial_setup or request.incoming_connection_source_node_name is not None:
+            return False
+        parameter = node.get_parameter_by_name(request.parameter_name)
+        if parameter is None:
+            return False
+        return node._list_rows.set_as_rows_if_unconnected(parameter, request.value)
 
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
     # For PLR0911 (too many return statements): don't want to do a ton of nested chains of success,
     # want to give clear reasoning for each failure.
     # For PLR0915 (too many statements): very little reusable code here, want to be explicit and
     # make debugger use friendly.
+    @handles(GetAllNodeInfoRequest)
     def on_get_all_node_info_request(self, request: GetAllNodeInfoRequest) -> ResultPayload:  # noqa: C901, PLR0911
         node_name = request.node_name
         node = None
 
         # Get from the current context.
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get all info for a Node from the Current Context. Failed because the Current Context is empty."
                 return GetAllNodeInfoResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 # Logged at DEBUG: this is usually a benign race where the GUI requests info
@@ -2789,20 +3185,21 @@ class NodeManager:
         )
         return result
 
+    @handles(GetCompatibleParametersRequest)
     def on_get_compatible_parameters_request(self, request: GetCompatibleParametersRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get compatible parameters for node, but no current node was found."
                 return GetCompatibleParametersResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Vet the node
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = (
@@ -2832,9 +3229,7 @@ class NodeManager:
 
         # Iterate through all nodes in this Flow (yes, this restriction still sucks)
         list_nodes_in_flow_request = ListNodesInFlowRequest(flow_name=flow_name)
-        list_nodes_in_flow_result = GriptapeNodes.FlowManager().on_list_nodes_in_flow_request(
-            list_nodes_in_flow_request
-        )
+        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request(list_nodes_in_flow_request)
         if not list_nodes_in_flow_result.succeeded():
             details = f"Attempted to get compatible parameters for '{node_name}.{request.parameter_name}'. Failed due to inability to list nodes in parent flow '{flow_name}'."
             return GetCompatibleParametersResultFailure(result_details=details)
@@ -2894,8 +3289,37 @@ class NodeManager:
             valid_parameters_by_node=valid_parameters_by_node, result_details=details
         )
 
+    def _cached_objects_owned_by(self, node: BaseNode) -> list[str]:
+        """The cache references for objects this node owns, which are the ones it produced.
+
+        A cached object belongs to the output parameter that produced it. A consumer holds a reference and
+        borrows the object; it never owns it and is never responsible for its life. So deleting a node
+        releases what that node made and nothing else, and a consumer left holding a reference to it finds
+        it stale and is told to re-run the producer -- which is the same answer it already gets when the
+        producer re-runs and displaces what it made.
+        """
+        owned: set[str] = set()
+        # Its own outputs, and of those only the references it produced itself -- not a reference a
+        # pass-through merely copied into its own outputs, which EndNode and the subflow boundary nodes do
+        # for every parameter they carry.
+        #
+        # Read from the values rather than from this process's store, because the object is cached in the
+        # worker that ran the node while deletion happens on the orchestrator -- so the orchestrator holds
+        # no entry for it and has only the reference to go on. Snapshot: node bodies write outputs from
+        # worker threads.
+        for value in list(node.parameter_output_values.values()):
+            owned |= node.local_objects.keys_this_node_produced(value)
+        # Plus anything this process does hold for the node, which covers an in-process library and an entry
+        # whose parameter was renamed or removed after it was cached.
+        owned.update(
+            self.engine.resource_manager.parked_keys_for(
+                owner=node.local_objects.owner, source=node.local_object_source
+            )
+        )
+        return sorted(owned)
+
     def get_node_by_name(self, name: str) -> BaseNode:
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
 
         node = obj_mgr.attempt_get_object_by_name_as_type(name, BaseNode)
         if node is None:
@@ -2905,14 +3329,15 @@ class NodeManager:
         return node
 
     def get_node_parent_flow_by_name(self, node_name: str) -> str:
-        if node_name not in self._name_to_parent_flow_name:
+        nodes = self._current_nodes_or_none()
+        if nodes is None or node_name not in nodes.name_to_parent_flow_name:
             msg = f"Node '{node_name}' could not be found."
             raise KeyError(msg)
-        return self._name_to_parent_flow_name[node_name]
+        return nodes.name_to_parent_flow_name[node_name]
 
-    async def on_resolve_from_node_request(self, request: ResolveNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
+    @handles(ResolveNodeRequest)
+    async def on_resolve_from_node_request(self, request: ResolveNodeRequest) -> ResultPayload:  # noqa: PLR0911
         node_name = request.node_name
-        debug_mode = request.debug_mode
 
         if node_name is None:
             details = "No Node name was provided. Failed to resolve node."
@@ -2932,7 +3357,7 @@ class NodeManager:
 
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
         try:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
         except KeyError as e:
             details = f'Failed to fetch parent flow for "{node_name}": {e}'
@@ -2943,22 +3368,36 @@ class NodeManager:
             details = f'Failed to fetch parent flow for "{node_name}"'
             return ResolveNodeResultFailure(validation_exceptions=[], result_details=details)
 
+        flow_mgr = self.engine.flow_manager
+        spec = ResolveNodeSpec(request=request, flow_name=flow.name, node_name=node.name)
+        # A node run while another node's run is in progress joins that run, so the two run side by side.
+        if flow_mgr.check_for_existing_running_flow() and flow_mgr.global_single_node_resolution:
+            return await flow_mgr.join_run_in_progress(spec)
+        return await flow_mgr.start_run(spec)
+
+    async def execute_resolve_node(self, node: BaseNode, flow: ControlFlow, *, debug_mode: bool) -> ResultPayload:  # noqa: C901, PLR0911
+        node_name = node.name
+        flow_name = flow.name
         # Check for existing running flow
-        flow_mgr = GriptapeNodes.FlowManager()
+        flow_mgr = self.engine.flow_manager
         if flow_mgr.check_for_existing_running_flow() and not flow_mgr._global_single_node_resolution:
             # Behavior should also match if the flow running is a Control Flow, and not a singular node resolution.
             errormsg = f"This workflow is already in progress. Please wait for the current control process to finish before starting {node.name} again."
             return ResolveNodeResultFailure(validation_exceptions=[RuntimeError(errormsg)], result_details=errormsg)
 
+        # Checked before anything below unresolves the node, so a rejected request leaves it as it was.
+        if flow_mgr.running_flow_is_stopping_after_failure():
+            errormsg = f"Attempted to run {node.name}. Failed because a node in the current run failed, and the run is waiting for its other nodes to finish. Try again once the run ends."
+            return ResolveNodeResultFailure(validation_exceptions=[RuntimeError(errormsg)], result_details=errormsg)
+
         # Check if the node is already in the DAG - if so, skip this resolution. It's already queued or has been resolved.
         if node.name in flow_mgr._global_dag_builder.node_to_reference:
-            logger.error("Node %s is already executing. Cannot start execution.", node.name)
             return ResolveNodeResultFailure(
                 validation_exceptions=[],
                 result_details=f"Node {node.name} is already executing. Cannot start execution.",
             )
         try:
-            GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+            self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
         except Exception as e:
             details = f'Failed to mark future nodes dirty. Unable to kick off flow from "{node_name}": {e}'
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
@@ -2980,16 +3419,14 @@ class NodeManager:
             details = f"Failed to resolve node '{node_name}'. Flow Validation Failed. Error: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
         try:
-            await GriptapeNodes.FlowManager().resolve_singular_node(flow, node, debug_mode=debug_mode)
+            await self.engine.flow_manager.resolve_singular_node(flow, node, debug_mode=debug_mode)
         except Exception as e:
             details = f'Failed to resolve "{node_name}".  Error: {e}'
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4532 - support
-        # wait_for_completion / completion_timeout_ms here, mirroring StartFlowRequest so
-        # callers do not have to poll check_for_existing_running_flow() themselves.
         details = f'Starting to resolve "{node_name}" in "{flow_name}"'
         return ResolveNodeResultSuccess(result_details=details)
 
+    @handles(ExecuteNodeRequest)
     async def on_execute_node_request(self, request: ExecuteNodeRequest) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
 
@@ -2999,27 +3436,31 @@ class NodeManager:
         real "node dropped from the live map" bug with a stub that has no
         connections and no flow parentage.
 
-        On the worker (is_worker=True) the node is constructed from
-        request.node_metadata on every call, hydrated, executed, and discarded.
+        On the worker (is_worker=True) a copy of the node is loaded into the
+        worker's own graph, from the structure and values the orchestrator sent,
+        the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values.
+        parameter values. A worker another engine runs first asks that engine
+        whether the lease the node was sent under holds it, and refuses the
+        node if not.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
         """
-        library_manager = GriptapeNodes.LibraryManager()
+        library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
 
+        node = None
         if is_worker:
-            worker_node = self._materialize_transient_node_from_metadata(request)
-            if isinstance(worker_node, ExecuteNodeResultFailure):
-                return worker_node
-            node = worker_node
+            library_name = (request.node_metadata or {}).get("library")
+            lease_refusal = await self.engine.worker_manager.lease_refusal(request.node_name, request.lease_id)
+            if lease_refusal is not None:
+                return ExecuteNodeResultFailure(result_details=lease_refusal)
         else:
-            obj_mgr = GriptapeNodes.ObjectManager()
-            orchestrator_node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
-            if orchestrator_node is None:
+            obj_mgr = self.engine.object_manager
+            node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+            if node is None:
                 return ExecuteNodeResultFailure(
                     result_details=(
                         f"Node '{request.node_name}' not found in ObjectManager on orchestrator. "
@@ -3027,19 +3468,37 @@ class NodeManager:
                         "from the live map and must be re-created via CreateNodeRequest."
                     ),
                 )
-            node = orchestrator_node
-
-        library_name = node.metadata.get("library")
+            library_name = node.metadata.get("library")
 
         # Forwarding to a worker exits the orchestrator's local code path before
         # the node runs, so strict-mode attribution belongs to the worker's
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
-        if not is_worker:
-            worker = library_manager.get_worker_for_library(library_name) if library_name else None
-            wm = GriptapeNodes.WorkerManager()
-            if wm is not None and worker is not None:
-                return await self._execute_node_via_worker(request, wm, worker)
+        if node is not None:
+            # "This library cannot run right now" is expected and recoverable -- an evicted worker,
+            # or one that never started -- and get_worker_for_library reports it by raising. Caught
+            # here so it reads as the node failure it is, rather than an unhandled engine error that
+            # buries a message written for an artist.
+            #
+            # The wait comes first: a worker is routable the moment it registers but loads its
+            # library after, and forwarding into that window fails node creation over there.
+            wm = self.engine.worker_manager
+            in_library_worker = await self._execute_node_in_library_worker(request, node, wm, library_name)
+            if in_library_worker is not None:
+                return in_library_worker
+            # A library's own worker comes first: that is where its dependencies are installed. Only a
+            # node that would otherwise run here moves to the worker its Isolated Execution names.
+            #
+            # The StartFlow and EndFlow the packager adds around a packaged body stay here. They are the
+            # flow's boundary and only pass values in and out.
+            # The packager flags them; a Start/End node a user placed carries no flag and goes.
+            isolated_scope = current_isolated_execution_scope.get()
+            is_flow_boundary = bool(node.metadata.get(PACKAGED_FLOW_BOUNDARY_KEY))
+            if wm is not None and isolated_scope is not None and not is_flow_boundary:
+                preparation_failure = self._prepare_for_worker(node, request)
+                if preparation_failure is not None:
+                    return preparation_failure
+                return await self._execute_node_in_isolated_execution_worker(request, wm, isolated_scope)
 
         async with STRICT_MODE.scoped_execution(
             kind=StrictModeScopeKind.RUNTIME_EXECUTE,
@@ -3047,7 +3506,10 @@ class NodeManager:
             library_name=library_name,
             is_worker=is_worker,
         ) as (ctx, scope):
-            ctx.result = await self._hydrate_and_run_node(node, request)
+            if node is None:
+                ctx.result = await self._run_worker_copy(request)
+            else:
+                ctx.result = await self._hydrate_and_run_node(node, request)
             # Worker-side correctness policy: an ExecuteNodeResultSuccess that
             # carries an ERROR-severity violation must be promoted to a
             # failure. Worker output gets shipped back to the orchestrator,
@@ -3062,55 +3524,311 @@ class NodeManager:
                 )
         return ctx.result
 
-    def _materialize_transient_node_from_metadata(
-        self, request: ExecuteNodeRequest
-    ) -> BaseNode | ExecuteNodeResultFailure:
-        """Construct a fresh node from request.node_metadata for worker-side execution.
+    def _prepare_for_worker(self, node: BaseNode, request: ExecuteNodeRequest) -> ExecuteNodeResultFailure | None:
+        """Fill `request` with what a worker loads its copy of `node` from. Returns a failure or None.
 
-        The returned node is transient: it is NOT added to ObjectManager. It
-        exists only for the duration of _hydrate_and_run_node and is released to
-        GC when that call returns. Called only on the worker path.
+        Values the request carried are set on `node` first, as they are when the node runs here, so the
+        worker's copy is built from the node as it is about to run.
         """
+        failure = self._apply_hydrated_values(node, node.name, hydrate_parameter_values(request.parameter_values))
+        if failure is not None:
+            return failure
+        structure = self._serialize_node_structure(node, node.name)
+        request.element_modification_commands = structure.commands
+        request.parameter_values = {
+            name: value
+            for name, value in node.parameter_values.items()
+            if name not in structure.omitted_parameter_names and node.get_parameter_by_name(name) is not None
+        }
+        return None
+
+    async def _run_worker_copy(self, request: ExecuteNodeRequest) -> ResultPayload:
+        """Load a copy of the node from `request`, run it, and discard it. Worker side only.
+
+        The copy lives in a flow of its own in the runtime this worker keeps for the orchestrator's
+        workflow. Loading and discarding run in a rebuild scope, so every request either makes, its
+        node's code included, is answered here and none reaches the orchestrator. Running it is
+        ordinary execution, whose requests go to the orchestrator.
+        """
+        # Run in the orchestrator's workflow before anything resolves a path. Loading resolves paths
+        # too, so this comes first.
+        try:
+            workflow = self.engine.context_manager.adopt_orchestrator_workflow(
+                request.orchestrator_workflow_id,
+                request.workflow_name,
+                request.workflow_file_path,
+                request.workflow_working_directory,
+            )
+        except ContextManager.OrchestratorWorkflowError as err:
+            return ExecuteNodeResultFailure(
+                result_details=str(err),
+                exception=err,
+                error=build_node_error_details(request.node_name, err),
+            )
+        with self.engine.run_in_worker_workflow(workflow):
+            return await self._run_worker_copy_in_workflow(request)
+
+    async def _run_worker_copy_in_workflow(self, request: ExecuteNodeRequest) -> ResultPayload:
+        """Load, run and discard the copy in the worker runtime bound for it."""
+        event_manager = self.engine.event_manager
+        with event_manager.rebuild_scope(request.node_name):
+            flow_name = self._create_worker_copy_flow(request.node_name)
+        if isinstance(flow_name, ExecuteNodeResultFailure):
+            return flow_name
+        try:
+            with event_manager.rebuild_scope(request.node_name):
+                copy = self._load_worker_copy(request, flow_name)
+            if isinstance(copy, ExecuteNodeResultFailure):
+                return copy
+            return await self._hydrate_and_run_node(copy, request)
+        finally:
+            with event_manager.rebuild_scope(request.node_name):
+                self._discard_worker_copy(flow_name)
+
+    def _create_worker_copy_flow(self, node_name: str) -> str | ExecuteNodeResultFailure:
+        """Make a flow for one execution's copy, under the worker's own top-level flow. Returns its name."""
+        if self.engine.object_manager.attempt_get_object_by_name_as_type(_WORKER_COPIES_FLOW_NAME, ControlFlow) is None:
+            top_result = self.engine.handle_request(
+                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME, set_as_new_context=False)
+            )
+            if not isinstance(top_result, CreateFlowResultSuccess):
+                details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {top_result.result_details}"
+                return ExecuteNodeResultFailure(result_details=details)
+        flow_result = self.engine.handle_request(
+            CreateFlowRequest(
+                parent_flow_name=_WORKER_COPIES_FLOW_NAME,
+                flow_name=f"{_WORKER_COPIES_FLOW_NAME}_{uuid4().hex}",
+                set_as_new_context=False,
+            )
+        )
+        if not isinstance(flow_result, CreateFlowResultSuccess):
+            details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {flow_result.result_details}"
+            return ExecuteNodeResultFailure(result_details=details)
+        return flow_result.flow_name
+
+    def _load_worker_copy(self, request: ExecuteNodeRequest, flow_name: str) -> BaseNode | ExecuteNodeResultFailure:  # noqa: PLR0911
+        """Load the node `request` describes into `flow_name`, the way a saved workflow loads it.
+
+        Created from request.node_metadata, then given request.element_modification_commands, then
+        request.parameter_values, each with initial_setup.
+        """
+        node_name = request.node_name
+        refusal = self._refuse_worker_copy_request(request)
+        if refusal is not None:
+            return refusal
+        node_metadata = cast("NodeMetadata", request.node_metadata)
+        node_type = node_metadata["node_type"]
+        library_name = node_metadata.get("library")
+
+        create_result = self.engine.handle_request(
+            CreateNodeRequest(
+                node_type=node_type,
+                specific_library_name=library_name,
+                node_name=node_name,
+                override_parent_flow_name=flow_name,
+                metadata=dict(node_metadata),
+                initial_setup=True,
+                create_error_proxy_on_failure=False,
+            )
+        )
+        if not isinstance(create_result, CreateNodeResultSuccess):
+            return self._worker_copy_creation_failure(node_name, node_type, library_name, create_result)
+        if create_result.node_name != node_name:
+            details = (
+                f"Attempted to prepare node '{node_name}' to run in this process. Failed because it was "
+                f"created as '{create_result.node_name}', and requests about it name '{node_name}'."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
+        node = self.get_node_by_name(node_name)
+        if isinstance(node, BaseNodeGroup):
+            details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because a node group runs where its workflow is open."
+            return ExecuteNodeResultFailure(result_details=details)
+        if request.local_object_source is not None:
+            # Adopt the orchestrator's identity. A copy is made for every execution, so without this each
+            # run would cache under a new identity and nothing would ever displace anything.
+            node.local_object_source = request.local_object_source
+
+        for command in request.element_modification_commands:
+            element_result = self.engine.handle_request(dataclasses.replace(command, node_name=node_name))
+            if element_result.failed():
+                details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {element_result.result_details}"
+                return ExecuteNodeResultFailure(result_details=details)
+
+        value_failure = self._set_worker_copy_values(node, request)
+        if value_failure is not None:
+            return value_failure
+        return node
+
+    @staticmethod
+    def _refuse_worker_copy_request(request: ExecuteNodeRequest) -> ExecuteNodeResultFailure | None:
+        """Refuse a request a worker cannot load a copy from, before anything is created."""
         node_name = request.node_name
         if not request.node_metadata:
             return ExecuteNodeResultFailure(
                 result_details=f"Node '{node_name}' requires node_metadata on worker path.",
             )
-        node_type = request.node_metadata.get("node_type")
-        library_name = request.node_metadata.get("library")
-        if not node_type:
+        if not request.node_metadata.get("node_type"):
             return ExecuteNodeResultFailure(
                 result_details=f"Node '{node_name}' node_metadata is missing 'node_type'.",
             )
-        # Gate worker-side construction on the same InstantiateNode checkpoint
-        # CreateNode enforces. node_metadata is caller-supplied, so without this
-        # a node the policy denies could be instantiated and executed by sending
-        # ExecuteNodeRequest straight to a worker, never passing through the
-        # gated CreateNode path.
-        try:
-            denial = self._evaluate_instantiation_checkpoint(node_type=node_type, specific_library_name=library_name)
-        except KeyError:
-            # Node type/library not registered here; let create_node below
-            # surface the clearer "node type not found" failure rather than
-            # masking it with a checkpoint-resolution error.
-            denial = None
-        if denial is not None:
+        for command in request.element_modification_commands:
+            if type(command) not in ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES:
+                details = (
+                    f"Attempted to prepare node '{node_name}' to run in this process. Failed because its "
+                    f"structure held a '{type(command).__name__}', and only parameter and group changes belong there."
+                )
+                return ExecuteNodeResultFailure(result_details=details)
+        return None
+
+    def _set_worker_copy_values(self, node: BaseNode, request: ExecuteNodeRequest) -> ExecuteNodeResultFailure | None:
+        """Set the values `request` carried on a worker's copy, as a saved workflow sets them. Returns a failure or None."""
+        node_name = request.node_name
+        for parameter_name, value in hydrate_parameter_values(request.parameter_values).items():
+            if not self._can_receive_value(node, parameter_name, value):
+                continue
+            value_result = self.engine.handle_request(
+                SetParameterValueRequest(
+                    parameter_name=parameter_name, node_name=node_name, value=value, initial_setup=True
+                )
+            )
+            if value_result.failed():
+                details = f"Attempted to set parameter '{parameter_name}' on node '{node_name}'. Failed because {value_result.result_details}"
+                return ExecuteNodeResultFailure(result_details=details)
+        return None
+
+    def _worker_copy_creation_failure(
+        self, node_name: str, node_type: str, library_name: str | None, result: ResultPayload
+    ) -> ExecuteNodeResultFailure:
+        """Explain a copy that could not be created, as plainly as this process can."""
+        # In a worker, this almost always means the process could not load the one library
+        # it exists to run -- most often because an execution dependency would not install.
+        # The orchestrator holds that library perfectly well and is drawing its nodes on the
+        # canvas, so "Library not found" sends whoever reads it hunting for a missing library
+        # that is right in front of them. When this process knows better, say that instead.
+        reason = self._local_library_load_failure(library_name)
+        if reason is None:
             return ExecuteNodeResultFailure(
-                result_details=(
-                    f"Node '{node_name}' of type '{node_type}' denied by license policy: {denial.reason()}"
-                ),
+                result_details=f"Failed to create node '{node_name}' of type '{node_type}': {result.result_details}"
             )
+
+        # The library's own account of why -- resolver output, environment paths, version
+        # solving -- is for whoever maintains the library, and an artist cannot act on any of
+        # it. It goes to the log, the way a model-policy failure's diagnostic does, while the
+        # surfaced message stays about what happened and what still works.
+        logger.error(
+            "The worker for library '%s' could not load it, so node '%s' (%s) cannot run: %s (%s)",
+            library_name,
+            node_name,
+            node_type,
+            reason,
+            result.result_details,
+        )
+        return ExecuteNodeResultFailure(
+            result_details=(
+                f"Attempted to run '{node_name}' ({node_type}). Failed because the separate process "
+                f"that runs '{library_name}' could not start it up. Editing the node still works and "
+                f"your workflow keeps it. Ask whoever maintains '{library_name}' to check its "
+                f"installation; the details are in the engine log."
+            )
+        )
+
+    def _discard_worker_copy(self, flow_name: str) -> None:
+        """Remove a copy and its flow from this process's graph, without deleting the node.
+
+        Deleting would release every cached object the node produced, and those are what the
+        orchestrator's outputs refer to; it would also run the library's after_node_deleted. Only the
+        bookkeeping is removed.
+        """
+        flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+        if flow is None:
+            return
+        for node in list(flow.nodes.values()):
+            self._forget_node(node, flow)
+        self.engine.flow_manager.forget_empty_flow(flow)
+
+    def _local_library_load_failure(self, library_name: str | None) -> str | None:
+        """What THIS process recorded about failing to load ``library_name``, if anything.
+
+        Worker-only: on the orchestrator a library that failed to load has no nodes to execute
+        in the first place, so there is nothing to explain here.
+        """
+        library_manager = self.engine.library_manager
+        if not library_name or not library_manager.is_worker:
+            return None
+        library_info = library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return None
+        # Whether the library LOADED, not whether it has any problem. A library can be LOADED and
+        # FLAWED -- one node module of twenty failed to import, a duplicate node name -- and be
+        # running everything else perfectly well. Treating that as "the process could not start"
+        # would misattribute a single broken node type to the whole library. Note the state after
+        # a failed dependency install is EVALUATED, not FAILURE, so this cannot test for FAILURE.
+        if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
+            return None
+        return library_manager.catalog.get_collated_problems_for_library(library_name)
+
+    async def _execute_node_in_library_worker(
+        self, request: ExecuteNodeRequest, node: BaseNode, wm: WorkerManager, library_name: str | None
+    ) -> ResultPayload | None:
+        """Run the node in its library's worker, here or on another engine, or None if the library has none.
+
+        A worker on another engine also waits for a lease on that engine, and is picked only after: that
+        engine may stop the worker while the lease waits, and the second wait starts it again.
+        """
+        library_manager = self.engine.library_manager
+        lease = None
         try:
-            return LibraryRegistry.create_node(
-                node_type=node_type,
-                name=node_name,
-                metadata=dict(request.node_metadata),
-                specific_library_name=library_name,
+            try:
+                if library_name:
+                    # A worker that engine stopped starts again only once the lease holds it.
+                    await wm.wait_until_executable(library_name, start_stopped=False)
+                    # A worker that could not be started there leaves nothing to lease, and an engine
+                    # that never answered the start would never answer the lease either.
+                    if wm.worker_unavailable_reason(library_name) is None:
+                        lease = await wm.acquire_lease(library_name, request.node_name)
+                        await wm.wait_until_executable(library_name)
+                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+            except RuntimeError as err:
+                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
+            if worker is None:
+                return None
+            preparation_failure = self._prepare_for_worker(node, request)
+            if preparation_failure is not None:
+                return preparation_failure
+            if lease is not None:
+                request.lease_id = lease.lease_id
+            return await self._execute_node_via_worker(request, wm, worker)
+        finally:
+            wm.release_after_node(lease)
+
+    async def _execute_node_in_isolated_execution_worker(
+        self, request: ExecuteNodeRequest, wm: WorkerManager, scope: IsolatedExecutionScope
+    ) -> ResultPayload:
+        """Run the node on the worker its Isolated Execution scope names.
+
+        The scope is set by NodeExecutor, which decided this run uses Isolated Execution, so nothing
+        here infers it from where the node sits in the graph.
+        """
+        try:
+            await wm.wait_until_executable(scope.worker_key)
+        except RuntimeError as err:
+            return ExecuteNodeResultFailure(result_details=str(err), exception=err)
+        unavailable = wm.worker_unavailable_reason(scope.worker_key)
+        if unavailable is not None:
+            details = (
+                f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
+                f"Failed because {unavailable} Reload your libraries, or restart Griptape Nodes, to start it again."
             )
-        except Exception as e:
-            return ExecuteNodeResultFailure(
-                result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}",
+            return ExecuteNodeResultFailure(result_details=details)
+        worker = wm.get_worker_for_key(scope.worker_key)
+        if worker is None:
+            details = (
+                f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
+                "Failed because the background process that runs Isolated Execution is not running. Reload your "
+                "libraries, or restart Griptape Nodes, to start it again."
             )
+            return ExecuteNodeResultFailure(result_details=details)
+        return await self._execute_node_via_worker(request, wm, worker)
 
     async def _execute_node_via_worker(
         self,
@@ -3120,13 +3838,20 @@ class NodeManager:
     ) -> ResultPayload:
         """Dispatch ExecuteNodeRequest to a worker and return its result.
 
-        The worker constructs a fresh transient node from request.node_metadata
-        on every call and discards it after aprocess returns (see #4476);
-        ExecuteNodeRequest is a pure RPC from the orchestrator's perspective.
+        The worker loads a copy of the node from the request on every call and
+        discards it after aprocess returns; ExecuteNodeRequest is a pure RPC
+        from the orchestrator's perspective.
         Output copy-back onto the orchestrator's live node happens in the caller
         (NodeExecutor.execute) so the write path is identical for local and
         worker routes.
         """
+        unsendable = self._unencodable_value_names(request.parameter_values)
+        if unsendable:
+            details = (
+                f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
+                f"its input {', '.join(unsendable)} cannot be sent there."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
         worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
@@ -3136,7 +3861,9 @@ class NodeManager:
         if not request.request_id:
             request.request_id = str(uuid4())
         target_request_id = request.request_id
-        self._orch_worker_requests[request.node_name] = (
+        # The same dict is cleared below even if the workflow closes while the node runs.
+        orch_worker_requests = self._orch_worker_requests
+        orch_worker_requests[request.node_name] = (
             target_request_id,
             worker_engine_id,
             worker_request_topic,
@@ -3149,10 +3876,20 @@ class NodeManager:
                 worker_engine_id,
                 worker_request_topic,
             )
+        except WorkerGoneError as err:
+            # A failure, not a cancellation: the resolution machine reaps cancellations as CANCELED,
+            # emitting no NodeErrorEvent and logging one unnamed line, so the node would come back
+            # UNRESOLVED with nothing anywhere saying why. The reason comes from whoever retired the
+            # worker, and rides on `exception` so it reaches the node-failure formatting.
+            details = (
+                f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
+                f"{err} Editing the node still works and your workflow keeps it."
+            )
+            return ExecuteNodeResultFailure(result_details=details, exception=err)
         finally:
             # Drop the tracking entry regardless of success, failure, or cancellation
             # so a subsequent execute on the same node doesn't see a stale record.
-            self._orch_worker_requests.pop(request.node_name, None)
+            orch_worker_requests.pop(request.node_name, None)
         result_type_name = execute_raw.get("result_type", "")
         result_data = execute_raw.get("result", {})
         # Route through cattrs structure (not ``**result_data`` spread)
@@ -3163,8 +3900,8 @@ class NodeManager:
         # worker-frame surfacing in
         # ``NodeExecutor._format_node_failure_message``.
         if result_type_name == ExecuteNodeResultSuccess.__name__:
-            return cast("ExecuteNodeResultSuccess", converter.structure(result_data, ExecuteNodeResultSuccess))
-        return cast("ExecuteNodeResultFailure", converter.structure(result_data, ExecuteNodeResultFailure))
+            return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
+        return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
 
     async def cancel_worker_execution(self, node_name: str) -> None:
         """Dispatch CancelExecuteNodeRequest to the worker running node_name.
@@ -3177,11 +3914,14 @@ class NodeManager:
         orchestrator's own route_to_worker await, which unblocks here as soon
         as the cancel event has been put on the wire.
         """
-        entry = self._orch_worker_requests.get(node_name)
+        nodes = self._current_nodes_or_none()
+        if nodes is None:
+            return
+        entry = nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry
-        wm = GriptapeNodes.WorkerManager()
+        wm = self.engine.worker_manager
         cancel_request = CancelExecuteNodeRequest(target_request_id=target_request_id)
         await wm.forward_event_to_worker(
             EventRequest(request=cancel_request),
@@ -3189,6 +3929,7 @@ class NodeManager:
             worker_request_topic=worker_request_topic,
         )
 
+    @handles(CancelExecuteNodeRequest)
     async def on_cancel_execute_node_request(self, request: CancelExecuteNodeRequest) -> ResultPayload:
         """Worker-side handler: cancel an in-flight aprocess task by request_id.
 
@@ -3212,17 +3953,15 @@ class NodeManager:
         )
 
     async def _hydrate_and_run_node(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
-        """Hydrate a node's input parameters and execute it.
+        """Apply a node's input values and execute it.
 
-        On a worker, hydration and node.aprocess() both run inside
-        worker_node_execution_scope so that any nested handle_request calls
-        originated from node code forward to the orchestrator. Hydration calls
-        set_parameter_value, which cascades into ListConnectionsForNodeRequest
-        and similar cross-node lookups; those must forward because the worker
-        only owns its single node copy and cannot resolve parent-flow or peer-
-        node state locally. On the orchestrator we skip the scope entirely --
-        there is no RemoteHandler to read the flag, so opening it there would
-        only bump a refcount nothing observes.
+        On the orchestrator the values the request carried are set first. A worker's copy already has
+        them, from being loaded (see _run_worker_copy).
+
+        node.aprocess() runs inside node_execution_scope. On a worker that is what makes any
+        handle_request call from node code forward to the orchestrator, which owns the graph the node
+        asks about. Everywhere it also marks the window in which a held object must not be freed, which
+        is why it is opened on the orchestrator too.
         """
         # Register this aprocess task under its request_id so
         # CancelExecuteNodeRequest can locate it. Only populated when the caller
@@ -3238,38 +3977,43 @@ class NodeManager:
         finally:
             if tracked_request_id:
                 self._worker_inflight_aprocesses.pop(tracked_request_id, None)
+            # Release hooks held back while nodes ran. A no-op while any node is still executing, which
+            # parallel resolution makes routine -- the drain enforces that itself.
+            dropped = self.engine.resource_manager.drain_deferred_releases()
+            if dropped:
+                logger.debug("Released %d held object(s) deferred while nodes were running.", dropped)
 
-    async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
+    @staticmethod
+    def _resolve_cached_inputs_in_place(node: BaseNode) -> None:
+        """Swap each reference in the node's input values for the object it stands for, where held here.
+
+        So a node body reading `self.parameter_values[name]` directly gets what `get_parameter_value` would
+        give it. Authors do read that dict -- hydration already materialises defaults into it for the same
+        reason -- and a reference sitting there hands them something that is not their object.
+
+        Written straight into the dict rather than through `set_parameter_value`: nothing changed as far as
+        the graph is concerned, and the setter would emit a lifecycle event carrying the live object where
+        the reference is what the editor should see.
+
+        Worker-side only. In-process a node's dict already holds the object it was handed, so there is
+        nothing to swap -- except a reference a library made itself through `reference_for`, and replacing
+        that one would blind the save and metadata guards, which look for a reference and would find an
+        object they cannot write out.
+        """
+        for param_name, stored in list(node.parameter_values.items()):
+            resolved = node.local_objects.resolve_what_is_here(stored)
+            if resolved is not stored:
+                node.parameter_values[param_name] = resolved
+
+    async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:  # noqa: C901
         node_name = request.node_name
-        # The node-execution scope only has meaning on a worker: it is what
-        # RemoteHandler consults to decide whether to forward a request to the
-        # orchestrator. On the orchestrator itself there is no RemoteHandler
-        # installed (register_remote_handlers is worker-only), so opening the
-        # scope there would just bump a refcount that nothing reads. Skip it
-        # to keep the depth counter accurate to its name.
-        is_worker = GriptapeNodes.LibraryManager()._is_worker
-        scope_cm = GriptapeNodes.EventManager().worker_node_execution_scope() if is_worker else contextlib.nullcontext()
-        with scope_cm:
-            # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
-            parameter_values = hydrate_parameter_values(request.parameter_values)
-            for param_name, value in parameter_values.items():
-                # Skip when the node already holds this value. The local path
-                # calls ExecuteNodeRequest with dict(node.parameter_values) on
-                # the same in-memory instance, so every iteration would be a
-                # no-op mutation that still ran before/after_value_set hooks
-                # and emitted a lifecycle event -- observably breaking nodes
-                # like LoadImage. On the worker the node is fresh, so current
-                # is _PARAM_MISSING and the normal set path runs.
-                current = node.parameter_values.get(param_name, _PARAM_MISSING)
-                if current is value or current == value:
-                    continue
-                try:
-                    node.set_parameter_value(param_name, value)
-                except Exception as e:
-                    return ExecuteNodeResultFailure(
-                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
-                        exception=e,
-                    )
+        with self.engine.event_manager.node_execution_scope():
+            # A worker's copy was loaded with its values (see _load_worker_copy).
+            if not self.engine.library_manager.is_worker:
+                hydrated_values = hydrate_parameter_values(request.parameter_values)
+                hydration_failure = self._apply_hydrated_values(node, node_name, hydrated_values)
+                if hydration_failure is not None:
+                    return hydration_failure
             # Materialize parameter defaults into parameter_values so that user
             # process() code reading self.parameter_values[name] directly (rather
             # than via get_parameter_value) sees the default. Newly-dropped nodes
@@ -3279,34 +4023,211 @@ class NodeManager:
             for param in node.parameters:
                 if param.name in node.parameter_values:
                     continue
-                if param.default_value is None:
+                # A list is read from its rows, and a stored default would hide them.
+                if param.default_value is None or isinstance(param, ParameterContainer):
                     continue
                 node.parameter_values[param.name] = param.default_value
+            if self.engine.library_manager.is_worker:
+                self._resolve_cached_inputs_in_place(node)
+
+            # After hydration and after cached inputs have become objects again, so a check here reads
+            # what `aprocess` will read. Before `aprocess`, so a node that cannot run does not half-run.
             try:
-                with aprocess_scope(request.variables):
+                validation_exceptions = node.validate_in_execution_environment()
+            except Exception as e:
+                # The check is a library's own code, and it runs where the execution dependencies are, so
+                # an ImportError out of it says the same thing as a returned exception: this node cannot
+                # run here. Letting it escape would report a node that declined as an engine crash.
+                validation_exceptions = [e]
+            if validation_exceptions:
+                return ExecuteNodeResultFailure(
+                    result_details=(
+                        f"Attempted to execute node '{node_name}'. It declined to run: "
+                        f"{'; '.join(str(exception) for exception in validation_exceptions)}"
+                    ),
+                    validation_exceptions=validation_exceptions,
+                    error=build_node_error_details(node_name, validation_exceptions),
+                )
+
+            try:
+                with aprocess_scope(request.variables, node):
                     await node.aprocess()
             except Exception as e:
-                # Pass the live exception through ``exception=`` so the
-                # converter can capture worker-side frames into a
-                # ForwardedException on the orchestrator. Without this
-                # the orchestrator only sees the type and message --
-                # PR06's whole reason for the dict wire-format -- and
-                # NodeExecutor._format_node_failure_message would have
-                # nothing to surface. ``__traceback__`` is populated
-                # because ``e`` was actually raised, so the strict-mode
-                # tripwire stays quiet for raise-in-process.
-                return ExecuteNodeResultFailure(
-                    result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
-                    exception=e,
-                )
+                return self._execution_failure(e, node_name)
+            finally:
+                # The scratch marker only means anything while the run is in flight. A parameter
+                # the node still holds here was never torn down, so serialization must treat it
+                # as structure rather than dropping it from every later save.
+                node.forget_parameters_added_during_execution()
+        # Only a worker's result leaves the process. In-process this is handed straight back to
+        # NodeExecutor, which copies it onto this very node, so caching here would put a reference in the
+        # dict the node just wrote its object into.
+        if self.engine.library_manager.is_worker:
+            return self._worker_execution_result(node)
         return ExecuteNodeResultSuccess(
             parameter_output_values=dict(node.parameter_output_values),
             result_details=f"Node '{node_name}' executed successfully.",
         )
 
+    def _worker_execution_result(self, node: BaseNode) -> ResultPayload:
+        """The result a worker sends back: outputs with cached objects swapped for their keys."""
+        output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
+        unsendable = self._unencodable_value_names(output_values)
+        if unsendable:
+            library_name = node.metadata.get("library", "its library")
+            details = (
+                f"Attempted to send node '{node.name}' output {', '.join(unsendable)} out of "
+                f"'{library_name}'s isolated process. Failed because it has no plain-data form. Give "
+                f"the value a plain-data form, or declare its parameter serializable=False so the value "
+                f"stays in that process and the next node receives a reference to it."
+            )
+            return ExecuteNodeResultFailure(result_details=details)
+        return ExecuteNodeResultSuccess(
+            parameter_output_values=output_values,
+            result_details=f"Node '{node.name}' executed successfully.",
+        )
+
+    def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
+        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
+        budget_halt = self._budget_halt_for(exc, node_name)
+        if budget_halt is not None:
+            # The engine words the halt, so it carries no node-built details.
+            return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
+        # The raised exception itself, so its traceback crosses the worker boundary. The details are
+        # built here, where the real exception and anything it attached still exist.
+        return ExecuteNodeResultFailure(
+            result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
+            exception=exc,
+            error=build_node_error_details(node_name, exc),
+        )
+
+    def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:
+        """Return the halt for a node whose call Griptape Cloud refused over budget, or None.
+
+        Every node failure passes through here, so no node type has to catch the
+        refusal itself. A halt that does not yet name a node (one a Cloud driver
+        raised) is re-worded to name this one; a halt that already does is kept.
+        """
+        already_worded = self._named_budget_halt(exc)
+        if already_worded is not None:
+            return already_worded
+
+        refusal = self._refusal_carried_by(exc)
+        if refusal is None:
+            return None
+
+        logger.error("%s: %s", node_name, budget_log_line(refusal))
+        halt = BudgetExceededError(describe_budget_refusal(refusal, node_name=node_name), refusal, node_name=node_name)
+        # Raised from the failure rather than only built, so the halt keeps the original as its
+        # cause and has a traceback of its own; without one the converter forwards no traceback
+        # across the worker boundary.
+        try:
+            raise halt from exc
+        except BudgetExceededError:
+            return halt
+
+    def _named_budget_halt(self, exc: Exception) -> BudgetExceededError | None:
+        """Return the halt on this chain that already names its node, if there is one."""
+        for halt in self._budget_halts_on(exc):
+            if halt.node_name is not None:
+                return halt
+        return None
+
+    def _refusal_carried_by(self, exc: Exception) -> BudgetRefusal | None:
+        """Return the refusal behind this failure, from a halt already raised or from the HTTP error.
+
+        A raised halt's parsed refusal is preferred, since the SDK may have closed
+        the response. The host resolver is passed uncalled so the secret is read
+        only for a failure that carries a response.
+        """
+        for halt in self._budget_halts_on(exc):
+            return halt.refusal
+        return refusal_from_exception(exc, cloud_host=self._cloud_host)
+
+    def _cloud_host(self) -> str:
+        """Hostname of the Griptape Cloud deployment this engine is pointed at."""
+        return resolve_cloud_host(self.engine.secrets_manager)
+
+    def _budget_halts_on(self, exc: Exception) -> Iterator[BudgetExceededError]:
+        """Walk the cause chain, yielding each budget halt on it, outermost first.
+
+        In-process only; a halt forwarded from a worker was already worded there.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, BudgetExceededError):
+                yield current
+            current = current.__cause__
+
+    @staticmethod
+    def _can_receive_value(node: BaseNode, parameter_name: str, value: Any) -> bool:
+        """Whether a value an ExecuteNodeRequest carried can be set on `node`, warning about any that can't.
+
+        A value for a parameter the node doesn't have is skipped. One this process could not rebuild into
+        its type is still set, since nodes that read artifact-shaped dicts can use it.
+        """
+        if node.get_parameter_by_name(parameter_name) is None:
+            logger.warning(
+                "Node '%s' received a value for parameter '%s', which it does not have. "
+                "The value was left unapplied for this run.",
+                node.name,
+                parameter_name,
+            )
+            return False
+        if type(value) is UndecodedValue:
+            logger.warning(
+                "Node '%s' received a value for parameter '%s' that this process cannot "
+                "rebuild, so it arrives as plain data instead of its type. %s",
+                node.name,
+                parameter_name,
+                value.reason,
+            )
+        return True
+
+    def _apply_hydrated_values(
+        self, node: BaseNode, node_name: str, parameter_values: dict[str, Any]
+    ) -> ExecuteNodeResultFailure | None:
+        """Set the values an ExecuteNodeRequest carried on the node about to run. Returns a failure or None.
+
+        Set as an edit would set them, since they change the live node. A value for a parameter the node
+        doesn't have is skipped with a warning.
+        """
+        for param_name, value in parameter_values.items():
+            # Skip when the node already holds this value: setting it again would fire
+            # before/after_value_set and emit a lifecycle event for no change -- observably breaking
+            # nodes like LoadImage.
+            current = node.parameter_values.get(param_name, _PARAM_MISSING)
+            if current is value or current == value:
+                continue
+            if not self._can_receive_value(node, param_name, value):
+                continue
+            parameter = cast("Parameter", node.get_parameter_by_name(param_name))
+            try:
+                if not node._list_rows.set_as_rows_if_unconnected(parameter, value):
+                    node.set_parameter_value(param_name, value)
+            except Exception as e:
+                return ExecuteNodeResultFailure(
+                    result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
+                    exception=e,
+                )
+        return None
+
+    @staticmethod
+    def _unencodable_value_names(values: dict[str, Any]) -> list[str]:
+        """Name each value that has no plain-data form, with the reason."""
+        names = []
+        for name, value in values.items():
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
+                names.append(f"'{name}' ({encoded.reason})")
+        return names
+
+    @handles(ValidateNodeDependenciesRequest)
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name
-        obj_manager = GriptapeNodes.ObjectManager()
+        obj_manager = self.engine.object_manager
         node = obj_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f'Failed to validate node dependencies. Node with "{node_name}" does not exist.'
@@ -3316,7 +4237,7 @@ class NodeManager:
         except Exception as e:
             details = f'Failed to validate node dependencies. Node with "{node_name}" has no parent flow. Error: {e}'
             return ValidateNodeDependenciesResultFailure(result_details=details)
-        flow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+        flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
         if not flow:
             details = f'Failed to validate node dependencies. Flow with "{flow_name}" does not exist.'
             return ValidateNodeDependenciesResultFailure(result_details=details)
@@ -3338,6 +4259,8 @@ class NodeManager:
         group_node: BaseNodeGroup,
         unique_uuid_to_values: dict,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        *,
+        serialize_all_parameter_values: bool = False,
     ) -> SerializedGroupResult:
         """Serialize a group node and its children for copy/paste operations.
 
@@ -3348,8 +4271,10 @@ class NodeManager:
 
         Args:
             group_node: The group node to serialize
-            unique_uuid_to_values: Shared dictionary for tracking pickled parameter values
+            unique_uuid_to_values: Shared pool of encoded parameter values, keyed by content
             serialized_parameter_value_tracker: Tracker for parameter value hashes
+            serialize_all_parameter_values: If True, capture every parameter value on the group and
+                on each child, not just the ones the ordinary save condition would record
 
         Returns:
             SerializedGroupResult containing the group command, child commands, and child UUIDs
@@ -3365,12 +4290,11 @@ class NodeManager:
                 node_name=group_name,
                 unique_parameter_uuid_to_values=unique_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                use_pickling=True,
+                serialize_all_parameter_values=serialize_all_parameter_values,
             )
         )
 
         if not isinstance(group_result, SerializeNodeToCommandsResultSuccess):
-            logger.error("Failed to serialize group node '%s'", group_name)
             msg = f"Failed to serialize children and group node '{group_name}'"
             raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
@@ -3391,12 +4315,11 @@ class NodeManager:
                     node_name=child_name,
                     unique_parameter_uuid_to_values=unique_uuid_to_values,
                     serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                    use_pickling=True,
+                    serialize_all_parameter_values=serialize_all_parameter_values,
                 )
             )
 
             if not isinstance(child_result, SerializeNodeToCommandsResultSuccess):
-                logger.error("%s failed to serialize child node '%s'", group_name, child_name)
                 msg = f"Failed to serialize child node '{child_name}'"
                 raise RuntimeError(msg)  # noqa: TRY004 Type Error doesn't make sense here, this is a runtime error.
 
@@ -3419,27 +4342,28 @@ class NodeManager:
             child_uuids=child_uuids,
         )
 
+    @handles(SerializeNodeToCommandsRequest)
     def on_serialize_node_to_commands(self, request: SerializeNodeToCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         node_name = request.node_name
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to serialize a Node to commands from the Current Context. Failed because the Current Context is empty."
                 return SerializeNodeToCommandsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize Node '{node_name}' to commands. Failed because no Node with that name could be found."
                 return SerializeNodeToCommandsResultFailure(result_details=details)
 
         # This is our current dude.
-        with GriptapeNodes.ContextManager().node(node=node):
+        with self.engine.context_manager.node(node=node):
             # Get the library and version details for all nodes.
             # A node's owning library is normally injected into metadata by
             # LibraryRegistry.create_node, but proxy/placeholder nodes can be created
@@ -3457,10 +4381,10 @@ class NodeManager:
             execution_env_library_details = None
             if isinstance(node, SubflowNodeGroup):
                 execution_env = node.get_parameter_value(node.execution_environment.name)
-                if execution_env not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
+                if execution_env not in (LOCAL_EXECUTION, ISOLATED_EXECUTION):
                     # Get library details for the execution environment library
                     exec_env_metadata_request = GetLibraryMetadataRequest(library=execution_env)
-                    exec_env_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
+                    exec_env_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
                         exec_env_metadata_request
                     )
                     if isinstance(exec_env_metadata_result, GetLibraryMetadataResultSuccess):
@@ -3472,7 +4396,7 @@ class NodeManager:
             library_metadata_request = GetLibraryMetadataRequest(library=library_used)
             # Call LibraryManager directly to avoid error toasts when library is unavailable (expected for ErrorProxyNode)
             # Per https://github.com/griptape-ai/griptape-nodes/issues/1940
-            library_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
                 library_metadata_request
             )
 
@@ -3531,112 +4455,22 @@ class NodeManager:
                     serialized_library_name = library_details.library_name
 
                 # Get the creation details for regular nodes
+                metadata_copy = copy.deepcopy(node.metadata)
+                # Per live node, never per serialized form -- see the group branch above.
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
-                    metadata=copy.deepcopy(node.metadata),
+                    metadata=metadata_copy,
                     # If it is actively resolving, mark as unresolved.
-                    resolution=node.state.value,
+                    # A node resolved only by a locked pass-through never ran, so it reloads unresolved.
+                    resolution=NodeResolutionState.UNRESOLVED.value if node.resolved_while_locked else node.state.value,
                     initial_setup=True,
                 )
 
-            # We're going to compare this node instance vs. a canonical one. Rez that one up.
-            # For ErrorProxyNode, we can't create a reference node, so skip comparison.
-            # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation
-            # detector skips this ephemeral instance's declarative ``add_parameter``
-            # calls (this construction bypasses ``LibraryRegistry.create_node``).
-            #
-            # Carry the node's library and type so the reference resolves the same
-            # library-backed ``__init__`` data the live node did (e.g. a model
-            # dropdown sourced from the ``model_catalog``); otherwise it would look
-            # mutated.
-            if isinstance(node, ErrorProxyNode):
-                reference_node = None
-            else:
-                with LibraryRegistry.constructing_node():
-                    reference_node = type(node)(
-                        name="REFERENCE NODE",
-                        metadata={
-                            "library": node.metadata.get("library"),
-                            "node_type": node.metadata.get("node_type"),
-                        },
-                    )
-
-            # Now creation or alteration of all of the elements.
-            element_modification_commands = []
-
-            # Serialize only user-defined ParameterGroups (like parameters)
-            all_groups = node.root_ui_element.find_elements_by_type(ParameterGroup)
-            for group in all_groups:
-                if group.user_defined:
-                    add_group_request = AddParameterGroupToNodeRequest(
-                        node_name=node_name,
-                        group_name=group.name,
-                        parent_element_name=group.parent_group_name,
-                        ui_options=group.ui_options or {},
-                        is_user_defined=True,
-                        initial_setup=True,
-                    )
-                    element_modification_commands.append(add_group_request)
-
-            # Then serialize parameters
-            for parameter in node.parameters:
-                # Create the parameter, or alter it on the existing node
-                if parameter.user_defined:
-                    # Always serialize user-defined parameters regardless of node type
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
-                    element_modification_commands.append(add_param_request)
-                elif isinstance(node, ErrorProxyNode):
-                    # For ErrorProxyNode, replay all recorded initialization requests for this parameter
-                    recorded_requests = node.get_recorded_initialization_requests()
-                    matching_requests = [
-                        recorded_request
-                        for recorded_request in recorded_requests
-                        if (
-                            hasattr(recorded_request, "parameter_name")
-                            and getattr(recorded_request, "parameter_name", None) == parameter.name
-                        )
-                    ]
-                    element_modification_commands.extend(matching_requests)
-                elif reference_node is None:
-                    # Normal node with no reference - treat all parameters as needing serialization
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
-                    element_modification_commands.append(add_param_request)
-                else:
-                    # Normal node - compare against reference node
-                    diff = NodeManager._manage_alter_details(parameter, reference_node)
-                    relevant = False
-                    for key in diff:
-                        if key in AlterParameterDetailsRequest.relevant_parameters():
-                            relevant = True
-                            break
-                    if relevant:
-                        diff["parameter_name"] = parameter.name
-                        diff["initial_setup"] = True
-                        alter_param_request = AlterParameterDetailsRequest.create(**diff)
-                        element_modification_commands.append(alter_param_request)
-
-            # Check for ParameterGroup alterations (ui_options changes like collapsed state)
-            if reference_node is not None and not isinstance(node, ErrorProxyNode):
-                # Compare ALL groups against the reference node (not just user-defined)
-                # This matches the pattern used for parameter alterations
-                for group in all_groups:
-                    diff = NodeManager._manage_alter_group_details(group, reference_node)
-                    relevant = False
-                    for key in diff:
-                        if key in AlterParameterGroupDetailsRequest.relevant_parameters():
-                            relevant = True
-                            break
-                    if relevant:
-                        diff["group_name"] = group.name
-                        diff["initial_setup"] = True
-                        alter_group_request = AlterParameterGroupDetailsRequest(**diff)
-                        element_modification_commands.append(alter_group_request)
+            structure = self._serialize_node_structure(node, node_name)
+            element_modification_commands = structure.commands
+            omitted_parameter_names = structure.omitted_parameter_names
 
             # Now assignment of values to all of the parameters.
             set_value_commands = []
@@ -3645,6 +4479,9 @@ class NodeManager:
             # Only AlterParameterDetailsRequest commands are recorded and replayed
             # Normal node - use current parameter values
             for parameter in node.parameters:
+                # No parameter to receive the value: it was left out of the commands above.
+                if parameter.name in omitted_parameter_names:
+                    continue
                 # SetParameterValueRequest event
                 set_param_value_requests = NodeManager.handle_parameter_value_saving(
                     parameter=parameter,
@@ -3652,7 +4489,8 @@ class NodeManager:
                     unique_parameter_uuid_to_values=request.unique_parameter_uuid_to_values,
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
-                    use_pickling=request.use_pickling,
+                    serialize_all_parameter_values=request.serialize_all_parameter_values,
+                    value_supplied_by_connection=parameter.name in request.values_supplied_by_connections,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -3693,6 +4531,148 @@ class NodeManager:
         )
         return result
 
+    def _serialize_node_structure(self, node: BaseNode, node_name: str) -> _NodeStructureCommands:  # noqa: C901, PLR0912, PLR0915
+        """The commands that rebuild ``node``'s groups and parameters on a copy built from its class.
+
+        A saved workflow replays them after creating the node, and a worker applies them to the copy it
+        runs, so both rebuild the same shape.
+        """
+        # We're going to compare this node instance vs. a canonical one. Rez that one up.
+        # For ErrorProxyNode, we can't create a reference node, so skip comparison.
+        # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation
+        # detector skips this ephemeral instance's declarative ``add_parameter``
+        # calls (this construction bypasses ``LibraryRegistry.create_node``).
+        #
+        # Carry the node's library and type so the reference resolves the same
+        # library-backed ``__init__`` data the live node did (e.g. a model
+        # dropdown sourced from the ``model_catalog``); otherwise it would look
+        # mutated.
+        if isinstance(node, ErrorProxyNode):
+            reference_node = None
+        else:
+            with LibraryRegistry.constructing_node(throwaway=True):
+                reference_node = type(node)(
+                    name="REFERENCE NODE",
+                    metadata={
+                        "library": node.metadata.get("library"),
+                        "node_type": node.metadata.get("node_type"),
+                    },
+                )
+
+        # Now creation or alteration of all of the elements.
+        element_modification_commands = []
+
+        # Parameters left out of the commands below, so their values must be left out too.
+        omitted_parameter_names: set[str] = set()
+
+        # Serialize only user-defined ParameterGroups (like parameters)
+        all_groups = node.root_ui_element.find_elements_by_type(ParameterGroup)
+        for group in all_groups:
+            if group.user_defined:
+                add_group_request = AddParameterGroupToNodeRequest(
+                    node_name=node_name,
+                    group_name=group.name,
+                    parent_element_name=group.parent_group_name,
+                    ui_options=group.ui_options or {},
+                    is_user_defined=True,
+                    initial_setup=True,
+                )
+                element_modification_commands.append(add_group_request)
+
+        # Then serialize parameters
+        for parameter in node.parameters:
+            # Create the parameter, or alter it on the existing node
+            if parameter.user_defined:
+                # Always serialize user-defined parameters regardless of node type
+                param_dict = parameter.save_dict()
+                param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
+                add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
+                element_modification_commands.append(add_param_request)
+            elif isinstance(node, ErrorProxyNode):
+                # For ErrorProxyNode, replay all recorded initialization requests for this parameter
+                recorded_requests = node.get_recorded_initialization_requests()
+                matching_requests = [
+                    recorded_request
+                    for recorded_request in recorded_requests
+                    if (
+                        hasattr(recorded_request, "parameter_name")
+                        and getattr(recorded_request, "parameter_name", None) == parameter.name
+                    )
+                ]
+                element_modification_commands.extend(matching_requests)
+            elif reference_node is None:
+                # Normal node with no reference - treat all parameters as needing serialization
+                param_dict = parameter.save_dict()
+                param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
+                add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
+                element_modification_commands.append(add_param_request)
+            elif (
+                parameter.name in node.parameters_added_during_execution
+                and reference_node.get_parameter_by_name(parameter.name) is None
+            ):
+                # Scratch state the run owns and tears down, so the copy should not have it at
+                # all. An alter would find no element on the recreated node and fail the whole
+                # deserialize, and an add would leave the artist a phantom property.
+                omitted_parameter_names.add(parameter.name)
+            elif (
+                parameter.name in node.parameters_added_after_construction
+                and reference_node.get_parameter_by_name(parameter.name) is None
+            ):
+                # Added outside ``__init__`` but meant to last — typically built from a value
+                # hook as an input arrived. The recreated node has no such parameter when the
+                # element commands replay, and the value replay will not rebuild it either
+                # because ``initial_setup`` suppresses the hooks, so recreate it outright.
+                #
+                # Reference absence cannot pick these out on its own: the reference's metadata is
+                # narrowed to library and node_type, so it also lacks parameters ``__init__``
+                # derives from any other metadata key, and adding those would collide with the
+                # copy's own and land as ``<name>_1``.
+                param_dict = parameter.to_dict()
+                param_dict["initial_setup"] = True
+                add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                element_modification_commands.append(add_param_request)
+            else:
+                # Normal node - compare against reference node
+                diff = NodeManager._manage_alter_details(parameter, reference_node)
+                relevant = False
+                for key in diff:
+                    if key in AlterParameterDetailsRequest.relevant_parameters():
+                        relevant = True
+                        break
+                if relevant:
+                    diff["parameter_name"] = parameter.name
+                    diff["initial_setup"] = True
+                    if "traits" in diff:
+                        diff["traits"] = self._stabilize_trait_modules(diff["traits"])
+                    alter_param_request = AlterParameterDetailsRequest.create(**diff)
+                    element_modification_commands.append(alter_param_request)
+
+        # Check for ParameterGroup alterations (ui_options changes like collapsed state)
+        if reference_node is not None and not isinstance(node, ErrorProxyNode):
+            # Compare ALL groups against the reference node (not just user-defined)
+            # This matches the pattern used for parameter alterations
+            for group in all_groups:
+                diff = NodeManager._manage_alter_group_details(group, reference_node)
+                relevant = False
+                for key in diff:
+                    if key in AlterParameterGroupDetailsRequest.relevant_parameters():
+                        relevant = True
+                        break
+                if relevant:
+                    diff["group_name"] = group.name
+                    diff["initial_setup"] = True
+                    if "traits" in diff:
+                        diff["traits"] = self._stabilize_trait_modules(diff["traits"])
+                    alter_group_request = AlterParameterGroupDetailsRequest(**diff)
+                    element_modification_commands.append(alter_group_request)
+
+        element_modification_commands = [
+            NodeManager._with_encodable_default(command, node_name) for command in element_modification_commands
+        ]
+        return _NodeStructureCommands(
+            commands=element_modification_commands, omitted_parameter_names=omitted_parameter_names
+        )
+
     def check_response(self, response: object, class_to_check: type, attribute_to_retrieve: Any) -> Any:
         """Helper function for remake_duplicates to check whether response is of a particular type before getting an attribute.
 
@@ -3721,7 +4701,7 @@ class NodeManager:
 
         """
         connection_info_request = GetParameterDetailsRequest(source_parameter_name, source_node_name)
-        connection_info_response = GriptapeNodes.handle_request(connection_info_request)
+        connection_info_response = self.engine.handle_request(connection_info_request)
         # only get value if it succeeds
         connection_type = NodeManager.check_response(
             self, connection_info_response, GetParameterDetailsResultSuccess, "type"
@@ -3747,7 +4727,7 @@ class NodeManager:
             list_connections_for_node_request = ListConnectionsForNodeRequest(
                 node_name=old_node_name, include_internal=False
             )
-            list_connections_for_node_response = GriptapeNodes.handle_request(list_connections_for_node_request)
+            list_connections_for_node_response = self.engine.handle_request(list_connections_for_node_request)
 
             # Only get incoming/outgoing connections if it returns the proper type
             incoming_connections = NodeManager.check_response(
@@ -3785,7 +4765,7 @@ class NodeManager:
                         target_node_name=new_node_name,
                         target_parameter_name=target_parameter_name,
                     )
-                    GriptapeNodes.handle_request(create_old_incoming_connections_request)
+                    self.engine.handle_request(create_old_incoming_connections_request)
 
             # If there are any outgoing connections, loop over them
             for outgoing_connection in outgoing_connections:
@@ -3809,12 +4789,13 @@ class NodeManager:
                         target_node_name=target_node_name,
                         target_parameter_name=outgoing_connection.target_parameter_name,
                     )
-                    GriptapeNodes.handle_request(create_old_outgoing_connections_request)
+                    self.engine.handle_request(create_old_outgoing_connections_request)
 
+    @handles(DeserializeNodeFromCommandsRequest)
     def on_deserialize_node_from_commands(self, request: DeserializeNodeFromCommandsRequest) -> ResultPayload:
         # Issue the creation command first.
         create_node_request = request.serialized_node_commands.create_node_command
-        create_node_result = GriptapeNodes().handle_request(create_node_request)
+        create_node_result = self.engine.handle_request(create_node_request)
         if not isinstance(create_node_result, CreateNodeResultSuccess):
             req_node_name = create_node_request.node_name
             details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to create node '{req_node_name}'."
@@ -3822,11 +4803,11 @@ class NodeManager:
 
         # Adopt the newly-created node as our current context.
         node_name = create_node_result.node_name
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to get node '{node_name}'."
             return DeserializeNodeFromCommandsResultFailure(result_details=details)
-        with GriptapeNodes.ContextManager().node(node=node):
+        with self.engine.context_manager.node(node=node):
             for element_command in request.serialized_node_commands.element_modification_commands:
                 # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4862
                 # This isinstance allowlist must be updated by hand for every new
@@ -3843,7 +4824,7 @@ class NodeManager:
                     ),
                 ):
                     element_command.node_name = node_name
-                element_result = GriptapeNodes().handle_request(element_command)
+                element_result = self.engine.handle_request(element_command)
                 if element_result.failed():
                     details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to execute an element command for node '{node_name}'."
                     self._cleanup_node_on_failed_deserialization(node_name)
@@ -3851,6 +4832,7 @@ class NodeManager:
         details = f"Successfully deserialized a serialized set of Node Creation commands for node '{node_name}'."
         return DeserializeNodeFromCommandsResultSuccess(node_name=node_name, result_details=details)
 
+    @handles(SerializeSelectedNodesToCommandsRequest)
     def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
         self, request: SerializeSelectedNodesToCommandsRequest
     ) -> ResultPayload:
@@ -3880,10 +4862,10 @@ class NodeManager:
 
         for node_name, _ in nodes_to_serialize:
             # Check if this is a group node that needs special handling
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get node '{node_name}'."
-                return SerializeNodeToCommandsResultFailure(result_details=details)
+                return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
             if isinstance(node, BaseNodeGroup):
                 # Use special method to handle group + children
@@ -3895,7 +4877,7 @@ class NodeManager:
 
                 if group_result.group_command is None:
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize group '{node_name}'."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
                 # Process the group node command
                 node_commands[node_name] = group_result.group_command
@@ -3908,7 +4890,7 @@ class NodeManager:
                     child_name = child_command.create_node_command.node_name
                     if not child_name:
                         details = f"Attempted to serialize group node '{node.name}'. Failed because child node command has no name."
-                        return SerializeNodeToCommandsResultFailure(result_details=details)
+                        return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                     if child_name in explicitly_selected and child_name in node_commands:
                         # We need to remove the explicitly selected name from the commands that already exist
                         node_commands.pop(child_name)
@@ -3938,12 +4920,11 @@ class NodeManager:
                         node_name=node_name,
                         unique_parameter_uuid_to_values=unique_uuid_to_values,
                         serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                        use_pickling=True,
                     )
                 )
                 if not isinstance(result, SerializeNodeToCommandsResultSuccess):
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize {node_name}."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                 node_commands[node_name] = result.serialized_node_commands
                 node_name_to_uuid[node_name] = result.serialized_node_commands.node_uuid
                 parameter_commands[result.serialized_node_commands.node_uuid] = result.set_parameter_value_commands
@@ -3953,12 +4934,12 @@ class NodeManager:
         for node_name in all_selected_for_connections:
             try:
                 flow_name = self.get_node_parent_flow_by_name(node_name)
-                GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
+                self.engine.flow_manager.get_flow_by_name(flow_name)
             except Exception:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get the flow of node {node_name}. Cannot serialize connections for this node."
                 logger.warning(details)
                 continue
-            connections = GriptapeNodes.FlowManager().get_connections()
+            connections = self.engine.flow_manager.get_connections()
             if node_name in connections.outgoing_index:
                 node_connections = [
                     connections.connections[connection_id]
@@ -4005,55 +4986,31 @@ class NodeManager:
             set_lock_commands_per_node=lock_commands,
         )
 
-        # Encode pickled bytes to latin-1 strings for JSON serialization
-        encoded_values = {}
-        for uuid, value in unique_uuid_to_values.items():
-            if isinstance(value, bytes):
-                # Pickled bytes - encode as latin-1 string for transport
-                encoded_values[uuid] = value.decode("latin1")
-            else:
-                # Non-pickled value - keep as-is (for backward compatibility)
-                encoded_values[uuid] = value
-
-        # Pickle the commands object and encode as latin-1 string for transport
-        pickled_commands_bytes = pickle.dumps(final_result)
-        pickled_commands_string = pickled_commands_bytes.decode("latin1")
+        try:
+            commands_text = dump_json(encode_commands(final_result))
+        except ValueEncodeError as error:
+            details = f"Attempted to copy {len(request.nodes_to_serialize)} nodes. Failed because {error}"
+            return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
+        # The pool already holds encoded values, so each one only needs to become text.
+        serialized_values = {uuid: json.dumps(value) for uuid, value in unique_uuid_to_values.items()}
         return SerializeSelectedNodesToCommandsResultSuccess(
-            pickled_commands_string,  # Send pickled string instead of object
-            pickled_values=encoded_values,
+            serialized_selected_node_commands=commands_text,
+            pickled_values=serialized_values,
             node_names_serialized=node_names_in_order,
             result_details=f"Successfully serialized {len(request.nodes_to_serialize)} selected nodes to commands.",
         )
 
+    @handles(DeserializeSelectedNodesFromCommandsRequest)
     def on_deserialize_selected_nodes_from_commands(  # noqa: C901, PLR0912, PLR0915
         self,
         request: DeserializeSelectedNodesFromCommandsRequest,
     ) -> ResultPayload:
-        # Decode latin-1 encoded pickled strings back to Python objects
-        decoded_values = {}
-        if request.pickled_values:
-            for uuid, latin1_string in request.pickled_values.items():
-                if isinstance(latin1_string, str):
-                    try:
-                        # Decode: latin-1 string → bytes → unpickled object
-                        pickled_bytes = latin1_string.encode("latin1")
-                        decoded_values[uuid] = pickle.loads(pickled_bytes)  # noqa: S301 Expecting this from the GUI.
-                    except Exception:
-                        details = f"Failed to unpickle parameter value for UUID {uuid}"
-                        logger.warning(details)
-                        # Keep original value if unpickling fails
-                        decoded_values[uuid] = latin1_string
-                else:
-                    # Not a string, keep as-is
-                    decoded_values[uuid] = latin1_string
-
-        # Unpickle the commands string into SerializedSelectedNodesCommands
         try:
-            pickled_commands_bytes = request.deserialize_commands.encode("latin1")
-            commands = pickle.loads(pickled_commands_bytes)  # noqa: S301 Expecting this from the GUI.
-        except Exception as e:
-            details = f"Failed to unpickle commands: {e}"
+            commands = self._read_copied_commands(request.deserialize_commands)
+        except CopiedNodesError as error:
+            details = f"Attempted to paste nodes. Failed because {error}."
             return DeserializeSelectedNodesFromCommandsResultFailure(result_details=details)
+        copied_values = self._read_copied_values(request.pickled_values)
         connections = commands.serialized_connection_commands
         node_uuid_to_name = {}
         created_node_names: list[str] = []
@@ -4097,9 +5054,8 @@ class NodeManager:
             if metadata and "_parent_group_uuid" in metadata:
                 parent_group_uuid = metadata["_parent_group_uuid"]
                 if parent_group_uuid not in node_uuid_to_name:
-                    logger.error("Parent group UUID %s not found in UUID mapping", parent_group_uuid)
                     return DeserializeSelectedNodesFromCommandsResultFailure(
-                        result_details="Parent group UUID not found in UUID mapping"
+                        result_details=f"Parent group UUID {parent_group_uuid} not found in UUID mapping"
                     )
                 node_command.create_node_command.parent_group_name = node_uuid_to_name[parent_group_uuid]
                 del metadata["_parent_group_uuid"]
@@ -4114,36 +5070,34 @@ class NodeManager:
 
             created_node_names.append(result.node_name)
             node_uuid_to_name[node_command.node_uuid] = result.node_name
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(result.node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(result.node_name, BaseNode)
             if node is None:
                 details = "Attempted to deserialize node but ran into an error on node serialization."
                 self._cleanup_created_nodes(created_node_names)
                 return DeserializeSelectedNodesFromCommandsResultFailure(result_details=details)
-            with GriptapeNodes.ContextManager().node(node=node):
+            with self.engine.context_manager.node(node=node):
                 parameter_commands = commands.set_parameter_value_commands[node_command.node_uuid]
                 for parameter_command in parameter_commands:
                     param_request = parameter_command.set_parameter_value_command
                     # Set the Node name
                     param_request.node_name = result.node_name
-                    # Set the new value from decoded_values
-                    if decoded_values and parameter_command.unique_value_uuid in decoded_values:
-                        value = decoded_values[parameter_command.unique_value_uuid]
-                        # Using try-except-pass instead of contextlib.suppress because it's clearer.
-                        try:  # noqa: SIM105
-                            # If we're pasting multiple times - we need to create a new copy for each paste so they don't all have the same reference.
-                            value = copy.deepcopy(value)
-                        except Exception:  # noqa: S110
-                            pass
-                        param_request.value = value
-                        set_parameter_result = GriptapeNodes.handle_request(
-                            parameter_command.set_parameter_value_command
-                        )
+                    if parameter_command.unique_value_uuid in copied_values:
+                        # Decoding builds a fresh object each time, so repeated pastes share nothing.
+                        param_request.value = decode_value(copied_values[parameter_command.unique_value_uuid])
+                        set_parameter_result = self.engine.handle_request(parameter_command.set_parameter_value_command)
                         if not set_parameter_result.succeeded():
                             details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
                             logger.warning(details)
+                    else:
+                        logger.warning(
+                            "Attempted to paste the value of parameter '%s' on node '%s'. Failed because the "
+                            "copied value could not be read, so the parameter uses its default.",
+                            param_request.parameter_name,
+                            param_request.node_name,
+                        )
                 lock_command = commands.set_lock_commands_per_node[node_command.node_uuid]
                 if lock_command is not None:
-                    lock_node_result = GriptapeNodes.handle_request(lock_command)
+                    lock_node_result = self.engine.handle_request(lock_command)
                     if not lock_node_result.succeeded():
                         details = f"Failed to lock node {lock_command.node_name}"
                         logger.warning(details)
@@ -4156,7 +5110,7 @@ class NodeManager:
                 target_node_name=node_uuid_to_name[connection_command.target_node_uuid],
                 target_parameter_name=connection_command.target_parameter_name,
             )
-            result = GriptapeNodes.handle_request(connection_request)
+            result = self.engine.handle_request(connection_request)
             if result.failed():
                 details = f"Failed to create a connection between {connection_request.source_node_name} and {connection_request.target_node_name}"
                 logger.warning(details)
@@ -4169,21 +5123,58 @@ class NodeManager:
             result_details=f"Successfully deserialized {len(node_uuid_to_name)} nodes from commands.",
         )
 
+    def _read_copied_commands(self, text: str) -> SerializedSelectedNodesCommands:
+        """Read copied node commands, sent as JSON, or as pickle by earlier engines.
+
+        Raises:
+            CopiedNodesError: The text holds no readable node commands.
+        """
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                return read_legacy_clipboard_commands(
+                    text, self.engine.library_manager.module_loading.stable_module_names()
+                )
+            except LegacyPickleError as error:
+                raise CopiedNodesError(str(error)) from error
+        try:
+            return decode_commands(data, SerializedSelectedNodesCommands)
+        except CommandsFormatError as error:
+            raise CopiedNodesError(str(error)) from error
+
+    def _read_copied_values(self, texts: dict[str, str]) -> dict[str, JsonValue]:
+        """Read copied parameter values, keeping them encoded until each use decodes its own copy.
+
+        A value that cannot be read is left out, so its parameter pastes with its default.
+        """
+        values: dict[str, JsonValue] = {}
+        library_modules = self.engine.library_manager.module_loading.stable_module_names()
+        for uuid, text in texts.items():
+            try:
+                values[uuid] = json.loads(text)
+            except json.JSONDecodeError:
+                try:
+                    values[uuid] = read_legacy_clipboard_value(text, library_modules)
+                except LegacyPickleError as error:
+                    logger.warning("Attempted to paste a copied parameter value. Failed because %s.", error)
+        return values
+
+    @handles(DuplicateSelectedNodesRequest)
     def on_duplicate_selected_nodes(self, request: DuplicateSelectedNodesRequest) -> ResultPayload:
-        serialize_result = GriptapeNodes.handle_request(
+        serialize_result = self.engine.handle_request(
             SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=request.nodes_to_duplicate)
         )
         if not isinstance(serialize_result, SerializeSelectedNodesToCommandsResultSuccess):
             details = "Failed to serialized selected nodes."
             return DuplicateSelectedNodesResultFailure(result_details=details)
 
-        # Pass the pickled commands and values to deserialization
         deserialize_request = DeserializeSelectedNodesFromCommandsRequest(
             deserialize_commands=serialize_result.serialized_selected_node_commands,
             pickled_values=serialize_result.pickled_values,
             positions=request.positions,
         )
-        result = GriptapeNodes.handle_request(deserialize_request)
+        result = self.engine.handle_request(deserialize_request)
         if not isinstance(result, DeserializeSelectedNodesFromCommandsResultSuccess):
             details = "Failed to deserialize selected nodes."
             return DuplicateSelectedNodesResultFailure(result_details=details)
@@ -4197,6 +5188,111 @@ class NodeManager:
             result.node_names,
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
+
+    def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        library_manager = self.engine.library_manager
+        for entry in trait_states:
+            trait_module = entry.get("trait_module")
+            if trait_module is None:
+                continue
+            if not library_manager.module_loading.is_dynamic_module(trait_module):
+                continue
+            stable_namespace = library_manager.module_loading.get_stable_namespace_for_dynamic_module(trait_module)
+            if stable_namespace is None:
+                entry["trait_module"] = None
+                logger.warning(
+                    "Attempted to save the '%s' control, but the library providing it has no stable name to "
+                    "record. Its state can only be restored when the node rebuilds that control.",
+                    entry.get("trait_name"),
+                )
+                continue
+            entry["trait_module"] = stable_namespace
+        return trait_states
+
+    @staticmethod
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+        """Update attached traits in place to preserve constructor wiring such as callbacks."""
+        unmatched = parameter.find_elements_by_type(Trait)
+        for state in trait_states:
+            entry = TraitStateEntry.from_dict(state)
+            if entry is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
+                    "The parameter will load without whatever control that entry described.",
+                    parameter.name,
+                )
+                continue
+            trait_class = None
+            if entry.trait_module is not None:
+                trait_class = resolve_trait(entry.trait_name, entry.trait_module)
+            existing = NodeManager._take_attached_trait(unmatched, entry, trait_class)
+            if existing is None:
+                NodeManager._build_saved_trait(parameter, entry, trait_class)
+                continue
+            # Library code can raise anything, and a bad trait must not fail the load.
+            try:
+                existing.apply_state(entry.trait_state)
+            except Exception as error:
+                logger.warning(
+                    "Parameter '%s' was saved with state for its '%s' control, but the control did not "
+                    "accept it (%s). The parameter keeps the state its node supplied.",
+                    parameter.name,
+                    entry.trait_name,
+                    error,
+                )
+
+    @staticmethod
+    def _take_attached_trait(
+        unmatched: list[Trait], entry: TraitStateEntry, trait_class: type[Trait] | None
+    ) -> Trait | None:
+        """Take the first match by resolved class, or by name when the class cannot be resolved.
+
+        Consumed so two entries cannot share one trait. The name fallback covers a library moving
+        a trait to another module while the node still builds it. Save-side pairing in
+        ``changed_trait_states`` compares module strings instead, since both its sides are live.
+        """
+        for candidate in unmatched:
+            if trait_class is None:
+                matched = type(candidate).__name__ == entry.trait_name
+            else:
+                matched = type(candidate) is trait_class
+            if matched:
+                unmatched.remove(candidate)
+                return candidate
+        return None
+
+    @staticmethod
+    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry, trait_class: type[Trait] | None) -> None:
+        if entry.trait_module is None:
+            logger.warning(
+                "Parameter '%s' was saved with a '%s' control, but no module was recorded and the node did "
+                "not rebuild it. The parameter loads without that control.",
+                parameter.name,
+                entry.trait_name,
+            )
+            return
+        if trait_class is None:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
+                "The parameter will load without it. Check that the library providing it is installed.",
+                parameter.name,
+                entry.trait_name,
+                entry.trait_module,
+            )
+            return
+        # Library code can raise anything, and a bad trait must not drop the parameter.
+        try:
+            trait = trait_class.from_state(entry.trait_state)
+        except Exception as error:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait, but its saved state could not build that "
+                "control (%s). The parameter loads without it. Check that the library providing it is up to date.",
+                parameter.name,
+                entry.trait_name,
+                error,
+            )
+            return
+        parameter.add_trait(trait)
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
@@ -4226,7 +5322,17 @@ class NodeManager:
         return diff
 
     @staticmethod
-    def _handle_value_hashing(  # noqa: PLR0913
+    def _with_encodable_default(command: Any, node_name: str) -> Any:
+        """Return ``command``, with a default value that has no plain-data form replaced by None."""
+        if not isinstance(command, AddParameterToNodeRequest | AlterParameterDetailsRequest):
+            return command
+        default_value = encodable_default(command.default_value, node_name, command.parameter_name)
+        if default_value is command.default_value:
+            return command
+        return dataclasses.replace(command, default_value=default_value)
+
+    @staticmethod
+    def _handle_value_hashing(  # noqa: PLR0913, PLR0917
         value: Any,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         unique_parameter_uuid_to_values: dict,
@@ -4235,55 +5341,32 @@ class NodeManager:
         node_name: str,
         *,
         is_output: bool,
-        use_pickling: bool = False,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
-        try:
-            hash(value)
-            value_id = (type(value), value)
-        except TypeError:
-            # Couldn't get a hash. Use the object's ID
-            value_id = id(value)
+        """Pool ``value``'s encoded form under a hash of its content and return the command that restores it.
 
+        Returns None when the value is not to be saved: the parameter opted out, or the value has no
+        plain-data form. The tracker remembers each object's outcome, so a value shared by several
+        parameters is encoded once.
+        """
+        value_id = id(value)
         tracker_status = serialized_parameter_value_tracker.get_tracker_state(value_id)
         match tracker_status:
             case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
-                # We have a match on this value. We're all good.
                 unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value_hash(value_id)
             case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
-                # This value is not serializable. Bail.
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                # This value is new for us.
-
-                # Check if parameter is marked as non-serializable (e.g., ImageDrivers, PromptDrivers, file handles)
+                # Author opt-out, e.g. drivers and file handles.
                 if not parameter.serializable:
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
-
-                # Check if we can serialize it.
-                try:
-                    pickle.dumps(value)
-                except Exception:
-                    # Not serializable; don't waste time on future attempts.
+                encoded = try_encode(value)
+                if isinstance(encoded, Unencodable):
+                    logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, encoded.reason)
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
-                    # Bail.
                     return None
-                # The value should be serialized. Add it to the map of uniques.
-                unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-
-                if use_pickling:
-                    # Use pickle serialization via WorkflowManager
-                    workflow_manager = GriptapeNodes.WorkflowManager()
-                    pickled_bytes = workflow_manager._patch_and_pickle_object(value)
-                    unique_parameter_uuid_to_values[unique_uuid] = pickled_bytes
-                else:
-                    # Use existing deep copy approach
-                    try:
-                        unique_parameter_uuid_to_values[unique_uuid] = copy.deepcopy(value)
-                    except Exception:
-                        details = f"Attempted to serialize parameter '{parameter_name}` on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
-                        logger.warning(details)
-                        unique_parameter_uuid_to_values[unique_uuid] = value
+                unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
+                unique_parameter_uuid_to_values[unique_uuid] = encoded
                 serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)
 
         # Serialize it
@@ -4307,8 +5390,8 @@ class NodeManager:
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
         *,
-        use_pickling: bool = False,
         serialize_all_parameter_values: bool = False,
+        value_supplied_by_connection: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -4326,17 +5409,15 @@ class NodeManager:
             unique_parameter_uuid_to_values (dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]): Dictionary mapping unique value UUIDs to values
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
-            use_pickling (bool): If True, use pickle-based serialization; if False, use deep copy
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
+            value_supplied_by_connection (bool): If True, leave out the set value: a connection in the destination flow supplies it. The output value is still saved.
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
 
         Notes:
             - Parameter output values take precedence over regular parameter values
-            - For values that can be hashed, the value itself is used as the key in values_created
-            - For unhashable values, the object's id is used as the key
-            - The function will reuse already created values to avoid duplication
+            - Each object is encoded once, tracked by its id, and pooled under a hash of its encoded content
         """
         output_value = None
         internal_value = None
@@ -4344,12 +5425,20 @@ class NodeManager:
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
-        effective_value = node.get_parameter_value(parameter.name)
+        effective_value = node._get_raw_parameter_value(parameter.name)
+        if isinstance(parameter, ParameterList) and node._has_connected_whole_list_value(parameter):
+            # The node reads a connected list as the connected items, then its rows' items. The rows are
+            # saved on their own, so saving what the node reads would add them again on every load.
+            effective_value = node.parameter_values[parameter.name]
         # Save the value if it was explicitly set OR if it equals the default value.
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
         # If serialize_all_parameter_values is True, save all parameter values regardless.
-        if (
+        # A value a connection will supply is not saved at all: replaying it would only have it
+        # validated against the parameter's current rules, and then overwritten by the connection.
+        if value_supplied_by_connection:
+            internal_value = None
+        elif (
             serialize_all_parameter_values
             or parameter.name in node.parameter_values
             or (parameter.default_value is not None and effective_value == parameter.default_value)
@@ -4367,7 +5456,6 @@ class NodeManager:
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
-            use_pickling=use_pickling,
         )
         if internal_command is not None:
             commands.append(internal_command)
@@ -4380,7 +5468,6 @@ class NodeManager:
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
-            use_pickling=use_pickling,
         )
         if output_command is not None:
             commands.append(output_command)
@@ -4397,7 +5484,6 @@ class NodeManager:
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
-        use_pickling: bool,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
         """Serialize one of a parameter's values (internal-set or output) for workflow save.
 
@@ -4413,6 +5499,14 @@ class NodeManager:
         # No value of this kind was set on the node.
         if value is None:
             return None
+        # A key into this process's memory means nothing in another, and a workflow that saved one would
+        # reload holding a dead reference on a node marked RESOLVED, with nothing re-running to replace it.
+        # Asked of the store rather than inferred from the parameter's flag, so a key that reached a
+        # serializable parameter is still skipped.
+        if node.local_objects.contains_a_parked_object(value):
+            if isinstance(create_node_request, CreateNodeRequest):
+                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -4421,7 +5515,6 @@ class NodeManager:
             is_output=is_output,
             parameter_name=parameter.name,
             node_name=node.name,
-            use_pickling=use_pickling,
         )
         if command is not None:
             return command
@@ -4434,175 +5527,37 @@ class NodeManager:
         if not parameter.serializable:
             return None
         # Genuine serialization failure — warn and mark unresolved.
-        details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
+        details = f"Attempted to save the {value_kind} value of parameter '{parameter.name}' on node '{node.name}'. Failed because a '{type(value).__name__}' value has no plain-data form, so the node will run again when the workflow is reopened. To keep the value, register its class with register_value_codec, or set serializable=False on the parameter to stop this warning."
         logger.warning(details)
         return None
 
     @staticmethod
-    def serialize_parameter_output_values(node: BaseNode, *, use_pickling: bool = False) -> SerializedParameterValues:
-        """Serialize parameter output values with optional pickling for complex objects.
+    def result_parameter_values(node: BaseNode) -> dict[str, Any]:
+        """Each parameter's result value, preferring its output value, for the flow's result event.
 
-        Args:
-            node: The node whose parameter output values should be serialized
-            use_pickling: If True, use pickle-based serialization; if False, use safe_unstructure
-
-        Returns:
-            SerializedParameterValues containing:
-            - parameter_output_values: Either raw values or UUID references if pickling was used
-            - unique_parameter_uuid_to_values: Dictionary of pickled values (None if no pickling needed)
+        A value with no plain-data form becomes None, so one such value cannot keep the others
+        from reaching whoever runs the flow.
         """
-        if not node.parameters:
-            return SerializedParameterValues({}, None)
-
-        if not use_pickling:
-            return NodeManager._serialize_without_pickling(node)
-
-        return NodeManager._serialize_with_pickling(node)
-
-    @staticmethod
-    def _serialize_without_pickling(node: BaseNode) -> SerializedParameterValues:
-        """Serialize parameter values using safe_unstructure.
-
-        Args:
-            node: The node whose parameter values should be serialized
-
-        Returns:
-            SerializedParameterValues with no pickling
-        """
-        param_values = {}
-        for param in node.parameters:
-            if param.name in node.parameter_output_values:
-                param_values[param.name] = node.parameter_output_values[param.name]
-            else:
-                param_values[param.name] = node.get_parameter_value(param.name)
-        simple_values = safe_unstructure(param_values)
-        return SerializedParameterValues(simple_values, None)
-
-    @staticmethod
-    def _serialize_with_pickling(
-        node: BaseNode,
-    ) -> SerializedParameterValues:
-        """Serialize parameter values using pickle-based serialization with UUID references.
-
-        Args:
-            node: The node whose parameter values should be serialized
-
-        Returns:
-            SerializedParameterValues with pickled values
-        """
-        unique_parameter_uuid_to_values = {}
-        serialized_parameter_value_tracker = SerializedParameterValueTracker()
-        uuid_referenced_values = {}
-
+        values = {}
         for parameter in node.parameters:
-            param_name = parameter.name
-            param_value = NodeManager._get_parameter_value_for_serialization(node, param_name)
-
-            unique_uuid = NodeManager._process_parameter_for_pickling(
-                param_value,
-                param_name,
-                serialized_parameter_value_tracker,
-                unique_parameter_uuid_to_values,
-                uuid_referenced_values,
-            )
-
-            uuid_referenced_values[param_name] = unique_uuid
-
-        return SerializedParameterValues(uuid_referenced_values, unique_parameter_uuid_to_values or None)
-
-    @staticmethod
-    def _get_parameter_value_for_serialization(node: BaseNode, param_name: str) -> Any:
-        """Get parameter value for serialization, checking output values first.
-
-        Args:
-            node: The node to get the parameter value from
-            param_name: The parameter name
-
-        Returns:
-            The parameter value
-        """
-        if param_name in node.parameter_output_values:
-            return node.parameter_output_values[param_name]
-        return node.get_parameter_value(param_name)
-
-    @staticmethod
-    def _process_parameter_for_pickling(
-        param_value: Any,
-        param_name: str,
-        tracker: SerializedParameterValueTracker,
-        unique_parameter_uuid_to_values: dict,
-        uuid_referenced_values: dict,
-    ) -> SerializedNodeCommands.UniqueParameterValueUUID | None:
-        """Process a parameter value for pickle-based serialization.
-
-        Args:
-            param_value: The value to serialize
-            param_name: Parameter name for tracking
-            tracker: Tracker for managing serialization state
-            unique_parameter_uuid_to_values: Dictionary to store pickled values
-            uuid_referenced_values: Dictionary to store UUID references
-
-        Returns:
-            UUID reference for the value, or None if not serializable
-        """
-        try:
-            hash(param_value)
-            value_id = param_value
-        except TypeError:
-            value_id = id(param_value)
-
-        tracker_status = tracker.get_tracker_state(value_id)
-
-        match tracker_status:
-            case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
-                return tracker.get_uuid_for_value_hash(value_id)
-            case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
-                uuid_referenced_values[param_name] = None
-                return None
-            case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                return NodeManager._handle_new_value_for_pickling(
-                    param_value, param_name, tracker, unique_parameter_uuid_to_values, uuid_referenced_values
+            if parameter.name in node.parameter_output_values:
+                value = node.parameter_output_values[parameter.name]
+            else:
+                value = node._get_raw_parameter_value(parameter.name)
+            encoded = try_encode(value)
+            if isinstance(encoded, Unencodable):
+                logger.warning(
+                    "Node '%s' finished its flow with a '%s' value that cannot be sent on. Whoever ran "
+                    "the flow receives no value for it. %s",
+                    node.name,
+                    parameter.name,
+                    encoded.reason,
                 )
+                value = None
+            values[parameter.name] = value
+        return values
 
-    @staticmethod
-    def _handle_new_value_for_pickling(
-        param_value: Any,
-        param_name: str,
-        tracker: SerializedParameterValueTracker,
-        unique_parameter_uuid_to_values: dict,
-        uuid_referenced_values: dict,
-    ) -> SerializedNodeCommands.UniqueParameterValueUUID | None:
-        """Handle a new value that hasn't been seen before in pickling serialization.
-
-        Args:
-            param_value: The value to pickle
-            param_name: Parameter name for tracking
-            tracker: Tracker for managing serialization state
-            unique_parameter_uuid_to_values: Dictionary to store pickled values
-            uuid_referenced_values: Dictionary to store UUID references
-
-        Returns:
-            UUID reference for the value, or None if not serializable
-        """
-        try:
-            hash(param_value)
-            value_id = param_value
-        except TypeError:
-            value_id = id(param_value)
-
-        try:
-            workflow_manager = GriptapeNodes.WorkflowManager()
-            pickled_bytes = workflow_manager._patch_and_pickle_object(param_value)
-        except Exception:
-            tracker.add_as_not_serializable(value_id)
-            uuid_referenced_values[param_name] = None
-            return None
-
-        unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
-        unique_parameter_uuid_to_values[unique_uuid] = pickled_bytes
-        tracker.add_as_serializable(value_id, unique_uuid)
-        return unique_uuid
-
+    @handles(RenameParameterRequest)
     def on_rename_parameter_request(self, request: RenameParameterRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
         """Handle renaming a parameter on a node.
 
@@ -4615,10 +5570,10 @@ class NodeManager:
         # Get the node
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to rename Parameter in the Current Context. Failed because the Current Context was empty."
                 return RenameParameterResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         else:
             try:
@@ -4655,8 +5610,8 @@ class NodeManager:
 
         # Get all connections for this node
         flow_name = self.get_node_parent_flow_by_name(node_name)
-        GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
-        connections = GriptapeNodes.FlowManager().get_connections()
+        self.engine.flow_manager.get_flow_by_name(flow_name)
+        connections = self.engine.flow_manager.get_connections()
 
         # Update connections that reference this parameter
         if node_name in connections.incoming_index:
@@ -4681,15 +5636,8 @@ class NodeManager:
                 # Update the index key from old name to new name
                 outgoing_connections[request.new_parameter_name] = outgoing_connections.pop(request.parameter_name)
 
-        # Update parameter name
         old_name = parameter.name
-        parameter.name = request.new_parameter_name
-
-        # Update parameter values if they exist
-        if old_name in node.parameter_values:
-            node.parameter_values[request.new_parameter_name] = node.parameter_values.pop(old_name)
-        if old_name in node.parameter_output_values:
-            node.parameter_output_values[request.new_parameter_name] = node.parameter_output_values.pop(old_name)
+        self._apply_parameter_rename(node, parameter, request.new_parameter_name)
 
         return RenameParameterResultSuccess(
             old_parameter_name=old_name,
@@ -4698,13 +5646,41 @@ class NodeManager:
             result_details=f"Successfully renamed parameter '{old_name}' to '{request.new_parameter_name}' on node '{node_name}'.",
         )
 
+    def _apply_parameter_rename(self, node: BaseNode, parameter: Parameter, new_name: str) -> None:
+        """Rename a parameter and carry the values stored under its old name across.
+
+        The values move off the old name first and back on after, because the output value's change
+        events are looked up by parameter name: a move done after the rename finds no parameter for
+        the old name, so consumers are told the new name has a value but never that the old one lost
+        it.
+        """
+        old_name = parameter.name
+        output_value = None
+        had_output_value = old_name in node.parameter_output_values
+        if had_output_value:
+            output_value = node.parameter_output_values[old_name]
+            del node.parameter_output_values[old_name]
+
+        set_value = None
+        had_set_value = old_name in node.parameter_values
+        if had_set_value:
+            set_value = node.parameter_values.pop(old_name)
+
+        parameter.name = new_name
+
+        if had_set_value:
+            node.parameter_values[new_name] = set_value
+        if had_output_value:
+            node.parameter_output_values[new_name] = output_value
+
+    @handles(SetLockNodeStateRequest)
     def on_toggle_lock_node_request(self, request: SetLockNodeStateRequest) -> ResultPayload:
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to lock node in the Current Context. Failed because the Current Context was empty."
                 return SetLockNodeStateResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         else:
             try:
@@ -4713,12 +5689,14 @@ class NodeManager:
                 details = f"Attempted to lock node '{request.node_name}'. Failed because the Node could not be found. Error: {err}"
                 return SetLockNodeStateResultFailure(result_details=details)
         node.lock = request.lock
+        self._unresolve_unlocked_node_left_unexecuted(node)
         return SetLockNodeStateResultSuccess(
             node_name=node_name,
             locked=node.lock,
             result_details=f"Successfully set lock state to {node.lock} for node '{node_name}'.",
         )
 
+    @handles(BatchSetNodeLockStateRequest)
     def on_batch_set_lock_node_state_request(self, request: BatchSetNodeLockStateRequest) -> ResultPayload:
         updated: list[str] = []
         failed: dict[str, str] = {}
@@ -4729,6 +5707,7 @@ class NodeManager:
                 failed[name] = f"Node not found. Error: {err}"
                 continue
             node.lock = request.lock
+            self._unresolve_unlocked_node_left_unexecuted(node)
             updated.append(name)
 
         if not updated:
@@ -4743,6 +5722,23 @@ class NodeManager:
             result_details=details,
         )
 
+    def _unresolve_unlocked_node_left_unexecuted(self, node: BaseNode) -> None:
+        """Unresolve an unlocked node, and everything downstream, unless it resolved by executing.
+
+        While locked, a node is passed through without running, and that pass marks it RESOLVED even
+        if it never ran. Its consumers resolve on whatever it held. Once it is unlocked, both must run
+        again, or the next run stops at them and never reaches it.
+        """
+        if node.lock:
+            return
+        if node.state == NodeResolutionState.RESOLVED and not node.resolved_while_locked:
+            return
+
+        node.resolved_while_locked = False
+        node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
+        self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
+
+    @handles(SendNodeMessageRequest)
     def on_send_node_message_request(self, request: SendNodeMessageRequest) -> ResultPayload:
         """Handle a SendNodeMessageRequest by calling the node's message callback.
 
@@ -4757,16 +5753,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to send message to Node from Current Context. Failed because the Current Context is empty."
                 return SendNodeMessageResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
             # Find the node by name
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to send message to Node '{node_name}', but no such Node was found."
@@ -4801,6 +5797,7 @@ class NodeManager:
             altered_workflow_state=callback_result.altered_workflow_state,
         )
 
+    @handles(GetFlowForNodeRequest)
     def on_get_flow_for_node_request(self, request: GetFlowForNodeRequest) -> ResultPayload:
         """Get the flow name that contains a specific node."""
         try:
@@ -4814,6 +5811,7 @@ class NodeManager:
                 result_details=f"Node '{request.node_name}' not found or not assigned to any flow.",
             )
 
+    @handles(MigrateParameterRequest)
     def on_migrate_parameter_request(
         self, request: MigrateParameterRequest
     ) -> MigrateParameterResultFailure | MigrateParameterResultSuccess:
@@ -4879,7 +5877,7 @@ class NodeManager:
         """Break all incoming and outgoing connections for a parameter."""
         # Break incoming connections
         for incoming_connection in connections_result.incoming_connections:
-            delete_result = GriptapeNodes.handle_request(
+            delete_result = self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=incoming_connection.source_node_name,
                     source_parameter_name=incoming_connection.source_parameter_name,
@@ -4897,7 +5895,7 @@ class NodeManager:
 
         # Break outgoing connections
         for outgoing_connection in connections_result.outgoing_connections:
-            delete_result = GriptapeNodes.handle_request(
+            delete_result = self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=source_node_name,
                     source_parameter_name=source_parameter_name,
@@ -4932,7 +5930,7 @@ class NodeManager:
     def _migrate_parameter_value(self, request: MigrateParameterRequest) -> MigrateParameterResultFailure | None:
         """Handle migrating parameter value when no incoming connections exist."""
         # Get the current value from source
-        get_value_result = GriptapeNodes.handle_request(
+        get_value_result = self.engine.handle_request(
             GetParameterValueRequest(node_name=request.source_node_name, parameter_name=request.source_parameter_name)
         )
 
@@ -4950,7 +5948,7 @@ class NodeManager:
                 return MigrateParameterResultFailure(result_details=f"Failed to apply value transformation: {e!s}")
 
         # Set the value on target
-        set_value_result = GriptapeNodes.handle_request(
+        set_value_result = self.engine.handle_request(
             SetParameterValueRequest(
                 node_name=request.target_node_name, parameter_name=request.target_parameter_name, value=value
             )
@@ -4992,7 +5990,7 @@ class NodeManager:
         # Set additional parameters
         if input_conversion.additional_parameters:
             for param_name, param_value in input_conversion.additional_parameters.items():
-                set_value_result = GriptapeNodes.handle_request(
+                set_value_result = self.engine.handle_request(
                     SetParameterValueRequest(
                         node_name=intermediate_node_name, parameter_name=param_name, value=param_value
                     )
@@ -5004,7 +6002,7 @@ class NodeManager:
 
         # Connect all sources to intermediate node
         for incoming_connection in connections_result.incoming_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=incoming_connection.source_node_name,
                     source_parameter_name=incoming_connection.source_parameter_name,
@@ -5019,7 +6017,7 @@ class NodeManager:
                 )
 
         # Connect intermediate node to target
-        connection_result = GriptapeNodes.handle_request(
+        connection_result = self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=intermediate_node_name,
                 source_parameter_name=input_conversion.output_parameter,
@@ -5040,7 +6038,7 @@ class NodeManager:
     ) -> MigrateParameterResultFailure | None:
         """Create direct incoming connections without conversion."""
         for incoming_connection in connections_result.incoming_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=incoming_connection.source_node_name,
                     source_parameter_name=incoming_connection.source_parameter_name,
@@ -5085,7 +6083,7 @@ class NodeManager:
         # Set additional parameters
         if output_conversion.additional_parameters:
             for param_name, param_value in output_conversion.additional_parameters.items():
-                set_value_result = GriptapeNodes.handle_request(
+                set_value_result = self.engine.handle_request(
                     SetParameterValueRequest(
                         node_name=intermediate_node_name, parameter_name=param_name, value=param_value
                     )
@@ -5096,7 +6094,7 @@ class NodeManager:
                     )
 
         # Connect target to intermediate node
-        connection_result = GriptapeNodes.handle_request(
+        connection_result = self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=request.target_node_name,
                 source_parameter_name=request.target_parameter_name,
@@ -5112,7 +6110,7 @@ class NodeManager:
 
         # Connect intermediate node to all destinations
         for outgoing_connection in connections_result.outgoing_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=intermediate_node_name,
                     source_parameter_name=output_conversion.output_parameter,
@@ -5133,7 +6131,7 @@ class NodeManager:
     ) -> MigrateParameterResultFailure | None:
         """Create direct outgoing connections without conversion."""
         for outgoing_connection in connections_result.outgoing_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=request.target_node_name,
                     source_parameter_name=request.target_parameter_name,
@@ -5166,6 +6164,7 @@ class NodeManager:
 
         return CanResetResult(can_reset=True, editor_tooltip_reason=None)
 
+    @handles(CanResetNodeToDefaultsRequest)
     def on_can_reset_node_to_defaults_request(self, request: CanResetNodeToDefaultsRequest) -> ResultPayload:
         """Check if a node can be reset to its default state."""
         node_name = request.node_name
@@ -5173,18 +6172,18 @@ class NodeManager:
 
         # FAILURE CHECK: Validate node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to check reset eligibility for a Node from the Current Context. "
                     "Failed because the Current Context is empty."
                 )
                 return CanResetNodeToDefaultsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # FAILURE CHECK: Get source node
         if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to check reset eligibility for Node '{node_name}', but no such Node was found."
             return CanResetNodeToDefaultsResultFailure(result_details=details)
@@ -5215,24 +6214,25 @@ class NodeManager:
             result_details=details,
         )
 
-    def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    @handles(ResetNodeToDefaultsRequest)
+    async def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Reset a node to its default state while preserving connections where possible."""
         node_name = request.node_name
         node = None
 
         # FAILURE CHECK: Validate node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to reset a Node from the Current Context. Failed because the Current Context is empty."
                 )
                 return ResetNodeToDefaultsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # FAILURE CHECK: Get source node
         if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to reset Node '{node_name}', but no such Node was found."
             return ResetNodeToDefaultsResultFailure(result_details=details)
@@ -5307,7 +6307,7 @@ class NodeManager:
                 target_node_name=new_node_name,
                 target_parameter_name=incoming_connection.target_parameter_name,
             )
-            connection_result = GriptapeNodes.FlowManager().on_create_connection_request(connection_request)
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_incoming.append(incoming_connection)
 
@@ -5318,13 +6318,13 @@ class NodeManager:
                 target_node_name=outgoing_connection.target_node_name,
                 target_parameter_name=outgoing_connection.target_parameter_name,
             )
-            connection_result = GriptapeNodes.FlowManager().on_create_connection_request(connection_request)
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_outgoing.append(outgoing_connection)
 
         # FAILURE CHECK: Delete source node
         delete_request = DeleteNodeRequest(node_name=node_name)
-        delete_result = self.on_delete_node_request(delete_request)
+        delete_result = await self.on_delete_node_request(delete_request)
         if not isinstance(delete_result, DeleteNodeResultSuccess):
             details = f"Attempted to reset Node '{node_name}'. Failed to delete original node."
             return ResetNodeToDefaultsResultFailure(result_details=details)
@@ -5333,9 +6333,9 @@ class NodeManager:
         rename_request = RenameObjectRequest(
             object_name=new_node_name, requested_name=node_name, allow_next_closest_name_available=False
         )
-        rename_result = GriptapeNodes.ObjectManager().on_rename_object_request(rename_request)
+        rename_result = self.engine.object_manager.on_rename_object_request(rename_request)
         if not isinstance(rename_result, RenameObjectResultSuccess):
-            details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name."
+            details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name: {rename_result.result_details}"
             return ResetNodeToDefaultsResultFailure(result_details=details)
 
         # SUCCESS PATH
@@ -5359,6 +6359,7 @@ class NodeManager:
             result_details=ResultDetails(message=details, level=log_level),
         )
 
+    @handles(ReorderParameterListItemRequest)
     def on_reorder_parameter_list_item_request(self, request: ReorderParameterListItemRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle reordering an item within a ParameterList.
 
@@ -5371,10 +6372,10 @@ class NodeManager:
         # Get the node
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to reorder ParameterList item in the Current Context. Failed because the Current Context was empty."
                 return ReorderParameterListItemResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         else:
             try:
@@ -5416,16 +6417,14 @@ class NodeManager:
         if request.from_index == request.to_index:
             details = f"Item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' is already at index {request.from_index}. No reordering needed."
             return ReorderParameterListItemResultSuccess(
-                result_details=ResultDetails(message=details, level=logging.WARNING)
+                result_details=ResultDetails(message=details, level=logging.DEBUG)
             )
 
-        # Perform the reorder by moving the item in the _children list
-        item_to_move = children[request.from_index]
-        parameter_list._children.remove(item_to_move)
-        parameter_list._children.insert(request.to_index, item_to_move)
+        parameter_list.move_child(request.from_index, request.to_index)
 
-        # Mark the node as unresolved since parameter structure changed
+        # Mark the node and what follows it as unresolved since the list's order changed
         node.state = NodeResolutionState.UNRESOLVED
+        self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
 
         # Manually add the reordered children structure to _changes so the event includes it
         parameter_list._changes["children"] = [child.to_dict() for child in parameter_list._children]
@@ -5437,9 +6436,10 @@ class NodeManager:
             result_details=f"Successfully reordered item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' from index {request.from_index} to {request.to_index}."
         )
 
+    @handles(UnresolveNodeRequest)
     def on_unresolve_node_request(self, request: UnresolveNodeRequest) -> ResultPayload:
         """Mark a single node UNRESOLVED and propagate to downstream nodes."""
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             return UnresolveNodeResultFailure(
                 result_details=f"Attempted to unresolve Node '{request.node_name}'. Node not found."
@@ -5449,5 +6449,5 @@ class NodeManager:
                 result_details=f"Attempted to unresolve Node '{request.node_name}'. Node is currently RESOLVING."
             )
         node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
-        GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+        self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
         return UnresolveNodeResultSuccess(result_details=f"Node '{request.node_name}' marked as unresolved.")

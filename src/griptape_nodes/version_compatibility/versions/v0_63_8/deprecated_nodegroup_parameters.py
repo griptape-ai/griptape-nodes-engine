@@ -13,13 +13,13 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.version_compatibility_manager import (
     SetParameterVersionCompatibilityCheck,
 )
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -35,9 +35,9 @@ class DeprecatedNodeGroupParametersCheck(SetParameterVersionCompatibilityCheck):
     DEPRECATED_PARAMETERS: ClassVar[set[str]] = {"job_group", "execution_environment"}
     REMOVAL_VERSION: ClassVar[semver.VersionInfo] = semver.VersionInfo(0, 63, 8)
 
-    def __init__(self) -> None:
+    def __init__(self, engine: Engine | None = None) -> None:
         """Initialize the check with an empty set of warned workflows."""
-        super().__init__()
+        super().__init__(engine)
         self._warned_workflows: set[str] = set()
 
     def applies_to_set_parameter(self, node: BaseNode, parameter_name: str, _value: Any) -> bool:
@@ -60,7 +60,7 @@ class DeprecatedNodeGroupParametersCheck(SetParameterVersionCompatibilityCheck):
             return False
 
         # Check if current engine version is >= 0.63.8
-        engine_version_result = GriptapeNodes.handle_request(GetEngineVersionRequest())
+        engine_version_result = self.engine.handle_request(GetEngineVersionRequest())
         if not isinstance(engine_version_result, GetEngineVersionResultSuccess):
             return False
 
@@ -81,7 +81,7 @@ class DeprecatedNodeGroupParametersCheck(SetParameterVersionCompatibilityCheck):
             SetParameterValueResultSuccess with empty list value
         """
         # Get the current workflow name to track warnings per workflow
-        workflow_name = GriptapeNodes.ContextManager().get_current_workflow_name()
+        workflow_name = self.engine.context_manager.get_current_workflow_name()
 
         # Check if we've already warned for this workflow
         if workflow_name not in self._warned_workflows:

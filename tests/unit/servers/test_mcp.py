@@ -1,24 +1,44 @@
 import asyncio
+import json
 import threading
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mcp.shared.exceptions import MCPError
+from mcp.types import CallToolRequestParams, ToolAnnotations
+from starlette.requests import Request
 
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
     _BATCH_PER_REQUEST_TIMEOUT_MS,
+    ENGINE_TOOLS,
     EVENT_REQUEST_BATCH_TOOL_NAME,
     SUPPORTED_REQUEST_EVENTS,
-    _build_batch_pairs,
+    _build_batch_requests,
     _dispatch_to_engine,
     _event_request_batch_input_schema,
     _resolve_batch_timeout_ms,
     _summarize_result_details,
+    _tool_selection_for_request,
+    _tools_for_request,
     _trim_batch_results,
     _trim_response,
+    call_tool,
+    list_tools,
 )
+
+if TYPE_CHECKING:
+    from mcp.server.context import ServerRequestContext
+
+# A context with no HTTP request, which the handlers serve the engine tools to.
+_NO_CONTEXT = cast("ServerRequestContext[Any]", SimpleNamespace(request=None))
 
 
 class TestSummarizeResultDetails:
@@ -53,8 +73,6 @@ class TestSummarizeResultDetails:
 class TestTrimResponse:
     def test_drops_envelope_noise_and_flattens_details(self) -> None:
         raw = {
-            "engine_id": "engine-1",
-            "session_id": "session-1",
             "request": {"node_type": "Probe", "library": "demo"},
             "request_id": "abc",
             "response_topic": "response",
@@ -107,13 +125,13 @@ class TestTrimResponse:
 
 class TestEventRequestBatchInputSchema:
     def test_enumerates_every_supported_request_type(self) -> None:
-        schema = _event_request_batch_input_schema()
+        schema = _event_request_batch_input_schema(["CreateNodeRequest", "ListRegisteredLibrariesRequest"])
 
         request_type_enum = schema["properties"]["requests"]["items"]["properties"]["request_type"]["enum"]
-        assert set(request_type_enum) == set(SUPPORTED_REQUEST_EVENTS)
+        assert request_type_enum == ["CreateNodeRequest", "ListRegisteredLibrariesRequest"]
 
     def test_marks_requests_required_and_non_empty(self) -> None:
-        schema = _event_request_batch_input_schema()
+        schema = _event_request_batch_input_schema(sorted(ENGINE_TOOLS))
 
         assert schema["required"] == ["requests"]
         assert schema["properties"]["requests"]["minItems"] == 1
@@ -134,36 +152,37 @@ class TestBuildBatchPairs:
             },
         ]
 
-        pairs = _build_batch_pairs(raw)
+        requests = _build_batch_requests(raw, ENGINE_TOOLS)
 
-        assert [request_type for request_type, _ in pairs] == ["CreateNodeRequest", "CreateConnectionRequest"]
-        # Defaults from the dataclasses are filled in, so payload dicts carry every field.
-        assert pairs[0][1]["node_type"] == "TextInput"
-        assert pairs[1][1]["source_node_name"] == "TextInput_1"
+        assert [type(request).__name__ for request in requests] == ["CreateNodeRequest", "CreateConnectionRequest"]
+        assert requests[0].node_type == "TextInput"  # type: ignore[attr-defined]
+        assert requests[1].source_node_name == "TextInput_1"  # type: ignore[attr-defined]
 
     def test_rejects_non_list_requests(self) -> None:
         with pytest.raises(TypeError, match="must be a list"):
-            _build_batch_pairs("not a list")
+            _build_batch_requests("not a list", ENGINE_TOOLS)
 
     def test_rejects_empty_list(self) -> None:
         with pytest.raises(ValueError, match="empty"):
-            _build_batch_pairs([])
+            _build_batch_requests([], ENGINE_TOOLS)
 
     def test_rejects_non_dict_entry(self) -> None:
         with pytest.raises(TypeError, match="entry 0"):
-            _build_batch_pairs(["not a dict"])
+            _build_batch_requests(["not a dict"], ENGINE_TOOLS)
 
     def test_rejects_unknown_request_type(self) -> None:
         with pytest.raises(ValueError, match="is not a supported tool"):
-            _build_batch_pairs([{"request_type": "NopeRequest", "request": {}}])
+            _build_batch_requests([{"request_type": "NopeRequest", "request": {}}], ENGINE_TOOLS)
 
     def test_rejects_non_dict_request_payload(self) -> None:
         with pytest.raises(TypeError, match="must be an object"):
-            _build_batch_pairs([{"request_type": "ListRegisteredLibrariesRequest", "request": "bad"}])
+            _build_batch_requests([{"request_type": "ListRegisteredLibrariesRequest", "request": "bad"}], ENGINE_TOOLS)
 
     def test_rejects_unknown_kwargs_in_inner_payload(self) -> None:
         with pytest.raises(ValueError, match="Attempted to construct CreateNodeRequest"):
-            _build_batch_pairs([{"request_type": "CreateNodeRequest", "request": {"node_type": "X", "bogus_field": 1}}])
+            _build_batch_requests(
+                [{"request_type": "CreateNodeRequest", "request": {"node_type": "X", "bogus_field": 1}}], ENGINE_TOOLS
+            )
 
 
 class TestResolveBatchTimeoutMs:
@@ -251,6 +270,134 @@ class TestEventRequestBatchToolName:
         assert EVENT_REQUEST_BATCH_TOOL_NAME not in SUPPORTED_REQUEST_EVENTS
 
 
+class TestListTools:
+    @pytest.mark.asyncio
+    async def test_advertises_every_request_event_plus_the_batch_envelope(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert names == set(SUPPORTED_REQUEST_EVENTS) | {EVENT_REQUEST_BATCH_TOOL_NAME}
+
+    @pytest.mark.asyncio
+    async def test_advertises_flow_recovery_requests(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert {"CancelFlowRequest", "UnresolveFlowRequest"} <= names
+
+    @pytest.mark.asyncio
+    async def test_advertises_flow_validation_request(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert "ValidateFlowDependenciesRequest" in names
+
+    @pytest.mark.asyncio
+    async def test_list_node_types_tool_offers_optional_include_metadata(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        tools_by_name = {tool.name: tool for tool in result.tools}
+        list_tool = tools_by_name["ListNodeTypesInLibraryRequest"]
+        assert "include_metadata" in list_tool.input_schema["properties"]
+        assert "include_metadata" not in list_tool.input_schema.get("required", [])
+
+    @pytest.mark.asyncio
+    async def test_every_tool_carries_an_object_input_schema(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        assert all(tool.input_schema.get("type") == "object" for tool in result.tools)
+
+
+class TestCallTool:
+    """The 2.x low-level server no longer converts a handler raise into an error result.
+
+    `call_tool` catches its own failures so a bad tool name or bad arguments still reach the
+    client as `CallToolResult(is_error=True)` text it can read and retry from, rather than a
+    JSON-RPC protocol error that carries no actionable message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_trimmed_payload_as_text_content(self) -> None:
+        async def fake_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {"libraries": ["demo"]}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT, CallToolRequestParams(name="ListRegisteredLibrariesRequest", arguments={})
+            )
+
+        assert result.is_error is False
+        assert json.loads(result.content[0].text) == {"ok": True, "libraries": ["demo"]}  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_treats_missing_arguments_as_empty(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            seen["payload"] = payload
+            return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(_NO_CONTEXT, CallToolRequestParams(name="ListRegisteredLibrariesRequest"))
+
+        assert result.is_error is False
+        assert isinstance(seen["payload"], SUPPORTED_REQUEST_EVENTS["ListRegisteredLibrariesRequest"])
+
+    @pytest.mark.asyncio
+    async def test_reports_unsupported_tool_as_error_result(self) -> None:
+        result = await call_tool(_NO_CONTEXT, CallToolRequestParams(name="NopeRequest", arguments={}))
+
+        assert result.is_error is True
+        assert "Unsupported tool: NopeRequest" in result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_reports_bad_arguments_as_error_result(self) -> None:
+        result = await call_tool(
+            _NO_CONTEXT, CallToolRequestParams(name="CreateNodeRequest", arguments={"bogus_field": 1})
+        )
+
+        assert result.is_error is True
+        assert result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_reports_dispatch_timeout_as_error_result(self) -> None:
+        async def timing_out_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            raise TimeoutError
+
+        with patch.object(mcp_module, "_dispatch_to_engine", timing_out_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT, CallToolRequestParams(name="ListRegisteredLibrariesRequest", arguments={})
+            )
+
+        assert result.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_dispatches_the_batch_envelope(self) -> None:
+        async def fake_batch_dispatch(requests: list[RequestPayload], timeout_ms: int) -> list[Any]:  # noqa: ARG001
+            return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}} for _ in requests]
+
+        with patch.object(mcp_module, "_dispatch_batch_to_engine", fake_batch_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT,
+                CallToolRequestParams(
+                    name=EVENT_REQUEST_BATCH_TOOL_NAME,
+                    arguments={"requests": [{"request_type": "CreateNodeRequest", "request": {"node_type": "X"}}]},
+                ),
+            )
+
+        assert result.is_error is False
+        assert json.loads(result.content[0].text) == [{"ok": True, "node_name": "A_1"}]  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_reports_malformed_batch_as_error_result(self) -> None:
+        result = await call_tool(
+            _NO_CONTEXT, CallToolRequestParams(name=EVENT_REQUEST_BATCH_TOOL_NAME, arguments={"requests": []})
+        )
+
+        assert result.is_error is True
+        assert "empty" in result.content[0].text  # type: ignore[union-attr]
+
+
 class TestDispatchToEngineShield:
     """A client-side timeout must not cancel the in-flight engine operation.
 
@@ -332,3 +479,175 @@ class TestDispatchToEngineShield:
             assert result == {"ok": True}
         finally:
             self._stop_engine_loop(engine_loop, thread)
+
+
+@dataclass
+class ProbeListRendersRequest(RequestPayload):
+    """List the probe library's renders."""
+
+
+@dataclass
+class ProbeStartRenderRequest(RequestPayload):
+    """Start a probe render."""
+
+    frame: int = 1
+
+
+_PROBE_LIBRARY_NAME = "Probe Render Library"
+_PROBE_LIBRARY_SLUG = "probe_render_library"
+_PROBE_TOOLS = [MCPTool(ProbeListRendersRequest, read_only=True), MCPTool(ProbeStartRenderRequest)]
+
+
+def _context_for(url_path: str, query_string: bytes = b"") -> "ServerRequestContext[Any]":
+    """A context whose HTTP request arrived at url_path on the server's /mcp mount."""
+    request = Request(
+        {"type": "http", "path": url_path, "root_path": "/mcp", "query_string": query_string, "headers": []}
+    )
+    return cast("ServerRequestContext[Any]", SimpleNamespace(request=request))
+
+
+@pytest.fixture
+def probe_library() -> Iterator[None]:
+    """Load a library exposing _PROBE_TOOLS, read on the calling thread instead of the engine loop."""
+    library = MagicMock()
+    library.get_mcp_tools.return_value = list(_PROBE_TOOLS)
+
+    async def run_inline(func: Callable[[], Any]) -> Any:
+        return func()
+
+    with (
+        patch.object(mcp_module, "_run_on_engine_loop", run_inline),
+        patch.object(mcp_module.LibraryRegistry, "list_libraries", return_value=[_PROBE_LIBRARY_NAME]),
+        patch.object(mcp_module.LibraryRegistry, "get_library", return_value=library),
+    ):
+        yield
+
+
+class TestToolSelectionForRequest:
+    def test_engine_endpoint_serves_engine_tools_only(self) -> None:
+        selection = _tool_selection_for_request(_context_for("/mcp/").request)
+
+        assert selection.include_engine_tools is True
+        assert selection.library_slugs == ()
+
+    def test_libraries_query_adds_libraries_to_engine_tools(self) -> None:
+        selection = _tool_selection_for_request(_context_for("/mcp/", b"libraries=b,%20a,,b").request)
+
+        assert selection.include_engine_tools is True
+        assert selection.library_slugs == ("b", "a")
+
+    @pytest.mark.parametrize("url_path", ["/mcp/libraries/acme/", "/mcp/libraries/acme"])
+    def test_library_endpoint_serves_one_library_only(self, url_path: str) -> None:
+        selection = _tool_selection_for_request(_context_for(url_path).request)
+
+        assert selection.include_engine_tools is False
+        assert selection.library_slugs == ("acme",)
+
+    def test_non_http_request_gets_engine_tools(self) -> None:
+        selection = _tool_selection_for_request(None)
+
+        assert selection.include_engine_tools is True
+        assert selection.library_slugs == ()
+
+
+@pytest.mark.usefixtures("probe_library")
+class TestLibraryTools:
+    @pytest.mark.asyncio
+    async def test_library_endpoint_lists_only_its_library_tools(self) -> None:
+        result = await list_tools(_context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"), None)
+
+        names = {tool.name for tool in result.tools}
+        assert names == {"ProbeListRendersRequest", "ProbeStartRenderRequest", EVENT_REQUEST_BATCH_TOOL_NAME}
+
+    @pytest.mark.asyncio
+    async def test_engine_endpoint_hides_library_tools(self) -> None:
+        result = await list_tools(_context_for("/mcp/"), None)
+
+        names = {tool.name for tool in result.tools}
+        assert "ProbeListRendersRequest" not in names
+
+    @pytest.mark.asyncio
+    async def test_libraries_query_adds_library_tools_to_engine_tools(self) -> None:
+        result = await list_tools(_context_for("/mcp/", f"libraries={_PROBE_LIBRARY_SLUG}".encode()), None)
+
+        names = {tool.name for tool in result.tools}
+        assert names == set(ENGINE_TOOLS) | {
+            "ProbeListRendersRequest",
+            "ProbeStartRenderRequest",
+            EVENT_REQUEST_BATCH_TOOL_NAME,
+        }
+
+    @pytest.mark.asyncio
+    async def test_marks_only_read_only_tools_with_the_hint(self) -> None:
+        result = await list_tools(_context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"), None)
+
+        tools_by_name = {tool.name: tool for tool in result.tools}
+        assert tools_by_name["ProbeListRendersRequest"].annotations == ToolAnnotations(read_only_hint=True)
+        assert tools_by_name["ProbeStartRenderRequest"].annotations is None
+
+    @pytest.mark.asyncio
+    async def test_batch_tool_enumerates_the_endpoints_tools(self) -> None:
+        result = await list_tools(_context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"), None)
+
+        batch_tool = next(tool for tool in result.tools if tool.name == EVENT_REQUEST_BATCH_TOOL_NAME)
+        request_type_schema = batch_tool.input_schema["properties"]["requests"]["items"]["properties"]["request_type"]
+        assert request_type_schema["enum"] == ["ProbeListRendersRequest", "ProbeStartRenderRequest"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_library_endpoint_fails_with_its_name(self) -> None:
+        with pytest.raises(MCPError, match="library 'missing'"):
+            await list_tools(_context_for("/mcp/libraries/missing/"), None)
+
+    @pytest.mark.asyncio
+    async def test_unknown_library_in_query_fails_with_its_name(self) -> None:
+        query = f"libraries={_PROBE_LIBRARY_SLUG},missing".encode()
+        with pytest.raises(MCPError, match="library 'missing'"):
+            await list_tools(_context_for("/mcp/", query), None)
+
+    @pytest.mark.asyncio
+    async def test_calls_a_library_tool(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            seen["payload"] = payload
+            return {"result_type": "ProbeStartRenderResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(
+                _context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"),
+                CallToolRequestParams(name="ProbeStartRenderRequest", arguments={"frame": 7}),
+            )
+
+        assert result.is_error is False
+        assert seen["payload"] == ProbeStartRenderRequest(frame=7)
+
+    @pytest.mark.asyncio
+    async def test_library_endpoint_rejects_engine_tools(self) -> None:
+        result = await call_tool(
+            _context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"),
+            CallToolRequestParams(name="ListRegisteredLibrariesRequest", arguments={}),
+        )
+
+        assert result.is_error is True
+        assert "Unsupported tool: ListRegisteredLibrariesRequest" in result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_engine_tool_wins_a_name_clash(self) -> None:
+        clashing = MCPTool(type("ListRegisteredLibrariesRequest", (ProbeStartRenderRequest,), {}))
+        tools_by_slug = {"anything": [clashing]}
+
+        with patch.object(mcp_module, "_collect_library_tools", return_value=tools_by_slug):
+            served = await _tools_for_request(_context_for("/mcp/", b"libraries=anything"))
+
+        assert served["ListRegisteredLibrariesRequest"] is ENGINE_TOOLS["ListRegisteredLibrariesRequest"]
+
+    @pytest.mark.asyncio
+    async def test_first_listed_library_wins_a_name_clash(self) -> None:
+        first = MCPTool(ProbeStartRenderRequest)
+        second = MCPTool(ProbeStartRenderRequest, read_only=True)
+        tools_by_slug = {"first": [first], "second": [second]}
+
+        with patch.object(mcp_module, "_collect_library_tools", return_value=tools_by_slug):
+            served = await _tools_for_request(_context_for("/mcp/", b"libraries=first,second"))
+
+        assert served["ProbeStartRenderRequest"] is first

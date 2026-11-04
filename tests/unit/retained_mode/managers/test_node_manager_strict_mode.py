@@ -22,17 +22,35 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
-    from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
 
 class TestExecuteNodeStrictMode:
-    def _get_node_manager(self) -> NodeManager:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        return GriptapeNodes.NodeManager()
+    def _make_node_manager(
+        self,
+        *,
+        object_manager: MagicMock | None = None,
+        library_manager: MagicMock | None = None,
+        worker_manager: MagicMock | None = None,
+    ) -> NodeManager:
+        """Build a NodeManager wired to a mock engine instead of the process-wide facade."""
+        mock_engine = MagicMock()
+        mock_engine.object_manager = object_manager
+        mock_engine.library_manager = library_manager
+        # Engine always has a WorkerManager, so a test that leaves it None describes a shape the
+        # engine cannot be in. Routing awaits it, so it needs to be awaitable.
+        worker_manager = worker_manager or MagicMock()
+        worker_manager.wait_until_executable = AsyncMock()
+        worker_manager.acquire_lease = AsyncMock(return_value=None)
+        worker_manager.lease_refusal = AsyncMock(return_value=None)
+        mock_engine.worker_manager = worker_manager
+        return NodeManager(MagicMock(), engine=mock_engine)
 
     def _make_mock_node(self, *, aprocess_reports: bool = False) -> MagicMock:
         node = MagicMock(spec=BaseNode)
@@ -42,6 +60,8 @@ class TestExecuteNodeStrictMode:
         node.metadata = {"library": "libA"}
         node._cancellation_requested = threading.Event()
         node.parameters = []
+        # A mock's default return value is truthy, and the executor reads this hook as "reasons not to run".
+        node.validate_in_execution_environment = MagicMock(return_value=None)
 
         async def _aprocess() -> None:
             if aprocess_reports:
@@ -49,6 +69,15 @@ class TestExecuteNodeStrictMode:
 
         node.aprocess = AsyncMock(side_effect=_aprocess)
         return node
+
+    @staticmethod
+    def _running_copy(node_manager: NodeManager, node: MagicMock) -> AbstractContextManager[object]:
+        """Have the worker run `node` as the copy it loaded, leaving the escalation policy as the thing tested."""
+
+        async def run_copy(request: ExecuteNodeRequest) -> ResultPayload:
+            return await node_manager._hydrate_and_run_node(node, request)
+
+        return patch.object(node_manager, "_run_worker_copy", side_effect=run_copy)
 
     def _make_mock_obj_mgr(self, existing_node: MagicMock) -> MagicMock:
         m = MagicMock()
@@ -59,7 +88,9 @@ class TestExecuteNodeStrictMode:
         m = MagicMock()
         m.is_worker = is_worker
         m._is_worker = is_worker
-        m.get_worker_for_library.return_value = None
+        m.workers.get_worker_for_library.return_value = None
+        # Awaited on the orchestrator route before a node is routed, so it has to be a coroutine
+        # rather than a plain MagicMock attribute.
         return m
 
     @pytest.mark.asyncio
@@ -67,23 +98,10 @@ class TestExecuteNodeStrictMode:
         node = self._make_mock_node(aprocess_reports=True)
         obj_mgr = self._make_mock_obj_mgr(existing_node=node)
         lib_mgr = self._make_mock_library_manager(is_worker=False)
+        node_manager = self._make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.ObjectManager",
-                return_value=obj_mgr,
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.LibraryManager",
-                return_value=lib_mgr,
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.WorkerManager",
-                return_value=None,
-            ),
-        ):
-            request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
-            result = await self._get_node_manager().on_execute_node_request(request)
+        request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         node.aprocess.assert_awaited_once()
@@ -92,15 +110,9 @@ class TestExecuteNodeStrictMode:
     async def test_worker_violation_elevates_to_failure(self) -> None:
         node = self._make_mock_node(aprocess_reports=True)
         lib_mgr = self._make_mock_library_manager(is_worker=True)
-        node_manager = self._get_node_manager()
+        node_manager = self._make_node_manager(library_manager=lib_mgr)
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.LibraryManager",
-                return_value=lib_mgr,
-            ),
-            patch.object(node_manager, "_materialize_transient_node_from_metadata", return_value=node),
-        ):
+        with self._running_copy(node_manager, node):
             request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
             result = await node_manager.on_execute_node_request(request)
 
@@ -114,15 +126,9 @@ class TestExecuteNodeStrictMode:
     async def test_worker_no_violations_unchanged(self) -> None:
         node = self._make_mock_node(aprocess_reports=False)
         lib_mgr = self._make_mock_library_manager(is_worker=True)
-        node_manager = self._get_node_manager()
+        node_manager = self._make_node_manager(library_manager=lib_mgr)
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.LibraryManager",
-                return_value=lib_mgr,
-            ),
-            patch.object(node_manager, "_materialize_transient_node_from_metadata", return_value=node),
-        ):
+        with self._running_copy(node_manager, node):
             request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
             result = await node_manager.on_execute_node_request(request)
 
@@ -134,23 +140,10 @@ class TestExecuteNodeStrictMode:
         node = self._make_mock_node(aprocess_reports=False)
         obj_mgr = self._make_mock_obj_mgr(existing_node=node)
         lib_mgr = self._make_mock_library_manager(is_worker=False)
+        node_manager = self._make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.ObjectManager",
-                return_value=obj_mgr,
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.LibraryManager",
-                return_value=lib_mgr,
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.WorkerManager",
-                return_value=None,
-            ),
-        ):
-            request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
-            result = await self._get_node_manager().on_execute_node_request(request)
+        request = ExecuteNodeRequest(node_name="n", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         node.aprocess.assert_awaited_once()

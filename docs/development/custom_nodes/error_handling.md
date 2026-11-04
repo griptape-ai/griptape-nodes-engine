@@ -1,0 +1,499 @@
+# Best Practices and Error Handling
+
+General best practices for production-quality nodes: secrets, imports, code quality, error handling, validation, and logging.
+
+## Best Practices
+
+### Core Principles
+
+- **Descriptive names and tooltips**
+- **Robust error handling with validators**
+- **Single responsibility per node**
+- **Use `SecretsManager` for API keys and secrets**
+- **Import all dependencies at module level**
+- **Idempotent process methods**
+
+### Secrets Management
+
+Read secrets with `GetSecretValueRequest`:
+
+```python
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetSecretValueRequest,
+    GetSecretValueResultSuccess,
+)
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+class MyNode(DataNode):
+    SERVICE_NAME = "MyService"
+    API_KEY_NAME = "MY_SERVICE_API_KEY"
+
+    def _validate_api_key(self) -> str:
+        result = GriptapeNodes.handle_request(GetSecretValueRequest(key=self.API_KEY_NAME))
+        if not isinstance(result, GetSecretValueResultSuccess) or not result.value:
+            raise ValueError(f"Missing {self.API_KEY_NAME}")
+        return result.value
+```
+
+**Key Points:**
+
+- Import at module level, not inside functions
+- Use a request rather than `GriptapeNodes.SecretsManager()`. The manager accessor is
+    **refused while a node executes in a worker**, and a helper like this is reachable from
+    both `process` (in the worker) and validation (in the orchestrator) — so the manager
+    version works in one caller and raises in the other. The request is correct in both.
+- Define `API_KEY_NAME` as a class constant for consistency
+- Always validate that the secret exists before using it
+
+### Parameter Payload Size
+
+A parameter value can end up fully embedded in two places:
+
+- **Saved workflow files.** The workflow serializer writes unique parameter values inline into the saved `.py` file, with no size limit — whatever Python state the value holds gets written out whole.
+- **WebSocket events.** Parameter values traveling in request/response events are serialized and sent to every connected client (the editor UI, the MCP server).
+
+Neither path checks the size of the value first, so by default a large value bloats both the saved workflow file and the traffic to every connected client. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it.
+
+`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it. On an output, the same declaration additionally holds the value in the process that produced it and sends only a key across a worker process boundary - see [Passing Values That Cannot Be Serialized](passing_unserializable_values.md).
+
+!!! warning "Keep parameter values small"
+
+    `griptape.artifacts.BlobArtifact` stores raw bytes, and `ImageArtifact` / `AudioArtifact` both subclass it — so a node using one of these as a parameter type sends the entire byte payload to every connected client, and writes it into saved workflows unless the parameter is declared `serializable=False`. Use `ImageUrlArtifact` / `AudioUrlArtifact` instead (the `ParameterImage` / `ParameterAudio` helper classes enforce them — see [Parameters](parameters.md#parameterimage-recommended-for-image-parameters)), which hold only a short URL string no matter how large the file they point to is.
+
+    Raw bytes aren't confined to `BlobArtifact` and its subclasses — `ThreeDArtifact` holds them too (though does not send its bytes over the WebSocket). Judge a parameter by the size of the value it will actually hold, not by whether its type name looks safe.
+
+### Import Best Practices
+
+**Always import dependencies at module level, not inside functions:**
+
+❌ **Bad** - Conditional/lazy imports:
+
+```python
+def _get_image_data(self, image_artifact):
+    try:
+        from PIL import Image  # Don't do this
+        from io import BytesIO
+        img = Image.open(BytesIO(image_bytes))
+```
+
+✅ **Good** - Module-level imports:
+
+```python
+# At top of file
+from PIL import Image
+from io import BytesIO
+
+
+def _get_image_data(self, image_artifact):
+    img = Image.open(BytesIO(image_bytes))
+```
+
+**Why?**
+
+- Makes dependencies clear and visible
+- Avoids redundant imports throughout the file
+- Follows Python best practices (PEP 8)
+- Easier to catch missing dependencies early
+- Better IDE support and code completion
+
+**Exception**: Only use conditional imports for truly optional dependencies that may not be installed:
+
+```python
+def process(self) -> None:
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        error_msg = "huggingface_hub library not installed"
+        self.parameter_output_values["output"] = None
+        raise ImportError(error_msg)
+```
+
+### Import Organization
+
+Organize imports in standard order with blank lines between groups:
+
+```python
+# Standard library imports
+import base64
+import logging
+from typing import Any
+
+# Third-party imports
+import requests
+from PIL import Image
+
+# Local/Griptape imports
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.node_types import DataNode
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+```
+
+### Type Checking for Third-Party Libraries
+
+When importing third-party libraries, you may encounter type checking errors. Use the appropriate `type: ignore` comment based on the situation:
+
+#### Scenario 1: Library Installed but Missing Type Stubs
+
+For libraries that are installed but lack type annotations (like `sklearn`, `ultralytics`, `supervision`):
+
+```python
+# ✅ Library exists but has no type stubs
+from sklearn.cluster import KMeans  # type: ignore[import-untyped]
+from ultralytics import YOLO  # type: ignore[import-untyped]
+from supervision import Detections  # type: ignore[import-untyped]
+```
+
+#### Scenario 2: Library Not Installed in CI Type Checking Environment
+
+For libraries that are runtime dependencies but not installed in the CI type checking environment (like `color-matcher`, specialized processing libraries):
+
+```python
+# ✅ Library not installed in type checking environment
+from color_matcher import ColorMatcher  # type: ignore[reportMissingImports]
+from color_matcher.normalizations import norm_img_to_uint8  # type: ignore[reportMissingImports]
+```
+
+#### When to Use Which
+
+| Error Type             | Comment                                | Use When                         |
+| ---------------------- | -------------------------------------- | -------------------------------- |
+| `import-untyped`       | `# type: ignore[import-untyped]`       | Library installed, no type stubs |
+| `reportMissingImports` | `# type: ignore[reportMissingImports]` | Library not in CI environment    |
+
+**General guidance:**
+
+- `import-untyped` is preferred when both work - it's more precise
+- `reportMissingImports` is necessary when the library isn't available during type checking
+- Check CI logs to determine which error you're actually getting
+
+### Function Parameter Management
+
+Keep function argument counts low (under 6) by using dataclasses:
+
+❌ **Bad** - Too many parameters:
+
+```python
+def process_bbox(self, x: int, y: int, width: int, height: int,
+                 dilation_percent: float, img_width: int, img_height: int):
+    # Process bounding box
+```
+
+✅ **Good** - Use dataclass:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class BoundingBox:
+    x: int
+    y: int
+    width: int
+    height: int
+    dilation_percent: float
+    img_width: int
+    img_height: int
+
+def process_bbox(self, bbox: BoundingBox):
+    # Process bounding box using bbox.x, bbox.y, etc.
+```
+
+**Benefits:**
+
+- Improved readability
+- Type safety
+- Easier to maintain
+- Self-documenting code
+
+### Code Quality
+
+**Additional linting best practices:**
+
+- Remove trailing whitespace from all lines (including blank lines)
+- Use consistent indentation (spaces only, no tabs)
+- Keep lines under 120 characters when possible
+- Use descriptive variable names
+- Avoid adding unnecessary Python packaging scaffolding. Create `__init__.py` files only when you actually want a package (or need them for your chosen packaging approach).
+
+#### Pre-commit checks (required)
+
+Before committing in `griptape-nodes`, run formatting and checks and fix any errors:
+
+```bash
+make format
+make check/lint
+make check/types
+```
+
+#### Node docs + navigation
+
+When adding a new node to the core library, also add node reference documentation:
+
+- Create a docs page at: `docs/nodes/<category>/<node>.md`
+- Add it to `mkdocs.yml` under: `nav -> Nodes Reference -> <Category>`
+
+#### Common gotchas
+
+- Repo-wide lint/type checks can surface issues in **untracked** files too. Avoid leaving untracked folders/files in the repo (for example, copied scratch folders) when running checks or preparing a PR.
+- If ruff flags function complexity (e.g., `C901`, `PLR0912`), prefer refactoring into smaller helpers over suppressing.
+- **`parent_container_name` ≠ `parent_element_name`**: These two `Parameter` attributes look similar but serve completely different purposes. `parent_container_name` is for `ParameterContainer` (list/dictionary ownership), `parent_element_name` is for `ParameterGroup` (UI grouping). Mixing them up causes parameters to land at the node root, skip cleanup between runs, and silently vanish on save/reload. See the [Containers](parameters.md#containers) section for the full distinction.
+
+## Production Error Handling
+
+### Writing Error Messages
+
+When a node fails, the editor shows the node's name and the exception type next to your message.
+Write the message for an artist and leave out what the editor already shows:
+
+- **Don't start with the node's name.** The editor knows which node failed. The engine removes a
+    leading `"{self.name}: "` for you, but new code shouldn't add it.
+- **Say what went wrong and what to do about it.** "Image is required for editing. Connect an
+    image to 'Input Image'." is better than "Invalid input."
+- **Don't paste a provider's response into the message.** A dumped dictionary buries the reason.
+    Attach it with `NodeError` instead (below).
+
+❌ **Bad** - name prefix and a dumped response:
+
+```python
+raise RuntimeError(f"{self.name}: Processing failed.\n\nFull API response:\n{response_json}")
+```
+
+✅ **Good** - `NodeError` with the reason in the message and the rest attached:
+
+```python
+from griptape_nodes.exe_types.core_types import NodeError, NodeErrorLink
+
+raise NodeError(
+    f"Processing failed: {response_json['status_detail']['details']}",
+    fields={"generation_id": response_json["generation_id"]},
+    response=response_json,
+)
+```
+
+`NodeError` takes three optional keyword arguments. The editor shows each one in its own place in
+the error panel:
+
+| Argument   | What it's for                                                                                                          | Limits                                                                                                   |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `fields`   | Labelled values a user may need to quote to support, such as a request ID.                                             | Text or number values.                                                                                   |
+| `response` | The provider's response body, so the details are there if someone needs them.                                          | Body only, never headers. Over 16 KB, long strings are cut down. Dropped if still too large or not JSON. |
+| `links`    | `NodeErrorLink(label=..., url=...)` pages that explain the failure, or places in the editor where the user can fix it. | Up to 3. `http`, `https`, or `#` for a place in the editor. Labels up to 80 characters.                  |
+
+```python
+raise NodeError(
+    "Image format 'image/heic' is not supported.",
+    links=[
+        NodeErrorLink(label="Supported image formats", url="https://docs.griptapenodes.com/nodes/load-image#formats")
+    ],
+)
+```
+
+Anything over a limit is dropped and the rest of the error still reaches the editor. `NodeError`
+works the same way when the node runs in a worker. Other exception types still work, and their
+message and type are shown, but the editor only reads `fields`, `response`, and `links` from a
+`NodeError`.
+
+#### Helpers for provider calls
+
+`NodeError` has a constructor for each failure that every provider call shares. Use them instead of
+writing your own helpers:
+
+| Helper                                                 | Use it when                                                                              |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `NodeError.from_missing_secret(name, key_url=...)`     | The API key is not set. Links to the secret in Settings.                                 |
+| `NodeError.from_http_response(response, provider=...)` | A response came back that the node can't use. Takes a `requests` or `httpx` response.    |
+| `NodeError.from_request_exception(e, provider=...)`    | A call raised. Handles an exception with a response, a timeout, and a failed connection. |
+| `NodeErrorLink.from_secret(name, label)`               | You are writing your own message and want the "open this secret in Settings" link.       |
+
+```python
+def validate_before_node_run(self) -> list[Exception] | None:
+    if not self._api_key():
+        return [NodeError.from_missing_secret("ACME_API_KEY", key_url="https://acme.example/keys")]
+    return None
+
+
+try:
+    response = requests.post(url, json=payload, timeout=60)
+    response.raise_for_status()
+except requests.RequestException as e:
+    raise NodeError.from_request_exception(e, provider="Acme", secret_name="ACME_API_KEY") from e
+```
+
+`from_http_response` takes the status code, the request ID (from a header or the body) and the
+error code into `fields`, and attaches the JSON body as `response`, or the start of the text when
+the body is not JSON. The message is the provider's own explanation when the body has one,
+including a list of validation problems. Otherwise it is a plain sentence for the status. A 401 or
+403 says the key was refused and, with `secret_name`, links to "Update the API key". Pass
+`fields={"job_id": ...}` for anything else a user may need to quote. If a 2xx body is not JSON, call
+`from_http_response` on it too, so it isn't reported as a connection failure.
+
+#### Common failures
+
+- **A call to a service raises.** Catch the SDK's own exception and re-raise it with
+    `raise NodeError(...) from e`. `from e` keeps the original traceback in the logs. Use the
+    provider's explanation as the message, and put the status code and request ID in `fields`.
+- **A required API key is missing.** Check it in `validate_before_node_run`, so the node fails
+    before it starts. Name the exact key and say to add it in **Settings → API Keys & Secrets**.
+    A validation exception can be a `NodeError` too, so it can carry a link. A link that starts
+    with `#` opens a place in the editor, so the user can go straight to the key:
+    `NodeErrorLink(label="Add the API key", url=f"#settings-secrets?filter={quote(API_KEY_NAME)}")`,
+    with `quote` from `urllib.parse`. The editor decides which `#` links it opens, and only
+    follows ones that go somewhere, never ones that change anything.
+- **Polling gives up.** Say how long the node waited and what to do next. Put the job or
+    generation ID in `fields` so the user can check on it later.
+- **The response contains image data.** Attach it as is. A response over 16 KB is shrunk by the
+    engine: base64 data becomes its length and strings over 2000 characters are cut. It is dropped
+    only if it is still too large.
+- **The user clicks "Stop".** That isn't a failure, so don't report it as one. Don't catch
+    `asyncio.CancelledError` or `BaseException`. `except Exception` lets cancellation through.
+
+To see each kind of failure in the editor, copy
+[example_node_error_node.py](example_node_error_node.py) into your sandbox library folder, add the
+node to a flow, pick a "Failure", and run it. It covers a failed provider job, a rejected HTTP
+request, an unsupported input, a missing API key, a plain `KeyError`, and validation problems.
+
+### Comprehensive Validation
+
+Use `validate_before_node_run()` for complex validation:
+
+```python
+def validate_before_node_run(self) -> list[Exception] | None:
+    """Validate parameters before running the node."""
+    exceptions = []
+
+    model = self.get_parameter_value("model")
+    if model == "advanced":
+        images = self.get_parameter_list_value("images") or []
+        if len(images) > MAX_IMAGES:
+            exceptions.append(ValueError(f"Maximum {MAX_IMAGES} images allowed, got {len(images)}"))
+
+    return exceptions if exceptions else None
+```
+
+### Connection Validation Patterns
+
+For complex nodes with multiple connection requirements:
+
+```python
+def _validate_iterative_connections(self) -> list[Exception]:
+    """Validate that all required connections are properly established."""
+    errors = []
+    node_type = self._get_base_node_type_name()
+
+    # Check if exec_out has outgoing connections
+    if not _outgoing_connection_exists(self.name, self.exec_out.name):
+        errors.append(
+            Exception(
+                "Missing required connection from 'On Each Item'. "
+                f"REQUIRED ACTION: Connect {node_type} Start to interior loop nodes. "
+                "The start node must connect to other nodes to execute the loop body."
+            )
+        )
+
+    # Check if loop has outgoing connection to End
+    if self.end_node is None:
+        errors.append(
+            Exception(
+                "Missing required tethering connection. "
+                f"REQUIRED ACTION: Connect {node_type} Start 'Loop End Node' to {node_type} End 'Loop Start Node'. "
+                "This establishes the explicit relationship between start and end nodes."
+            )
+        )
+
+    return errors
+```
+
+**Best Practice**: Provide detailed, actionable error messages that tell users exactly what connections are missing and how to fix them. The editor lists each returned exception on its own line, so return one exception per problem rather than joining them into one message.
+
+### Safe Defaults Pattern
+
+Always set safe defaults before raising exceptions:
+
+```python
+def _set_safe_defaults(self) -> None:
+    """Set safe default values for all outputs."""
+    self.parameter_output_values["result"] = None
+    self.parameter_output_values["status"] = "error"
+    self.parameter_output_values["count"] = 0
+
+
+def process(self) -> None:
+    try:
+        # Processing logic
+        result = process_data()
+        self.parameter_output_values["result"] = result
+    except Exception as e:
+        self._set_safe_defaults()
+        raise RuntimeError(f"Processing failed: {str(e)}") from e
+```
+
+### URL Construction
+
+Use `urllib.parse.urljoin()` for safe URL building:
+
+```python
+from urllib.parse import urljoin
+import os
+
+
+def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+
+    # Safe URL construction
+    base = os.getenv("API_BASE_URL", "https://api.example.com")
+    base_slash = base if base.endswith("/") else base + "/"
+    api_base = urljoin(base_slash, "api/")
+    self._endpoint = urljoin(api_base, "v1/process/")
+```
+
+## Logging Best Practices
+
+### Safe Logging Pattern
+
+Prevent logging failures from breaking execution:
+
+```python
+from contextlib import suppress
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _log(self, message: str) -> None:
+    """Safe logging with exception suppression."""
+    with suppress(Exception):
+        logger.info(message)
+```
+
+### Request Sanitization
+
+Sanitize sensitive data in logs:
+
+```python
+from copy import deepcopy
+import json
+
+PROMPT_TRUNCATE_LENGTH = 100
+
+
+def _log_request(self, payload: dict[str, Any]) -> None:
+    """Log request with sanitized sensitive data."""
+    with suppress(Exception):
+        sanitized_payload = deepcopy(payload)
+
+        # Truncate long prompts
+        prompt = sanitized_payload.get("prompt", "")
+        if len(prompt) > PROMPT_TRUNCATE_LENGTH:
+            sanitized_payload["prompt"] = prompt[:PROMPT_TRUNCATE_LENGTH] + "..."
+
+        # Redact base64 image data
+        if "image" in sanitized_payload:
+            image_data = sanitized_payload["image"]
+            if isinstance(image_data, str) and image_data.startswith("data:image/"):
+                parts = image_data.split(",", 1)
+                header = parts[0] if parts else "data:image/"
+                b64_len = len(parts[1]) if len(parts) > 1 else 0
+                sanitized_payload["image"] = f"{header},<base64 data length={b64_len}>"
+
+        self._log(f"Request: {json.dumps(sanitized_payload, indent=2)}")
+```

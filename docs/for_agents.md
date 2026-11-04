@@ -24,8 +24,8 @@ does not give you.
 - Every doc page is also available as standalone markdown next to its HTML
     rendering. The URL is the rendered page URL with `/index.md` appended,
     for example
-    [`/developing_nodes/comprehensive_guide/index.md`](https://docs.griptapenodes.com/en/stable/developing_nodes/comprehensive_guide/index.md)
-    and [`/retained_mode/index.md`](https://docs.griptapenodes.com/en/stable/retained_mode/index.md).
+    [`/development/custom_nodes/parameters/index.md`](https://docs.griptapenodes.com/en/stable/development/custom_nodes/parameters/index.md)
+    and [`/retained_mode/index.md`](https://docs.griptapenodes.com/en/stable/development/retained_mode/index.md).
     Top-level pages live at `/<page>/index.md`; nested pages mirror the
     rendered URL.
 
@@ -39,19 +39,19 @@ does not give you.
     the per-page markdown files, concatenated in the order declared in the
     llms.txt sections.
 - Reach for **a single per-page `.md`** when you already know which page
-    you need (e.g. you're writing a custom node and want the comprehensive
-    guide, or you're scripting and want `retained_mode.md`).
+    you need (e.g. you're writing a custom node and want the parameters
+    reference, or you're scripting and want `retained_mode.md`).
 
 ## High-value pages for engine grounding
 
 If you are pointing an agent at a small set of pages to bootstrap, these
 five cover most of the engine's first-party API surface:
 
-- [Scripting (retained mode)](https://docs.griptapenodes.com/en/stable/retained_mode/index.md)
-- [Comprehensive node development guide](https://docs.griptapenodes.com/en/stable/developing_nodes/comprehensive_guide/index.md)
-- [Getting started with node development](https://docs.griptapenodes.com/en/stable/developing_nodes/getting_started/index.md)
-- [Project system overview](https://docs.griptapenodes.com/en/stable/projects/index.md)
-- [MCP integration overview](https://docs.griptapenodes.com/en/stable/how_to/mcp/index.md)
+- [Scripting (retained mode)](https://docs.griptapenodes.com/en/stable/development/retained_mode/index.md)
+- [Custom node development overview](https://docs.griptapenodes.com/en/stable/development/custom_nodes/index.md)
+- [Getting started with node development](https://docs.griptapenodes.com/en/stable/development/custom_nodes/getting_started/index.md)
+- [Project system overview](https://docs.griptapenodes.com/en/stable/guides/projects/index.md)
+- [MCP integration overview](https://docs.griptapenodes.com/en/stable/guides/mcp/index.md)
 
 ## Stability
 

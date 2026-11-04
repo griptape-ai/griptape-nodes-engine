@@ -25,6 +25,7 @@ This repository contains the Griptape Nodes Engine - the local component that ru
 - **⚙️ Installation:** [docs.griptapenodes.com/en/stable/installation/](https://docs.griptapenodes.com/en/latest/installation/)
 - **🔧 Engine Configuration:** [docs.griptapenodes.com/en/stable/configuration/](https://docs.griptapenodes.com/en/latest/configuration/)
 - **📋 Migration Guide:** [MIGRATION.md](MIGRATION.md) - Guide for migrating from deprecated nodes
+- **📝 Changelog:** [CHANGELOG.md](CHANGELOG.md) - Notable changes in each release
 
 **🧩 Extending Griptape Nodes:**
 

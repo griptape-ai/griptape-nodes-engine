@@ -1,10 +1,10 @@
 """Sidecar metadata file creation for files written through the retained mode API.
 
 When a file is saved, a sidecar JSON file is written to the project's metadata
-directory (`.griptape-nodes-metadata/`) with preserved path hierarchy. The sidecar captures
-caller-provided project context (situation name, macro template, variable values)
-merged with auto-collected workflow metadata (workflow name, flow context, node
-parameters).
+directory (`.griptape-nodes-metadata/`) with preserved path hierarchy. The sidecar
+captures the situation that triggered the save (name, macro, policy, variables) plus
+auto-collected workflow provenance (workflow name and dates, flow name, resolving node
+name, and node parameter values, with parameters marked exclude_from_metadata=True omitted).
 
 Example layout (for a file at <workspace>/outputs/image.png):
     .griptape-nodes-metadata/
@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -32,15 +32,17 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetSituationRequest,
     GetSituationResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.file_metadata.workflow_metadata import collect_sidecar_provenance
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from griptape_nodes.retained_mode.engine import Engine
+
 
 logger = logging.getLogger("griptape_nodes")
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.2.0"
 
 
 class SituationPolicy(BaseModel):
@@ -59,13 +61,44 @@ class SituationMetadata(BaseModel):
     variables: dict[str, str] | None = None
 
 
+class WorkflowInfo(BaseModel):
+    """Workflow-level provenance captured at save time."""
+
+    name: str | None = None
+    created: str | None = None
+    modified: str | None = None
+    engine_version: str | None = None
+    description: str | None = None
+
+
+class FlowInfo(BaseModel):
+    """Flow and node provenance captured at save time."""
+
+    name: str | None = None
+    node_name: str | None = None
+
+
 class SidecarContent(BaseModel):
-    """Caller-provided context written to the sidecar JSON file alongside saved files."""
+    """Caller-supplied context for the sidecar JSON file.
+
+    Only `situation` is read by `write_sidecar()`; provenance fields
+    (workflow, flow, parameters) are always auto-collected from the engine.
+    """
 
     situation: SituationMetadata | None = None
 
 
-def _resolve_sidecar_path(file_path: Path) -> Path:
+class _SidecarDocument(BaseModel):
+    """Assembled sidecar document written to disk. Internal to write_sidecar()."""
+
+    situation: SituationMetadata | None = None
+    workflow: WorkflowInfo | None = None
+    flow: FlowInfo | None = None
+    parameters: dict[str, Any] | None = None
+    parameters_omitted: list[str] | None = None
+
+
+def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
     """Resolve the sidecar path for a given file via the project template system.
 
     Uses the 'save_griptape_nodes_metadata' situation from the current project template to determine
@@ -74,6 +107,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
 
     Args:
         file_path: Absolute path to the saved file.
+        engine: The engine whose request bus resolves the project and situation.
 
     Returns:
         Absolute path to the sidecar JSON file.
@@ -81,7 +115,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     Raises:
         RuntimeError: If project not loaded, situation not found, or path resolution fails.
     """
-    get_project_result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
+    get_project_result = engine.handle_request(GetCurrentProjectRequest())
     if not isinstance(get_project_result, GetCurrentProjectResultSuccess):
         msg = "No current project loaded"
         raise RuntimeError(msg)  # noqa: TRY004
@@ -89,7 +123,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     workspace_dir = get_project_result.project_info.project_base_dir
     decomposed = decompose_source_path(file_path, workspace_dir)
 
-    get_situation_result = GriptapeNodes.handle_request(
+    get_situation_result = engine.handle_request(
         GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA)
     )
     if not isinstance(get_situation_result, GetSituationResultSuccess):
@@ -102,7 +136,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
 
     situation = get_situation_result.situation
     parsed_macro = ParsedMacro(situation.macro)
-    path_result = GriptapeNodes.handle_request(
+    path_result = engine.handle_request(
         GetPathForMacroRequest(
             parsed_macro=parsed_macro,
             variables=variables,
@@ -115,7 +149,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     return path_result.absolute_path
 
 
-def write_sidecar(file_path: Path, metadata: SidecarContent | None) -> None:
+def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engine) -> None:
     """Write a sidecar JSON metadata file for the saved file.
 
     Resolves the sidecar path via the project template's 'save_griptape_nodes_metadata' situation,
@@ -126,10 +160,18 @@ def write_sidecar(file_path: Path, metadata: SidecarContent | None) -> None:
     Args:
         file_path: Absolute path to the file that was just saved.
         metadata: Caller-provided situation and variable context (may be None).
+        engine: The engine whose request bus resolves the sidecar path.
     """
     try:
-        sidecar_path = _resolve_sidecar_path(file_path)
-        content = metadata or SidecarContent()
+        sidecar_path = _resolve_sidecar_path(file_path, engine)
+        provenance = collect_sidecar_provenance(engine)
+        content = _SidecarDocument(
+            situation=metadata.situation if metadata else None,
+            workflow=WorkflowInfo(**provenance["workflow"]) if "workflow" in provenance else None,
+            flow=FlowInfo(**provenance["flow"]) if "flow" in provenance else None,
+            parameters=provenance.get("parameters"),
+            parameters_omitted=provenance.get("parameters_omitted"),
+        )
         output = {
             "schema_version": SCHEMA_VERSION,
             "saved_at": datetime.now(UTC).isoformat(),

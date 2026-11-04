@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx2
 import pytest
 
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
@@ -23,7 +24,7 @@ class TestGriptapeCloudStorageDriverCreateSignedUploadUrl:
     def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
         """Create GriptapeCloudStorageDriver instance for testing."""
         return GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id=TEST_BUCKET_ID,
             api_key=TEST_API_KEY,
         )
@@ -130,7 +131,7 @@ class TestGriptapeCloudStorageDriverParseCloudAssetPath:
     def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
         """Create GriptapeCloudStorageDriver instance for testing."""
         return GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id="test-bucket-123",
             api_key="test-api-key",
             base_url="https://cloud.griptape.ai",
@@ -208,10 +209,8 @@ class TestGriptapeCloudStorageDriverParseCloudAssetPath:
         assert "https://cloud.griptape.ai" in error_message
         assert "cloud.griptape.ai" in error_message
 
-        # Verify error was also logged
-        assert len(caplog.records) == 1
-        assert caplog.records[0].levelno == logging.ERROR
-        assert "Invalid cloud asset URL" in caplog.records[0].message
+        # The caller reports the raised error, so the driver does not log it too.
+        assert not caplog.records
 
     def test_parse_full_url_with_nested_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
         """Full URL with nested path after assets should extract correctly."""
@@ -226,7 +225,7 @@ class TestGriptapeCloudStorageDriverUploadTimeout:
     def test_upload_file_uses_timeout_parameter(self) -> None:
         """upload_file should pass timeout parameter to signed URL upload request."""
         driver = GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id=TEST_BUCKET_ID,
             api_key=TEST_API_KEY,
         )
@@ -234,7 +233,7 @@ class TestGriptapeCloudStorageDriverUploadTimeout:
         with (
             patch.object(driver, "create_signed_upload_url") as mock_create_signed_upload_url,
             patch.object(driver, "create_signed_download_url") as mock_create_signed_download_url,
-            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx.request") as mock_request,
+            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx2.request") as mock_request,
         ):
             mock_create_signed_upload_url.return_value = {
                 "method": "PUT",
@@ -254,6 +253,129 @@ class TestGriptapeCloudStorageDriverUploadTimeout:
             assert mock_request.call_count == 1
             _, call_kwargs = mock_request.call_args
             assert call_kwargs["timeout"] == REQUEST_TIMEOUT_SECONDS
+
+
+class TestGriptapeCloudStorageDriverBucketExists:
+    """Test GriptapeCloudStorageDriver.bucket_exists() static method.
+
+    `bucket_exists` does a direct GET on the bucket resource so a valid bucket beyond
+    the first page of `list_buckets` is still recognized. A 404 means "does not exist";
+    any other HTTP error is surfaced rather than being swallowed as a missing bucket.
+    """
+
+    MODULE = "griptape_nodes.drivers.storage.griptape_cloud_storage_driver"
+
+    def test_returns_true_when_bucket_found(self) -> None:
+        with patch(f"{self.MODULE}.request_with_retry") as mock_request:
+            mock_request.return_value = Mock()
+
+            result = GriptapeCloudStorageDriver.bucket_exists(
+                TEST_BUCKET_ID, base_url="https://base", api_key=TEST_API_KEY
+            )
+
+        assert result is True
+        args, _ = mock_request.call_args
+        assert args[0] == "GET"
+        assert args[1].endswith(f"/api/buckets/{TEST_BUCKET_ID}")
+
+    def test_returns_false_on_404(self) -> None:
+        response = Mock()
+        response.status_code = 404
+        error = httpx2.HTTPStatusError("not found", request=Mock(), response=response)
+
+        with patch(f"{self.MODULE}.request_with_retry", side_effect=error):
+            result = GriptapeCloudStorageDriver.bucket_exists(
+                "missing-bucket", base_url="https://base", api_key=TEST_API_KEY
+            )
+
+        assert result is False
+
+    def test_raises_on_non_404_error(self) -> None:
+        response = Mock()
+        response.status_code = 500
+        error = httpx2.HTTPStatusError("server error", request=Mock(), response=response)
+
+        with (
+            patch(f"{self.MODULE}.request_with_retry", side_effect=error),
+            pytest.raises(RuntimeError, match="Failed to check bucket"),
+        ):
+            GriptapeCloudStorageDriver.bucket_exists(TEST_BUCKET_ID, base_url="https://base", api_key=TEST_API_KEY)
+
+    def test_passes_timeout_through(self) -> None:
+        with patch(f"{self.MODULE}.request_with_retry") as mock_request:
+            mock_request.return_value = Mock()
+
+            GriptapeCloudStorageDriver.bucket_exists(
+                TEST_BUCKET_ID, base_url="https://base", api_key=TEST_API_KEY, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+
+        _, call_kwargs = mock_request.call_args
+        assert call_kwargs["timeout"] == REQUEST_TIMEOUT_SECONDS
+
+
+class TestGriptapeCloudStorageDriverGetDefaultBucketId:
+    """Test GriptapeCloudStorageDriver.get_default_bucket_id() static method.
+
+    The organization's default bucket is guaranteed to exist and cannot be deleted, so it
+    is the stable fallback when GT_CLOUD_BUCKET_ID is unset. It is read from
+    `GET /api/organizations` (which reports `default_bucket_id`) rather than the paginated
+    bucket list.
+    """
+
+    MODULE = "griptape_nodes.drivers.storage.griptape_cloud_storage_driver"
+
+    def test_returns_default_bucket_id(self) -> None:
+        response = Mock()
+        response.json.return_value = {"organizations": [{"default_bucket_id": "org-default"}]}
+
+        with patch(f"{self.MODULE}.request_with_retry", return_value=response) as mock_request:
+            result = GriptapeCloudStorageDriver.get_default_bucket_id(base_url="https://base", api_key=TEST_API_KEY)
+
+        assert result == "org-default"
+        args, _ = mock_request.call_args
+        assert args[0] == "GET"
+        assert args[1].endswith("/api/organizations")
+
+    def test_returns_none_when_no_organizations(self) -> None:
+        response = Mock()
+        response.json.return_value = {"organizations": []}
+
+        with patch(f"{self.MODULE}.request_with_retry", return_value=response):
+            result = GriptapeCloudStorageDriver.get_default_bucket_id(base_url="https://base", api_key=TEST_API_KEY)
+
+        assert result is None
+
+    def test_returns_none_when_default_bucket_missing(self) -> None:
+        response = Mock()
+        response.json.return_value = {"organizations": [{"organization_id": "org-1"}]}
+
+        with patch(f"{self.MODULE}.request_with_retry", return_value=response):
+            result = GriptapeCloudStorageDriver.get_default_bucket_id(base_url="https://base", api_key=TEST_API_KEY)
+
+        assert result is None
+
+    def test_raises_on_http_error(self) -> None:
+        response = Mock()
+        response.status_code = 500
+        error = httpx2.HTTPStatusError("server error", request=Mock(), response=response)
+
+        with (
+            patch(f"{self.MODULE}.request_with_retry", side_effect=error),
+            pytest.raises(RuntimeError, match="Failed to fetch organization default bucket"),
+        ):
+            GriptapeCloudStorageDriver.get_default_bucket_id(base_url="https://base", api_key=TEST_API_KEY)
+
+    def test_passes_timeout_through(self) -> None:
+        response = Mock()
+        response.json.return_value = {"organizations": [{"default_bucket_id": "org-default"}]}
+
+        with patch(f"{self.MODULE}.request_with_retry", return_value=response) as mock_request:
+            GriptapeCloudStorageDriver.get_default_bucket_id(
+                base_url="https://base", api_key=TEST_API_KEY, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+
+        _, call_kwargs = mock_request.call_args
+        assert call_kwargs["timeout"] == REQUEST_TIMEOUT_SECONDS
 
 
 class TestGriptapeCloudStorageDriverExtractBucketId:
@@ -353,3 +475,89 @@ class TestGriptapeCloudStorageDriverExtractBucketId:
         url = "https://cloud.griptape.ai/buckets/my-bucket_test-123/assets/file.txt"
         result = GriptapeCloudStorageDriver.extract_bucket_id_from_url(url)
         assert result == "my-bucket_test-123"
+
+
+class TestGriptapeCloudStorageDriverDeleteFile:
+    """Test GriptapeCloudStorageDriver.delete_file() idempotency.
+
+    Deleting an asset that is already gone means the requested end state holds, so a 404
+    is a no-op. Cleanup of a transient upload must not fail an otherwise-successful run
+    over it. See griptape-ai/griptape-nodes-engine#4872.
+    """
+
+    @pytest.fixture
+    def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
+        return GriptapeCloudStorageDriver(
+            Mock(workspace_path=Path("/workspace")),
+            bucket_id=TEST_BUCKET_ID,
+            api_key=TEST_API_KEY,
+        )
+
+    @staticmethod
+    def _status_error(status_code: int) -> httpx2.HTTPStatusError:
+        response = Mock()
+        response.status_code = status_code
+        return httpx2.HTTPStatusError(f"http {status_code}", request=Mock(), response=response)
+
+    def test_deletes_asset_at_workspace_relative_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with patch.object(cloud_storage_driver, "_request") as mock_request:
+            cloud_storage_driver.delete_file(Path("artifact_url_storage/abc/video.mp4"))
+
+        args, _ = mock_request.call_args
+        assert args[0] == "DELETE"
+        assert args[1].endswith(f"/api/buckets/{TEST_BUCKET_ID}/assets/artifact_url_storage/abc/video.mp4")
+
+    def test_absent_asset_is_a_no_op(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with patch.object(cloud_storage_driver, "_request", side_effect=self._status_error(404)):
+            cloud_storage_driver.delete_file(TEST_FILE_PATH)
+
+    def test_raises_on_permission_denied(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with (
+            patch.object(cloud_storage_driver, "_request", side_effect=self._status_error(403)),
+            pytest.raises(RuntimeError, match="Failed to delete file"),
+        ):
+            cloud_storage_driver.delete_file(TEST_FILE_PATH)
+
+    def test_raises_on_server_error(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with (
+            patch.object(cloud_storage_driver, "_request", side_effect=self._status_error(500)),
+            pytest.raises(RuntimeError, match="Failed to delete file"),
+        ):
+            cloud_storage_driver.delete_file(TEST_FILE_PATH)
+
+
+class TestGriptapeCloudStorageDriverBaseUrlPath:
+    """Test that requests and asset URLs keep the path on base_url."""
+
+    @pytest.fixture
+    def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
+        return GriptapeCloudStorageDriver(
+            Mock(workspace_path=Path("/workspace")),
+            bucket_id=TEST_BUCKET_ID,
+            api_key=TEST_API_KEY,
+            base_url="https://example.com/prefix",
+        )
+
+    def test_create_signed_download_url_keeps_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        mock_response = Mock()
+        mock_response.json.return_value = {"url": "https://signed.url/file.txt"}
+
+        with patch.object(cloud_storage_driver, "_request", return_value=mock_response) as mock_request:
+            cloud_storage_driver.create_signed_download_url(TEST_FILE_PATH)
+
+        args, _ = mock_request.call_args
+        assert args[1] == f"https://example.com/prefix/api/buckets/{TEST_BUCKET_ID}/asset-urls/{TEST_FILE_PATH}"
+
+    def test_get_asset_url_keeps_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        result = cloud_storage_driver.get_asset_url(TEST_FILE_PATH)
+
+        assert result == f"https://example.com/prefix/buckets/{TEST_BUCKET_ID}/assets/{TEST_FILE_PATH}"
+
+    def test_list_buckets_keeps_path(self) -> None:
+        with patch("griptape_nodes.drivers.storage.griptape_cloud_storage_driver.request_with_retry") as mock_request:
+            mock_request.return_value = Mock(json=Mock(return_value={"buckets": []}))
+
+            GriptapeCloudStorageDriver.list_buckets(base_url="https://example.com/prefix", api_key=TEST_API_KEY)
+
+        args, _ = mock_request.call_args
+        assert args[1] == "https://example.com/prefix/api/buckets"

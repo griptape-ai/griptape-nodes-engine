@@ -12,13 +12,13 @@ import logging
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.version_compatibility_manager import (
     SetParameterVersionCompatibilityCheck,
 )
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -35,9 +35,9 @@ class Flux2RemovedParametersCheck(SetParameterVersionCompatibilityCheck):
     # The standard library: https://github.com/griptape-ai/griptape-nodes-library-standard
     LIBRARY_NAME: ClassVar[str] = "griptape_nodes_library"
 
-    def __init__(self) -> None:
+    def __init__(self, engine: Engine | None = None) -> None:
         """Initialize the check with an empty set of warned workflows."""
-        super().__init__()
+        super().__init__(engine)
         self._warned_workflows: set[str] = set()
 
     def applies_to_set_parameter(self, node: BaseNode, parameter_name: str, _value: Any) -> bool:
@@ -70,7 +70,7 @@ class Flux2RemovedParametersCheck(SetParameterVersionCompatibilityCheck):
         Returns:
             SetParameterValueResultSuccess with None value
         """
-        workflow_name = GriptapeNodes.ContextManager().get_current_workflow_name()
+        workflow_name = self.engine.context_manager.get_current_workflow_name()
 
         if workflow_name not in self._warned_workflows:
             self._warned_workflows.add(workflow_name)

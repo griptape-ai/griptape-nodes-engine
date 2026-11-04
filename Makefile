@@ -1,3 +1,8 @@
+# mdformat sorts and lowercases link definitions, which breaks the Keep a Changelog layout, and it
+# rewraps the entries in changelog.d. scripts/changelog.py checks both instead, so neither
+# CHANGELOG.md nor changelog.d is passed to format or check/format.
+MARKDOWN_ROOT_FILES := $(filter-out CHANGELOG.md,$(wildcard *.md))
+
 .PHONY: version/get
 version/get: ## Get version.
 	@uv version | awk '{print $$2}'
@@ -28,14 +33,46 @@ version/commit: ## Commit version.
 	@git add pyproject.toml uv.lock
 	@git commit -m "chore: bump v$$(make version/get)"
 
+# Commits the roll on a detached HEAD so the local branch still matches its remote. On main, the
+# bump-next PR repeats the roll. Pushes only the release tags, since GitHub fires no events for a
+# push of more than 3 tags.
 .PHONY: version/publish
-version/publish: ## Create and push git tags.
+version/publish: ## Roll the changelog, then create and push git tags. Pass allow_empty=1 to release with no entries.
 	@git fetch --tags --force
+	@# The roll overwrites CHANGELOG.md and deletes the entry files, and this target tags and pushes
+	@# the result, so uncommitted work here ships unreviewed or is lost outright.
+	@git diff --quiet HEAD -- CHANGELOG.md changelog.d \
+		&& test -z "$$(git ls-files --others --exclude-standard -- changelog.d)" \
+		|| { echo "CHANGELOG.md or changelog.d holds changes that are not committed, and the roll would overwrite them."; \
+		     echo "Commit them, then release. Nothing has been rolled, tagged, or pushed."; \
+		     exit 1; }
+	@uv run python scripts/changelog.py roll $$(make version/get) $(if $(allow_empty),--allow-empty)
+	@git checkout --quiet --detach
+	@# Named paths, so nothing else a maintainer staged rides into a commit this target tags. Asks git
+	@# rather than testing the directory because a pathspec git knows nothing about is fatal, and an
+	@# ignored .DS_Store keeps the directory present on a branch cut before changelog.d existed.
+	@tracked_entries=$$(git ls-files changelog.d); \
+		git commit --quiet -m "chore: release v$$(make version/get)" -- CHANGELOG.md $${tracked_entries:+changelog.d}
+	@make version/assert-rolled
 	@git tag v$$(make version/get)
 	@git tag stable -f
-	@git push -f --tags
+	@git push -f origin refs/tags/v$$(make version/get) refs/tags/stable
 	@git push origin HEAD:refs/heads/release/v$$(make version/get | awk -F. '{print $$1 "." $$2}')
+	@git checkout --quiet -
 	
+# The roll deletes the entry files it folds in. A commit that staged CHANGELOG.md alone would leave
+# them in the tree, and the next release would publish them a second time.
+.PHONY: version/assert-rolled
+version/assert-rolled: ## Fail if HEAD still carries changelog.d entries.
+	@# Exempts what the roll never folds, so this must match _entry_paths in scripts/changelog.py: a
+	@# tracked file the roll leaves behind on purpose would block every release with no way out.
+	@unfolded=$$(git ls-tree -r --name-only HEAD -- changelog.d | grep -v -e '^changelog\.d/README\.md$$' -e '/\.'); \
+		test -z "$$unfolded" \
+		|| { echo "HEAD still carries these changelog.d entries, so the roll did not reach this commit:"; \
+		     echo "$$unfolded" | sed 's/^/  /'; \
+		     echo "Nothing has been tagged or pushed. See Making a Release in CONTRIBUTING.md to recover."; \
+		     exit 1; }
+
 .PHONY: install
 install: ## Install all dependencies.
 	@make install/all
@@ -56,13 +93,24 @@ install/dev: ## Install dev dependencies.
 install/test: ## Install test dependencies.
 	@uv sync --group test
 
+# The published app pins an exact engine version. Overriding that pin with this checkout stops uv
+# from falling back to an older app whose pin happens to accept the local engine version. The
+# override must be editable: a plain path install is built once and cached, so it goes stale when
+# the checkout changes.
+RUN_OVERRIDES := build/run-overrides.txt
+
+.PHONY: run/overrides
+run/overrides:
+	@mkdir -p $(dir $(RUN_OVERRIDES))
+	@printf -- '-e %s\n' "$(CURDIR)" > $(RUN_OVERRIDES)
+
 .PHONY: run
-run: ## Run the engine from this checkout (published app + local editable engine).
-	@uvx --python 3.12 --from griptape-nodes --with-editable . gtn $(ARGS)
+run: run/overrides ## Run the engine from this checkout (published app + local editable engine).
+	@uvx --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
 
 .PHONY: run/refresh
-run/refresh: ## Run the engine, pulling the latest published app first.
-	@uvx --refresh --python 3.12 --from griptape-nodes --with-editable . gtn $(ARGS)
+run/refresh: run/overrides ## Run the engine, pulling the latest published app first.
+	@uvx --refresh --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
 
 .PHONY: lint
 lint: ## Lint project.
@@ -71,7 +119,7 @@ lint: ## Lint project.
 .PHONY: format
 format: ## Format project.
 	@uv run ruff format
-	@uv run mdformat .github docs src tests *.md
+	@uv run mdformat .github docs src tests $(MARKDOWN_ROOT_FILES)
 
 .PHONY: fix
 fix: ## Fix project.
@@ -79,12 +127,12 @@ fix: ## Fix project.
 	@uv run ruff check --fix --unsafe-fixes
 
 .PHONY: check
-check: check/format check/lint check/types check/spell ## Run all checks.
+check: check/format check/lint check/types check/spell check/changelog ## Run all checks.
 
 .PHONY: check/format
 check/format:
 	@uv run ruff format --check
-	@uv run mdformat --check .github docs src tests *.md
+	@uv run mdformat --check .github docs src tests $(MARKDOWN_ROOT_FILES)
 
 .PHONY: check/lint
 check/lint:
@@ -97,6 +145,14 @@ check/types:
 .PHONY: check/spell
 check/spell:
 	@uv run typos 
+
+.PHONY: check/changelog
+check/changelog: ## Check CHANGELOG.md and the changelog.d entries follow Keep a Changelog.
+	@uv run python scripts/changelog.py check
+
+.PHONY: changelog
+changelog: ## Print [Unreleased] as the next release will show it, changelog.d entries folded in.
+	@uv run python scripts/changelog.py render
 
 .PHONY: test  ## Run all tests.
 test: test/unit test/integration test/e2e

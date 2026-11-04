@@ -7,8 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetAllSecretValuesRequest,
+    GetAllSecretValuesResultFailure,
+    GetAllSecretValuesResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
-from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager, merge_env_file_values
 
 
 @pytest.mark.skipif(
@@ -603,7 +608,7 @@ class TestSecretsManager:
         """
 
         def assert_invariant(secrets_manager: SecretsManager) -> None:
-            merged = secrets_manager._read_merged_env_files()
+            merged = secrets_manager.read_merged_env_files()
             for key in secrets_manager._managed_env_keys:
                 assert key in os.environ, f"managed key {key!r} missing from os.environ"
                 if key in merged:
@@ -723,3 +728,109 @@ class TestSecretsManager:
                     assert os.environ["UNRELATED"] == "value"
                     assert "UNRELATED" in secrets_manager._managed_env_keys
                     assert_invariant(secrets_manager)
+
+
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
+)
+class TestGetAllSecretValuesRequest:
+    """An unreadable secrets file must not be reported as an empty one.
+
+    Callers that *replace* content with this result -- the workflow packager rebuilding a
+    published bundle's .env -- would otherwise turn a read failure into a silent deletion
+    of every credential from the bundle.
+    """
+
+    def test_missing_file_succeeds_with_no_values(self) -> None:
+        """No stored secrets yet is a real empty success, not a failure."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_path = Path(temp_dir)
+            global_env = workspace_path / "global.env"
+
+            config_manager = ConfigManager()
+            config_manager.workspace_path = workspace_path
+
+            with patch("griptape_nodes.retained_mode.managers.secrets_manager.ENV_VAR_PATH", global_env):
+                secrets_manager = SecretsManager(config_manager)
+                result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
+
+            assert isinstance(result, GetAllSecretValuesResultSuccess)
+            assert result.values == {}
+
+    def test_existing_file_returns_its_values(self) -> None:
+        """The happy path is unchanged: stored secrets come back as values."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_path = Path(temp_dir)
+            global_env = workspace_path / "global.env"
+            global_env.write_text("STORED_KEY=stored_value\n")
+
+            config_manager = ConfigManager()
+            config_manager.workspace_path = workspace_path
+
+            with patch("griptape_nodes.retained_mode.managers.secrets_manager.ENV_VAR_PATH", global_env):
+                secrets_manager = SecretsManager(config_manager)
+                result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
+
+            assert isinstance(result, GetAllSecretValuesResultSuccess)
+            assert result.values == {"STORED_KEY": "stored_value"}
+
+    def test_unreadable_file_fails_rather_than_looking_empty(self) -> None:
+        """A file that exists but cannot be read is a failure, not an empty success."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_path = Path(temp_dir)
+            global_env = workspace_path / "global.env"
+            global_env.write_text("STORED_KEY=stored_value\n")
+
+            config_manager = ConfigManager()
+            config_manager.workspace_path = workspace_path
+
+            with patch("griptape_nodes.retained_mode.managers.secrets_manager.ENV_VAR_PATH", global_env):
+                secrets_manager = SecretsManager(config_manager)
+                with patch(
+                    "griptape_nodes.retained_mode.managers.secrets_manager.dotenv_values",
+                    side_effect=OSError("permission denied"),
+                ):
+                    result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
+
+            assert isinstance(result, GetAllSecretValuesResultFailure)
+
+
+class TestMergeEnvFileValues:
+    """The precedence between the two `.env` files, stated in exactly one place.
+
+    `get_secret` resolves from these files and the diagnostics report says which file each key
+    came from, and the two have to agree -- forever, not just today. Written by hand in both, a
+    later change to the layering could leave the report wrong about where to look.
+    """
+
+    def test_the_workspace_file_wins(self) -> None:
+        merged = merge_env_file_values(
+            global_values={"SHARED_KEY": "from_global"}, workspace_values={"SHARED_KEY": "from_workspace"}
+        )
+
+        assert merged == {"SHARED_KEY": "from_workspace"}
+
+    def test_a_key_in_only_one_file_survives_from_either(self) -> None:
+        merged = merge_env_file_values(global_values={"GLOBAL_ONLY": "a"}, workspace_values={"WORKSPACE_ONLY": "b"})
+
+        assert merged == {"GLOBAL_ONLY": "a", "WORKSPACE_ONLY": "b"}
+
+    def test_an_empty_workspace_value_still_wins(self) -> None:
+        """`FOO=` in the workspace file is a deliberate blanking, not an absence.
+
+        Falling back to the global value here would make a key the user emptied on purpose go
+        on working, from a file they were not editing.
+        """
+        merged = merge_env_file_values(global_values={"SHARED_KEY": "from_global"}, workspace_values={"SHARED_KEY": ""})
+
+        assert merged == {"SHARED_KEY": ""}
+
+    def test_the_arguments_are_left_alone(self) -> None:
+        """Both come from a file read; a merge that mutated one would corrupt the layer."""
+        global_values = {"SHARED_KEY": "from_global"}
+        workspace_values = {"SHARED_KEY": "from_workspace"}
+
+        merge_env_file_values(global_values=global_values, workspace_values=workspace_values)
+
+        assert global_values == {"SHARED_KEY": "from_global"}
+        assert workspace_values == {"SHARED_KEY": "from_workspace"}

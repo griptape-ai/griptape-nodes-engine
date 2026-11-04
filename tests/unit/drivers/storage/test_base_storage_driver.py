@@ -1,4 +1,3 @@
-from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -64,16 +63,7 @@ class TestBaseStorageDriverUploadFile:
     @pytest.fixture
     def base_storage_driver(self) -> ConcreteStorageDriver:
         """Create a concrete BaseStorageDriver instance for testing."""
-        return self.ConcreteStorageDriver(Path("/workspace"))
-
-    @pytest.fixture
-    def mock_workspace_path(self) -> Generator[None, None, None]:
-        """Mock ConfigManager to return /workspace for all tests."""
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes") as mock_griptape:
-            mock_config_manager = Mock()
-            mock_config_manager.workspace_path = Path("/workspace")
-            mock_griptape.ConfigManager.return_value = mock_config_manager
-            yield
+        return self.ConcreteStorageDriver(Mock(workspace_path=Path("/workspace")))
 
     @pytest.fixture
     def mock_upload_response(self) -> dict[str, Any]:
@@ -88,12 +78,11 @@ class TestBaseStorageDriverUploadFile:
     def test_upload_file_passes_existing_file_policy_to_create_signed_upload_url(
         self,
         base_storage_driver: ConcreteStorageDriver,
-        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test line 95: upload_file passes existing_file_policy to create_signed_upload_url."""
         with (
             patch.object(base_storage_driver, "create_signed_upload_url") as mock_create_url,
-            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx.request") as mock_request,
+            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx2.request") as mock_request,
         ):
             # Setup mocks
             mock_create_url.return_value = {
@@ -115,12 +104,11 @@ class TestBaseStorageDriverUploadFile:
     def test_upload_file_default_policy_is_overwrite(
         self,
         base_storage_driver: ConcreteStorageDriver,
-        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test line 95: upload_file defaults to OVERWRITE policy when not specified."""
         with (
             patch.object(base_storage_driver, "create_signed_upload_url") as mock_create_url,
-            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx.request") as mock_request,
+            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx2.request") as mock_request,
         ):
             # Setup mocks
             mock_create_url.return_value = {
@@ -142,12 +130,11 @@ class TestBaseStorageDriverUploadFile:
     def test_upload_file_create_new_policy(
         self,
         base_storage_driver: ConcreteStorageDriver,
-        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test line 95: upload_file passes CREATE_NEW policy correctly."""
         with (
             patch.object(base_storage_driver, "create_signed_upload_url") as mock_create_url,
-            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx.request") as mock_request,
+            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx2.request") as mock_request,
         ):
             # Setup mocks
             mock_create_url.return_value = {
@@ -166,14 +153,14 @@ class TestBaseStorageDriverUploadFile:
             # Verify create_signed_upload_url was called with CREATE_NEW policy (line 95)
             mock_create_url.assert_called_once_with(TEST_FILE_PATH, ExistingFilePolicy.CREATE_NEW)
 
-    def test_upload_file_uses_timeout_parameter(self, mock_workspace_path: Any) -> None:  # noqa: ARG002
-        """upload_file should pass timeout parameter to httpx.request."""
-        driver = self.ConcreteStorageDriver(Path("/workspace"))
+    def test_upload_file_uses_timeout_parameter(self) -> None:
+        """upload_file should pass timeout parameter to httpx2.request."""
+        driver = self.ConcreteStorageDriver(Mock(workspace_path=Path("/workspace")))
 
         with (
             patch.object(driver, "create_signed_upload_url") as mock_create_url,
             patch.object(driver, "create_signed_download_url") as mock_create_download_url,
-            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx.request") as mock_request,
+            patch("griptape_nodes.drivers.storage.base_storage_driver.httpx2.request") as mock_request,
         ):
             mock_create_url.return_value = {
                 "url": "http://test.com/upload",

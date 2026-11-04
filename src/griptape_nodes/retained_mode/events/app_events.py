@@ -56,6 +56,12 @@ class AppStartSessionRequest(RequestPayload):
     Results: AppStartSessionResultSuccess (with session ID) | AppStartSessionResultFailure (session creation error)
     """
 
+    # A client that names itself is listed on the session (see SessionClient) so engine
+    # discovery can show who is attached. Blank client_id keeps today's anonymous join.
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
+
 
 @dataclass
 @PayloadRegistry.register
@@ -119,6 +125,16 @@ class AppInitializationComplete(AppPayload):
     # taken from the first entry in libraries_to_register. Multiple workers can run
     # simultaneously for different libraries.
     is_worker: bool = False
+    # Set by short-lived engines (workflow subprocesses and script runs) that can run beside a live
+    # orchestrator, which owns any library resets still waiting for a restart.
+    defer_pending_library_resets: bool = False
+    # When True, this worker serves no single library: it loads every enabled library and runs the
+    # nodes the orchestrator routes to it, such as the members of an Isolated Execution group. Only
+    # meaningful together with is_worker; libraries_to_register is ignored.
+    is_general_purpose_worker: bool = False
+    # URL of the static file server the host process runs for this workspace. The engine serves
+    # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
+    static_server_base_url: str | None = None
 
 
 @dataclass
@@ -205,60 +221,81 @@ class EngineInitializationProgress(AppPayload):
 
 
 @dataclass
-class WorkerParameterSchema:
-    """Serialized parameter from a worker-loaded node.
-
-    Contains the fields needed to reconstruct a Parameter on the orchestrator
-    without importing the worker library's Python modules.
-    """
-
-    name: str
-    type: str
-    input_types: list[str]
-    output_type: str
-    default_value: Any
-    tooltip: Any
-    tooltip_as_input: Any
-    tooltip_as_property: Any
-    tooltip_as_output: Any
-    mode_allowed_input: bool
-    mode_allowed_property: bool
-    mode_allowed_output: bool
-    user_defined: bool
-    settable: bool
-    serializable: bool
-    private: bool
-    ui_options: dict | None
-
-
-@dataclass
-class WorkerNodeSchema:
-    """Serialized node from a worker-loaded library."""
-
-    class_name: str
-    parameters: list[WorkerParameterSchema]
-
-
-@dataclass
 @PayloadRegistry.register
 class LibraryLoadedNotification(AppPayload):
     """Notification that a library has finished loading, including its fitness outcome.
 
-    Emitted after a library reaches LOADED state. The orchestrator re-broadcasts it so
-    all listeners (including the GUI) can update their view of library health.
+    Raised by the process that owns the library's record, so listeners including the GUI can update
+    their view of library health. For a library whose nodes execute in a worker that process is the
+    orchestrator, once it has accepted the worker's ``ReportLibraryLoadedRequest``.
 
     Args:
         library_name: Name of the library that was loaded.
         fitness: Final fitness value (LibraryManager.LibraryFitness string).
         problem_details: Human-readable summary of problems, or None if there are none.
-        node_schemas: Serialized node/parameter schemas from the worker process, or None
-            if this notification was not produced by a worker.
     """
 
     library_name: str
     fitness: str
     problem_details: str | None = None
-    node_schemas: list[WorkerNodeSchema] | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by a worker to the orchestrator to report how a library loaded in the worker.
+
+    It is what releases anything waiting to route execution to that worker.
+
+    ``SkipTheLineMixin`` because the orchestrator may be executing a node when this arrives, and that
+    node can itself be waiting on this very report through ``WorkerManager.wait_until_executable``.
+    Queued behind execution, the report that ends the wait cannot be handled until the wait ends.
+
+    Args:
+        library_name: Name of the library that finished loading in the worker.
+        fitness: Final fitness value (LibraryManager.LibraryFitness string).
+        problem_details: Human-readable summary of problems, or None if there are none.
+    """
+
+    library_name: str
+    fitness: str
+    problem_details: str | None = None
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The orchestrator recorded the worker's load outcome."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The orchestrator had no record of the library the worker reported on."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportGeneralPurposeWorkerReadyRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by a general-purpose worker to the orchestrator once it has loaded its libraries.
+
+    A worker registers before it loads anything, so registration alone does not mean it can create
+    the nodes routed to it. A library worker reports each library it serves through
+    ``ReportLibraryLoadedRequest``; a general-purpose worker serves none of them, so it reports
+    once, for itself.
+
+    ``SkipTheLineMixin`` for the same reason as ``ReportLibraryLoadedRequest``: a node already
+    executing on the orchestrator can be waiting on this report.
+    """
+
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportGeneralPurposeWorkerReadyResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The orchestrator recorded that its general-purpose worker is ready."""
 
 
 @dataclass
@@ -312,9 +349,10 @@ class CurrentProjectChanged(AppPayload):
     orchestrator's project even on a "shallow" switch (same workspace and
     library config) that would not otherwise restart them.
 
-    Boot-time activation is handled separately: a worker boots like any engine
-    and re-derives the orchestrator's project from shared on-disk config, so
-    ProjectManager only emits this after _initialization_complete.
+    Emitted on every successful activation that changed the project, including
+    during boot: boot activations precede worker spawn, so those emissions fan
+    out to zero workers, and a worker registering into that window is sent its
+    first activation by the registration handler.
 
     Args:
         project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY
@@ -391,6 +429,53 @@ class AppEndSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class AppJoinSessionRequest(RequestPayload):
+    """Join the named session, which must be the active one, and list the client on it.
+
+    Start creates-or-joins without naming a session; Join is for a client that already holds a
+    session id, e.g. one restored from storage, and wants the engine to refuse a stale id.
+    """
+
+    session_id: str
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+    session_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultFailure(ResultPayloadFailure):
+    """Join failed: no session is active, or the named one is not the active session."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionRequest(RequestPayload):
+    """Delist a client from the active session without ending it."""
+
+    client_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionResultSuccess(ResultPayloadSuccess):
+    """The client is no longer listed; leaving when never listed succeeds too."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionResultFailure(ResultPayloadFailure):
+    """Leave failed because no session is active."""
+
+
+@dataclass
+@PayloadRegistry.register
 class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use ensure the engine session is still active."""
 
@@ -421,6 +506,16 @@ class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 
 
 @dataclass
+class SessionClient:
+    """A client registered on the active session: an opaque id the client minted, its kind, and a display label."""
+
+    client_id: str
+    client_type: str
+    connected_at: str
+    client_label: str = ""
+
+
+@dataclass
 @PayloadRegistry.register
 class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     """Engine heartbeat successful with comprehensive status information.
@@ -430,17 +525,24 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         engine_version: Current engine version string
         engine_id: Unique engine identifier (None if not set)
         session_id: Current session identifier (None if no session)
+        engine_run_id: Id minted when this engine started, never saved. Workflow ids are only
+            valid while it stays the same; a new value means the engine restarted.
         timestamp: Heartbeat timestamp
         instance_type: Cloud instance type (None if not applicable)
         instance_region: Cloud instance region (None if not applicable)
         instance_provider: Cloud provider name (None if not applicable)
         deployment_type: Type of deployment (None if not applicable)
         current_workflow: Name of active workflow (None if none)
+        current_workflow_id: Id of active workflow (None if none)
         workflow_file_path: Path to workflow file (None if none)
         has_active_flow: Whether there's an active flow running
         engine_name: Human-readable engine name
+        engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
         user: User information including ID, email, and name (None if not logged in)
         user_organization: User's organization information including ID and name (None if not logged in)
+        orchestrator_engine_id: Engine id of the orchestrator that spawned this engine as a
+            worker process, or None when this engine IS the orchestrator. A discovery client
+            treats a non-None value as "this is a worker engine, nest it under that orchestrator".
     """
 
     heartbeat_id: str
@@ -463,6 +565,28 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # empty workflow list; the live EngineInitializationProgress stream fills in the detail.
     # Defaulted for backward compatibility with older clients.
     is_initializing: bool = False
+    # Set on worker engines to the id of the orchestrator that spawned them; None on the
+    # orchestrator itself. A discovery client uses this both to identify a worker engine
+    # (worker <=> orchestrator_engine_id is not None) and to nest it under its parent.
+    # Defaulted for backward compatibility with older clients.
+    orchestrator_engine_id: str | None = None
+    # Operating system the engine process is running on, so a client can tell apart several
+    # local engines connected from different machines. Same vocabulary as
+    # GetWorkflowRunCommandResultSuccess.engine_os -- a Platform value ("windows", "darwin",
+    # "linux") for the client to map to a label and icon, not a name to show as-is. An
+    # unrecognized platform falls back to `sys.platform`, so the set is open. A live engine
+    # always fills this in, so the "" default means the heartbeat came from an engine too old
+    # to report it -- a client should show nothing rather than guess.
+    engine_os: str = ""
+    # Clients that identified themselves to the active session (SessionManager.attach_client),
+    # so a discovery client can tell a free engine from one another host is already driving.
+    # Entries leave when the host is displaced or the session ends; nothing expires them, so a
+    # host that crashed stays listed until then. Defaulted for backward compatibility.
+    clients: list[SessionClient] = field(default_factory=list)
+    # Id of the active workflow (None if none). Defaulted for backward compatibility.
+    current_workflow_id: str | None = None
+    # Changes on every engine restart, unlike session_id. None from an engine too old to report it.
+    engine_run_id: str | None = None
 
 
 @dataclass

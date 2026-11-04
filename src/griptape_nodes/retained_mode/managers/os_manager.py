@@ -1,17 +1,22 @@
 import asyncio
 import base64
+import contextlib
 import ctypes
+import errno
 import logging
 import mimetypes
 import os
+import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import anyio
 import portalocker
@@ -20,6 +25,7 @@ from fileseq.exceptions import FileSeqException
 from rich.console import Console
 
 from griptape_nodes.common.macro_parser import (
+    SEQUENCE_VARIABLE_NAME,
     MacroResolutionError,
     MacroResolutionFailure,
     MacroSyntaxError,
@@ -30,6 +36,7 @@ from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailure
 from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
     InvalidTemplateError,
@@ -61,6 +68,7 @@ from griptape_nodes.files.path_utils import (
     sanitize_path_string,
     strip_surrounding_quotes,
 )
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
     CopyFileRequest,
@@ -92,6 +100,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetNextVersionIndexRequest,
     GetNextVersionIndexResultFailure,
     GetNextVersionIndexResultSuccess,
+    LaunchExternalViewerRequest,
+    LaunchExternalViewerResultFailure,
+    LaunchExternalViewerResultSuccess,
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
@@ -120,10 +131,15 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
+    WriteTempFileRequest,
+    WriteTempFileResultFailure,
+    WriteTempFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultSuccess,
     MacroPath,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -133,16 +149,23 @@ from griptape_nodes.retained_mode.events.resource_events import (
     RegisterResourceTypeResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes, logger
+from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
+from griptape_nodes.retained_mode.request_handlers import handles
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
+from griptape_nodes.utils.async_utils import to_thread
+from griptape_nodes.utils.file_utils import atomic_write_bytes
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
 console = Console()
+logger = logging.getLogger("griptape_nodes")
 
 # Maximum number of indexed candidates to try when CREATE_NEW policy is used
 MAX_INDEXED_CANDIDATES = 1000
@@ -151,6 +174,14 @@ MAX_INDEXED_CANDIDATES = 1000
 # string before truncating the rest with "(+N more)". Larger lists overwhelm
 # the artist's status panel; the full list lives on `missing_item_numbers`.
 ABORTED_AT_GAP_PREVIEW_COUNT = 5
+
+# Placeholder bound to the index slot while GetNextVersionIndexRequest resolves the rest of
+# a macro through the project. Picked to be a digit run that never shows up in a real path,
+# so its rendered form can be located in the resolved string and swapped back for the slot.
+VERSION_INDEX_SENTINEL = 918273645
+
+# Matches one `{...}` variable group in a macro template.
+MACRO_VARIABLE_GROUP_PATTERN = re.compile(r"\{[^{}]*\}")
 
 
 @dataclass
@@ -234,6 +265,30 @@ class FilePathValidationError(Exception):
         self.reason = reason
 
 
+class StagingFailedError(Exception):
+    """Raised when ``OSManager._stage_bytes_at_temp`` cannot land bytes on disk.
+
+    The on-disk vet path catches this to fail closed: if the bytes cannot even
+    be staged for inspection, the write cannot be verified as compliant and
+    must be refused. Carries the ``FileIOFailureReason`` that would have
+    appeared in a ``WriteTempFileResultFailure`` so the public
+    ``on_write_temp_file_request`` handler can preserve the failure reason
+    when translating the exception back into a request result.
+    """
+
+    def __init__(self, message: str, failure_reason: FileIOFailureReason) -> None:
+        super().__init__(message)
+        self.failure_reason = failure_reason
+
+
+@dataclass(frozen=True)
+class _StagedTempOutcome:
+    """Result of ``OSManager._stage_bytes_at_temp`` on the success path."""
+
+    staged_path: str
+    bytes_written: int
+
+
 @dataclass
 class CopyTreeStats:
     """Statistics from copying a directory tree."""
@@ -255,7 +310,7 @@ class WindowsSpecialFolderResult(NamedTuple):
     remaining_parts: list[str] | None
 
 
-class OSManager:
+class OSManager(EngineScoped):
     """A class to manage OS-level scenarios.
 
     Making its own class as some runtime environments and some customer requirements may dictate this as optional.
@@ -272,6 +327,16 @@ class OSManager:
         "videos": 0x000E,  # CSIDL_MYVIDEO
         "music": 0x000D,  # CSIDL_MYMUSIC
     }
+
+    # Matches the File Browser dialog's own client-side preview cutoff. The sequence-frame
+    # loader bypasses that client-side check, so this is what actually stops a 200+ MB frame
+    # from being base64-encoded whole -- the real cost behind the engine hang in #6043.
+    _MAX_PREVIEWABLE_IMAGE_BYTES: ClassVar[int] = 10 * 1024 * 1024
+
+    # Returned in place of a preview for files over the size cap. A syntactically valid, empty
+    # data URL: no image decoder can render it, so the editor shows its own "failed to load
+    # preview" state instead of the raw file content.
+    _NO_PREVIEW_DATA_URL: ClassVar[str] = "data:,"
 
     @staticmethod
     def normalize_path_parts_for_special_folder(path_str: str) -> list[str]:
@@ -336,76 +401,10 @@ class OSManager:
         remaining = parts[1:] if len(parts) > 1 else []
         return WindowsSpecialFolderResult(special_path=special_path, remaining_parts=remaining)
 
-    def __init__(self, event_manager: EventManager | None = None):
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None):
+        super().__init__(engine)
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(
-                request_type=OpenAssociatedFileRequest, callback=self.on_open_associated_file_request
-            )
-            event_manager.assign_manager_to_request_type(
-                request_type=ListDirectoryRequest, callback=self.on_list_directory_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ListDirectorySequencesRequest,
-                callback=self.on_list_directory_sequences_request,
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=DeduceSequencesFromFileListRequest,
-                callback=self.on_deduce_sequences_from_file_list_request,
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ScanSequencesRequest, callback=self.on_scan_sequences_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ReadFileRequest, callback=self.on_read_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=CreateFileRequest, callback=self.on_create_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=RenameFileRequest, callback=self.on_rename_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=WriteFileRequest, callback=self.on_write_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=CopyTreeRequest, callback=self.on_copy_tree_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=CopyFileRequest, callback=self.on_copy_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=DeleteFileRequest, callback=self.on_delete_file_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=GetFileInfoRequest, callback=self.on_get_file_info_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=ResolveMacroPathRequest, callback=self.on_handle_resolve_macro_path_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=GetNextUnusedFilenameRequest, callback=self.on_get_next_unused_filename_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=GetNextVersionIndexRequest, callback=self.on_get_next_version_index_request
-            )
-
-            event_manager.assign_manager_to_request_type(
-                request_type=MakeDirectoryRequest, callback=self.on_make_directory_request
-            )
+            event_manager.register_request_handlers(self)
 
             # Store event_manager for direct access during resource registration
             self._event_manager = event_manager
@@ -436,7 +435,7 @@ class OSManager:
 
     def _get_workspace_path(self) -> Path:
         """Get the workspace path from config."""
-        return GriptapeNodes.ConfigManager().workspace_path
+        return self.engine.config_manager.workspace_path
 
     def _get_windows_special_folder_path(self, csidl: int) -> Path:
         """Get Windows special folder path using Shell API.
@@ -501,7 +500,9 @@ class OSManager:
             path_str: Path string that may contain ~, environment variables, or special folder names
 
         Returns:
-            Expanded Path object
+            Expanded, absolute Path object. A result that is still relative after expansion is
+            anchored on the workspace directory. Windows special folders resolve to their
+            actual system paths (e.g. OneDrive redirection).
         """
         resolved = None
         if self.is_windows():
@@ -520,17 +521,25 @@ class OSManager:
             expanded_user = os.path.expanduser(expanded_vars)  # noqa: PTH111
             final_path = Path(expanded_user)
 
+        # Anchor a relative expansion result on the workspace directory. Expansion leaves a
+        # path relative when the string contains '%' or '$' but no resolvable variable
+        # (e.g. "foo%20bar.txt", "report$.txt", "$UNSET_VAR/sub").
+        if not final_path.is_absolute():
+            final_path = self._get_workspace_path() / final_path
+
         return resolve_path_safely(final_path)
 
     def _resolve_file_path(self, path_str: str, *, workspace_only: bool = False) -> Path:
         """Resolve a file path, handling absolute, relative, and tilde paths.
 
         Args:
-            path_str: Path string that may be absolute, relative, or start with ~
+            path_str: Path string that may be absolute, start with ~, or be a path relative
+                to the workspace directory
             workspace_only: If True and path is invalid, fall back to workspace directory
 
         Returns:
-            Resolved Path object
+            Absolute, resolved Path object. Relative paths resolve against the workspace
+            directory.
         """
         try:
             if path_needs_expansion(path_str):
@@ -570,11 +579,12 @@ class OSManager:
             MacroResolutionFailure: Details about resolution failure (missing variables, etc.)
             str: Successfully resolved absolute path string (success path; last)
         """
-        result = GriptapeNodes.handle_request(
+        result = self.engine.handle_request(
             GetPathForMacroRequest(
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
                 failure_log_level=failure_log_level,
+                broadcast_result=False,
             )
         )
         if not isinstance(result, GetPathForMacroResultSuccess):
@@ -672,7 +682,7 @@ class OSManager:
         Returns:
             Tuple of (is_workspace_path, relative_or_absolute_path)
         """
-        workspace = GriptapeNodes.ConfigManager().workspace_path
+        workspace = self.engine.config_manager.workspace_path
 
         # Canonicalize both sides so ~ / env vars / symlinks / relative spellings
         # all compare equal. Non-existent paths don't raise; the resolvable
@@ -835,6 +845,70 @@ class OSManager:
     # CREATE_NEW File Collision Policy - Helper Methods
     # ============================================================================
 
+    def _bind_project_variables_for_index_scan(self, macro_path: MacroPath) -> MacroPath:
+        """Bake project directories and builtins into a macro so only its `{_index}` slot is left open.
+
+        Callers such as `DirectoryDestination` and `build_versioned_sequence_destination` pass
+        project macros like `{outputs}/renders_v{###}` without binding `{outputs}`. The index
+        scan only sees caller variables, so it would find two unresolved variables and fail.
+
+        The macro is resolved through `GetPathForMacroRequest` with a sentinel number in the
+        index slot. The sentinel's rendered text is then swapped back for the original slot
+        text, giving an absolute template such as `/project/outputs/renders_v{###}`.
+
+        Args:
+            macro_path: MacroPath whose template contains an unresolved `{_index}` slot.
+
+        Returns:
+            A MacroPath with only the index slot unresolved. Returns `macro_path` unchanged
+            when project resolution fails or the slot cannot be located, so callers that
+            bind every variable themselves are scanned as given.
+        """
+        template = macro_path.parsed_macro.template
+        if SEQUENCE_VARIABLE_NAME in macro_path.variables:
+            return macro_path
+
+        slot_groups = [
+            group
+            for group in MACRO_VARIABLE_GROUP_PATTERN.findall(template)
+            if self._is_single_variable_group(group, SEQUENCE_VARIABLE_NAME)
+        ]
+        if not slot_groups:
+            return macro_path
+
+        sentinel_vars: MacroVariables = {SEQUENCE_VARIABLE_NAME: VERSION_INDEX_SENTINEL}
+        rendered_slots = [ParsedMacro(group).resolve(sentinel_vars) for group in slot_groups]
+
+        result = self.engine.handle_request(
+            GetPathForMacroRequest(
+                parsed_macro=macro_path.parsed_macro,
+                variables={**macro_path.variables, **sentinel_vars},
+                failure_log_level=logging.DEBUG,
+            )
+        )
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            return macro_path
+
+        resolved = canonicalize_to_posix(result.absolute_path)
+        pieces: list[str] = []
+        cursor = 0
+        for group, rendered in zip(slot_groups, rendered_slots, strict=True):
+            position = resolved.find(rendered, cursor)
+            if position == -1:
+                return macro_path
+            pieces.append(resolved[cursor:position])
+            pieces.append(group)
+            cursor = position + len(rendered)
+        pieces.append(resolved[cursor:])
+
+        # A resolved path containing literal braces cannot be re-parsed as a macro.
+        try:
+            bound_macro = ParsedMacro("".join(pieces))
+        except MacroSyntaxError:
+            return macro_path
+
+        return MacroPath(parsed_macro=bound_macro, variables={})
+
     def _identify_index_variable(self, parsed_macro: ParsedMacro, variables: MacroVariables) -> ParsedVariable | None:
         """Identify which variable should be used for auto-incrementing.
 
@@ -867,7 +941,7 @@ class OSManager:
             → Raises ValueError (batch and frame_num both unresolved)
         """
         # Partially resolve to identify unresolved variables
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
         partial = partial_resolve(parsed_macro.template, parsed_macro.segments, variables, secrets_manager)
 
         # Get unresolved variables (optional variables already filtered out)
@@ -979,7 +1053,7 @@ class OSManager:
             Variables: {"outputs": "/path"}
             → Returns 123
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
 
         # Normalize path separators to POSIX form before reverse-matching. The
         # macro template uses `/` by convention, but the filename comes from
@@ -1199,18 +1273,24 @@ class OSManager:
         None, the caller walks *its* slot (using ProjectManager so unresolved project
         directories like ``{outputs}`` get substituted each iteration).
 
-        When the caller passed a MacroPath whose unresolved variable carries a
-        ``NumericPaddingFormat`` — required ``{x:NN}`` OR optional ``{x?:NN}`` — we
-        walk that slot against the user's ORIGINAL macro. Incrementing it produces
-        consistent zero-padded width across the sequence (``v001 → v002 → v003``).
+        When the caller passed a MacroPath whose macro carries a sequence-slot marker
+        (``SequenceFormat`` from ``{###}`` shorthand, or legacy ``NumericPaddingFormat``
+        from ``{x:NN}`` / ``{x?:NN}``), AND regardless of whether the caller pre-bound
+        that slot, we walk that slot against the user's ORIGINAL macro. Incrementing it
+        produces consistent zero-padded width across the sequence
+        (``v001 → v002 → v003``). Discrimination goes through ``_has_sequence_slot_marker``
+        so both marker types are recognized uniformly.
 
-        The ``is_required`` distinction matters for the SEED step (we only seed required
-        slots; optional slots happily resolve as omitted on the first attempt). It does
-        NOT matter for the walk: by the time we're in collision-fallback the first
-        attempt has already failed via "file exists," and the user's intent for either
-        shape is "give me a padded index here." Walking either kind closes #4544 and
-        #4092 — optional ``{_index?:03}`` collisions previously rendered as ``_1``
-        (unpadded suffix injection) instead of ``_001`` (padded walk).
+        The bound/unbound distinction matters for *starting* the walk (see the
+        start-index logic in ``on_write_file_request``'s CREATE_NEW arm) but not for
+        *selecting* the slot: by the time we're in collision-fallback the first
+        attempt has already failed via "file exists," and the user's intent for any
+        padded slot is "give me a padded index here." Walking unbound padded slots
+        keeps optional collisions in their padded form (``_001`` instead of ``_1``);
+        walking bound padded slots covers the reverse-match case — a matched file
+        whose variables came back from ``ParsedMacro.extract_variables`` lands here
+        with the index slot bound, and we still want ``v007 → v008`` instead of
+        ``v007_1``.
 
         Otherwise (plain string path, or a MacroPath without ANY padded slot), fall
         back to ``_convert_str_path_to_macro_with_index`` which synthesizes
@@ -1218,11 +1298,13 @@ class OSManager:
         """
         if isinstance(request.file_path, MacroPath):
             for segment in request.file_path.parsed_macro.segments:
-                if (
-                    isinstance(segment, ParsedVariable)
-                    and segment.info.name not in request.file_path.variables
-                    and OSManager._has_sequence_slot_marker(segment)
-                ):
+                # `_has_sequence_slot_marker` recognizes both `SequenceFormat` (from
+                # `{###}` shorthand) and legacy `NumericPaddingFormat` (from `{x:NN}`)
+                # as sequence-slot markers. We do NOT gate on "not already bound" —
+                # the reverse-match flow (#4956) intentionally binds `_index` in the
+                # variables dict before landing here, and we still want that slot to
+                # be the one we walk forward on collision.
+                if isinstance(segment, ParsedVariable) and OSManager._has_sequence_slot_marker(segment):
                     return request.file_path, segment
         return self._convert_str_path_to_macro_with_index(str(file_path)), None
 
@@ -1269,7 +1351,7 @@ class OSManager:
                 Files: []
                 Returns: 1 (start with index 1)
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
         index_var_name = index_var.info.name
 
         # Check if index variable is optional
@@ -1311,7 +1393,23 @@ class OSManager:
 
     @staticmethod
     def platform() -> str:
+        """Get `sys.platform` as-is, spellings and all ("win32", "darwin", "linux").
+
+        For a value collapsed onto the platforms we support, use `platform_name()`.
+        """
         return sys.platform
+
+    @staticmethod
+    def _is_single_variable_group(group: str, variable_name: str) -> bool:
+        """Return True if a `{...}` template group parses to exactly one variable named `variable_name`."""
+        try:
+            parsed = ParsedMacro(group)
+        except MacroSyntaxError:
+            return False
+        variables = parsed.get_variables()
+        if len(variables) != 1:
+            return False
+        return next(iter(variables)).name == variable_name
 
     @staticmethod
     def is_windows() -> bool:
@@ -1324,6 +1422,23 @@ class OSManager:
     @staticmethod
     def is_linux() -> bool:
         return os_utils.is_linux()
+
+    @staticmethod
+    def platform_name() -> str:
+        """Get the platform as a `Platform` value, for anything keyed by which OS we are on.
+
+        Unlike `platform()`, this collapses the `sys.platform` spellings onto the three
+        platforms we support -- "win32" reports as "windows", "linux" and "linux2" both as
+        "linux". A platform we do not recognize falls back to `sys.platform`, which is always
+        set, so the result is never empty.
+        """
+        if OSManager.is_windows():
+            return Platform.WINDOWS
+        if OSManager.is_mac():
+            return Platform.DARWIN
+        if OSManager.is_linux():
+            return Platform.LINUX
+        return sys.platform
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
@@ -1340,16 +1455,15 @@ class OSManager:
             sys.stdout.flush()  # Recommended here https://docs.python.org/3/library/os.html#os.execvpe
             os.execvp(args[0], args)  # noqa: S606
 
-    def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    @handles(OpenAssociatedFileRequest)
+    def on_open_associated_file_request(self, request: OpenAssociatedFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         # Validate that exactly one of path_to_file or file_entry is provided
         if request.path_to_file is None and request.file_entry is None:
             msg = "Either path_to_file or file_entry must be provided"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         if request.path_to_file is not None and request.file_entry is not None:
             msg = "Only one of path_to_file or file_entry should be provided, not both"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Get the file path to open
@@ -1362,13 +1476,11 @@ class OSManager:
         else:
             # This should never happen due to validation above, but type checker needs it
             msg = "No valid file path provided"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # At this point, file_path_str is guaranteed to be a string
         if file_path_str is None:
             msg = "No valid file path provided"
-            logger.error(msg)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Sanitize and validate the path (file or directory)
@@ -1377,22 +1489,20 @@ class OSManager:
             path = self._resolve_file_path(file_path_str, workspace_only=False)
         except (ValueError, RuntimeError):
             details = f"Invalid file path: '{file_path_str}'"
-            logger.info(details)
             return OpenAssociatedFileResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
             )
 
         if not path.exists():
             details = f"Path does not exist: '{path}'"
-            logger.info(details)
             return OpenAssociatedFileResultFailure(
                 failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
             )
 
-        logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
+        logger.debug("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
-            platform_name = sys.platform
+            raw_platform = sys.platform
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
@@ -1403,7 +1513,7 @@ class OSManager:
                 # Windows -- a prefixed path makes ShellExecute fail to open the file. The
                 # path is already validated to exist above, so hand it over unprefixed.
                 os.startfile(os.fspath(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
-                logger.info("Opened path on Windows: %s", path)
+                logger.debug("Opened path on Windows: %s", path)
             elif self.is_mac():
                 # On macOS, open should be in a standard location
                 subprocess.run(  # noqa: S603
@@ -1412,7 +1522,7 @@ class OSManager:
                     capture_output=True,
                     text=True,
                 )
-                logger.info("Opened path on macOS: %s", path)
+                logger.debug("Opened path on macOS: %s", path)
             elif self.is_linux():
                 # Use full path to xdg-open to satisfy linter
                 # Common locations for xdg-open:
@@ -1421,7 +1531,6 @@ class OSManager:
                 xdg_path = next((p for p in xdg_paths if Path(p).exists()), None)
                 if not xdg_path:
                     details = "xdg-open not found in standard locations"
-                    logger.info(details)
                     return OpenAssociatedFileResultFailure(
                         failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
                     )
@@ -1432,10 +1541,9 @@ class OSManager:
                     capture_output=True,
                     text=True,
                 )
-                logger.info("Opened path on Linux: %s", path)
+                logger.debug("Opened path on Linux: %s", path)
             else:
-                details = f"Unsupported platform: '{platform_name}'"
-                logger.info(details)
+                details = f"Unsupported platform: '{raw_platform}'"
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
                 )
@@ -1445,12 +1553,129 @@ class OSManager:
             details = (
                 f"Process error when opening file: return code={e.returncode}, stdout={e.stdout}, stderr={e.stderr}"
             )
-            logger.error(details)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=details)
         except Exception as e:
             details = f"Exception occurred when trying to open path: {e}"
-            logger.error(details)
             return OpenAssociatedFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=details)
+
+    @handles(LaunchExternalViewerRequest)
+    def on_launch_external_viewer_request(self, request: LaunchExternalViewerRequest) -> ResultPayload:  # noqa: PLR0911
+        executable_key = f"{request.config_category}.viewer_executable"
+        args_key = f"{request.config_category}.viewer_args"
+        attempt = f"Attempted to open '{request.path_to_file}' in the external viewer"
+
+        try:
+            path = self._resolve_file_path(request.path_to_file, workspace_only=False)
+        except (ValueError, RuntimeError):
+            details = f"{attempt}. Failed because the path is not valid."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
+            )
+
+        if not path.exists():
+            details = f"{attempt}. Failed because the file does not exist."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
+            )
+
+        viewer_executable = self.engine.config_manager.get_config_value(executable_key, default="")
+        viewer_executable = (viewer_executable or "").strip()
+        if not viewer_executable:
+            if not request.fallback_to_os_default:
+                details = f"{attempt}. Failed because no viewer is set in the '{executable_key}' setting."
+                logger.info(details)
+                return LaunchExternalViewerResultFailure(
+                    failure_reason=FileIOFailureReason.NOT_CONFIGURED, result_details=details
+                )
+            return self._open_with_os_default_for_viewer(path, attempt)
+
+        viewer_args = self.engine.config_manager.get_config_value(args_key, default="")
+        try:
+            viewer_arg_list = self._split_viewer_args(viewer_args or "")
+        except ValueError as e:
+            details = f"{attempt}. Failed because the '{args_key}' setting has unbalanced quotes: {e}"
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH, result_details=details
+            )
+
+        # The OS path is passed unprefixed: viewers do not understand the Windows \\?\ long-path form.
+        argv = [viewer_executable, *viewer_arg_list, os.fspath(path)]
+        try:
+            self._spawn_detached(argv)
+        except FileNotFoundError:
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' was not found."
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=details
+            )
+        except PermissionError:
+            details = (
+                f"{attempt}. Failed because the viewer '{viewer_executable}' could not be run (permission denied)."
+            )
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=details
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            details = f"{attempt}. Failed because the viewer '{viewer_executable}' could not be started: {e}"
+            logger.info(details)
+            return LaunchExternalViewerResultFailure(
+                failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
+            )
+
+        return LaunchExternalViewerResultSuccess(
+            used_fallback=False, result_details=f"Opened '{path}' in the external viewer '{viewer_executable}'."
+        )
+
+    def _open_with_os_default_for_viewer(self, path: Path, attempt: str) -> ResultPayload:
+        open_result = self.on_open_associated_file_request(OpenAssociatedFileRequest(path_to_file=os.fspath(path)))
+        if isinstance(open_result, OpenAssociatedFileResultFailure):
+            details = f"{attempt}. No viewer is set, and opening it with the default application failed: {open_result.result_details}"
+            return LaunchExternalViewerResultFailure(failure_reason=open_result.failure_reason, result_details=details)
+        return LaunchExternalViewerResultSuccess(
+            used_fallback=True,
+            result_details=f"No external viewer is set, so '{path}' was opened with the default application.",
+        )
+
+    def _split_viewer_args(self, viewer_args: str) -> list[str]:
+        """Split the configured viewer arguments with shell-style quoting.
+
+        POSIX mode would treat Windows backslashes as escapes, but non-POSIX mode keeps the
+        quotes on each token, so they are stripped here before the tokens reach Popen.
+        """
+        if not self.is_windows():
+            return shlex.split(viewer_args)
+        tokens = shlex.split(viewer_args, posix=False)
+        unquoted = []
+        for token in tokens:
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":  # noqa: PLR2004
+                unquoted.append(token[1:-1])
+            else:
+                unquoted.append(token)
+        return unquoted
+
+    def _spawn_detached(self, argv: list[str]) -> None:
+        """Start ``argv`` without waiting for it, so it outlives the engine and never blocks it."""
+        if self.is_windows():
+            creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # pyright: ignore[reportAttributeAccessIssue]
+            subprocess.Popen(  # noqa: S603
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            return
+        subprocess.Popen(  # noqa: S603
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def _is_hidden(self, dir_entry: os.DirEntry, stat_result: os.stat_result | None = None) -> bool:
         """Check if a directory entry is hidden in an OS-independent way.
@@ -1500,6 +1725,7 @@ class OSManager:
             mime_type = "text/plain"
         return mime_type
 
+    @handles(ListDirectoryRequest)
     def on_list_directory_request(self, request: ListDirectoryRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Handle a request to list directory contents."""
         try:
@@ -1528,24 +1754,21 @@ class OSManager:
             # Check if directory exists
             if not directory.exists():
                 msg = f"Directory does not exist: {directory}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
             if not directory.is_dir():
                 msg = f"Path is not a directory: {directory}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
             # Check workspace constraints
             is_workspace_path, relative_or_abs_path = self._validate_workspace_path(directory)
             if request.workspace_only and not is_workspace_path:
                 msg = f"Directory is outside workspace: {directory}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
             # Cache workspace path and resolved workspace to avoid repeated lookups/resolutions
             # Only resolve workspace if we need it for relative paths or absolute paths
             need_relative_paths = request.workspace_only is True
-            workspace_path = GriptapeNodes.ConfigManager().workspace_path
+            workspace_path = self.engine.config_manager.workspace_path
             if need_relative_paths or request.include_absolute_path:
                 resolved_workspace = canonicalize_for_identity(workspace_path)
             else:
@@ -1661,13 +1884,11 @@ class OSManager:
 
             except PermissionError as e:
                 msg = f"Permission denied listing directory {directory}: {e}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(
                     failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg
                 )
             except OSError as e:
                 msg = f"I/O error listing directory {directory}: {e}"
-                logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
             # Group sequence files into Sequence objects when requested.
@@ -1726,9 +1947,9 @@ class OSManager:
 
         except Exception as e:
             msg = f"Unexpected error in list_directory: {type(e).__name__}: {e}"
-            logger.error(msg)
             return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
+    @handles(ListDirectorySequencesRequest)
     def on_list_directory_sequences_request(self, request: ListDirectorySequencesRequest) -> ResultPayload:
         """Handle a request to list only file sequences in a directory.
 
@@ -1766,6 +1987,7 @@ class OSManager:
             result_details="Unexpected result type from on_list_directory_request.",
         )
 
+    @handles(DeduceSequencesFromFileListRequest)
     def on_deduce_sequences_from_file_list_request(self, request: DeduceSequencesFromFileListRequest) -> ResultPayload:
         """Handle a request to detect sequences from a caller-supplied file list.
 
@@ -1814,7 +2036,6 @@ class OSManager:
             )
         except Exception as e:
             msg = f"Attempted to deduce sequences from file list. Failed with {type(e).__name__}: {e}"
-            logger.error(msg)
             return DeduceSequencesFromFileListResultFailure(
                 failure_reason=FileIOFailureReason.UNKNOWN,
                 result_details=msg,
@@ -1825,6 +2046,7 @@ class OSManager:
             result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
         )
 
+    @handles(ScanSequencesRequest)
     async def on_scan_sequences_request(self, request: ScanSequencesRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to scan a path or pattern for file sequences.
 
@@ -1852,6 +2074,7 @@ class OSManager:
                 scan_sequences,
                 mapping,
                 mapping.filename_pattern,
+                engine=self.engine,
                 policy=request.policy,
                 no_token_behavior=request.no_token_behavior,
                 start=request.start_number,
@@ -1967,9 +2190,7 @@ class OSManager:
                 filename_pattern=filename_pattern,
             )
 
-        resolve_result = GriptapeNodes.handle_request(
-            GetPathForMacroRequest(parsed_macro=parsed_directory, variables={})
-        )
+        resolve_result = self.engine.handle_request(GetPathForMacroRequest(parsed_macro=parsed_directory, variables={}))
         if not isinstance(resolve_result, GetPathForMacroResultSuccess):
             return ScanSequencesResultFailure(
                 failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
@@ -2057,7 +2278,7 @@ class OSManager:
 
             # Handle image thumbnail generation (if requested)
             if mime_type.startswith("image/") and request.should_transform_image_content_to_thumbnail and not is_text:
-                content = self._generate_thumbnail_from_image_content(content, location, mime_type)
+                content = await self._generate_thumbnail_from_image_content(content, location, mime_type)
                 # Thumbnail returns a string (URL or data URI), not bytes
                 decoded_content: str | bytes = content
                 encoding = None
@@ -2096,6 +2317,7 @@ class OSManager:
                 failure_reason=FileIOFailureReason.IO_ERROR, result_details=f"Error reading from {location}: {e}"
             )
 
+    @handles(ReadFileRequest)
     async def on_read_file_request(self, request: ReadFileRequest) -> ResultPayload:
         """Handle a request to read file contents with automatic text/binary detection.
 
@@ -2108,7 +2330,6 @@ class OSManager:
             location = request.file_path
         else:
             msg = "Either file_path or file_entry must be provided"
-            logger.error(msg)
             return ReadFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Sanitize path string (basic cleanup)
@@ -2117,8 +2338,18 @@ class OSManager:
         # Read via driver system (driver handles all validation and I/O)
         return await self._read_via_driver(location, request)
 
-    def _generate_thumbnail_from_image_content(self, content: bytes, file_path: Path | str, mime_type: str) -> str:
+    async def _generate_thumbnail_from_image_content(
+        self, content: bytes, file_path: Path | str, mime_type: str
+    ) -> str:
         """Handle image content by creating previews or returning static URLs.
+
+        The workspace check reads engine state, so it runs on the loop; only the image encode
+        runs on a worker thread. Pillow is tried first regardless of file size, since decoding a
+        large-but-valid image (a big JPEG or TIFF, say) is cheap and still worth a thumbnail. Only
+        when Pillow can't decode the file does size matter: under ``_MAX_PREVIEWABLE_IMAGE_BYTES``
+        the original bytes are returned undecoded; over it, a no-preview sentinel is returned
+        instead, since base64-encoding a multi-hundred-MB file whole is what has hung the engine
+        on large or multi-part images Pillow can't open (EXR sequences, for one).
 
         Args:
             content: Image bytes
@@ -2138,7 +2369,7 @@ class OSManager:
 
             # Only check workspace directory for absolute local paths
             if path_obj.is_absolute():
-                config_manager = GriptapeNodes.ConfigManager()
+                config_manager = self.engine.config_manager
                 static_dir = config_manager.workspace_path
 
                 try:
@@ -2149,7 +2380,7 @@ class OSManager:
                     pass
                 else:
                     # File is in static directory, construct URL directly
-                    static_base_url = GriptapeNodes.StaticFilesManager().static_server_base_url
+                    static_base_url = self.engine.static_files_manager.static_server_base_url
                     static_url = f"{static_base_url}/workspace/{file_relative_to_static}"
                     msg = f"Image already in workspace directory, returning URL: {static_url}"
                     logger.debug(msg)
@@ -2158,8 +2389,40 @@ class OSManager:
             # Not a valid local path (might be URL or data URI), continue to preview
             pass
 
+        path_obj = Path(file_path) if isinstance(file_path, str) else file_path
+
+        pillow_preview = await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes)
+        if pillow_preview is not None:
+            return pillow_preview
+
+        if len(original_image_bytes) > self._MAX_PREVIEWABLE_IMAGE_BYTES:
+            # Pillow couldn't decode this file, and it's large enough that base64-encoding it
+            # whole is the actual cost that has hung the engine on large/multi-part images it
+            # can't open (EXR sequences, for one). A 200+ MB EXR sequence frame reaches this
+            # unconditionally via the sequence-frame loader, which bypasses the File Browser
+            # dialog's own 10MB client-side preview cutoff. Skip encoding it entirely.
+            logger.debug(
+                "%s exceeds the %d byte preview cap and Pillow could not decode it; skipping preview.",
+                path_obj,
+                self._MAX_PREVIEWABLE_IMAGE_BYTES,
+            )
+            return self._NO_PREVIEW_DATA_URL
+
+        # Pillow couldn't decode this file, but it's small enough that returning it undecoded
+        # costs nothing worth guarding against.
+        logger.debug("No preview could be generated for %s; returning the original bytes.", path_obj)
+        return f"data:{mime_type};base64,{base64.b64encode(original_image_bytes).decode('utf-8')}"
+
+    @staticmethod
+    def _image_bytes_to_preview_data_url(image_bytes: bytes) -> str | None:
+        """Encode a small WEBP preview of the image as a data URL. CPU-bound and touches no engine state.
+
+        Returns:
+            The preview data URL, or None if Pillow could not decode the image (the caller then
+            returns the original bytes under the size cap, or a no-preview sentinel over it).
+        """
         preview_data_url = create_image_preview_from_bytes(
-            original_image_bytes,  # type: ignore[arg-type]
+            image_bytes,  # type: ignore[arg-type]
             max_width=200,
             max_height=200,
             quality=85,
@@ -2170,11 +2433,9 @@ class OSManager:
             logger.debug("Image preview created (file not moved)")
             return preview_data_url
 
-        # Fallback to data URL if preview creation fails
-        data_url = f"data:{mime_type};base64,{base64.b64encode(original_image_bytes).decode('utf-8')}"
-        logger.debug("Fallback to full image data URL")
-        return data_url
+        return None
 
+    @handles(GetNextUnusedFilenameRequest)
     def on_get_next_unused_filename_request(self, request: GetNextUnusedFilenameRequest) -> ResultPayload:
         """Handle a request to find the next available filename (preview only - no file creation)."""
         # Handle string paths specially: try base path first, then indexed
@@ -2184,7 +2445,6 @@ class OSManager:
                 base_path = self._resolve_file_path(request.file_path, workspace_only=False)
             except (ValueError, RuntimeError) as e:
                 msg = f"Invalid path: {e}"
-                logger.error(msg)
                 return GetNextUnusedFilenameResultFailure(
                     failure_reason=FileIOFailureReason.INVALID_PATH,
                     result_details=msg,
@@ -2212,7 +2472,6 @@ class OSManager:
             index_info = self._identify_index_variable(parsed_macro, variables)
         except ValueError as e:
             msg = f"Failed to identify index variable in path template: {e}"
-            logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2221,7 +2480,6 @@ class OSManager:
         if index_info is None:
             # No unresolved variables - cannot auto-increment
             msg = "No index variable found in path template"
-            logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2231,7 +2489,7 @@ class OSManager:
         next_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
 
         # Resolve path with the index
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
         try:
             if next_index is None:
                 # Optional index variable with base filename available
@@ -2242,7 +2500,6 @@ class OSManager:
                 available_filename = parsed_macro.resolve(index_vars, secrets_manager)
         except MacroResolutionError as e:
             msg = f"Failed to resolve path template: {e}"
-            logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
                 result_details=msg,
@@ -2256,16 +2513,17 @@ class OSManager:
             else "Found available filename (no index needed)",
         )
 
+    @handles(GetNextVersionIndexRequest)
     def on_get_next_version_index_request(self, request: GetNextVersionIndexRequest) -> ResultPayload:
         """Handle a request to find the next available version index via a single glob pass."""
-        parsed_macro = request.macro_path.parsed_macro
-        variables = request.macro_path.variables
+        scan_macro_path = self._bind_project_variables_for_index_scan(request.macro_path)
+        parsed_macro = scan_macro_path.parsed_macro
+        variables = scan_macro_path.variables
 
         try:
             index_info = self._identify_index_variable(parsed_macro, variables)
         except ValueError as e:
             msg = f"Attempted to find next version index. Failed: {e}"
-            logger.error(msg)
             return GetNextVersionIndexResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2273,7 +2531,6 @@ class OSManager:
 
         if index_info is None:
             msg = "Attempted to find next version index. Failed because no unresolved {_index} variable was found in the macro template."
-            logger.error(msg)
             return GetNextVersionIndexResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
                 result_details=msg,
@@ -2288,8 +2545,16 @@ class OSManager:
             else "Base path is available (no index needed)",
         )
 
-    def on_write_file_request(self, request: WriteFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
-        """Handle a request to write content to a file with exclusive locking."""
+    @handles(WriteFileRequest)
+    async def on_write_file_request(self, request: WriteFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+        """Write content to a file with exclusive locking, returning once it is on disk.
+
+        Everything that reads engine state runs on the thread driving this coroutine: macro
+        resolution, the config read, the codec vet, the index scan, and the collision policy.
+        Manager state has no locks, so none of that may move to a worker thread. Only the two
+        steps that touch no engine state and take seconds for a large file are handed to a worker
+        thread: re-encoding image bytes with workflow metadata, and writing the bytes to disk.
+        """
         # Initialize success tracking variables
         final_file_path: Path | None = None
         final_bytes_written: int | None = None
@@ -2300,7 +2565,9 @@ class OSManager:
         # writes, and only if the macro author opted in via `:NN` padding.
         if isinstance(request.file_path, MacroPath):
             macro_path = request.file_path
-            path_display = f"{macro_path.parsed_macro}"
+            # The readable template string, not the ParsedMacro dataclass repr, which dumps
+            # the whole segment tree into every error message below.
+            path_display = macro_path.parsed_macro.template
             # First-attempt resolve: for CREATE_NEW, a missing sequence slot is EXPECTED —
             # the failure is the signal the seed-and-retry logic below uses to pick which
             # slot to auto-allocate. Demote the log level so the probing miss doesn't
@@ -2379,18 +2646,56 @@ class OSManager:
                 result_details=msg,
             )
 
-        # Sniff bytes ONCE and align the destination suffix to the sniffed format
-        # before any scan, write, or candidate generation runs. Without this, the
-        # scan globs the template's suffix while the post-write rename moves the
-        # file to the sniffed suffix; the next CREATE_NEW save with the same bytes
-        # globs the wrong family, returns an already-used index, writes, and the
-        # rename clobbers the prior save. (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
+        # Sniff bytes ONCE up front. The sniffed format drives two independent
+        # decisions -- the codec-permission vet (which must run even for
+        # extension-less destinations) and the extension-coercion planner
+        # (only relevant when there IS a destination extension to reconcile).
+        # ``sniff_extension`` returns None for non-bytes content, so a non-None
+        # sniffed_ext also implies ``request.content`` is bytes; downstream code
+        # relies on that.
+        sniffed_ext = (
+            self.engine.artifact_manager.sniff_extension(request.content)
+            if isinstance(request.content, bytes)
+            else None
+        )
+
+        # Write vet. Runs BEFORE extension coercion so an extension-less
+        # destination (e.g. "movie") does not silently bypass the gate --
+        # sniff on bytes is independent of the destination suffix. Appends
+        # skip the vet: the tail alone has no container header to classify.
+        # Whether the vet actually does any work is the provider's call:
+        # opting out is a single ``None`` return in ``get_write_vetting_policy``,
+        # short-circuited inside ``_run_write_vet``.
+        if sniffed_ext is not None and not request.append:
+            vet_failure = self._run_write_vet(
+                content=request.content,  # type: ignore[arg-type]
+                sniffed_ext=sniffed_ext,
+                file_path=file_path,
+                caller_variables=request.file_path.variables if isinstance(request.file_path, MacroPath) else None,
+            )
+            if vet_failure is not None:
+                return vet_failure
+
+        # Align the destination suffix to the sniffed format before any scan,
+        # write, or candidate generation runs. Without this, the scan globs
+        # the template's suffix while the post-write rename moves the file to
+        # the sniffed suffix; the next CREATE_NEW save with the same bytes
+        # globs the wrong family, returns an already-used index, writes, and
+        # the rename clobbers the prior save.
+        # (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
         # Strict mode fails here before touching the disk.
-        alignment = self._apply_extension_coercion(request, file_path)
+        alignment = self._apply_extension_coercion(request, file_path, sniffed_ext)
         if isinstance(alignment, WriteFileResultFailure):
             return alignment
-        sniffed_ext = alignment.sniffed_ext
         file_path = alignment.aligned_path
+        # ``alignment.sniffed_ext`` is the *swap-only* signal: non-None only
+        # when the on-disk suffix was actually rewritten. Do NOT reuse the raw
+        # ``sniffed_ext`` local for on-disk-name-sensitive downstream code
+        # (indexed-fallback walk, sidecar update). The raw sniff is truthy
+        # for alias pairs too (jpg/jpeg, tif/tiff, m4v/mp4), where the file
+        # lands at the caller's requested suffix and downstream consumers
+        # would otherwise disagree with the on-disk name.
+        swapped_ext = alignment.sniffed_ext
 
         # Normalize path
         normalized_path = normalize_path_for_platform(file_path)
@@ -2400,9 +2705,15 @@ class OSManager:
         if (
             isinstance(content, bytes)
             and not request.skip_metadata_injection
-            and GriptapeNodes.ConfigManager().get_config_value("auto_inject_workflow_metadata")
+            and self.engine.config_manager.get_config_value("auto_inject_workflow_metadata")
         ):
-            content = GriptapeNodes.ArtifactManager().prepare_content_for_write(content, file_path.name)
+            # The provider lookup and metadata collection read engine state, so they stay on the
+            # loop; only the re-encode with the collected metadata goes to a worker thread.
+            provider = self.engine.artifact_manager.provider_for_write(file_path.name)
+            if provider is not None:
+                metadata = provider.collect_metadata_for_write(file_path.name)
+                if metadata:
+                    content = await to_thread(provider.prepare_content_for_write, content, file_path.name, metadata)
 
         # Now attempt the write, based on our collision (existing file) policy.
         match request.existing_file_policy:
@@ -2415,16 +2726,39 @@ class OSManager:
                 else:
                     mode = "a" if request.append else "w"  # Append or overwrite
 
-                # Perform the write operation using helper
-                result = self._attempt_file_write(
-                    normalized_path=Path(normalized_path),
-                    content=content,
-                    encoding=request.encoding,
-                    mode=mode,
-                    file_path_display=file_path,
-                    fail_if_file_exists=True,  # FAIL policy always fails on file exists
-                    fail_if_file_locked=True,
-                )
+                if mode == "w":
+                    # Whole-file overwrites go through a sibling temp file + rename
+                    # instead of truncating in place, so a concurrent reader (e.g. the
+                    # static server streaming a preview to a browser) never observes a
+                    # zero-length or partially-written destination. The rename replaces
+                    # portalocker as the concurrency mechanism here: concurrent
+                    # overwrites are last-rename-wins, and writer interleaving is
+                    # impossible because each writer fills a private sibling.
+                    result = await to_thread(
+                        self._attempt_atomic_file_write,
+                        normalized_path=Path(normalized_path),
+                        content=content,
+                        encoding=request.encoding,
+                        file_path_display=file_path,
+                    )
+                else:
+                    # The other modes cannot use rename semantics and keep the
+                    # portalocker-locked in-place write: append ("a") mutates the
+                    # existing file, so writer mutual exclusion is the only thing
+                    # keeping two appenders from interleaving; exclusive create ("x",
+                    # the FAIL policy) gets its atomicity from O_EXCL, and its
+                    # FileExistsError signal plus the debris cleanup around it are
+                    # load-bearing for the CREATE_NEW candidate walk.
+                    result = await to_thread(
+                        self._attempt_file_write,
+                        normalized_path=Path(normalized_path),
+                        content=content,
+                        encoding=request.encoding,
+                        mode=mode,
+                        file_path_display=file_path,
+                        fail_if_file_exists=True,  # FAIL policy always fails on file exists
+                        fail_if_file_locked=True,
+                    )
                 if result.failure_reason is not None:
                     # error_message is guaranteed to be set when failure_reason is set
                     return WriteFileResultFailure(
@@ -2440,7 +2774,8 @@ class OSManager:
                 # Path already validated and ready to use (handled at method top)
 
                 # TRY-FIRST: Attempt to write to the requested path
-                result = self._attempt_file_write(
+                result = await to_thread(
+                    self._attempt_file_write,
                     normalized_path=Path(normalized_path),
                     content=content,
                     encoding=request.encoding,
@@ -2520,26 +2855,43 @@ class OSManager:
                     #    via `_resolve_macro_path_to_string` so project directories get
                     #    substituted. Skip the filesystem scan; just walk forward.
                     #
-                    #    Starting index depends on whether the seed already tried index=1:
-                    #    - Required `{x:NN}`: seed in COMMON SETUP assigned 1 → start at 2.
-                    #    - Optional `{x?:NN}`: seed didn't fire (it's gated on required);
-                    #      the first attempt resolved with the slot OMITTED → start at 1
-                    #      so this loop is the FIRST place we try a value.
+                    #    Three starting-index cases depending on whether the slot was
+                    #    bound at request time, and (if unbound) whether the seed gate
+                    #    in COMMON SETUP already tried 1:
+                    #    - Bound to value N (caller reverse-matched an existing file,
+                    #      e.g. `_index=7` from `my_file_v007.py`): start at N+1.
+                    #      The slot's value is the "current version"; we want the next.
+                    #    - Required `{x:NN}` unbound: seed in COMMON SETUP assigned 1 →
+                    #      start at 2.
+                    #    - Optional `{x?:NN}` unbound: seed didn't fire (it's gated on
+                    #      required); the first attempt resolved with the slot OMITTED
+                    #      → start at 1 so this loop is the FIRST place we try a value.
                     # B. Synthesized MacroPath from `_convert_str_path_to_macro_with_index`
                     #    — variables is empty, template is fully static except `{_index}`.
                     #    Run the existing scan to find a starting index (`output.png`
                     #    exists, scan finds `output_1.png`, …, `output_4.png`, returns 5).
                     walking_original = padded_index_var is not None
                     if walking_original:
-                        # padded_index_var is the var the walk targets. is_required tells
-                        # us whether the seed already tried 1 in COMMON SETUP.
-                        start_idx = 2 if padded_index_var.info.is_required else 1
+                        # padded_index_var is the var the walk targets. Three cases:
+                        bound_value = (
+                            request.file_path.variables.get(padded_index_var.info.name)
+                            if isinstance(request.file_path, MacroPath)
+                            else None
+                        )
+                        if isinstance(bound_value, int):
+                            start_idx = bound_value + 1
+                        elif padded_index_var.info.is_required:
+                            # Seed already tried 1 in COMMON SETUP.
+                            start_idx = 2
+                        else:
+                            # Optional + unbound: seed didn't fire; this loop is the first try.
+                            start_idx = 1
                     else:
                         starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
                         start_idx = starting_index if starting_index is not None else 1
 
                     # Try indexed candidates on-demand (up to max attempts)
-                    secrets_manager = GriptapeNodes.SecretsManager()
+                    secrets_manager = self.engine.secrets_manager
                     attempted_count = 0
 
                     for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
@@ -2602,9 +2954,13 @@ class OSManager:
                         # try-first attempt. The synthesized-macro path inherits this
                         # because its template comes from the already-swapped file_path;
                         # the walking-original path uses the user's original suffix and
-                        # needs this swap every iteration.
-                        if sniffed_ext is not None:
-                            candidate_path = candidate_path.with_suffix(f".{sniffed_ext}")
+                        # needs this swap every iteration. Use ``swapped_ext`` (non-None
+                        # only when a genuine swap happened) rather than the raw sniff:
+                        # alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) leave the on-disk
+                        # suffix at the caller's request, and the walked candidate must
+                        # follow suit.
+                        if swapped_ext is not None:
+                            candidate_path = candidate_path.with_suffix(f".{swapped_ext}")
 
                         # Ensure parent directory for this candidate
                         parent_failure_reason = self._ensure_parent_directory_ready(
@@ -2617,7 +2973,8 @@ class OSManager:
                         normalized_candidate_path = normalize_path_for_platform(candidate_path)
 
                         # Try to write this indexed candidate using helper
-                        result = self._attempt_file_write(
+                        result = await to_thread(
+                            self._attempt_file_write,
                             normalized_path=Path(normalized_candidate_path),
                             content=content,
                             encoding=request.encoding,
@@ -2656,19 +3013,23 @@ class OSManager:
         # Sidecar provenance must reflect the on-disk extension, not the requested one.
         # The actual reconciliation already happened at the top of the handler via
         # the sniff-and-swap; this just keeps the sidecar's file_extension variable
-        # (when present) consistent with what the bytes turned out to be.
+        # (when present) consistent with what the bytes turned out to be. Use
+        # ``swapped_ext`` (non-None only when a genuine swap happened) rather
+        # than the raw sniff: for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the
+        # file lands at the caller's requested suffix, and the sidecar's
+        # ``file_extension`` should stay whatever the caller supplied.
         if (
-            sniffed_ext is not None
+            swapped_ext is not None
             and request.file_metadata is not None
             and request.file_metadata.situation is not None
         ):
             sidecar_variables = request.file_metadata.situation.variables
             if sidecar_variables is not None and "file_extension" in sidecar_variables:
-                sidecar_variables["file_extension"] = sniffed_ext
+                sidecar_variables["file_extension"] = swapped_ext
 
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:
-            write_sidecar(final_file_path, request.file_metadata)
+            write_sidecar(final_file_path, request.file_metadata, self.engine)
 
         if used_indexed_fallback:
             msg = f"File written to indexed path: {final_file_path} (original path '{path_display}' already existed)"
@@ -2682,27 +3043,245 @@ class OSManager:
             result_details=result_details,
         )
 
+    @handles(WriteTempFileRequest)
+    def on_write_temp_file_request(self, request: WriteTempFileRequest) -> ResultPayload:
+        """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path.
+
+        Distinct from ``on_write_file_request``: callers do not choose the
+        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. Thin
+        wrapper around ``_stage_bytes_at_temp``; the shared helper is what the
+        internal codec-vet path calls without re-entering ``handle_request``.
+
+        The handler does NOT synthesize any variable bindings on the caller's
+        behalf. Callers are responsible for supplying enough variables to
+        fully resolve the macro (unresolved required slots surface as a
+        Failure); if a caller wants collision-safe filenames they must include
+        a uuid or similar in ``variables["file_name_base"]``.
+        """
+        try:
+            outcome = self._stage_bytes_at_temp(request.content, request.variables)
+        except StagingFailedError as exc:
+            return WriteTempFileResultFailure(
+                failure_reason=exc.failure_reason,
+                result_details=str(exc),
+            )
+        return WriteTempFileResultSuccess(
+            staged_path=outcome.staged_path,
+            bytes_written=outcome.bytes_written,
+            result_details=f"Temp file written at {outcome.staged_path}",
+        )
+
+    def _stage_bytes_at_temp(self, content: bytes, variables: MacroVariables) -> _StagedTempOutcome:
+        """Land ``content`` at the SAVE_TEMP_FILE path resolved with ``variables``.
+
+        Resolves the SAVE_TEMP_FILE situation, resolves its macro against the
+        caller's variables (merged with project builtins by
+        ``GetPathForMacroRequest``), ensures the parent dir, and delegates the
+        write to ``_attempt_file_write``. Called by both the public
+        ``on_write_temp_file_request`` handler and the internal codec-vet path
+        in ``on_write_file_request``. The vet path calls this directly rather
+        than round-tripping through ``handle_request`` so a provider vetting a
+        path never re-enters the request dispatcher.
+
+        Raises ``StagingFailedError`` on any failure, tagged with the
+        ``FileIOFailureReason`` that would have appeared in the request result.
+        """
+        situation_result = self.engine.handle_request(
+            GetSituationRequest(situation_name=BuiltInSituation.SAVE_TEMP_FILE)
+        )
+        if not isinstance(situation_result, GetSituationResultSuccess):
+            msg = (
+                f"Attempted to write temp file. Failed because the '{BuiltInSituation.SAVE_TEMP_FILE}' "
+                f"situation is not registered in the current project template."
+            )
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        try:
+            parsed_macro = ParsedMacro(situation_result.situation.macro)
+        except MacroSyntaxError as exc:
+            msg = f"Attempted to write temp file. Failed to parse SAVE_TEMP_FILE macro: {exc}"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH) from exc
+
+        path_result = self.engine.handle_request(GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables))
+        if not isinstance(path_result, GetPathForMacroResultSuccess):
+            msg = f"Attempted to write temp file. Failed to resolve SAVE_TEMP_FILE macro: {path_result.result_details}"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        staged_path = path_result.absolute_path
+
+        parent_failure_reason = self._ensure_parent_directory_ready(staged_path, create_parents=True)
+        if parent_failure_reason is not None:
+            msg = f"Attempted to write temp file at '{staged_path}'. Failed to prepare parent directory."
+            raise StagingFailedError(msg, parent_failure_reason)
+
+        normalized_path = normalize_path_for_platform(staged_path)
+        attempt = self._attempt_file_write(
+            normalized_path=Path(normalized_path),
+            content=content,
+            encoding="utf-8",  # ignored for bytes content
+            mode="w",
+            file_path_display=staged_path,
+            fail_if_file_exists=False,  # uuid stem makes this unreachable, but be explicit
+            fail_if_file_locked=True,
+        )
+        if attempt.failure_reason is not None:
+            # ``error_message`` is guaranteed set when ``failure_reason`` is set.
+            raise StagingFailedError(attempt.error_message or "unknown write failure", attempt.failure_reason)
+        # ``bytes_written`` is guaranteed set on the success path.
+        return _StagedTempOutcome(staged_path=str(staged_path), bytes_written=attempt.bytes_written)  # type: ignore[arg-type]
+
+    def _truncate_and_delete_staged(self, staged_path: str) -> None:
+        r"""Neutralize and remove a staged codec-vet temp file.
+
+        Truncate the file to a single ``\x00`` byte, then delete it. Truncate
+        first so that even if the delete fails, whatever remains on disk
+        cannot be interpreted as a video: ffprobe on a 1-byte file finds no
+        container header. Delete second so the normal case leaves nothing
+        behind.
+
+        The truncate calls ``_attempt_file_write`` directly rather than
+        dispatching ``WriteFileRequest`` -- routing a single null byte back
+        through ``on_write_file_request`` would re-run the sniff / vet /
+        extension-coercion pipeline against the very cleanup path that just
+        stripped the bytes we care about. Sniffing that byte is harmless
+        today (returns None), but any future check bolted onto the write
+        handler would fire on cleanup too.
+
+        The delete dispatches ``DeleteFileRequest`` via ``handle_request``,
+        specifically so it flows through ``on_delete_file_request``: that's
+        where workspace containment, permanent-vs-trash policy, and audit
+        logging live. Skipping the request layer here would silently opt
+        codec-vet cleanup out of every one of those.
+
+        Best-effort: logs on failure, never raises. A cleanup failure must
+        not mask the vet's real result.
+        """
+        try:
+            normalized = Path(normalize_path_for_platform(Path(staged_path)))
+            attempt = self._attempt_file_write(
+                normalized_path=normalized,
+                content=b"\x00",
+                encoding="utf-8",
+                mode="w",
+                file_path_display=staged_path,
+                fail_if_file_exists=False,
+                fail_if_file_locked=True,
+            )
+            if attempt.failure_reason is not None:
+                logger.error(
+                    "Attempted to truncate staged codec-vet temp at '%s'. Failed: %s",
+                    staged_path,
+                    attempt.error_message,
+                )
+        except OSError as exc:
+            logger.error("Attempted to truncate staged codec-vet temp at '%s'. Failed: %s", staged_path, exc)
+
+        delete_result = self.engine.handle_request(
+            DeleteFileRequest(
+                path=staged_path,
+                workspace_only=False,
+                deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
+            )
+        )
+        if not isinstance(delete_result, DeleteFileResultSuccess):
+            logger.error(
+                "Attempted to delete staged codec-vet temp at '%s'. Failed: %s (file has been truncated).",
+                staged_path,
+                delete_result.result_details,
+            )
+
+    def _run_write_vet(
+        self,
+        *,
+        content: bytes,
+        sniffed_ext: str,
+        file_path: Path,
+        caller_variables: MacroVariables | None,
+    ) -> WriteFileResultFailure | None:
+        """Ask the format's provider to vet the pending write.
+
+        Reads the provider's declared ``WriteVettingPolicy`` and dispatches
+        accordingly:
+
+        - ``None`` -- provider opts out. No staging, no dispatch, no cost.
+        - ``FROM_BYTES`` -- hand the raw bytes to the provider directly.
+        - ``FROM_PATH`` -- stage bytes at the SAVE_TEMP_FILE path, hand the
+          resulting path to the provider, and truncate + delete the staged
+          file in a ``finally`` regardless of outcome. Staging failure is
+          treated as fail-closed: an unstageable vet cannot verify the write.
+
+        Returns a ``WriteFileResultFailure`` when the vet refuses (or fails
+        closed), or ``None`` when the write is permitted.
+
+        An unrecognized ``WriteVettingPolicy`` raises loudly: silently
+        falling through would let a policy variant added without updating
+        this switch bless every write that reached it.
+        """
+        artifact_manager = self.engine.artifact_manager
+        policy = artifact_manager.get_write_vetting_policy(sniffed_ext)
+        denial: CheckpointDenial | None = None
+
+        match policy:
+            case None:
+                return None
+            case WriteVettingPolicy.FROM_BYTES:
+                denial = artifact_manager.check_write_format_from_bytes(content, sniffed_ext)
+            case WriteVettingPolicy.FROM_PATH:
+                staging_variables: MacroVariables = dict(caller_variables) if caller_variables else {}
+                # Vet's required overrides sit on top of caller variables --
+                # ``file_name_base`` must be a uuid to keep concurrent vet
+                # stagings from colliding under SAVE_TEMP_FILE's OVERWRITE
+                # policy; ``file_extension`` must match the sniffed container
+                # so ffprobe's extension-based demuxer dispatch picks correctly.
+                staging_variables["file_name_base"] = uuid.uuid4().hex
+                staging_variables["file_extension"] = sniffed_ext
+
+                try:
+                    outcome = self._stage_bytes_at_temp(content, staging_variables)
+                except StagingFailedError as exc:
+                    return WriteFileResultFailure(
+                        failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                        result_details=(f"Cannot save '{file_path.name}': staging for verification failed ({exc})."),
+                    )
+                try:
+                    denial = artifact_manager.check_write_format_from_path(outcome.staged_path, sniffed_ext)
+                finally:
+                    self._truncate_and_delete_staged(outcome.staged_path)
+            case _:
+                msg = f"Unrecognized WriteVettingPolicy '{policy}' returned by provider for format '{sniffed_ext}'."
+                raise RuntimeError(msg)
+
+        if denial is None:
+            return None
+        return WriteFileResultFailure(
+            failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+            result_details=f"Cannot save '{file_path.name}': {denial.reason()}",
+        )
+
     def _apply_extension_coercion(
         self,
         request: WriteFileRequest,
         file_path: Path,
+        sniffed_ext: str | None,
     ) -> ExtensionAlignment | WriteFileResultFailure:
-        """Reconcile the destination suffix with the sniffed byte format.
+        """Reconcile the destination suffix with the pre-sniffed byte format.
 
-        Runs once at the top of ``on_write_file_request`` so the planner and the
-        on-disk filename agree on the extension before any scan or write begins.
-        The two relevant signals are the sniffed canonical extension and the
-        path's current suffix:
+        ``on_write_file_request`` sniffs once up front and hands the result in,
+        so this method never sniffs on its own; its single responsibility is
+        deciding whether to rewrite the destination suffix.
 
-        - No bytes / unrecognized bytes / empty suffix → no swap; pass the path
-          through unchanged. An unrecognized-bytes case logs a warning so callers
-          can spot it in logs.
+        The three relevant signals are the pre-sniffed extension, the path's
+        current suffix, and ``coerce_extension_to_match_bytes``:
+
+        - No sniff / no bytes / empty destination suffix → no swap; pass the
+          path through unchanged. Unrecognized bytes with a non-empty suffix
+          log a warning so callers can spot it in logs.
         - Sniffed matches the path's canonical suffix → no swap.
         - Sniffed differs and ``coerce_extension_to_match_bytes=True`` (default)
           → swap to the sniffed suffix and return the new path.
-        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` → return
-          a ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the caller
-          can early-exit before touching the disk.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` →
+          return ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the
+          caller can early-exit before touching the disk.
         """
         content = request.content
         if not isinstance(content, bytes):
@@ -2712,8 +3291,7 @@ class OSManager:
         if not destination_suffix:
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
-        sniffed = GriptapeNodes.ArtifactManager().sniff_extension(content)
-        if sniffed is None:
+        if sniffed_ext is None:
             logger.warning(
                 "Attempted to identify the format of bytes destined for '%s'. "
                 "Could not recognize the bytes as a known file format, so the file will be written "
@@ -2723,30 +3301,30 @@ class OSManager:
             )
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
-        if canonical_extension(destination_suffix) == canonical_extension(sniffed):
+        if canonical_extension(destination_suffix) == canonical_extension(sniffed_ext):
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
         if not request.coerce_extension_to_match_bytes:
             msg = (
-                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed}'. "
+                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed_ext}'. "
                 f"Failed because the requested extension '.{destination_suffix}' does not match the "
                 f"byte content and coerce_extension_to_match_bytes=False. Either rename the destination "
-                f"to '.{sniffed}' or supply bytes that match '.{destination_suffix}'."
+                f"to '.{sniffed_ext}' or supply bytes that match '.{destination_suffix}'."
             )
             return WriteFileResultFailure(
                 failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
                 result_details=msg,
             )
 
-        aligned_path = file_path.with_suffix(f".{sniffed}")
+        aligned_path = file_path.with_suffix(f".{sniffed_ext}")
         logger.warning(
             "Attempted to write '%s'. The bytes look like '.%s', so the destination has been "
             "adjusted to '%s' to match the byte content.",
             file_path,
-            sniffed,
+            sniffed_ext,
             aligned_path,
         )
-        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed)
+        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed_ext)
 
     def _ensure_parent_directory_ready(
         self,
@@ -2776,6 +3354,108 @@ class OSManager:
             return FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
         return None
+
+    def _attempt_atomic_file_write(  # noqa: PLR0911
+        self,
+        normalized_path: Path,
+        content: str | bytes,
+        encoding: str,
+        file_path_display: str | Path,
+    ) -> FileWriteAttemptResult:
+        """Overwrite a file atomically via ``atomic_write_bytes``, mapping errors.
+
+        The destination holds either its prior content or the full new content —
+        readers never see a truncated file, and a failed write (including disk
+        full) leaves the previous file intact instead of destroying it first the
+        way an in-place truncate does.
+
+        Args:
+            normalized_path: The normalized destination path
+            content: Content to write (str or bytes)
+            encoding: Encoding for text content
+            file_path_display: Path to use in error messages
+
+        Returns:
+            FileWriteAttemptResult with either bytes_written set (success) or
+            failure_reason and error_message set (failure). Never returns the
+            continue signal — overwrites have no fallback candidates.
+        """
+        if isinstance(content, bytes):
+            data = content
+        else:
+            # Text mode translates every "\n" to os.linesep ("\r\n" on Windows);
+            # this path writes raw bytes, so translate here or every text save
+            # on Windows lands with bare LF.
+            if os.linesep != "\n":
+                content = content.replace("\n", os.linesep)
+            try:
+                data = content.encode(encoding)
+            except UnicodeEncodeError as e:
+                msg = f"Attempted to write to file '{file_path_display}'. Failed because the text could not be encoded as {encoding}: {e}"
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.ENCODING_ERROR,
+                    error_message=msg,
+                )
+
+        try:
+            atomic_write_bytes(normalized_path, data)
+        except IsADirectoryError as e:
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to path is a directory: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.IS_DIRECTORY,
+                error_message=msg,
+            )
+        except PermissionError as e:
+            # On Windows, renaming onto a destination that another process holds
+            # open (without FILE_SHARE_DELETE) raises PermissionError. That is
+            # contention, not a permissions problem — retrying after the reader
+            # closes succeeds — so report it as a lock. Classify off the error's
+            # own winerror (sharing/lock violation) rather than probing the
+            # filesystem afterward, which could observe a different state than
+            # the one that caused the failure. winerror is None off-Windows.
+            windows_contention_codes = (32, 33)  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+            if getattr(e, "winerror", None) in windows_contention_codes:
+                msg = f"Attempted to write to file '{file_path_display}'. Failed because the file is in use by another process: {e}"
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.FILE_LOCKED,
+                    error_message=msg,
+                )
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to permission denied: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                error_message=msg,
+            )
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                # The swap needs the old and new file to coexist briefly, so a
+                # nearly-full volume fails here — cleanly, with the previous
+                # file untouched. Say so in terms an artist can act on.
+                msg = (
+                    f"Attempted to write to file '{file_path_display}'. "
+                    f"Failed because the disk holding it is full. The previous version of the file was left unchanged. "
+                    f"Free up space on that drive and try again."
+                )
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.DISK_FULL,
+                    error_message=msg,
+                )
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to I/O error: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.IO_ERROR,
+                error_message=msg,
+            )
+
+        return FileWriteAttemptResult(
+            bytes_written=len(data),
+            failure_reason=None,
+            error_message=None,
+        )
 
     def _attempt_file_write(  # noqa: PLR0911, PLR0913
         self,
@@ -2868,9 +3548,7 @@ class OSManager:
                 error_message=msg,
             )
 
-    def _write_with_portalocker(  # noqa: C901
-        self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str
-    ) -> int:
+    def _write_with_portalocker(self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str) -> int:
         """Write content to a file with exclusive lock using portalocker.
 
         Args:
@@ -2893,22 +3571,7 @@ class OSManager:
         error_details = None
 
         try:
-            # Determine binary vs text mode
-            if isinstance(content, bytes):
-                file_mode = mode + "b"
-            else:
-                file_mode = mode
-
-            with portalocker.Lock(
-                normalized_path,
-                mode=file_mode,  # type: ignore[arg-type]
-                encoding=encoding if isinstance(content, str) else None,
-                timeout=0,  # Non-blocking
-                flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
-            ) as fh:
-                fh.write(content)
-                fh.flush()
-                os.fsync(fh.fileno())
+            self._write_locked_discarding_debris(normalized_path, content, encoding, mode=mode)
 
             # Calculate bytes written
             if isinstance(content, bytes):
@@ -2929,12 +3592,65 @@ class OSManager:
             # Check for disk full
             if "No space left" in str(e) or "Disk full" in str(e):
                 error_details = f"Disk full: {e}"
-                logger.error(error_details)
                 raise OSError(error_details) from e
             raise
-        except Exception as e:
-            error_details = f"Unexpected error: {type(e).__name__}: {e}"
-            logger.error(error_details)
+
+    def _write_locked_discarding_debris(
+        self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str
+    ) -> None:
+        """Write under an exclusive lock, removing the file if the write fails.
+
+        portalocker opens the file before it acquires the lock, so under ``mode="x"`` the
+        file exists by the time a lock failure or a write/fsync error is raised. Leaving it
+        there is what breaks the CREATE_NEW collision loop: that loop treats a lock failure
+        as "try the next candidate," so debris accumulates one file per index until every
+        candidate slot is taken and all later saves fail with "could not find available
+        filename" (griptape-ai/internal#178).
+
+        Removing it is safe because ``mode="x"`` maps to ``O_EXCL``, whose create is atomic:
+        if anything already holds the name -- a file, a directory, or a symlink, live or
+        dangling -- ``open()`` raises ``FileExistsError`` and the cleanup is never reached.
+        The unlink is therefore reachable only after *our* create succeeded, which both
+        proves the file is ours and rules out a concurrent writer sneaking a file in between
+        (their create would have lost the race to ours). That proof rests entirely on the
+        exclusive-create flag, so ``file_mode`` is derived here rather than accepted from the
+        caller: a caller passing ``mode="x"`` alongside a non-exclusive open would arm the
+        unlink against a pre-existing file.
+
+        Args:
+            normalized_path: Platform-normalized path string to write to
+            content: Content to write (str or bytes)
+            encoding: Text encoding (ignored for bytes content)
+            mode: Logical write mode ("x", "w", or "a"). Only "x" enables cleanup.
+
+        Raises:
+            Exception: Whatever the write raised, after cleanup.
+        """
+        # Binary flag belongs to the payload, not the caller's policy.
+        file_mode = mode + "b" if isinstance(content, bytes) else mode
+
+        try:
+            with portalocker.Lock(
+                normalized_path,
+                mode=file_mode,  # type: ignore[arg-type]
+                encoding=encoding if isinstance(content, str) else None,
+                timeout=0,  # Non-blocking
+                flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+            ) as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+        # LOAD-BEARING, despite the blanket handler below also re-raising: this arm is what
+        # keeps the unlink away from a file we did not create. O_EXCL raises FileExistsError
+        # when the name is already taken, so returning here is the only thing standing
+        # between a lost race and deleting the winner's file. Do not merge it into the
+        # handler below.
+        except FileExistsError:
+            raise
+        except Exception:
+            if mode == "x":
+                with contextlib.suppress(OSError):
+                    Path(normalized_path).unlink()
             raise
 
     def _copy_file(self, src_path: Path, dest_path: Path) -> int:
@@ -2955,8 +3671,33 @@ class OSManager:
         src_normalized = normalize_path_for_platform(src_path)
         dest_normalized = normalize_path_for_platform(dest_path)
 
-        # Copy file preserving metadata
-        shutil.copy2(src_normalized, dest_normalized)
+        # Copy file preserving metadata.
+        #
+        # We deliberately avoid shutil.copy2 here. copy2 copies the contents and
+        # then calls shutil.copystat to replicate metadata, which on BSD-derived
+        # platforms (macOS) includes BSD file flags via os.chflags(). SMB mounts
+        # surface the DOS "archive" attribute as SF_ARCHIVED, and that flag can
+        # only be set by root on a local volume -- so chflags(dst, SF_ARCHIVED)
+        # raises EPERM. copystat only swallows EOPNOTSUPP/ENOTSUP, not EPERM, so
+        # the exception propagates and the whole copy is reported as failed even
+        # though the file contents copied fine (see issue #5109).
+        #
+        # Instead, copy contents explicitly and then best-effort the metadata,
+        # ignoring an EPERM raised by the flags step so metadata that can't be
+        # replicated on the destination filesystem doesn't fail the copy.
+        shutil.copyfile(src_normalized, dest_normalized)
+        try:
+            shutil.copystat(src_normalized, dest_normalized)
+        except PermissionError:
+            # chflags() couldn't replicate BSD file flags on the destination
+            # (e.g. SF_ARCHIVED on an SMB mount). Contents and the permission
+            # bits that matter are already in place; the copy has effectively
+            # succeeded, so warn rather than fail.
+            logger.warning(
+                "Could not replicate all file metadata from %s to %s (EPERM); file contents copied successfully.",
+                src_normalized,
+                dest_normalized,
+            )
 
         # Return size of copied file
         return Path(src_normalized).stat().st_size
@@ -3083,9 +3824,12 @@ class OSManager:
             logger.error("Directory %s does not exist. Skipping cleanup.", path)
             return 0.0
 
-        for _, _, files in os.walk(path):
+        # os.walk yields file names relative to each iteration's root, so they
+        # must be rejoined against that root rather than the top-level path.
+        for root, _, files in os.walk(path):
+            root_path = Path(root)
             for f in files:
-                fp = path / f
+                fp = root_path / f
                 if not fp.is_symlink():
                     total_size += fp.stat().st_size
         return total_size / (1024 * 1024 * 1024)  # Convert to GB
@@ -3169,6 +3913,7 @@ class OSManager:
 
         return removed_count > 0
 
+    @handles(MakeDirectoryRequest)
     def on_make_directory_request(self, request: MakeDirectoryRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to create a directory."""
         sanitized = sanitize_path_string(request.path)
@@ -3219,6 +3964,7 @@ class OSManager:
             result_details=f"Directory created successfully at {dir_path}",
         )
 
+    @handles(CreateFileRequest)
     def on_create_file_request(self, request: CreateFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         """Handle a request to create a file or directory."""
         # Get the full path
@@ -3226,7 +3972,6 @@ class OSManager:
             full_path_str = request.get_full_path()
         except ValueError as e:
             msg = f"Invalid path specification: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Determine if path is absolute (not constrained to workspace)
@@ -3235,7 +3980,6 @@ class OSManager:
         # If workspace_only is True and path is absolute, it's outside workspace
         if request.workspace_only and is_absolute:
             msg = f"Absolute path is outside workspace: {full_path_str}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Resolve path - if absolute, use as-is; if relative, align to workspace
@@ -3256,43 +4000,37 @@ class OSManager:
             file_path.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError as e:
             msg = f"Permission denied creating parent directory for {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             msg = f"I/O error creating parent directory for {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Create file or directory
         try:
             if request.is_directory:
                 file_path.mkdir()
-                logger.info("Created directory: %s", file_path)
+                logger.debug("Created directory: %s", file_path)
             # Create file with optional content
             elif request.content is not None:
                 with file_path.open("w", encoding=request.encoding) as f:
                     f.write(request.content)
-                logger.info("Created file with content: %s", file_path)
+                logger.debug("Created file with content: %s", file_path)
             else:
                 file_path.touch()
-                logger.info("Created empty file: %s", file_path)
+                logger.debug("Created empty file: %s", file_path)
         except PermissionError as e:
             msg = f"Permission denied creating {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             # Check for disk full
             if "No space left" in str(e) or "Disk full" in str(e):
                 msg = f"Disk full creating {file_path}: {e}"
-                logger.error(msg)
                 return CreateFileResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
 
             msg = f"I/O error creating {file_path}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error creating {file_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return CreateFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -3301,6 +4039,7 @@ class OSManager:
             result_details=f"{'Directory' if request.is_directory else 'File'} created successfully at {file_path}",
         )
 
+    @handles(RenameFileRequest)
     def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
         """Handle a request to rename a file or directory."""
         # Resolve and validate paths
@@ -3308,26 +4047,22 @@ class OSManager:
             old_path = self._resolve_file_path(request.old_path, workspace_only=request.workspace_only is True)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid source path: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         try:
             new_path = self._resolve_file_path(request.new_path, workspace_only=request.workspace_only is True)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid destination path: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if old path exists
         if not old_path.exists():
             msg = f"Source path does not exist: {old_path}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if new path already exists
         if new_path.exists():
             msg = f"Destination path already exists: {new_path}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check workspace constraints for both paths
@@ -3336,7 +4071,6 @@ class OSManager:
 
         if request.workspace_only and (not is_old_in_workspace or not is_new_in_workspace):
             msg = f"One or both paths are outside workspace: {old_path} -> {new_path}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Create parent directories for new path if needed
@@ -3344,11 +4078,9 @@ class OSManager:
             new_path.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError as e:
             msg = f"Permission denied creating parent directory for {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             msg = f"I/O error creating parent directory for {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Perform the rename operation
@@ -3356,15 +4088,12 @@ class OSManager:
             old_path.rename(new_path)
         except PermissionError as e:
             msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             msg = f"I/O error renaming {old_path} to {new_path}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -3375,6 +4104,7 @@ class OSManager:
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    @handles(CopyFileRequest)
     def on_copy_file_request(self, request: CopyFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
         """Handle a request to copy a single file."""
         # Resolve source path
@@ -3383,19 +4113,16 @@ class OSManager:
             source_normalized = normalize_path_for_platform(source_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid source path: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if source exists
         if not Path(source_normalized).exists():
             msg = f"Source file does not exist: {source_path}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if source is a file (not a directory)
         if not Path(source_normalized).is_file():
             msg = f"Source path is not a file: {source_path}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Resolve destination path
@@ -3404,13 +4131,11 @@ class OSManager:
             dest_normalized = normalize_path_for_platform(destination_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid destination path: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if destination already exists (unless overwrite is True)
         if Path(dest_normalized).exists() and not request.overwrite:
             msg = f"Destination file already exists: {destination_path}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Create parent directory if it doesn't exist
@@ -3420,11 +4145,9 @@ class OSManager:
                 dest_parent.mkdir(parents=True)
             except PermissionError as e:
                 msg = f"Permission denied creating parent directory {dest_parent}: {e}"
-                logger.error(msg)
                 return CopyFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
             except OSError as e:
                 msg = f"I/O error creating parent directory {dest_parent}: {e}"
-                logger.error(msg)
                 return CopyFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Copy the file
@@ -3432,20 +4155,16 @@ class OSManager:
             bytes_copied = self._copy_file(source_path, destination_path)
         except PermissionError as e:
             msg = f"Permission denied copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             if "No space left" in str(e) or "Disk full" in str(e):
                 msg = f"Disk full copying {source_path} to {destination_path}: {e}"
-                logger.error(msg)
                 return CopyFileResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
 
             msg = f"I/O error copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error copying {source_path} to {destination_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -3462,7 +4181,7 @@ class OSManager:
 
         https://stackoverflow.com/a/50924863
         """
-        if not GriptapeNodes.OSManager().is_windows():
+        if not OSManager.is_windows():
             return
 
         long_path = Path(normalize_path_for_platform(Path(path)))
@@ -3475,6 +4194,7 @@ class OSManager:
             console.print(f"[red]Details: {e}[/red]")
             raise
 
+    @handles(DeleteFileRequest)
     async def on_delete_file_request(  # noqa: PLR0911, PLR0912, PLR0915, C901
         self, request: DeleteFileRequest
     ) -> DeleteFileResultSuccess | DeleteFileResultFailure:
@@ -3508,7 +4228,7 @@ class OSManager:
         is_directory = await anyio.Path(resolved_path).is_dir()
 
         # Collect all paths that will be deleted (for reporting)
-        if is_directory:
+        if is_directory and request.collect_deleted_paths:
             # Collect all file and directory paths before deletion
             deleted_paths = [str(item) async for item in anyio.Path(resolved_path).rglob("*")]
             deleted_paths.append(str(resolved_path))
@@ -3599,6 +4319,7 @@ class OSManager:
             result_details=result_details,
         )
 
+    @handles(GetFileInfoRequest)
     def on_get_file_info_request(  # noqa: PLR0911
         self, request: GetFileInfoRequest
     ) -> GetFileInfoResultSuccess | GetFileInfoResultFailure:
@@ -3625,8 +4346,12 @@ class OSManager:
         # Get file information
         try:
             is_dir = resolved_path.is_dir()
-            size = 0 if is_dir else resolved_path.stat().st_size
-            modified_time = resolved_path.stat().st_mtime
+            # One stat() call for both fields: two calls can straddle a concurrent
+            # replace and pair one file's size with another's mtime, poisoning the
+            # preview staleness check that compares both against recorded values.
+            stat_result = resolved_path.stat()
+            size = 0 if is_dir else stat_result.st_size
+            modified_time = stat_result.st_mtime
 
             # Get MIME type for files only
             mime_type = None
@@ -3664,6 +4389,7 @@ class OSManager:
             result_details=f"Successfully retrieved file info for path {request.path}",
         )
 
+    @handles(ResolveMacroPathRequest)
     def on_handle_resolve_macro_path_request(
         self, request: ResolveMacroPathRequest
     ) -> ResolveMacroPathResultSuccess | ResolveMacroPathResultFailure:
@@ -3702,19 +4428,16 @@ class OSManager:
             source_normalized = normalize_path_for_platform(source_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid source path: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if source exists
         if not Path(source_normalized).exists():
             msg = f"Source path does not exist: {source_path}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if source is a directory
         if not Path(source_normalized).is_dir():
             msg = f"Source path is not a directory: {source_path}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Resolve and normalize destination path
@@ -3723,13 +4446,11 @@ class OSManager:
             dest_normalized = normalize_path_for_platform(destination_path)
         except (ValueError, RuntimeError) as e:
             msg = f"Invalid destination path: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if destination already exists (unless dirs_exist_ok is True)
         if Path(dest_normalized).exists() and not dirs_exist_ok:
             msg = f"Destination path already exists: {destination_path}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         return CopyTreeValidationResult(
@@ -3843,6 +4564,7 @@ class OSManager:
 
         return CopyTreeStats(files_copied=files_copied, total_bytes_copied=total_bytes_copied)
 
+    @handles(CopyTreeRequest)
     def on_copy_tree_request(self, request: CopyTreeRequest) -> ResultPayload:
         """Handle a request to copy a directory tree."""
         # Validate paths
@@ -3871,20 +4593,16 @@ class OSManager:
             )
         except PermissionError as e:
             msg = f"Permission denied copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
         except OSError as e:
             if "No space left" in str(e) or "Disk full" in str(e):
                 msg = f"Disk full copying {source_path} to {destination_path}: {e}"
-                logger.error(msg)
                 return CopyTreeResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
 
             msg = f"I/O error copying {source_path} to {destination_path}: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
         except Exception as e:
             msg = f"Unexpected error copying {source_path} to {destination_path}: {type(e).__name__}: {e}"
-            logger.error(msg)
             return CopyTreeResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
@@ -3900,8 +4618,9 @@ class OSManager:
     def _register_system_resources_direct(self) -> None:
         """Register OS, CPU, and Compute resource types directly during initialization.
 
-        This method is called during __init__ and uses the event_manager directly
-        to avoid singleton recursion issues with GriptapeNodes.handle_request.
+        This method is called during __init__ and uses the event_manager directly so
+        registration does not re-enter the full request pipeline before the engine has
+        finished wiring itself up.
         """
         self._attempt_generate_os_resources_direct()
         self._attempt_generate_cpu_resources_direct()
@@ -3910,7 +4629,8 @@ class OSManager:
     def _handle_request_direct(self, request: Any) -> Any:
         """Handle a request directly through the event_manager during initialization.
 
-        This bypasses GriptapeNodes.handle_request to avoid singleton recursion.
+        Dispatches straight to the registered callback, skipping the result broadcast and
+        re-entrancy the full request path would add while the engine is still constructing.
         """
         request_type = type(request)
         callback = self._event_manager._request_type_to_manager.get(request_type)
@@ -3969,7 +4689,7 @@ class OSManager:
     def _create_system_os_instance_direct(self) -> None:
         """Create system OS instance (direct version for init)."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4028,7 +4748,7 @@ class OSManager:
         # Register OS resource type
         os_resource_type = OSResourceType()
         register_request = RegisterResourceTypeRequest(resource_type=os_resource_type)
-        result = GriptapeNodes.handle_request(register_request)
+        result = self.engine.handle_request(register_request)
 
         if not isinstance(result, RegisterResourceTypeResultSuccess):
             logger.error("Attempted to register OS resource type. Failed due to resource type registration failure")
@@ -4043,7 +4763,7 @@ class OSManager:
         # Register CPU resource type
         cpu_resource_type = CPUResourceType()
         register_request = RegisterResourceTypeRequest(resource_type=cpu_resource_type)
-        result = GriptapeNodes.handle_request(register_request)
+        result = self.engine.handle_request(register_request)
 
         if not isinstance(result, RegisterResourceTypeResultSuccess):
             logger.error("Attempted to register CPU resource type. Failed due to resource type registration failure")
@@ -4056,14 +4776,14 @@ class OSManager:
     def _create_system_os_instance(self) -> None:
         """Create system OS instance."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
         create_request = CreateResourceInstanceRequest(
             resource_type_name="OSResourceType", capabilities=os_capabilities
         )
-        result = GriptapeNodes.handle_request(create_request)
+        result = self.engine.handle_request(create_request)
 
         if not isinstance(result, CreateResourceInstanceResultSuccess):
             logger.error(
@@ -4082,7 +4802,7 @@ class OSManager:
         create_request = CreateResourceInstanceRequest(
             resource_type_name="CPUResourceType", capabilities=cpu_capabilities
         )
-        result = GriptapeNodes.handle_request(create_request)
+        result = self.engine.handle_request(create_request)
 
         if not isinstance(result, CreateResourceInstanceResultSuccess):
             logger.error(
@@ -4097,7 +4817,7 @@ class OSManager:
         # Register Compute resource type
         compute_resource_type = ComputeResourceType()
         register_request = RegisterResourceTypeRequest(resource_type=compute_resource_type)
-        result = GriptapeNodes.handle_request(register_request)
+        result = self.engine.handle_request(register_request)
 
         if not isinstance(result, RegisterResourceTypeResultSuccess):
             logger.error(
@@ -4117,7 +4837,7 @@ class OSManager:
         create_request = CreateResourceInstanceRequest(
             resource_type_name="ComputeResourceType", capabilities=compute_capabilities
         )
-        result = GriptapeNodes.handle_request(create_request)
+        result = self.engine.handle_request(create_request)
 
         if not isinstance(result, CreateResourceInstanceResultSuccess):
             logger.error(
@@ -4187,19 +4907,9 @@ class OSManager:
         logger.debug("MPS detected: Apple Silicon Mac")
         return True
 
-    def _get_platform_name(self) -> str:
-        """Get platform name using existing sys.platform detection."""
-        if self.is_windows():
-            return Platform.WINDOWS
-        if self.is_mac():
-            return Platform.DARWIN
-        if self.is_linux():
-            return Platform.LINUX
-        return sys.platform
-
     def _get_architecture(self) -> str:
         """Get system architecture, normalized across platforms."""
-        platform = self._get_platform_name()
+        platform = self.platform_name()
         if platform == Platform.WINDOWS:
             arch = os.environ.get("PROCESSOR_ARCHITECTURE", "unknown").lower()
         else:

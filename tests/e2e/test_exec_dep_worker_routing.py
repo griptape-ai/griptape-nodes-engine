@@ -1,0 +1,461 @@
+"""End-to-end tests for the exec-dep worker MVP.
+
+A library that declares execution dependencies (``pip_dependencies_exec``) splits where it
+lives from where it runs:
+
+- It loads its real node classes on the orchestrator, because its node modules import with
+  edit-time deps only.
+- Its nodes EXECUTE in its dedicated worker process, where ``.venv-exec`` is on
+  ``sys.path``.
+- While executing there, node code cannot reach orchestrator-owned managers directly; it
+  asks the orchestrator with a request instead.
+- A value it produces that cannot leave that process fails loudly with instructions.
+
+These tests pin those four behaviors, plus the crucial negative: a library that declares no
+execution dependencies is untouched by any of it.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar, cast
+
+import pytest
+
+from griptape_nodes.exe_types.local_objects import is_reference
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
+from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.execution_events import (
+    ExecuteNodeRequest,
+    ExecuteNodeResultSuccess,
+    NodeMetadata,
+)
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.library_events import (
+    RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultSuccess,
+)
+from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
+    SendNodeMessageRequest,
+    SendNodeMessageResultSuccess,
+)
+
+# The facade import survives for the dummy-manager guard tests, whose subject it is.
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # noqa: TID251
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.testing.offline_wheels import build_wheel, offline_install_flags
+from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
+from griptape_nodes.utils.version_utils import engine_version
+from tests.e2e.fixtures.behavior_preservation_library.behavior_preservation_node import CLICK_ACKNOWLEDGEMENT
+from tests.simulated_worker import sent_from_open_workflow, simulated_worker
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+EXEC_FIXTURE = Path(__file__).parent / "fixtures" / "exec_dep_library"
+NONSERIALIZABLE_FIXTURE = Path(__file__).parent / "fixtures" / "nonserializable_library"
+BEHAVIOR_FIXTURE = Path(__file__).parent / "fixtures" / "behavior_preservation_library"
+
+
+def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manifest field)
+    tmp_path: Path,
+    *,
+    fixture_dir: Path,
+    node_file: str,
+    name: str,
+    exec_dependencies: list[str] | None = None,
+    edit_dependencies: list[str] | None = None,
+    required_resources: dict[str, object] | None = None,
+) -> str:
+    """Register a fixture library, optionally declaring execution dependencies."""
+    library_dir = tmp_path / name.replace(" ", "_")
+    library_dir.mkdir(parents=True, exist_ok=True)
+    schema = json.loads((fixture_dir / "griptape_nodes_library.json").read_text())
+    schema["name"] = name
+    schema["library_schema_version"] = LibrarySchema.LATEST_SCHEMA_VERSION
+    schema["metadata"]["engine_version"] = engine_version
+    dependencies: dict[str, list[str]] = {"pip_dependencies": list(edit_dependencies or [])}
+    if exec_dependencies:
+        wheel_dir = tmp_path / "wheels"
+        for dep in [*(edit_dependencies or []), *exec_dependencies]:
+            build_wheel(wheel_dir, dep, "1.0.0")
+        dependencies["pip_dependencies_exec"] = exec_dependencies
+        dependencies["pip_install_flags"] = offline_install_flags(wheel_dir)
+    elif edit_dependencies:
+        wheel_dir = tmp_path / "wheels"
+        for dep in edit_dependencies:
+            build_wheel(wheel_dir, dep, "1.0.0")
+        dependencies["pip_install_flags"] = offline_install_flags(wheel_dir)
+    schema["metadata"]["dependencies"] = dependencies
+    if required_resources is not None:
+        resources: dict[str, object] = {}
+        if required_resources is not None:
+            resources["required"] = required_resources
+        schema["metadata"]["resources"] = resources
+    library_json = library_dir / "griptape_nodes_library.json"
+    library_json.write_text(json.dumps(schema, indent=2))
+    shutil.copy(fixture_dir / node_file, library_dir / node_file)
+    result = current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    assert isinstance(result, RegisterLibraryFromFileResultSuccess), getattr(result, "result_details", result)
+    return str(library_json)
+
+
+def _library_info(library_json: str) -> LibraryManager.LibraryInfo:
+    return current_engine().library_manager._library_file_path_to_info[library_json]
+
+
+EDIT_DEP = "fakeedit"
+EXEC_DEP = "fakeexec"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_import_state() -> Iterator[None]:
+    """Keep sys.path and sys.modules from leaking between tests.
+
+    Every registration inserts paths and imports modules. Without this, a dependency imported
+    by one test would satisfy the next test's import from the module cache, which would hide
+    exactly the wiring these tests exist to check.
+    """
+    original_path = list(sys.path)
+    original_is_worker = current_engine().library_manager._is_worker
+    for dep in (EDIT_DEP, EXEC_DEP):
+        sys.modules.pop(dep, None)
+    yield
+    sys.path[:] = original_path
+    current_engine().library_manager._is_worker = original_is_worker
+    for dep in (EDIT_DEP, EXEC_DEP):
+        sys.modules.pop(dep, None)
+
+
+class TestRoutingFact:
+    def test_exec_dependencies_mean_execution_in_a_worker(self, tmp_path: Path) -> None:
+        """Declaring exec deps routes execution to a worker, and nothing else does."""
+        library_json = _register(
+            tmp_path,
+            fixture_dir=EXEC_FIXTURE,
+            node_file="exec_dep_node.py",
+            name="Routing Heavy",
+            edit_dependencies=["fakeedit"],
+            exec_dependencies=["fakeexec"],
+        )
+
+        info = _library_info(library_json)
+        assert info.executes_in_worker is True
+        # The library loaded here all the same: its nodes are real classes in this process.
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED
+
+    def test_no_exec_dependencies_means_no_worker(self, tmp_path: Path) -> None:
+        library_json = _register(
+            tmp_path,
+            fixture_dir=NONSERIALIZABLE_FIXTURE,
+            node_file="nonserializable_nodes.py",
+            name="Routing Light",
+        )
+
+        info = _library_info(library_json)
+        assert info.executes_in_worker is False
+
+    def test_worker_is_required_once_declared(self, tmp_path: Path) -> None:
+        """With no worker registered, routing raises instead of silently running locally.
+
+        Falling back to in-process execution would run the node in the one process that
+        deliberately lacks its execution dependencies.
+        """
+        _register(
+            tmp_path,
+            fixture_dir=EXEC_FIXTURE,
+            node_file="exec_dep_node.py",
+            name="Routing Guard",
+            edit_dependencies=["fakeedit"],
+            exec_dependencies=["fakeexec"],
+        )
+
+        with pytest.raises(RuntimeError, match="requires a dedicated worker"):
+            current_engine().library_manager.workers.get_worker_for_library("Routing Guard")
+
+
+class TestRealNodesOnOrchestrator:
+    def test_orchestrator_holds_real_node_classes_not_stubs(self, tmp_path: Path) -> None:
+        """The point of the dep split: real classes in the editor, heavy deps elsewhere.
+
+        The node instantiates here with its edit-time dependency importable and its
+        execution dependency absent from this process.
+        """
+        _register(
+            tmp_path,
+            fixture_dir=EXEC_FIXTURE,
+            node_file="exec_dep_node.py",
+            name="Real Nodes",
+            edit_dependencies=["fakeedit"],
+            exec_dependencies=["fakeexec"],
+        )
+
+        node = LibraryRegistry.create_node(node_type="ExecDepNode", name="real", specific_library_name="Real Nodes")
+
+        # A stub would carry parameter shape only; this is the real class, so its
+        # __init__ ran and read its edit-time dependency.
+        assert node.get_parameter_value("edit_dep_version") == "1.0.0"
+        assert type(node).__name__ == "ExecDepNode"
+        assert type(node).__module__ != "griptape_nodes.retained_mode.managers.library.workers"
+
+
+class TestParameterBehaviorsSurviveOnRealClasses:
+    """Traits, converters and validators reach the editor, because the real class loads here.
+
+    These three exist only as Python callables on the class, so nothing that rebuilds a node
+    from serialized parameter data can carry them -- see griptape-nodes-engine#5420 for the
+    trait case, the worst of the family because ``ui_options`` DO serialize: the button
+    renders, looks clickable, and cannot work.
+
+    A worker-routed library is not special here. The orchestrator loads its node modules like
+    any other library's and only sends ``process()`` out, so these tests pin that the routing
+    decision costs nothing in the editor.
+    """
+
+    def _register_behavior_library(self, tmp_path: Path) -> str:
+        return _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Behavior Library",
+            exec_dependencies=["fakeexec"],
+        )
+
+    def test_a_button_trait_survives_and_its_click_resolves(self, tmp_path: Path) -> None:
+        """The #5420 case: the trait is present, so the click reaches the node's handler."""
+        self._register_behavior_library(tmp_path)
+        node = LibraryRegistry.create_node(
+            node_type="BehaviorPreservationNode", name="behaviors", specific_library_name="Behavior Library"
+        )
+        current_engine().context_manager.push_workflow(workflow_name="behaviors_workflow")
+        current_engine().object_manager.add_object_by_name("behaviors", node)
+
+        parameter = node.get_parameter_by_name("model_manager")
+        assert parameter is not None
+        assert list(parameter.find_elements_by_type(Button)), "the Button trait did not survive"
+
+        result = current_engine().handle_request(
+            SendNodeMessageRequest(
+                node_name="behaviors",
+                optional_element_name="model_manager",
+                message_type="on_click",
+                message=ButtonDetailsMessagePayload(label="Open", variant="default", size="md", state="ready"),
+            )
+        )
+
+        assert isinstance(result, SendNodeMessageResultSuccess), getattr(result, "result_details", result)
+        # The trait's bound callback is what produced this, so the string proves the node's own
+        # handler ran rather than something merely accepting the message.
+        assert CLICK_ACKNOWLEDGEMENT in str(result.result_details)
+
+    def test_converters_and_validators_survive(self, tmp_path: Path) -> None:
+        """The quieter half of the same family: both only exist as Python callables."""
+        self._register_behavior_library(tmp_path)
+        node = LibraryRegistry.create_node(
+            node_type="BehaviorPreservationNode", name="callables", specific_library_name="Behavior Library"
+        )
+
+        node.set_parameter_value("mode", "expand")
+        assert node.get_parameter_value("mode") == "EXPAND", "the converter did not run"
+
+        with pytest.raises(ValueError, match="forbidden"):
+            node.set_parameter_value("mode", "FORBIDDEN")
+
+
+class TestUnmetResourcesCostExecutionNotLoading:
+    """A capability this machine lacks must not take the library away.
+
+    Nothing about a missing GPU stops the orchestrator importing base-clean node modules,
+    drawing their parameters, or saving a workflow that uses them. Refusing to REGISTER took
+    all of that away: fitness UNUSABLE, no node types, and placeholder nodes reading "Library
+    not found" on every machine that was only ever going to edit. This is the same rule the
+    engine applies to a dependency that will not install -- the capability gates the run.
+    """
+
+    IMPOSSIBLE_COMPUTE: ClassVar[dict[str, object]] = {"compute": [["definitely-not-a-real-backend"], "has_any"]}
+
+    def test_the_library_still_registers_and_its_nodes_still_load(self, tmp_path: Path) -> None:
+        library_json = _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Unmet Resources",
+            required_resources=self.IMPOSSIBLE_COMPUTE,
+        )
+
+        info = _library_info(library_json)
+        assert info.lifecycle_state is not LibraryManager.LibraryLifecycleState.FAILURE
+        assert info.fitness is LibraryManager.LibraryFitness.FLAWED
+        node = LibraryRegistry.create_node(
+            node_type="BehaviorPreservationNode", name="editable", specific_library_name="Unmet Resources"
+        )
+        assert node.get_parameter_by_name("mode") is not None
+
+    def test_execution_refuses_and_names_the_capability(self, tmp_path: Path) -> None:
+        _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Unmet Resources Refuses",
+            required_resources=self.IMPOSSIBLE_COMPUTE,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            current_engine().library_manager.workers.get_worker_for_library("Unmet Resources Refuses")
+
+        message = str(excinfo.value)
+        assert "definitely-not-a-real-backend" in message, "the artist is not told what is missing"
+        assert "Editing its nodes still works" in message
+
+    def test_a_library_whose_resources_are_met_is_unaffected(self, tmp_path: Path) -> None:
+        """The gate must not fire for a requirement this machine does satisfy."""
+        library_json = _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Met Resources",
+            required_resources={"compute": [["cpu"], "has_any"]},
+        )
+
+        info = _library_info(library_json)
+        assert info.execution_unavailable_reason is None
+        assert info.fitness is LibraryManager.LibraryFitness.GOOD
+
+
+class TestUnmetRequirementCostsExecutionNotEditing:
+    """A resource this machine lacks must not stop the library loading.
+
+    SAM3 declares cuda-only, and refusing to register it took editing away from every machine that
+    was only ever going to edit -- placeholder nodes reading "Library not found" on a laptop. The
+    requirement now gates the run instead, so the refusal arrives when someone presses run.
+    """
+
+    IMPOSSIBLE_COMPUTE: ClassVar[dict[str, object]] = {"compute": [["definitely-not-a-real-backend"], "has_any"]}
+
+    def test_execution_refuses_for_an_unmet_requirement(self, tmp_path: Path) -> None:
+        _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Requires The Impossible",
+            required_resources=self.IMPOSSIBLE_COMPUTE,
+        )
+
+        with pytest.raises(RuntimeError, match="definitely-not-a-real-backend"):
+            current_engine().library_manager.workers.get_worker_for_library("Requires The Impossible")
+
+
+class TestUnshippableOutputIsKept:
+    @pytest.mark.asyncio
+    async def test_worker_producing_an_unshippable_value_ships_a_reference(self, tmp_path: Path) -> None:
+        """A serializable=False output stays in the worker and a reference crosses in its place."""
+        _register(
+            tmp_path,
+            fixture_dir=NONSERIALIZABLE_FIXTURE,
+            node_file="nonserializable_nodes.py",
+            name="Guardrail Library",
+        )
+        engine = current_engine()
+        engine.context_manager.push_workflow(workflow_name="unshippable_wf")
+        flow_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="unshippable_flow", set_as_new_context=False)
+        )
+        assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+        create_result = engine.handle_request(
+            CreateNodeRequest(
+                node_type="ProducerNode",
+                specific_library_name="Guardrail Library",
+                node_name="Producer",
+                override_parent_flow_name=flow_result.flow_name,
+            )
+        )
+        assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        node = engine.node_manager.get_node_by_name("Producer")
+
+        with simulated_worker(engine, "Guardrail Library") as worker:
+            request = ExecuteNodeRequest(node_name="Producer", node_metadata=cast("NodeMetadata", dict(node.metadata)))
+            result = await engine.ahandle_request(sent_from_open_workflow(request, engine))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        sent = result.parameter_output_values["session"]
+        assert is_reference(sent), sent
+        entry = worker.engine.resource_manager.entry_for(sent["key"])
+        assert entry is not None
+        assert entry.value.marker == "live-session-marker"
+
+
+class TestManagerAccessDuringWorkerExecution:
+    def test_config_manager_is_refused_inside_worker_execution(self) -> None:
+        """In a worker, node code must ask the orchestrator rather than read local state."""
+        library_manager = current_engine().library_manager
+        library_manager._is_worker = True
+        event_manager = current_engine().event_manager
+
+        with event_manager.node_execution_scope(), pytest.raises(RuntimeError) as excinfo:
+            GriptapeNodes.ConfigManager()
+
+        message = str(excinfo.value)
+        assert "ConfigManager" in message
+        assert "GetConfigValueRequest" in message
+
+    def test_secrets_and_os_managers_are_refused_too(self) -> None:
+        current_engine().library_manager._is_worker = True
+        event_manager = current_engine().event_manager
+
+        with event_manager.node_execution_scope():
+            with pytest.raises(RuntimeError, match="GetSecretValueRequest"):
+                GriptapeNodes.SecretsManager()
+            with pytest.raises(RuntimeError, match="ReadFileRequest"):
+                GriptapeNodes.OSManager()
+
+    def test_the_guard_covers_every_accessor_but_static_files(self) -> None:
+        """The guard is broad by design: silently-wrong local answers are worse than errors.
+
+        Sweeps every accessor on the facade rather than naming a few, so adding an accessor
+        without deciding its worker story fails here instead of shipping unguarded.
+        """
+        current_engine().library_manager._is_worker = True
+        event_manager = current_engine().event_manager
+
+        minimum_believable_sweep = 20
+        accessors = [
+            name
+            for name, member in vars(GriptapeNodes).items()
+            if isinstance(member, classmethod) and name[0].isupper()
+        ]
+        assert len(accessors) > minimum_believable_sweep, "sweep found too few accessors to be believed"
+
+        with event_manager.node_execution_scope():
+            for name in accessors:
+                if name == "StaticFilesManager":
+                    assert getattr(GriptapeNodes, name)() is not None
+                    continue
+                with pytest.raises(RuntimeError, match=name):
+                    getattr(GriptapeNodes, name)()
+
+    def test_managers_work_outside_node_execution_in_a_worker(self) -> None:
+        """Engine boot and library load happen in the worker too, and need real managers."""
+        current_engine().library_manager._is_worker = True
+
+        assert GriptapeNodes.ConfigManager() is not None
+        assert GriptapeNodes.SecretsManager() is not None
+
+    def test_managers_work_during_execution_on_the_orchestrator(self) -> None:
+        """The refusal is about being in a worker, not about executing."""
+        event_manager = current_engine().event_manager
+
+        with event_manager.node_execution_scope():
+            assert GriptapeNodes.ConfigManager() is not None
+
+    def test_static_files_manager_stays_available(self) -> None:
+        """Storage is the one local capability: media bytes cannot cross the boundary."""
+        current_engine().library_manager._is_worker = True
+        event_manager = current_engine().event_manager
+
+        with event_manager.node_execution_scope():
+            assert GriptapeNodes.StaticFilesManager() is not None

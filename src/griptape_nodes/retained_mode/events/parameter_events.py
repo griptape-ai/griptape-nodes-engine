@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -14,6 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.connection_events import IncomingConnection, OutgoingConnection
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument, Value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,6 +49,8 @@ class AddParameterToNodeRequest(RequestPayload):
         parent_element_name: Name of parent element if nested
         initial_setup: Skip setup work when loading from file
         settable: Whether parameter can be set directly by the user or not
+        allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
+        serializable: Whether the parameter's value is saved with the workflow
 
     Results: AddParameterToNodeResultSuccess (with parameter name) | AddParameterToNodeResultFailure
     """
@@ -54,7 +58,7 @@ class AddParameterToNodeRequest(RequestPayload):
     # If node name is None, use the Current Context
     node_name: str | None = None
     parameter_name: str | None = None
-    default_value: Any | None = None
+    default_value: Value = None
     tooltip: str | list[dict] | None = None
     tooltip_as_input: str | list[dict] | None = None
     tooltip_as_property: str | list[dict] | None = None
@@ -68,8 +72,11 @@ class AddParameterToNodeRequest(RequestPayload):
     mode_allowed_output: bool = field(default=True)
     is_user_defined: bool = field(default=True)
     settable: bool = field(default=True)
+    allow_variable_substitution: bool = field(default=True)
+    serializable: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
+    traits: list[dict[str, Any]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
 
@@ -108,7 +115,7 @@ class AddParameterToNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveParameterFromNodeRequest(RequestPayload):
+class RemoveParameterFromNodeRequest(RequestPayload, GraphAccessMixin):
     """Remove a parameter from a node.
 
     Use when: Cleaning up unused parameters, dynamically restructuring node interfaces,
@@ -244,7 +251,7 @@ class SetParameterValueRequest(RequestPayload):
     """
 
     parameter_name: str
-    value: str | int | float | bool | dict | list | None
+    value: DisplayValue
     # If node name is None, use the Current Context
     node_name: str | None = None
     data_type: str | None = None
@@ -268,7 +275,7 @@ class SetParameterValueResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess)
         data_type: The determined data type of the value
     """
 
-    finalized_value: Any
+    finalized_value: DisplayValue
     data_type: str
 
 
@@ -319,6 +326,7 @@ class GetParameterDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
         is_user_defined: Whether this is a user-defined parameter
         settable: Whether parameter can be set directly by the user or not (None for non-Parameters)
         private: Whether this parameter is private
+        allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
         ui_options: UI configuration options
     """
 
@@ -326,7 +334,7 @@ class GetParameterDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
     type: str
     input_types: list[str]
     output_type: str
-    default_value: Any | None
+    default_value: DisplayValue
     tooltip: str | list[dict]
     tooltip_as_input: str | list[dict] | None
     tooltip_as_property: str | list[dict] | None
@@ -337,6 +345,7 @@ class GetParameterDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
     is_user_defined: bool
     settable: bool | None
     private: bool
+    allow_variable_substitution: bool
     ui_options: dict | None
 
 
@@ -370,8 +379,8 @@ class AlterParameterDetailsRequest(RequestPayload):
         mode_allowed_property: Whether parameter can be used as property
         mode_allowed_output: Whether parameter can be used as output
         settable: Whether parameter can be set directly by the user or not
+        allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
         ui_options: New UI configuration options
-        traits: Set of parameter traits
         initial_setup: Skip setup work when loading from file
 
     Results: AlterParameterDetailsResultSuccess | AlterParameterDetailsResultFailure
@@ -383,7 +392,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     type: str | None = None
     input_types: list[str] | None = None
     output_type: str | None = None
-    default_value: Any | None = None
+    default_value: Value = None
     clear_default_value: bool = False
     tooltip: str | list[dict] | None = None
     tooltip_as_input: str | list[dict] | None = None
@@ -393,8 +402,9 @@ class AlterParameterDetailsRequest(RequestPayload):
     mode_allowed_property: bool | None = None
     mode_allowed_output: bool | None = None
     settable: bool | None = None
+    allow_variable_substitution: bool | None = None
     ui_options: dict | None = None
-    traits: set[str] | None = None
+    traits: list[dict[str, Any]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
 
@@ -432,6 +442,7 @@ class AlterParameterDetailsRequest(RequestPayload):
             "mode_allowed_property",
             "mode_allowed_output",
             "settable",
+            "allow_variable_substitution",
             "ui_options",
             "traits",
         ]
@@ -484,7 +495,7 @@ class GetParameterValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
     input_types: list[str]
     type: str
     output_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -499,7 +510,7 @@ class OnParameterValueChanged(WorkflowAlteredMixin, ResultPayloadSuccess):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -570,7 +581,7 @@ class GetNodeElementDetailsRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class GetNodeElementDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    element_details: dict[str, Any]
+    element_details: ElementDocument
 
 
 @dataclass
@@ -583,7 +594,7 @@ class GetNodeElementDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 @dataclass
 @PayloadRegistry.register
 class AlterElementEvent(ExecutionPayload):
-    element_details: dict[str, Any]
+    element_details: ElementDocument
 
 
 @dataclass
@@ -639,7 +650,7 @@ class RenameParameterResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConnectionsForParameterRequest(RequestPayload):
+class GetConnectionsForParameterRequest(RequestPayload, GraphAccessMixin):
     """Get connections for a specific parameter on a node.
 
     Use when: Checking if a parameter is connected, getting connection details for a parameter,

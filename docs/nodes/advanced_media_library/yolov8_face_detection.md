@@ -2,7 +2,7 @@
 
 !!! warning "You need to perform setup steps to use Hugging Face models"
 
-    [This guide](../../how_to/installs/hugging_face.md) will walk you through setting up a Hugging Face account, creating an access token, and installing the required models to make this node fully functional.
+    [This guide](../../guides/integrations/hugging_face.md) will walk you through setting up a Hugging Face account, creating an access token, and installing the required models to make this node fully functional.
 
 ## What is it?
 
@@ -147,7 +147,7 @@ The bounding box coordinates are in pixels relative to the input image dimension
 
 ## Common Issues
 
-- **Missing API Key**: Ensure the Hugging Face API token is set as `HF_TOKEN`; instructions for that are in [this guide](../../how_to/installs/hugging_face.md)
+- **Missing API Key**: Ensure the Hugging Face API token is set as `HF_TOKEN`; instructions for that are in [this guide](../../guides/integrations/hugging_face.md)
 - **Model Not Found**: If you see "model not available" warnings, click the provided link to open the Model Manager and download the model
 - **No Faces Detected**: Try lowering the `confidence_threshold` if you expect faces but none are detected
 - **Too Many False Positives**: Increase the `confidence_threshold` to filter out low-confidence detections

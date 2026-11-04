@@ -1,24 +1,24 @@
 """File driver for static file server URLs.
 
-Intercepts http://localhost:PORT/workspace/... URLs and reads the files
-directly from the workspace directory on disk, avoiding unnecessary
-HTTP round-trips through the dev server.
+Intercepts http://localhost:PORT/workspace/... and /external/... URLs and reads
+the files directly from disk, so reading them needs no static server running.
 """
 
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 import anyio
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.files.path_utils import parse_static_server_url
+from griptape_nodes.retained_mode.engine import current_engine
 
 
 class StaticServerFileDriver(BaseFileDriver):
     """File driver for static file server URLs.
 
-    Handles URLs matching http(s)://localhost:PORT/workspace/... by extracting
-    the workspace-relative path and reading directly from disk.
+    Handles URLs matching http(s)://localhost:PORT/workspace/... or /external/...
+    by mapping them to the file they serve and reading directly from disk.
     """
 
     @property
@@ -31,24 +31,21 @@ class StaticServerFileDriver(BaseFileDriver):
         return 5
 
     def can_handle(self, location: str) -> bool:
-        """Check if location is a localhost URL with /workspace/ path.
+        """Check if location is a localhost URL with a /workspace/ or /external/ path.
 
         Args:
             location: Location string to check
 
         Returns:
-            True if location is a localhost URL with /workspace/ path
+            True if location is a localhost URL with a /workspace/ or /external/ path
         """
         if not location.startswith(("http://localhost:", "https://localhost:")):
             return False
-        parsed = urlparse(location)
-        return "/workspace/" in parsed.path
+        parsed = urlsplit(location, allow_fragments=False)
+        return "/workspace/" in parsed.path or parsed.path.startswith("/external/")
 
     def _resolve_to_local_path(self, location: str) -> Path:
         """Resolve a localhost URL to the actual file path on disk.
-
-        Strips query parameters (cachebuster ?t=...) from localhost URLs
-        before extracting the workspace-relative path.
 
         Args:
             location: Localhost URL
@@ -59,23 +56,20 @@ class StaticServerFileDriver(BaseFileDriver):
         Raises:
             ValueError: If URL format is invalid
         """
-        # Strip query parameters (cachebuster ?t=...)
-        url_without_params = location.split("?", maxsplit=1)[0] if "?" in location else location
-        parsed = urlparse(url_without_params)
+        workspace_path = current_engine().config_manager.workspace_path
+        local_path = parse_static_server_url(location, workspace_path)
 
-        if "/workspace/" not in parsed.path:
-            msg = f"Attempted to resolve localhost URL. Failed with url='{location}' because /workspace/ not found in path."
+        if local_path is None:
+            msg = f"Attempted to resolve localhost URL. Failed with url='{location}' because neither /workspace/ nor /external/ found in path."
             raise ValueError(msg)
 
-        workspace_relative_path = parsed.path.split("/workspace/", 1)[1]
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
-        return workspace_path / workspace_relative_path
+        return local_path
 
     async def read(self, location: str, timeout: float) -> bytes:  # noqa: ARG002, ASYNC109
-        """Read file from workspace path resolved from localhost URL.
+        """Read the file a localhost static server URL names.
 
         Args:
-            location: Localhost workspace URL
+            location: Localhost static server URL
             timeout: Ignored for local file reads
 
         Returns:
@@ -98,10 +92,10 @@ class StaticServerFileDriver(BaseFileDriver):
         return await anyio_path.read_bytes()
 
     async def exists(self, location: str) -> bool:
-        """Check if file exists at resolved workspace path.
+        """Check if the file a localhost static server URL names exists.
 
         Args:
-            location: Localhost workspace URL
+            location: Localhost static server URL
 
         Returns:
             True if file exists and is a regular file
@@ -113,10 +107,10 @@ class StaticServerFileDriver(BaseFileDriver):
         return await anyio_path.exists() and await anyio_path.is_file()
 
     def get_size(self, location: str) -> int:
-        """Get file size from resolved workspace path.
+        """Get the size of the file a localhost static server URL names.
 
         Args:
-            location: Localhost workspace URL
+            location: Localhost static server URL
 
         Returns:
             File size in bytes

@@ -51,9 +51,15 @@ from griptape_nodes.node_library.library_declarations import (
     iter_catalog_models,
     resolve_node_models,
 )
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibraryRegistryError
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.access_events import (
+    CodecAccessDirection,
+    CodecAccessVerdict,
     ModelAccessVerdict,
+    QueryCodecAccessRequest,
+    QueryCodecAccessResultFailure,
+    QueryCodecAccessResultSuccess,
     QueryModelAccessForCatalogRequest,
     QueryModelAccessForCatalogResultSuccess,
     QueryModelAccessForNodeRequest,
@@ -62,18 +68,19 @@ from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessRequest,
     QueryModelAccessResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
     CheckpointAttribute,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from griptape_nodes.node_library.library_declarations import ModelCatalogLibraryProperty, NodeDeclaration
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
@@ -100,31 +107,29 @@ class _NodeResolution:
     resolved_by_id: dict[str, ResolvedModel]
 
 
-class AccessManager:
+class AccessManager(EngineScoped):
     """Answers per-candidate authorization queries via the `OFFER_MODEL` checkpoint."""
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(QueryModelAccessRequest, self.on_query_model_access_request)
-            event_manager.assign_manager_to_request_type(
-                QueryModelAccessForNodeRequest, self.on_query_model_access_for_node_request
-            )
-            event_manager.assign_manager_to_request_type(
-                QueryModelAccessForCatalogRequest, self.on_query_model_access_for_catalog_request
-            )
+            event_manager.register_request_handlers(self)
 
+    @handles(QueryModelAccessRequest)
     def on_query_model_access_request(self, request: QueryModelAccessRequest) -> ResultPayload:
         """Bare form. Hook sees `ID` (the model id) per candidate; no `NODE_TYPE`, no catalog enrichment."""
         verdicts = self._evaluate(
             candidate_model_ids=request.candidate_model_ids,
             node_type=None,
             resolved_by_id={},
+            event_manager=self.engine.event_manager,
         )
         return QueryModelAccessResultSuccess(
             verdicts=verdicts,
             result_details=f"Evaluated {len(verdicts)} candidate model(s).",
         )
 
+    @handles(QueryModelAccessForNodeRequest)
     def on_query_model_access_for_node_request(self, request: QueryModelAccessForNodeRequest) -> ResultPayload:
         """Node-attributed. Engine derives candidates from declarations unless caller overrides."""
         try:
@@ -144,12 +149,57 @@ class AccessManager:
             candidate_model_ids=candidates,
             node_type=request.node_type,
             resolved_by_id=resolution.resolved_by_id,
+            event_manager=self.engine.event_manager,
         )
         return QueryModelAccessForNodeResultSuccess(
             verdicts=verdicts,
             result_details=f"Evaluated {len(verdicts)} model(s) for '{request.node_type}'.",
         )
 
+    @handles(QueryCodecAccessRequest)
+    def on_query_codec_access_request(self, request: QueryCodecAccessRequest) -> ResultPayload:
+        """Per-codec offer query. Hook sees `ID` (the codec) plus optional `CONTAINER_FORMAT`.
+
+        Mirrors ``QueryModelAccessRequest`` for codec dropdowns: filter what the
+        UI offers against the same policy that gates the actual read or write.
+        """
+        match request.direction:
+            case CodecAccessDirection.READ:
+                action = CheckpointAction.READ_VIDEO_CODEC
+            case CodecAccessDirection.WRITE:
+                action = CheckpointAction.WRITE_VIDEO_CODEC
+            case _:
+                # Defense in depth for stray wire-side values. StrEnum catches
+                # Python-side typos; a request deserialized from the WS boundary
+                # can still carry any string.
+                valid = ", ".join(f"'{d.value}'" for d in CodecAccessDirection)
+                msg = (
+                    f"Attempted to query codec access. Failed because direction "
+                    f"'{request.direction}' is not one of {valid}."
+                )
+                return QueryCodecAccessResultFailure(result_details=msg)
+
+        event_manager = self.engine.event_manager
+        verdicts: list[CodecAccessVerdict] = []
+        for codec in request.candidate_codecs:
+            attributes: dict[str, Any] = {CheckpointAttribute.ID: codec}
+            if request.container_format is not None:
+                attributes[CheckpointAttribute.CONTAINER_FORMAT] = request.container_format
+            denial = event_manager.evaluate_authorization_checkpoint(
+                AuthorizationCheckpoint(
+                    action=action,
+                    subject_type=CheckpointSubjectType.VIDEO_CODEC,
+                    subject_id=codec,
+                    attributes=attributes,
+                )
+            )
+            verdicts.append(CodecAccessVerdict(codec=codec, container_format=request.container_format, denial=denial))
+        return QueryCodecAccessResultSuccess(
+            verdicts=verdicts,
+            result_details=f"Evaluated {len(verdicts)} candidate codec(s) for '{request.direction}'.",
+        )
+
+    @handles(QueryModelAccessForCatalogRequest)
     def on_query_model_access_for_catalog_request(self, request: QueryModelAccessForCatalogRequest) -> ResultPayload:
         """Catalog-scoped. Hook sees `ID` (the model id) plus enrichment when the id resolves.
 
@@ -168,6 +218,7 @@ class AccessManager:
             candidate_model_ids=request.candidate_model_ids,
             node_type=None,
             resolved_by_id=resolved_by_id,
+            event_manager=self.engine.event_manager,
         )
         return QueryModelAccessForCatalogResultSuccess(
             verdicts=verdicts,
@@ -185,18 +236,17 @@ class AccessManager:
         """
         try:
             library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
-        except KeyError as exc:
-            detail = exc.args[0] if exc.args else str(exc)
+        except LibraryRegistryError as exc:
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
-                f"Failed because the library could not be resolved: {detail}"
+                f"Failed because the library could not be resolved: {exc}"
             )
             raise _NodeLookupError(msg) from exc
 
         try:
             node_metadata = library.get_node_metadata(node_type)
-        except KeyError as exc:
-            library_name = exc.args[0] if exc.args else specific_library_name
+        except LibraryRegistryError as exc:
+            library_name = library.get_library_data().name
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
                 f"Failed because it is not registered in library '{library_name}'."
@@ -264,6 +314,7 @@ class AccessManager:
         candidate_model_ids: Sequence[str],
         node_type: str | None,
         resolved_by_id: dict[str, ResolvedModel],
+        event_manager: EventManager,
     ) -> list[ModelAccessVerdict]:
         """Ask the authorization hook chain once per candidate; collect one verdict each.
 
@@ -281,7 +332,6 @@ class AccessManager:
         iterations; the guard only short-circuits when a hook itself re-enters a
         guarded engine operation, not when one handler loops over candidates.
         """
-        event_manager = GriptapeNodes.EventManager()
         verdicts: list[ModelAccessVerdict] = []
         for model_id in candidate_model_ids:
             attributes: dict[str, Any] = {CheckpointAttribute.ID: model_id}
@@ -289,11 +339,13 @@ class AccessManager:
                 attributes[CheckpointAttribute.NODE_TYPE] = node_type
             resolved = resolved_by_id.get(model_id)
             provider_model_id: str | None = None
+            display_name: str | None = None
             if resolved is not None:
                 attributes[CheckpointAttribute.PROVIDER_ID] = resolved.provider_id
                 if resolved.model.family:
                     attributes[CheckpointAttribute.MODEL_FAMILIES] = [resolved.model.family]
                 provider_model_id = resolved.model.provider_model_id
+                display_name = resolved.model.display_name
             denial = event_manager.evaluate_authorization_checkpoint(
                 AuthorizationCheckpoint(
                     action=CheckpointAction.OFFER_MODEL,
@@ -302,5 +354,12 @@ class AccessManager:
                     attributes=attributes,
                 )
             )
-            verdicts.append(ModelAccessVerdict(model_id=model_id, provider_model_id=provider_model_id, denial=denial))
+            verdicts.append(
+                ModelAccessVerdict(
+                    model_id=model_id,
+                    provider_model_id=provider_model_id,
+                    denial=denial,
+                    display_name=display_name,
+                )
+            )
         return verdicts

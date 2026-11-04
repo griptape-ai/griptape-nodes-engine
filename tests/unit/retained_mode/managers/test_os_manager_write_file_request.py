@@ -16,8 +16,11 @@ import unicodedata
 from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from typing import IO
+from unittest.mock import MagicMock, patch
 
+import portalocker
+import portalocker.utils
 import pytest
 from PIL import Image
 
@@ -25,8 +28,9 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayloadFailure
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -45,10 +49,11 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
@@ -65,16 +70,16 @@ class TestCreateNewWarningLevelResultDetails:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_fallback_warning_level(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_fallback_warning_level(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW returns WARNING-level ResultDetails when falling back to indexed path."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         # Create the originally requested file so CREATE_NEW must fall back
@@ -86,7 +91,7 @@ class TestCreateNewWarningLevelResultDetails:
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
         )
 
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         # Should succeed but with indexed filename
         assert isinstance(result, WriteFileResultSuccess)
@@ -102,9 +107,9 @@ class TestCreateNewWarningLevelResultDetails:
         assert "already existed" in detail.message.lower()
         assert str(file_path) in detail.message or "test.txt" in detail.message
 
-    def test_create_new_first_try_no_warning(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_first_try_no_warning(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW returns normal success (not WARNING) when first-try succeeds."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "newfile.txt"
 
         # Don't create the file - let CREATE_NEW succeed on first try
@@ -114,7 +119,7 @@ class TestCreateNewWarningLevelResultDetails:
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
         )
 
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         # Should succeed with requested filename
         assert isinstance(result, WriteFileResultSuccess)
@@ -127,9 +132,9 @@ class TestCreateNewWarningLevelResultDetails:
         assert detail.level == logging.DEBUG  # Normal success is DEBUG, not WARNING
         assert "successfully" in detail.message.lower()
 
-    def test_create_new_fallback_multiple_times(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_fallback_multiple_times(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW generates multiple DEBUG messages for multiple fallbacks."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # Create original file
@@ -141,7 +146,7 @@ class TestCreateNewWarningLevelResultDetails:
             content="Content 1",
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
         )
-        result1 = os_manager.on_write_file_request(request1)
+        result1 = os_manager.engine.handle_request(request1)
         assert isinstance(result1, WriteFileResultSuccess)
         assert isinstance(result1.result_details, ResultDetails)
         assert result1.result_details.result_details[0].level == logging.DEBUG
@@ -152,7 +157,7 @@ class TestCreateNewWarningLevelResultDetails:
             content="Content 2",
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
         )
-        result2 = os_manager.on_write_file_request(request2)
+        result2 = os_manager.engine.handle_request(request2)
         assert isinstance(result2, WriteFileResultSuccess)
         assert isinstance(result2.result_details, ResultDetails)
         assert result2.result_details.result_details[0].level == logging.DEBUG
@@ -168,50 +173,141 @@ class TestBlanketExceptionHandling:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_blanket_exception_on_path_resolution(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_blanket_exception_on_path_resolution(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during path resolution."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
         # Mock _resolve_file_path to raise unexpected exception (not ValueError/RuntimeError)
         with patch.object(os_manager, "_resolve_file_path", side_effect=TypeError("Unexpected type error")):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
         assert isinstance(result.result_details, ResultDetails)
         assert "unexpected error" in result.result_details.result_details[0].message.lower()
 
-    def test_blanket_exception_on_write_operation(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_blanket_exception_on_write_operation(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during write."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
-        # Mock _write_with_portalocker to raise unexpected exception (not FileExistsError or LockException)
-        with patch.object(os_manager, "_write_with_portalocker", side_effect=OSError("Unexpected I/O error")):
-            result = os_manager.on_write_file_request(request)
+        # Mock the atomic write primitive to raise an unclassified OSError
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=OSError("Unexpected I/O error"),
+        ):
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
         assert isinstance(result.result_details, ResultDetails)
-        assert "unexpected error" in result.result_details.result_details[0].message.lower()
+        assert "i/o error" in result.result_details.result_details[0].message.lower()
 
-    def test_blanket_exception_on_macro_resolution_in_candidate_loop(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    def test_text_overwrite_translates_newlines_to_platform_linesep(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Str OVERWRITE keeps the text-mode newline translation open(mode="w") did.
+
+        The atomic write path emits raw bytes, so without explicit translation
+        every text save on Windows would silently switch from CRLF to bare LF.
+        """
+        import os as os_module
+
+        monkeypatch.setattr(os_module, "linesep", "\r\n")
+
+        file_path = temp_dir / "text.txt"
+        request = WriteFileRequest(file_path=str(file_path), content="line one\nline two\n")
+
+        result = engine.os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert file_path.read_bytes() == b"line one\r\nline two\r\n"
+
+    def test_unencodable_text_overwrite_maps_to_encoding_error(self, engine: Engine, temp_dir: Path) -> None:
+        """Text that cannot be represented in the requested encoding fails as ENCODING_ERROR."""
+        file_path = temp_dir / "text.txt"
+        request = WriteFileRequest(file_path=str(file_path), content="naïve café", encoding="ascii")
+
+        result = engine.os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.ENCODING_ERROR
+        assert not file_path.exists()
+
+    def test_directory_destination_on_overwrite_maps_to_is_directory(self, engine: Engine, temp_dir: Path) -> None:
+        """An overwrite whose destination is a directory fails as IS_DIRECTORY."""
+        request = WriteFileRequest(file_path=str(temp_dir / "some.txt"), content="Content")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=IsADirectoryError("that is a directory"),
+        ):
+            result = engine.os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
+
+    def test_windows_sharing_violation_maps_to_file_locked(self, engine: Engine, temp_dir: Path) -> None:
+        """A Windows sharing violation on the rename reports FILE_LOCKED, not PERMISSION_DENIED."""
+        locked_error = PermissionError("The process cannot access the file")
+        locked_error.winerror = 32  # ERROR_SHARING_VIOLATION  # type: ignore[attr-defined]
+
+        request = WriteFileRequest(file_path=str(temp_dir / "held.png"), content=b"payload")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=locked_error,
+        ):
+            result = engine.os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_LOCKED
+        assert "in use by another process" in str(result.result_details)
+
+    def test_disk_full_on_overwrite_maps_to_disk_full(self, engine: Engine, temp_dir: Path) -> None:
+        """A full destination volume fails as DISK_FULL with an actionable message.
+
+        Workstations with small local disks and assets on nearly-full shared storage
+        hit this for real; the failure must name the problem, and the atomic swap
+        guarantees the previous file survives it.
+        """
+        import errno
+
+        os_manager = engine.os_manager
+        file_path = temp_dir / "test.txt"
+        file_path.write_text("previous content")
+
+        request = WriteFileRequest(file_path=str(file_path), content="Content")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=OSError(errno.ENOSPC, "No space left on device"),
+        ):
+            result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.DISK_FULL
+        assert isinstance(result.result_details, ResultDetails)
+        message = result.result_details.result_details[0].message.lower()
+        assert "disk" in message
+        assert "left unchanged" in message
+        assert file_path.read_text() == "previous content"
+
+    def test_blanket_exception_on_macro_resolution_in_candidate_loop(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during CREATE_NEW macro resolution."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # Create original file to trigger CREATE_NEW fallback
@@ -231,7 +327,7 @@ class TestBlanketExceptionHandling:
             raise TypeError(msg)
 
         with patch.object(ParsedMacro, "resolve", mock_resolve):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
@@ -249,16 +345,16 @@ class TestParentDirectoryMatchCase:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_parent_directory_permission_denied_message(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_parent_directory_permission_denied_message(self, engine: Engine, temp_dir: Path) -> None:
         """Test match/case generates correct message for PERMISSION_DENIED."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "subdir" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
@@ -267,7 +363,7 @@ class TestParentDirectoryMatchCase:
         with patch.object(
             os_manager, "_ensure_parent_directory_ready", return_value=FileIOFailureReason.PERMISSION_DENIED
         ):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
@@ -276,14 +372,14 @@ class TestParentDirectoryMatchCase:
         assert "permission denied" in message.lower()
         assert "parent directory" in message.lower()
 
-    def test_parent_directory_no_create_message(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_parent_directory_no_create_message(self, engine: Engine, temp_dir: Path) -> None:
         """Test match/case generates correct message for POLICY_NO_CREATE_PARENT_DIRS."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "nonexistent" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=False)
 
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
@@ -293,16 +389,16 @@ class TestParentDirectoryMatchCase:
         assert "parent directory" in message.lower()
         assert "not exist" in message.lower() or "does not exist" in message.lower()
 
-    def test_parent_directory_generic_io_error_message(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_parent_directory_generic_io_error_message(self, engine: Engine, temp_dir: Path) -> None:
         """Test match/case default case generates generic error message."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "subdir" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
 
         # Mock _ensure_parent_directory_ready to return IO_ERROR (not permission or policy)
         with patch.object(os_manager, "_ensure_parent_directory_ready", return_value=FileIOFailureReason.IO_ERROR):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
@@ -321,16 +417,16 @@ class TestOnDemandCandidateGeneration:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_on_demand_generation_early_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_on_demand_generation_early_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW only resolves macros until it finds available filename."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # CREATE_NEW always tries the first-try path first (without index)
@@ -356,7 +452,7 @@ class TestOnDemandCandidateGeneration:
             return original_resolve(self, *args, **kwargs)  # type: ignore[arg-type]
 
         with patch.object(ParsedMacro, "resolve", counting_resolve):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         assert (temp_dir / "output_5.txt").exists()
@@ -372,9 +468,9 @@ class TestOnDemandCandidateGeneration:
             f"Expected >= {min_expected_resolutions} macro resolution, got {resolve_call_count}"
         )
 
-    def test_on_demand_generation_stops_on_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_on_demand_generation_stops_on_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW stops generating candidates immediately after successful write."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         # Create original file to trigger fallback
@@ -395,7 +491,7 @@ class TestOnDemandCandidateGeneration:
             return original_write(*args, **kwargs)  # type: ignore[arg-type]
 
         with patch.object(os_manager, "_write_with_portalocker", tracking_write):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
 
@@ -418,33 +514,37 @@ class TestMetadataInjection:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_metadata_injected_for_bytes_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
-        """Test that prepare_content_for_write is called for bytes content."""
-        os_manager = griptape_nodes.OSManager()
+    def test_metadata_injected_for_bytes_content(self, engine: Engine, temp_dir: Path) -> None:
+        """Test that metadata is collected and embedded for bytes content."""
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         original_bytes = b"fake png bytes"
         injected_bytes = b"fake png bytes with metadata"
 
         request = WriteFileRequest(file_path=str(file_path), content=original_bytes)
 
-        with patch.object(
-            griptape_nodes.ArtifactManager(), "prepare_content_for_write", return_value=injected_bytes
-        ) as mock_prepare:
-            result = os_manager.on_write_file_request(request)
+        metadata = {"gtn_saved_at": "2024-01-01T00:00:00+00:00"}
+        provider = MagicMock()
+        provider.collect_metadata_for_write.return_value = metadata
+        provider.prepare_content_for_write.return_value = injected_bytes
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider) as mock_lookup:
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        mock_prepare.assert_called_once_with(original_bytes, "image.png")
+        mock_lookup.assert_called_once_with("image.png")
+        provider.collect_metadata_for_write.assert_called_once_with("image.png")
+        provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
 
-    def test_metadata_not_injected_when_skip_flag_set(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
 
         request = WriteFileRequest(
@@ -453,78 +553,81 @@ class TestMetadataInjection:
             skip_metadata_injection=True,
         )
 
-        with patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write") as mock_prepare:
-            result = os_manager.on_write_file_request(request)
+        with patch.object(engine.artifact_manager, "provider_for_write") as mock_prepare:
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
-    def test_metadata_not_injected_when_config_disabled(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_not_injected_when_config_disabled(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when auto_inject_workflow_metadata config is False."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(file_path), content=b"fake png bytes")
 
         with (
             patch.object(
-                griptape_nodes.ConfigManager(),
+                engine.config_manager,
                 "get_config_value",
                 side_effect=lambda key, **kwargs: (
                     False if key == "auto_inject_workflow_metadata" else kwargs.get("default")
                 ),
             ),
-            patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write") as mock_prepare,
+            patch.object(engine.artifact_manager, "provider_for_write") as mock_prepare,
         ):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
-    def test_metadata_not_injected_for_str_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_not_injected_for_str_content(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped for str content (only bytes are images)."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "text.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="text content")
 
-        with patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write") as mock_prepare:
-            result = os_manager.on_write_file_request(request)
+        with patch.object(engine.artifact_manager, "provider_for_write") as mock_prepare:
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
     def test_injection_failure_logs_warning_and_write_succeeds(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Test that injection failure logs a warning and the write succeeds with original content."""
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         original_bytes = b"fake png bytes"
 
         request = WriteFileRequest(file_path=str(file_path), content=original_bytes)
 
         with patch(self.INJECT_PATH, side_effect=RuntimeError("injection failed")), caplog.at_level(logging.WARNING):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_bytes() == original_bytes
         assert any("Attempted to collect workflow metadata" in record.message for record in caplog.records)
 
-    def test_injected_content_is_written_to_disk(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_injected_content_is_written_to_disk(self, engine: Engine, temp_dir: Path) -> None:
         """Test that the injected (modified) content is what gets written to disk."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         original_bytes = b"fake png bytes"
         injected_bytes = b"fake png bytes with metadata injected"
 
         request = WriteFileRequest(file_path=str(file_path), content=original_bytes)
 
-        with patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write", return_value=injected_bytes):
-            result = os_manager.on_write_file_request(request)
+        provider = MagicMock()
+        provider.collect_metadata_for_write.return_value = {"k": "v"}
+        provider.prepare_content_for_write.return_value = injected_bytes
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_bytes() == injected_bytes
@@ -544,9 +647,9 @@ class TestSidecarMetadata:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Set workspace to temp_dir and load a project template for sidecar path resolution."""
-        config_manager = griptape_nodes.ConfigManager()
+        config_manager = engine.config_manager
         original_workspace = config_manager.workspace_path
         # Set the *configured* workspace_directory, not just the workspace_path property.
         # The project loaded below is parentless, so activation resolves its workspace via
@@ -558,52 +661,52 @@ class TestSidecarMetadata:
         # Create a project template file so sidecar path resolution has a project to use
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
         config_manager.set_config_value("workspace_directory", str(original_workspace))
 
-    def test_sidecar_not_written_without_file_metadata(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_not_written_without_file_metadata(self, engine: Engine, temp_dir: Path) -> None:
         """Test that no sidecar is written when file_metadata is not provided."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="hello")
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         sidecar_path = temp_dir / ".griptape-nodes-metadata" / "output.txt.json"
         assert not sidecar_path.exists(), "Sidecar should not be written when file_metadata is not provided"
 
-    def test_sidecar_written_when_file_metadata_provided(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_written_when_file_metadata_provided(self, engine: Engine, temp_dir: Path) -> None:
         """Test that a sidecar is written when file_metadata is explicitly provided."""
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
         file_metadata = SidecarContent(
             situation=SituationMetadata(name="save_node_output", macro="{outputs}/output.txt"),
         )
 
         request = WriteFileRequest(file_path=str(file_path), content="hello", file_metadata=file_metadata)
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         sidecar_path = temp_dir / ".griptape-nodes-metadata" / "output.txt.json"
         assert sidecar_path.exists()
         data = _json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.1.0"
+        assert data["schema_version"] == "0.2.0"
         assert "saved_at" in data
 
-    def test_sidecar_contains_situation_info_when_provided(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_contains_situation_info_when_provided(self, engine: Engine, temp_dir: Path) -> None:
         """Test sidecar includes situation block when file_metadata has situation info."""
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         file_metadata = SidecarContent(
             situation=SituationMetadata(
@@ -614,7 +717,7 @@ class TestSidecarMetadata:
         )
 
         request = WriteFileRequest(file_path=str(file_path), content=b"", file_metadata=file_metadata)
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         sidecar_path = temp_dir / ".griptape-nodes-metadata" / "image.png.json"
@@ -624,11 +727,11 @@ class TestSidecarMetadata:
         assert data["situation"]["policy"]["on_collision"] == "create_new"
         assert data["situation"]["policy"]["create_dirs"] is True
 
-    def test_sidecar_written_for_indexed_fallback_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_written_for_indexed_fallback_path(self, engine: Engine, temp_dir: Path) -> None:
         """Test sidecar is written at the actual indexed fallback path, not the requested path."""
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
         file_path.write_text("Original")
         file_metadata = SidecarContent(
@@ -641,14 +744,58 @@ class TestSidecarMetadata:
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
             file_metadata=file_metadata,
         )
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         actual_path = Path(result.final_file_path)
         sidecar_path = actual_path.parent / ".griptape-nodes-metadata" / (actual_path.name + ".json")
         assert sidecar_path.exists(), "Sidecar should be created at the actual indexed fallback path"
         data = _json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.1.0"
+        assert data["schema_version"] == "0.2.0"
+
+    def test_sidecar_file_extension_unchanged_for_alias_extensions(self, engine: Engine, temp_dir: Path) -> None:
+        """Sidecar's ``file_extension`` variable must reflect the on-disk name, not the raw sniff.
+
+        Regression for the alias-extension case (jpg/jpeg, tif/tiff, m4v/mp4):
+        the image provider sniffs JPEG bytes as ``"jpg"``, but writing to
+        ``output.jpeg`` leaves the file at ``.jpeg`` on disk (no swap:
+        ``canonical_extension("jpg") == canonical_extension("jpeg")``). The
+        sidecar's ``file_extension`` variable must therefore stay at what the
+        caller supplied (``"jpeg"``), not get rewritten to the raw sniff
+        (``"jpg"``).
+        """
+        import json as _json
+
+        os_manager = engine.os_manager
+        file_path = temp_dir / "photo.jpeg"
+        # Bind file_extension in the sidecar's situation variables so the
+        # sidecar update path has something to (potentially) overwrite.
+        file_metadata = SidecarContent(
+            situation=SituationMetadata(
+                name="save_node_output",
+                macro="{outputs}/{file_name_base}.{file_extension}",
+                variables={"file_name_base": "photo", "file_extension": "jpeg"},
+            ),
+        )
+
+        request = WriteFileRequest(
+            file_path=str(file_path),
+            content=_jpeg_bytes(),
+            file_metadata=file_metadata,
+        )
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        # File landed at the caller's requested suffix (alias -> no swap).
+        assert Path(result.final_file_path) == file_path
+        assert file_path.exists()
+
+        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "photo.jpeg.json"
+        assert sidecar_path.exists()
+        data = _json.loads(sidecar_path.read_text())
+        # The critical assertion: sidecar variable stayed at "jpeg" (the caller's
+        # value), not "jpg" (the raw sniff). Before the fix this returned "jpg".
+        assert data["situation"]["variables"]["file_extension"] == "jpeg"
 
 
 def _png_bytes() -> bytes:
@@ -673,29 +820,29 @@ class TestExtensionCoercion:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Set workspace and register the image artifact provider so sniff_extension works."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
 
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
 
         yield
 
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
     def test_default_coerce_renames_jpeg_when_destination_is_png(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """JPEG bytes saved to a .png path should be renamed to .jpeg by default."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=_jpeg_bytes())
         with caplog.at_level(logging.WARNING):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         coerced_path = temp_dir / "image.jpg"
@@ -704,11 +851,9 @@ class TestExtensionCoercion:
         assert not requested_path.exists()
         assert any("destination has been adjusted" in r.message for r in caplog.records)
 
-    def test_strict_mode_returns_extension_mismatch_failure(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_strict_mode_returns_extension_mismatch_failure(self, engine: Engine, temp_dir: Path) -> None:
         """With coerce_extension_to_match_bytes=False, mismatched bytes should fail and leave no file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(
@@ -716,45 +861,43 @@ class TestExtensionCoercion:
             content=_jpeg_bytes(),
             coerce_extension_to_match_bytes=False,
         )
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.EXTENSION_MISMATCH
         assert not requested_path.exists()
         assert not (temp_dir / "image.jpg").exists()
 
-    def test_coerce_no_op_when_bytes_match_suffix(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_coerce_no_op_when_bytes_match_suffix(self, engine: Engine, temp_dir: Path) -> None:
         """No rename, no warning when bytes already match the destination suffix."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
         assert requested_path.exists()
 
     def test_coerce_no_op_when_sniff_returns_none(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Unrecognized bytes log a 'Could not identify' warning and write through unchanged."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "blob.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=b"\x00\x01\x02\x03 not a known format")
         with caplog.at_level(logging.WARNING):
-            result = os_manager.on_write_file_request(request)
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
         assert any("Could not recognize the bytes as a known file format" in r.message for r in caplog.records)
 
-    def test_coerce_updates_sidecar_file_extension_variable(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_coerce_updates_sidecar_file_extension_variable(self, engine: Engine, temp_dir: Path) -> None:
         """When coercion fires, the sidecar's situation.variables.file_extension is rewritten to match."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         file_metadata = SidecarContent(
@@ -770,7 +913,7 @@ class TestExtensionCoercion:
             content=_jpeg_bytes(),
             file_metadata=file_metadata,
         )
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         # The mutation happens before write_sidecar runs, so the in-memory metadata
@@ -780,16 +923,357 @@ class TestExtensionCoercion:
         assert request.file_metadata.situation.variables is not None
         assert request.file_metadata.situation.variables["file_extension"] == "jpg"
 
-    def test_coerce_skipped_for_text_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_coerce_skipped_for_text_content(self, engine: Engine, temp_dir: Path) -> None:
         """Text writes should never trigger sniffing/rename."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "notes.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content="just some text")
-        result = os_manager.on_write_file_request(request)
+        result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
+
+
+class TestOSWritePermissionVet:
+    """Provider write-permission vet runs on every recognized-bytes write.
+
+    After sniff picks a format, OSManager asks the format's provider whether
+    the write is permitted. A denial produces WriteFileResultFailure(
+    CODEC_NOT_PERMITTED) BEFORE any bytes reach disk. Format sniffing itself
+    is unchanged -- only the vet is new. Unregistered / unrecognized bytes
+    bypass the vet entirely (there's no provider to ask).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        # Register the image provider so PNG/JPEG bytes are recognized; the
+        # vet under test is provider.check_write_permission on the returned
+        # provider instance.
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
+
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+
+        yield
+
+        engine.config_manager.workspace_path = original_workspace
+
+    def test_deny_returns_codec_not_permitted_and_no_file(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A provider that denies must abort the write before any bytes hit disk."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
+
+        # Image provider defaults to ``None`` policy (no vet). Override its
+        # policy to ``FROM_BYTES`` and its from-bytes hook to deny -- keeps the
+        # test focused on the vet dispatch without dragging in disk staging.
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
+        assert provider_classes, "PNG must resolve to the registered image provider"
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_bytes",
+            lambda data, detected_format: expected_denial,  # noqa: ARG005
+        )
+
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        # The user-facing message must include the denial's own reason string
+        # (owned by the policy) so an artist sees plain English, not "sniffed".
+        assert "This codec is not licensed." in str(result.result_details)
+        # And OSManager owns the "Cannot save '...'" framing -- the provider
+        # denial detail is generic; the file-name wrapping happens here.
+        assert "image.png" in str(result.result_details)
+        assert "sniffed" not in str(result.result_details).lower()
+        assert not requested_path.exists()
+
+    def test_allow_writes_normally(self, engine: Engine, temp_dir: Path) -> None:
+        """The default ``None`` policy skips the vet entirely -> allow."""
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "image.png"
+
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert Path(result.final_file_path) == requested_path
+        assert requested_path.exists()
+
+    def test_unrecognized_bytes_skip_vet_entirely(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If sniff returns None (no provider claims the bytes), the vet is never invoked."""
+        called: list[bool] = []
+
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
+            called.append(True)
+
+        # Spy on ArtifactManager.get_write_vetting_policy: if OSManager ever
+        # asks about an unrecognized format, we'd see it here. sniff on the
+        # blob returns None, so the vet block never even reads the policy.
+        monkeypatch.setattr(engine.artifact_manager, "get_write_vetting_policy", spy_policy)
+
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "blob.dat"
+
+        request = WriteFileRequest(file_path=str(requested_path), content=b"\x00\x01 not a known format")
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert called == []
+        assert requested_path.exists()
+
+    def test_deny_returns_codec_not_permitted_and_no_file_for_extensionless_destination(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: extension-less destinations must not bypass the codec vet.
+
+        Before the fix, ``_apply_extension_coercion`` returned early when the
+        destination had no suffix and the vet inside it never fired, letting
+        gated bytes reach disk simply by omitting the extension. The vet now
+        lives in ``on_write_file_request`` and runs BEFORE coercion, so an
+        extensionless destination is protected.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
+
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
+        assert provider_classes, "PNG must resolve to the registered image provider"
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_bytes",
+            lambda data, detected_format: expected_denial,  # noqa: ARG005
+        )
+
+        os_manager = engine.os_manager
+        # Destination has NO extension. Sniff on bytes classifies as PNG,
+        # provider denies, OSManager must refuse the write. Before the fix
+        # this would return Success and leave the file on disk.
+        requested_path = temp_dir / "movie"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        assert "This codec is not licensed." in str(result.result_details)
+        assert not requested_path.exists()
+
+    def test_append_writes_are_not_vetted(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Appends skip the codec vet: the tail alone has no container header to classify."""
+        called: list[bool] = []
+
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
+            called.append(True)
+
+        monkeypatch.setattr(engine.artifact_manager, "get_write_vetting_policy", spy_policy)
+
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "image.png"
+        # Seed the file so append has something to append to.
+        requested_path.write_bytes(_png_bytes())
+
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes(), append=True)
+        os_manager.engine.handle_request(request)
+
+        assert called == []
+
+    def test_unrecognized_policy_variant_raises_loudly(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A future ``WriteVettingPolicy`` variant OSManager doesn't know how to dispatch must fail loud.
+
+        Silently falling through would let an unrecognized policy bless every
+        write that reached it. Simulate the future variant by returning a
+        sentinel string the switch doesn't recognize.
+        """
+        monkeypatch.setattr(
+            engine.artifact_manager,
+            "get_write_vetting_policy",
+            lambda fmt: "future_variant",  # noqa: ARG005
+        )
+
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, ResultPayloadFailure)
+        assert isinstance(result.exception, RuntimeError)
+        assert "Unrecognized WriteVettingPolicy" in str(result.exception)
+        assert not requested_path.exists()
+
+    def test_from_path_policy_stages_bytes_and_provides_path_to_provider(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When a provider declares ``FROM_PATH`` OSManager stages bytes, hands the provider a path, and truncates + deletes after.
+
+        The provider must (a) receive a filesystem path that exists at call
+        time, (b) never see the raw bytes, (c) never re-enter ``handle_request``
+        for cleanup: OSManager owns the whole staged-file lifecycle.
+        """
+        seen_paths: list[str] = []
+
+        def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
+            # Path must exist at hook-call time.
+            assert Path(source_path).exists()
+            assert Path(source_path).read_bytes() == _png_bytes()
+            seen_paths.append(source_path)
+
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+        monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
+
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.engine.handle_request(request)
+
+        # Allowed: the write proceeds to the real destination.
+        assert isinstance(result, WriteFileResultSuccess)
+        assert requested_path.exists()
+        # The staged temp path must have been truncated + deleted after the vet.
+        assert len(seen_paths) == 1
+        assert not Path(seen_paths[0]).exists(), "staged codec-vet temp must be cleaned up"
+
+    def test_from_path_policy_staging_failure_fails_closed(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If staging the vet's temp file blows up, the write must be refused, not permitted.
+
+        An unstageable vet cannot verify the write is compliant -- fail closed
+        rather than silently blessing bytes because we couldn't run the check.
+        """
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+
+        provider_hook_calls: list[str] = []
+
+        def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
+            provider_hook_calls.append(source_path)
+
+        monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
+
+        # Break the staging step by making the SAVE_TEMP_FILE macro resolve fail.
+        # Easiest: monkeypatch _stage_bytes_at_temp on the manager to raise.
+        os_manager = engine.os_manager
+
+        def raise_staging(*_args, **_kwargs):  # type: ignore[no-untyped-def]  # noqa: ANN202
+            msg = "simulated staging outage"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        monkeypatch.setattr(os_manager, "_stage_bytes_at_temp", raise_staging)
+
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        assert "staging for verification failed" in str(result.result_details)
+        assert not requested_path.exists()
+        # Provider hook must not have been called if we couldn't stage.
+        assert provider_hook_calls == []
+
+    def test_from_path_policy_cleanup_dispatches_delete_file_request(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cleanup must go through ``DeleteFileRequest``, not raw ``Path.unlink``.
+
+        Routing the delete through the request handler is what gets us the
+        workspace containment, permanent-vs-trash policy, and audit logging
+        that ``on_delete_file_request`` enforces. If a future change swapped
+        the dispatch for a raw ``unlink``, codec-vet cleanups would silently
+        opt out of that policy -- this test catches that regression.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            DeleteFileRequest,
+            DeleteFileResultSuccess,
+            DeletionBehavior,
+            DeletionOutcome,
+        )
+
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_path",
+            lambda source_path, detected_format: None,  # noqa: ARG005
+        )
+
+        # Intercept DeleteFileRequest at the event dispatcher and record every
+        # call. Handler returns Success so the vet's cleanup logs no error.
+        seen_deletes: list[DeleteFileRequest] = []
+
+        def spy_delete_handler(request: DeleteFileRequest) -> DeleteFileResultSuccess:
+            seen_deletes.append(request)
+            # OSManager always passes ``path`` (not the file_entry alternative)
+            # for codec-vet cleanup -- narrow the type for the rest of this handler.
+            assert request.path is not None
+            # Real unlink so the file is actually gone -- keeps the "staged
+            # file must be cleaned up" invariant from the sibling test intact.
+            Path(request.path).unlink(missing_ok=True)
+            return DeleteFileResultSuccess(
+                deleted_path=request.path,
+                was_directory=False,
+                deleted_paths=[request.path],
+                outcome=DeletionOutcome.PERMANENTLY_DELETED,
+                result_details="delete recorded by spy",
+            )
+
+        event_manager = engine.event_manager
+        registry = event_manager._request_type_to_manager
+        monkeypatch.setitem(registry, DeleteFileRequest, spy_delete_handler)
+
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = engine.os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        # Exactly one DeleteFileRequest for the staged temp; not more (would
+        # indicate double-cleanup) and not zero (would indicate unlink bypass).
+        assert len(seen_deletes) == 1
+        # PERMANENTLY_DELETE -- codec-vet temps should never land in the trash
+        # where an artist could recover legally-encumbered bytes.
+        assert seen_deletes[0].deletion_behavior == DeletionBehavior.PERMANENTLY_DELETE
+        # The staged path (not the destination) is what's being deleted.
+        assert seen_deletes[0].path != str(requested_path)
 
 
 class TestExtensionCoercionDoesNotClobberPriorSave:
@@ -809,25 +1293,25 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -860,20 +1344,20 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
         assert not (outputs_dir / "render_v002.png").exists()
 
     def test_plain_path_create_new_with_mismatched_bytes_does_not_clobber(
-        self, griptape_nodes: GriptapeNodes, outputs_dir: Path
+        self, engine: Engine, outputs_dir: Path
     ) -> None:
         """Plain string path variant: two JPEG saves to ``output.png`` produce two .jpg files."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = outputs_dir / "output.png"
 
-        first_result = os_manager.on_write_file_request(
+        first_result = os_manager.engine.handle_request(
             WriteFileRequest(
                 file_path=str(requested_path),
                 content=_jpeg_bytes(),
                 existing_file_policy=ExistingFilePolicy.CREATE_NEW,
             )
         )
-        second_result = os_manager.on_write_file_request(
+        second_result = os_manager.engine.handle_request(
             WriteFileRequest(
                 file_path=str(requested_path),
                 content=_jpeg_bytes(),
@@ -914,7 +1398,7 @@ class TestCreateNewMacroIndexSeed:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Production macro resolution requires a loaded project so `{outputs}` from the
         # default template can resolve to <workspace>/outputs.
         #
@@ -923,20 +1407,20 @@ class TestCreateNewMacroIndexSeed:
         # from the project/workspace config layers (see ProjectManager._activate_project),
         # which would clobber any earlier workspace_path assignment. Setting it AFTER
         # activation makes our temp_dir stick for the duration of the test.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1180,19 +1664,19 @@ class TestOptionalPaddedIndexCollision:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Same load-then-force ordering as TestCreateNewMacroIndexSeed: SetCurrentProject
         # remerges workspace_path from project config layers, so we set it AFTER.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.config_manager.workspace_path = temp_dir
         yield
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1279,6 +1763,61 @@ class TestOptionalPaddedIndexCollision:
     # tries to apply `:03` to the separator-prepended string `1_` and errors). That's
     # a parser-level bug, not the collision-walk bug this PR fixes — out of scope here.
 
+    # --- Bound padded slot (the #4956 case) -----------------------------------------
+
+    def test_bound_padded_slot_walks_forward_from_current_value(self, outputs_dir: Path) -> None:
+        """A CREATE_NEW write with `_index` pre-bound to N advances to N+1 on collision.
+
+        Regression coverage for #4956: when a caller has reverse-matched an existing
+        versioned file (e.g. via ``ParsedMacro.extract_variables``) and passes the
+        resulting variables — including the bound index — to the destination, the
+        collision-walk must step the padded slot forward from its bound value. Under
+        the old gate that required the slot to be UNBOUND to walk it, this test would
+        produce ``file_v008_1.png`` (suffix-synthesized) instead of ``file_v008.py``.
+        """
+        # Pre-create v007 (the matched file) so the first write attempt collides.
+        (outputs_dir / "file_v007.png").write_bytes(b"existing v007")
+
+        # Pass `_index=7` in the variables dict (simulating a reverse-match result).
+        # The macro resolves to file_v007.png, which exists → collision-walk runs.
+        # The walk must start at 8 (bound_value + 1), NOT at 1 (unbound default).
+        macro_path = MacroPath(ParsedMacro("{outputs}/file_v{_index:03}.png"), {"_index": 7})
+        self._save(macro_path, b"next version")
+
+        assert (outputs_dir / "file_v008.png").exists()
+        assert (outputs_dir / "file_v008.png").read_bytes() == b"next version"
+        # Negative: the buggy suffix-synthesis fallback would produce these.
+        assert not (outputs_dir / "file_v007_1.png").exists()
+        assert not (outputs_dir / "file_v001.png").exists()
+
+    def test_bound_optional_sequence_slot_walks_forward_from_current_value(self, outputs_dir: Path) -> None:
+        """A CREATE_NEW write with an OPTIONAL sequence slot pre-bound to N advances to N+1.
+
+        The companion to ``test_bound_padded_slot_walks_forward_from_current_value``
+        for the template shape ``create_versioned_workflow`` actually uses:
+        ``{###?:^_v}`` — an *optional* sequence slot with a leading separator.
+        Byte-for-byte the two forms render the same when the slot is bound
+        (``_v007`` either way), but the walk logic in
+        ``on_write_file_request`` branches on
+        ``padded_index_var.info.is_required`` — the required branch was
+        tested; the optional branch's bound-slot path is what
+        ``create_versioned_workflow`` walks in production.
+        """
+        # Pre-create v007 so the first write attempt collides.
+        (outputs_dir / "file_v007.png").write_bytes(b"existing v007")
+
+        # Optional sequence-slot form + leading `_v` prefix — the same shape used
+        # by `CREATE_VERSIONED_WORKFLOW` in the default project template.
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{###?:^_v}.png"), {"_index": 7})
+        self._save(macro_path, b"next version")
+
+        assert (outputs_dir / "file_v008.png").exists()
+        assert (outputs_dir / "file_v008.png").read_bytes() == b"next version"
+        # Negative: walk restarting from 1 (unbound-optional default) would leave v001.
+        assert not (outputs_dir / "file_v001.png").exists()
+        # Negative: suffix-synthesis fallback shape.
+        assert not (outputs_dir / "file_v007_1.png").exists()
+
 
 class TestCreateNewMacroIndexSeedDefensiveFallthrough:
     """Defensive paths around the auto-index seed and the collision-walk loop.
@@ -1294,20 +1833,20 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Same ordering as TestCreateNewMacroIndexSeed.setup_project — load + activate
         # FIRST, then force workspace_path. SetCurrentProjectRequest re-derives the
         # workspace from project config layers and would otherwise clobber temp_dir.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.config_manager.workspace_path = temp_dir
         yield
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1423,20 +1962,20 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Same ordering as TestCreateNewMacroIndexSeed.setup_project — load + activate
         # FIRST, then force workspace_path so SetCurrentProject's project-config remerge
         # doesn't clobber temp_dir.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.config_manager.workspace_path = temp_dir
         yield
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     def test_long_windows_path_gap_fill(self, temp_dir: Path) -> None:
         r"""Workspace + nested dirs + filename combine to >260 chars; gap-fill must still work.
@@ -1497,3 +2036,388 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
         assert (outputs_dir / "render_v003.png").read_bytes() == b"new"
         # Negative assertion: the convert-on-collision unpadded fallback must NOT have fired.
         assert not (outputs_dir / "render_v001_1.png").exists()
+
+
+class TestWriteTempFileRequest:
+    """``WriteTempFileRequest`` stages bytes at the project's SAVE_TEMP_FILE macro path.
+
+    Distinct from ``WriteFileRequest``: caller does not pick the destination,
+    the situation's macro does. Used by artifact providers that need bytes
+    on disk for one-shot inspection (e.g. ffprobe for codec extraction).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        """Load the default project template so SAVE_TEMP_FILE resolves."""
+        config_manager = engine.config_manager
+        original_workspace = config_manager.workspace_path
+        config_manager.set_config_value("workspace_directory", str(temp_dir))
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        yield
+
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        config_manager.set_config_value("workspace_directory", str(original_workspace))
+
+    def test_stages_bytes_at_project_temp_path(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.events.os_events import (
+            WriteTempFileRequest,
+            WriteTempFileResultSuccess,
+        )
+
+        os_manager = engine.os_manager
+        payload = b"probe target bytes"
+
+        result = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(
+                content=payload,
+                variables={"file_name_base": "probe", "file_extension": "mp4"},
+            )
+        )
+
+        assert isinstance(result, WriteTempFileResultSuccess)
+        staged = Path(result.staged_path)
+        # File must exist and carry the caller's bytes verbatim.
+        assert staged.exists()
+        assert staged.read_bytes() == payload
+        assert result.bytes_written == len(payload)
+        # Suffix must reflect ``file_extension`` so ffprobe & tools recognize
+        # the type from the filename.
+        assert staged.suffix == ".mp4"
+        assert "probe" in staged.stem
+
+    def test_caller_controls_uniqueness_via_variables(self, engine: Engine) -> None:
+        """The handler does not inject uuids -- callers who want uniqueness supply their own.
+
+        SAVE_TEMP_FILE's on-collision policy is OVERWRITE, so two callers passing
+        the same ``file_name_base`` land at the same path and the second wins.
+        Callers who need collision safety (e.g. the codec vet racing across
+        multiple provider instances) must include a uuid in ``file_name_base``.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            WriteTempFileRequest,
+            WriteTempFileResultSuccess,
+        )
+
+        os_manager = engine.os_manager
+
+        result_a = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"})
+        )
+        result_b = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"b", variables={"file_name_base": "unique-b", "file_extension": "mp4"})
+        )
+
+        assert isinstance(result_a, WriteTempFileResultSuccess)
+        assert isinstance(result_b, WriteTempFileResultSuccess)
+        assert result_a.staged_path != result_b.staged_path
+        assert Path(result_a.staged_path).read_bytes() == b"a"
+        assert Path(result_b.staged_path).read_bytes() == b"b"
+
+    def test_lands_under_project_temp_directory(self, engine: Engine, temp_dir: Path) -> None:
+        """The staged path is under the project's ``{temp}`` directory, not the OS temp dir.
+
+        Confirms we're using the SAVE_TEMP_FILE situation's project-scoped
+        macro rather than a system-wide tempfile, which is the whole point of
+        the request type (avoid exhausting a small OS temp partition when
+        staging multi-GB video bytes).
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            WriteTempFileRequest,
+            WriteTempFileResultSuccess,
+        )
+
+        os_manager = engine.os_manager
+
+        result = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        )
+
+        assert isinstance(result, WriteTempFileResultSuccess)
+        staged = Path(result.staged_path).resolve()
+        # Staged path must live under the workspace root, not /tmp or the
+        # system temp dir. Using ``resolve()`` on both sides handles symlink
+        # differences (e.g. macOS ``/var`` vs ``/private/var``).
+        assert temp_dir.resolve() in staged.parents
+
+    def test_returns_failure_when_variables_do_not_resolve_macro(self, engine: Engine) -> None:
+        """Caller omitting a required macro variable surfaces as a Failure.
+
+        The SAVE_TEMP_FILE macro references ``{file_name_base}`` and
+        ``{file_extension}``. Passing an empty ``variables`` dict leaves those
+        slots unresolved; the handler surfaces the ``GetPathForMacroRequest``
+        failure verbatim as ``INVALID_PATH``.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            WriteTempFileRequest,
+            WriteTempFileResultFailure,
+        )
+
+        os_manager = engine.os_manager
+        result = os_manager.on_write_temp_file_request(WriteTempFileRequest(content=b"payload", variables={}))
+
+        assert isinstance(result, WriteTempFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_returns_failure_when_situation_registry_missing_save_temp_file(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SAVE_TEMP_FILE absent from the situation registry -> Failure result.
+
+        SAVE_TEMP_FILE ships in DEFAULT_PROJECT_TEMPLATE so this failure
+        branch is unreachable in normal operation. Test it by monkeypatching
+        the GetSituationRequest handler to return Failure, simulating a
+        project template that removed the situation.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            WriteTempFileRequest,
+            WriteTempFileResultFailure,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetSituationRequest,
+            GetSituationResultFailure,
+        )
+
+        def situation_missing_handler(request: GetSituationRequest) -> GetSituationResultFailure:  # noqa: ARG001
+            return GetSituationResultFailure(result_details="situation missing (test)")
+
+        event_manager = engine.event_manager
+        registry = event_manager._request_type_to_manager
+        monkeypatch.setitem(registry, GetSituationRequest, situation_missing_handler)
+
+        os_manager = engine.os_manager
+        result = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        )
+
+        assert isinstance(result, WriteTempFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+        assert "save_temp_file" in str(result.result_details).lower()
+
+
+class TestFailedWriteLeavesNoLitter:
+    """A write that fails AFTER the file is created must not leave the file behind.
+
+    portalocker opens the file before acquiring the lock, so under ``mode="x"`` the file
+    exists by the time a lock failure or a write/fsync error is raised. Left in place,
+    that debris is indistinguishable from a real output: the CREATE_NEW collision loop
+    treats a lock failure as "try the next candidate," so one zero-byte file accumulates
+    per index until all MAX_INDEXED_CANDIDATES slots are taken and every later save fails
+    with "could not find available filename" (griptape-ai/internal#178).
+
+    These tests drive portalocker directly rather than gating on Windows: the open-then-lock
+    ordering is portalocker's, so the bug reproduces on any platform once the lock fails.
+    Windows is merely where it fires in practice, because POSIX ``fcntl`` locks are advisory
+    while Windows AV/indexers transiently lock freshly created files.
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        # Mirrors TestPaddedIndexMacroSaves: load + activate the project first, then pin
+        # workspace_path, since activation re-derives it.
+        original_workspace = engine.config_manager.workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        engine.config_manager.workspace_path = temp_dir
+
+        yield
+
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
+
+    @pytest.fixture
+    def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+        return outputs
+
+    @staticmethod
+    def _fail_lock_times(monkeypatch: pytest.MonkeyPatch, count: int | None) -> None:
+        """Make the portalocker LOCK step fail, leaving the already-opened file behind.
+
+        ``count=None`` fails every attempt; an int fails the first ``count`` attempts and
+        then delegates to the real implementation.
+        """
+        real_get_lock = portalocker.utils.Lock._get_lock
+        attempts = {"n": 0}
+
+        def flaky_get_lock(self: portalocker.utils.Lock, fh: IO) -> IO:
+            attempts["n"] += 1
+            if count is None or attempts["n"] <= count:
+                msg = "simulated transient lock failure"
+                raise portalocker.exceptions.LockException(msg)
+            return real_get_lock(self, fh)
+
+        monkeypatch.setattr(portalocker.utils.Lock, "_get_lock", flaky_get_lock)
+
+    def test_transient_lock_failures_leave_no_litter(self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Candidates abandoned to a lock failure are cleaned up, so the save still lands."""
+        self._fail_lock_times(monkeypatch, count=3)
+
+        FileDestination(
+            MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {}),
+            existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+        ).write_bytes(b"payload")
+
+        # The 3 locked candidates left nothing behind; only the successful write remains.
+        written = sorted(p.name for p in outputs_dir.iterdir() if p.suffix == ".png")
+        assert written == ["render_v004.png"]
+        assert (outputs_dir / "render_v004.png").read_bytes() == b"payload"
+
+    def test_exhausting_every_candidate_leaves_directory_empty(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure path itself must not litter, or it poisons all later runs.
+
+        Without cleanup this leaves one zero-byte file per index, and because a zero-byte
+        file is indistinguishable from a real output, every subsequent save fails
+        immediately on FileExistsError for all candidates.
+        """
+        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.MAX_INDEXED_CANDIDATES", 5)
+        self._fail_lock_times(monkeypatch, count=None)
+
+        with pytest.raises(FileWriteError):
+            FileDestination(
+                MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {}),
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            ).write_bytes(b"should not land")
+
+        assert list(outputs_dir.iterdir()) == []
+
+    def test_fail_policy_lock_failure_leaves_no_file(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
+    ) -> None:
+        """The FAIL policy also writes with mode="x", so it leaked debris too."""
+        self._fail_lock_times(monkeypatch, count=None)
+        target = outputs_dir / "single.png"
+
+        result = engine.os_manager.engine.handle_request(
+            WriteFileRequest(
+                file_path=str(target),
+                content=b"payload",
+                existing_file_policy=ExistingFilePolicy.FAIL,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_LOCKED
+        assert not target.exists()
+
+    def test_write_error_leaves_no_partial_file(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
+    ) -> None:
+        """A mid-write failure is worse than zero-byte: the debris has a plausible size."""
+
+        def exploding_fsync(fd: int) -> None:  # noqa: ARG001
+            msg = "simulated disk full"
+            raise OSError(msg)
+
+        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.os.fsync", exploding_fsync)
+        target = outputs_dir / "partial.png"
+
+        result = engine.os_manager.engine.handle_request(
+            WriteFileRequest(
+                file_path=str(target),
+                content=b"A" * 4096,
+                existing_file_policy=ExistingFilePolicy.FAIL,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert not target.exists()
+
+    def test_cleanup_cannot_be_armed_against_a_non_exclusive_open(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
+    ) -> None:
+        """The exclusive-create flag is derived from ``mode``, so the two cannot disagree.
+
+        The whole safety proof is that ``O_EXCL`` makes a pre-existing file raise
+        FileExistsError before the cleanup is reachable. If a caller could pass ``mode="x"``
+        (cleanup on) alongside a non-exclusive open, a lock failure would delete a file it
+        never created.
+        """
+        target = outputs_dir / "precious.png"
+        target.write_bytes(b"REAL USER DATA")
+        self._fail_lock_times(monkeypatch, count=None)
+
+        # Even with every lock attempt rigged to fail, mode="x" over an existing file
+        # raises from open() first, so the cleanup is never reachable.
+        with pytest.raises(FileExistsError):
+            engine.os_manager._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
+
+        assert target.read_bytes() == b"REAL USER DATA"
+
+    def test_overwrite_never_deletes_pre_existing_file(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
+    ) -> None:
+        """A failed overwrite must leave the pre-existing file intact, with no temp debris.
+
+        The overwrite path writes a sibling temp file and renames it into place, so a
+        write that dies mid-flight (rigged here via fsync) never touches the
+        destination. This is the guarantee that keeps a full disk or a crash from
+        destroying real user data the way an in-place truncate would.
+        """
+        target = outputs_dir / "precious.png"
+        target.write_bytes(b"REAL USER DATA")
+
+        def failing_fsync(_fd: int) -> None:
+            msg = "fsync failed"
+            raise OSError(msg)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", failing_fsync)
+
+        result = engine.os_manager.engine.handle_request(
+            WriteFileRequest(
+                file_path=str(target),
+                content=b"replacement",
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert target.read_bytes() == b"REAL USER DATA"
+        leftovers = [p for p in outputs_dir.iterdir() if p != target]
+        assert leftovers == []
+
+
+class TestMacroFailureMessageIsReadable:
+    """Error messages must name the macro template, not dump the ParsedMacro repr."""
+
+    def test_failure_details_show_template_not_dataclass_repr(self, engine: Engine) -> None:
+        template = "{outputs}/{file_name_base}_v{###}.{file_extension}"
+
+        result = engine.os_manager.engine.handle_request(
+            WriteFileRequest(
+                file_path=MacroPath(ParsedMacro(template), {}),
+                content=b"payload",
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        details = str(result.result_details)
+        assert template in details
+        assert "ParsedMacro(" not in details
+        assert "ParsedVariable(" not in details

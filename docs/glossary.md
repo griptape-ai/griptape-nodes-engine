@@ -20,7 +20,7 @@ Griptape Nodes is a toolkit that enables artists and creators to build AI-power
 
 - **Script**: A Python script that runs code. This term should be avoided when describing a Workflow; instead, script refers to tools, macros, or flow-building aids.
 
-- **Libraries**: Collections of node definitions and/or scripts that extend functionality. See [Libraries](libraries.md) for installing and managing them.
+- **Libraries**: Collections of node definitions and/or scripts that extend functionality. See [Libraries](guides/libraries.md) for installing and managing them.
 
 - **Node**: A single piece of the puzzle in your workflow. Nodes are like LEGO blocks that you can connect to create something bigger. Each node does one specific thing (like generating an image or processing text). There are **types** of nodes:
 

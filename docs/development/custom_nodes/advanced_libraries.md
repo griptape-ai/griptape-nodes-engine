@@ -1,0 +1,647 @@
+# Advanced Libraries
+
+Most libraries are fully described by their `griptape_nodes_library.json` manifest: the
+engine reads it, imports the node modules it names, and registers those classes. An
+**advanced library** is an optional Python class that lets your library run code at
+points in its own lifecycle: before its nodes load, after they load, and before it is
+unregistered. It also hands the engine things to register on your library's behalf:
+request handlers, post-dispatch hooks, and event listeners.
+
+This page is the author's reference for that class. For the manifest itself (metadata,
+categories, declarations, dependency management) see
+[Authoring Libraries](authoring_libraries.md).
+
+## Should I write one?
+
+**You don't need one if** your library is a fixed set of node classes in files you can
+list in the manifest. That is the common case and it needs no Python beyond the nodes.
+
+**Write one if** you need to:
+
+- **Acquire or release process-wide resources** at library load and unload: a GPU
+    context, a Python binding to a native SDK, a background thread, a connection pool.
+- **Register node types the manifest doesn't list**, because the set is data-driven or
+    generated. See
+    [Registering node types without listing them](#registering-node-types-without-listing-them-in-the-manifest).
+- **Serve a request type** your library owns, so other libraries and nodes can call into
+    it. See [`get_request_handlers`](#get_request_handlers).
+- **Give AI agents tools for your product**, such as listing or starting renders, through
+    the engine's MCP server. See [`get_mcp_tools`](#get_mcp_tools).
+- **React after the engine handles a request** it already owns, such as running your own
+    step every time a workflow is saved. See
+    [`get_post_dispatch_hooks`](#get_post_dispatch_hooks).
+- **Watch every node a workflow runs**, including the nodes inside groups and loops: log
+    when each one starts and how it ends, time it, or send it to your own monitoring. See
+    [`get_execution_event_listeners`](#get_execution_event_listeners) and the
+    [timing example](#example-a-library-that-times-every-node-run).
+- **React to what happens in the engine process**, such as a setting changing. See
+    [`get_app_event_listeners`](#get_app_event_listeners).
+- **Register a competing provider** for an engine request type, such as a workflow
+    publisher. See [Publishing](../../guides/publishing.md).
+
+## Wiring one up
+
+Point the manifest at a Python file with `advanced_library_path`, relative to the
+manifest:
+
+```json
+{
+  "name": "My Library",
+  "advanced_library_path": "advanced_library.py",
+  "nodes": []
+}
+```
+
+Then subclass `AdvancedNodeLibrary` in that file and override only the hooks you need.
+Every hook has a default no-op implementation:
+
+```python
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+
+
+class MyLibrary(AdvancedNodeLibrary):
+    def after_library_nodes_loaded(self, library_data, library) -> None:
+        print(f"Loaded {len(library.get_registered_nodes())} nodes")
+```
+
+Three rules govern how the engine finds and builds your class. All three fail the whole
+library if broken, so they are worth knowing:
+
+- **The class must be defined in that file.** The engine scans the module for an
+    `AdvancedNodeLibrary` subclass whose `__module__` matches the module it just
+    imported. A subclass *imported* into the file is skipped. If you want the
+    implementation to live in a package, subclass it in the file the manifest names.
+- **The first match wins.** The engine takes the first qualifying subclass it finds in
+    module order and stops. Define exactly one to avoid ambiguity.
+- **`__init__` must take no required arguments.** The engine instantiates your class with
+    no arguments. Derive whatever state you need in `__init__` or in the hooks.
+
+If the module fails to import, contains no qualifying subclass, or cannot be
+instantiated, the library is marked `UNUSABLE`, registration fails, and the editor shows
+an `AdvancedLibraryLoadFailureProblem` carrying the underlying error.
+
+## The load sequence
+
+Understanding where each hook sits is the difference between a hook that works and one
+that silently does nothing. Registering a library runs, in order:
+
+| Step | What the engine does                                                |
+| ---- | ------------------------------------------------------------------- |
+| 1    | Parses and validates `griptape_nodes_library.json`                  |
+| 2    | Adds the library directory and its venv site-packages to `sys.path` |
+| 3    | Imports your advanced library module and instantiates your class    |
+| 4    | Registers the `Library` in the `LibraryRegistry`                    |
+| 5    | Persists any library settings the manifest declares                 |
+| 6    | **Calls `before_library_nodes_loaded`**                             |
+| 7    | Iterates `library_data.nodes`, registering each node type           |
+| 8    | Registers the manifest's widgets                                    |
+| 9    | **Calls `after_library_nodes_loaded`**                              |
+| 10   | **Calls `get_request_handlers`** and registers what it returns      |
+| 11   | **Calls `get_mcp_tools`** and exposes what it returns               |
+| 12   | **Calls `get_post_dispatch_hooks`** and registers what it returns   |
+| 13   | **Calls `get_execution_event_listeners`** and registers them        |
+| 14   | **Calls `get_app_event_listeners`** and registers them              |
+| 15   | Computes library fitness and marks the library `LOADED`             |
+
+Two consequences worth internalizing:
+
+- Your class exists (step 3) before the library is registered (step 4), so
+    `__init__` cannot look itself up in the `LibraryRegistry`.
+- Step 7 reads `library_data.nodes` *after* step 6 has run, which is what makes dynamic
+    registration possible.
+
+Unregistering runs in the reverse spirit:
+
+| Step | What the engine does                                                            |
+| ---- | ------------------------------------------------------------------------------- |
+| 1    | **Calls `before_library_unregistered`**                                         |
+| 2    | Removes the library's app and execution event listeners, and its dispatch hooks |
+| 3    | Removes the request handlers it registered and the MCP tools it exposed         |
+| 4    | Unregisters the library's widgets                                               |
+| 5    | Removes the library from the `LibraryRegistry`                                  |
+
+## The hooks
+
+### `before_library_nodes_loaded`
+
+```python
+def before_library_nodes_loaded(self, library_data: LibrarySchema, library: Library) -> None: ...
+```
+
+Runs after your library is registered but before any node type is. Use it to set up
+prerequisites that node imports depend on, or to add node definitions to
+`library_data.nodes`.
+
+`library_data` is the live `LibrarySchema` the `Library` holds, not a copy. Mutating it
+here changes what the engine loads in step 7 and what it reports afterwards.
+
+If this raises, the engine records a `BeforeLibraryCallbackProblem` and **continues
+loading**. The library ends up `FLAWED` rather than failed, so a broken hook produces a
+library whose nodes work but whose setup did not run. Do not rely on it having succeeded.
+
+### `after_library_nodes_loaded`
+
+```python
+def after_library_nodes_loaded(self, library_data: LibrarySchema, library: Library) -> None: ...
+```
+
+Runs once every node type in the manifest is registered. At this point
+`library.get_registered_nodes()` returns the full list, so this is the place for work
+that needs to see the finished library.
+
+This is also where you register competing-provider event handlers via
+`LibraryManager.on_register_event_handler()`, which is how a library advertises itself as
+a workflow publisher.
+
+Errors are handled the same way as the before hook: an `AfterLibraryCallbackProblem` is
+recorded and loading continues.
+
+### `before_library_unregistered`
+
+```python
+def before_library_unregistered(self, library_data: LibrarySchema, library: Library) -> None: ...
+```
+
+Runs before the engine tears anything down, so your listeners and handlers are still
+registered while it executes. Use it to release what you acquired at load: native
+bindings, GPU contexts, background threads, connection pools.
+
+Errors here are **logged and swallowed**. Unregistration continues regardless, so a
+failing teardown cannot wedge the engine. The flip side is that a resource you fail to
+release is leaked silently.
+
+### `get_request_handlers`
+
+```python
+def get_request_handlers(self) -> list[tuple[type[RequestPayload], Callable]]: ...
+```
+
+Returns `(request_type, handler)` pairs the engine registers on your behalf, and
+deregisters automatically when your library unloads. Both sync and async handlers work.
+This is how a library exposes a service its own nodes, other libraries, and external
+clients can all call.
+
+There are three pieces to build. See
+[the worked example](#example-a-library-that-serves-a-request-type) for all of them in
+context.
+
+**1. Define the payloads.** A request type and at least one result type, each a dataclass
+registered with `PayloadRegistry` so it can be resolved by name over the WebSocket and
+MCP surfaces:
+
+```python
+@dataclass
+@PayloadRegistry.register
+class ConvertColorspaceRequest(RequestPayload):
+    color: tuple[float, float, float]
+    source: str
+    target: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertColorspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    color: tuple[float, float, float]
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertColorspaceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    pass
+```
+
+Put them in their own module that both your advanced library and your nodes import. The
+library directory is on `sys.path` by the time either loads, so a plain
+`import colorspace_events` resolves, and both files get the same module object and
+therefore the same payload classes. Give that module a distinctive name: every library
+directory lands on the same `sys.path`, so `events.py` risks resolving to another
+library's file.
+
+A field that carries a parameter value, such as an artifact, must be annotated `Value` from
+`griptape_nodes.serialization.values` (`image: Value`) so it reads back as the same type in
+another engine process. Clients, such as the editor, get it as plain JSON. A field holding a value
+JSON can't represent fails to send.
+
+**2. Return the pair from the hook.**
+
+```python
+def get_request_handlers(self) -> list[tuple[type[RequestPayload], Callable]]:
+    return [(ConvertColorspaceRequest, self._handle_convert_colorspace)]
+```
+
+Annotate the return with a bare `Callable`. The base class declares
+`Callable[[RequestPayload], ResultPayload]`, and a handler annotated with your concrete
+request type is not assignable to that, because parameter types are contravariant.
+Keeping the handler's own annotation precise is worth more than matching the base
+signature exactly.
+
+**3. Dispatch it.** Any caller in the orchestrator process sends the request through the
+normal bus and gets your result back:
+
+```python
+result = GriptapeNodes.handle_request(ConvertColorspaceRequest(color=(1.0, 0.0, 0.0), source="rgb", target="hsv"))
+if result.failed():
+    msg = f"Attempted to convert a color in '{self.name}'. Failed because {result.result_details}"
+    raise RuntimeError(msg)
+
+success = cast("ConvertColorspaceResultSuccess", result)
+```
+
+Two rules for callers:
+
+- **Dispatch from `process`, never from `__init__`.** A node constructor that sends a
+    request can deadlock against handlers that await engine startup.
+- **Always handle failure.** The providing library might not be installed, might have
+    failed to load, or might have been unloaded. In those cases the request has no handler
+    at all, and the engine returns a generic failure result rather than your library's
+    failure type. Check `result.failed()` before narrowing to your success type.
+
+Constraints on the mechanism:
+
+- **Your library must own the request type.** Define the `RequestPayload` subclass in
+    your own package.
+- **One handler per request type, engine-wide.** Registering a type that already has a
+    handler raises, surfaced as a `RequestHandlerRegistrationProblem`. For request types
+    where several libraries compete and the caller picks one by name, use
+    `LibraryManager.on_register_event_handler()` in `after_library_nodes_loaded` instead.
+- **Registered per process.** Every library loads on the orchestrator, so its handlers
+    always serve requests dispatched there. A library whose nodes execute in a worker
+    also loads in that worker and registers its own copy; neither process forwards
+    handler requests to the other. See
+    [Node Isolation with Workers](node_isolation_with_workers.md).
+
+Other code can discover what a loaded library exposes with
+`library.get_registered_request_handler_types()`, then inspect each type with
+`dataclasses.fields()` and `typing.get_type_hints()`.
+
+### `get_mcp_tools`
+
+```python
+def get_mcp_tools(self) -> list[MCPTool]: ...
+```
+
+Returns the request types to offer AI agents as tools on the engine's MCP server, which
+external clients such as Claude Code and Cursor connect to. Each tool is a request your
+library already serves through [`get_request_handlers`](#get_request_handlers), so a call
+from an agent runs your handler like any other request.
+
+```python
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary, MCPTool
+
+
+class RenderLibrary(AdvancedNodeLibrary):
+    def get_request_handlers(self):
+        return [
+            (ListRendersRequest, self._handle_list_renders),
+            (StartRenderRequest, self._handle_start_render),
+        ]
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        return [
+            MCPTool(ListRendersRequest, read_only=True),
+            MCPTool(StartRenderRequest),
+        ]
+```
+
+The agent sees the tool under the request's name. It reads the request's docstring to
+learn what the tool does and its fields to learn what to send, so write the docstring for
+an agent that has never seen your product. Set `read_only=True` on tools that only read
+state. Clients use it to skip asking the user before a call.
+
+In the editor, your library appears under **Libraries** in the chat sidebar's **MCP servers**
+dropdown, so users can give the built-in agent your tools without any setup. The agent asks
+the user before calling any tool without `read_only=True`.
+
+Your tools stay off the engine's own address, so agents that don't use your product don't
+have to load them. With the server at its default `http://localhost:8125/mcp/`:
+
+| Address                               | Serves                                       |
+| ------------------------------------- | -------------------------------------------- |
+| `/mcp/libraries/<slug>/`              | Your library's tools only                    |
+| `/mcp/?libraries=<slug>,<other slug>` | The engine's tools plus the named libraries' |
+
+The slug is your library's name in lowercase, with each run of spaces and punctuation
+replaced by one underscore, so "Render Library" becomes `render_library`. See
+[Connect External MCP Clients](../../guides/mcp/external_clients.md#library-tools).
+
+Constraints on the mechanism:
+
+- **Expose only requests you handle.** Every request type must also come from
+    `get_request_handlers`. A tool that breaks this rule, or an entry that is not an
+    `MCPTool`, is reported as an `MCPToolRegistrationProblem` and none of your tools are
+    exposed.
+- **Use fields Pydantic can describe.** The input schema comes from Pydantic, so a field
+    typed with an arbitrary class has no schema. It is reported the same way.
+- **The first tool with a name wins.** If a request shares its name with one of the
+    engine's tools, the combined address serves the engine's. If two libraries on one
+    address share a name, the one listed first in `?libraries=` wins.
+
+### `get_post_dispatch_hooks`
+
+```python
+def get_post_dispatch_hooks(self) -> list[tuple[type[RequestPayload], Callable]]: ...
+```
+
+Returns `(request_type, callback)` pairs the engine registers on your behalf, and
+deregisters when your library unloads. After the engine's own handler for that request
+type produces a result, your callback is invoked with `(request, result)`. This is how a
+library runs its own step, such as appending to an audit log, posting to a chat channel,
+or kicking off an export, when the engine handles a request type the library does not
+own.
+
+It is the mirror image of [`get_request_handlers`](#get_request_handlers), and the
+difference is ownership:
+
+|                         | `get_request_handlers`         | `get_post_dispatch_hooks`                          |
+| ----------------------- | ------------------------------ | -------------------------------------------------- |
+| Claims the request type | Yes, one handler engine-wide   | No, any number of libraries may hook the same type |
+| When it runs            | *Instead of* an engine handler | *After* the engine's handler produced a result     |
+| Can change the outcome  | It **is** the outcome          | No, notification only                              |
+
+That is why you can hook `SaveWorkflowRequest`, which `WorkflowManager` already owns and
+which `get_request_handlers` would fail to claim.
+
+Both sync and async callbacks work. Return the pairs from the hook:
+
+```python
+def get_post_dispatch_hooks(self):
+    return [(SaveWorkflowRequest, self._on_workflow_saved)]
+
+
+async def _on_workflow_saved(self, request: RequestPayload, result: ResultPayload) -> None:
+    if not isinstance(result, SaveWorkflowResultSuccess):
+        return
+    await self._append_audit_line(result.file_path)
+```
+
+Constraints on the mechanism:
+
+- **Notification only.** The return value is ignored, and the callback cannot alter the
+    result or fail the operation. One that raises is logged and otherwise ignored, and it
+    does not stop other hooks on the same request.
+- **Both outcomes.** The callback fires for successes and failures alike, including a
+    failure synthesized from an exception that escaped the handler. Branch on the result
+    type to filter, as the example above does.
+- **Usually detached, sometimes not.** Whenever the engine has a live event loop the hook
+    is scheduled as a detached task, so the result reaches the editor without waiting for
+    it. Some paths, such as CLI commands, bootstrap workflow runs, and worker threads,
+    have no such loop, and there the hook runs inline and **blocks the caller until it
+    returns**.
+    Keep hooks quick, or move slow work off-process, if they may fire on those paths.
+- **Exact type matching.** A hook registered for a request type fires for that exact type
+    only, never for its subclasses.
+- **Read-only arguments.** Do not mutate the request or the result; both are still
+    referenced by the result event the engine is about to serialize. Fields marked
+    `omit_from_result` have already been cleared on the request you receive, so a hook is
+    not a way to read them.
+- **Do not issue engine requests from a hook.** The engine's operation-depth and
+    node-execution state is process-wide, so a request sent from a hook can perturb an
+    operation that is still in flight. Do external work, such as HTTP calls or file
+    writes, instead.
+- **Registered per process.** Hooks are registered on the event manager of whichever
+    process loads the library. A library whose nodes execute in a worker loads in both
+    processes, so each copy observes only the requests its own process handles. See
+    [Node Isolation with Workers](node_isolation_with_workers.md).
+- **Not durable.** Hooks still in flight when the process exits are abandoned. Do not use
+    them where delivery has to be guaranteed.
+
+A pair is malformed when its callback is not callable or its key is not a request type. A
+malformed pair is reported as a `PostDispatchHookRegistrationProblem` and stops the rest
+of the list from registering, leaving the library `FLAWED`. Pairs registered before the
+bad one stay active, and are still removed when the library unloads.
+
+### `get_execution_event_listeners`
+
+```python
+def get_execution_event_listeners(self) -> list[tuple[type[ExecutionPayload], Callable]]: ...
+```
+
+Returns `(event_type, callback)` pairs. While Griptape Nodes runs a workflow, it calls
+your callback with the event each time one of that type happens. The engine registers
+the pairs when your library loads and removes them when it unloads.
+
+|               | `get_post_dispatch_hooks`    | `get_execution_event_listeners`  | `get_app_event_listeners`          |
+| ------------- | ---------------------------- | -------------------------------- | ---------------------------------- |
+| Reacts to     | A request the engine handled | Something that happened in a run | Something that happened to the app |
+| Called with   | `(request, result)`          | The event                        | The event                          |
+| Sync or async | Both                         | Sync only                        | Both                               |
+| When it runs  | After the request is handled | As the event happens             | As the event happens               |
+
+Rules for writing a listener:
+
+- **Keep it quick.** The workflow waits for your callback to return, so a slow one holds
+    it up. Hand slow work, such as network calls or writing files, to a background thread.
+    The [timing example](#example-a-library-that-times-every-node-run) shows how.
+- **Synchronous only.** An `async` callback is reported as an
+    `ExecutionEventListenerRegistrationProblem`.
+- **Notification only.** The return value is ignored. If your callback raises, the error
+    is logged and the workflow carries on.
+- **Don't modify the event.** Other listeners receive the same one.
+- **Exact type matching.** A listener for an event type hears that type only, never its
+    subclasses.
+
+A pair is malformed when its callback is not callable or its key is not an execution event
+type. A malformed pair is reported as an `ExecutionEventListenerRegistrationProblem` and
+stops the rest of the list from registering, leaving the library `FLAWED`. Pairs
+registered before the bad one stay active, and are still removed when the library unloads.
+
+### `get_app_event_listeners`
+
+```python
+def get_app_event_listeners(self) -> list[tuple[type[AppPayload], Callable]]: ...
+```
+
+Returns `(event_type, callback)` pairs for app events: things that happen to Griptape
+Nodes itself, such as `ConfigChanged` when a setting changes or `CurrentProjectChanged`
+when the user switches projects. For example, a library that caches an API client built
+from one of its settings can drop the client when that setting changes, so the next node
+run builds a new one:
+
+```python
+def get_app_event_listeners(self):
+    return [(ConfigChanged, self._on_config_changed)]
+
+
+def _on_config_changed(self, event: ConfigChanged) -> None:
+    # An empty key means the whole configuration was replaced.
+    if event.key in ("my_library.base_url", ""):
+        self._client = None
+```
+
+Callbacks can be sync or `async`. Otherwise the rules are the same as for
+[execution event listeners](#get_execution_event_listeners), and a malformed pair is
+reported as an `AppEventListenerRegistrationProblem`. One thing to watch for: libraries
+load while Griptape Nodes starts up, so a listener for `AppInitializationComplete` doesn't
+hear the startup that loaded its library. Do that work in
+[`after_library_nodes_loaded`](#after_library_nodes_loaded) instead.
+
+## Registering node types without listing them in the manifest
+
+If your node set is data-driven, generated, or simply large enough that hand-maintaining
+the manifest is a chore, you can leave `"nodes": []` in the manifest and synthesize the
+definitions in `before_library_nodes_loaded`.
+
+This works because of step 6 and step 7 in [the load sequence](#the-load-sequence): the
+hook runs first, `library_data` is the same object the engine reads next, and
+`library_data.nodes` is an ordinary list.
+
+```python
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        library_data.nodes.extend(
+            NodeDefinition(
+                class_name=spec["class_name"],
+                file_path="generated_nodes.py",
+                metadata=NodeMetadata(
+                    category="dynamic",
+                    description=spec["description"],
+                    display_name=spec["display_name"],
+                ),
+            )
+            for spec in load_specs()
+        )
+```
+
+Nothing the editor reads comes from the manifest's `nodes` list. `ListNodeTypesInLibrary`
+and `GetAllInfoForLibrary` both read the in-memory `Library`, so synthesized node types
+appear in the node palette exactly like declared ones. Categories are still read from the
+manifest, so declare every category you intend to synthesize into. Nothing validates a
+node's category against the declared keys, so a mismatch fails quietly: the node type
+registers fine, but the editor has no category to file it under.
+
+Definitions added this way are indistinguishable from hand-written ones, which means they
+inherit the loader's behavior: lazy module loading, one memoized import per file even
+when many classes share it, stable-namespace aliasing so saved workflows, copied nodes, and
+images can rebuild values your classes define, per-node problem reporting, and correct fitness.
+
+### Where the classes come from
+
+The engine resolves a node type by importing the file in `NodeDefinition.file_path` and
+calling `getattr(module, class_name)`. A module-level `__getattr__`
+([PEP 562](https://peps.python.org/pep-0562/)) satisfies that, so one file can back every
+node type in the library without a single `class` statement:
+
+```python
+def __getattr__(name: str) -> type[DataNode]:
+    spec = find_spec(name)
+    if spec is None:
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+    node_class = build_node_class(spec)
+    globals()[name] = node_class  # cache: next lookup skips __getattr__
+    return node_class
+```
+
+Cache the built class in module globals. Two lookups of the same node type must return
+the same object, because the engine caches the resolved class and `isinstance` checks
+compare against it.
+
+!!! warning "Set `__module__` explicitly when you build a class"
+
+    `type(name, bases, namespace)` does not give you the current module for free. With
+    no `__module__` key in the namespace, class creation reads `__name__` from the
+    calling frame's globals. Because `BaseNode` subclasses carry `ABCMeta`, that frame
+    is inside the standard library's `abc` module, and your class ends up claiming
+    `__module__ == "abc"`.
+
+    Nothing complains at load time. The failure appears later: reopening a saved
+    workflow looks up `__qualname__` in `__module__`, so a value your class defines
+    comes back as plain data instead of as your class. Pass both explicitly:
+
+    ```python
+    return type(
+        spec["class_name"],
+        (DataNode,),
+        {
+            "__init__": __init__,
+            "process": process,
+            "__module__": __name__,
+            "__qualname__": spec["class_name"],
+        },
+    )
+    ```
+
+### Why not register classes directly?
+
+`Library.register_new_node_type()` and `Library.register_lazy_node_type()` are public,
+and calling them from `after_library_nodes_loaded` also registers working node types.
+Prefer synthesizing definitions anyway, for two reasons:
+
+- **Fitness.** The engine decides whether a library loaded successfully from the
+    manifest-driven loop in step 7. A library with `"nodes": []` that registers
+    everything in the after hook is scored `UNUSABLE` and its registration is reported as
+    a failure, even though the node types registered fine.
+- **Stable namespaces.** The loader also registers a pending stable-module loader so
+    `griptape_nodes.node_libraries.<library>.<file>` resolves when a saved workflow
+    reopens. Registering a class directly skips that, and you own the problem.
+
+### Limitations
+
+- **Declaration validation only sees the manifest.** Validation of `model_usage` and
+    `model_provider_usage` references runs against the manifest read from disk, so those
+    declarations on synthesized nodes are never checked. A bad model reference fails at
+    runtime instead of at load.
+- **Node name collisions still apply.** Synthesized class names go through the same
+    cross-library collision check as declared ones, and generated names collide just as
+    easily. Prefix them.
+
+## Examples
+
+Three complete, working libraries. Copy any of the folders into your workspace's
+`libraries` directory, register it through the editor's library settings, and restart the
+engine.
+
+### Example: a library that serves a request type
+
+A library that owns `ConvertColorspaceRequest`, serves it from its advanced library, and
+consumes it from its own node:
+
+- [`griptape_nodes_library.json`](example_request_handler_library/griptape_nodes_library.json):
+    manifest declaring one node and the advanced library
+- [`colorspace_events.py`](example_request_handler_library/colorspace_events.py): the
+    request and result payloads, registered with `PayloadRegistry`
+- [`advanced_library.py`](example_request_handler_library/advanced_library.py): returns the
+    handler from `get_request_handlers` and implements it
+- [`nodes.py`](example_request_handler_library/nodes.py): a node that dispatches the
+    request from `process()` and handles failure
+
+Add a **Convert Colorspace** node, set `color` to `[0, 0.5, 1]` with `source` `rgb` and
+`target` `hsv`, and run it. Any other library in the same engine can now send
+`ConvertColorspaceRequest` and get the same answer.
+
+### Example: a library that registers node types dynamically
+
+A library that registers four node types from a JSON file while declaring none in its
+manifest:
+
+- [`griptape_nodes_library.json`](example_dynamic_library/griptape_nodes_library.json):
+    manifest with `"nodes": []` and one declared category
+- [`node_specs.json`](example_dynamic_library/node_specs.json): the data the node set is
+    derived from
+- [`advanced_library.py`](example_dynamic_library/advanced_library.py): synthesizes one
+    `NodeDefinition` per spec in `before_library_nodes_loaded`
+- [`generated_nodes.py`](example_dynamic_library/generated_nodes.py): module
+    `__getattr__` that builds each `DataNode` subclass on demand
+
+You should see a **Dynamic** category with four nodes. Add an entry to `node_specs.json`
+reusing an existing `operator` value, restart, and a fifth node appears with no change to
+the manifest or the Python.
+
+### Example: a library that times every node run
+
+A library that logs how long every node in a workflow takes, including the nodes inside
+groups and loops, and how each run ended:
+
+- [`griptape_nodes_library.json`](example_node_timing_library/griptape_nodes_library.json):
+    manifest declaring one node and the advanced library
+- [`advanced_library.py`](example_node_timing_library/advanced_library.py): listens for
+    `NodeStartProcessEvent` and `NodeFinishProcessEvent`, and writes one log line per node
+    run from a background thread
+- [`nodes.py`](example_node_timing_library/nodes.py): a **Wait** node that waits a set
+    number of seconds, so there is something to time
+
+Add two **Wait** nodes, give them different `seconds`, connect them, and run the
+workflow. The engine log gets a line for each, such as
+`Wait_1 (WaitNode) succeeded in 2.00s`. Put a **Wait** node inside a **ForEach Group** and
+you get a line for every iteration, plus one for the group. To send the timings somewhere
+else, replace the logging call in `_on_finish`; the rest of the library stays the same.

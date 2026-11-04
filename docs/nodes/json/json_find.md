@@ -75,16 +75,16 @@ The `search_field` parameter uses the same dot notation as JSON Extract Value:
 ### Basic Object Access
 
 ```python
-search_field = "name"                    # Search in root name field
-search_field = "attributes.content"      # Search in nested content field
-search_field = "user.profile.email"     # Search in deeply nested email field
+search_field = "name"  # Search in root name field
+search_field = "attributes.content"  # Search in nested content field
+search_field = "user.profile.email"  # Search in deeply nested email field
 ```
 
 ### Array Indexing
 
 ```python
-search_field = "items[0].title"         # Search in title of first item
-search_field = "users[2].name"          # Search in name of third user
+search_field = "items[0].title"  # Search in title of first item
+search_field = "users[2].name"  # Search in name of third user
 ```
 
 ## Examples
@@ -116,7 +116,7 @@ search_field = "users[2].name"          # Search in name of third user
 # search_value: "wtg"
 # search_mode: "exact"
 # return_mode: "all"
-# Result: [{"attributes": {"content": "Design", "status": "wtg"}}, 
+# Result: [{"attributes": {"content": "Design", "status": "wtg"}},
 #          {"attributes": {"content": "Model", "status": "wtg"}}]
 ```
 

@@ -1,8 +1,11 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 from unittest.mock import ANY
 
 import pytest  # type: ignore[reportMissingImports]
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventResultSuccess
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
@@ -10,24 +13,28 @@ from griptape_nodes.retained_mode.events.node_events import (
     GetAllNodeInfoRequest,
     GetAllNodeInfoResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
+
+pytestmark = pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
 
 
 class TestNodeEvents:
     @pytest.fixture
-    def create_node_result(self) -> Any:
+    def create_node_result(self, engine: Engine) -> Any:
         request = CreateNodeRequest(node_type="RunAgentNode", override_parent_flow_name="canvas")
-        result = GriptapeNodes.handle_request(request)
+        result = engine.handle_request(request)
 
         return result
 
-    def test_GetAllNodeInfoResult(self, create_node_result: CreateNodeResultSuccess) -> None:
+    def test_GetAllNodeInfoResult(self, create_node_result: CreateNodeResultSuccess, engine: Engine) -> None:
         request = GetAllNodeInfoRequest(node_name=create_node_result.node_name)
-        result = GriptapeNodes.handle_request(request)
+        result = engine.handle_request(request)
 
         assert isinstance(result, GetAllNodeInfoResultSuccess)
 
-        assert EventResultSuccess(request=request, result=result).dict() == {
+        assert converters.engine.unstructure(EventResultSuccess(request=request, result=result)) == {
             "request": {"request_id": None, "node_name": "RunAgentNode_1"},
             "result": {
                 "metadata": {

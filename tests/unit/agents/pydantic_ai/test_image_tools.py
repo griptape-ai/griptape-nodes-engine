@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 import pytest
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai import Agent
+from pydantic_ai.exceptions import ApprovalRequired, ModelRetry
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from griptape_nodes.agents.pydantic_ai.image_tools import (
     ImageGenerationToolset,
     ImageGenerationToolsetConfig,
+    register_image_tools,
 )
+from griptape_nodes.agents.pydantic_ai.tool_approval import ToolApprovalDeps
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError
+from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 if TYPE_CHECKING:
+    from pydantic_ai import RunContext
+    from pydantic_ai.messages import ModelMessage
+
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
 
@@ -43,6 +54,27 @@ def _make_toolset(
     return ImageGenerationToolset(config, cast("StaticFilesManager", static_files))
 
 
+def _ctx(
+    model_settings: dict[str, Any] | None = None,
+    *,
+    deps: ToolApprovalDeps | None = None,
+    tool_call_approved: bool = True,
+) -> RunContext[Any]:
+    """Stand in for the agent run; the tool reads its model settings and approval state.
+
+    Defaults to a call the user already approved, so tests about generating the
+    image are not stopped by the approval gate.
+    """
+    return cast(
+        "RunContext[Any]",
+        SimpleNamespace(
+            model_settings=model_settings,
+            deps=deps or ToolApprovalDeps(),
+            tool_call_approved=tool_call_approved,
+        ),
+    )
+
+
 def _image_artifact_response(image_bytes: bytes, image_format: str = "png") -> dict[str, Any]:
     return {
         "artifact": {
@@ -57,13 +89,13 @@ def _image_artifact_response(image_bytes: bytes, image_format: str = "png") -> d
 class _TransportRecorder:
     """Captures outgoing requests and supplies queued responses."""
 
-    requests: list[httpx.Request] = field(default_factory=list)
-    responses: list[httpx.Response] = field(default_factory=list)
+    requests: list[httpx2.Request] = field(default_factory=list)
+    responses: list[httpx2.Response] = field(default_factory=list)
 
 
 @pytest.fixture
 def patch_transport(monkeypatch: pytest.MonkeyPatch) -> _TransportRecorder:
-    """Route `httpx.AsyncClient.post` through a recording mock transport.
+    """Route `httpx2.AsyncClient.post` through a recording mock transport.
 
     Returns a recorder so a test can assert on captured requests and enqueue
     custom responses. The mock returns a PNG artifact unless a response is
@@ -71,17 +103,17 @@ def patch_transport(monkeypatch: pytest.MonkeyPatch) -> _TransportRecorder:
     """
     recorder = _TransportRecorder()
 
-    async def fake_post(self: httpx.AsyncClient, url: str, **kwargs: Any) -> httpx.Response:  # noqa: ARG001
-        request = httpx.Request("POST", url, json=kwargs.get("json"), headers=kwargs.get("headers"))
+    async def fake_post(self: httpx2.AsyncClient, url: str, **kwargs: Any) -> httpx2.Response:  # noqa: ARG001
+        request = httpx2.Request("POST", url, json=kwargs.get("json"), headers=kwargs.get("headers"))
         recorder.requests.append(request)
         if recorder.responses:
             response = recorder.responses.pop(0)
         else:
-            response = httpx.Response(200, json=_image_artifact_response(b"image-bytes"))
+            response = httpx2.Response(200, json=_image_artifact_response(b"image-bytes"))
         response.request = request
         return response
 
-    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(httpx2.AsyncClient, "post", fake_post)
     return recorder
 
 
@@ -100,18 +132,38 @@ class TestConfig:
 
 
 @pytest.mark.asyncio
+class TestRegistration:
+    async def test_offers_generate_image_to_the_model_without_its_run_context(
+        self, static_files: _FakeStaticFilesManager
+    ) -> None:
+        offered: list[AgentInfo] = []
+
+        def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            offered.append(info)
+            return ModelResponse(parts=[TextPart("done")])
+
+        agent: Agent[None, str] = Agent(FunctionModel(respond))
+        register_image_tools(agent, ImageGenerationToolsetConfig(api_key="k"), cast("StaticFilesManager", static_files))
+        await agent.run("draw a bird")
+
+        (tool,) = offered[0].function_tools
+        assert tool.name == "generate_image"
+        assert set(tool.parameters_json_schema["properties"]) == {"prompt", "negative_prompt"}
+
+
+@pytest.mark.asyncio
 class TestGenerateImage:
     async def test_rejects_empty_prompt(self, static_files: _FakeStaticFilesManager) -> None:
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
         with pytest.raises(ModelRetry, match="non-empty"):
-            await toolset.generate_image("   ")
+            await toolset.generate_image(_ctx(), "   ")
 
     async def test_saves_image_and_returns_url(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
-        url = await toolset.generate_image("a red bird")
+        url = await toolset.generate_image(_ctx(), "a red bird")
 
         assert len(static_files.saved) == 1
         saved_bytes, filename = static_files.saved[0]
@@ -123,12 +175,57 @@ class TestGenerateImage:
         assert "a red bird" in body
         assert "gpt-image-1-mini" in body
 
+    async def test_asks_before_spending_credits(
+        self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
+    ) -> None:
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        with pytest.raises(ApprovalRequired):
+            await toolset.generate_image(_ctx(deps=ToolApprovalDeps(), tool_call_approved=False), "a red bird")
+
+        assert patch_transport.requests == []
+
+    @pytest.mark.parametrize(
+        ("deps", "tool_call_approved"),
+        [
+            (ToolApprovalDeps(), True),
+            (ToolApprovalDeps(granted=frozenset({"generate_image"})), False),
+        ],
+        ids=["approved-call", "granted-for-conversation"],
+    )
+    async def test_runs_without_asking_once_approved(
+        self,
+        static_files: _FakeStaticFilesManager,
+        patch_transport: _TransportRecorder,
+        deps: ToolApprovalDeps,
+        *,
+        tool_call_approved: bool,
+    ) -> None:
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        await toolset.generate_image(_ctx(deps=deps, tool_call_approved=tool_call_approved), "a red bird")
+
+        assert len(patch_transport.requests) == 1
+
+    async def test_sends_the_runs_extra_headers(
+        self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
+    ) -> None:
+        # The attribution header rides on the run, so the image is billed like the reply.
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+        ctx = _ctx({"extra_headers": {"X-Griptape-Attribution": "abc", "Authorization": "Bearer spoofed"}})
+
+        await toolset.generate_image(ctx, "a red bird")
+
+        headers = patch_transport.requests[0].headers
+        assert headers["X-Griptape-Attribution"] == "abc"
+        assert headers["Authorization"] == "Bearer k"
+
     async def test_includes_negative_prompt_when_set(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
-        await toolset.generate_image("a red bird", negative_prompt="blurry")
+        await toolset.generate_image(_ctx(), "a red bird", negative_prompt="blurry")
 
         body = patch_transport.requests[0].read().decode()
         assert "negative_prompts" in body
@@ -139,7 +236,7 @@ class TestGenerateImage:
     ) -> None:
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
-        await toolset.generate_image("a red bird", negative_prompt="   ")
+        await toolset.generate_image(_ctx(), "a red bird", negative_prompt="   ")
 
         body = patch_transport.requests[0].read().decode()
         assert "negative_prompts" not in body
@@ -152,7 +249,7 @@ class TestGenerateImage:
             static_files,
         )
 
-        await toolset.generate_image("a cat")
+        await toolset.generate_image(_ctx(), "a cat")
 
         body = patch_transport.requests[0].read().decode()
         assert "1536x1024" in body
@@ -165,11 +262,11 @@ class TestGenerateImage:
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         patch_transport.responses.append(
-            httpx.Response(200, json=_image_artifact_response(b"jpeg-bytes", image_format="jpeg"))
+            httpx2.Response(200, json=_image_artifact_response(b"jpeg-bytes", image_format="jpeg"))
         )
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
-        await toolset.generate_image("a cat")
+        await toolset.generate_image(_ctx(), "a cat")
 
         _, filename = static_files.saved[0]
         assert filename.endswith(".jpeg")
@@ -177,31 +274,44 @@ class TestGenerateImage:
     async def test_raises_on_http_error(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
-        patch_transport.responses.append(httpx.Response(500, json={"error": "boom"}))
+        patch_transport.responses.append(httpx2.Response(500, json={"error": "boom"}))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         # A Cloud failure becomes a ModelRetry so the agent turn survives.
         with pytest.raises(ModelRetry):
-            await toolset.generate_image("a cat")
+            await toolset.generate_image(_ctx(), "a cat")
+        assert static_files.saved == []
+
+    async def test_a_budget_refusal_stops_the_run_instead_of_retrying(
+        self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
+    ) -> None:
+        # Retrying a budget refusal only spends the turn being refused again.
+        patch_transport.responses.append(httpx2.Response(403, json=a_refusal_body()))
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        with pytest.raises(BudgetExceededError) as raised:
+            await toolset.generate_image(_ctx(), "a cat")
+        assert str(raised.value).startswith(BUDGET_REPLY_HALT_PREFIX)
+        assert "tight" in str(raised.value)
         assert static_files.saved == []
 
     async def test_raises_on_malformed_response(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
-        patch_transport.responses.append(httpx.Response(200, json={"unexpected": "shape"}))
+        patch_transport.responses.append(httpx2.Response(200, json={"unexpected": "shape"}))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         with pytest.raises(ModelRetry):
-            await toolset.generate_image("a cat")
+            await toolset.generate_image(_ctx(), "a cat")
         assert static_files.saved == []
 
     async def test_raises_when_artifact_not_a_dict(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
     ) -> None:
         # A JSON body whose `artifact` is the wrong shape must not escape as TypeError.
-        patch_transport.responses.append(httpx.Response(200, json={"artifact": ["not", "a", "dict"]}))
+        patch_transport.responses.append(httpx2.Response(200, json={"artifact": ["not", "a", "dict"]}))
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
         with pytest.raises(ModelRetry):
-            await toolset.generate_image("a cat")
+            await toolset.generate_image(_ctx(), "a cat")
         assert static_files.saved == []

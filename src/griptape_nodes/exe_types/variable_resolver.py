@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import json
+import logging
 import re
 from contextvars import ContextVar
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
+
+logger = logging.getLogger("griptape_nodes")
 
 # Sentinel meaning "the flow lookup was attempted but the node is not in any flow."
 _NO_FLOW: object = object()
@@ -22,8 +31,9 @@ _aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
 class VariableResolver:
     """Resolves inline {VAR} macro references in node parameter values during aprocess().
 
-    All GriptapeNodes singleton access is concentrated in this class's static methods,
-    keeping the lazy-import cycle-break in one place rather than scattered across BaseNode.
+    The methods that need engine state take the engine as their first argument rather than
+    reaching for process-wide state, so a resolver call answers from the same engine as the
+    node that asked.
     """
 
     _HAS_VARIABLE_MACRO: ClassVar[re.Pattern[str]] = re.compile(r"\{[A-Za-z_]")
@@ -31,18 +41,39 @@ class VariableResolver:
     _MACRO_TOKEN: ClassVar[re.Pattern[str]] = re.compile(r"\{([^{}]*)\}")
 
     @staticmethod
-    def contains_variable_macro(value: Any) -> bool:
-        """Return True if value is, or recursively contains, a str with a variable macro reference."""
+    def _contains_string(value: Any, matches: Callable[[str], bool], _active: set[int] | None = None) -> bool:
+        """Whether `value` is, or contains, a string that `matches` accepts.
+
+        Shared by the predicates below so the cycle guard cannot be added to one walk and forgotten
+        in the other. A value can reach itself, and a repeat visit answers False rather than
+        recursing: a container cannot contain a macro by way of containing itself.
+        """
         if isinstance(value, str):
-            return bool(VariableResolver._HAS_VARIABLE_MACRO.search(value))
-        if isinstance(value, dict):
-            return any(VariableResolver.contains_variable_macro(v) for v in value.values())
-        if isinstance(value, list):
-            return any(VariableResolver.contains_variable_macro(item) for item in value)
-        return False
+            return matches(value)
+        if not isinstance(value, (dict, list)):
+            return False
+
+        if _active is None:
+            _active = set()
+        if id(value) in _active:
+            return False
+
+        _active.add(id(value))
+        try:
+            items = value.values() if isinstance(value, dict) else value
+            return any(VariableResolver._contains_string(item, matches, _active) for item in items)
+        finally:
+            _active.discard(id(value))
 
     @staticmethod
-    def resolve_macro_token(token: str, variables: dict[str, str | int]) -> str:
+    def contains_variable_macro(value: Any) -> bool:
+        """Return True if value is, or recursively contains, a str with a variable macro reference."""
+        return VariableResolver._contains_string(
+            value, lambda text: bool(VariableResolver._HAS_VARIABLE_MACRO.search(text))
+        )
+
+    @staticmethod
+    def resolve_macro_token(token: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
         """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
 
         Returns the resolved string on success, or the original token if the variable
@@ -63,8 +94,21 @@ class VariableResolver:
         # one ParsedVariable segment. Iterate segments directly (not get_variables()) to retain
         # format_specs, which are stripped by get_variables().
         parsed_var = next((seg for seg in parsed.segments if isinstance(seg, ParsedVariable)), None)
-        if parsed_var is None or parsed_var.info.name not in variables:
+        if parsed_var is None:
             return token
+        if parsed_var.info.name not in variables:
+            if parsed_var.info.is_required:
+                # DEBUG intentionally — unresolved tokens are common during partial setup and shouldn't flood the UI.
+                if node_name:
+                    logger.debug(
+                        "Node %r: variable %r not found; leaving token %r unresolved",
+                        node_name,
+                        parsed_var.info.name,
+                        token,
+                    )
+                else:
+                    logger.debug("Variable %r not found; leaving token %r unresolved", parsed_var.info.name, token)
+            return "" if not parsed_var.info.is_required else token
         value: str | int = variables[parsed_var.info.name]
         try:
             for format_spec in parsed_var.format_specs:
@@ -74,25 +118,59 @@ class VariableResolver:
         return str(value)
 
     @staticmethod
-    def resolve_string(text: str, variables: dict[str, str | int]) -> str:
+    def resolve_string(text: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
         """Substitute all {VAR} tokens in text using the provided variable dict."""
         return VariableResolver._MACRO_TOKEN.sub(
-            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables),
+            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables, node_name),
             text,
         )
 
     @staticmethod
-    def resolve_value(value: Any, variables: dict[str, str | int]) -> Any:
-        """Recursively substitute {VAR} references in any str/dict/list value."""
+    def resolve_value(  # noqa: PLR0911
+        value: Any,
+        variables: dict[str, str | int],
+        node_name: str | None = None,
+        _active: set[int] | None = None,
+    ) -> Any:
+        """Recursively substitute {VAR} references in any str/dict/list value.
+
+        Returns `value` itself when nothing inside it was rewritten, so a node that writes a
+        container to an output and reads it straight back gets the container it wrote. Output
+        writes run through here, so rebuilding unconditionally would also copy every dict and
+        list on that path.
+
+        `_active` is the containers currently being walked, so a value that reaches itself
+        terminates rather than recursing.
+        """
         if isinstance(value, str):
             if VariableResolver._HAS_VARIABLE_MACRO.search(value):
-                return VariableResolver.resolve_string(value, variables)
+                return VariableResolver.resolve_string(value, variables, node_name)
             return value
-        if isinstance(value, dict):
-            return {k: VariableResolver.resolve_value(v, variables) for k, v in value.items()}
-        if isinstance(value, list):
-            return [VariableResolver.resolve_value(item, variables) for item in value]
-        return value
+
+        if not isinstance(value, (dict, list)):
+            return value
+
+        if _active is None:
+            _active = set()
+        if id(value) in _active:
+            return value
+
+        _active.add(id(value))
+        try:
+            if isinstance(value, dict):
+                resolved_dict = {
+                    k: VariableResolver.resolve_value(v, variables, node_name, _active) for k, v in value.items()
+                }
+                if all(resolved_dict[k] is v for k, v in value.items()):
+                    return value
+                return resolved_dict
+
+            resolved_list = [VariableResolver.resolve_value(item, variables, node_name, _active) for item in value]
+            if all(new is old for new, old in zip(resolved_list, value, strict=True)):
+                return value
+            return resolved_list
+        finally:
+            _active.discard(id(value))
 
     @staticmethod
     def seed_cache(variables: dict[str, str | int] | None) -> object:
@@ -105,15 +183,33 @@ class VariableResolver:
         _aprocess_variable_cache.reset(token)  # type: ignore[arg-type]
 
     @staticmethod
-    def is_substitution_enabled() -> bool:
-        """Return True if variable substitution is enabled for the active workflow."""
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    def is_substitution_enabled(engine: Engine) -> bool:
+        """Return True if variable substitution is enabled for the active workflow.
 
-        return GriptapeNodes.WorkflowManager().is_variable_substitution_enabled()
+        KNOWN LIMITATION in a worker: this reads a local manager whose map is never populated.
+        SetVariableSubstitutionEnabledRequest writes it, and a generated workflow file emits that as
+        it loads -- on the orchestrator. Adopting the orchestrator's workflow context makes the
+        lookup index by name rather than short-circuit, but the answer is still the default True.
+
+        The orchestrator encodes "disabled" as an EMPTY variable dict when it pre-seeds one for a
+        dispatch, and substituting with an empty dict is not the same as not substituting:
+        `{VAR}` is preserved either way, but `{VAR?}` collapses to "" instead of staying literal.
+        So an optional macro resolves differently for a worker-executed node than for the same
+        node in-process, on a workflow that turned substitution off. The other affected readers
+        are the ones using this answer to decide whether a stored value is still an unresolved
+        template -- `node_types._variable_template_to_preserve`, and through it the display value
+        and the output write-back -- plus the sibling local read in `get_variables_if_enabled`.
+
+        Routing it through GetVariableSubstitutionEnabledRequest so it forwards was tried and
+        backed out: `parameter_output_values[...] = x` inside a node `__init__` reaches this
+        through TrackedParameterOutputValues, so every node construction became a bus request.
+        Fixing it properly means resolving the answer once per execution and carrying it,
+        rather than asking per value.
+        """
+        return engine.workflow_manager.variable_substitution.is_enabled()
 
     @staticmethod
-    def get_variables_if_enabled(node_name: str) -> dict[str, str | int] | None:
+    def get_variables_if_enabled(engine: Engine, node_name: str) -> dict[str, str | int] | None:
         """Return the variable dict if substitution is enabled, else None.
 
         Checks the per-aprocess cache first to avoid repeated singleton lookups.
@@ -131,10 +227,9 @@ class VariableResolver:
         orchestrator-resolved variable dict, so this fallback path is only reached for
         in-process nodes whose request predates the variables field (e.g. unit tests).
         """
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
+        # Same local read as is_substitution_enabled, and the same worker limitation applies;
+        # see the note there.
+        if not engine.workflow_manager.variable_substitution.is_enabled():
             return None
 
         cached = _aprocess_variable_cache.get()
@@ -144,23 +239,24 @@ class VariableResolver:
             return cached  # type: ignore[return-value]
 
         from griptape_nodes.retained_mode.events.variable_events import (
-            GetVariablesRequest,
-            GetVariablesResultSuccess,
+            ListVariablesRequest,
+            ListVariablesResultSuccess,
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
         try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(node_name)
+            flow_name = engine.node_manager.get_node_parent_flow_by_name(node_name)
         except KeyError:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
-        result = GriptapeNodes.handle_request(
-            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+        result = engine.handle_request(
+            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
-        if not isinstance(result, GetVariablesResultSuccess):
+        if not isinstance(result, ListVariablesResultSuccess):
+            logger.debug("Variable substitution skipped for node %s: %s", node_name, result.result_details)
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
-        resolved = VariableResolver._filter_for_substitution(result.variables)
+        resolved = VariableResolver._filter_for_substitution({v.name: v.value for v in result.variables})
         _aprocess_variable_cache.set(resolved)
         return resolved
 
@@ -186,10 +282,83 @@ class VariableResolver:
         return False
 
     @staticmethod
+    def would_substitute(value: Any, variables: dict[str, str | int]) -> bool:
+        """Return True if substitution would actually rewrite a {VAR} token in value.
+
+        The exact form of the ``contains_variable_macro`` heuristic, which only asks
+        whether the text contains a brace followed by a letter. Text that merely
+        looks templated (``body {color: red}`` with no ``color`` variable) does not
+        count here. Recurses into dicts and lists.
+
+        Exactness comes from asking ``resolve_macro_token`` itself rather than
+        re-deriving its rules, which is what makes the answer trustworthy for a
+        stored-state write. Every reason a token is left verbatim -- unknown required
+        variable, unparsable token, a format spec that raises on the variable's
+        actual value (``{SHOT:03}`` where ``SHOT`` is ``"hero"``) -- is honoured for
+        free, and cannot drift as the resolver gains rules. Note an optional
+        ``{VAR?}`` counts as a rewrite whether or not the variable exists, because
+        the resolver substitutes "" for it either way.
+        """
+
+        def rewrites(text: str) -> bool:
+            return any(
+                VariableResolver.resolve_macro_token(match.group(0), variables) != match.group(0)
+                for match in VariableResolver._MACRO_TOKEN.finditer(text)
+            )
+
+        return VariableResolver._contains_string(value, rewrites)
+
+    @staticmethod
+    def get_variables_without_memoizing(engine: Engine, node_name: str) -> dict[str, str | int] | None:
+        """Like `get_variables_if_enabled`, but never leaves the memo cache set.
+
+        ``get_variables_if_enabled`` memoises its lookup into the ContextVar without
+        a reset token. That is fine inside ``aprocess_scope()``, which owns the cache
+        and resets it on exit, but callers on the orchestrator run outside any scope:
+        there the ``set()`` is unpaired and leaves a variable dict visible -- and
+        going stale -- to everything that follows on the same task. Use this from
+        outside ``aprocess_scope()``. An already-populated cache is left untouched.
+        """
+        if _aprocess_variable_cache.get() is not None:
+            return VariableResolver.get_variables_if_enabled(engine, node_name)
+        token = _aprocess_variable_cache.set(None)
+        try:
+            return VariableResolver.get_variables_if_enabled(engine, node_name)
+        finally:
+            _aprocess_variable_cache.reset(token)
+
+    @staticmethod
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
-        """Filter a name→value dict to only str/int values (excluding bool) for macro substitution."""
-        return {
-            name: value
-            for name, value in variables.items()
-            if isinstance(value, (str, int)) and not isinstance(value, bool)
-        }
+        """Filter a name→value dict to the values that can substitute into {VAR} tokens.
+
+        str and int (excluding bool) pass through unchanged. Floats, bools, dicts, and lists pass as
+        strings, so the substitution and picker code downstream only ever sees str/int. A float,
+        bool, or dict is spelled as compact JSON (`1.5`, `true`, `{"a": 1}`), and a list has one
+        item per line.
+        """
+        filtered: dict[str, str | int] = {}
+        for name, value in variables.items():
+            if isinstance(value, list):
+                filtered[name] = VariableResolver._render_list(value)
+            # bool subclasses int, so it has to be caught before the int branch below.
+            elif isinstance(value, (bool, float, dict)):
+                filtered[name] = VariableResolver._render_value(value)
+            elif isinstance(value, (str, int)):
+                filtered[name] = value
+        return filtered
+
+    @staticmethod
+    def _render_list(items: list[Any]) -> str:
+        """Join list items into one string, one item per line."""
+        return "\n".join(VariableResolver._render_value(item) for item in items)
+
+    @staticmethod
+    def _render_value(item: Any) -> str:
+        """Strings pass through. Every other item is JSON, so a value is spelled the same at any depth."""
+        if isinstance(item, str):
+            return item
+        try:
+            return json.dumps(item)
+        except (TypeError, ValueError):
+            # Non-JSON values, or a container that contains itself.
+            return str(item)

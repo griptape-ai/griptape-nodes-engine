@@ -7,12 +7,17 @@ operations (rename, archive, delete, list).
 
 from __future__ import annotations
 
+import itertools
+import json
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ImageUrl, ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
+from griptape_nodes.retained_mode.events.agent_events import RunRecord
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,21 +55,66 @@ def test_save_and_load_history_round_trips(storage: LocalThreadStorageDriver) ->
     assert any(isinstance(p, TextPart) and p.content == "Hello!" for p in reloaded[1].parts)
 
 
+def test_saved_history_leaves_out_instructions(storage: LocalThreadStorageDriver) -> None:
+    """Each run sends its own instructions, so a request's saved copy is dropped."""
+    thread_id, _ = storage.create_thread()
+    request = ModelRequest(parts=[UserPromptPart(content="hi")], instructions="a long catalog")
+
+    storage.save_history(thread_id, [request, ModelResponse(parts=[TextPart(content="hello")])])
+
+    loaded = storage.load_history(thread_id)
+    assert isinstance(loaded[0], ModelRequest)
+    assert loaded[0].instructions is None
+    assert loaded[0].parts == request.parts
+
+
+def test_image_url_in_user_prompt_round_trips(storage: LocalThreadStorageDriver) -> None:
+    """A user prompt carrying an ImageUrl reference survives save/load intact."""
+    thread_id, _ = storage.create_thread()
+    url = "http://localhost:8124/workspace/cat.png"
+    history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+    storage.save_history(thread_id, history)
+    reloaded = storage.load_history(thread_id)
+
+    assert isinstance(reloaded[0], ModelRequest)
+    part = reloaded[0].parts[0]
+    assert isinstance(part, UserPromptPart)
+    assert part.content[0] == "look"
+    assert isinstance(part.content[1], ImageUrl)
+    assert part.content[1].url == url
+
+
 def test_list_threads_returns_message_counts_and_sorts(storage: LocalThreadStorageDriver) -> None:
-    """list_threads reports per-thread message counts and orders by recency."""
-    older_id, _ = storage.create_thread(title="older")
-    newer_id, _ = storage.create_thread(title="newer")
+    """list_threads reports per-thread message counts and orders by recency.
 
-    storage.save_history(older_id, [ModelRequest(parts=[UserPromptPart(content="Hi")])])
-    storage.save_history(
-        newer_id,
-        [
-            ModelRequest(parts=[UserPromptPart(content="Q1")]),
-            ModelResponse(parts=[TextPart(content="A1")]),
-        ],
-    )
+    The clock is stubbed so successive writes get strictly increasing timestamps.
+    This keeps the recency assertion deterministic on platforms with coarse
+    wall-clock resolution (e.g. Windows), where two real back-to-back writes can
+    otherwise land on the same tick and sort arbitrarily.
+    """
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    tick = itertools.count()
 
-    threads = storage.list_threads()
+    def increasing_now(_tz: object = None) -> datetime:
+        return base + timedelta(seconds=next(tick))
+
+    with patch("griptape_nodes.drivers.thread_storage.local_thread_storage_driver.datetime") as mock_datetime:
+        mock_datetime.now.side_effect = increasing_now
+
+        older_id, _ = storage.create_thread(title="older")
+        newer_id, _ = storage.create_thread(title="newer")
+
+        storage.save_history(older_id, [ModelRequest(parts=[UserPromptPart(content="Hi")])])
+        storage.save_history(
+            newer_id,
+            [
+                ModelRequest(parts=[UserPromptPart(content="Q1")]),
+                ModelResponse(parts=[TextPart(content="A1")]),
+            ],
+        )
+
+        threads = storage.list_threads()
+
     by_id = {t.thread_id: t for t in threads}
     assert by_id[older_id].message_count == 1
     assert by_id[newer_id].message_count == 2  # noqa: PLR2004
@@ -111,4 +161,64 @@ def test_update_thread_metadata_rename(storage: LocalThreadStorageDriver) -> Non
     thread_id, _ = storage.create_thread(title="old name")
     updated = storage.update_thread_metadata(thread_id, title="new name")
     assert updated["title"] == "new name"
-    assert storage.get_thread_metadata(thread_id)["title"] == "new name"
+    assert storage.get_thread_metadata(thread_id).title == "new name"
+
+
+def test_append_run_record_appears_in_get_thread_metadata(storage: LocalThreadStorageDriver) -> None:
+    """append_run_record persists a RunRecord that get_thread_metadata returns."""
+    thread_id, _ = storage.create_thread(title="conversation")
+    record = RunRecord(
+        message_index=1,
+        provider_name="griptape_cloud",
+        model="claude-sonnet-5",
+        mcp_servers=["brave"],
+        library_mcp_servers=["acme_render_tools"],
+    )
+    storage.append_run_record(thread_id, record)
+
+    thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
+    assert len(thread.runs) == 1
+    assert thread.runs[0] == record
+
+
+def test_append_run_record_accumulates_across_turns(storage: LocalThreadStorageDriver) -> None:
+    """Multiple append_run_record calls accumulate in order, not overwrite."""
+    thread_id, _ = storage.create_thread()
+    storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
+    storage.append_run_record(thread_id, RunRecord(message_index=3, provider_name="griptape_cloud", model="gpt-4o"))
+
+    thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
+    assert len(thread.runs) == 2  # noqa: PLR2004
+    assert thread.runs[0].message_index == 1
+    assert thread.runs[1].message_index == 3  # noqa: PLR2004
+
+
+def test_list_threads_omits_runs(storage: LocalThreadStorageDriver) -> None:
+    """list_threads does not load runs — use get_thread_metadata for that."""
+    thread_id, _ = storage.create_thread(title="fast-list")
+    storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
+
+    thread = next(t for t in storage.list_threads() if t.thread_id == thread_id)
+    assert thread.runs is None, "list_threads must not deserialize runs"
+
+
+def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadStorageDriver) -> None:
+    """A malformed run record in runs.json is skipped without crashing get_thread_metadata."""
+    thread_id, _ = storage.create_thread(title="resilient")
+    runs_path = storage.threads_directory / f"thread_{thread_id}.runs.json"
+    runs_path.write_text(
+        json.dumps(
+            [
+                {"bad_field": "value"},  # missing required fields — must be skipped
+                {"message_index": 1, "provider_name": "ollama", "model": "llama3", "mcp_servers": []},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
+    assert len(thread.runs) == 1
+    assert thread.runs[0].message_index == 1

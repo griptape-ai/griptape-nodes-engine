@@ -1,12 +1,12 @@
 import logging
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, overload
 
 from dotenv import dotenv_values, get_key, set_key, unset_key
 from dotenv.main import DotEnv
-from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.retained_mode.events.app_events import SecretChanged
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     DeleteSecretValueResultFailure,
     DeleteSecretValueResultSuccess,
     GetAllSecretValuesRequest,
+    GetAllSecretValuesResultFailure,
     GetAllSecretValuesResultSuccess,
     GetSecretValueRequest,
     GetSecretValueResultFailure,
@@ -25,11 +26,23 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
+from griptape_nodes.utils.engine_dirs import engine_config_dir
 
 logger = logging.getLogger("griptape_nodes")
 
-ENV_VAR_PATH = xdg_config_home() / "griptape_nodes" / ".env"
+ENV_VAR_PATH = engine_config_dir() / ".env"
+
+
+def merge_env_file_values(*, global_values: Mapping[str, str], workspace_values: Mapping[str, str]) -> dict[str, str]:
+    """Merge the two ``.env`` layers in the precedence ``get_secret`` documents.
+
+    Workspace beats global. Stated once and shared with the diagnostics report, which reads the
+    same two files to say which one a key came from: two hand-written copies meant a change to
+    the layering could leave the report wrong about the file to look in.
+    """
+    return {**global_values, **workspace_values}
 
 
 class SecretsManager:
@@ -52,7 +65,7 @@ class SecretsManager:
         self._load_env_files_into_environ()
 
         if event_manager is not None:
-            self._register_handlers(event_manager)
+            event_manager.register_request_handlers(self)
 
     def refresh_from_env_file(self) -> None:
         """Re-read the .env files into os.environ for keys this manager owns.
@@ -81,7 +94,7 @@ class SecretsManager:
             logger.debug("No .env files to refresh from; leaving os.environ untouched.")
             return
 
-        merged = self._read_merged_env_files()
+        merged = self.read_merged_env_files()
         previously_managed = set(self._managed_env_keys)
         installed = 0
         overridden = 0
@@ -135,19 +148,20 @@ class SecretsManager:
             if self.get_secret(secret_name, should_error_on_not_found=False) is None:
                 self.set_secret(secret_name, default_value)
 
+    @handles(GetSecretValueRequest)
     def on_handle_get_secret_request(self, request: GetSecretValueRequest) -> ResultPayload:
         secret_key = SecretsManager._apply_secret_name_compliance(request.key)
         secret_value = self.get_secret(secret_key, should_error_on_not_found=request.should_error_on_not_found)
 
         if secret_value is None and request.should_error_on_not_found:
             details = f"Secret '{secret_key}' not found."
-            logger.error(details)
             return GetSecretValueResultFailure(result_details=details)
 
         return GetSecretValueResultSuccess(
             value=secret_value, result_details=f"Successfully retrieved secret value for key: {secret_key}"
         )
 
+    @handles(SetSecretValueRequest)
     def on_handle_set_secret_request(self, request: SetSecretValueRequest) -> ResultPayload:
         secret_name = SecretsManager._apply_secret_name_compliance(request.key)
         secret_value = request.value
@@ -171,24 +185,34 @@ class SecretsManager:
 
         return SetSecretValueResultSuccess(result_details=f"Successfully set secret value for key: {secret_name}")
 
+    @handles(GetAllSecretValuesRequest)
     def on_handle_get_all_secret_values_request(self, request: GetAllSecretValuesRequest) -> ResultPayload:  # noqa: ARG002
-        secret_values = dotenv_values(ENV_VAR_PATH)
+        # An unreadable file fails; a missing one is a real "no secrets yet" and succeeds
+        # empty, so callers replacing content with this result cannot delete credentials
+        # because of a read error.
+        if ENV_VAR_PATH.exists():
+            try:
+                secret_values = dotenv_values(ENV_VAR_PATH)
+            except OSError as err:
+                details = f"Attempted to read stored secrets from '{ENV_VAR_PATH}'. Failed because the file could not be read: {err}"
+                return GetAllSecretValuesResultFailure(result_details=details)
+        else:
+            secret_values = {}
 
         return GetAllSecretValuesResultSuccess(
             values=secret_values, result_details=f"Successfully retrieved {len(secret_values)} secret values"
         )
 
+    @handles(DeleteSecretValueRequest)
     def on_handle_delete_secret_value_request(self, request: DeleteSecretValueRequest) -> ResultPayload:
         secret_name = SecretsManager._apply_secret_name_compliance(request.key)
 
         if not ENV_VAR_PATH.exists():
             details = f"Secret file does not exist: '{ENV_VAR_PATH}'"
-            logger.error(details)
             return DeleteSecretValueResultFailure(result_details=details)
 
         if get_key(ENV_VAR_PATH, secret_name) is None:
             details = f"Secret {secret_name} not found in {ENV_VAR_PATH}"
-            logger.error(details)
             return DeleteSecretValueResultFailure(result_details=details)
 
         unset_key(ENV_VAR_PATH, secret_name)
@@ -256,6 +280,19 @@ class SecretsManager:
             )
         self._install_managed(secret_name, secret_value)
 
+    def read_merged_env_files(self) -> dict[str, str]:
+        """Return the merged contents of both .env files with workspace winning.
+
+        The precedence ``get_secret`` documents. Empty values (``FOO=`` in the file) are kept as
+        empty strings, missing files are skipped, and ``None`` from ``dotenv_values`` is filtered
+        out so callers can rely on a ``dict[str, str]``. Public because the diagnostics report
+        needs the same values, to scrub them out of log text.
+        """
+        return merge_env_file_values(
+            global_values=self._read_env_file(ENV_VAR_PATH),
+            workspace_values=self._read_env_file(self.workspace_env_path),
+        )
+
     def _load_env_files_into_environ(self) -> None:
         """Read both .env files into ``os.environ`` and seed ``_managed_env_keys``.
 
@@ -272,39 +309,22 @@ class SecretsManager:
         delivered before.
         """
         pre_load_environ = set(os.environ.keys())
-        merged = self._read_merged_env_files()
+        merged = self.read_merged_env_files()
         for key, value in merged.items():
             if key in pre_load_environ:
                 # OS-owned. Leave alone.
                 continue
             self._install_managed(key, value)
 
-    def _read_merged_env_files(self) -> dict[str, str]:
-        """Return the merged contents of both .env files with workspace winning.
+    def _read_env_file(self, path: Path) -> dict[str, str]:
+        """Return one .env file's contents, or nothing when there is no file there.
 
-        Workspace overrides global because that is the precedence order
-        ``get_secret`` documents. Empty values (``FOO=`` in the file) are
-        kept as empty strings; missing files are skipped. ``None`` values
-        from ``dotenv_values`` are filtered out so callers can rely on
-        ``dict[str, str]`` shape.
+        ``None`` values from ``dotenv_values`` -- a bare ``FOO`` with no ``=`` -- are
+        dropped, so callers can rely on the ``dict[str, str]`` shape.
         """
-        merged: dict[str, str] = {}
-        if ENV_VAR_PATH.exists():
-            merged.update({k: v for k, v in dotenv_values(ENV_VAR_PATH).items() if v is not None})
-        if self.workspace_env_path.exists():
-            merged.update({k: v for k, v in dotenv_values(self.workspace_env_path).items() if v is not None})
-        return merged
-
-    def _register_handlers(self, event_manager: EventManager) -> None:
-        """Wire request types to their handlers."""
-        event_manager.assign_manager_to_request_type(GetSecretValueRequest, self.on_handle_get_secret_request)
-        event_manager.assign_manager_to_request_type(SetSecretValueRequest, self.on_handle_set_secret_request)
-        event_manager.assign_manager_to_request_type(
-            GetAllSecretValuesRequest, self.on_handle_get_all_secret_values_request
-        )
-        event_manager.assign_manager_to_request_type(
-            DeleteSecretValueRequest, self.on_handle_delete_secret_value_request
-        )
+        if not path.exists():
+            return {}
+        return {key: value for key, value in dotenv_values(path).items() if value is not None}
 
     def _install_managed(self, key: str, value: str) -> None:
         """Write ``key`` to ``os.environ`` and claim it as manager-owned.

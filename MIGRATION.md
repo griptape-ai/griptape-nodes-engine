@@ -1,3 +1,264 @@
+# Unreleased
+
+## `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
+
+Rename the key in any config file or environment that sets it; the environment variable is
+`GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`. The old name is not read, so a setting left behind
+silently reverts to the 600 second default.
+
+What the value bounds is unchanged: how long a worker may take to load its library, covering a node
+waiting for its library's worker and a project switch waiting for each worker to adopt it. It no
+longer delays heartbeat enforcement, which is what the old name suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
+
+## Libraries no longer choose a worker
+
+Where a library's nodes execute now follows from its dependencies. A library that declared
+`SuggestedWorkerMode(WORKER)`, or that a user set to "Isolated" through `worker_mode_override`, used
+to be hosted whole in a worker process. It now loads into the engine process like any other
+library, and its `pip_dependencies` install into `<library>/.venv`, which sits on the engine's own
+import path. Packages that conflict with the engine's now conflict in that process.
+
+**Library authors.** Move the packages that need isolation into `pip_dependencies_exec`, under
+`metadata.dependencies` in `griptape-nodes-library.json`:
+
+```json
+"dependencies": {
+  "pip_dependencies": ["pillow"],
+  "pip_dependencies_exec": ["torch", "diffusers"]
+}
+```
+
+The library's nodes still load in the engine, so the editor gets their real traits, converters,
+and validators. Only `process`/`aprocess` runs in a worker, against `<library>/.venv-exec`, which is
+resolved over both sets. A node module must stay importable without the execution set, so import
+those packages inside `process`. See
+[How to declare execution dependencies](docs/development/custom_nodes/node_isolation_with_workers.md#how-to-declare-execution-dependencies).
+
+`WorkerModeCompatibility`, `SuggestedWorkerMode`, and the `worker_mode_override` key in
+`libraries_to_register` still parse, so neither old manifests nor old config files fail to load.
+They have no effect. While a library still asks for a worker and declares no
+`pip_dependencies_exec`, loading it logs one INFO line saying so.
+
+**Also removed:**
+
+- The `WORKER_DELEGATED` and `WORKER_PENDING` library lifecycle states.
+- `requires_worker` on a library's diagnostics.
+- `node_schemas` on `ReportLibraryLoadedRequest`, with the `WorkerNodeSchema` and
+    `WorkerParameterSchema` payloads it carried.
+- The strict-mode rules `reentrant-bus-in-init`, `parameter-behaviors-dropped-in-schema`,
+    `connection-hooks-inert-on-worker`, and `value-hooks-execute-only-on-worker`, and the
+    `LOAD_PROBE` scope kind. `parameter-mutation-during-aprocess` is the only rule left.
+- The fitness problems reporting that request handlers and post-dispatch hooks are unsupported in an
+    isolated library. Both now work in every library.
+
+## Parameter values keep their type
+
+**Library authors.** A field of your own request, result, or event payload that holds parameter
+values must be annotated `Value`. A field typed `Any` that holds a griptape object, or any value
+JSON can't represent, now fails to send:
+
+```python
+from griptape_nodes.serialization.values import Value
+
+
+@dataclass
+class ColorizeResultSuccess(ResultPayloadSuccess):
+    image: Value  # was: Any
+```
+
+To make a class you own save, decorate it with `register_value_codec` and
+give it `to_state()` and a `from_state()` classmethod. For a class you cannot edit, pass the
+conversion functions from your library's `before_library_nodes_loaded`:
+
+```python
+import numpy as np
+
+from griptape_nodes.exe_types.core_types import register_value_codec
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+
+
+@register_value_codec
+class Palette:
+    def __init__(self, colors: list[str]) -> None:
+        self.colors = colors
+
+    def to_state(self) -> dict:
+        return {"colors": self.colors}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Palette":
+        return cls(state["colors"])
+
+
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        register_value_codec(
+            np.ndarray,
+            to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+            from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+        )
+```
+
+## Events are serialized by converters
+
+**Embedders and request API clients written in Python.** Events and payloads no longer have
+wire-format serialization methods. Use the cattrs converters in
+`griptape_nodes.retained_mode.events.converters` for the message's reader:
+
+```python
+from griptape_nodes.retained_mode.events import converters
+
+converters.client.dumps(event)  # was: event.json()
+converters.engine.unstructure(event)  # was: event.dict()
+converters.engine.dumps(result)  # was: result.strict_json()
+converters.engine.dumps_result(result).text  # was: result.failure_json(error)
+converters.engine.dumps(payload)  # was: payload.to_json()
+converters.engine.structure(data, EventResultSuccess)  # was: EventResultSuccess.from_dict(data)
+```
+
+`engine` preserves parameter types between engine processes; `client` writes plain JSON for
+the editor and other clients. `dumps` raises `EventSerializationError` from `converters`.
+Use `dumps_result(result).text` to send a failure when a result cannot be serialized.
+
+`event.json()` and `event.dict()` raise `TypeError`.
+
+## `serializable=False` outputs are held in their own process across a worker boundary
+
+`Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it
+now also means "hold this object in the process that produced it": when the value would cross a worker
+process boundary, the engine keeps the object where it is and sends an opaque key in its place, and the
+consuming node's read turns the key back into the object. This is how a library isolated in a worker hands
+a pipeline or a latent tensor to its next node. See
+[Passing Values That Cannot Be Serialized](docs/development/custom_nodes/passing_unserializable_values.md).
+
+Nothing changes for a graph that stays in one process, for values that are already data, or for values on
+a parameter that declares nothing: a string, a number or a dict of them on a declared parameter still
+travels as itself, because a key would be unresolvable on the far side.
+
+The cache belongs to the **worker**, not to a library. One worker can host several libraries, and they
+share it: a co-hosted library handed a key can resolve it, because they genuinely share a process. Keys a
+library chooses through `local_objects.put` are namespaced by that library inside the worker, so
+co-tenants cannot collide. What an object cannot do is leave the process that built it.
+
+A list or dictionary parameter is unaffected: declaring `serializable=False` on one still keeps it out of
+saved workflows. It adds no holding, because a container builds its value from its children. Put the value
+on an ordinary parameter marked `serializable=False` if you want it cached.
+
+## Traits can save runtime state
+
+A trait keeps its existing constructor. To persist runtime changes, implement `to_state()` and
+`apply_state()`:
+
+```python
+class Threshold(Trait):
+    def __init__(self, level: int = 5) -> None:
+        super().__init__()
+        self.level = level
+
+    def to_state(self) -> dict[str, int]:
+        return {"level": self.level}
+
+    def apply_state(self, state: dict[str, int]) -> None:
+        if "level" in state:
+            self.level = state["level"]
+```
+
+The default methods save nothing, so existing traits remain compatible. State must contain plain
+JSON-compatible values. The engine applies it to the trait the node already built, preserving
+callbacks and other constructor wiring. For a parameter the node declares, only keys that differ
+from what the node builds are saved, so changing a constructor default still reaches existing
+workflows.
+
+When the node does not build a saved trait, the engine builds it with `from_state()`, which passes
+the state to the constructor. Override it when `to_state()` keys are not constructor arguments.
+The state can hold only some keys, so fall back to defaults for missing ones.
+
+## Branched workflows show a title instead of a file path
+
+Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
+name — to its registry key, which is derived from the file path. A branch of "Shot 010 Comp" saved
+under `shots/sh010/` came back named `shots/sh010/comp_branch_1`, so anywhere the editor shows a
+workflow title, a branch read as a path while its own source next to it read as a title.
+
+A branch is now named after the workflow it came from:
+
+|                 | before                      | after                                   |
+| --------------- | --------------------------- | --------------------------------------- |
+| registry key    | `shots/sh010/comp_branch_1` | `shots/sh010/comp_branch_1` (unchanged) |
+| `metadata.name` | `shots/sh010/comp_branch_1` | `Shot 010 Comp (branch 1)`              |
+
+Registry keys are unchanged, so anything that looks workflows up by name keeps working. Merging a
+branch no longer overwrites its source's title, and resetting a branch no longer overwrites its own.
+
+`BranchWorkflowRequest` takes an optional `branched_workflow_display_name` if you want to set the
+label yourself:
+
+```python
+BranchWorkflowRequest(workflow_name="shots/sh010/comp", branched_workflow_display_name="Lighting Test")
+```
+
+**Workflows already on disk.** Files written by earlier versions still carry the path in their
+header. The engine shows the readable name (just the file name, e.g. `comp_branch_1`) when it loads
+one, and the header is rewritten the next time that workflow is saved. Nothing is rewritten during
+load, so no files change until you save them. Only a display name that exactly equals its own
+registry key is repaired — a title you deliberately wrote with a `/` in it is left alone.
+
+## Agent streaming payloads carry `thread_id`
+
+`AgentStreamEvent`, `AgentThinkingEvent`, `AgentToolCallEvent`, and `AgentToolResultEvent`
+now require a `thread_id` naming the conversation they belong to. Execution events are
+broadcast to every connected client, so a client with more than one chat surface open
+previously had to assume a delta belonged to whichever turn it started last. The id
+matches the `thread_id` on the `RunAgentResultSuccess` that ends the turn.
+
+If your code constructs one of these payloads, add the thread id:
+
+```python
+AgentStreamEvent(thread_id=thread_id, token=token)
+```
+
+Consumers keep working unchanged; `thread_id` is a new field on the wire, not a rename.
+
+## Test isolation for node library test suites
+
+`GriptapeNodes` is no longer built by `SingletonMeta`. Its managers now live on an `Engine`
+that is resolved per context, so clearing the metaclass cache no longer resets engine state.
+
+If your library's test suite copied this repo's old isolation pattern:
+
+```python
+from griptape_nodes.utils.metaclasses import SingletonMeta
+
+SingletonMeta._instances.clear()
+```
+
+replace it with:
+
+```python
+from griptape_nodes.retained_mode.engine import reset_root_engine
+
+reset_root_engine()
+```
+
+This matters even though the old call still imports and runs: it silently stops resetting the
+engine, so a patched `USER_CONFIG_PATH` or `ENV_VAR_PATH` set up per test no longer takes
+effect after the first test touches the engine. Tests keep passing while reading config from a
+previous test's temporary directory.
+
+A test that needs an engine it can hold, rather than a reset between cases, can use
+`engine_scope()` from the same module.
+
+## `package_to_folder` reports where it put the workflow
+
+`WorkflowPackager.package_to_folder` returned a `list[str]` of library paths. It now returns a
+`PackagedBundle`:
+
+```python
+packaged = packager.package_to_folder(destination, workflow)
+packaged.entrypoint_workflow_path  # Path, relative to the bundle root
+packaged.library_paths  # tuple[Path, ...], relative to the bundle root
+```
+
 # v0.64.0
 
 This guide documents the removal of deprecated nodes from Griptape Nodes libraries in version 0.64.0.
