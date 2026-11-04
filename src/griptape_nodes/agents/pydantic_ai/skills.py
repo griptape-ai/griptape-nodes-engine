@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import os
 import posixpath
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -75,9 +76,17 @@ class ReadOnlyDirectoryBackend:
         return "/"
 
     def host_path(self, path: str) -> Path:
-        """The host path for an absolute workspace path. `..` cannot climb above the root."""
+        """The host path for an absolute workspace path. `..` cannot climb above the root.
+
+        Raises:
+            FileNotFoundError: The path names a place outside the root.
+        """
         parts = PurePosixPath(posixpath.normpath("/" + path.lstrip("/"))).parts[1:]
-        return self._root.joinpath(*parts)
+        # Windows also splits on `\` and reads `C:` as a drive, which the POSIX normalization above cannot see.
+        target = Path(os.path.normpath(self._root.joinpath(*parts)))
+        if not target.is_relative_to(self._root):
+            raise FileNotFoundError(errno.ENOENT, "No such file in the skills directory", path)
+        return target
 
     async def read_bytes(self, path: str) -> bytes:
         return self._contained_path(path).read_bytes()
@@ -106,7 +115,10 @@ class ReadOnlyDirectoryBackend:
         return entries
 
     async def exists(self, path: str) -> bool:
-        target = self.host_path(path)
+        try:
+            target = self.host_path(path)
+        except FileNotFoundError:
+            return False
         return self._is_contained(target) and target.exists()
 
     async def realpath(self, path: str) -> str:

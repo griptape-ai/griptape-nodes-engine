@@ -41,7 +41,7 @@ The `name` must match the skill's folder name, and `description` tells the agent
 
 If a `SKILL.md` has a mistake in its frontmatter, the agent leaves that skill out and logs a warning naming the file. Your other skills still load.
 
-Add `disable-model-invocation: true` to the frontmatter to keep a skill in the folder without offering it to the agent.
+Add `disable-model-invocation: true` to the frontmatter to keep a skill in the folder without offering it to the agent. The agent can still read the skill's files while it uses your other skills, so move a skill out of the folder to keep it private.
 
 ## Bundled files
 
