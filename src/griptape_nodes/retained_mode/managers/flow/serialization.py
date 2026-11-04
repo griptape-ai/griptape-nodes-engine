@@ -432,8 +432,6 @@ class FlowSerialization(EngineScoped):
 
         return aggregated_commands
 
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/861
-    # similar manager refactors: https://github.com/griptape-ai/griptape-nodes/issues/806
     @handles(SerializeFlowToCommandsRequest)
     def on_serialize_flow_to_commands(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: SerializeFlowToCommandsRequest, workflow: WorkflowRuntime
