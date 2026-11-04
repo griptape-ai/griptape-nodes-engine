@@ -104,6 +104,12 @@ Must equal ``servers.mcp.EVENT_REQUEST_BATCH_TOOL_NAME``; a test holds the two i
 GTN_BATCH_TOOL_NAME = f"{GTN_SERVER_NAME}_{BATCH_TOOL_BARE_NAME}"
 """Prefixed name of the engine's batch tool, whose inner requests are gated one by one."""
 
+GTN_WORKFLOW_ID_HEADER = "X-Griptape-Workflow-Id"
+"""Header naming the open workflow the engine's MCP server acts on for an agent run.
+
+Must equal ``servers.mcp.WORKFLOW_ID_HEADER``; a test holds the two in step.
+"""
+
 
 @dataclass(frozen=True)
 class BuiltMCPServer:
@@ -212,15 +218,19 @@ async def disconnect_transport(name: str, transport: ClientTransport) -> None:
         logger.warning("Attempted to shut down MCP server '%s'. Failed because of: %s", name, e)
 
 
-def streamable_http_local(url: str) -> AbstractToolset[Any]:
+def streamable_http_local(url: str, *, workflow_id: str | None) -> AbstractToolset[Any]:
     """Convenience builder for the engine's own MCP server (streamable HTTP).
 
     Always prefixed with :data:`GTN_SERVER_NAME`: the approval gate and grant keys
-    match the engine's tools by that prefix.
+    match the engine's tools by that prefix. ``workflow_id`` names the open workflow
+    the tool calls act on, sent as :data:`GTN_WORKFLOW_ID_HEADER`; None sends no header.
     """
+    headers: dict[str, str] = {}
+    if workflow_id is not None:
+        headers[GTN_WORKFLOW_ID_HEADER] = workflow_id
     return _compose(
         GTN_SERVER_NAME,
-        MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES),
+        MCPToolset(StreamableHttpTransport(url=url, headers=headers), max_retries=DEFAULT_TOOL_MAX_RETRIES),
         tool_blocklist=DEFAULT_GTN_TOOL_BLOCKLIST,
     ).approval_required(_gtn_tool_requires_approval)
 

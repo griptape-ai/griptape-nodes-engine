@@ -12,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI
 from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
+from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.shared.exceptions import MCPError
 from mcp.types import (
@@ -35,6 +36,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
     RequestPayload,
+    ResultPayload,
 )
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueRequest,
@@ -47,8 +49,10 @@ from griptape_nodes.retained_mode.events.connection_events import (
 )
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     SetWorkflowContextRequest,
+    SetWorkflowContextSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
@@ -66,6 +70,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListFlowsInCurrentContextRequest,
     ListNodesInFlowRequest,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     GetEngineSourceInfoRequest,
@@ -246,6 +251,21 @@ secrets_manager = SecretsManager(config_manager)
 mcp_server_logger = logging.getLogger("griptape_nodes_mcp_server")
 mcp_server_logger.setLevel(logging.INFO)
 
+# HTTP header naming the open workflow a client's tool calls act on, by workflow id.
+WORKFLOW_ID_HEADER = "X-Griptape-Workflow-Id"
+
+# The workflow each MCP session opened or selected with its own EnsureWorkflowAndFlowRequest or
+# SetWorkflowContextRequest, by MCP session id. Read and written only on the engine loop.
+_session_workflow_ids: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class ToolCallSender:
+    """What a tool call says about who sent it: the workflow its header names and its MCP session."""
+
+    header_workflow_id: str | None = None
+    session_id: str | None = None
+
 
 def _summarize_result_details(result_details: object) -> str | list[dict] | None:
     """Collapse the engine's nested result_details payload into something terse.
@@ -413,17 +433,19 @@ def _trim_batch_results(raw_results: list[Any]) -> list[dict[str, Any]]:
     return trimmed
 
 
-async def _handle_request_on_engine_loop(request_payload: RequestPayload) -> dict[str, Any]:
+async def _handle_request_on_engine_loop(request_payload: RequestPayload, sender: ToolCallSender) -> dict[str, Any]:
     """Handle a request on the engine loop and serialize the result to the wire shape.
 
-    Must be scheduled onto the engine's event loop (see _dispatch_to_engine). GriptapeNodes.
-    ahandle_request is the same in-memory entry point the engine's own inbound path uses: it
-    dispatches to the assigned manager and broadcasts the result so connected clients (e.g. the
-    editor) still observe the change. The returned ResultPayload is wrapped back into an
-    EventResult purely to reuse its wire serializer, producing the same dict shape the WebSocket
-    transport delivered, which _trim_response already knows how to collapse.
+    Must be scheduled onto the engine's event loop (see _dispatch_to_engine). The request goes
+    through the same in-memory entry point the engine's own inbound path uses: it dispatches to the
+    assigned manager and broadcasts the result so connected clients (e.g. the editor) still observe
+    the change. It acts on the workflow the sender names (see `_workflow_id_for_sender`). The
+    returned ResultPayload is wrapped back into an EventResult purely to reuse its wire serializer,
+    producing the same dict shape the WebSocket transport delivered, which _trim_response already
+    knows how to collapse.
     """
-    result_payload = await GriptapeNodes.ahandle_request(request_payload)
+    result_payload = await _handle_in_named_workflow(request_payload, _workflow_id_for_sender(sender))
+    _remember_session_workflow(sender, result_payload)
     if result_payload.succeeded():
         result_event: EventResultSuccess | EventResultFailure = EventResultSuccess(
             request=request_payload, result=result_payload
@@ -433,7 +455,54 @@ async def _handle_request_on_engine_loop(request_payload: RequestPayload) -> dic
     return json.loads(converters.client.dumps_result(result_event).text)
 
 
-async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int | None = None) -> dict[str, Any]:
+async def _handle_in_named_workflow(request_payload: RequestPayload, workflow_id: str | None) -> ResultPayload:
+    """Handle `request_payload` in the open workflow `workflow_id`, or with None, naming no workflow."""
+    engine = GriptapeNodes.get_instance()
+    if workflow_id is None:
+        return await engine.ahandle_request(request_payload)
+    workflow = engine.open_workflows.find(workflow_id)
+    if workflow is None:
+        details = (
+            f"Attempted to handle {type(request_payload).__name__} in workflow '{workflow_id}'. "
+            "Failed because that workflow isn't open in the engine. Open it, or name another workflow."
+        )
+        return WorkflowNotOpenResultFailure(result_details=details)
+    return await workflow.ahandle_request(request_payload)
+
+
+def _workflow_id_for_sender(sender: ToolCallSender) -> str | None:
+    """The workflow a tool call acts on: its header's, else the one its session opened, else none.
+
+    A session's workflow that has closed since is forgotten and counts as none.
+    """
+    if sender.header_workflow_id is not None:
+        return sender.header_workflow_id
+    if sender.session_id is None:
+        return None
+    workflow_id = _session_workflow_ids.get(sender.session_id)
+    if workflow_id is None:
+        return None
+    if not GriptapeNodes.get_instance().open_workflows.is_open(workflow_id):
+        del _session_workflow_ids[sender.session_id]
+        return None
+    return workflow_id
+
+
+def _remember_session_workflow(sender: ToolCallSender, result: ResultPayload) -> None:
+    """Remember the workflow a session's own Ensure or SetWorkflowContext request opened or selected."""
+    if sender.session_id is None or sender.header_workflow_id is not None:
+        return
+    workflow_id = None
+    if isinstance(result, (EnsureWorkflowAndFlowResultSuccess, SetWorkflowContextSuccess)):
+        workflow_id = result.workflow_id
+    if workflow_id is None:
+        return
+    _session_workflow_ids[sender.session_id] = workflow_id
+
+
+async def _dispatch_to_engine(
+    request_payload: RequestPayload, sender: ToolCallSender, timeout_ms: int | None = None
+) -> dict[str, Any]:
     """Dispatch a request from the MCP server's loop onto the engine loop and await the result.
 
     The MCP server runs uvicorn on its own event loop in a daemon thread, so `call_tool` is not
@@ -460,7 +529,7 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
         )
         raise RuntimeError(msg)
     response_future = asyncio.wrap_future(
-        asyncio.run_coroutine_threadsafe(_handle_request_on_engine_loop(request_payload), engine_loop)
+        asyncio.run_coroutine_threadsafe(_handle_request_on_engine_loop(request_payload, sender), engine_loop)
     )
     if timeout_ms:
         return await asyncio.wait_for(asyncio.shield(response_future), timeout=timeout_ms / 1000)
@@ -495,18 +564,30 @@ async def call_tool(ctx: ServerRequestContext[Any], params: CallToolRequestParam
     """
     try:
         tools = await _tools_for_request(ctx)
-        payload = await _call_tool_payload(params.name, params.arguments or {}, tools)
+        payload = await _call_tool_payload(params.name, params.arguments or {}, tools, _tool_call_sender(ctx))
     except Exception as exc:
         return CallToolResult(content=[TextContent(text=str(exc))], is_error=True)
     return CallToolResult(content=[TextContent(text=payload)])
 
 
-async def _call_tool_payload(name: str, arguments: dict[str, Any], tools: dict[str, MCPTool]) -> str:
+def _tool_call_sender(ctx: ServerRequestContext[Any]) -> ToolCallSender:
+    """Read the workflow header and MCP session id off the HTTP request that carried a tool call."""
+    if not isinstance(ctx.request, Request):
+        return ToolCallSender()
+    return ToolCallSender(
+        header_workflow_id=ctx.request.headers.get(WORKFLOW_ID_HEADER) or None,
+        session_id=ctx.request.headers.get(MCP_SESSION_ID_HEADER) or None,
+    )
+
+
+async def _call_tool_payload(
+    name: str, arguments: dict[str, Any], tools: dict[str, MCPTool], sender: ToolCallSender
+) -> str:
     """Dispatch one tool call and return its JSON text payload."""
     if name == EVENT_REQUEST_BATCH_TOOL_NAME:
         requests = _build_batch_requests(arguments.get("requests"), tools)
         timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(requests))
-        raw_results = await _dispatch_batch_to_engine(requests, timeout_ms)
+        raw_results = await _dispatch_batch_to_engine(requests, sender, timeout_ms)
         mcp_server_logger.debug("Got %d batch results", len(raw_results))
         return json.dumps(_trim_batch_results(raw_results))
 
@@ -515,19 +596,22 @@ async def _call_tool_payload(name: str, arguments: dict[str, Any], tools: dict[s
         raise ValueError(msg)
 
     request_payload = tools[name].request_type(**arguments)
-    result = await _dispatch_to_engine(request_payload, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
+    result = await _dispatch_to_engine(request_payload, sender, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
     mcp_server_logger.debug("Got result: %s", result)
     return json.dumps(_trim_response(result))
 
 
-async def _dispatch_batch_to_engine(requests: list[RequestPayload], timeout_ms: int) -> list[Any]:
+async def _dispatch_batch_to_engine(
+    requests: list[RequestPayload], sender: ToolCallSender, timeout_ms: int
+) -> list[Any]:
     """Dispatch a batch of requests concurrently onto the engine loop.
 
-    Mirrors the single-request path but gathers the per-request futures. Failures are returned
+    Mirrors the single-request path, every inner request acting on the workflow the batch call
+    names, but gathers the per-request futures. Failures are returned
     in their slot (return_exceptions semantics) so one bad inner request does not abort the rest;
     _trim_batch_results maps those exceptions to ok=false responses.
     """
-    coros = [_dispatch_to_engine(request) for request in requests]
+    coros = [_dispatch_to_engine(request, sender) for request in requests]
     gather = asyncio.gather(*coros, return_exceptions=True)
     return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
 

@@ -205,7 +205,6 @@ class PydanticAgentRunner:
     system_prompt: str | None = None
     provider: str = ProviderID.GRIPTAPE_CLOUD
     base_url: str | None = None
-    mcp_servers: list[AbstractToolset[Any]] = field(default_factory=list)
     image_config: ImageGenerationToolsetConfig | None = None
     static_files_manager: StaticFilesManager | None = None
     auto_load_skills: bool = True
@@ -217,12 +216,8 @@ class PydanticAgentRunner:
     _image_toolset: ImageGenerationToolset | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        toolsets: list[Any] = list(self.mcp_servers)
         instructions = self._build_instructions()
-        agent_kwargs: dict[str, Any] = {
-            "instructions": instructions,
-            "toolsets": toolsets or None,
-        }
+        agent_kwargs: dict[str, Any] = {"instructions": instructions}
         if self.system_prompt:
             agent_kwargs["system_prompt"] = self.system_prompt
         # `build_model` resolves `settings=None` to the catalog preset for this
@@ -243,11 +238,10 @@ class PydanticAgentRunner:
             self._image_toolset = register_image_tools(self._agent, self.image_config, self.static_files_manager)
         resolved_settings = model.settings or {}
         logger.debug(
-            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills_library=%s "
+            "PydanticAgentRunner ready: model=%s workspace=%s image_tool=%s skills_library=%s "
             "usage_limits=%s max_tokens=%s",
             self.model_name,
             self.workspace_root,
-            len(self.mcp_servers),
             self._image_toolset is not None,
             self._skills_library(),
             self.usage_limits,
@@ -424,11 +418,11 @@ class PydanticAgentRunner:
                 so any in-place edit would leak back onto disk. ``None`` sends
                 the loaded history to the model unchanged.
             extra_toolsets: Toolsets to attach to this run only, on top of the
-                ones baked into the agent. Pydantic AI treats run-level toolsets
-                as additive, so these do not replace ``mcp_servers``. Use this
-                for toolsets whose configuration can change between runs - an
-                MCP server the user just edited - so the run picks up the
-                current config without rebuilding the agent.
+                ones registered on the agent. Use this for toolsets whose
+                configuration can change between runs - an MCP server the user
+                just edited, or the engine's own server addressed to the run's
+                workflow - so the run picks up the current config without
+                rebuilding the agent.
             extra_instructions: Instructions to append for this run only, in the
                 same additive spirit. Guidance that belongs to a toolset passed
                 via ``extra_toolsets`` travels here, so the two stay in sync.

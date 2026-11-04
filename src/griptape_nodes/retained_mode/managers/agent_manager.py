@@ -946,7 +946,7 @@ class AgentManager(EngineScoped):
                 cancel_event=active.cancel_event,
                 persist_prompt=persist_prompt,
                 history_rehydrator=_rehydrate_history,
-                extra_toolsets=[*mcp.lease.toolsets, *library_toolsets],
+                extra_toolsets=[self._engine_mcp_toolset(workflow), *mcp.lease.toolsets, *library_toolsets],
                 extra_instructions=_compose_run_instructions(workflow_context, mcp.instructions),
                 extra_headers=attribution_headers,
                 approval=approval,
@@ -1442,10 +1442,11 @@ class AgentManager(EngineScoped):
         """Return the cached agent for this provider/model, building it if needed.
 
         The runner carries only what is fixed for the life of an agent: the
-        model, the engine's own MCP server, and the base instructions. Anything
-        the user can edit mid-session - their MCP servers and the rules attached
-        to them - is passed to :meth:`PydanticAgentRunner.run` instead, so an
-        edit takes effect on the next run rather than the next engine restart.
+        model and the base instructions. Anything that can change between runs -
+        the user's MCP servers and the rules attached to them, and the workflow
+        the engine's own MCP server acts on - is passed to
+        :meth:`PydanticAgentRunner.run` instead, so it takes effect on the next run
+        rather than the next engine restart.
         """
         provider = self._get_provider(provider_name)
         provider_type = provider.type
@@ -1483,12 +1484,6 @@ class AgentManager(EngineScoped):
 
         workspace_root = Path(config_manager.workspace_path)
         self._ensure_skills_directory(workspace_root)
-        # The engine's own MCP server is the only one baked into the agent: the
-        # engine owns its lifetime and its address cannot change mid-session.
-        mcp_servers: list[AbstractToolset[Any]] = [
-            streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/"),
-        ]
-
         runner = PydanticAgentRunner(
             model_name=model_name,
             provider=provider_type,
@@ -1498,13 +1493,22 @@ class AgentManager(EngineScoped):
             storage=self._thread_storage,
             instructions=_build_agent_instructions(include_image_tool=image_config is not None),
             system_prompt=self._system_prompt_extra or None,
-            mcp_servers=mcp_servers,
             image_config=image_config,
             static_files_manager=self.static_files_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def _engine_mcp_toolset(self, workflow: WorkflowRuntime | None) -> AbstractToolset[Any]:
+        """The engine's own MCP server, addressed to `workflow`, for one run.
+
+        Built per run because the cached runner is shared by chats about different workflows.
+        """
+        workflow_id = None
+        if workflow is not None:
+            workflow_id = workflow.workflow_id
+        return streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/", workflow_id=workflow_id)
 
     def _ensure_skills_directory(self, workspace_root: Path) -> None:
         """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.

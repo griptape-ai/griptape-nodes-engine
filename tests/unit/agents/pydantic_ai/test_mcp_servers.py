@@ -21,6 +21,7 @@ from pydantic_ai.toolsets.filtered import FilteredToolset
 from pydantic_ai.toolsets.prefixed import PrefixedToolset
 
 from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    GTN_WORKFLOW_ID_HEADER,
     BuiltMCPServer,
     _blocklist_filter,
     _compose,
@@ -29,6 +30,7 @@ from griptape_nodes.agents.pydantic_ai.mcp_servers import (
     require_user_tool_approval,
     streamable_http_local,
 )
+from griptape_nodes.servers.mcp import WORKFLOW_ID_HEADER
 
 
 def _mcp_toolset(composed: Any) -> MCPToolset:
@@ -196,11 +198,31 @@ def test_require_user_tool_approval_gates_on_the_prefixed_toolset() -> None:
 
 def test_streamable_http_local_prefixes_with_default_name() -> None:
     """The engine's own server uses the `GriptapeNodes` prefix over streamable HTTP, gated."""
-    composed = streamable_http_local("http://localhost:9/mcp/")
+    composed = streamable_http_local("http://localhost:9/mcp/", workflow_id=None)
     assert isinstance(composed, ApprovalRequiredToolset)
     assert isinstance(composed.wrapped, PrefixedToolset)
     assert composed.wrapped.prefix == "GriptapeNodes"
     assert isinstance(_mcp_toolset(composed).client.transport, StreamableHttpTransport)
+
+
+def test_streamable_http_local_names_the_workflow_in_a_header() -> None:
+    """The run's workflow travels as a header the engine's server reads."""
+    composed = streamable_http_local("http://localhost:9/mcp/", workflow_id="abc123")
+    transport = _mcp_toolset(composed).client.transport
+    assert isinstance(transport, StreamableHttpTransport)
+    assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "abc123"}
+
+
+def test_streamable_http_local_without_a_workflow_sends_no_header() -> None:
+    """A run from no workflow names none."""
+    transport = _mcp_toolset(streamable_http_local("http://localhost:9/mcp/", workflow_id=None)).client.transport
+    assert isinstance(transport, StreamableHttpTransport)
+    assert transport.headers == {}
+
+
+def test_the_workflow_header_is_the_one_the_engine_server_reads() -> None:
+    """The agent sends the header the engine's MCP server reads."""
+    assert GTN_WORKFLOW_ID_HEADER == WORKFLOW_ID_HEADER
 
 
 def test_blocklist_filter_drops_only_listed_bare_names() -> None:

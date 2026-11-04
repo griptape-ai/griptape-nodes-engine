@@ -13,12 +13,17 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
 
 import httpx2
 import pytest
+from fastmcp.client.transports import StreamableHttpTransport
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.mcp_servers import GTN_WORKFLOW_ID_HEADER
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.agents.pydantic_ai.runner import (
     AgentRunResult,
@@ -112,6 +117,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.servers.mcp import LibraryMCPTools
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError, refusal_from_body
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
@@ -1257,6 +1263,33 @@ class TestConfigureAgentActiveProvider:
         assert gc.model == "gpt-5"
 
 
+class TestEngineMcpToolset:
+    """Each run reaches the engine's MCP server addressed to the workflow the run was sent from."""
+
+    @staticmethod
+    def _transport(toolset: object) -> StreamableHttpTransport:
+        node: Any = toolset
+        while not isinstance(node, MCPToolset):
+            node = node.wrapped
+        transport = node.client.transport
+        assert isinstance(transport, StreamableHttpTransport)
+        return transport
+
+    def test_names_the_run_workflow_in_the_header(self, providers_manager: AgentManager) -> None:
+        providers_manager._mcp_server_port = 1234
+        workflow = WorkflowRuntime("tab-workflow", MagicMock())
+
+        transport = self._transport(providers_manager._engine_mcp_toolset(workflow))
+
+        assert transport.url == "http://localhost:1234/mcp/"
+        assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "tab-workflow"}
+
+    def test_a_run_from_no_workflow_sends_no_header(self, providers_manager: AgentManager) -> None:
+        providers_manager._mcp_server_port = 1234
+
+        assert self._transport(providers_manager._engine_mcp_toolset(None)).headers == {}
+
+
 class TestBuildRunnerCredential:
     """The Griptape Cloud runner accepts a license, not just `GT_CLOUD_API_KEY`."""
 
@@ -1518,6 +1551,7 @@ class TestRunAgentResultPayloadContract:
         manager = AgentManager.__new__(AgentManager)
         manager._active_runs = {}
         manager._mcp_toolsets = MCPToolsetCache()
+        manager._mcp_server_port = 1234
 
         async def fake_run(*_args: object, **_kwargs: object) -> AgentRunResult:
             return result
