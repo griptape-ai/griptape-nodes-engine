@@ -145,12 +145,13 @@ def _encode_text_chunk(key: str, text: str) -> bytes:
             body = key_bytes + b"\x00\x01\x00\x00\x00" + zlib.compress(utf8)
         else:
             body = key_bytes + b"\x00\x00\x00\x00\x00" + utf8
-        return _chunk(b"iTXt", body)
+        return png_chunk(b"iTXt", body)
     if compress:
-        return _chunk(b"zTXt", key_bytes + b"\x00\x00" + zlib.compress(text_bytes))
-    return _chunk(b"tEXt", key_bytes + b"\x00" + text_bytes)
+        return png_chunk(b"zTXt", key_bytes + b"\x00\x00" + zlib.compress(text_bytes))
+    return png_chunk(b"tEXt", key_bytes + b"\x00" + text_bytes)
 
 
-def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    """Return a complete PNG chunk: length, type, data, and CRC."""
     crc = zlib.crc32(chunk_type + data)
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
