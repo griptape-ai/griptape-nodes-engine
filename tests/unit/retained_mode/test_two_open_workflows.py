@@ -1129,14 +1129,6 @@ class TestOtherSharedState:
 
         assert sent[0].open_workflow_id == _ORCHESTRATOR_A
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "FINDING j4: DeleteWorkflowRequest closes the deleted workflow only when it is the current one. "
-            "Deleting B from A's tab is refused safely instead: the "
-            "registry will not remove an open workflow's entry ('Failed because it is open. Close it first')."
-        ),
-    )
     def test_deleting_a_workflow_open_in_another_tab_closes_it(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
