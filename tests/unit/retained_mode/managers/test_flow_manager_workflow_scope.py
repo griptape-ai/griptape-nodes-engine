@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -55,6 +56,7 @@ from griptape_nodes.retained_mode.managers.flow.summary import FlowSummarizer
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 if TYPE_CHECKING:
@@ -265,19 +267,33 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         with pytest.raises(KeyError, match="doesn't exist"):
             flow_manager.get_flow_by_name("canvas")
 
-    def test_dag_edge_methods_with_no_workflow_open_see_no_connections(self, engine: Engine) -> None:
-        flow_manager = engine.flow_manager
+    @pytest.mark.parametrize(
+        "edge",
+        [
+            lambda c: c.fm.get_connected_output_parameters(c.node, c.param),
+            lambda c: c.fm.has_connection(c.node, c.param, c.node, c.param),
+            lambda c: c.fm.get_start_node_from_node(c.flow, c.node),
+            lambda c: c.fm.get_prev_node(c.flow, c.node),
+            lambda c: c.fm.classify_nodes_for_dag([c.node]),
+            lambda c: c.fm.get_connected_input_from_node(c.flow, c.node),
+            lambda c: c.fm.get_connected_output_from_node(c.flow, c.node),
+            lambda c: c.fm.get_connected_input_parameters(c.flow, c.node, c.param),
+            lambda c: c.fm.get_connections_on_node(c.node),
+            lambda c: c.fm.get_all_connected_nodes(c.node),
+        ],
+    )
+    def test_connection_edge_methods_with_no_workflow_open_raise(self, engine: Engine, edge: Any) -> None:
+        """Every one raises rather than answering as if `node` had no connections."""
         node = MagicMock(spec=BaseNode)
         node.name = "node"
         node.parameters = []
         flow = MagicMock()
         flow.nodes = {"node": node}
+        param = MagicMock()
+        param.name = "value"
 
-        categories = flow_manager.classify_nodes_for_dag([node])
-
-        assert categories.data_sink_nodes == [node]
-        assert flow_manager.get_start_node_from_node(flow, node) is node
-        assert flow_manager.get_start_node_from_node(MagicMock(nodes={}), node) is None
+        with pytest.raises(NoOpenWorkflowError):
+            edge(SimpleNamespace(fm=engine.flow_manager, flow=flow, node=node, param=param))
 
 
 def _connection_request(request_type: type) -> Any:
