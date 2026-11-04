@@ -8,6 +8,7 @@ import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import DataNode
 from griptape_nodes.files.directory import DirectoryDestination
 from griptape_nodes.files.file_sequence import FileSequenceDestination
@@ -26,7 +27,12 @@ from griptape_nodes.retained_mode.events.destination_events import (
     GetConnectedFileSequenceDestinationResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from griptape_nodes.retained_mode.events.node_events import (
+    AddNodesToNodeGroupRequest,
+    AddNodesToNodeGroupResultSuccess,
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import MacroPath
@@ -101,6 +107,16 @@ class _SaverNode(DataNode):
         pass
 
 
+class _GroupNode(SubflowNodeGroup):
+    """A group whose boundary a wire crosses through a proxy parameter."""
+
+    async def aprocess(self) -> None:
+        await self.execute_subflow()
+
+    def process(self) -> None:
+        pass
+
+
 @pytest.fixture
 def nodes(engine: Engine) -> Iterator[None]:
     """A "settings" node, a "plain" node and a "saver", none connected, in a fresh flow."""
@@ -116,7 +132,7 @@ def nodes(engine: Engine) -> Iterator[None]:
         nodes=[],
     )
     library = LibraryRegistry.generate_new_library(schema)
-    for node_class in (_SettingsNode, _PlainNode, _SaverNode):
+    for node_class in (_SettingsNode, _PlainNode, _SaverNode, _GroupNode):
         library.register_new_node_type(node_class, NodeMetadata(category="test", description="d", display_name="n"))
     engine.context_manager.push_workflow(workflow_name="connected_destination_wf")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
@@ -141,6 +157,13 @@ def _connect(engine: Engine, source: str, target_parameter: str = "output") -> N
         )
     )
     assert isinstance(result, CreateConnectionResultSuccess), result
+
+
+def _group(engine: Engine, group_name: str, member_names: list[str]) -> None:
+    created = engine.handle_request(CreateNodeRequest(node_type="_GroupNode", node_name=group_name))
+    assert isinstance(created, CreateNodeResultSuccess), created
+    result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=member_names, node_group_name=group_name))
+    assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
 
 
 def _unconfigure_settings(engine: Engine) -> None:
@@ -258,4 +281,53 @@ class TestGetConnectedFileSequenceDestination:
         )
 
         assert isinstance(result, GetConnectedFileSequenceDestinationResultFailure), result
+        assert "'settings' has no destination set" in str(result.result_details)
+
+
+@pytest.mark.usefixtures("nodes")
+class TestASettingsNodeOutsideTheSaversGroup:
+    """A wire into a group runs through a proxy parameter on the group, which the lookup sees through."""
+
+    def test_is_found_through_the_groups_proxy(self, engine: Engine) -> None:
+        _connect(engine, "settings")
+        _group(engine, "group", ["saver"])
+
+        result = engine.handle_request(GetConnectedFileDestinationRequest(node_name="saver", parameter_name="output"))
+
+        assert isinstance(result, GetConnectedFileDestinationResultSuccess), result
+        assert result.destination is not None
+        assert result.destination.file_path == _MACRO
+
+    def test_is_found_through_nested_groups(self, engine: Engine) -> None:
+        _connect(engine, "settings")
+        _group(engine, "inner", ["saver"])
+        _group(engine, "outer", ["inner"])
+
+        result = engine.handle_request(
+            GetConnectedDirectoryDestinationRequest(node_name="saver", parameter_name="output")
+        )
+
+        assert isinstance(result, GetConnectedDirectoryDestinationResultSuccess), result
+        assert result.destination is not None
+        assert result.destination.dir_path == _MACRO
+
+    def test_a_settings_node_inside_the_same_group_is_still_found(self, engine: Engine) -> None:
+        _connect(engine, "settings")
+        _group(engine, "group", ["saver", "settings"])
+
+        result = engine.handle_request(
+            GetConnectedFileSequenceDestinationRequest(node_name="saver", parameter_name="output")
+        )
+
+        assert isinstance(result, GetConnectedFileSequenceDestinationResultSuccess), result
+        assert result.destination is not None
+
+    def test_an_unset_settings_node_outside_the_group_still_fails_naming_it(self, engine: Engine) -> None:
+        _connect(engine, "settings")
+        _group(engine, "group", ["saver"])
+        _unconfigure_settings(engine)
+
+        result = engine.handle_request(GetConnectedFileDestinationRequest(node_name="saver", parameter_name="output"))
+
+        assert isinstance(result, GetConnectedFileDestinationResultFailure), result
         assert "'settings' has no destination set" in str(result.result_details)
