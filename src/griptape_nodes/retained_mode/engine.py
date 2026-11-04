@@ -746,17 +746,7 @@ class Engine:
             raise WorkflowNotOpenError(msg)
         if bound is not None:
             return bound
-        return self.only_open_workflow_or_none()
 
-    def only_open_workflow_or_none(self) -> WorkflowRuntime | None:
-        """The engine's one open workflow, or None when none is open.
-
-        For the few OPTIONAL_WORKFLOW handlers whose clients name no workflow on the request
-        envelope yet and rely on the one open. Goes once clients send it.
-
-        Raises:
-            WorkflowNotNamedError: Several workflows are open.
-        """
         open_workflows = self._open_workflows.all_open()
         if len(open_workflows) > 1:
             msg = (

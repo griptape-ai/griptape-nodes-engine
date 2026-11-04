@@ -10,7 +10,12 @@ workflow, None when none is open, and fail with `WorkflowNotNamedResultFailure` 
 Once every client names it, the entry goes.
 """
 
-ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset()
+ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
+    {
+        # The editor and the MCP server name no workflow yet.
+        "ExecuteNodeRequest",
+    }
+)
 
 AMBIENT_UNTIL_MIGRATED: frozenset[str] = frozenset(
     {

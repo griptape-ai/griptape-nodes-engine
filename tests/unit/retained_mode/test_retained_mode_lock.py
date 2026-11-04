@@ -14,6 +14,7 @@ from griptape_nodes.node_library.library_registry import (
 )
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeLockStateRequest,
     BatchSetNodeLockStateResultFailure,
@@ -72,9 +73,9 @@ class TestRetainedModeLock:
         details = str(res.result_details)
         assert "Failed to update any nodes" in details
 
-    def test_batch_lock_with_no_workflow_open_returns_its_own_failure(self) -> None:
+    def test_batch_lock_with_no_workflow_open_says_none_is_open(self) -> None:
         res = RetainedMode.batch_set_lock_node_state(node_names=["nope_a_123"], lock=True)
-        assert isinstance(res, BatchSetNodeLockStateResultFailure)
+        assert isinstance(res, WorkflowNotNamedResultFailure)
         assert "none is open" in str(res.result_details)
 
 

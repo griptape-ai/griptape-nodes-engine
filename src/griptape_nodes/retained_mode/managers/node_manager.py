@@ -3497,23 +3497,8 @@ class NodeManager(EngineScoped):
         return ResolveNodeResultSuccess(result_details=details)
 
     @handles(ExecuteNodeRequest)
-    async def on_execute_node_request(
+    async def on_execute_node_request(  # noqa: C901
         self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None = None
-    ) -> ResultPayload:
-        """Execute a node in `workflow` (see `_execute_node`).
-
-        Clients, and the MCP server, name no workflow yet: until they do, the orchestrator looks the node up
-        in the only open workflow, bound while it runs as a named one would be.
-        """
-        if workflow is None and not self.engine.library_manager.is_worker:
-            fallback = self.engine.only_open_workflow_or_none()
-            if fallback is not None:
-                with self.engine.bind_workflow(fallback):
-                    return await self._execute_node(request, fallback)
-        return await self._execute_node(request, workflow)
-
-    async def _execute_node(  # noqa: C901
-        self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None
     ) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
 

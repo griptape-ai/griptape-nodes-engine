@@ -247,8 +247,8 @@ class TestInstallRemoteHandlersSwap:
         event_manager = EventManager()
         locals_registered: dict[type[RequestPayload], Any] = {}
         for request_type in LOCAL_ONLY_REQUEST_TYPES:
-
-            async def original(_request: RequestPayload) -> _StubResult:
+            # Optional, so it registers for any request type, including one that falls back to the only open workflow.
+            async def original(_request: RequestPayload, workflow: object | None = None) -> _StubResult:  # noqa: ARG001
                 return _StubResult(result_details="local")
 
             locals_registered[request_type] = original
