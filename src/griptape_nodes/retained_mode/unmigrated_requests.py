@@ -6,7 +6,8 @@ Migrating a handler, by giving it a `workflow` parameter or confirming it is HOS
 
 An OPTIONAL_WORKFLOW handler gets None when its request names no workflow, except for the request
 types in `ONLY_OPEN_UNTIL_CLIENTS_NAME`, whose clients don't name one yet: they get the only open
-workflow, and None when none or several are open. Once every client names it, the entry goes.
+workflow, None when none is open, and fail with `WorkflowNotNamedResultFailure` when several are.
+Once every client names it, the entry goes.
 """
 
 ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset()

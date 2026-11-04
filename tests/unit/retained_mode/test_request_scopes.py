@@ -323,7 +323,7 @@ def probe_falls_back_to_the_only_open_workflow(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.usefixtures("probe_falls_back_to_the_only_open_workflow")
 class TestOnlyOpenUntilClientsName:
-    """A listed OPTIONAL_WORKFLOW request that names nothing gets the only open workflow, else None."""
+    """A listed OPTIONAL_WORKFLOW request that names nothing gets the only open workflow, None with none open."""
 
     @pytest.mark.asyncio
     async def test_no_envelope_id_while_one_is_open_gets_it(self, engine: Engine, calls: _Calls) -> None:
@@ -336,15 +336,24 @@ class TestOnlyOpenUntilClientsName:
         assert calls.workflows == [workflow]
         assert calls.current == [workflow]
 
-    def test_no_envelope_id_while_several_are_open_gets_none(self, engine: Engine, calls: _Calls) -> None:
-        _open_two(engine)
+    def test_no_envelope_id_while_none_is_open_gets_none(self, engine: Engine, calls: _Calls) -> None:
         _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
 
         result = engine.handle_request(_ScopeProbeRequest())
 
         assert result.succeeded()
         assert calls.workflows == [None]
-        assert calls.current == [None]
+
+    def test_no_envelope_id_while_several_are_open_fails(self, engine: Engine, calls: _Calls) -> None:
+        """Its client means the open one, and which that is can't be told."""
+        _open_two(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
+
+        result = engine.handle_request(_ScopeProbeRequest())
+
+        assert isinstance(result, WorkflowNotNamedResultFailure)
+        assert "2 workflows are open" in str(result.result_details)
+        assert calls.workflows == []
 
     def test_the_envelope_id_wins_over_the_only_open_workflow(self, engine: Engine, calls: _Calls) -> None:
         a, b = _open_two(engine)

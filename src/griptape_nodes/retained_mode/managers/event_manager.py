@@ -1527,7 +1527,8 @@ class EventManager(EngineScoped):
         Raises:
             _RequestWorkflowError: The envelope id names no open workflow, or the caller is bound to
                 a workflow that has closed, or a WORKFLOW request names no workflow, or names nothing
-                while none or several are open.
+                while none or several are open, or a listed OPTIONAL_WORKFLOW request names nothing
+                while several are open.
         """
         named: WorkflowRuntime | NoWorkflow | None
         if scope is RequestScope.HOST:
@@ -1562,7 +1563,12 @@ class EventManager(EngineScoped):
         """The workflow an OPTIONAL_WORKFLOW request acts on: the one it names, else None.
 
         A request type in `ONLY_OPEN_UNTIL_CLIENTS_NAME` that names nothing gets the only open
-        workflow, and None when none or several are open, as an unscoped request does.
+        workflow, and None when none is open.
+
+        Raises:
+            _RequestWorkflowError: A listed request names nothing while several are open, answered
+                with `WorkflowNotNamedResultFailure`: its client means the open one, and which that
+                is can't be told.
         """
         if named is NO_WORKFLOW:
             return None
@@ -1571,7 +1577,13 @@ class EventManager(EngineScoped):
         if type(request).__name__ not in ONLY_OPEN_UNTIL_CLIENTS_NAME:
             return None
         open_workflows = self.engine.open_workflows.all_open()
-        if len(open_workflows) != 1:
+        if len(open_workflows) > 1:
+            msg = (
+                f"Attempted to run {type(request).__name__}. Failed because {len(open_workflows)} workflows are open "
+                "and the request did not name one. Name one on the request envelope."
+            )
+            raise _RequestWorkflowError(WorkflowNotNamedResultFailure(result_details=msg))
+        if not open_workflows:
             return None
         return open_workflows[0]
 
