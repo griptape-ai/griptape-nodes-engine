@@ -116,12 +116,12 @@ self.add_parameter(
 ```
 
 - Each name in `synced_parameters` is the name of a parameter on the same node. In this example the node also has `left`, `top`, `width` and `height` parameters, such as sliders.
-- The editor reads a synced parameter's live value under its parameter name and merges it over the widget's own value dict. If a parameter name differs from the key the widget uses internally, the widget does the mapping.
-- Nodes do not need connection hooks or locked-state handling. The editor works out which synced parameters are locked and passes that to the widget.
+- The editor reads a synced parameter's live value under its parameter name and merges it over the widget's own value dict. This applies when the widget's value is a dict. Any other value type reaches `update` unchanged. If a parameter name differs from the key the widget uses internally, the widget does the mapping.
+- Nodes do not need connection hooks or locked-state handling. The editor works out which synced parameters are locked and passes that to the widget as `props.locked`.
 
 ### Receiving Updates in the Widget
 
-A widget opts into live updates by returning an object with `cleanup` and `update` instead of a bare cleanup function. The editor calls `update` whenever a synced parameter changes during interaction, or when its locked state changes.
+A widget opts into live updates by returning an object with `cleanup` and `update` instead of a bare cleanup function. The editor calls `update` whenever a synced parameter changes during interaction, or when its locked state changes. Live values arrive in `props.value` and the locked list arrives in `props.locked`.
 
 ```javascript
 export default function MyEditorWidget(container, props) {
@@ -133,7 +133,7 @@ export default function MyEditorWidget(container, props) {
     const v = newProps.value || {};
 
     // Parameters with incoming connections. Treat these as read-only.
-    const locked = v.locked || [];
+    const locked = newProps.locked || [];
 
     // Ignore incoming values while the user is dragging inside the widget,
     // otherwise the widget fights the live updates.
@@ -152,19 +152,19 @@ export default function MyEditorWidget(container, props) {
 }
 ```
 
-**Value passed to `update`:**
+**Passed to `update`:**
 
-| Key                    | Description                                                                      |
-| ---------------------- | -------------------------------------------------------------------------------- |
-| Synced parameter names | Live value for parameters being dragged, merged over the widget's own value dict |
-| `locked`               | `string[]` of synced parameters that have incoming connections. Always present.  |
+| Where          | Key                    | Description                                                                                                     |
+| -------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `props.value`  | Synced parameter names | Live value for parameters being dragged, merged over the widget's own value dict                                |
+| `props.locked` | (the prop itself)      | `string[]` of synced parameters that have incoming connections. Always present when `synced_parameters` is set. |
 
 **Widget requirements:**
 
 1. **Return `{ cleanup, update }`.** A widget that returns only a cleanup function, or nothing, does not receive live updates.
 1. **Guard active interaction.** Skip incoming values while the user is dragging a handle or otherwise editing inside the widget.
 1. **Handle partial updates.** Only the parameters being dragged carry live values. The rest reflect the last committed state. A synced name that is not a key in the widget's own dict has a value only while it is live.
-1. **Respect `locked`.** Parameters in `locked` are driven by a connection. The editor never sends live overrides for them, and the widget should also disable direct manipulation of them, for example by showing a not-allowed cursor on a locked handle.
+1. **Respect `props.locked`.** Parameters in `locked` are driven by a connection. The editor never sends live overrides for them, and the widget should also disable direct manipulation of them, for example by showing a not-allowed cursor on a locked handle. `locked` is editor state and is not part of the parameter value, so it is never saved with the workflow.
 
 ## Critical Patterns and Pitfalls
 
