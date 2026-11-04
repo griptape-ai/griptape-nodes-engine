@@ -668,27 +668,6 @@ class FileWriter(EngineScoped):
             walking_original=padded_index_var is not None,
         )
 
-    @staticmethod
-    def _collision_walk_start_index(request: WriteFileRequest, padded_index_var: ParsedVariable) -> int:
-        """Pick the first index to try when walking the caller's own padded slot.
-
-        - Bound to value N (caller reverse-matched an existing file, e.g. `_index=7` from
-          `my_file_v007.py`): start at N+1. The slot's value is the "current version";
-          we want the next.
-        - Required `{x:NN}` unbound: the seed in `_resolve_write_target` already tried 1,
-          so start at 2.
-        - Optional `{x?:NN}` unbound: the seed didn't fire (it's gated on required), and
-          the first attempt resolved with the slot omitted, so start at 1.
-        """
-        bound_value = None
-        if isinstance(request.file_path, MacroPath):
-            bound_value = request.file_path.variables.get(padded_index_var.info.name)
-        if isinstance(bound_value, int):
-            return bound_value + 1
-        if padded_index_var.info.is_required:
-            return 2
-        return 1
-
     def _resolve_indexed_candidate(
         self,
         macro_path: MacroPath,
@@ -1344,3 +1323,24 @@ class FileWriter(EngineScoped):
                 with contextlib.suppress(OSError):
                     Path(normalized_path).unlink()
             raise
+
+    @staticmethod
+    def _collision_walk_start_index(request: WriteFileRequest, padded_index_var: ParsedVariable) -> int:
+        """Pick the first index to try when walking the caller's own padded slot.
+
+        - Bound to value N (caller reverse-matched an existing file, e.g. `_index=7` from
+          `my_file_v007.py`): start at N+1. The slot's value is the "current version";
+          we want the next.
+        - Required `{x:NN}` unbound: the seed in `_resolve_write_target` already tried 1,
+          so start at 2.
+        - Optional `{x?:NN}` unbound: the seed didn't fire (it's gated on required), and
+          the first attempt resolved with the slot omitted, so start at 1.
+        """
+        bound_value = None
+        if isinstance(request.file_path, MacroPath):
+            bound_value = request.file_path.variables.get(padded_index_var.info.name)
+        if isinstance(bound_value, int):
+            return bound_value + 1
+        if padded_index_var.info.is_required:
+            return 2
+        return 1

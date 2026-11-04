@@ -418,7 +418,7 @@ class OSManager(EngineScoped):
         Pure resolver: routes through ``GetPathForMacroRequest`` so project
         directories, builtins, and env vars are applied uniformly. No
         write-policy awareness lives here — auto-index seeding for CREATE_NEW
-        writes happens in ``on_write_file_request`` instead, where the policy
+        writes happens in ``FileWriter.on_write_file_request`` instead, where the policy
         is in scope.
 
         Args:
@@ -428,7 +428,7 @@ class OSManager(EngineScoped):
                 ``result_details``. Defaults to ``logging.ERROR`` — the
                 natural level for a failed resolve. Callers that treat a
                 resolution failure as an expected signal (e.g. the
-                ``on_write_file_request`` seed-and-retry path, whose first
+                ``FileWriter.on_write_file_request`` seed-and-retry path, whose first
                 attempt is intentionally probing for a missing sequence slot)
                 should pass ``logging.DEBUG`` so the noise doesn't surface as
                 a user-facing ERROR when the fallback succeeds.
