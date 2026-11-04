@@ -1,8 +1,12 @@
 """Base class for image metadata injection and extraction drivers."""
 
-from abc import ABC, abstractmethod
+from __future__ import annotations
 
-from PIL import Image
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from griptape_nodes.image import GriptapeImage
 
 
 class BaseImageMetadataDriver(ABC):
@@ -19,7 +23,7 @@ class BaseImageMetadataDriver(ABC):
 
     @abstractmethod
     def get_supported_formats(self) -> list[str]:
-        """Return list of PIL format strings this driver supports.
+        """Return list of GriptapeImage format names this driver supports.
 
         Returns:
             List of format strings (e.g., ["PNG"], ["JPEG", "TIFF", "MPO"])
@@ -27,11 +31,11 @@ class BaseImageMetadataDriver(ABC):
         ...
 
     @abstractmethod
-    def inject_metadata(self, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
+    def inject_metadata(self, image: GriptapeImage, metadata: dict[str, str]) -> bytes:
         """Inject metadata into image and return modified image bytes.
 
         Args:
-            pil_image: PIL Image object to inject metadata into
+            image: Source image to inject metadata into
             metadata: Dictionary of key-value string pairs to inject
 
         Returns:
@@ -43,7 +47,7 @@ class BaseImageMetadataDriver(ABC):
         ...
 
     @abstractmethod
-    def extract_metadata(self, pil_image: Image.Image) -> dict[str, str]:
+    def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract ALL metadata from image.
 
         Returns all available metadata for the format:
@@ -55,7 +59,7 @@ class BaseImageMetadataDriver(ABC):
         is included alongside format-specific metadata.
 
         Args:
-            pil_image: PIL Image object to extract metadata from
+            image: Source image to extract metadata from
 
         Returns:
             Dictionary of metadata key-value pairs, empty dict if none found
