@@ -26,7 +26,8 @@ class RequestScope(StrEnum):
     WORKFLOW: `workflow: WorkflowRuntime`. One open workflow: the one the request envelope names, else
         the caller's, else the only open one.
     OPTIONAL_WORKFLOW: `workflow: WorkflowRuntime | None = None`. Works without a workflow: the one the
-        envelope names, else the caller's, else none, never the only open one.
+        envelope names, else the caller's, else none. Only a request type in
+        `ONLY_OPEN_UNTIL_CLIENTS_NAME` gets the only open one before none.
 
     A library handler with no `workflow` parameter, and an engine handler listed in
     `AMBIENT_UNTIL_MIGRATED`, have no scope: dispatch calls them with the request alone, bound to the

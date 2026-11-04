@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
-from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED
+from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED, ONLY_OPEN_UNTIL_CLIENTS_NAME
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -1000,7 +1000,8 @@ class EventManager(EngineScoped):
         Raises:
             ValueError: The request type already has a handler.
             TypeError: The callback's signature does not say what the request acts on (see
-                `scope_from_signature`).
+                `scope_from_signature`), or the request type is in `ONLY_OPEN_UNTIL_CLIENTS_NAME` and
+                the callback is not OPTIONAL_WORKFLOW.
         """
         existing_manager = self._request_type_to_manager.get(request_type)
         if existing_manager is not None:
@@ -1012,6 +1013,12 @@ class EventManager(EngineScoped):
             scope = scope_from_signature(callback)
         if scope is None and request_type.__name__ not in AMBIENT_UNTIL_MIGRATED:
             scope = without_workflow
+        if request_type.__name__ in ONLY_OPEN_UNTIL_CLIENTS_NAME and scope is not RequestScope.OPTIONAL_WORKFLOW:
+            msg = (
+                f"Attempted to register a handler for {request_type.__name__}. Failed because it is listed in "
+                "ONLY_OPEN_UNTIL_CLIENTS_NAME, which only an OPTIONAL_WORKFLOW handler can use."
+            )
+            raise TypeError(msg)
         self._request_type_to_manager[request_type] = callback
         if scope is not None:
             self._request_scopes[request_type] = scope
@@ -1510,7 +1517,8 @@ class EventManager(EngineScoped):
         - HOST binds NO_WORKFLOW, whatever the request names, and never checks its envelope id.
         - WORKFLOW binds the workflow the request names, else the only open one, and hands it over.
         - OPTIONAL_WORKFLOW binds the workflow the request names and hands it over, else binds
-          NO_WORKFLOW and hands over None. It never falls back to the only open workflow.
+          NO_WORKFLOW and hands over None. Only a request type in `ONLY_OPEN_UNTIL_CLIENTS_NAME`
+          that names nothing falls back to the only open workflow (see `_optional_workflow`).
         - With no scope, see `_unscoped_request_workflow`.
 
         A scoped request with no envelope id whose binding is its caller's keeps the caller's
@@ -1535,8 +1543,8 @@ class EventManager(EngineScoped):
             return self._unscoped_request_workflow(named, addressed=open_workflow_id is not None or sender is not None)
 
         workflow: WorkflowRuntime | None = None
-        if scope is RequestScope.OPTIONAL_WORKFLOW and named is not None and named is not NO_WORKFLOW:
-            workflow = named
+        if scope is RequestScope.OPTIONAL_WORKFLOW:
+            workflow = self._optional_workflow(request, named)
         elif scope is RequestScope.WORKFLOW:
             workflow = self._workflow_for_workflow_request(request, named)
         binding: WorkflowRuntime | NoWorkflow = NO_WORKFLOW
@@ -1547,6 +1555,25 @@ class EventManager(EngineScoped):
         # handler opens or closes is the caller's too.
         inherits = open_workflow_id is None and sender is None and bound_workflow.get() is binding
         return _RequestWorkflow(rebinds=not inherits, binding=binding, workflow=workflow)
+
+    def _optional_workflow(
+        self, request: RequestPayload, named: WorkflowRuntime | NoWorkflow | None
+    ) -> WorkflowRuntime | None:
+        """The workflow an OPTIONAL_WORKFLOW request acts on: the one it names, else None.
+
+        A request type in `ONLY_OPEN_UNTIL_CLIENTS_NAME` that names nothing gets the only open
+        workflow, and None when none or several are open, as an unscoped request does.
+        """
+        if named is NO_WORKFLOW:
+            return None
+        if named is not None:
+            return named
+        if type(request).__name__ not in ONLY_OPEN_UNTIL_CLIENTS_NAME:
+            return None
+        open_workflows = self.engine.open_workflows.all_open()
+        if len(open_workflows) != 1:
+            return None
+        return open_workflows[0]
 
     def _open_workflow_named_by_envelope(self, request: RequestPayload, open_workflow_id: str) -> WorkflowRuntime:
         """The open workflow an envelope id names.

@@ -56,11 +56,12 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListCallableWorkflowsRequest,
     SetVariableSubstitutionEnabledRequest,
 )
+from griptape_nodes.retained_mode.managers import event_manager as event_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope, scope_from_signature
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
-from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED
+from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED, ONLY_OPEN_UNTIL_CLIENTS_NAME
 from tests.unit.host_workflow_reads import HostWorkflowRead
 
 if TYPE_CHECKING:
@@ -312,6 +313,80 @@ class TestOptionalWorkflowScope:
 
         assert result.succeeded()
         assert calls.workflows == [None]
+
+
+@pytest.fixture
+def probe_falls_back_to_the_only_open_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """List `_ScopeProbeRequest` in `ONLY_OPEN_UNTIL_CLIENTS_NAME`."""
+    monkeypatch.setattr(event_manager_module, "ONLY_OPEN_UNTIL_CLIENTS_NAME", frozenset({"_ScopeProbeRequest"}))
+
+
+@pytest.mark.usefixtures("probe_falls_back_to_the_only_open_workflow")
+class TestOnlyOpenUntilClientsName:
+    """A listed OPTIONAL_WORKFLOW request that names nothing gets the only open workflow, else None."""
+
+    @pytest.mark.asyncio
+    async def test_no_envelope_id_while_one_is_open_gets_it(self, engine: Engine, calls: _Calls) -> None:
+        workflow = _open_workflow(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
+
+        result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest())
+
+        assert result_event.succeeded()
+        assert calls.workflows == [workflow]
+        assert calls.current == [workflow]
+
+    def test_no_envelope_id_while_several_are_open_gets_none(self, engine: Engine, calls: _Calls) -> None:
+        _open_two(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
+
+        result = engine.handle_request(_ScopeProbeRequest())
+
+        assert result.succeeded()
+        assert calls.workflows == [None]
+        assert calls.current == [None]
+
+    def test_the_envelope_id_wins_over_the_only_open_workflow(self, engine: Engine, calls: _Calls) -> None:
+        a, b = _open_two(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
+
+        result_event = engine.event_manager.handle_request(
+            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=b.workflow_id)
+        )
+
+        assert result_event.succeeded()
+        assert calls.workflows == [b]
+        assert a not in calls.workflows
+
+    def test_a_caller_bound_to_no_workflow_gets_none_while_one_is_open(self, engine: Engine, calls: _Calls) -> None:
+        """Naming no workflow is naming something: only a request that names nothing falls back."""
+        _open_workflow(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            result = engine.handle_request(_ScopeProbeRequest())
+
+        assert result.succeeded()
+        assert calls.workflows == [None]
+
+    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.HOST])
+    def test_a_handler_that_is_not_optional_workflow_cannot_register(
+        self, engine: Engine, calls: _Calls, scope: RequestScope
+    ) -> None:
+        with pytest.raises(TypeError, match="ONLY_OPEN_UNTIL_CLIENTS_NAME"):
+            _register(engine, calls, scope, _ScopeProbeRequest)
+
+
+class TestOnlyOpenUntilClientsNameEntries:
+    """Each entry is a request type whose OPTIONAL_WORKFLOW handler's clients don't name a workflow yet."""
+
+    @pytest.mark.parametrize("name", sorted(ONLY_OPEN_UNTIL_CLIENTS_NAME))
+    def test_its_handler_is_optional_workflow(self, engine: Engine, name: str) -> None:
+        request_type = PayloadRegistry.get_type(name)
+        assert request_type is not None
+        assert issubclass(request_type, RequestPayload)
+
+        assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.OPTIONAL_WORKFLOW
 
 
 class TestHostScope:
