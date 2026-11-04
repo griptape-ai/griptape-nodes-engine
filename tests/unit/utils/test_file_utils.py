@@ -453,6 +453,34 @@ class TestAfindFilesRecursive:
         assert result == [scan_root / "linked" / "found.json"]
 
     @pytest.mark.asyncio
+    async def test_skip_directory_prunes_matching_directories(self, temp_dir: Path) -> None:
+        """A directory the predicate rejects is not searched, nor anything beneath it."""
+        (temp_dir / "keep").mkdir()
+        (temp_dir / "keep" / "a.json").write_text("{}")
+        (temp_dir / "skip" / "nested").mkdir(parents=True)
+        (temp_dir / "skip" / "b.json").write_text("{}")
+        (temp_dir / "skip" / "nested" / "c.json").write_text("{}")
+
+        result = await find_files_recursive(
+            temp_dir,
+            "*.json",
+            max_depth=DEFAULT_MAX_SEARCH_DEPTH,
+            skip_directory=lambda directory: directory.name == "skip",
+        )
+
+        assert result == [temp_dir / "keep" / "a.json"]
+
+    @pytest.mark.asyncio
+    async def test_skip_directory_applies_to_the_search_root(self, temp_dir: Path) -> None:
+        (temp_dir / "a.json").write_text("{}")
+
+        result = await find_files_recursive(
+            temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, skip_directory=lambda _: True
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
     async def test_symlink_loop_terminates(self, temp_dir: Path) -> None:
         """A directory symlink pointing back at an ancestor terminates via the depth cap."""
         nested = temp_dir / "a"
