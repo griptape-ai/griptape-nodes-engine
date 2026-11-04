@@ -40,6 +40,37 @@ class TestRowInputTypes:
 
         assert row.input_types == ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
 
+    def test_a_restored_row_keeps_its_own_input_types(self, node: MockNode) -> None:
+        refs = _refs(node)
+        row = Parameter(name="saved_row", tooltip="t", input_types=["VideoUrlArtifact"], parent_container_name="refs")
+
+        refs.add_child(row)
+
+        assert row.input_types == ["VideoUrlArtifact", "list[VideoUrlArtifact]", "list"]
+
+    def test_a_row_saved_with_list_variants_is_not_widened_again(self, node: MockNode) -> None:
+        refs = _refs(node)
+        saved_types = ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
+        row = Parameter(name="saved_row", tooltip="t", input_types=saved_types, parent_container_name="refs")
+
+        refs.add_child(row)
+
+        assert row.input_types == saved_types
+        assert row.save_dict()["input_types"] == ["ImageUrlArtifact"]
+
+    def test_a_row_saves_only_its_item_types(self, node: MockNode) -> None:
+        row = _refs(node).add_child_parameter()
+
+        assert row.save_dict()["input_types"] == ["ImageUrlArtifact"]
+
+    def test_a_row_taken_out_of_the_list_accepts_only_its_item_types(self, node: MockNode) -> None:
+        refs = _refs(node)
+        row = refs.add_child_parameter()
+
+        refs.remove_child(row)
+
+        assert row.input_types == ["ImageUrlArtifact"]
+
     def test_existing_rows_follow_a_change_of_input_types(self, node: MockNode) -> None:
         refs = _refs(node)
         row = refs.add_child_parameter()
@@ -80,6 +111,37 @@ class TestRowInputTypes:
         new_row = refs.add_child_parameter()
 
         assert old_row.input_types == new_row.input_types
+
+
+class TestSavedTypes:
+    def test_a_retyped_list_saves_its_item_types(self) -> None:
+        declared = ParameterList(name="refs", tooltip="t", type="any")
+        live = ParameterList(name="refs", tooltip="t", type="any")
+
+        live.type = "Thing"
+        live.input_types = ["Thing"]
+        live.output_type = "Thing"
+
+        diff = declared.equals(live)
+        assert (diff["type"], diff["input_types"], diff["output_type"]) == ("Thing", ["Thing"], "Thing")
+
+    def test_replaying_the_saved_types_restores_the_list(self) -> None:
+        declared = ParameterList(name="refs", tooltip="t", type="any")
+        live = ParameterList(name="refs", tooltip="t", type="any")
+        live.type = "Thing"
+        live.input_types = ["Thing"]
+        live.output_type = "Thing"
+
+        diff = declared.equals(live)
+        declared.type = diff["type"]
+        declared.input_types = diff["input_types"]
+        declared.output_type = diff["output_type"]
+
+        assert (declared.type, declared.input_types, declared.output_type) == (
+            live.type,
+            live.input_types,
+            live.output_type,
+        )
 
 
 class TestConcatenation:
