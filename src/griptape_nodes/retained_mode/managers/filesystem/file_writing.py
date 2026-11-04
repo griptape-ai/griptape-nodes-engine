@@ -18,6 +18,7 @@ from griptape_nodes.common.macro_parser import (
     MacroVariables,
     ParsedMacro,
 )
+from griptape_nodes.common.macro_parser.segments import ParsedVariable
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.file import canonical_extension
 from griptape_nodes.files.path_utils import (
@@ -50,14 +51,13 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_si
 from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.utils.async_utils import to_thread
+from griptape_nodes.utils.file_utils import atomic_write_bytes
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
-# File is not in static directory (or not a local file), create small preview
-from griptape_nodes.utils.async_utils import to_thread
-from griptape_nodes.utils.file_utils import atomic_write_bytes
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -120,6 +120,31 @@ class _StagedTempOutcome:
     bytes_written: int
 
 
+class _WriteTarget(NamedTuple):
+    """The file a write first targets, and how to name the requested path in messages."""
+
+    file_path: Path
+    path_display: str
+
+
+class _IndexWalk(NamedTuple):
+    """How the CREATE_NEW walk steps through candidate names."""
+
+    macro_path: MacroPath
+    index_variable: ParsedVariable
+    start_index: int
+    # True when walking the caller's own padded slot rather than a synthesized `{stem}_{_index}`.
+    walking_original: bool
+
+
+class _WrittenFile(NamedTuple):
+    """Where a write landed."""
+
+    file_path: Path
+    bytes_written: int
+    used_indexed_fallback: bool
+
+
 class FileWriter(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -152,7 +177,7 @@ class FileWriter(EngineScoped):
         )
 
     @handles(WriteFileRequest)
-    async def on_write_file_request(  # noqa: PLR0911, PLR0912, PLR0915, C901
+    async def on_write_file_request(
         self, request: WriteFileRequest, workflow: "WorkflowRuntime | None" = None
     ) -> ResultPayload:
         """Write content to a file with exclusive locking, returning once it is on disk.
@@ -165,14 +190,125 @@ class FileWriter(EngineScoped):
         steps that touch no engine state and take seconds for a large file are handed to a worker
         thread: re-encoding image bytes with workflow metadata, and writing the bytes to disk.
         """
-        # Initialize success tracking variables
-        final_file_path: Path | None = None
-        final_bytes_written: int | None = None
-        used_indexed_fallback = False
+        target = self._resolve_write_target(request, workflow)
+        if isinstance(target, WriteFileResultFailure):
+            return target
+        path_display = target.path_display
 
-        # COMMON SETUP: Resolve path for all policies. For MacroPath inputs we may
-        # auto-seed a single padded missing-required slot — but only for CREATE_NEW
-        # writes, and only if the macro author opted in via `:NN` padding.
+        # Sniff bytes ONCE up front. The sniffed format drives two independent
+        # decisions -- the codec-permission vet (which must run even for
+        # extension-less destinations) and the extension-coercion planner
+        # (only relevant when there IS a destination extension to reconcile).
+        # ``sniff_extension`` returns None for non-bytes content, so a non-None
+        # sniffed_ext also implies ``request.content`` is bytes; downstream code
+        # relies on that.
+        sniffed_ext = (
+            self.engine.artifact_manager.sniff_extension(request.content)
+            if isinstance(request.content, bytes)
+            else None
+        )
+
+        # Write vet. Runs BEFORE extension coercion so an extension-less
+        # destination (e.g. "movie") does not silently bypass the gate --
+        # sniff on bytes is independent of the destination suffix. Appends
+        # skip the vet: the tail alone has no container header to classify.
+        # Whether the vet actually does any work is the provider's call:
+        # opting out is a single ``None`` return in ``get_write_vetting_policy``,
+        # short-circuited inside ``_run_write_vet``.
+        if sniffed_ext is not None and not request.append:
+            vet_failure = self._run_write_vet(
+                workflow,
+                content=request.content,  # type: ignore[arg-type]
+                sniffed_ext=sniffed_ext,
+                file_path=target.file_path,
+                caller_variables=request.file_path.variables if isinstance(request.file_path, MacroPath) else None,
+            )
+            if vet_failure is not None:
+                return vet_failure
+
+        # Align the destination suffix to the sniffed format before any scan,
+        # write, or candidate generation runs. Without this, the scan globs
+        # the template's suffix while the post-write rename moves the file to
+        # the sniffed suffix; the next CREATE_NEW save with the same bytes
+        # globs the wrong family, returns an already-used index, writes, and
+        # the rename clobbers the prior save.
+        # (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
+        # Strict mode fails here before touching the disk.
+        alignment = self._apply_extension_coercion(request, target.file_path, sniffed_ext)
+        if isinstance(alignment, WriteFileResultFailure):
+            return alignment
+        file_path = alignment.aligned_path
+        # ``alignment.sniffed_ext`` is the *swap-only* signal: non-None only
+        # when the on-disk suffix was actually rewritten. Do NOT reuse the raw
+        # ``sniffed_ext`` local for on-disk-name-sensitive downstream code
+        # (indexed-fallback walk, sidecar update). The raw sniff is truthy
+        # for alias pairs too (jpg/jpeg, tif/tiff, m4v/mp4), where the file
+        # lands at the caller's requested suffix and downstream consumers
+        # would otherwise disagree with the on-disk name.
+        swapped_ext = alignment.sniffed_ext
+
+        content = await self._inject_workflow_metadata(request, file_path)
+
+        if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
+            written = await self._write_create_new(
+                request,
+                workflow,
+                file_path=file_path,
+                path_display=path_display,
+                content=content,
+                swapped_ext=swapped_ext,
+            )
+        else:
+            written = await self._write_in_place(request, file_path, content)
+        if isinstance(written, WriteFileResultFailure):
+            return written
+
+        if request.file_metadata is not None:
+            self._write_sidecar(request, written.file_path, swapped_ext, workflow)
+
+        if written.used_indexed_fallback:
+            msg = f"File written to indexed path: {written.file_path} (original path '{path_display}' already existed)"
+            result_details = ResultDetails(message=msg, level=logging.DEBUG)
+        else:
+            result_details = f"File written successfully: {written.file_path}"
+
+        return WriteFileResultSuccess(
+            final_file_path=str(written.file_path),
+            bytes_written=written.bytes_written,
+            result_details=result_details,
+        )
+
+    def _write_sidecar(
+        self,
+        request: WriteFileRequest,
+        file_path: Path,
+        swapped_ext: str | None,
+        workflow: "WorkflowRuntime | None",
+    ) -> None:
+        """Write the sidecar metadata file the caller opted into by providing `file_metadata`."""
+        file_metadata = request.file_metadata
+        if file_metadata is None:
+            return
+        # Sidecar provenance must reflect the on-disk extension, not the requested one.
+        # The reconciliation already happened in the sniff-and-swap; this just keeps the
+        # sidecar's file_extension variable (when present) consistent with what the bytes
+        # turned out to be. ``swapped_ext`` is non-None only when a genuine swap happened:
+        # for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the file lands at the caller's
+        # requested suffix, and the sidecar's ``file_extension`` stays what the caller supplied.
+        if swapped_ext is not None and file_metadata.situation is not None:
+            sidecar_variables = file_metadata.situation.variables
+            if sidecar_variables is not None and "file_extension" in sidecar_variables:
+                sidecar_variables["file_extension"] = swapped_ext
+        write_sidecar(file_path, file_metadata, self.engine, workflow)
+
+    def _resolve_write_target(
+        self, request: WriteFileRequest, workflow: "WorkflowRuntime | None"
+    ) -> "_WriteTarget | WriteFileResultFailure":
+        """Resolve the requested path to the file the write first targets, and ready its parent directory.
+
+        For a MacroPath, a single padded missing-required slot is seeded with 1, but only
+        for CREATE_NEW writes, and only if the macro author opted in via `:NN` padding.
+        """
         if isinstance(request.file_path, MacroPath):
             macro_path = request.file_path
             # The readable template string, not the ParsedMacro dataclass repr, which dumps
@@ -183,9 +319,10 @@ class FileWriter(EngineScoped):
             # slot to auto-allocate. Demote the log level so the probing miss doesn't
             # surface as a user-facing ERROR when the retry succeeds. For any other
             # policy the failure IS terminal, so it keeps the default ERROR level.
-            first_attempt_log_level = (
-                logging.DEBUG if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW else logging.ERROR
-            )
+            if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
+                first_attempt_log_level = logging.DEBUG
+            else:
+                first_attempt_log_level = logging.ERROR
             resolution_result = self.engine.os_manager.resolve_macro_path_to_string(
                 macro_path, workflow, failure_log_level=first_attempt_log_level
             )
@@ -222,9 +359,20 @@ class FileWriter(EngineScoped):
             resolved_path_str = sanitize_path_string(request.file_path)
             path_display = resolved_path_str
 
-        # Convert str → Path
+        file_path = self._resolve_candidate_path(resolved_path_str, path_display)
+        if isinstance(file_path, WriteFileResultFailure):
+            return file_path
+
+        parent_failure_reason = self._ensure_parent_directory_ready(file_path, create_parents=request.create_parents)
+        if parent_failure_reason is not None:
+            return self._handle_parent_directory_failure(parent_failure_reason, file_path)
+
+        return _WriteTarget(file_path=file_path, path_display=path_display)
+
+    def _resolve_candidate_path(self, path_str: str, path_display: str) -> "Path | WriteFileResultFailure":
+        """Convert a resolved path string to a Path, naming `path_display` in any failure."""
         try:
-            file_path = self.engine.os_manager.resolve_file_path(resolved_path_str, workspace_only=False)
+            return self.engine.os_manager.resolve_file_path(path_str, workspace_only=False)
         except (ValueError, RuntimeError) as e:
             msg = f"Attempted to write to file '{path_display}'. Failed due to invalid path: {e}"
             return WriteFileResultFailure(
@@ -238,430 +386,347 @@ class FileWriter(EngineScoped):
                 result_details=msg,
             )
 
-        # Ensure parent directory is ready
+    async def _inject_workflow_metadata(self, request: WriteFileRequest, file_path: Path) -> str | bytes:
+        """Return the content to write, with workflow metadata embedded when the config asks for it."""
+        content = request.content
+        if not isinstance(content, bytes):
+            return content
+        if request.skip_metadata_injection:
+            return content
+        if not self.engine.config_manager.get_config_value("auto_inject_workflow_metadata"):
+            return content
+        # The provider lookup and metadata collection read engine state, so they stay on the
+        # loop; only the re-encode with the collected metadata goes to a worker thread.
+        provider = self.engine.artifact_manager.provider_for_write(file_path.name)
+        if provider is None:
+            return content
+        # Providers read the bound workflow, which dispatch bound to the one the file's sidecar records.
+        metadata = provider.collect_metadata_for_write(file_path.name)
+        if not metadata:
+            return content
+        return await to_thread(provider.prepare_content_for_write, content, file_path.name, metadata)
+
+    async def _write_in_place(
+        self, request: WriteFileRequest, file_path: Path, content: str | bytes
+    ) -> "_WrittenFile | WriteFileResultFailure":
+        """Write for the FAIL and OVERWRITE policies, which only ever target `file_path`."""
+        normalized_path = Path(normalize_path_for_platform(file_path))
+        if request.existing_file_policy == ExistingFilePolicy.FAIL:
+            mode = "x"  # Exclusive creation (fail if exists)
+        elif request.append:
+            mode = "a"
+        else:
+            mode = "w"
+
+        if mode == "w":
+            # Whole-file overwrites go through a sibling temp file + rename
+            # instead of truncating in place, so a concurrent reader (e.g. the
+            # static server streaming a preview to a browser) never observes a
+            # zero-length or partially-written destination. The rename replaces
+            # portalocker as the concurrency mechanism here: concurrent
+            # overwrites are last-rename-wins, and writer interleaving is
+            # impossible because each writer fills a private sibling.
+            result = await to_thread(
+                self._attempt_atomic_file_write,
+                normalized_path=normalized_path,
+                content=content,
+                encoding=request.encoding,
+                file_path_display=file_path,
+            )
+        else:
+            # The other modes cannot use rename semantics and keep the
+            # portalocker-locked in-place write: append ("a") mutates the
+            # existing file, so writer mutual exclusion is the only thing
+            # keeping two appenders from interleaving; exclusive create ("x",
+            # the FAIL policy) gets its atomicity from O_EXCL, and its
+            # FileExistsError signal plus the debris cleanup around it are
+            # load-bearing for the CREATE_NEW candidate walk.
+            result = await to_thread(
+                self._attempt_file_write,
+                normalized_path=normalized_path,
+                content=content,
+                encoding=request.encoding,
+                mode=mode,
+                file_path_display=file_path,
+                fail_if_file_exists=True,  # FAIL policy always fails on file exists
+                fail_if_file_locked=True,
+            )
+        if result.failure_reason is not None:
+            # error_message is guaranteed to be set when failure_reason is set
+            return WriteFileResultFailure(
+                failure_reason=result.failure_reason,
+                result_details=result.error_message,  # type: ignore[arg-type]
+            )
+        if result.bytes_written is None:
+            msg = "Internal error: write reported neither failure nor bytes written"
+            raise RuntimeError(msg)
+        return _WrittenFile(file_path=file_path, bytes_written=result.bytes_written, used_indexed_fallback=False)
+
+    async def _write_create_new(  # noqa: PLR0913
+        self,
+        request: WriteFileRequest,
+        workflow: "WorkflowRuntime | None",
+        *,
+        file_path: Path,
+        path_display: str,
+        content: str | bytes,
+        swapped_ext: str | None,
+    ) -> "_WrittenFile | WriteFileResultFailure":
+        """Write for the CREATE_NEW policy: try `file_path`, then the next free indexed name."""
+        result = await to_thread(
+            self._attempt_file_write,
+            normalized_path=Path(normalize_path_for_platform(file_path)),
+            content=content,
+            encoding=request.encoding,
+            mode="x",
+            file_path_display=file_path,
+            fail_if_file_exists=False,  # Fall back to indexed
+            fail_if_file_locked=False,  # Fall back to indexed
+        )
+        if result.failure_reason is not None:
+            # error_message is guaranteed to be set when failure_reason is set
+            return WriteFileResultFailure(
+                failure_reason=result.failure_reason,
+                result_details=result.error_message,  # type: ignore[arg-type]
+            )
+        if result.bytes_written is not None:
+            return _WrittenFile(file_path=file_path, bytes_written=result.bytes_written, used_indexed_fallback=False)
+        # The file exists or is locked, so walk forward to the next free name.
+        return await self._write_next_free_index(
+            request,
+            workflow,
+            file_path=file_path,
+            path_display=path_display,
+            content=content,
+            swapped_ext=swapped_ext,
+        )
+
+    async def _write_next_free_index(  # noqa: PLR0913
+        self,
+        request: WriteFileRequest,
+        workflow: "WorkflowRuntime | None",
+        *,
+        file_path: Path,
+        path_display: str,
+        content: str | bytes,
+        swapped_ext: str | None,
+    ) -> "_WrittenFile | WriteFileResultFailure":
+        """Write to the first free indexed candidate after `file_path` was taken.
+
+        Two ways to discover the index variable to walk:
+
+        1. If the caller passed a MacroPath that already opted into the auto-index seed
+           (one unresolved required `{x:NN}` slot bound to `1` by the seed gate), walk
+           THAT slot. Incrementing `_index` against the user's original macro produces
+           consistent zero-padded width across the sequence (`v001 → v002 → v003`).
+        2. Otherwise, synthesize an `{stem}_{_index}{ext}` macro from the resolved string.
+           This is the original behavior for plain string paths (`output.png` →
+           `output_1.png`). For seeded MacroPaths it would lose padding (`v003 → v003_1`),
+           which is why path 1 catches them first.
+        """
+        walk = self._plan_index_walk(request, file_path, path_display)
+        if isinstance(walk, WriteFileResultFailure):
+            return walk
+        for idx in range(walk.start_index, walk.start_index + MAX_INDEXED_CANDIDATES):
+            candidate_path = self._prepare_indexed_candidate(
+                request,
+                workflow,
+                walk,
+                idx=idx,
+                path_display=path_display,
+                swapped_ext=swapped_ext,
+            )
+            if isinstance(candidate_path, WriteFileResultFailure):
+                return candidate_path
+
+            result = await to_thread(
+                self._attempt_file_write,
+                normalized_path=Path(normalize_path_for_platform(candidate_path)),
+                content=content,
+                encoding=request.encoding,
+                mode="x",
+                file_path_display=candidate_path,
+                fail_if_file_exists=False,  # Try next candidate
+                fail_if_file_locked=False,  # Try next candidate
+            )
+            if result.failure_reason is not None:
+                # error_message is guaranteed to be set when failure_reason is set
+                return WriteFileResultFailure(
+                    failure_reason=result.failure_reason,
+                    result_details=result.error_message,  # type: ignore[arg-type]
+                )
+            if result.bytes_written is not None:
+                return _WrittenFile(
+                    file_path=candidate_path, bytes_written=result.bytes_written, used_indexed_fallback=True
+                )
+
+        msg = f"Attempted to write to file '{path_display}'. Failed due to could not find available filename after trying {MAX_INDEXED_CANDIDATES} candidates"
+        return WriteFileResultFailure(
+            failure_reason=FileIOFailureReason.IO_ERROR,
+            result_details=msg,
+        )
+
+    def _prepare_indexed_candidate(  # noqa: PLR0913
+        self,
+        request: WriteFileRequest,
+        workflow: "WorkflowRuntime | None",
+        walk: "_IndexWalk",
+        *,
+        idx: int,
+        path_display: str,
+        swapped_ext: str | None,
+    ) -> "Path | WriteFileResultFailure":
+        """Resolve the candidate at `idx` to a path whose parent directory is ready."""
+        index_vars = {**walk.macro_path.variables, walk.index_variable.info.name: idx}
+        candidate_str = self._resolve_indexed_candidate(
+            MacroPath(parsed_macro=walk.macro_path.parsed_macro, variables=index_vars),
+            workflow,
+            idx=idx,
+            path_display=path_display,
+            walking_original=walk.walking_original,
+        )
+        if isinstance(candidate_str, WriteFileResultFailure):
+            return candidate_str
+
+        candidate_path = self._resolve_candidate_path(candidate_str, candidate_str)
+        if isinstance(candidate_path, WriteFileResultFailure):
+            return candidate_path
+
+        # Align the candidate suffix with the sniffed extension so the walked
+        # candidate ends up on disk at the same suffix as the try-first attempt.
+        # The synthesized-macro path inherits this because its template comes from
+        # the already-swapped file_path; the walking-original path uses the user's
+        # original suffix and needs this swap every iteration. Use ``swapped_ext``
+        # (non-None only when a genuine swap happened) rather than the raw sniff:
+        # alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) leave the on-disk suffix at the
+        # caller's request, and the walked candidate must follow suit.
+        if swapped_ext is not None:
+            candidate_path = candidate_path.with_suffix(f".{swapped_ext}")
+
         parent_failure_reason = self._ensure_parent_directory_ready(
-            file_path,
+            candidate_path,
             create_parents=request.create_parents,
         )
         if parent_failure_reason is not None:
-            match parent_failure_reason:
-                case FileIOFailureReason.PERMISSION_DENIED:
-                    msg = f"Attempted to write to file '{file_path}'. Failed due to permission denied creating parent directory {file_path.parent}"
-                case FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS:
-                    msg = f"Attempted to write to file '{file_path}'. Failed due to the parent directory not existing, and a policy was specified to NOT create parent directories: {file_path.parent}"
-                case _:
-                    msg = f"Attempted to write to file '{file_path}'. Failed due to error creating parent directory {file_path.parent}"
+            return self._handle_parent_directory_failure(parent_failure_reason, candidate_path)
+
+        return candidate_path
+
+    def _plan_index_walk(
+        self, request: WriteFileRequest, file_path: Path, path_display: str
+    ) -> "_IndexWalk | WriteFileResultFailure":
+        """Pick the macro, slot, and starting index the CREATE_NEW walk steps through."""
+        indexed_filenames = self.engine.os_manager.indexed_filenames
+        macro_path, padded_index_var = indexed_filenames.select_collision_walk_macro(request, file_path)
+        parsed_macro = macro_path.parsed_macro
+        variables = macro_path.variables
+
+        # For the synthesized-macro case (padded_index_var is None) we still use
+        # identify_index_variable to find the slot — its variables dict is empty by
+        # construction so the call is unambiguous. For the original-macro case the
+        # caller already knows the slot from select_collision_walk_macro, so we skip the
+        # call entirely (running it against `{outputs}/render_v{_index:NN}.png` with
+        # empty variables would falsely report ambiguity since `{outputs}` is also
+        # unresolved at that level — it gets substituted by ProjectManager during the
+        # per-iteration resolve).
+        if padded_index_var is not None:
+            index_info = padded_index_var
+            start_idx = self._collision_walk_start_index(request, padded_index_var)
+        else:
+            try:
+                identified = indexed_filenames.identify_index_variable(parsed_macro, variables)
+            except ValueError as e:
+                msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.INVALID_PATH,
+                    result_details=msg,
+                )
+            except Exception as e:
+                msg = f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.IO_ERROR,
+                    result_details=msg,
+                )
+            if identified is None:
+                # This should not happen since the synthesized macro always carries {_index}
+                msg = f"Attempted to write to file '{path_display}'. Failed due to missing index variable after conversion"
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.INVALID_PATH,
+                    result_details=msg,
+                )
+            index_info = identified
+            # The synthesized macro is fully static except `{_index}`, so scan for a
+            # starting index (`output.png` exists, the scan finds `output_1.png`, …,
+            # `output_4.png`, and returns 5).
+            starting_index = indexed_filenames.scan_for_next_available_index(parsed_macro, variables, index_info)
+            start_idx = starting_index if starting_index is not None else 1
+
+        return _IndexWalk(
+            macro_path=macro_path,
+            index_variable=index_info,
+            start_index=start_idx,
+            walking_original=padded_index_var is not None,
+        )
+
+    @staticmethod
+    def _collision_walk_start_index(request: WriteFileRequest, padded_index_var: ParsedVariable) -> int:
+        """Pick the first index to try when walking the caller's own padded slot.
+
+        - Bound to value N (caller reverse-matched an existing file, e.g. `_index=7` from
+          `my_file_v007.py`): start at N+1. The slot's value is the "current version";
+          we want the next.
+        - Required `{x:NN}` unbound: the seed in `_resolve_write_target` already tried 1,
+          so start at 2.
+        - Optional `{x?:NN}` unbound: the seed didn't fire (it's gated on required), and
+          the first attempt resolved with the slot omitted, so start at 1.
+        """
+        bound_value = None
+        if isinstance(request.file_path, MacroPath):
+            bound_value = request.file_path.variables.get(padded_index_var.info.name)
+        if isinstance(bound_value, int):
+            return bound_value + 1
+        if padded_index_var.info.is_required:
+            return 2
+        return 1
+
+    def _resolve_indexed_candidate(
+        self,
+        macro_path: MacroPath,
+        workflow: "WorkflowRuntime | None",
+        *,
+        idx: int,
+        path_display: str,
+        walking_original: bool,
+    ) -> "str | WriteFileResultFailure":
+        """Resolve one indexed candidate's path string.
+
+        The caller's original MacroPath routes through ProjectManager so project
+        directories (`{outputs}`, …) get substituted along with the index. A synthesized
+        macro is fully static apart from the index, so it resolves directly.
+        """
+        if walking_original:
+            resolution = self.engine.os_manager.resolve_macro_path_to_string(macro_path, workflow)
+            if isinstance(resolution, MacroResolutionFailure):
+                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {resolution.error_details}"
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                    result_details=msg,
+                )
+            return resolution
+        try:
+            return macro_path.parsed_macro.resolve(macro_path.variables, self.engine.secrets_manager)
+        except MacroResolutionError as e:
+            msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {e}"
             return WriteFileResultFailure(
-                failure_reason=parent_failure_reason,
+                failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
                 result_details=msg,
             )
-
-        # Sniff bytes ONCE up front. The sniffed format drives two independent
-        # decisions -- the codec-permission vet (which must run even for
-        # extension-less destinations) and the extension-coercion planner
-        # (only relevant when there IS a destination extension to reconcile).
-        # ``sniff_extension`` returns None for non-bytes content, so a non-None
-        # sniffed_ext also implies ``request.content`` is bytes; downstream code
-        # relies on that.
-        sniffed_ext = (
-            self.engine.artifact_manager.sniff_extension(request.content)
-            if isinstance(request.content, bytes)
-            else None
-        )
-
-        # Write vet. Runs BEFORE extension coercion so an extension-less
-        # destination (e.g. "movie") does not silently bypass the gate --
-        # sniff on bytes is independent of the destination suffix. Appends
-        # skip the vet: the tail alone has no container header to classify.
-        # Whether the vet actually does any work is the provider's call:
-        # opting out is a single ``None`` return in ``get_write_vetting_policy``,
-        # short-circuited inside ``_run_write_vet``.
-        if sniffed_ext is not None and not request.append:
-            vet_failure = self._run_write_vet(
-                workflow,
-                content=request.content,  # type: ignore[arg-type]
-                sniffed_ext=sniffed_ext,
-                file_path=file_path,
-                caller_variables=request.file_path.variables if isinstance(request.file_path, MacroPath) else None,
+        except Exception as e:
+            msg = f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
+            return WriteFileResultFailure(
+                failure_reason=FileIOFailureReason.IO_ERROR,
+                result_details=msg,
             )
-            if vet_failure is not None:
-                return vet_failure
-
-        # Align the destination suffix to the sniffed format before any scan,
-        # write, or candidate generation runs. Without this, the scan globs
-        # the template's suffix while the post-write rename moves the file to
-        # the sniffed suffix; the next CREATE_NEW save with the same bytes
-        # globs the wrong family, returns an already-used index, writes, and
-        # the rename clobbers the prior save.
-        # (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
-        # Strict mode fails here before touching the disk.
-        alignment = self._apply_extension_coercion(request, file_path, sniffed_ext)
-        if isinstance(alignment, WriteFileResultFailure):
-            return alignment
-        file_path = alignment.aligned_path
-        # ``alignment.sniffed_ext`` is the *swap-only* signal: non-None only
-        # when the on-disk suffix was actually rewritten. Do NOT reuse the raw
-        # ``sniffed_ext`` local for on-disk-name-sensitive downstream code
-        # (indexed-fallback walk, sidecar update). The raw sniff is truthy
-        # for alias pairs too (jpg/jpeg, tif/tiff, m4v/mp4), where the file
-        # lands at the caller's requested suffix and downstream consumers
-        # would otherwise disagree with the on-disk name.
-        swapped_ext = alignment.sniffed_ext
-
-        # Normalize path
-        normalized_path = normalize_path_for_platform(file_path)
-
-        # Inject workflow metadata into file content if applicable
-        content = request.content
-        if (
-            isinstance(content, bytes)
-            and not request.skip_metadata_injection
-            and self.engine.config_manager.get_config_value("auto_inject_workflow_metadata")
-        ):
-            # The provider lookup and metadata collection read engine state, so they stay on the
-            # loop; only the re-encode with the collected metadata goes to a worker thread.
-            provider = self.engine.artifact_manager.provider_for_write(file_path.name)
-            if provider is not None:
-                # Providers read the bound workflow, which dispatch bound to the one the file's sidecar records.
-                metadata = provider.collect_metadata_for_write(file_path.name)
-                if metadata:
-                    content = await to_thread(provider.prepare_content_for_write, content, file_path.name, metadata)
-
-        # Now attempt the write, based on our collision (existing file) policy.
-        match request.existing_file_policy:
-            case ExistingFilePolicy.FAIL | ExistingFilePolicy.OVERWRITE:
-                # Path already validated and ready to use
-
-                # Determine write mode based on policy
-                if request.existing_file_policy == ExistingFilePolicy.FAIL:
-                    mode = "x"  # Exclusive creation (fail if exists)
-                else:
-                    mode = "a" if request.append else "w"  # Append or overwrite
-
-                if mode == "w":
-                    # Whole-file overwrites go through a sibling temp file + rename
-                    # instead of truncating in place, so a concurrent reader (e.g. the
-                    # static server streaming a preview to a browser) never observes a
-                    # zero-length or partially-written destination. The rename replaces
-                    # portalocker as the concurrency mechanism here: concurrent
-                    # overwrites are last-rename-wins, and writer interleaving is
-                    # impossible because each writer fills a private sibling.
-                    result = await to_thread(
-                        self._attempt_atomic_file_write,
-                        normalized_path=Path(normalized_path),
-                        content=content,
-                        encoding=request.encoding,
-                        file_path_display=file_path,
-                    )
-                else:
-                    # The other modes cannot use rename semantics and keep the
-                    # portalocker-locked in-place write: append ("a") mutates the
-                    # existing file, so writer mutual exclusion is the only thing
-                    # keeping two appenders from interleaving; exclusive create ("x",
-                    # the FAIL policy) gets its atomicity from O_EXCL, and its
-                    # FileExistsError signal plus the debris cleanup around it are
-                    # load-bearing for the CREATE_NEW candidate walk.
-                    result = await to_thread(
-                        self._attempt_file_write,
-                        normalized_path=Path(normalized_path),
-                        content=content,
-                        encoding=request.encoding,
-                        mode=mode,
-                        file_path_display=file_path,
-                        fail_if_file_exists=True,  # FAIL policy always fails on file exists
-                        fail_if_file_locked=True,
-                    )
-                if result.failure_reason is not None:
-                    # error_message is guaranteed to be set when failure_reason is set
-                    return WriteFileResultFailure(
-                        failure_reason=result.failure_reason,
-                        result_details=result.error_message,  # type: ignore[arg-type]
-                    )
-
-                # Success - set variables for return at end
-                final_file_path = file_path
-                final_bytes_written = result.bytes_written
-
-            case ExistingFilePolicy.CREATE_NEW:
-                # Path already validated and ready to use (handled at method top)
-
-                # TRY-FIRST: Attempt to write to the requested path
-                result = await to_thread(
-                    self._attempt_file_write,
-                    normalized_path=Path(normalized_path),
-                    content=content,
-                    encoding=request.encoding,
-                    mode="x",
-                    file_path_display=file_path,
-                    fail_if_file_exists=False,  # Fall back to indexed
-                    fail_if_file_locked=False,  # Fall back to indexed
-                )
-                if result.failure_reason is not None:
-                    # error_message is guaranteed to be set when failure_reason is set
-                    return WriteFileResultFailure(
-                        failure_reason=result.failure_reason,
-                        result_details=result.error_message,  # type: ignore[arg-type]
-                    )
-                if result.bytes_written is not None:
-                    # Success on first try!
-                    final_file_path = file_path
-                    final_bytes_written = result.bytes_written
-                else:
-                    # FILE EXISTS OR IS LOCKED. ATTEMPT TO FIND THE NEXT AVAILABLE.
-                    # Two ways to discover the index variable to walk:
-                    #
-                    # 1. If the caller passed a MacroPath that already opted into the
-                    #    auto-index seed (one unresolved required `{x:NN}` slot bound to
-                    #    `1` by ProjectManager's seed gate), walk THAT slot — incrementing
-                    #    `_index` against the user's original macro produces consistent
-                    #    zero-padded width across the sequence (`v001 → v002 → v003`).
-                    # 2. Otherwise, synthesize an `{stem}_{_index}{ext}` macro from the
-                    #    resolved string. This is the original behavior for plain string
-                    #    paths (`output.png` → `output_1.png`). For seeded MacroPaths it
-                    #    would lose padding (`v003 → v003_1`), which is why path 1 above
-                    #    catches them first.
-                    macro_path, padded_index_var = self.engine.os_manager.indexed_filenames.select_collision_walk_macro(
-                        request, file_path
-                    )
-                    parsed_macro = macro_path.parsed_macro
-                    variables = macro_path.variables
-
-                    # For the synthesized-macro case (padded_index_var is None) we still
-                    # use identify_index_variable to find the slot — its variables dict
-                    # is empty by construction so the call is unambiguous. For the
-                    # original-macro case the caller already knows the slot from
-                    # select_collision_walk_macro, so we skip the call entirely
-                    # (running it against `{outputs}/render_v{_index:NN}.png` with empty
-                    # variables would falsely report ambiguity since `{outputs}` is also
-                    # unresolved at that level — it gets substituted by ProjectManager
-                    # during the per-iteration resolve).
-                    if padded_index_var is not None:
-                        index_info = padded_index_var
-                    else:
-                        try:
-                            index_info = self.engine.os_manager.indexed_filenames.identify_index_variable(
-                                parsed_macro, variables
-                            )
-                        except ValueError as e:
-                            msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
-                            return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.INVALID_PATH,
-                                result_details=msg,
-                            )
-                        except Exception as e:
-                            msg = f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
-                            return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.IO_ERROR,
-                                result_details=msg,
-                            )
-
-                        if index_info is None:
-                            # This should not happen since we always inject {_index} above
-                            msg = f"Attempted to write to file '{path_display}'. Failed due to missing index variable after conversion"
-                            return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.INVALID_PATH,
-                                result_details=msg,
-                            )
-
-                    # We have a macro with one and only one index variable on it. Two
-                    # walking strategies, picked in `select_collision_walk_macro`:
-                    #
-                    # A. Original MacroPath with a padded slot — `request.file_path` is
-                    #    the same MacroPath the caller sent. We re-resolve each iteration
-                    #    via `resolve_macro_path_to_string` so project directories get
-                    #    substituted. Skip the filesystem scan; just walk forward.
-                    #
-                    #    Three starting-index cases depending on whether the slot was
-                    #    bound at request time, and (if unbound) whether the seed gate
-                    #    in COMMON SETUP already tried 1:
-                    #    - Bound to value N (caller reverse-matched an existing file,
-                    #      e.g. `_index=7` from `my_file_v007.py`): start at N+1.
-                    #      The slot's value is the "current version"; we want the next.
-                    #    - Required `{x:NN}` unbound: seed in COMMON SETUP assigned 1 →
-                    #      start at 2.
-                    #    - Optional `{x?:NN}` unbound: seed didn't fire (it's gated on
-                    #      required); the first attempt resolved with the slot OMITTED
-                    #      → start at 1 so this loop is the FIRST place we try a value.
-                    # B. Synthesized MacroPath from `convert_str_path_to_macro_with_index`
-                    #    — variables is empty, template is fully static except `{_index}`.
-                    #    Run the existing scan to find a starting index (`output.png`
-                    #    exists, scan finds `output_1.png`, …, `output_4.png`, returns 5).
-                    walking_original = padded_index_var is not None
-                    if walking_original:
-                        # padded_index_var is the var the walk targets. Three cases:
-                        bound_value = (
-                            request.file_path.variables.get(padded_index_var.info.name)
-                            if isinstance(request.file_path, MacroPath)
-                            else None
-                        )
-                        if isinstance(bound_value, int):
-                            start_idx = bound_value + 1
-                        elif padded_index_var.info.is_required:
-                            # Seed already tried 1 in COMMON SETUP.
-                            start_idx = 2
-                        else:
-                            # Optional + unbound: seed didn't fire; this loop is the first try.
-                            start_idx = 1
-                    else:
-                        starting_index = self.engine.os_manager.indexed_filenames.scan_for_next_available_index(
-                            parsed_macro, variables, index_info
-                        )
-                        start_idx = starting_index if starting_index is not None else 1
-
-                    # Try indexed candidates on-demand (up to max attempts)
-                    secrets_manager = self.engine.secrets_manager
-                    attempted_count = 0
-
-                    for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
-                        attempted_count += 1
-
-                        # Step 1: Resolve macro with current index
-                        index_vars = {**variables, index_info.info.name: idx}
-                        if walking_original:
-                            # Original MacroPath: route through ProjectManager so project
-                            # directories (`{outputs}`, …) get substituted along with our
-                            # incremented index. The variable is already bound (we just
-                            # set it ourselves), so the resolver doesn't need any policy
-                            # context — it'll succeed without invoking any seed logic.
-                            resolution = self.engine.os_manager.resolve_macro_path_to_string(
-                                MacroPath(parsed_macro=parsed_macro, variables=index_vars), workflow
-                            )
-                            if isinstance(resolution, MacroResolutionFailure):
-                                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {resolution.error_details}"
-                                return WriteFileResultFailure(
-                                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
-                                    result_details=msg,
-                                )
-                            candidate_str = resolution
-                        else:
-                            try:
-                                candidate_str = parsed_macro.resolve(index_vars, secrets_manager)
-                            except MacroResolutionError as e:
-                                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {e}"
-                                return WriteFileResultFailure(
-                                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
-                                    result_details=msg,
-                                )
-                            except Exception as e:
-                                msg = (
-                                    f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
-                                )
-                                return WriteFileResultFailure(
-                                    failure_reason=FileIOFailureReason.IO_ERROR,
-                                    result_details=msg,
-                                )
-
-                        # Step 2: Resolve file path
-                        try:
-                            candidate_path = self.engine.os_manager.resolve_file_path(
-                                candidate_str, workspace_only=False
-                            )
-                        except (ValueError, RuntimeError) as e:
-                            msg = f"Attempted to write to file '{candidate_str}'. Failed due to invalid path: {e}"
-                            return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.INVALID_PATH,
-                                result_details=msg,
-                            )
-                        except Exception as e:
-                            msg = f"Attempted to write to file '{candidate_str}'. Failed due to unexpected error: {e}"
-                            return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.IO_ERROR,
-                                result_details=msg,
-                            )
-
-                        # Align the candidate suffix with the sniffed extension so the
-                        # walked candidate ends up on disk at the same suffix as the
-                        # try-first attempt. The synthesized-macro path inherits this
-                        # because its template comes from the already-swapped file_path;
-                        # the walking-original path uses the user's original suffix and
-                        # needs this swap every iteration. Use ``swapped_ext`` (non-None
-                        # only when a genuine swap happened) rather than the raw sniff:
-                        # alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) leave the on-disk
-                        # suffix at the caller's request, and the walked candidate must
-                        # follow suit.
-                        if swapped_ext is not None:
-                            candidate_path = candidate_path.with_suffix(f".{swapped_ext}")
-
-                        # Ensure parent directory for this candidate
-                        parent_failure_reason = self._ensure_parent_directory_ready(
-                            candidate_path,
-                            create_parents=request.create_parents,
-                        )
-                        if parent_failure_reason is not None:
-                            return self._handle_parent_directory_failure(parent_failure_reason, candidate_path)
-
-                        normalized_candidate_path = normalize_path_for_platform(candidate_path)
-
-                        # Try to write this indexed candidate using helper
-                        result = await to_thread(
-                            self._attempt_file_write,
-                            normalized_path=Path(normalized_candidate_path),
-                            content=content,
-                            encoding=request.encoding,
-                            mode="x",
-                            file_path_display=candidate_path,
-                            fail_if_file_exists=False,  # Try next candidate
-                            fail_if_file_locked=False,  # Try next candidate
-                        )
-                        if result.failure_reason is not None:
-                            # error_message is guaranteed to be set when failure_reason is set
-                            return WriteFileResultFailure(
-                                failure_reason=result.failure_reason,
-                                result_details=result.error_message,  # type: ignore[arg-type]
-                            )
-                        if result.bytes_written is not None:
-                            # Success with indexed path!
-                            final_file_path = candidate_path
-                            final_bytes_written = result.bytes_written
-                            used_indexed_fallback = True
-                            break
-                        # else: continue to next candidate
-
-                    # Check if we exhausted all indexed candidates
-                    if final_file_path is None:
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to could not find available filename after trying {attempted_count} candidates"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.IO_ERROR,
-                            result_details=msg,
-                        )
-
-        # SUCCESS PATH: All three policies converge here
-        if final_file_path is None or final_bytes_written is None:
-            msg = "Internal error: success path reached but file path or bytes not set"
-            raise RuntimeError(msg)
-
-        # Sidecar provenance must reflect the on-disk extension, not the requested one.
-        # The actual reconciliation already happened at the top of the handler via
-        # the sniff-and-swap; this just keeps the sidecar's file_extension variable
-        # (when present) consistent with what the bytes turned out to be. Use
-        # ``swapped_ext`` (non-None only when a genuine swap happened) rather
-        # than the raw sniff: for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the
-        # file lands at the caller's requested suffix, and the sidecar's
-        # ``file_extension`` should stay whatever the caller supplied.
-        if (
-            swapped_ext is not None
-            and request.file_metadata is not None
-            and request.file_metadata.situation is not None
-        ):
-            sidecar_variables = request.file_metadata.situation.variables
-            if sidecar_variables is not None and "file_extension" in sidecar_variables:
-                sidecar_variables["file_extension"] = swapped_ext
-
-        # Write sidecar metadata file if caller opted in by providing file_metadata
-        if request.file_metadata is not None:
-            write_sidecar(final_file_path, request.file_metadata, self.engine, workflow)
-
-        if used_indexed_fallback:
-            msg = f"File written to indexed path: {final_file_path} (original path '{path_display}' already existed)"
-            result_details = ResultDetails(message=msg, level=logging.DEBUG)
-        else:
-            result_details = f"File written successfully: {final_file_path}"
-
-        return WriteFileResultSuccess(
-            final_file_path=str(final_file_path),
-            bytes_written=final_bytes_written,
-            result_details=result_details,
-        )
 
     @handles(WriteTempFileRequest)
     def on_write_temp_file_request(

@@ -113,13 +113,12 @@ from griptape_nodes.retained_mode.managers.filesystem.indexed_filenames import I
 from griptape_nodes.retained_mode.managers.filesystem.sequences import FileSequences, describe_missing_items
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import current_platform
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.utils.async_utils import to_thread
+from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
-# File is not in static directory (or not a local file), create small preview
-from griptape_nodes.utils.async_utils import to_thread
-from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
 console = Console()
 logger = logging.getLogger("griptape_nodes")
