@@ -46,8 +46,6 @@ dependencies = [
   # the mcp 2.x our `mcp>=2.0,<3` pin resolves to. Below it, `pydantic_ai/mcp.py` imports symbols
   # mcp 2.x moved, such as `mcp.shared.context.RequestContext`, and `agent_manager` fails to import.
   "pydantic-ai-slim[mcp,openai]>=2.29.0",
-  # Floor at 0.58: the first release whose `FileSystem.read_file` returns images and PDFs, which
-  # the skills guide promises.
   "pydantic-ai-harness[skills]>=0.58",
 ]
 
