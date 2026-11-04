@@ -63,7 +63,7 @@ Instance methods come first because they can call anything. Class methods come n
 
 ## Path Handling
 
-**Canonicalize at the boundary, not in the middle** - The OS boundary (`OSManager.on_write_file_request`, `LocalFileDriver._resolve_path`) already canonicalizes incoming paths. Do not wrap a path with `canonicalize_for_io` before passing it to `ReadFileRequest` / `WriteFileRequest` or to a `FileDriver` method, it is redundant.
+**Canonicalize at the boundary, not in the middle** - The OS boundary (`FileWriter.on_write_file_request`, `LocalFileDriver._resolve_path`) already canonicalizes incoming paths. Do not wrap a path with `canonicalize_for_io` before passing it to `ReadFileRequest` / `WriteFileRequest` or to a `FileDriver` method, it is redundant.
 
 **Use `canonicalize_for_identity` for keys** - When a path is about to become a dict key, cache key, dedupe-set member, or workspace-containment input, call `canonicalize_for_identity(path)` from `griptape_nodes.files.path_utils`. It sanitizes + expands `~`/env vars + absolutizes + follows symlinks, so two spellings of the same file collide. Prefer it over ad-hoc `Path(x).resolve()`, which skips `expanduser` and causes identity drift.
 

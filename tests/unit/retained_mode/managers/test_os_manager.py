@@ -213,7 +213,7 @@ class TestWriteFileRequest:
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
         with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
             side_effect=PermissionError("Permission denied"),
         ):
             result = os_manager.engine.handle_request(request)
@@ -1327,7 +1327,7 @@ class TestExpandPath:
 
 
 class TestResolveFilePath:
-    """Test OSManager._resolve_file_path anchoring behaviour."""
+    """Test OSManager.resolve_file_path anchoring behaviour."""
 
     UNSET_VAR_NAME = "GRIPTAPE_UNSET_VAR_FOR_TEST"
 
@@ -1357,7 +1357,7 @@ class TestResolveFilePath:
     def test_relative_path_anchored_on_workspace(self, engine: Engine, path_str: str) -> None:
         """Relative paths resolve against the workspace directory, not the process CWD."""
         os_manager = engine.os_manager
-        result = os_manager._resolve_file_path(path_str)
+        result = os_manager.resolve_file_path(path_str)
         expected = engine.config_manager.workspace_path / path_str
         assert result == expected
 
@@ -1365,7 +1365,7 @@ class TestResolveFilePath:
         """A path naming an undefined variable stays literal and is anchored on the workspace."""
         monkeypatch.delenv(self.UNSET_VAR_NAME, raising=False)
         os_manager = engine.os_manager
-        result = os_manager._resolve_file_path(f"${self.UNSET_VAR_NAME}/sub")
+        result = os_manager.resolve_file_path(f"${self.UNSET_VAR_NAME}/sub")
         expected = engine.config_manager.workspace_path / f"${self.UNSET_VAR_NAME}" / "sub"
         assert result == expected
 
@@ -1375,7 +1375,7 @@ class TestResolveFilePath:
             pytest.skip("Windows resolves ~/Downloads through the Shell API special folder path")
         os_manager = engine.os_manager
         workspace_path = engine.config_manager.workspace_path
-        result = os_manager._resolve_file_path("~/Downloads")
+        result = os_manager.resolve_file_path("~/Downloads")
         assert result == resolve_path_safely(Path.home() / "Downloads")
         assert not result.is_relative_to(workspace_path)
 
@@ -1384,7 +1384,7 @@ class TestResolveFilePath:
         os_manager = engine.os_manager
         workspace_path = engine.config_manager.workspace_path
         absolute_path = resolve_path_safely(tmp_path / "elsewhere" / "file.txt")
-        result = os_manager._resolve_file_path(str(absolute_path))
+        result = os_manager.resolve_file_path(str(absolute_path))
         assert result == absolute_path
         assert not result.is_relative_to(workspace_path)
 
@@ -2448,7 +2448,7 @@ class TestMakeDirectoryRequest:
         """A path that cannot be resolved returns INVALID_PATH before any filesystem operation."""
         os_manager = engine.os_manager
 
-        with patch.object(OSManager, "_resolve_file_path", side_effect=ValueError("bad path")):
+        with patch.object(OSManager, "resolve_file_path", side_effect=ValueError("bad path")):
             result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(temp_dir / "any")))
 
         assert isinstance(result, MakeDirectoryResultFailure)
