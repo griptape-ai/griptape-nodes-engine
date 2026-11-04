@@ -1530,7 +1530,7 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully listed project templates. Loaded: {len(successfully_loaded)}, Failed: {len(failed_to_load)}",
         )
 
-    @handles(RefreshProjectTemplatesRequest, scope=RequestScope.HOST)
+    @handles(RefreshProjectTemplatesRequest)
     async def on_refresh_project_templates_request(
         self, _request: RefreshProjectTemplatesRequest
     ) -> RefreshProjectTemplatesResultSuccess:
