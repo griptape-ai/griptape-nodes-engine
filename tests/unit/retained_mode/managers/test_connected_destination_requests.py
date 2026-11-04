@@ -285,8 +285,8 @@ class TestGetConnectedFileSequenceDestination:
 
 
 @pytest.mark.usefixtures("nodes")
-class TestASettingsNodeOutsideTheSaversGroup:
-    """A wire into a group runs through a proxy parameter on the group, which the lookup sees through."""
+class TestAWireAcrossAGroupBoundary:
+    """A wire into or out of a group runs through a proxy parameter on the group, which the lookup sees through."""
 
     def test_is_found_through_the_groups_proxy(self, engine: Engine) -> None:
         _connect(engine, "settings")
@@ -298,10 +298,9 @@ class TestASettingsNodeOutsideTheSaversGroup:
         assert result.destination is not None
         assert result.destination.file_path == _MACRO
 
-    def test_is_found_through_nested_groups(self, engine: Engine) -> None:
+    def test_is_found_when_it_sits_in_a_group_the_saver_is_outside(self, engine: Engine) -> None:
         _connect(engine, "settings")
-        _group(engine, "inner", ["saver"])
-        _group(engine, "outer", ["inner"])
+        _group(engine, "group", ["settings"])
 
         result = engine.handle_request(
             GetConnectedDirectoryDestinationRequest(node_name="saver", parameter_name="output")
@@ -310,6 +309,17 @@ class TestASettingsNodeOutsideTheSaversGroup:
         assert isinstance(result, GetConnectedDirectoryDestinationResultSuccess), result
         assert result.destination is not None
         assert result.destination.dir_path == _MACRO
+
+    def test_is_found_across_sibling_groups(self, engine: Engine) -> None:
+        _connect(engine, "settings")
+        _group(engine, "settings_group", ["settings"])
+        _group(engine, "saver_group", ["saver"])
+
+        result = engine.handle_request(GetConnectedFileDestinationRequest(node_name="saver", parameter_name="output"))
+
+        assert isinstance(result, GetConnectedFileDestinationResultSuccess), result
+        assert result.destination is not None
+        assert result.destination.file_path == _MACRO
 
     def test_a_settings_node_inside_the_same_group_is_still_found(self, engine: Engine) -> None:
         _connect(engine, "settings")

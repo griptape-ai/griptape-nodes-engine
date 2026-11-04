@@ -2061,17 +2061,17 @@ class NodeManager(EngineScoped):
     def _sources_through_group_proxies(
         self, workflow: WorkflowRuntime, node_name: str, parameter_name: str
     ) -> list[BaseNode]:
-        """The nodes feeding ``node_name.parameter_name``, looking through the groups it sits in.
+        """The nodes feeding ``node_name.parameter_name``, looking through group proxy parameters.
 
-        A wire from outside a group to a node inside it runs through a proxy parameter on the group, so the
-        node's own incoming source is the group. Following the group's internal connection back to what
-        feeds the proxy finds the node at the other end, through any number of nested groups.
+        A wire that crosses a group's boundary, into it or out of it, runs through a proxy parameter on the
+        group, so the source a node sees can be the group. Following what feeds that proxy finds the node
+        at the other end.
         """
         connection_mgr = workflow.flows.connections
         sources: list[BaseNode] = []
         for connection_id in connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, []):
             connection = connection_mgr.connections[connection_id]
-            if isinstance(connection.source_node, SubflowNodeGroup) and connection.is_node_group_internal:
+            if isinstance(connection.source_node, SubflowNodeGroup):
                 sources.extend(
                     self._sources_through_group_proxies(
                         workflow, connection.source_node.name, connection.source_parameter.name
