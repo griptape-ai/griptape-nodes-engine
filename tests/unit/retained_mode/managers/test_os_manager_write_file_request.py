@@ -1507,7 +1507,7 @@ class TestCreateNewMacroIndexSeed:
         """A `{###}` sequence-slot macro auto-allocates v001/v002/v003 just like the legacy `{_index:03}` form.
 
         Drives the production write path through the new explicit syntax. The
-        parser emits a ``SequenceFormat`` slot which ``_has_sequence_slot_marker``
+        parser emits a ``SequenceFormat`` slot which ``has_sequence_slot_marker``
         recognizes through the seed gate and the collision-walk gate — so the
         ``{###}`` macro produces the same v001/v002/v003 sequence as the legacy
         ``{_index:03}`` form would. (The glob-builder's ``SequenceFormat`` →
@@ -1560,7 +1560,7 @@ class TestCreateNewMacroIndexSeed:
         a CREATE_NEW save and assert: (a) the new file lands at the literal name, and (b) the
         index allocated reflects only files whose name actually matches the literal template,
         not the false-positive. If this fails the fix lives in
-        ``_build_glob_pattern_from_partially_resolved`` (or its caller) and tracks under a
+        ``build_glob_pattern_from_partially_resolved`` (or its caller) and tracks under a
         follow-up issue — see the plan file.
         """
         # Bracket class would match any single char in the class — `renderx_v001.png` would
@@ -1658,7 +1658,7 @@ class TestCreateNewMacroIndexSeed:
     def test_same_index_variable_used_in_directory_and_filename(self, outputs_dir: Path) -> None:
         """Same `{_index:03}` referenced twice (as dir AND filename component) — both seeded equally.
 
-        ``_find_padded_unresolved_required`` picks the first ParsedVariable matching the
+        ``find_padded_unresolved_required`` picks the first ParsedVariable matching the
         missing name; ``GetPathForMacroRequest.resolve`` then renders BOTH occurrences with
         the same value. Pre-create a v001 sibling so the scan must gap-fill / extend.
 
@@ -1761,7 +1761,7 @@ class TestOptionalPaddedIndexCollision:
         """Optional `{_index?:03}` SECOND save: walks to padded `_001`, NOT unpadded `_1`.
 
         This is the bug #4544 / #4092 regression test. Pre-fix behavior:
-        `_convert_str_path_to_macro_with_index("file.png")` synthesized
+        `convert_str_path_to_macro_with_index("file.png")` synthesized
         `file_{_index}.png` (no format spec) → produced `file_1.png`. The fix walks
         the user's ORIGINAL macro's `{_index?:03}` slot, preserving the `:03` format.
         """
@@ -1892,7 +1892,7 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
     def test_two_distinct_padded_required_vars_fail_loudly(self, temp_dir: Path) -> None:
         """Macro with TWO distinct padded unresolved required vars must fail, not auto-pick.
 
-        ``_find_padded_unresolved_required`` only fires for a SINGLE missing required
+        ``find_padded_unresolved_required`` only fires for a SINGLE missing required
         variable. With two (``{a:03}`` and ``{b:03}``), the heuristic refuses to guess —
         the user sees ``MISSING_REQUIRED_VARIABLES`` naming both, no silent allocation.
         """
@@ -2014,7 +2014,7 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
         r"""Workspace + nested dirs + filename combine to >260 chars; gap-fill must still work.
 
         ``_apply_windows_long_path_prefix`` (``\\?\``) is added by ``canonicalize_for_io``
-        only at the OS-level write boundary. The scan in ``_scan_for_next_available_index``
+        only at the OS-level write boundary. The scan in ``scan_for_next_available_index``
         uses ``Path.glob()`` directly. If pathlib can't enumerate long-path entries on this
         runner, the scan returns 1 and the test fails — surfacing a real bug to fix or
         track.
@@ -2050,7 +2050,7 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
 
         On Windows: ``Path.glob()`` returns absolute ``WindowsPath`` objects whose ``str()``
         uses backslashes. The macro template uses forward slashes. Without a clean
-        round-trip in ``_extract_index_from_filename``, indices won't extract and the scan
+        round-trip in ``extract_index_from_filename``, indices won't extract and the scan
         returns 1 every call — the same failure mode that broke the prior Windows CI run.
         """
         outputs_dir = temp_dir / "outputs"
