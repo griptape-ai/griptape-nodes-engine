@@ -154,10 +154,10 @@ export default function MyEditorWidget(container, props) {
 
 **Value passed to `update`:**
 
-| Key                    | Description                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------ |
-| Synced parameter names | Live value for parameters being dragged, otherwise the last committed backend value  |
-| `locked`               | `string[]` of synced parameters that have incoming connections. Always present.      |
+| Key                    | Description                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| Synced parameter names | Live value for parameters being dragged, otherwise the last committed backend value |
+| `locked`               | `string[]` of synced parameters that have incoming connections. Always present.     |
 
 **Widget requirements:**
 
