@@ -90,7 +90,7 @@ class SaveWorkflowTargetInfo:
     - ``destination`` is set for FIRST_SAVE, SAVE_AS, and SAVE_FROM_TEMPLATE
       scenarios. It carries the unresolved ``ProjectFileDestination`` from
       the ``save_workflow`` situation so the macro resolves inside
-      ``OSManager.on_write_file_request`` (seed-and-retry for unresolved
+      ``FileWriter.on_write_file_request`` (seed-and-retry for unresolved
       required ``{x:NN}`` slots; situation policy honored).
     - ``file_path`` is set for OVERWRITE_EXISTING. The registry already
       knows the workflow's on-disk location, so an in-place overwrite is
@@ -698,7 +698,7 @@ class WorkflowSaver(EngineScoped):
 
         Returns an unresolved ``ProjectFileDestination`` plus a registry-relative
         display string. The destination's macro is resolved inside
-        ``OSManager.on_write_file_request`` so the seed-and-retry contract for
+        ``FileWriter.on_write_file_request`` so the seed-and-retry contract for
         unresolved required ``{x:NN}`` slots applies (see issue #4941).
 
         ``relative_file_path`` is computed from the user-supplied name and

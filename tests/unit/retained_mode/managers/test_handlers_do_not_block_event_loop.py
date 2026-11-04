@@ -187,9 +187,9 @@ class TestWriteFileRequest:
 
             monkeypatch.setattr(owner, method_name, wrapper)
 
-        record("macro resolution", os_manager, "_resolve_macro_path_to_string")
+        record("macro resolution", os_manager, "resolve_macro_path_to_string")
         record("index scan", os_manager.indexed_filenames, "scan_for_next_available_index")
-        record("disk write", os_manager, "_attempt_file_write")
+        record("disk write", os_manager.writer, "_attempt_file_write")
         engine.config_manager.workspace_path = tmp_path
         (tmp_path / "taken.txt").write_text("already here")
 
@@ -324,8 +324,8 @@ class TestConfigWrites:
             msg = "disk unavailable"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(engine.os_manager, "_attempt_atomic_file_write", fail_to_write)
-        monkeypatch.setattr(engine.os_manager, "_attempt_file_write", fail_to_write)
+        monkeypatch.setattr(engine.os_manager.writer, "_attempt_atomic_file_write", fail_to_write)
+        monkeypatch.setattr(engine.os_manager.writer, "_attempt_file_write", fail_to_write)
 
         with caplog.at_level(logging.ERROR):
             written = engine.config_manager._write_user_config_delta({"max_nodes_in_parallel": 9})
@@ -347,7 +347,7 @@ class TestConfigWrites:
             msg = "disk unavailable"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(engine.os_manager, "_attempt_file_write", fail_to_write)
+        monkeypatch.setattr(engine.os_manager.writer, "_attempt_file_write", fail_to_write)
 
         with caplog.at_level(logging.ERROR):
             written = engine.config_manager._write_user_config_delta({"max_nodes_in_parallel": 9})
@@ -436,8 +436,8 @@ class TestPreviewGenerators:
             msg = "disk unavailable"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(engine.os_manager, "_attempt_atomic_file_write", fail_to_write)
-        monkeypatch.setattr(engine.os_manager, "_attempt_file_write", fail_to_write)
+        monkeypatch.setattr(engine.os_manager.writer, "_attempt_atomic_file_write", fail_to_write)
+        monkeypatch.setattr(engine.os_manager.writer, "_attempt_file_write", fail_to_write)
 
         with pytest.raises(OSError, match="Failed to write preview image"):
             await generator.attempt_generate_preview()
