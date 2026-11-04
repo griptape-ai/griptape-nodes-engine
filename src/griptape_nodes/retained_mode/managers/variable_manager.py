@@ -1083,7 +1083,7 @@ class VariablesManager(EngineScoped):
         new callers use ListVariablesRequest and derive source/read_only from layers +
         permission. Uses the same layered walk as ListVariables, so shim and successor
         always agree on precedence.
-        TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete after
+        TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete after
         the GUI migrates (griptape-ai/griptape-vsl-gui#2668).
         """
         # Lazy import to avoid circular dependency between retained_mode and exe_types.
@@ -1173,7 +1173,7 @@ class VariablesManager(EngineScoped):
         No engine-internal callers remain — kept wire-identical for out-of-tree scripts.
         New callers use ListVariablesRequest (same layered walk) and build the dict from
         the result's variables.
-        TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+        TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
         """
         try:
             starting_flow = self._get_starting_flow(workflow, request.starting_flow)
@@ -1219,7 +1219,7 @@ class VariablesManager(EngineScoped):
         PROJECT-layer entries are refused regardless of stored permission (this shim never
         gained the project write-through; use SetVariableValueRequest for that). Refuses
         the whole batch if any variable isn't writable — no partial writes.
-        TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+        TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
         """
         try:
             starting_flow = self._get_starting_flow(workflow, request.starting_flow)

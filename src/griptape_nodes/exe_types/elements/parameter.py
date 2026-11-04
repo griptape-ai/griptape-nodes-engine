@@ -391,7 +391,9 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     @property
     def validators(self) -> list[Callable[[Parameter, Any], None]]:
         validators = []
-        traits = self.find_elements_by_type(Trait)  # TODO: https://github.com/griptape-ai/griptape-nodes/issues/857
+        traits = self.find_elements_by_type(
+            Trait
+        )  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/857
         for trait in traits:
             validators += trait.validators_for_trait()
         validators += self._validators

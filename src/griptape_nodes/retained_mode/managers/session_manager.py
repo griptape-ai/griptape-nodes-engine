@@ -204,7 +204,7 @@ class SessionManager:
         session_state_file = self._get_session_state_file(engine_id)
         if session_state_file.exists():
             try:
-                # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
+                # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes-engine/issues/3765
                 session_state_file.unlink()
                 logger.debug("Cleared all saved session data for engine: %s", engine_id)
             except OSError:

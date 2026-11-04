@@ -87,7 +87,7 @@ class ParameterContainer(Parameter, ABC):
         parameter structure/definitions rather than just data, so they remain
         meaningful even when empty.
 
-        See: https://github.com/griptape-ai/griptape-nodes/issues/1799
+        See: https://github.com/griptape-ai/griptape-nodes-engine/issues/1799
         """
         return True
 

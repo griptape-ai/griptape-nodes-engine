@@ -522,7 +522,7 @@ class BaseNode(ABC):
         )
 
     # This is gross and we need to have a universal pass on resolution state changes and emission of events. That's what this ticket does!
-    # https://github.com/griptape-ai/griptape-nodes/issues/994
+    # https://github.com/griptape-ai/griptape-nodes-engine/issues/994
     def make_node_unresolved(self, current_states_to_trigger_change_event: set[NodeResolutionState] | None) -> None:
         # See if the current state is in the set of states to trigger a change event.
         if current_states_to_trigger_change_event is not None and self.state in current_states_to_trigger_change_event:
@@ -806,7 +806,7 @@ class BaseNode(ABC):
 
     def after_settings_changed(self, **kwargs: Any) -> None:  # noqa: ARG002
         """Callback for when the settings of this Node are changed."""
-        # Waiting for https://github.com/griptape-ai/griptape-nodes/issues/1309
+        # Waiting for https://github.com/griptape-ai/griptape-nodes-engine/issues/1309
         return
 
     def on_node_message_received(
@@ -867,7 +867,7 @@ class BaseNode(ABC):
         """Adds a Parameter to the Node. Control and Data Parameters are all treated equally."""
         self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="add_parameter")
         if any(char.isspace() for char in param.name):
-            msg = f"Failed to add Parameter `{param.name}`. Parameter names cannot currently any whitespace characters. Please see https://github.com/griptape-ai/griptape-nodes/issues/714 to check the status on a remedy for this issue."
+            msg = f"Failed to add Parameter `{param.name}`. Parameter names cannot currently any whitespace characters. Please see https://github.com/griptape-ai/griptape-nodes-engine/issues/714 to check the status on a remedy for this issue."
             raise ValueError(msg)
         if self.does_name_exist(param.name):
             msg = f"Cannot have duplicate names on parameters. Encountered two instances of '{param.name}'."
@@ -2703,7 +2703,7 @@ class StartNode(BaseNode):
 
 
 class EndNode(BaseNode):
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/854
+    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/854
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata)
 

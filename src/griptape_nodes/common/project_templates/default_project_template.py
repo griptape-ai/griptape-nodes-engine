@@ -166,7 +166,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
         ),
         # Workflows save into the workspace root today for backward compatibility.
         # Migrating to a dedicated subdirectory is tracked in
-        # https://github.com/griptape-ai/griptape-nodes/issues/2047.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/2047.
         BuiltInSituation.SAVE_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.SAVE_WORKFLOW,
             description="Save a workflow Python file, preserving any sub-directory hierarchy",

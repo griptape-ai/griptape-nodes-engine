@@ -1876,7 +1876,7 @@ class TestGeneratorValidation:
         params_model_class = PILThumbnailGenerator.get_parameters()
 
         # Extra fields are ignored (for backward compatibility with old configs)
-        # See https://github.com/griptape-ai/griptape-nodes/issues/3980
+        # See https://github.com/griptape-ai/griptape-nodes-engine/issues/3980
         validated_params = cast("PILThumbnailParameters", params_model_class.model_validate(params))
 
         # Only known fields are included in the model
