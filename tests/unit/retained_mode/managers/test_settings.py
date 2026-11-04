@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.settings import (
     AppInitializationComplete,
+    DistributedExecutionSettings,
     LibraryDependencyInstallBehavior,
     LibraryDownload,
     LibraryRegistration,
@@ -170,3 +171,18 @@ class TestRefreshPreviewsMaxFiles:
 
         with pytest.raises(ValidationError, match="refresh_previews_max_files must be a whole number"):
             Settings.model_validate({"refresh_previews_max_files": value}, context={FROM_ENV_CONTEXT: True})
+
+
+class TestDistributedExecutionMaxWorkers:
+    """`max_workers` is a limit of at least one worker, or empty for none."""
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_a_limit_below_one_is_rejected(self, value: int) -> None:
+        with pytest.raises(ValidationError):
+            DistributedExecutionSettings.model_validate({"max_workers": value})
+
+    @pytest.mark.parametrize("value", [None, 1, 4])
+    def test_no_limit_or_a_positive_limit_is_accepted(self, value: int | None) -> None:
+        settings = DistributedExecutionSettings.model_validate({"max_workers": value})
+
+        assert settings.max_workers == value

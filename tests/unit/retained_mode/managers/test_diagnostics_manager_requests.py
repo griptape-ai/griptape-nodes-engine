@@ -22,6 +22,7 @@ import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlparse
 
 import httpx2
 import pytest
@@ -48,10 +49,15 @@ from griptape_nodes.retained_mode.events.diagnostics_events import (
     RunHealthChecksResultFailure,
     RunHealthChecksResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
+from tests.workflow_context import push_unsaved_workflow
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.common.diagnostics.report import DiagnosticsReport
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -509,11 +515,10 @@ class TestTheOpenWorkflow:
     """
 
     @pytest.fixture
-    def open_workflow(self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    def open_workflow(self, engine: Engine, tmp_path: Path) -> Path:
         """Open a saved workflow in the engine, and return the file it was saved to."""
         workflow = tmp_path / "the-flow-that-broke.py"
-        workflow.write_text("# a saved workflow\n", encoding="utf-8")
-        self._open(monkeypatch, engine, name="the-flow-that-broke", file_path=str(workflow))
+        self._open(engine, saved_to=workflow)
         return workflow
 
     @pytest.mark.asyncio
@@ -525,46 +530,90 @@ class TestTheOpenWorkflow:
         assert f"workflow/{open_workflow.name}" in _members(result)
 
     @pytest.mark.asyncio
+    async def test_a_stale_envelope_id_still_collects_the_open_workflow(
+        self, engine: Engine, tmp_path: Path, open_workflow: Path
+    ) -> None:
+        """The editor stamps every request with the id it last knew, which may be a closed workflow.
+
+        The troubleshooting button has to work exactly then, so the bundle ignores that id.
+        """
+        result = (
+            await engine.event_manager.ahandle_request(
+                CollectDiagnosticsRequest(
+                    output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+                ),
+                result_context=ResultContext(open_workflow_id="a-workflow-closed-since"),
+            )
+        ).result
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert f"workflow/{open_workflow.name}" in _members(result)
+
+    @pytest.mark.asyncio
+    async def test_the_report_names_the_open_workflow(self, engine: Engine, open_workflow: Path) -> None:
+        report = await _report(engine)
+
+        assert report.session.current_workflow_name is not None
+        assert open_workflow.stem in report.session.current_workflow_name
+        assert report.session.current_workflow_path is not None
+        assert report.session.current_workflow_path.endswith(open_workflow.name)
+
+    @pytest.mark.asyncio
     async def test_nothing_open_is_reported_rather_than_left_blank(self, engine: Engine, tmp_path: Path) -> None:
         """Asked for and absent is a different thing from never asked for."""
         result = await _collect(engine, tmp_path, include_current_workflow=True)
 
-        assert [warning for warning in result.manifest.warnings if "No workflow was open" in warning] != []
+        assert [warning for warning in result.manifest.warnings if "No workflow is open" in warning] != []
+
+    @pytest.mark.asyncio
+    async def test_nothing_open_and_a_stale_envelope_id_still_collects(self, engine: Engine, tmp_path: Path) -> None:
+        """The editor's id outlives the last workflow it named; the bundle is still collected."""
+        result = (
+            await engine.event_manager.ahandle_request(
+                CollectDiagnosticsRequest(
+                    output_path=str(tmp_path), include_health_checks=False, include_current_workflow=True
+                ),
+                result_context=ResultContext(open_workflow_id="a-workflow-closed-since"),
+            )
+        ).result
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert [warning for warning in result.manifest.warnings if "No workflow is open" in warning] != []
 
     @pytest.mark.asyncio
     async def test_an_unsaved_workflow_is_reported_with_what_to_do_about_it(
-        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """The likeliest case of all: the workflow being reported on has never been saved."""
-        self._open(monkeypatch, engine, name="untitled", file_path=None)
+        self._open(engine, saved_to=None)
 
         result = await _collect(engine, tmp_path, include_current_workflow=True)
 
         assert [warning for warning in result.manifest.warnings if "never been saved" in warning] != []
 
     @pytest.mark.asyncio
-    async def test_a_workflow_whose_file_is_gone_is_reported_by_name(
-        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_a_workflow_whose_file_is_gone_is_reported_by_name(self, engine: Engine, tmp_path: Path) -> None:
         """Deleted from under the engine, which is itself worth knowing about."""
-        self._open(monkeypatch, engine, name="deleted-since", file_path=str(tmp_path / "deleted-since.py"))
+        saved_to = tmp_path / "deleted-since.py"
+        self._open(engine, saved_to=saved_to)
+        saved_to.unlink()
 
         result = await _collect(engine, tmp_path, include_current_workflow=True)
 
         assert [warning for warning in result.manifest.warnings if "deleted-since.py" in warning] != []
 
     @staticmethod
-    def _open(monkeypatch: pytest.MonkeyPatch, engine: Engine, *, name: str, file_path: str | None) -> None:
-        """Answer the context manager as though this workflow were open.
+    def _open(engine: Engine, *, saved_to: Path | None) -> None:
+        """Open an empty workflow, saved to a placeholder file at `saved_to` unless it is None.
 
-        Patched rather than really opened: opening one runs its generated module, which
-        registers nodes and libraries this has nothing to do with. The three methods
-        replaced here are everything the diagnostics code asks about the open workflow.
+        The placeholder is never run: running a workflow file registers nodes and libraries this has
+        nothing to do with.
         """
-        context_manager = engine.context_manager
-        monkeypatch.setattr(context_manager, "has_current_workflow", lambda: True)
-        monkeypatch.setattr(context_manager, "get_current_workflow_name", lambda: name)
-        monkeypatch.setattr(context_manager, "get_current_workflow_file_path", lambda: file_path)
+        entry = push_unsaved_workflow(engine)
+        if saved_to is None:
+            return
+        saved_to.write_text("# a saved workflow\n", encoding="utf-8")
+        engine.workflow_registry.set_file_path(entry, saved_to)
 
 
 class TestBundleWrittenToStaticFiles:
@@ -579,7 +628,7 @@ class TestBundleWrittenToStaticFiles:
     async def test_returns_a_link_rather_than_a_path(self, engine: Engine) -> None:
         saved_as = "https://static.example.com/files/griptape-nodes-diagnostics-1.2.3-20260101-000000_1.zip"
 
-        with patch.object(engine.static_files_manager, "save_static_file", return_value=saved_as) as save:
+        with patch.object(engine.static_files_manager, "save_workspace_static_file", return_value=saved_as) as save:
             result = await engine.ahandle_request(
                 CollectDiagnosticsRequest(include_health_checks=False, include_current_workflow=False)
             )
@@ -600,7 +649,9 @@ class TestBundleWrittenToStaticFiles:
         """No disk space, or a static files directory that is not there any more."""
         with (
             patch.object(
-                engine.static_files_manager, "save_static_file", side_effect=OSError("No space left on device")
+                engine.static_files_manager,
+                "save_workspace_static_file",
+                side_effect=OSError("No space left on device"),
             ),
             caplog.at_level(logging.ERROR, logger=LOGGER_NAME),
         ):
@@ -625,7 +676,7 @@ class TestBundleWrittenToStaticFiles:
         with (
             patch.object(
                 engine.static_files_manager,
-                "save_static_file",
+                "save_workspace_static_file",
                 side_effect=httpx2.ConnectError("All connection attempts failed"),
             ),
             caplog.at_level(logging.ERROR, logger=LOGGER_NAME),
@@ -637,6 +688,51 @@ class TestBundleWrittenToStaticFiles:
         assert isinstance(result, CollectDiagnosticsResultFailure)
         assert "All connection attempts failed" in str(result.result_details)
         assert "Attempted to save the diagnostics bundle" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_open_the_bundle_lands_in_the_workspace_static_files(
+        self, engine: Engine, workspace: Path
+    ) -> None:
+        """The editor offers "Collect troubleshooting info" before any workflow is open."""
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        result = await engine.ahandle_request(
+            CollectDiagnosticsRequest(include_health_checks=False, include_current_workflow=False)
+        )
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert result.url is not None
+        # The static server serves the workspace, so the editor can download it from this link.
+        assert urlparse(result.url).path == f"/workspace/staticfiles/{result.file_name}"
+        assert zipfile.is_zipfile(workspace / "staticfiles" / result.file_name)
+
+    @pytest.mark.asyncio
+    async def test_with_a_workflow_open_the_bundle_still_lands_in_the_workspace_static_files(
+        self, engine: Engine, workspace: Path, tmp_path: Path
+    ) -> None:
+        """The bundle describes the engine, so it does not follow the open workflow to its folder."""
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.context_manager.push_workflow(workflow_name="elsewhere", working_directory=str(tmp_path / "elsewhere"))
+        try:
+            result = await engine.ahandle_request(
+                CollectDiagnosticsRequest(include_health_checks=False, include_current_workflow=False)
+            )
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        assert isinstance(result, CollectDiagnosticsResultSuccess), result.result_details
+        assert zipfile.is_zipfile(workspace / "staticfiles" / result.file_name)
+        assert not (tmp_path / "elsewhere").exists()
+
+    @pytest.fixture
+    def workspace(self, engine: Engine, tmp_path: Path) -> Iterator[Path]:
+        """Point the engine's workspace at a fresh folder, so the bundle written there can be found."""
+        original = engine.config_manager.workspace_path
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        engine.config_manager.workspace_path = workspace_path
+        yield workspace_path
+        engine.config_manager.workspace_path = original
 
 
 class TestHealthChecks:

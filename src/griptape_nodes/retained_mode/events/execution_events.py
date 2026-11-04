@@ -279,7 +279,8 @@ class RunInfo:
         run_id: The run.
         flow_name: The flow it executes.
         state: Its state: queued, running, or paused.
-        position: Its place in line, 1 being next, or 0 for the run in progress.
+        position: Its place in line, 1 being next, or 0 for the run in progress. The run in progress has one
+            too, and is queued, while its node waits in another engine's line.
         request_id: The id the client gave the request that submitted the run, or None if it gave none.
     """
 
@@ -771,6 +772,9 @@ class ExecuteNodeRequest(RequestPayload):
             Workers carry this field because they have no access to VariablesManager
             or the workflow context; in-process nodes use it to skip the NodeManager
             lookup that would otherwise resolve the flow.
+        orchestrator_workflow_id: id of the orchestrator's open workflow the node runs for. Not
+            `workflow_id`, which names the saved workflow a request acts on. The worker registers
+            the workflow under this id (unlisted) and runs the node in the runtime it keeps for it.
         workflow_name / workflow_file_path / workflow_working_directory: the orchestrator's workflow
             CONTEXT, which the worker adopts as its own before running the node. Sent for the same
             reason as `variables` -- it lives in in-process state only the orchestrator has -- and
@@ -778,9 +782,13 @@ class ExecuteNodeRequest(RequestPayload):
             (`workflow_dir`, `workflow_name`, variable-substitution enablement, anything added
             later) is answered by the worker's normal code paths. A worker without it answers "no
             current workflow" to all of them, which silently degrades `{outputs}` from the
-            workflow's own folder to a workspace-relative path. These three mirror
-            ContextManager.WorkflowContextState exactly; workflow_name None means the orchestrator
-            had no workflow either, so there is nothing to adopt.
+            workflow's own folder to a workspace-relative path. With the id, these are what the
+            worker's registry entry for the workflow answers. The worker builds its copy of the
+            node in that workflow, so a request with no orchestrator_workflow_id fails rather than
+            running without one.
+        lease_id: The lease, on the engine that runs the worker, that the node is sent under. A worker
+            another engine runs asks that engine whether the lease holds it before running the node,
+            and refuses a node sent under none. None for a worker on this machine.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -793,10 +801,12 @@ class ExecuteNodeRequest(RequestPayload):
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
     local_object_source: str | None = None
+    orchestrator_workflow_id: str | None = None
     workflow_name: str | None = None
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
+    lease_id: str | None = None
 
 
 @dataclass

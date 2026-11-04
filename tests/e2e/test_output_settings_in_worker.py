@@ -34,7 +34,7 @@ from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, C
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
-from tests.simulated_worker import SimulatedWorker, simulated_worker
+from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -125,12 +125,12 @@ def _build_graph(name_base: str, if_exists: str = "overwrite") -> None:
 
 
 async def _run_saver() -> ResultPayload:
-    return await current_engine().ahandle_request(
-        ExecuteNodeRequest(
-            node_name=_SAVER,
-            node_metadata={"node_type": "SavesThroughOutputParametersNode", "library": WORKER_BEHAVIOR_LIBRARY_NAME},
-        )
+    engine = current_engine()
+    request = ExecuteNodeRequest(
+        node_name=_SAVER,
+        node_metadata={"node_type": "SavesThroughOutputParametersNode", "library": WORKER_BEHAVIOR_LIBRARY_NAME},
     )
+    return await engine.current_workflow().ahandle_request(sent_from_open_workflow(request, engine))
 
 
 @pytest.mark.usefixtures("venue")

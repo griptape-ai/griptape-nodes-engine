@@ -8,8 +8,13 @@ Covers:
   download reports a written message rather than whatever landed in the subprocess pipe
 - `on_handle_download_model_request` — a missing Hugging Face token does not block the attempt
 - `_load_status_file` — status file reads survive a concurrent status file write
+- `on_handle_pause_model_download_request` / `on_handle_resume_model_download_request` — a paused
+  download keeps its status until resumed with the parameters it started with
+- `on_handle_delete_model_request` — deleting a model clears its download record
 """
 
+import asyncio
+import contextvars
 import importlib.util
 import io
 import json
@@ -31,27 +36,38 @@ from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
     DeclareModelInvocationResultSuccess,
+    DeleteModelRequest,
+    DeleteModelResultSuccess,
     DownloadModelRequest,
+    DownloadModelResultFailure,
     DownloadModelResultSuccess,
     GetModelInfoRequest,
     GetModelInfoResultFailure,
     GetModelInfoResultSuccess,
     ListModelDownloadsRequest,
     ListModelDownloadsResultSuccess,
+    PauseModelDownloadRequest,
+    PauseModelDownloadResultFailure,
+    PauseModelDownloadResultSuccess,
+    ResumeModelDownloadRequest,
+    ResumeModelDownloadResultFailure,
+    ResumeModelDownloadResultSuccess,
     SearchModelsRequest,
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.managers.model_manager import (
     _PROGRESS_PIPE_ENV_VAR,
     _STATUS_READ_LOCK_ATTEMPTS,
     _STATUS_READ_TORN_ATTEMPTS,
     DownloadParams,
     ModelManager,
+    _bytes_already_downloaded,
     _create_progress_tracker,
     _load_status_file,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 @pytest.fixture
@@ -211,14 +227,20 @@ class TestOnHandleDeclareModelInvocationRequest:
         # Reaching the handler means the pre-dispatch chain did not deny the
         # declaration, so the node is cleared to invoke the model itself.
         result = model_manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(
-                model_id="gtc_claude_opus_4_7",
-                node_name="Agent_1",
-            )
+            DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7")
         )
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)
         assert result.model_id == "gtc_claude_opus_4_7"
+
+    def test_a_node_with_no_workflow_to_find_it_in_is_denied(self, model_manager: ModelManager) -> None:
+        # Without the node, provider- and family-scoped rules could not gate the invocation.
+        result = model_manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7", node_name="Agent_1")
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultFailure)
+        assert "names no open workflow" in str(result.result_details)
 
     def test_a_denying_pre_dispatch_hook_short_circuits_before_the_handler(self) -> None:
         # End to end: enforcement lives in the pre-dispatch chain, not the
@@ -354,8 +376,8 @@ class TestDeclareModelInvocationCatalogEnrichment:
             }
         )
 
-    def _register_node(self, node_name: str, engine: Engine) -> None:
-        """Register a library + probe node type, then a node instance the handler can resolve."""
+    def _register_node(self, node_name: str, engine: Engine) -> WorkflowRuntime:
+        """Register a library + probe node type, then a node instance in a newly opened workflow, which it returns."""
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.node_library.library_registry import (
             LibraryMetadata,
@@ -392,12 +414,48 @@ class TestDeclareModelInvocationCatalogEnrichment:
             name=node_name,
             metadata={"library": _CATALOG_LIBRARY_NAME, "node_type": _ProbeModelNode.__name__},
         )
-        engine.object_manager.add_object_by_name(node_name, node)
+        engine.context_manager.push_workflow(workflow_name="model_workflow")
+        workflow = engine.current_workflow()
+        engine.object_manager.add_object_by_name_in(workflow, node_name, node)
+        return workflow
 
     def test_checkpoint_carries_family_and_provider_for_declared_model(
         self,
         engine: Engine,
     ) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        workflow = self._register_node("Probe_1", engine)
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        engine.event_manager.add_authorization_hook(capture)
+
+        result = engine.event_manager.handle_request(
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
+            result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+        ).result
+
+        assert isinstance(result, DeclareModelInvocationResultSuccess)
+        # The InvokeModel checkpoint now carries the provider and family the
+        # declared catalog key resolves to, not just the bare id.
+        assert seen["attributes"] == {
+            "id": "gtc_gpt_image_1_mini",
+            "provider_id": "openai",
+            "model_families": ["GPT Image"],
+        }
+
+    def test_a_declaration_from_a_fresh_context_is_enriched_from_the_only_open_workflow(
+        self,
+        engine: Engine,
+    ) -> None:
+        """As a node declares from its library's own thread pool: no envelope id and no binding."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -411,15 +469,17 @@ class TestDeclareModelInvocationCatalogEnrichment:
             return None
 
         engine.event_manager.add_authorization_hook(capture)
-        manager = ModelManager()
 
-        result = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
+        result = (
+            contextvars.Context()
+            .run(
+                engine.event_manager.handle_request,
+                DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
+            )
+            .result
         )
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)
-        # The InvokeModel checkpoint now carries the provider and family the
-        # declared catalog key resolves to, not just the bare id.
         assert seen["attributes"] == {
             "id": "gtc_gpt_image_1_mini",
             "provider_id": "openai",
@@ -437,7 +497,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             CheckpointFailure,
         )
 
-        self._register_node("Probe_1", engine)
+        workflow = self._register_node("Probe_1", engine)
 
         def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             if "GPT Image" in (checkpoint.attributes.get("model_families") or []):
@@ -448,7 +508,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
         manager = ModelManager()
 
         result = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"), workflow
         )
 
         assert isinstance(result, DeclareModelInvocationResultFailure)
@@ -463,7 +523,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             CheckpointDenial,
         )
 
-        self._register_node("Probe_1", engine)
+        workflow = self._register_node("Probe_1", engine)
         seen: dict[str, object] = {}
 
         def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
@@ -474,10 +534,32 @@ class TestDeclareModelInvocationCatalogEnrichment:
         manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model_id="gtc_not_declared", node_name="Probe_1")
+            DeclareModelInvocationRequest(model_id="gtc_not_declared", node_name="Probe_1"), workflow
         )
 
         assert seen["attributes"] == {"id": "gtc_not_declared"}
+
+    def test_a_node_not_in_the_workflow_falls_back_to_bare_id(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        workflow = self._register_node("Probe_1", engine)
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        engine.event_manager.add_authorization_hook(capture)
+        manager = ModelManager()
+
+        manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_2"), workflow
+        )
+
+        assert seen["attributes"] == {"id": "gtc_gpt_image_1_mini"}
 
     def test_missing_node_name_falls_back_to_bare_id(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
@@ -546,8 +628,7 @@ class TestDownloadModelTaskSubprocess:
         spec = importlib.util.find_spec(spawned_module)
         assert spec is not None, f"spawned module '{spawned_module}' is not importable"
 
-        assert captured_cmd[3] == "download"
-        assert "org/model" in captured_cmd
+        assert captured_cmd[3] == "org/model"
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +674,90 @@ class TestProgressTrackerInPipeMode:
         bar.close()
 
         assert bar._should_track is False
+
+
+# ---------------------------------------------------------------------------
+# Restarted downloads count the files an earlier attempt finished
+# ---------------------------------------------------------------------------
+
+_COMMIT_HASH = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.fixture
+def hf_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the Hugging Face cache at an empty temp directory."""
+    cache = tmp_path / "hub"
+    monkeypatch.setattr("griptape_nodes.retained_mode.managers.model_manager.hf_constants.HF_HUB_CACHE", str(cache))
+    return cache
+
+
+def _write_snapshot(cache: Path, files: dict[str, int]) -> None:
+    repo_dir = cache / "models--org--model"
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(_COMMIT_HASH)
+    for name, size in files.items():
+        path = repo_dir / "snapshots" / _COMMIT_HASH / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+    # A partial download lives in blobs/ and never appears in the snapshot.
+    (repo_dir / "blobs").mkdir()
+    (repo_dir / "blobs" / "abc.incomplete").write_bytes(b"x" * 1000)
+
+
+class TestBytesAlreadyDownloaded:
+    def test_counts_the_finished_files_of_the_revision(self, hf_cache: Path) -> None:
+        _write_snapshot(hf_cache, {"config.json": 20, "transformer/model.safetensors": 30})
+
+        assert _bytes_already_downloaded(DownloadParams(model_id="org/model", revision="main")) == 50  # noqa: PLR2004
+
+    def test_a_commit_hash_revision_names_the_snapshot(self, hf_cache: Path) -> None:
+        _write_snapshot(hf_cache, {"config.json": 20})
+
+        assert _bytes_already_downloaded(DownloadParams(model_id="org/model", revision=_COMMIT_HASH)) == 20  # noqa: PLR2004
+
+    def test_files_outside_the_patterns_are_not_counted(self, hf_cache: Path) -> None:
+        _write_snapshot(hf_cache, {"config.json": 20, "model.safetensors": 30})
+
+        params = DownloadParams(model_id="org/model", revision="main", ignore_patterns=["*.safetensors"])
+        assert _bytes_already_downloaded(params) == 20  # noqa: PLR2004
+
+    def test_nothing_downloaded_yet_counts_zero(self, hf_cache: Path) -> None:  # noqa: ARG002
+        assert _bytes_already_downloaded(DownloadParams(model_id="org/model", revision="main")) == 0
+
+    def test_a_local_dir_skips_its_partial_downloads(self, tmp_path: Path) -> None:
+        (tmp_path / "model.safetensors").write_bytes(b"x" * 30)
+        partial = tmp_path / ".cache" / "huggingface" / "download" / "other.safetensors.incomplete"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"x" * 1000)
+
+        params = DownloadParams(model_id="org/model", local_dir=str(tmp_path), revision="main")
+        assert _bytes_already_downloaded(params) == 30  # noqa: PLR2004
+
+
+class TestRestartedDownloadProgress:
+    def test_finished_files_count_as_downloaded_and_toward_the_total(
+        self, hf_cache: Path, model_manager: ModelManager
+    ) -> None:
+        """Mirrors how snapshot_download drives the bar: created at 0, grown per file still to fetch."""
+        _write_snapshot(hf_cache, {"finished.safetensors": 60})
+        bars: list[Any] = []
+
+        def fake_snapshot_download(**kwargs: Any) -> str:
+            bar = kwargs["tqdm_class"](total=0, unit="B", desc="Downloading bytes", file=io.StringIO())
+            bars.append(bar)
+            bar.total += 40  # the one file left to download
+            bar.update(40)
+            bar.close()
+            return str(hf_cache)
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            model_manager.download_model("org/model")
+
+        assert bars[0]._cumulative_bytes == 100  # noqa: PLR2004
+        assert bars[0].total == 100  # noqa: PLR2004
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +1061,7 @@ class TestAppInitializationCompleteWorkerGuard:
         with (
             patch.object(type(model_manager), "engine", property(lambda _self: engine)),
             patch.object(model_manager, "_find_unfinished_downloads", return_value=["org/model"]) as find_unfinished,
+            patch.object(model_manager, "_find_paused_downloads", return_value=set()),
             patch.object(model_manager, "on_handle_download_model_request", new_callable=AsyncMock) as handle_download,
         ):
             await model_manager.on_app_initialization_complete(AppInitializationComplete(is_worker=False))
@@ -950,3 +1116,228 @@ class TestFindUnfinishedDownloads:
         self._write(status_dir, "org/done", status="completed")
 
         assert model_manager._find_unfinished_downloads() == []
+
+    def test_a_paused_download_stays_paused(self, model_manager: ModelManager, status_dir: Path) -> None:
+        """The user stopped it on purpose; an engine start must not restart the transfer."""
+        self._write(status_dir, "org/paused", status="paused")
+
+        assert model_manager._find_unfinished_downloads() == []
+
+
+# ---------------------------------------------------------------------------
+# Pause and resume
+# ---------------------------------------------------------------------------
+
+
+class _BlockingProcess:
+    """Download subprocess that runs until terminated, or until `finish` is called."""
+
+    def __init__(self) -> None:
+        self.stdout = None
+        self.stderr = None
+        self.returncode: int | None = None
+        self._exited = asyncio.Event()
+
+    def terminate(self) -> None:
+        self.returncode = -15
+        self._exited.set()
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def finish(self) -> None:
+        self.returncode = 0
+        self._exited.set()
+
+    async def wait(self) -> int | None:
+        await self._exited.wait()
+        return self.returncode
+
+
+class TestPauseAndResume:
+    @pytest.fixture
+    def status_dir(self, model_manager: ModelManager, tmp_path: Path) -> Iterator[Path]:
+        def write(status_file: Path, data: dict) -> None:
+            status_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with (
+            patch.object(model_manager, "_get_status_directory", return_value=tmp_path),
+            patch.object(model_manager, "_write_download_status", side_effect=write),
+        ):
+            yield tmp_path
+
+    async def _start_download(
+        self, model_manager: ModelManager, process: _BlockingProcess, **request_fields: Any
+    ) -> asyncio.Task:
+        spawned = asyncio.Event()
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> _BlockingProcess:
+            spawned.set()
+            return process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            download = asyncio.create_task(
+                model_manager.on_handle_download_model_request(
+                    DownloadModelRequest(model_id="org/model", **request_fields)
+                )
+            )
+            # The task registers the process before its next await, which is the earliest this wakes.
+            await spawned.wait()
+        assert "org/model" in model_manager._download_processes
+        return download
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_pausing_keeps_the_download_paused(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(model_manager, _BlockingProcess())
+
+        result = await model_manager.on_handle_pause_model_download_request(
+            PauseModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, PauseModelDownloadResultSuccess)
+        status = model_manager._read_model_download_status("org/model")
+        assert status is not None
+        assert status.status == "paused"
+        # The request that started the download ends without claiming the model downloaded.
+        assert isinstance(await download, DownloadModelResultFailure)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_a_download_that_finishes_first_is_not_paused(self, model_manager: ModelManager) -> None:
+        process = _BlockingProcess()
+        download = await self._start_download(model_manager, process)
+        process.finish()
+        await download
+
+        result = await model_manager.on_handle_pause_model_download_request(
+            PauseModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, PauseModelDownloadResultFailure)
+        status = model_manager._read_model_download_status("org/model")
+        assert status is not None
+        assert status.status == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_resume_downloads_what_was_paused(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(
+            model_manager, _BlockingProcess(), local_dir="/models/here", revision="refs/pr/1"
+        )
+        await model_manager.on_handle_pause_model_download_request(PauseModelDownloadRequest(model_id="org/model"))
+        await download
+
+        resumed_process = _BlockingProcess()
+        resumed_process.finish()
+        spawned: list[str] = []
+
+        async def fake_create_subprocess_exec(*cmd: str, **_kwargs: object) -> _BlockingProcess:
+            spawned.extend(cmd)
+            return resumed_process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            result = await model_manager.on_handle_resume_model_download_request(
+                ResumeModelDownloadRequest(model_id="org/model")
+            )
+
+        assert isinstance(result, ResumeModelDownloadResultSuccess)
+        assert spawned[spawned.index("--local-dir") + 1] == "/models/here"
+        assert spawned[spawned.index("--revision") + 1] == "refs/pr/1"
+        status = model_manager._read_model_download_status("org/model")
+        assert status is not None
+        assert status.status == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_a_second_resume_does_not_start_a_second_download(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(model_manager, _BlockingProcess())
+        await model_manager.on_handle_pause_model_download_request(PauseModelDownloadRequest(model_id="org/model"))
+        await download
+
+        resumed_process = _BlockingProcess()
+        first_resume = await self._start_resume(model_manager, resumed_process)
+
+        second = await model_manager.on_handle_resume_model_download_request(
+            ResumeModelDownloadRequest(model_id="org/model")
+        )
+        resumed_process.finish()
+
+        assert isinstance(second, ResumeModelDownloadResultFailure)
+        assert isinstance(await first_resume, ResumeModelDownloadResultSuccess)
+
+    async def _start_resume(self, model_manager: ModelManager, process: _BlockingProcess) -> asyncio.Task:
+        spawned = asyncio.Event()
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> _BlockingProcess:
+            spawned.set()
+            return process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            resume = asyncio.create_task(
+                model_manager.on_handle_resume_model_download_request(ResumeModelDownloadRequest(model_id="org/model"))
+            )
+            await spawned.wait()
+        return resume
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_a_paused_configured_model_is_not_downloaded_at_startup(self, model_manager: ModelManager) -> None:
+        download = await self._start_download(model_manager, _BlockingProcess())
+        await model_manager.on_handle_pause_model_download_request(PauseModelDownloadRequest(model_id="org/model"))
+        await download
+        engine = SimpleNamespace(
+            config_manager=SimpleNamespace(get_config_value=lambda *_args, **_kwargs: ["org/model"])
+        )
+
+        with (
+            patch.object(type(model_manager), "engine", property(lambda _self: engine)),
+            patch.object(model_manager, "on_handle_download_model_request", new_callable=AsyncMock) as handle_download,
+        ):
+            await model_manager.on_app_initialization_complete(AppInitializationComplete(is_worker=False))
+
+        handle_download.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("status_dir")
+    async def test_nothing_to_pause(self, model_manager: ModelManager) -> None:
+        result = await model_manager.on_handle_pause_model_download_request(
+            PauseModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, PauseModelDownloadResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_only_a_paused_download_resumes(self, model_manager: ModelManager, status_dir: Path) -> None:
+        record = {"model_id": "org/model", "status": "completed", "started_at": "s", "updated_at": "u"}
+        (status_dir / "org--model.json").write_text(json.dumps(record), encoding="utf-8")
+
+        result = await model_manager.on_handle_resume_model_download_request(
+            ResumeModelDownloadRequest(model_id="org/model")
+        )
+
+        assert isinstance(result, ResumeModelDownloadResultFailure)
+
+
+# ---------------------------------------------------------------------------
+# on_handle_delete_model_request
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteModelClearsDownloadRecord:
+    """A paused or failed record left behind would mark a later copy of the model incomplete."""
+
+    @pytest.mark.asyncio
+    async def test_the_download_record_goes_with_the_files(self, model_manager: ModelManager, tmp_path: Path) -> None:
+        record = {"model_id": "org/model", "status": "paused", "started_at": "s", "updated_at": "u"}
+        status_file = tmp_path / "org--model.json"
+        status_file.write_text(json.dumps(record), encoding="utf-8")
+
+        with (
+            patch.object(model_manager, "_get_status_directory", return_value=tmp_path),
+            patch.object(model_manager, "_delete_model", return_value="/cache/org--model"),
+        ):
+            result = await model_manager.on_handle_delete_model_request(DeleteModelRequest(model_id="org/model"))
+
+        assert isinstance(result, DeleteModelResultSuccess)
+        assert not status_file.exists()

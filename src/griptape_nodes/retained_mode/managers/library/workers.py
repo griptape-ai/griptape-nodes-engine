@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryRegistration,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.utils.library_utils import extract_library_path
 
 if TYPE_CHECKING:
@@ -404,8 +405,8 @@ class LibraryWorkers(EngineScoped):
             return
         if not self.engine.library_manager._worker_manager.is_worker_running_or_starting(None):
             return
-        self._general_purpose_restart = asyncio.get_running_loop().create_task(
-            self._restart_stale_general_purpose_worker()
+        self._general_purpose_restart = create_task_bound_to_no_workflow(
+            asyncio.get_running_loop(), self._restart_stale_general_purpose_worker()
         )
         self._general_purpose_restart.add_done_callback(self._log_general_purpose_restart_error)
 

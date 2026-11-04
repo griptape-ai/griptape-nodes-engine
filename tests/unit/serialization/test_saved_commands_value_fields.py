@@ -137,7 +137,7 @@ def test_saved_placeholders_are_none(engine: Engine) -> None:
     result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name="flow_a"))
     assert isinstance(result, SerializeFlowToCommandsResultSuccess)
     commands = result.serialized_flow_commands
-    variable_command = engine.flow_manager._build_serialized_variable_command(
+    variable_command = engine.flow_manager.serialization._build_serialized_variable_command(
         FlowVariable(name="v", owning_flow_name="flow_a", type="str", value="text"), {}
     )
 

@@ -108,7 +108,7 @@ def _add[NodeT: BaseNode](engine: Engine, node: NodeT, flow_name: str) -> NodeT:
     """Register a hand-built node the way CreateNodeRequest does, with no library to create it from."""
     engine.flow_manager.get_flow_by_name(flow_name).add_node(node)
     engine.object_manager.add_object_by_name(node.name, node)
-    engine.node_manager._name_to_parent_flow_name[node.name] = flow_name
+    engine.current_workflow().nodes.name_to_parent_flow_name[node.name] = flow_name
     return node
 
 
@@ -662,6 +662,16 @@ class TestAHookRunsOncePerObject:
         _egress(producer)
 
         engine.clear_current_workflow_data()
+
+        assert producer.released == ["shared"]
+
+    def test_popping_the_workflow_releases_what_its_nodes_hold(self, engine: Engine, flow_name: str) -> None:
+        """Closing the workflow by popping it is a teardown too, not a drop of live nodes."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("shared")
+        _egress(producer)
+
+        engine.context_manager.pop_workflow()
 
         assert producer.released == ["shared"]
 

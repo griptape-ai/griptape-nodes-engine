@@ -198,6 +198,7 @@ def _check_nesting_rebuilt() -> None:
 
 
 async def _e2e_run() -> None:
+    GriptapeNodes.ContextManager().push_workflow(file_path=__file__)  # noqa: F821
     await build_workflow()  # noqa: F821 - defined by the generated workflow source above
     _ensure_workflow_context()
     _check_nesting_rebuilt()

@@ -319,7 +319,20 @@ class BaseEvent(BaseModel, ABC):
 
 
 class EventRequest[P: Payload](BaseEvent):
-    """Request event."""
+    """Request event.
+
+    Args:
+        request: The request payload.
+        request_id: Id the caller matches the result by. Echoed on the result.
+        response_topic: Where the result is sent. Echoed on the result.
+        open_workflow_id: Id of the open workflow the request runs in. Echoed on the result. The
+            handler, and every task it starts, acts on that workflow. An id that names no open
+            workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
+            handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
+            Left out, the request acts on the engine's only open workflow, unless another engine
+            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
+            else: the workflow the request is about.
+    """
 
     request: P
     request_id: str | None = None
@@ -327,6 +340,7 @@ class EventRequest[P: Payload](BaseEvent):
     # None: a local client, such as the editor, an agent, or a worker. Handlers read it with
     # `require_request_sender()`.
     sender: RequestSender | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
@@ -365,13 +379,25 @@ class EventRequestBatch(BaseEvent):
 
 
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
-    """Abstract base class for result events."""
+    """Abstract base class for result events.
+
+    Args:
+        open_workflow_id: The request envelope's `open_workflow_id`, echoed back: the open workflow
+            the request ran in. A result payload's own `workflow_id` is something else. For
+            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
+            Save As is a copy that is not open.
+        engine_id: The engine that sent the result. A client that reached it through a session
+            topic learns from this which engine holds the session. None when the result was built
+            outside the engine's dispatch, such as by the MCP server or a bootstrap script.
+    """
 
     request: P
     result: R
     request_id: str | None = None
     response_topic: str | None = None
     retained_mode: str | None = None
+    open_workflow_id: str | None = None
+    engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""

@@ -12,6 +12,7 @@ from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 from griptape_nodes.common.directed_graph import DirectedGraph
+from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
@@ -55,7 +56,7 @@ def machine_running_one_node(max_nodes_in_parallel: int) -> RunningMachine:
     engine = MagicMock()
     # Dispatching a node awaits this; a bare MagicMock is not awaitable.
     engine.event_manager.aput_event = AsyncMock()
-    dag_builder = DagBuilder(engine)
+    dag_builder = DagBuilder(Connections())
     dag_builder.graphs["running"] = graph
     dag_builder.graph_to_nodes["running"] = {"running"}
     dag_builder.node_to_reference["running"] = DagNode(node_reference=running_node, node_state=NodeState.PROCESSING)

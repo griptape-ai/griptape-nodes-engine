@@ -14,6 +14,7 @@ from griptape_nodes.node_library.library_registry import (
 )
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeLockStateRequest,
     BatchSetNodeLockStateResultFailure,
@@ -55,6 +56,7 @@ class _ValueNode(DataNode):
 
 class TestRetainedModeLock:
     def test_lock_without_current_context_returns_failure(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="lock_no_node_wf")
         # Ensure empty current context for nodes
         ctx = engine.context_manager
         while ctx.has_current_node():
@@ -63,12 +65,18 @@ class TestRetainedModeLock:
         assert isinstance(res, SetLockNodeStateResultFailure)
         assert "Current Context" in str(res.result_details)
 
-    def test_lock_all_missing_nodes_failure(self) -> None:
+    def test_lock_all_missing_nodes_failure(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="lock_missing_wf")
         missing_nodes = ["nope_a_123", "nope_b_456"]
         res = RetainedMode.batch_set_lock_node_state(node_names=missing_nodes, lock=True)
         assert isinstance(res, BatchSetNodeLockStateResultFailure)
         details = str(res.result_details)
         assert "Failed to update any nodes" in details
+
+    def test_batch_lock_with_no_workflow_open_says_none_is_open(self) -> None:
+        res = RetainedMode.batch_set_lock_node_state(node_names=["nope_a_123"], lock=True)
+        assert isinstance(res, WorkflowNotNamedResultFailure)
+        assert "none is open" in str(res.result_details)
 
 
 class TestUnlockUnresolvesNodeLeftUnexecuted:

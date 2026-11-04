@@ -90,6 +90,7 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
 
     def get_var(
         _self: object,
+        _workflow: object,
         name: str,
         *,
         project_id: str | None = None,  # noqa: ARG001
@@ -220,6 +221,7 @@ class TestListSubstitutablesRequest:
         assert isinstance(result, ListSubstitutablesResultSuccess)
         assert result.substitutables == []
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
             result = engine.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
@@ -270,6 +272,7 @@ class TestGetVariablesRequest:
         assert isinstance(result, GetVariablesResultFailure)
         assert "ListVariablesRequest" in str(result.result_details)
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         result = engine.handle_request(GetVariablesRequest(starting_flow="does_not_exist", names=["x"]))
         assert isinstance(result, GetVariablesResultFailure)
@@ -328,6 +331,7 @@ class TestResolveSubstitutionRequest:
         assert result.unresolved == ["MISSING"]
         assert result.resolved == {"SHOT": "sc001", "workspace_dir": "/workspace"}
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
             result = engine.handle_request(ResolveSubstitutionRequest(starting_flow="does_not_exist"))
@@ -731,7 +735,7 @@ class TestReservedNames:
         it, a no-op rename of a reserved-named variable would surface a spurious 'that name is
         reserved' failure.
         """
-        engine.variables_manager._global_layer.set(
+        engine.current_workflow().variables.global_layer.set(
             FlowVariable(name="workspace_dir", owning_flow_name=None, type="str", value="/g")
         )
         result = engine.handle_request(
@@ -880,9 +884,9 @@ class TestListProjectVariablesRealBody:
         real_resolve = project_manager_type._resolve_workflow_dir
         calls: list[object] = []
 
-        def counting_resolve(pm_self: object, project_info: object) -> str:
+        def counting_resolve(pm_self: object, project_info: object, workflow: object) -> str:
             calls.append(project_info)
-            return real_resolve(pm_self, project_info)  # type: ignore[arg-type]
+            return real_resolve(pm_self, project_info, workflow)  # type: ignore[arg-type]
 
         with patch.object(project_manager_type, "_resolve_workflow_dir", counting_resolve):
             result = engine.handle_request(
