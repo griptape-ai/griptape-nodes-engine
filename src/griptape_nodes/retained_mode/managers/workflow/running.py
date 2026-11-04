@@ -49,7 +49,6 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -305,11 +304,6 @@ class WorkflowRunner(EngineScoped):
 
         # Failure: no identifier and no current context
         if workflow_name is None and file_path is None:
-            if workflow is None:
-                try:
-                    workflow = self.engine.only_open_workflow_or_none()
-                except WorkflowNotNamedError as err:
-                    return GetWorkflowRunCommandResultFailure(result_details=str(err))
             if workflow is None:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(

@@ -18,7 +18,6 @@ from griptape_nodes.common.project_templates.default_project_template import DEF
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
-    EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     SetWorkflowContextRequest,
@@ -33,6 +32,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
@@ -533,7 +533,7 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
 
         result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
 
-        assert isinstance(result, EnsureWorkflowAndFlowResultFailure)
+        assert isinstance(result, WorkflowNotNamedResultFailure)
         assert "did not name one" in str(result.result_details)
         assert engine.open_workflows.all_open() == [tab, beside]
 

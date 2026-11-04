@@ -26,7 +26,6 @@ from griptape_nodes.retained_mode.events.context_events import (
 from griptape_nodes.retained_mode.managers.event_manager import current_request_type
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
-from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -260,12 +259,6 @@ class ContextManager(EngineScoped):
             CreateFlowResultSuccess,
         )
 
-        # Clients name no workflow on the envelope yet, and find the open one through this call.
-        if workflow is None:
-            try:
-                workflow = self.engine.only_open_workflow_or_none()
-            except WorkflowNotNamedError as err:
-                return EnsureWorkflowAndFlowResultFailure(result_details=str(err))
         created_workflow = False
         if workflow is not None:
             workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name

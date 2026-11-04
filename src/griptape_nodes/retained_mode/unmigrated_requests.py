@@ -13,7 +13,10 @@ Once every client names it, the entry goes.
 ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
     {
         # The editor and the MCP server name no workflow yet.
+        "EnsureWorkflowAndFlowRequest",
         "ExecuteNodeRequest",
+        "GetPublishOptionsRequest",
+        "GetWorkflowRunCommandRequest",
     }
 )
 

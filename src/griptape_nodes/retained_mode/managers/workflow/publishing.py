@@ -21,7 +21,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowRequest,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -40,12 +39,11 @@ class WorkflowPublishing(EngineScoped):
 
     @handles(GetPublishOptionsRequest)
     def on_get_publish_options_request(
-        self, request: GetPublishOptionsRequest, workflow: WorkflowRuntime | None = None
+        self,
+        request: GetPublishOptionsRequest,
+        workflow: WorkflowRuntime | None = None,  # noqa: ARG002 - declares the scope dispatch binds for the callback
     ) -> ResultPayload:
-        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads.
-
-        Clients name no workflow on the envelope yet: until they do, the callback reads the only open one.
-        """
+        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads."""
         event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
         )
@@ -56,10 +54,7 @@ class WorkflowPublishing(EngineScoped):
 
         event_data = publishing_handler.event_data
         if isinstance(event_data, PublishWorkflowRegisteredEventData) and event_data.get_publish_options is not None:
-            if workflow is None:
-                workflow = self.engine.only_open_workflow_or_none()
-            with self.engine.bind_workflow(workflow if workflow is not None else NO_WORKFLOW):
-                return event_data.get_publish_options(request)
+            return event_data.get_publish_options(request)
 
         return GetPublishOptionsResultSuccess(
             fields=[],
