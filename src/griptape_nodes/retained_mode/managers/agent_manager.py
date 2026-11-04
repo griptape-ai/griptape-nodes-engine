@@ -934,7 +934,7 @@ class AgentManager(EngineScoped):
                 return
             event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
 
-        library_toolsets = self._library_toolsets(library_mcp_server_names)
+        library_toolsets = self._library_toolsets(library_mcp_server_names, workflow)
         # Nothing may sit between this and the `async with` that releases
         # it: a server left with a stray use count is never shut down.
         mcp = await self._acquire_mcp_toolsets(mcp_server_names)
@@ -1733,8 +1733,8 @@ class AgentManager(EngineScoped):
         )
         return _MCPAttachment(lease=lease, instructions=instructions)
 
-    def _library_toolsets(self, names: list[str]) -> list[AbstractToolset[Any]]:
-        """Build a toolset for each named library MCP server, skipping names no loaded library serves."""
+    def _library_toolsets(self, names: list[str], workflow: WorkflowRuntime | None) -> list[AbstractToolset[Any]]:
+        """Build a toolset for each named library MCP server, addressed to `workflow`, skipping names no loaded library serves."""
         read_only_by_slug: dict[str, set[str]] = {}
         for library in list_library_mcp_tools():
             read_only = read_only_by_slug.setdefault(library.slug, set())
@@ -1746,12 +1746,17 @@ class AgentManager(EngineScoped):
                 "MCP tools, so the agent will run without them. Check the library is loaded.",
                 ", ".join(sorted(unavailable)),
             )
+        workflow_id = None
+        if workflow is not None:
+            workflow_id = workflow.workflow_id
         toolsets: list[AbstractToolset[Any]] = []
         for name in dict.fromkeys(names):
             if name not in read_only_by_slug:
                 continue
             read_only = frozenset(read_only_by_slug[name])
-            toolsets.append(streamable_http_library(name, self._library_mcp_url(name), read_only))
+            toolsets.append(
+                streamable_http_library(name, self._library_mcp_url(name), read_only, workflow_id=workflow_id)
+            )
         return toolsets
 
     def _library_mcp_url(self, slug: str) -> str:

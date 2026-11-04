@@ -815,3 +815,58 @@ class TestToolCallWorkflow:
         # With the session's workflow gone the call names none, and two are still open.
         assert not _payload(result)["ok"]
         assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
+
+    @pytest.mark.asyncio
+    async def test_a_header_follows_its_workflow_when_a_save_moves_it(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """Saving a template continues in a copy under another id, and the header still reaches it."""
+        _, second = two_open
+        held_id = second.workflow_id
+        copy = engine.workflow_registry.register_unsaved("copy", listed=False)
+        engine.open_workflows.move(second, copy.workflow_id)
+
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": held_id}), _create_flow_call("canvas"))
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in second.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_the_header_wins_over_the_sessions_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        first, _ = two_open
+        await call_tool(
+            _http_context({"mcp-session-id": "session-a"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+        third = engine.open_workflows.all_open()[-1]
+
+        result = await call_tool(
+            _http_context({"mcp-session-id": "session-a", "X-Griptape-Workflow-Id": first.workflow_id}),
+            _create_flow_call("canvas"),
+        )
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in first.flows.name_to_parent_name
+        assert "canvas" not in third.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_remembering_a_session_forgets_sessions_whose_workflow_closed(
+        self,
+        engine: Engine,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        """Sessions end without telling the server, so their entries go once their workflow closes."""
+        await call_tool(
+            _http_context({"mcp-session-id": "ended"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+        engine.close_workflow(engine.open_workflows.all_open()[-1])
+
+        await call_tool(
+            _http_context({"mcp-session-id": "live"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+
+        assert set(mcp_module._session_workflow_ids) == {"live"}

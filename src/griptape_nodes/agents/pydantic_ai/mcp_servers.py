@@ -225,24 +225,29 @@ def streamable_http_local(url: str, *, workflow_id: str | None) -> AbstractTools
     match the engine's tools by that prefix. ``workflow_id`` names the open workflow
     the tool calls act on, sent as :data:`GTN_WORKFLOW_ID_HEADER`; None sends no header.
     """
-    headers: dict[str, str] = {}
-    if workflow_id is not None:
-        headers[GTN_WORKFLOW_ID_HEADER] = workflow_id
     return _compose(
         GTN_SERVER_NAME,
-        MCPToolset(StreamableHttpTransport(url=url, headers=headers), max_retries=DEFAULT_TOOL_MAX_RETRIES),
+        MCPToolset(
+            StreamableHttpTransport(url=url, headers=_workflow_headers(workflow_id)),
+            max_retries=DEFAULT_TOOL_MAX_RETRIES,
+        ),
         tool_blocklist=DEFAULT_GTN_TOOL_BLOCKLIST,
     ).approval_required(_gtn_tool_requires_approval)
 
 
-def streamable_http_library(name: str, url: str, read_only_tools: frozenset[str]) -> AbstractToolset[Any]:
+def streamable_http_library(
+    name: str, url: str, read_only_tools: frozenset[str], *, workflow_id: str | None
+) -> AbstractToolset[Any]:
     """Build the chat agent's toolset for one library's tools on the engine's MCP server.
 
     Prefixed with ``name``, the library's slug. Calls to tools in ``read_only_tools`` (bare names)
     run without asking and every other call waits for the user. The batch tool is hidden, since
-    approving it would approve every library tool inside it.
+    approving it would approve every library tool inside it. ``workflow_id`` names the open
+    workflow the calls act on, as for :func:`streamable_http_local`.
     """
-    toolset = MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES)
+    toolset = MCPToolset(
+        StreamableHttpTransport(url=url, headers=_workflow_headers(workflow_id)), max_retries=DEFAULT_TOOL_MAX_RETRIES
+    )
     return _library_toolset(name, toolset, read_only_tools)
 
 
@@ -280,6 +285,13 @@ def grant_keys_for_call(tool_name: str, args: Mapping[str, Any]) -> list[str]:
         if key not in keys:
             keys.append(key)
     return keys
+
+
+def _workflow_headers(workflow_id: str | None) -> dict[str, str]:
+    """The headers naming the open workflow `workflow_id` to the engine's MCP server, none for None."""
+    if workflow_id is None:
+        return {}
+    return {GTN_WORKFLOW_ID_HEADER: workflow_id}
 
 
 def _gtn_tool_requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, tool_args: dict[str, Any]) -> bool:

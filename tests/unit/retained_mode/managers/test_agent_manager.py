@@ -293,20 +293,23 @@ class TestLibraryMCPServers:
 
     def test_builds_a_toolset_per_library_with_its_read_only_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = self._manager(monkeypatch)
-        built: list[tuple[str, str, frozenset[str]]] = []
+        built: list[tuple[str, str, frozenset[str], str | None]] = []
         monkeypatch.setattr(
             f"{_AGENT_MANAGER_MODULE}.streamable_http_library",
-            lambda name, url, read_only: built.append((name, url, read_only)) or name,
+            lambda name, url, read_only, *, workflow_id: built.append((name, url, read_only, workflow_id)) or name,
         )
+        workflow = MagicMock(spec=WorkflowRuntime, workflow_id="wf-1")
 
-        toolsets = manager._library_toolsets(["acme_render_tools", "acme_render_tools"])
+        toolsets = manager._library_toolsets(["acme_render_tools", "acme_render_tools"], workflow)
 
         assert toolsets == ["acme_render_tools"]
+        # The library's tools act on the run's workflow, like the engine's own.
         assert built == [
             (
                 "acme_render_tools",
                 "http://localhost:9001/mcp/libraries/acme_render_tools/",
                 frozenset({"_ListRendersRequest"}),
+                "wf-1",
             )
         ]
 
@@ -316,7 +319,7 @@ class TestLibraryMCPServers:
         manager = self._manager(monkeypatch)
 
         with caplog.at_level(logging.WARNING):
-            toolsets = manager._library_toolsets(["missing"])
+            toolsets = manager._library_toolsets(["missing"], None)
 
         assert toolsets == []
         assert "missing" in caplog.text

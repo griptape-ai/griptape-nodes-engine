@@ -5,7 +5,8 @@ This module is the single point of contact between the request-handling layer
 point :meth:`PydanticAgentRunner.run` that:
 
   * builds (or reuses) a Pydantic AI ``Agent`` configured with the Griptape
-    Cloud model, the skills capability, and any MCP servers the caller passed,
+    Cloud model and the skills capability, with the toolsets the caller passes
+    for the run,
   * loads message history for the requested thread from the storage driver,
   * runs the conversation while emitting Griptape Nodes ``AgentStreamEvent``
     tokens through the supplied sink so the chat sidebar UI streams as before,

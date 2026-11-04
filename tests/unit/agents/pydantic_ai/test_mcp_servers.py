@@ -28,6 +28,7 @@ from griptape_nodes.agents.pydantic_ai.mcp_servers import (
     disconnect_transport,
     mcp_server_from_config,
     require_user_tool_approval,
+    streamable_http_library,
     streamable_http_local,
 )
 from griptape_nodes.servers.mcp import WORKFLOW_ID_HEADER
@@ -218,6 +219,14 @@ def test_streamable_http_local_without_a_workflow_sends_no_header() -> None:
     transport = _mcp_toolset(streamable_http_local("http://localhost:9/mcp/", workflow_id=None)).client.transport
     assert isinstance(transport, StreamableHttpTransport)
     assert transport.headers == {}
+
+
+def test_streamable_http_library_names_the_workflow_in_a_header() -> None:
+    """A library's tools act on the run's workflow, like the engine's own."""
+    composed = streamable_http_library("acme", "http://localhost:9/mcp/libraries/acme/", frozenset(), workflow_id="abc")
+    transport = _mcp_toolset(composed).client.transport
+    assert isinstance(transport, StreamableHttpTransport)
+    assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "abc"}
 
 
 def test_the_workflow_header_is_the_one_the_engine_server_reads() -> None:
