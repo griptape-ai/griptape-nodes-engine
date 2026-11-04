@@ -122,6 +122,8 @@ T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
 
+_SCAN_PROGRESS_COALESCE_KEY = "workflow_scan_progress"
+
 # How many squelch contexts the current context is inside of; see `WorkflowManager.WorkflowSquelchContext`.
 #
 # Scoped to the context rather than to the manager because a squelch belongs to the load that
@@ -1120,18 +1122,7 @@ class WorkflowManager(EngineScoped):
         for current_index, workflow_file in enumerate(all_workflow_files, start=1):
             workflow_name = str(workflow_file.name)
 
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
-                )
-            )
+            self._emit_scan_progress(workflow_name, InitializationStatus.LOADING, current_index, total_workflows)
 
             # Process the workflow
             workflow = await self._process_single_workflow_file(
@@ -1142,35 +1133,46 @@ class WorkflowManager(EngineScoped):
             if workflow is not None:
                 succeeded.append(workflow.name)
                 workflow_ids.append(workflow.workflow_id)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
+                self._emit_scan_progress(workflow_name, InitializationStatus.COMPLETE, current_index, total_workflows)
             else:
                 failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
+                self._emit_scan_progress(
+                    workflow_name,
+                    InitializationStatus.FAILED,
+                    current_index,
+                    total_workflows,
+                    error="Failed to process workflow file",
                 )
 
         return WorkflowRegistrationResult(succeeded=succeeded, failed=failed, workflow_ids=workflow_ids)
+
+    def _emit_scan_progress(
+        self,
+        item_name: str,
+        status: InitializationStatus,
+        current: int,
+        total: int,
+        *,
+        error: str | None = None,
+    ) -> None:
+        # Failures and the final event are sent as they happen: clients list the failures and end
+        # their loading state on the final event. The rest are coalesced to one per interval.
+        is_final = current >= total and status != InitializationStatus.LOADING
+        must_send = is_final or status == InitializationStatus.FAILED
+        coalesce_key = None if must_send else _SCAN_PROGRESS_COALESCE_KEY
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.WORKFLOWS,
+                    item_name=item_name,
+                    status=status,
+                    current=current,
+                    total=total,
+                    error=error,
+                )
+            ),
+            coalesce_key=coalesce_key,
+        )
 
     async def _process_single_workflow_file(
         self,
