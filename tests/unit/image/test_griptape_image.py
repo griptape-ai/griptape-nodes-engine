@@ -14,8 +14,10 @@ from griptape_nodes.drivers.image_metadata.exif_metadata_driver import EXIF_USER
 from griptape_nodes.image import (
     IMAGE_BACKEND_ENV_VAR,
     OPENCV_BACKEND,
+    OPENIMAGEIO_BACKEND,
     PILLOW_BACKEND,
     OpenCVImage,
+    OpenImageIOImage,
     PillowImage,
     image_backend_name,
     open_image,
@@ -29,7 +31,7 @@ _ROTATE_90_CLOCKWISE = 6
 _PNG_BIT_DEPTH_OFFSET = 24
 
 
-@pytest.fixture(params=[PILLOW_BACKEND, OPENCV_BACKEND])
+@pytest.fixture(params=[PILLOW_BACKEND, OPENCV_BACKEND, OPENIMAGEIO_BACKEND])
 def backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
     """Run the test once per image backend."""
     monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, request.param)
@@ -64,6 +66,11 @@ class TestBackendSelection:
         monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, " OpenCV ")
 
         assert isinstance(open_image(_encode(Image.new("RGB", (2, 2)), "PNG")), OpenCVImage)
+
+    def test_env_var_selects_openimageio(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, "openimageio")
+
+        assert isinstance(open_image(_encode(Image.new("RGB", (2, 2)), "PNG")), OpenImageIOImage)
 
     def test_unknown_value_falls_back_to_pillow(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, "imagemagick")
@@ -117,8 +124,11 @@ class TestReading:
 
 
 class TestBitDepth:
-    def test_opencv_keeps_sixteen_bit_color_through_a_png_round_trip(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, OPENCV_BACKEND)
+    @pytest.mark.parametrize("deep_backend", [OPENCV_BACKEND, OPENIMAGEIO_BACKEND])
+    def test_keeps_sixteen_bit_color_through_a_png_round_trip(
+        self, monkeypatch: pytest.MonkeyPatch, deep_backend: str
+    ) -> None:
+        monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, deep_backend)
 
         with open_image(_sixteen_bit_rgb_png()) as image:
             assert image.bit_depth == 16  # noqa: PLR2004
@@ -195,6 +205,28 @@ class TestTransforms:
 
 
 @pytest.mark.usefixtures("backend")
+class TestAlpha:
+    @pytest.mark.parametrize("image_format", ["WEBP", "PNG", "TIFF"])
+    def test_grayscale_with_alpha_encodes(self, image_format: str) -> None:
+        with open_image(_encode(Image.new("LA", (8, 8), (128, 200)), "PNG")) as image:
+            encoded = image.thumbnail(4, 4).encode(image_format)
+
+        assert Image.open(BytesIO(encoded)).size == (4, 4)
+
+    def test_thumbnail_keeps_transparent_color_out_of_edges(self) -> None:
+        source = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        source.paste((255, 255, 255, 255), (32, 0, 64, 64))
+
+        with open_image(_encode(source, "PNG")) as image, image.thumbnail(8, 8) as small:
+            decoded = _decode_rgba(small.encode("PNG"))
+
+        for x in range(8):
+            red, _, _, alpha = decoded.getpixel((x, 4))  # type: ignore[misc]
+            if alpha > 64:  # noqa: PLR2004
+                assert red > 200  # noqa: PLR2004
+
+
+@pytest.mark.usefixtures("backend")
 class TestMetadata:
     def test_png_text_round_trips_latin1_unicode_and_long_text(self) -> None:
         long_text = '{"nodes": [' + ", ".join(['{"name": "node"}'] * 200) + "]}"
@@ -225,6 +257,66 @@ class TestMetadata:
         assert metadata["gtn_key"] == "value"
         assert metadata["Make"] == "Camera Maker"
         assert EXIF_USERCOMMENT_TAG in Image.open(BytesIO(injected)).getexif()
+
+    @pytest.mark.parametrize(("mode", "color"), [("RGB", (255, 0, 0)), ("RGBA", (255, 0, 0, 128))])
+    def test_exif_round_trips_through_webp(self, mode: str, color: tuple[int, ...]) -> None:
+        source = Image.new(mode, (8, 8), color)
+        exif = source.getexif()
+        exif[0x010F] = "Camera Maker"  # Make
+
+        with open_image(_encode(source, "WEBP", exif=exif)) as image:
+            webp = image.encode("WEBP", exif_bytes=image.exif_bytes)
+
+        decoded = Image.open(BytesIO(webp))
+        assert decoded.getexif()[0x010F] == "Camera Maker"
+        assert decoded.mode == mode
+
+
+class TestOpenImageIOEdgeCases:
+    def test_reads_metadata_without_decoding(self) -> None:
+        source = Image.new("RGB", (8, 8))
+        exif = source.getexif()
+        exif[0x010F] = "Camera Maker"  # Make
+
+        image = OpenImageIOImage.open(_encode(source, "JPEG", exif=exif))
+
+        assert image.exif_bytes is not None
+        parsed = Image.Exif()
+        parsed.load(image.exif_bytes)
+        assert parsed[0x010F] == "Camera Maker"
+        assert image._buf is None
+
+    def test_reads_and_writes_targa(self) -> None:
+        with OpenImageIOImage.open(_encode(Image.new("RGB", (6, 4), "red"), "TGA")) as image:
+            assert image.format == "TGA"
+            assert (image.width, image.height) == (6, 4)
+            assert Image.open(BytesIO(image.encode("TGA"))).size == (6, 4)
+
+    def test_encode_writes_only_the_given_exif(self) -> None:
+        source = Image.new("RGB", (8, 8))
+        exif = source.getexif()
+        exif[0x010F] = "Camera Maker"  # Make
+
+        with OpenImageIOImage.open(_encode(source, "JPEG", exif=exif)) as image:
+            stripped = image.encode("JPEG")
+            kept = image.encode("PNG", exif_bytes=image.exif_bytes)
+
+        assert not Image.open(BytesIO(stripped)).getexif()
+        assert Image.open(BytesIO(kept)).getexif()[0x010F] == "Camera Maker"
+
+    def test_derived_images_drop_the_source_orientation(self) -> None:
+        source = Image.new("RGB", (8, 4))
+        exif = source.getexif()
+        exif[_EXIF_ORIENTATION_TAG] = _ROTATE_90_CLOCKWISE
+
+        with OpenImageIOImage.open(_encode(source, "JPEG", exif=exif)) as image:
+            upright = image.to_rgb().exif_transposed()
+
+        assert (upright.width, upright.height) == (8, 4)
+
+    def test_open_rejects_data_that_is_not_an_image(self) -> None:
+        with pytest.raises(ValueError, match="could not read"):
+            OpenImageIOImage.open(b"<html>not an image</html>")
 
 
 class TestOpenCVEdgeCases:
