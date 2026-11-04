@@ -130,8 +130,7 @@ class TestAttributionForwardingIsWired:
             return EventResultSuccess(request=request, result=_orchestrator_answer())
 
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
-        event_manager.remove_manager_from_request_type(GetAttributionContextRequest)
-        event_manager.assign_manager_to_request_type(
+        event_manager.replace_manager_for_request_type(
             GetAttributionContextRequest,
             RemoteHandler(original=local_handler, event_manager=event_manager),
         )

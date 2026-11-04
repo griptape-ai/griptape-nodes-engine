@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListFlowsInFlowRequest,
     ListFlowsInFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import (
     ClearAllObjectStateRequest,
     RenameObjectRequest,
@@ -40,7 +41,6 @@ from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
     SetVariableSubstitutionEnabledRequest,
-    SetVariableSubstitutionEnabledResultFailure,
 )
 from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
@@ -141,7 +141,7 @@ class TestRuntimeLifecycle:
     def test_closing_the_bound_workflow_leaves_the_work_on_no_workflow_not_another_open_one(
         self, engine: Engine
     ) -> None:
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
         other = engine.current_workflow()
         closed = engine.open_workflows.open(
@@ -155,7 +155,7 @@ class TestRuntimeLifecycle:
         assert engine.open_workflows.all_open() == [other]
 
     def test_a_request_acts_on_the_workflow_it_opens_until_it_ends(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
         acted_on: list[WorkflowRuntime] = []
 
@@ -167,7 +167,7 @@ class TestRuntimeLifecycle:
 
         # A request from another engine starts bound to no workflow, so it can open one beside "other".
         engine.event_manager.assign_manager_to_request_type(
-            _ReplaceWorkflowRequest, open_workflow, sender=RequiredSender.ENGINE
+            _ReplaceWorkflowRequest, open_workflow, sender=RequiredSender.ENGINE, without_workflow=None
         )
 
         engine.event_manager.handle_request(
@@ -191,7 +191,9 @@ class TestRuntimeLifecycle:
             acted_on.append(engine.current_workflow())
             return ResultPayloadSuccess(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ReplaceWorkflowRequest, replace_workflow)
+        engine.event_manager.assign_manager_to_request_type(
+            _ReplaceWorkflowRequest, replace_workflow, without_workflow=None
+        )
 
         engine.handle_request(_ReplaceWorkflowRequest())
 
@@ -303,7 +305,7 @@ class TestObjectsOnTheRuntime:
         assert engine.object_manager.take_nodes_with_queued_changes() == []
 
     def test_queued_ui_changes_are_taken_from_the_bound_workflow_or_every_open_one(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="first")
         first = engine.current_workflow()
         second = engine.open_workflows.open(
@@ -348,10 +350,10 @@ class TestVariablesOnTheRuntime:
     def test_creating_a_global_variable_needs_an_open_workflow(self, engine: Engine) -> None:
         result = engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
 
-        assert not result.succeeded()
-        assert "no workflow is open" in str(result.result_details)
+        assert isinstance(result, WorkflowNotNamedResultFailure)
+        assert "names no workflow and none is open" in str(result.result_details)
         lookup = engine.handle_request(GetVariableValueRequest(name="greeting", lookup_scope=VariableScope.GLOBAL_ONLY))
-        assert isinstance(lookup, GetVariableValueResultFailure)
+        assert isinstance(lookup, WorkflowNotNamedResultFailure)
 
     def test_work_bound_to_no_workflow_reads_no_variables_and_cannot_create_one(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -365,7 +367,7 @@ class TestVariablesOnTheRuntime:
                 CreateVariableRequest(name="farewell", type="str", is_global=True, value="bye")
             )
 
-        assert isinstance(lookup, GetVariableValueResultFailure)
+        assert isinstance(lookup, WorkflowNotNamedResultFailure)
         assert not created.succeeded()
         assert not engine.current_workflow().variables.global_layer.has("farewell")
 
@@ -384,7 +386,7 @@ class TestSubstitutionFlagOnTheRuntime:
     def test_with_no_workflow_open_the_flag_reads_enabled_and_cannot_be_set(self, engine: Engine) -> None:
         result = engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
-        assert isinstance(result, SetVariableSubstitutionEnabledResultFailure)
+        assert isinstance(result, WorkflowNotNamedResultFailure)
         assert engine.workflow_manager.variable_substitution.is_enabled() is True
 
     def test_the_flag_is_held_by_the_open_workflow(self, engine: Engine) -> None:
@@ -572,7 +574,7 @@ class TestNodesAndFlowsOnTheRuntime:
             runs.append(asyncio.create_task(read_run_state()))
             return ResultPayloadSuccess(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_StartRunRequest, start_run)
+        engine.event_manager.assign_manager_to_request_type(_StartRunRequest, start_run, without_workflow=None)
         workflow_id = None
         if addressed:
             workflow_id = first.workflow_id

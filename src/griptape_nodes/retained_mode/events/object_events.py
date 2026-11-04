@@ -51,7 +51,7 @@ class RenameObjectResultFailure(ResultPayloadFailure):
         next_available_name: Suggested alternative name (None if not available)
     """
 
-    next_available_name: str | None
+    next_available_name: str | None = None
 
 
 @dataclass

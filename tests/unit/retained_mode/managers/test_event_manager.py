@@ -6,7 +6,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -395,13 +395,14 @@ class TestHandleRequestForwardingFromRunningLoop:
                 result=_ForwardableProbeResult(result_details="forwarded"),
             )
 
-        # Register a RemoteHandler shape: dispatch table entry points at it directly.
-        # ``handle_request`` detects RemoteHandler via isinstance and routes onto the WS loop.
+        # Install a RemoteHandler as a worker does. ``handle_request`` sees a ForwardingHandler and
+        # routes onto the WS loop.
         async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
             return _ForwardableProbeResult(result_details="local")
 
+        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, original)
         remote = RemoteHandler(original=original, event_manager=event_manager)
-        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
+        event_manager.replace_manager_for_request_type(_ForwardableProbeRequest, remote)
         event_manager._websocket_event_loop = ws_loop
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
@@ -1657,12 +1658,12 @@ class TestPostDispatchHooks:
         engine = Engine()
         event_manager = engine.event_manager
         event_manager.initialize_queue(asyncio.Queue())
-        workflow = WorkflowRuntime("bound")
+        workflow = WorkflowRuntime("bound", MagicMock())
 
         async def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok")
 
-        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         seen_workflows: list[WorkflowRuntime | None] = []
 

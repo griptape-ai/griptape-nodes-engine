@@ -47,7 +47,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
     NoWorkflow,
@@ -60,6 +60,7 @@ from griptape_nodes.retained_mode.runtime.open_workflow_set import (
     OpenWorkflowError,
     OpenWorkflowSet,
 )
+from griptape_nodes.retained_mode.runtime.read_observer import observe_read_without_workflow
 from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -247,9 +248,9 @@ class Engine:
         # Workflow ids live only as long as this engine, so clients compare this to notice a
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
-        self._open_workflows = OpenWorkflowSet()
+        self._open_workflows = OpenWorkflowSet(self)
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
-        self._worker_workflows = WorkerWorkflowSet()
+        self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
@@ -735,6 +736,7 @@ class Engine:
         """
         bound = bound_workflow.get()
         if bound is NO_WORKFLOW:
+            observe_read_without_workflow(self, "read the current workflow")
             return None
         if bound is not None and bound.closed:
             msg = (
@@ -920,7 +922,7 @@ class Engine:
                 raise OpenWorkflowError(msg)
             deleted.add(orphan)
 
-    @handles(GetEngineVersionRequest, scope=RequestScope.HOST)
+    @handles(GetEngineVersionRequest)
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:
             engine_ver = semver.VersionInfo.parse(engine_version)
@@ -934,7 +936,7 @@ class Engine:
             details = f"Attempted to get engine version. Failed due to '{err}'."
             return GetEngineVersionResultFailure(result_details=details)
 
-    @handles(EngineHeartbeatRequest, scope=RequestScope.HOST)
+    @handles(EngineHeartbeatRequest)
     def handle_engine_heartbeat_request(self, request: EngineHeartbeatRequest) -> ResultPayload:
         """Handle engine heartbeat requests.
 

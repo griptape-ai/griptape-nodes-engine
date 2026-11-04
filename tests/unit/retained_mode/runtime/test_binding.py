@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -53,7 +54,7 @@ def _count_handler_calls(engine: Engine) -> list[_ProbeRequest]:
         calls.append(request)
         return _ProbeResult(result_details="ok")
 
-    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
     return calls
 
 
@@ -61,7 +62,7 @@ def _record_current_workflow(engine: Engine) -> None:
     def handler(_request: _ProbeRequest) -> _ProbeResult:
         return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+    engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
 
 class TestCurrentWorkflow:
@@ -78,7 +79,7 @@ class TestCurrentWorkflow:
 
     def test_the_bound_workflow_comes_before_the_open_one(self, engine: Engine) -> None:
         _open(engine, "open")
-        bound = WorkflowRuntime("bound")
+        bound = WorkflowRuntime("bound", MagicMock())
 
         with engine.bind_workflow(bound):
             assert engine.current_workflow() is bound
@@ -95,7 +96,7 @@ class TestCurrentWorkflow:
 
     def test_unbound_work_with_several_open_raises(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         # Several open cannot happen through `open`; force it to check the read refuses to guess.
-        several = [WorkflowRuntime("abc"), WorkflowRuntime("def")]
+        several = [WorkflowRuntime("abc", MagicMock()), WorkflowRuntime("def", MagicMock())]
         monkeypatch.setattr(engine.open_workflows, "all_open", lambda: several)
 
         with pytest.raises(WorkflowNotNamedError, match="2 workflows are open"):
@@ -137,7 +138,7 @@ class TestClosedWorkflowBinding:
             engine.context_manager.push_workflow(workflow_name="opened")
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         result = engine.event_manager.handle_request(_ProbeRequest()).result
 
@@ -220,7 +221,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
     def test_a_nested_request_with_no_envelope_id_keeps_the_callers_binding(self, engine: Engine) -> None:
         workflow = _open(engine, "open")
         _record_current_workflow(engine)
-        bound = WorkflowRuntime("bound")
+        bound = WorkflowRuntime("bound", MagicMock())
 
         with engine.bind_workflow(bound):
             result_event = engine.event_manager.handle_request(_ProbeRequest())
@@ -235,7 +236,9 @@ class TestDispatchBindsTheEnvelopeWorkflow:
         def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=RequiredSender.ENGINE)
+        engine.event_manager.assign_manager_to_request_type(
+            _ProbeRequest, handler, sender=RequiredSender.ENGINE, without_workflow=None
+        )
 
         result_event = engine.event_manager.handle_request(
             _ProbeRequest(), result_context=ResultContext(sender=_OTHER_ENGINE)
@@ -250,7 +253,9 @@ class TestDispatchBindsTheEnvelopeWorkflow:
         def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, sender=RequiredSender.ENGINE)
+        engine.event_manager.assign_manager_to_request_type(
+            _ProbeRequest, handler, sender=RequiredSender.ENGINE, without_workflow=None
+        )
 
         result_event = engine.event_manager.handle_request(
             _ProbeRequest(), result_context=ResultContext(sender=_OTHER_ENGINE, open_workflow_id=workflow.workflow_id)
@@ -273,7 +278,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             spawned.append(asyncio.create_task(read_after_release()))
             return _ProbeResult(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         with engine.bind_workflow(NO_WORKFLOW):
             await engine.event_manager.ahandle_request(
@@ -298,7 +303,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             spawned.append(asyncio.create_task(read_after_release()))
             return _ProbeResult(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         await engine.event_manager.ahandle_request(_ProbeRequest())
         engine.context_manager.pop_workflow()
@@ -316,7 +321,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             opened.append(_open(engine, "opened"))
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         result_event = engine.event_manager.handle_request(_ProbeRequest())
 
@@ -324,13 +329,13 @@ class TestDispatchBindsTheEnvelopeWorkflow:
         assert result_event.result.workflow is opened[0]
 
     def test_a_binding_the_handler_makes_with_none_open_ends_with_the_request(self, engine: Engine) -> None:
-        bound = WorkflowRuntime("bound")
+        bound = WorkflowRuntime("bound", MagicMock())
 
         def handler(_request: _ProbeRequest) -> _ProbeResult:
             bound_workflow.set(bound)
             return _ProbeResult(result_details="ok")
 
-        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         engine.event_manager.handle_request(_ProbeRequest())
 

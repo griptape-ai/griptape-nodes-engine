@@ -38,6 +38,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     RemoveNodeFromNodeGroupResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -107,6 +108,7 @@ def _fail_the_second_move_into(engine: Engine, target_flow_name: str, monkeypatc
     """
     event_manager = engine.event_manager
     real_handler = event_manager._request_type_to_manager[MoveNodeToNewFlowRequest]
+    assert not isinstance(real_handler, ForwardingHandler)
     moves_into_target = 0
 
     def refuse_the_second_move_in(request: MoveNodeToNewFlowRequest) -> object:
