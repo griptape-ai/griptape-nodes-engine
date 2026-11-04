@@ -798,7 +798,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "portalocker", specifier = ">=2.10.0" },
     { name = "pydantic", specifier = ">=2.10.6" },
-    { name = "pydantic-ai-harness", extras = ["skills"], specifier = ">=0.57" },
+    { name = "pydantic-ai-harness", extras = ["skills"], specifier = ">=0.58" },
     { name = "pydantic-ai-slim", extras = ["mcp", "openai"], specifier = ">=2.29.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "pyyaml", specifier = ">=6.0.2" },

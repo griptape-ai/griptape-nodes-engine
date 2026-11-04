@@ -2,14 +2,16 @@
 
 Every test drives a real run through a scripted `FunctionModel`, so they pin what the
 model sees and receives rather than how the runner builds it: the skill catalog, the
-`read_skill_resource` tool, the instructions a loaded skill delivers, and what each
-resource read returns or retries with. Catalog entries and loaded instructions are
-read out of pydantic-ai's framing, which belongs to pydantic-ai rather than the runner.
+instructions a loaded skill delivers, and what the read-only file tools reach. Catalog
+entries and loaded instructions are read out of pydantic-ai's framing, which belongs to
+pydantic-ai rather than the runner. The file tools themselves belong to harness, so the
+tests here cover only what the runner decides: which files they can reach.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -18,7 +20,14 @@ from unittest.mock import patch
 
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import (
+    BinaryContent,
+    ModelMessage,
+    ModelRequest,
+    RetryPromptPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.workspaces import LocalWorkspaceBackend
 
@@ -29,46 +38,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-READ_SKILL_RESOURCE_DESCRIPTION = (
-    "<summary>Read a supplementary file bundled with a skill.\n\n"
-    "Skill packages ship reference documentation, templates, schemas and data files\n"
-    "alongside their instructions. A skill's instructions name the ones it needs;\n"
-    "this tool reads them.\n\n"
-    "When to use this:\n"
-    "- When a loaded skill's instructions reference a specific file\n"
-    "- To access form templates, reference documentation, or data schemas\n"
-    "- When you need supplementary information beyond the skill instructions</summary>\n"
-    "<returns>\n<description>The resource content as a string.</description>\n</returns>"
-)
-
-READ_SKILL_RESOURCE_SCHEMA = {
-    "additionalProperties": False,
-    "properties": {
-        "skill_name": {
-            "description": "Name of the skill containing the resource, exactly as it\nappears in the capability catalog.",
-            "type": "string",
-        },
-        "resource_name": {
-            "description": (
-                "Path of the resource relative to the skill directory, as\n"
-                'listed under "Bundled files" in the loaded skill\'s instructions.\n'
-                'Examples: "FORMS.md", "references/REFERENCE.md", "get_schema"\n'
-                "A file name on its own works when only one resource has it."
-            ),
-            "type": "string",
-        },
-        "args": {
-            "anyOf": [{"additionalProperties": True, "type": "object"}, {"type": "null"}],
-            "default": None,
-            "description": (
-                "Arguments for callable resources (optional for static files).\n"
-                "Keys must match the parameter names in the resource's schema."
-            ),
-        },
-    },
-    "required": ["skill_name", "resource_name"],
-    "type": "object",
-}
+# The read-only `FileSystem` tools harness offers alongside skills.
+FILE_TOOLS = {"file_info", "find_files", "list_directory", "read_file", "search_files"}
 
 CATALOG_PREAMBLE = (
     "The following capabilities are deferred and can be loaded using the `load_capability` tool. "
@@ -182,8 +153,18 @@ def _load(name: str) -> tuple[str, dict[str, Any]]:
     return ("load_capability", {"id": name})
 
 
-def _read(skill: str, resource: str) -> tuple[str, dict[str, Any]]:
-    return ("read_skill_resource", {"skill_name": skill, "resource_name": resource})
+def _read(path: str) -> tuple[str, dict[str, Any]]:
+    return ("read_file", {"path": path})
+
+
+def _list(path: str) -> tuple[str, dict[str, Any]]:
+    return ("list_directory", {"path": path})
+
+
+def _file_text(result: Any) -> str:
+    """The file content in a `read_file` result, without its header and line numbers."""
+    lines = str(result).splitlines()[1:]
+    return "\n".join(line.split("\t", 1)[1] for line in lines)
 
 
 @pytest.fixture
@@ -231,226 +212,188 @@ async def test_catalog_lists_each_skill(workspace: Path, threads: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skill_hidden_from_the_model(workspace: Path, threads: Path) -> None:
-    """A skill whose frontmatter sets `disable-model-invocation: true` is left out of the catalog."""
-    _write_skill(workspace, "shown")
-    hidden = workspace / ".agents/skills/hidden"
-    _write(
-        hidden / "SKILL.md",
-        "---\nname: hidden\ndescription: Hidden.\ndisable-model-invocation: true\n---\n\nBody.",
-    )
-    _write(hidden / "references/notes.md", "notes")
-
-    run = await _drive(_runner(workspace, threads), [])
-
-    assert _catalog(run.steps[0]) == "- shown: shown description"
-    assert _tool_names(run.steps[0]) == {"load_capability"}
-
-
-@pytest.mark.asyncio
-async def test_no_resource_tool_without_bundled_files(workspace: Path, threads: Path) -> None:
-    """Skills that ship only a `SKILL.md` get `load_capability` and no resource tool."""
+async def test_skills_come_with_read_only_file_tools(workspace: Path, threads: Path) -> None:
+    """Skills add `load_capability` and the file tools that only read."""
     _write_skill(workspace, "demo-skill")
 
     run = await _drive(_runner(workspace, threads), [])
 
-    assert _tool_names(run.steps[0]) == {"load_capability"}
+    assert _tool_names(run.steps[0]) == {"load_capability", *FILE_TOOLS}
 
 
 @pytest.mark.asyncio
-async def test_resource_tool_definition(workspace: Path, threads: Path) -> None:
-    """The resource tool's name, description, and schema are what the model is given."""
-    skill_dir = _write_skill(workspace, "demo-skill")
-    _write(skill_dir / "references/notes.md", "Reference material.")
+async def test_skill_hidden_from_the_model(workspace: Path, threads: Path) -> None:
+    """A skill whose frontmatter sets `disable-model-invocation: true` is left out of the catalog."""
+    _write_skill(workspace, "shown")
+    _write(
+        workspace / ".agents/skills/hidden/SKILL.md",
+        "---\nname: hidden\ndescription: Hidden.\ndisable-model-invocation: true\n---\n\nBody.",
+    )
 
     run = await _drive(_runner(workspace, threads), [])
 
-    tools = {tool.name: tool for tool in run.steps[0].function_tools}
-    assert set(tools) == {"load_capability", "read_skill_resource"}
-    tool = tools["read_skill_resource"]
-    assert tool.description == READ_SKILL_RESOURCE_DESCRIPTION
-    assert tool.parameters_json_schema == READ_SKILL_RESOURCE_SCHEMA
-    assert tool.strict is None
-    assert tool.kind == "function"
+    assert _catalog(run.steps[0]) == "- shown: shown description"
+
+
+@pytest.mark.asyncio
+async def test_no_tools_when_every_skill_is_hidden(workspace: Path, threads: Path) -> None:
+    """With no skill to offer, the run gets no catalog and no file tools."""
+    _write(
+        workspace / ".agents/skills/hidden/SKILL.md",
+        "---\nname: hidden\ndescription: Hidden.\ndisable-model-invocation: true\n---\n\nBody.",
+    )
+
+    run = await _drive(_runner(workspace, threads), [])
+
+    assert _tool_names(run.steps[0]) == set()
 
 
 @pytest.mark.asyncio
 async def test_loaded_instructions(workspace: Path, threads: Path) -> None:
-    """Loading a skill returns its heading, its body with placeholders resolved, and its file list."""
-    skill_dir = _write_skill(workspace, "demo-skill", body="See ${SKILL_DIR}/x and ${CLAUDE_SKILL_DIR}.\n\nDone.")
-    _write(skill_dir / "references/notes.md", "Reference material.")
-    _write(skill_dir / "data.json", "{}")
+    """Loading a skill returns its heading, the directory its relative paths resolve against, and its body."""
+    _write_skill(workspace, "demo-skill", body="Read references/notes.md.\n\nDone.")
 
     run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
 
-    directory = skill_dir.resolve()
     assert run.loaded == {
         "demo-skill": (
-            f"# Skill: demo-skill\n\nSee {directory}/x and {directory}.\n\nDone.\n\n"
-            "## Bundled files\n\n"
-            "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
-            "- `data.json`\n- `references/notes.md`"
+            "# Skill: demo-skill\n\n"
+            "Skill directory: `/demo-skill`. Relative paths in this skill resolve against it.\n\n"
+            "Read references/notes.md.\n\nDone."
         )
     }
 
 
 @pytest.mark.asyncio
-async def test_loaded_instructions_without_files_or_body(workspace: Path, threads: Path) -> None:
-    """A skill with no body and no files loads as its heading alone."""
+async def test_loaded_instructions_without_body(workspace: Path, threads: Path) -> None:
+    """A skill with no body loads as its heading and directory alone."""
     _write_skill(workspace, "demo-skill", body="")
 
     run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
 
-    assert run.loaded == {"demo-skill": "# Skill: demo-skill"}
-
-
-@pytest.mark.asyncio
-async def test_file_list_is_truncated(workspace: Path, threads: Path) -> None:
-    """Past 50 files the list ends with a count of the rest."""
-    skill_dir = _write_skill(workspace, "demo-skill", body="")
-    for index in range(53):
-        _write(skill_dir / f"references/{index:02d}.md", "x")
-
-    run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
-
-    listed = "\n".join(f"- `references/{index:02d}.md`" for index in range(50))
     assert run.loaded == {
         "demo-skill": (
-            "# Skill: demo-skill\n\n## Bundled files\n\n"
-            "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
-            f"{listed}\n- ...and 3 more"
+            "# Skill: demo-skill\n\nSkill directory: `/demo-skill`. Relative paths in this skill resolve against it."
         )
     }
 
 
 @pytest.mark.asyncio
-async def test_which_files_are_resources(workspace: Path, threads: Path, tmp_path: Path) -> None:
-    """Text files are resources; scripts, binaries, build noise, and escaping links are not."""
-    skill_dir = _write_skill(workspace, "demo-skill", body="")
+async def test_reading_skill_files(workspace: Path, threads: Path) -> None:
+    """The file tools reach every file a skill ships: documents, scripts, nested `SKILL.md` files, and images."""
+    skill_dir = _write_skill(workspace, "demo-skill")
     _write(skill_dir / "references/notes.md", "notes")
-    _write(skill_dir / "deep/nested/page.txt", "page")
-    _write(skill_dir / "config.yaml", "a: 1")
     _write(skill_dir / "scripts/go.py", "print(1)")
-    _write(skill_dir / "scripts/README.md", "about the scripts")
-    _write(skill_dir / "helper.sh", "echo hi")
-    _write(skill_dir / "image.png", b"\x89PNG\r\n\x1a\n\x00\xff\xfe")
-    _write(skill_dir / "__pycache__/mod.cpython-312.pyc", "x")
-    _write(skill_dir / "stale.pyc", "x")
-    _write(skill_dir / ".DS_Store", "x")
-    outside = _write(tmp_path / "outside.md", "secret")
-    (skill_dir / "escape.md").symlink_to(outside)
-    if os.name == "posix":
-        executable = _write(skill_dir / "tool", "#!/bin/sh\necho hi\n")
-        executable.chmod(0o755)
+    _write(skill_dir / "examples/child/SKILL.md", "a nested example")
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    _write(skill_dir / "pic.png", png)
 
-    run = await _drive(_runner(workspace, threads), [_load("demo-skill")])
-
-    instructions = run.loaded["demo-skill"]
-    listed = [line[3:-1] for line in instructions.splitlines() if line.startswith("- `")]
-    assert listed == ["config.yaml", "deep/nested/page.txt", "references/notes.md", "scripts/README.md"]
-
-
-@pytest.mark.asyncio
-async def test_reading_resources(workspace: Path, threads: Path) -> None:
-    """Reads resolve exact and short names, parse JSON and YAML, and explain every failure."""
-    skill_dir = _write_skill(workspace, "demo-skill", body="")
-    _write(skill_dir / "references/notes.md", "notes")
-    _write(skill_dir / "data.json", '{"a": [1, 2]}')
-    _write(skill_dir / "broken.json", "{not json")
-    _write(skill_dir / "config.yaml", "a: 1\nb: [x, y]")
-    _write(skill_dir / "a/dup.md", "first")
-    _write(skill_dir / "b/dup.md", "second")
-    _write_skill(workspace, "other-skill")
-
-    # One failure per tool is allowed before a success, so failures alternate with reads that work.
     run = await _drive(
         _runner(workspace, threads),
         [
-            _read("demo-skill", "references/notes.md"),
             _load("demo-skill"),
-            _read("demo-skill", "references/notes.md"),
-            _read("missing-skill", "notes.md"),
-            _read("demo-skill", "notes"),
-            _read("demo-skill", "dup.md"),
-            _read("demo-skill", "notes.md"),
-            _read("demo-skill", "nowhere.md"),
-            _read("demo-skill", "data.json"),
-            _read("demo-skill", "broken.json"),
-            _read("demo-skill", "config.yaml"),
-            _read("other-skill", "notes.md"),
-            _read("demo-skill", "a/dup.md"),
-            _load("other-skill"),
-            _read("other-skill", "notes.md"),
+            _read("demo-skill/references/notes.md"),
+            _read("demo-skill/scripts/go.py"),
+            _read("demo-skill/examples/child/SKILL.md"),
+            _read("demo-skill/pic.png"),
         ],
     )
 
-    assert run.results[0] == (
-        "Skill 'demo-skill' is not loaded. Call load_capability with id='demo-skill' first, then read its files."
-    )
-    assert run.results[2] == "notes"
-    # The list names every skill, including ones that ship no files.
-    assert run.results[3] == (
-        "Skill 'missing-skill' has no bundled files available. Skills with bundled files: demo-skill, other-skill. "
-        "Use the exact skill name."
-    )
-    assert run.results[4] == "notes"
-    assert run.results[5] == (
-        "Resource 'dup.md' is ambiguous in skill 'demo-skill': ['a/dup.md', 'b/dup.md']. "
-        "Use the full path relative to the skill directory."
-    )
-    assert run.results[6] == "notes"
-    assert run.results[7] == (
-        "Resource 'nowhere.md' not found in skill 'demo-skill'. Available: ['a/dup.md', 'b/dup.md', "
-        "'broken.json', 'config.yaml', 'data.json', 'references/notes.md']. "
-        "Use the exact name from the skill instructions."
-    )
-    assert run.results[8] == {"a": [1, 2]}
-    assert run.results[9] == "{not json"
-    assert run.results[10] == {"a": 1, "b": ["x", "y"]}
-    assert run.results[11] == (
-        "Skill 'other-skill' is not loaded. Call load_capability with id='other-skill' first, then read its files."
-    )
-    assert run.results[12] == "first"
-    assert run.results[14] == (
-        "Resource 'notes.md' not found in skill 'other-skill'. Available: []. "
-        "Use the exact name from the skill instructions."
-    )
+    assert _file_text(run.results[1]) == "notes"
+    assert _file_text(run.results[2]) == "print(1)"
+    assert _file_text(run.results[3]) == "a nested example"
+    image = run.results[4][1]
+    assert isinstance(image, BinaryContent)
+    assert image.data == png
 
 
 @pytest.mark.asyncio
-async def test_a_resource_that_fails_to_read_is_a_retry(workspace: Path, threads: Path) -> None:
-    """A file that passes the text check on its first bytes but is not text later asks the model to retry."""
+async def test_files_cannot_leave_their_skill(workspace: Path, threads: Path, tmp_path: Path) -> None:
+    """A symlink inside a skill that points out of it reads as missing and is left out of listings."""
     skill_dir = _write_skill(workspace, "demo-skill")
-    _write(skill_dir / "late.md", b"a" * 70_000 + b"\xff")
     _write(skill_dir / "notes.md", "notes")
+    outside = _write(tmp_path / "outside/secret.md", "secret")
+    (skill_dir / "escape.md").symlink_to(outside)
+    (skill_dir / "escape-dir").symlink_to(outside.parent, target_is_directory=True)
+    other_dir = _write_skill(workspace, "other-skill")
+    _write(other_dir / "private.md", "private")
+    (skill_dir / "sibling.md").symlink_to(other_dir / "private.md")
 
     run = await _drive(
         _runner(workspace, threads),
-        [_load("demo-skill"), _read("demo-skill", "late.md"), _read("demo-skill", "notes.md")],
+        [
+            _list("demo-skill"),
+            _read("demo-skill/escape.md"),
+            _read("demo-skill/notes.md"),
+            _read("demo-skill/escape-dir/secret.md"),
+            _read("demo-skill/notes.md"),
+            _read("demo-skill/sibling.md"),
+            _read("demo-skill/notes.md"),
+            _read("../outside/secret.md"),
+        ],
     )
 
-    assert str(run.results[1]).startswith("Resource 'late.md' could not be read:")
-    assert run.results[2] == "notes"
+    assert "escape" not in str(run.results[0])
+    assert "sibling" not in str(run.results[0])
+    assert "notes.md" in str(run.results[0])
+    assert [run.results[index] for index in (1, 3, 5, 7)] == [
+        "Path not found: demo-skill/escape.md",
+        "Path not found: demo-skill/escape-dir/secret.md",
+        "Path not found: demo-skill/sibling.md",
+        "Path not found: ../outside/secret.md",
+    ]
+    assert _file_text(run.results[2]) == "notes"
+
+
+@pytest.mark.asyncio
+async def test_a_skill_folder_can_be_a_symlink(workspace: Path, threads: Path, tmp_path: Path) -> None:
+    """A skill folder linked in from elsewhere is offered, and its files are readable."""
+    shared = _write_skill(tmp_path / "shared", "shared-skill")
+    _write(shared / "references/notes.md", "notes")
+    library = workspace / ".agents/skills"
+    library.mkdir(parents=True)
+    (library / "shared-skill").symlink_to(shared, target_is_directory=True)
+
+    run = await _drive(
+        _runner(workspace, threads),
+        [_load("shared-skill"), _read("shared-skill/references/notes.md")],
+    )
+
+    assert _catalog(run.steps[0]) == "- shared-skill: shared-skill description"
+    assert _file_text(run.results[1]) == "notes"
+
+
+@pytest.mark.asyncio
+async def test_spec_gaps_are_logged(workspace: Path, threads: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """An overlong description and ignored frontmatter fields are logged, and the skill is still offered."""
+    _write_skill(workspace, "long-skill", description="x" * 1025)
+    _write(
+        workspace / ".agents/skills/tools-skill/SKILL.md",
+        "---\nname: tools-skill\ndescription: Tools.\nallowed-tools: Bash\nmodel: opus\n---\n\nBody.",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+        run = await _drive(_runner(workspace, threads), [])
+
+    assert _catalog(run.steps[0]) == f"- long-skill: {'x' * 1025}\n- tools-skill: Tools."
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Skill 'long-skill'" in message and "1025 characters, over the 1024-character limit" in message
+        for message in messages
+    )
+    assert any("Skill 'tools-skill'" in message and "ignores: allowed-tools, model." in message for message in messages)
 
 
 @pytest.mark.asyncio
 async def test_broken_skill_costs_only_itself(workspace: Path, threads: Path) -> None:
     """A `SKILL.md` with bad frontmatter is left out; the valid skills beside it still load."""
-    skill_dir = _write_skill(workspace, "good-skill")
-    _write(skill_dir / "references/notes.md", "Reference material.")
+    _write_skill(workspace, "good-skill")
     _write(workspace / ".agents/skills/broken-skill/SKILL.md", "no frontmatter at all\n")
-    _write(workspace / ".agents/skills/broken-skill/references/notes.md", "Unreachable.")
 
     run = await _drive(_runner(workspace, threads), [_load("good-skill")])
 
     assert _catalog(run.steps[0]) == "- good-skill: good-skill description"
-    assert run.loaded == {
-        "good-skill": (
-            "# Skill: good-skill\n\nGuidance for the task.\n\n## Bundled files\n\n"
-            "Read with `read_skill_resource`, using these exact `resource_name` values:\n\n"
-            "- `references/notes.md`"
-        )
-    }
+    assert set(run.loaded) == {"good-skill"}
 
 
 @pytest.mark.asyncio
@@ -479,15 +422,18 @@ async def test_unreadable_skill_costs_skills_not_the_run(workspace: Path, thread
 
 @pytest.mark.asyncio
 async def test_skills_load_without_a_posix_workspace(workspace: Path, threads: Path) -> None:
-    """Skills load where `LocalWorkspaceBackend` cannot be built, as on Windows."""
+    """Skills load and their files read where `LocalWorkspaceBackend` cannot be built, as on Windows."""
     skill_dir = _write_skill(workspace, "demo-skill")
     _write(skill_dir / "references/notes.md", "notes")
     unsupported = NotImplementedError("`LocalWorkspaceBackend` only supports POSIX platforms at the moment")
 
     with patch.object(LocalWorkspaceBackend, "__init__", side_effect=unsupported):
-        run = await _drive(_runner(workspace, threads), [_load("demo-skill"), _read("demo-skill", "notes.md")])
+        run = await _drive(
+            _runner(workspace, threads),
+            [_load("demo-skill"), _read("demo-skill/references/notes.md")],
+        )
 
-    assert run.results[1] == "notes"
+    assert _file_text(run.results[1]) == "notes"
 
 
 @pytest.mark.asyncio

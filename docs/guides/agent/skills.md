@@ -54,9 +54,19 @@ my-skill/
     └── color-palette.md
 ```
 
-When the agent uses the skill, it sees a list of the skill's text files and can read any of them. JSON and YAML files are read as data. Scripts and binary files such as images are left out of the list.
+When the agent uses the skill, it learns where the skill's folder is and can look through and read the files in it, including scripts, images, and PDFs. Refer to files by their path inside the skill's folder, such as `references/color-palette.md`. The agent can only read files. It can't change them.
 
-Write `${SKILL_DIR}` in a skill's instructions to refer to the skill's own folder. The agent sees the full path in its place.
+A file can be a symlink as long as it points somewhere inside the skill's folder. The agent can't see links that point outside it, so a skill can't read other files on your computer. The skill folder itself can be a symlink.
+
+## What isn't supported
+
+Griptape Nodes follows the [Agent Skills specification](https://agentskills.io/specification) with these exceptions:
+
+- The agent can read a skill's scripts but can't run them. A skill whose instructions say "run `scripts/extract.py`" won't work.
+- The agent can read images and PDFs, but not other binary files.
+- Frontmatter fields that change how a skill runs, such as `allowed-tools` and `model`, are ignored. The engine logs a warning naming the skill and the fields.
+- A `description` longer than 1,024 characters still loads, with a warning in the log.
+- `license`, `compatibility`, and `metadata` are accepted but not checked or used.
 
 ## Example: a house style guide
 

@@ -50,10 +50,10 @@ dependencies = [
   # PR #5449 raised the `mcp` ceiling without checking this; PR #5493 papered over the fallout
   # for pydantic-ai-skills but left this one. Lift no lower than this floor.
   "pydantic-ai-slim[mcp,openai]>=2.29.0",
-  # Floor at 0.57: the first release whose `Skills.load` skips a `SKILL.md` with bad
-  # frontmatter instead of failing the whole library. agents/pydantic_ai/skills.py relies on
-  # that, and on `Skills(workspace=...)` and `SkillDefinition.render`.
-  "pydantic-ai-harness[skills]>=0.57",
+  # Floor at 0.58: the first release whose `FileSystem.read_file` returns images and PDFs, which
+  # the skills guide promises. agents/pydantic_ai/skills.py also relies on `Skills.load` skipping
+  # a `SKILL.md` with bad frontmatter instead of failing the whole library (0.57).
+  "pydantic-ai-harness[skills]>=0.58",
   "pyyaml>=6.0.2",
 ]
 
