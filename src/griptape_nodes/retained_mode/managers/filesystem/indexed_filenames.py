@@ -39,8 +39,6 @@ MACRO_VARIABLE_GROUP_PATTERN = re.compile(r"\{[^{}]*\}")
 
 
 class IndexedFilenames(EngineScoped):
-    """Scans existing files to pick the next index for a filename pattern."""
-
     def bind_project_variables_for_index_scan(
         self, macro_path: MacroPath, workflow: WorkflowRuntime | None
     ) -> MacroPath:
