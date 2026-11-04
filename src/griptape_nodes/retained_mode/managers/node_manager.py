@@ -2919,7 +2919,6 @@ class NodeManager(EngineScoped):
             if target_connections is not None:
                 param_connections = target_connections.get(request.parameter_name)
                 if param_connections:  # Has incoming connections
-                    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1965 Consider emitting UI events when parameters become settable/unsettable due to connection changes
                     details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because this parameter has incoming connections and cannot be set as a property while connected."
                     result = SetParameterValueResultFailure(result_details=details)
                     return result
