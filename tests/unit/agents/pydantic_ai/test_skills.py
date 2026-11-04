@@ -346,6 +346,19 @@ async def test_files_cannot_leave_their_skill(workspace: Path, threads: Path, tm
 
 
 @pytest.mark.asyncio
+async def test_a_link_beside_the_skills_stays_in_the_library(workspace: Path, threads: Path, tmp_path: Path) -> None:
+    """A top-level link that is not a skill folder reads as missing when it points out of the library."""
+    _write_skill(workspace, "demo-skill")
+    _write(tmp_path / "outside/secret.md", "secret")
+    (workspace / ".agents/skills/stray").symlink_to(tmp_path / "outside", target_is_directory=True)
+
+    run = await _drive(_runner(workspace, threads), [_list("/"), _read("stray/secret.md")])
+
+    assert "stray" not in str(run.results[0])
+    assert run.results[1] == "Path not found: stray/secret.md"
+
+
+@pytest.mark.asyncio
 async def test_a_skill_folder_can_be_a_symlink(workspace: Path, threads: Path, tmp_path: Path) -> None:
     """A skill folder linked in from elsewhere is offered, and its files are readable."""
     shared = _write_skill(tmp_path / "shared", "shared-skill")

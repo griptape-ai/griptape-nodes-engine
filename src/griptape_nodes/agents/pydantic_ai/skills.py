@@ -60,9 +60,10 @@ class ReadOnlyDirectoryBackend:
     appears as the workspace root `/`, so its paths are POSIX paths on every platform.
     Writes raise `WorkspaceReadOnlyError`.
 
-    Each entry directly under the root bounds the paths beneath it. The entry itself may be
-    a symlink, so a skill folder can live elsewhere, but a link inside it that points out of
-    it reads as missing. That keeps a skill from exposing other files on disk.
+    Each skill folder directly under the root bounds the paths beneath it. The folder itself
+    may be a symlink, so a skill can live elsewhere, but a link inside it that points out of
+    it reads as missing. Anything else must resolve inside the root. That keeps a skill, or a
+    stray link beside one, from exposing other files on disk.
     """
 
     def __init__(self, root: Path) -> None:
@@ -140,10 +141,10 @@ class ReadOnlyDirectoryBackend:
         raise WorkspaceReadOnlyError(_READ_ONLY_REASON)
 
     def _contained_path(self, path: str) -> Path:
-        """The host path for `path`, which must stay inside the root entry it is under.
+        """The host path for `path`, which must pass `_is_contained`.
 
         Raises:
-            FileNotFoundError: The path resolves outside that entry.
+            FileNotFoundError: The path resolves outside its skill folder or the root.
         """
         target = self.host_path(path)
         if not self._is_contained(target):
@@ -151,12 +152,15 @@ class ReadOnlyDirectoryBackend:
         return target
 
     def _is_contained(self, target: Path) -> bool:
-        """Whether `target` resolves inside the root entry it is under."""
+        """Whether `target` resolves inside the skill folder it is under, or inside the root."""
         parts = target.relative_to(self._root).parts
         if not parts:
             return True
+        entry = self._root / parts[0]
         try:
-            boundary = (self._root / parts[0]).resolve()
+            boundary = self._root
+            if (entry / "SKILL.md").is_file():
+                boundary = entry.resolve()
             resolved = target.resolve()
         # A symlink loop raises `RuntimeError` on Python 3.12 and `OSError` from 3.13.
         except (OSError, RuntimeError):
