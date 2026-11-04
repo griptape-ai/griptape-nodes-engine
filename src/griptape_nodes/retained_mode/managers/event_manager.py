@@ -49,6 +49,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
 )
 from griptape_nodes.retained_mode.request_handlers import (
+    ForwardingHandler,
     RequestScope,
     RequiredSender,
     SenderRule,
@@ -170,8 +171,8 @@ def _is_async_callable(callback: Any) -> bool:
     """Whether calling `callback` returns a coroutine.
 
     `inspect.iscoroutinefunction` alone misses callable objects whose `__call__` is
-    async (worker_routing.RemoteHandler is one), which would otherwise be handed to a
-    thread where the coroutine it returns is never awaited.
+    async, which would otherwise be handed to a thread where the coroutine it returns
+    is never awaited.
     """
     if inspect.iscoroutinefunction(callback):
         return True
@@ -312,7 +313,7 @@ class EventManager(EngineScoped):
     def __init__(self, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         # Dictionary to store the SPECIFIC manager for each request type
-        self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
+        self._request_type_to_manager: dict[type[RequestPayload], Callable | ForwardingHandler] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # The request types another engine may send, and which engines. Any other is refused. See `@handles`.
         self._sender_rules: dict[type[RequestPayload], _AssignedSenderRule] = {}
         # Tells whether a sender's session registered with this engine. Until one is given, no session has.
@@ -365,7 +366,7 @@ class EventManager(EngineScoped):
         self._pre_dispatch_hooks_lock = threading.Lock()
         # Post-dispatch hooks, keyed by exact request type. Notification-only: they run
         # after the result exists and cannot change it. Lists rather than sets because a
-        # callback need not be hashable -- a callable dataclass (RemoteHandler) has
+        # callback need not be hashable -- a callable dataclass has
         # __hash__ set to None and would raise on set.add.
         self._post_dispatch_hooks: dict[type[RequestPayload], list[PostDispatchHook]] = {}
         self._post_dispatch_hooks_lock = threading.Lock()
@@ -1020,12 +1021,15 @@ class EventManager(EngineScoped):
                 owner=cast("Callable[[RequestPayload, RequestSender], str | None] | None", owner),
             )
 
-    def replace_manager_for_request_type(self, request_type: type[RP], callback: Callable[..., Any]) -> None:
+    def replace_manager_for_request_type(
+        self, request_type: type[RP], callback: Callable[..., Any] | ForwardingHandler
+    ) -> None:
         """Swap in a callback that wraps the registered handler, keeping its scope and sender rule.
 
         Dispatch calls the new callback as it called the old one, so a wrapper passes any keyword
-        arguments it receives (the `workflow` its scope passes) through to the handler it wraps. Its
-        signature must take the same `workflow` the handler's did, as one copied with `__signature__` does.
+        arguments it receives (the `workflow` its scope passes) through to the handler it wraps, and
+        its signature must take the same `workflow` the handler's did. A `ForwardingHandler` is
+        checked by its `original`.
 
         Raises:
             ValueError: The request type has no handler to replace.
@@ -1038,7 +1042,12 @@ class EventManager(EngineScoped):
         expected_scope = None
         if replaced_scope is RequestScope.WORKFLOW or replaced_scope is RequestScope.OPTIONAL_WORKFLOW:
             expected_scope = replaced_scope
-        if scope_from_signature(callback) is not expected_scope:
+        signature_owner: Callable[..., Any]
+        if isinstance(callback, ForwardingHandler):
+            signature_owner = callback.original
+        else:
+            signature_owner = callback
+        if scope_from_signature(signature_owner) is not expected_scope:
             msg = (
                 f"Attempted to replace the handler for {request_type.__name__}. Failed because the replacement "
                 "takes a different `workflow` parameter than the handler it replaces."
@@ -1164,7 +1173,7 @@ class EventManager(EngineScoped):
         """The node the current chain is rebuilding, or None outside a rebuild scope."""
         return _rebuilding_node_name.get()
 
-    def get_manager_for_request_type(self, request_type: type[RP]) -> Callable | None:
+    def get_manager_for_request_type(self, request_type: type[RP]) -> Callable | ForwardingHandler | None:
         """Return the currently-registered handler callback for a request type, or None."""
         return self._request_type_to_manager.get(request_type)
 
@@ -1455,7 +1464,9 @@ class EventManager(EngineScoped):
             context=context,
         )
 
-    def _handler_call(self, callback: Callable, request: RequestPayload, result_context: ResultContext) -> _HandlerCall:
+    def _handler_call(
+        self, callback: Callable | ForwardingHandler, request: RequestPayload, result_context: ResultContext
+    ) -> _HandlerCall:
         """What to call for `request`. A worker's forwarding handler is asked here, once, whether it forwards.
 
         Asking once keeps the answer from changing between deciding and calling: it comes from a
@@ -1466,16 +1477,13 @@ class EventManager(EngineScoped):
             _RequestWorkflowError: The call stays here and names no workflow its handler can act on
                 (see `_request_workflow`).
         """
-        # Lazy import: worker_routing imports ResultContext from this module at
-        # runtime, so a top-level import here would cycle through event_manager
-        # -> worker_routing -> event_manager during module load.
-        from griptape_nodes.app.worker_routing import RemoteHandler
-
-        local_callback = callback
-        if isinstance(callback, RemoteHandler):
+        local_callback: Callable
+        if isinstance(callback, ForwardingHandler):
             if callback.forwards_now():
                 return _HandlerCall(function=callback.forward, request_workflow=_KEEP_CALLER_BINDING)
             local_callback = callback.handle_locally
+        else:
+            local_callback = callback
 
         scope = self._request_scopes.get(type(request))
         request_workflow = self._request_workflow(
@@ -1740,19 +1748,14 @@ class EventManager(EngineScoped):
             message=rule.render(node_name=node_name, request_type=type(request).__name__),
         )
 
-    def _handler_for(self, request_type: type[RequestPayload]) -> Callable | None:
+    def _handler_for(self, request_type: type[RequestPayload]) -> Callable | ForwardingHandler | None:
         """The handler that answers `request_type` in the current chain.
 
         Inside a rebuild scope that is always this process's own handler: a worker replaces forwarded
-        types with a RemoteHandler, which would send the request to the orchestrator.
+        types with a `ForwardingHandler`, which would send the request to the orchestrator.
         """
-        # Lazy import: worker_routing imports ResultContext from this module at
-        # runtime, so a top-level import here would cycle through event_manager
-        # -> worker_routing -> event_manager during module load.
-        from griptape_nodes.app.worker_routing import RemoteHandler
-
         callback = self._request_type_to_manager.get(request_type)
-        if _rebuilding_node_name.get() is not None and isinstance(callback, RemoteHandler):
+        if _rebuilding_node_name.get() is not None and isinstance(callback, ForwardingHandler):
             return callback.original
         return callback
 
@@ -1833,27 +1836,21 @@ class EventManager(EngineScoped):
                 bound_workflow.reset(binding_token)
 
     def _invoke_handler_from_sync(
-        self, registered: Callable, callback: Callable, request: RequestPayload
+        self, registered: Callable | ForwardingHandler, callback: Callable, request: RequestPayload
     ) -> ResultPayload:
         """Call a request handler from sync code, bridging async handlers onto a loop.
 
         `callback` is what dispatch calls; `registered` is the handler it came from, which decides
         whether the call hops onto the websocket loop.
         """
-        # Worker-side RemoteHandler callbacks are async but safe to invoke from any
+        # A worker's ForwardingHandler callbacks are async but safe to invoke from any
         # running loop except the WS loop itself: forward_to_orchestrator dispatches onto
         # the WS loop via run_coroutine_threadsafe, which then runs on a different thread
         # than the caller's loop, so no primitives are shared and the #4469 deadlock shape
         # does not apply. A caller on the WS loop would block the loop it waits on.
         # Hop the callback onto the WS loop here and block the caller's thread on the
-        # concurrent.futures.Future so RemoteHandler itself stays a plain async callable.
-        #
-        # Lazy import: worker_routing imports ResultContext from this module at
-        # runtime, so a top-level import here would cycle through event_manager
-        # -> worker_routing -> event_manager during module load.
-        from griptape_nodes.app.worker_routing import RemoteHandler
-
-        if isinstance(registered, RemoteHandler):
+        # concurrent.futures.Future so the handler itself stays plain async.
+        if isinstance(registered, ForwardingHandler):
             running_loop = _running_loop()
             if running_loop is None:
                 return asyncio.run(callback(request))

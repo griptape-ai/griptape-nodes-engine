@@ -57,7 +57,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetVariableSubstitutionEnabledRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.retained_mode.request_handlers import RequestScope, scope_from_signature
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope, scope_from_signature
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED
@@ -512,7 +512,7 @@ class TestObjectAndVariableRequests:
 class _FlippingRemoteHandler(RemoteHandler):
     """Answers `forwards_now` differently each time, as the process-wide counter it reads can between two reads.
 
-    Dispatch must ask once and act on that answer, so it never calls `__call__`, which would ask again.
+    Dispatch must ask once and act on that answer.
     """
 
     def __init__(self, original: Any, engine: Engine, *, forwards_first: bool) -> None:
@@ -520,10 +520,6 @@ class _FlippingRemoteHandler(RemoteHandler):
         self.forwards_first = forwards_first
         self.forwards_now_calls = 0
         self.forwarded: list[RequestPayload] = []
-
-    async def __call__(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:  # noqa: ARG002
-        msg = "Dispatch decides once whether to forward, so it calls forward or handle_locally."
-        raise AssertionError(msg)
 
     def forwards_now(self) -> bool:
         self.forwards_now_calls += 1
@@ -700,4 +696,5 @@ class TestAmbientUntilMigrated:
         if handler is None:
             pytest.skip(f"{name} is registered only in a worker.")
 
+        assert not isinstance(handler, ForwardingHandler)
         assert scope_from_signature(handler) is None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, TypeVar
@@ -9,7 +10,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import Any
 
-    from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayload
 
 F = TypeVar("F", bound="Callable[..., Any]")
 
@@ -35,6 +36,29 @@ class RequestScope(StrEnum):
     HOST = "host"
     WORKFLOW = "workflow"
     OPTIONAL_WORKFLOW = "optional_workflow"
+
+
+class ForwardingHandler(ABC):
+    """A handler that sends some requests to another engine instead of answering them.
+
+    Registered with `EventManager.replace_manager_for_request_type` in place of `original`, whose
+    scope it keeps. Dispatch asks `forwards_now` once per request, then calls `forward` with the
+    request alone, or `handle_locally` with the request and the `workflow` the scope passes.
+    """
+
+    original: Callable[..., Any]
+
+    @abstractmethod
+    def forwards_now(self) -> bool:
+        """Whether a request dispatched now is forwarded."""
+
+    @abstractmethod
+    async def forward(self, request: RequestPayload) -> ResultPayload:
+        """Send `request` to the other engine and return its answer."""
+
+    @abstractmethod
+    async def handle_locally(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:
+        """Hand `request` and `kwargs` (the `workflow` its scope passes) to `original`."""
 
 
 class RequiredSender(StrEnum):

@@ -154,7 +154,7 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
-from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
@@ -4637,6 +4637,9 @@ class OSManager(EngineScoped):
         if callback is None:
             msg = f"No manager found to handle request of type '{request_type.__name__}'."
             raise TypeError(msg)
+        # Engine construction runs outside node execution, where a forwarding handler answers locally.
+        if isinstance(callback, ForwardingHandler):
+            return callback.original(request)
         return callback(request)
 
     def _register_system_resources(self) -> None:

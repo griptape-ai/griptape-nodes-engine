@@ -43,6 +43,7 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
+    ResultPayload,
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
@@ -59,7 +60,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import RequestScope
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -90,8 +91,17 @@ class _ProbeResult(ResultPayloadSuccess):
     seen_by: str
 
 
+async def _dispatch(handler: RemoteHandler, request: RequestPayload) -> ResultPayload:
+    """Dispatch `request` through `handler`'s event manager, with `handler` registered as a worker registers it."""
+    event_manager = handler.event_manager
+    event_manager.assign_manager_to_request_type(type(request), handler.original)
+    event_manager.replace_manager_for_request_type(type(request), handler)
+    result_event = await event_manager.ahandle_request(request)
+    return result_event.result
+
+
 class TestRemoteHandlerScopeGate:
-    """RemoteHandler must forward in-scope and delegate out-of-scope."""
+    """Dispatch forwards through a RemoteHandler in-scope and delegates out-of-scope."""
 
     @pytest.mark.asyncio
     async def test_out_of_scope_delegates_to_original(self) -> None:
@@ -105,7 +115,7 @@ class TestRemoteHandlerScopeGate:
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
         assert not event_manager.in_node_execution()
-        result = await handler(_ProbeRequest(marker="m1"))
+        result = await _dispatch(handler, _ProbeRequest(marker="m1"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "local:m1"
@@ -123,7 +133,7 @@ class TestRemoteHandlerScopeGate:
 
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
-        await handler(_ProbeRequest(marker="m1"), workflow=workflow)
+        await handler.handle_locally(_ProbeRequest(marker="m1"), workflow=workflow)
 
         assert seen["workflow"] is workflow
 
@@ -161,7 +171,7 @@ class TestRemoteHandlerScopeGate:
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
         with event_manager.node_execution_scope():
-            result = await handler(_ProbeRequest(marker="m2"))
+            result = await _dispatch(handler, _ProbeRequest(marker="m2"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "orchestrator"
@@ -178,7 +188,7 @@ class TestRemoteHandlerScopeGate:
 
         handler = RemoteHandler(original=sync_original, event_manager=event_manager)
 
-        result = await handler(_ProbeRequest(marker="s1"))
+        result = await _dispatch(handler, _ProbeRequest(marker="s1"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "sync:s1"
@@ -582,7 +592,8 @@ def _route_probe_through_a_remote_handler(event_manager: EventManager) -> None:
     async def original(request: _ProbeRequest) -> _ProbeResult:
         return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
 
-    event_manager.assign_manager_to_request_type(
+    event_manager.assign_manager_to_request_type(_ProbeRequest, original)
+    event_manager.replace_manager_for_request_type(
         _ProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
     )
 
@@ -649,6 +660,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         worker_settled = _install_adoption(event_manager, project_manager)
         handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
         assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
 
         result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
 
@@ -665,6 +677,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         worker_settled = _install_adoption(event_manager, project_manager)
         handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
         assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
 
         result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
 
