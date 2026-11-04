@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest  # type: ignore[reportMissingImports]
 
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeLockStateRequest,
     BatchSetNodeLockStateResultFailure,
@@ -145,7 +146,7 @@ class TestLockNodes:
         assert isinstance(res, SetLockNodeStateResultFailure)
         assert missing in str(res.result_details)
 
-    def test_lock_with_no_workflow_open_returns_its_own_failure(self, engine: Engine) -> None:
+    def test_lock_with_no_workflow_open_says_none_is_open(self, engine: Engine) -> None:
         res = engine.handle_request(SetLockNodeStateRequest(lock=True, node_name="not_here_456"))
-        assert isinstance(res, SetLockNodeStateResultFailure)
+        assert isinstance(res, WorkflowNotNamedResultFailure)
         assert "none is open" in str(res.result_details)
