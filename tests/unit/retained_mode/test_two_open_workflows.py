@@ -151,6 +151,7 @@ class _ParkNode(ControlNode):
     gates: ClassVar[dict[str, asyncio.Event]] = {}
     started: ClassVar[dict[str, asyncio.Event]] = {}
     ran_in: ClassVar[dict[str, Any]] = {}
+    node_workflow: ClassVar[dict[str, Any]] = {}
 
     def __init__(self, name: str, metadata: dict | None = None) -> None:
         super().__init__(name, metadata=metadata)
@@ -170,6 +171,7 @@ class _ParkNode(ControlNode):
 
     async def aprocess(self) -> None:
         _ParkNode.ran_in[self.name] = self.engine.current_workflow_or_none()
+        _ParkNode.node_workflow[self.name] = self.workflow
         started = _ParkNode.started.get(self.name)
         if started is not None:
             started.set()
@@ -226,6 +228,7 @@ def spike_library() -> Iterator[None]:
     _ParkNode.gates = {}
     _ParkNode.started = {}
     _ParkNode.ran_in = {}
+    _ParkNode.node_workflow = {}
     _RawThreadNode.seen = {}
     try:
         yield
@@ -342,6 +345,20 @@ class TestEachWorkflowSeesOnlyItsOwn:
         assert not b.objects.has("only_in_a")
         assert a.nodes.name_to_parent_flow_name == {"n": "canvas", "only_in_a": "canvas"}
         assert b.nodes.name_to_parent_flow_name == {"n": "canvas"}
+
+    def test_nodes_with_the_same_name_each_name_their_own_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        for workflow in (a, b):
+            _make_node(engine, workflow, "_ValueNode", "n")
+
+        node_in_a = a.objects.get_as_type("n", _ValueNode)
+        node_in_b = b.objects.get_as_type("n", _ValueNode)
+        assert node_in_a is not None
+        assert node_in_b is not None
+        assert node_in_a.workflow is a
+        assert node_in_b.workflow is b
 
     def test_connections_stay_in_their_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
@@ -863,6 +880,16 @@ class TestWorkerForTwoOrchestratorWorkflows:
         assert ran_first.workflow_id == _ORCHESTRATOR_A
         assert ran_second.workflow_id == _ORCHESTRATOR_B
         assert ran_first is not ran_second
+
+    @pytest.mark.asyncio
+    async def test_a_workers_copy_of_a_node_names_the_runtime_kept_for_its_workflow(
+        self, worker_engine: Engine
+    ) -> None:
+        result = await worker_engine.ahandle_request(_worker_request("p", _ORCHESTRATOR_A, "a"))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert _ParkNode.node_workflow["p"] is _ParkNode.ran_in["p"]
+        assert _ParkNode.node_workflow["p"].workflow_id == _ORCHESTRATOR_A
 
     @pytest.mark.asyncio
     async def test_interleaved_nodes_for_two_workflows_each_run_in_their_own_runtime(
