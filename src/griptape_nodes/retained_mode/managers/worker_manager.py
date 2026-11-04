@@ -1692,13 +1692,9 @@ class WorkerManager(EngineScoped):
     ) -> worker_events.StartWorkerForEngineResultSuccess | worker_events.StartWorkerForEngineResultFailure:
         """Start a worker for an artist's session on another engine, in that session, under the ID it chose."""
         worker_key = f"{session_id}/{library_name}"
-        starting = any(
-            hosted.worker_key == worker_key and not hosted.started.is_set() for hosted in self._hosted_workers.values()
-        )
-        if starting or worker_key in self._spawns_in_flight:
-            return worker_events.StartWorkerForEngineResultFailure(
-                result_details=f"A worker for library '{library_name}' is already starting for that session."
-            )
+        duplicate = self._duplicate_worker_refusal(library_name, worker_key, worker_engine_id)
+        if duplicate is not None:
+            return duplicate
         refusal = self._start_refusal(library_name, session_id, worker_key)
         if refusal is not None:
             return refusal
@@ -1761,6 +1757,31 @@ class WorkerManager(EngineScoped):
         return worker_events.StartWorkerForEngineResultSuccess(
             result_details=f"Started worker {worker_engine_id} for library '{library_name}' for another engine."
         )
+
+    def _duplicate_worker_refusal(
+        self, library_name: str, worker_key: str, worker_engine_id: str
+    ) -> worker_events.StartWorkerForEngineResultFailure | None:
+        """Why this engine refuses to start `worker_key`'s worker under `worker_engine_id`, or None if it may."""
+        starting = any(
+            hosted.worker_key == worker_key and not hosted.started.is_set() for hosted in self._hosted_workers.values()
+        )
+        if starting or worker_key in self._spawns_in_flight:
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details=f"A worker for library '{library_name}' is already starting for that session."
+            )
+        if (
+            worker_engine_id in self._hosted_workers
+            or worker_engine_id in self._workers
+            or worker_engine_id in self._remote_starts
+            or worker_engine_id == self.engine.get_engine_id()
+        ):
+            return worker_events.StartWorkerForEngineResultFailure(
+                result_details=(
+                    f"Attempted to start worker {worker_engine_id}. Failed because that ID is "
+                    "already in use on this engine."
+                )
+            )
+        return None
 
     def _start_refusal(
         self, library_name: str, session_id: str, worker_key: str
