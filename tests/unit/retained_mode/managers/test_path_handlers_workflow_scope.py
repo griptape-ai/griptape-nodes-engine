@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     PreviewGenerationPolicy,
     RegisterArtifactProviderRequest,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
@@ -241,9 +242,10 @@ class TestMacrosResolveForTheDispatchedWorkflow:
         assert not result.succeeded()
         assert "did not name one" in str(result.result_details)
 
-    def test_a_macro_without_a_workflow_builtin_needs_no_workflow_while_several_are_open(
+    def test_naming_no_workflow_while_several_are_open_fails_even_without_a_workflow_builtin(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
+        """Dispatch picks the workflow before the macro is read, so it can't tell the macro needs none."""
         _open(nothing_open, tmp_path / "a")
         _open(nothing_open, tmp_path / "b", beside=True)
 
@@ -251,7 +253,7 @@ class TestMacrosResolveForTheDispatchedWorkflow:
             nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{workspace_dir}/img.png"), variables={})
         )
 
-        assert isinstance(result, GetPathForMacroResultSuccess), result.result_details
+        assert isinstance(result, WorkflowNotNamedResultFailure)
 
 
 class TestNoWorkflow:

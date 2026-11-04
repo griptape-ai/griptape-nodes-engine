@@ -296,15 +296,10 @@ class TestCollectSidecarProvenance:
 
         assert result == {}
 
-    def test_with_no_workflow_records_the_workflow_paths_resolve_for(self) -> None:
-        engine = _make_engine()
-        workflow = _make_workflow(engine, workflow_name="only_open", flow_name="OnlyFlow")
-        engine.project_manager.workflow_for_paths.return_value = workflow
+    def test_with_no_workflow_records_nothing(self) -> None:
+        engine = _make_engine(workflow_name="in_context", flow_name="ContextFlow")
 
-        result = collect_sidecar_provenance(engine, None)
-
-        assert result["workflow"]["name"] == "only_open"
-        engine.project_manager.workflow_for_paths.assert_called_once_with(None)
+        assert collect_sidecar_provenance(engine, None) == {}
 
     def test_reads_the_given_workflow_not_the_context(self) -> None:
         engine = _make_engine(workflow_name="in_context", flow_name="ContextFlow")

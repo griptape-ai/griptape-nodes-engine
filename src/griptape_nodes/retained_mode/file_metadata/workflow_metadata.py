@@ -261,14 +261,11 @@ def collect_sidecar_provenance(engine: Engine, workflow: WorkflowRuntime | None)
 
     Args:
         engine: The engine whose flow manager and workflow registry supply the metadata.
-        workflow: The workflow the file was written for, or None, which records the provenance of
-            the workflow paths resolve for (`ProjectManager.workflow_for_paths`), if any.
+        workflow: The workflow the file was written for, or None, which records no provenance.
 
     Returns:
         Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
     """
-    if workflow is None:
-        workflow = engine.project_manager.workflow_for_paths(None)
     if workflow is None:
         return {}
     raw = _collect_raw_provenance_in(engine, workflow)

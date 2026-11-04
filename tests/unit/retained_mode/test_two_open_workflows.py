@@ -582,6 +582,7 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
 
 # What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
 _FAIL_WITHOUT_AN_ID = {
+    "ResolveMacroPathRequest {workspace_dir}",
     "ResolveMacroPathRequest {workflow_dir}",
     "GetWorkflowContextRequest",
     "ListFlowsInCurrentContextRequest",

@@ -17,6 +17,25 @@ ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
         "ExecuteNodeRequest",
         "GetPublishOptionsRequest",
         "GetWorkflowRunCommandRequest",
+        # Paths, macros and file provenance resolve {workflow_dir} for the open workflow.
+        "AttemptMapAbsolutePathToProjectRequest",
+        "AttemptMatchPathAgainstMacroRequest",
+        "CreateStaticFileDownloadUrlFromPathRequest",
+        "CreateStaticFileDownloadUrlRequest",
+        "CreateStaticFileRequest",
+        "CreateStaticFileUploadUrlRequest",
+        "GeneratePreviewFromDefaultsRequest",
+        "GeneratePreviewRequest",
+        "GetNextVersionIndexRequest",
+        "GetPathForMacroRequest",
+        "GetPreviewForArtifactRequest",
+        "GetStateForMacroRequest",
+        "ListDirectoryRequest",
+        "ListDirectorySequencesRequest",
+        "ResolveMacroPathRequest",
+        "ScanSequencesRequest",
+        "WriteFileRequest",
+        "WriteTempFileRequest",
     }
 )
 

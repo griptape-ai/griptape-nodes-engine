@@ -150,7 +150,6 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     rename_project_template,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -1715,8 +1714,8 @@ class ProjectManager(EngineScoped):
     ) -> GetPathForMacroResultSuccess | GetPathForMacroResultFailure:
         """Resolve ANY macro schema with variables to final Path.
 
-        `{workflow_dir}` and `{workflow_name}` answer for `workflow_for_paths(workflow)`, and
-        cannot resolve when there is none.
+        `{workflow_dir}` and `{workflow_name}` answer for `workflow`, and cannot resolve when there is
+        none.
 
         Flow:
         1. Select the project (request.project_id; None = current)
@@ -2023,7 +2022,7 @@ class ProjectManager(EngineScoped):
         `ProjectVariableResolver` for the recursion and reference-lookup rules.
         """
         # Applied to the whole process, so no workflow's folder or name may leak into it.
-        resolver = self._build_variable_resolver(template, project_info, NO_WORKFLOW)
+        resolver = self._build_variable_resolver(template, project_info, None)
         for key in template.environment:
             try:
                 resolver.resolve_env(key)
@@ -2032,11 +2031,11 @@ class ProjectManager(EngineScoped):
         return dict(resolver.env_resolved)
 
     def _build_variable_resolver(
-        self, template: ProjectTemplate, project_info: ProjectInfo, workflow: WorkflowRuntime | NoWorkflow | None
+        self, template: ProjectTemplate, project_info: ProjectInfo, workflow: WorkflowRuntime | None
     ) -> ProjectVariableResolver:
         """Build a resolver that recursively resolves directories and env vars for this project.
 
-        Workflow builtins answer for `workflow_for_paths(workflow)`, or cannot resolve when there is none.
+        Workflow builtins answer for `workflow`, or cannot resolve when there is none.
         """
         return ProjectVariableResolver(
             template=template,
@@ -5031,15 +5030,15 @@ class ProjectManager(EngineScoped):
         return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
     def _get_builtin_variable_value(
-        self, var_name: str, project_info: ProjectInfo, workflow: WorkflowRuntime | NoWorkflow | None
+        self, var_name: str, project_info: ProjectInfo, workflow: WorkflowRuntime | None
     ) -> str:
         """Get the value of a single builtin variable.
 
         Args:
             var_name: Name of the builtin variable
             project_info: Information about the current project
-            workflow: The workflow handed to the request; `workflow_name` and `workflow_dir` answer
-                for `workflow_for_paths(workflow)`
+            workflow: The workflow handed to the request, which `workflow_name` and `workflow_dir`
+                answer for
 
         Returns:
             String value of the builtin variable
@@ -5048,8 +5047,6 @@ class ProjectManager(EngineScoped):
             ValueError: If var_name is not a recognized builtin variable
             NotImplementedError: If builtin variable is not yet implemented
             MacroNeedsWorkflowError: If var_name is a workflow builtin and there is no workflow
-            WorkflowNotNamedError: If var_name is a workflow builtin, `workflow` is None and several
-                workflows are open
         """
         match var_name:
             case "project_dir":
@@ -5063,16 +5060,14 @@ class ProjectManager(EngineScoped):
                 return self._resolve_builtin_workspace_dir()
 
             case "workflow_name":
-                for_paths = self.workflow_for_paths(workflow)
-                if for_paths is None:
+                if workflow is None:
                     raise MacroNeedsWorkflowError(var_name)
-                return self.engine.workflow_registry.get(for_paths.workflow_id).name
+                return self.engine.workflow_registry.get(workflow.workflow_id).name
 
             case "workflow_dir":
-                for_paths = self.workflow_for_paths(workflow)
-                if for_paths is None:
+                if workflow is None:
                     raise MacroNeedsWorkflowError(var_name)
-                return self._resolve_workflow_dir(project_info, for_paths)
+                return self._resolve_workflow_dir(project_info, workflow)
 
             case "static_files_dir":
                 return self._config_manager.get_config_value("static_files_directory", default="staticfiles")
@@ -5115,22 +5110,6 @@ class ProjectManager(EngineScoped):
         files land somewhere `{workspace_dir}` does not describe.
         """
         return str(self._config_manager.workspace_path)
-
-    def workflow_for_paths(self, workflow: WorkflowRuntime | NoWorkflow | None) -> WorkflowRuntime | None:
-        """The workflow a request's paths, macros and file provenance resolve for.
-
-        `workflow`, none for NO_WORKFLOW, else the engine's only open workflow: clients name no
-        workflow on the request envelope yet, and their path requests rely on the one open. The
-        fallback goes once clients send it.
-
-        Raises:
-            WorkflowNotNamedError: `workflow` is None and several workflows are open.
-        """
-        if workflow is NO_WORKFLOW:
-            return None
-        if workflow is not None:
-            return workflow
-        return self.engine.only_open_workflow_or_none()
 
     def _resolve_workflow_dir(self, project_info: ProjectInfo, workflow: WorkflowRuntime) -> str:
         """Resolve the `workflow_dir` builtin: the folder `workflow` belongs to.
