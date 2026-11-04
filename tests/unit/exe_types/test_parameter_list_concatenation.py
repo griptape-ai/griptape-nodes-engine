@@ -155,3 +155,16 @@ class TestSavedTypes:
         refs.input_types = refs.save_dict()["input_types"]
 
         assert refs.input_types == list_shaped
+
+    def test_a_list_restored_from_its_save_keeps_its_type_and_output_type(self) -> None:
+        node = MockNode()
+        node.add_parameter(ParameterList(name="refs", tooltip="t", type="Thing", output_type="Thing"))
+        refs = node.get_parameter_by_name("refs")
+        assert isinstance(refs, ParameterList)
+        saved = refs.save_dict()
+
+        refs.type = saved["type"]
+        refs.output_type = saved["output_type"]
+
+        assert refs.type == "list[Thing]"
+        assert refs.output_type == "list[Thing]"

@@ -294,9 +294,11 @@ class ParameterList(ParameterContainer):
         return data
 
     def save_dict(self) -> dict[str, Any]:
-        """Save the item types, which is what the `input_types` setter restores on load."""
+        """Save the item-level types, which is what the type setters restore on load."""
         data = super().save_dict()
+        data["type"] = super()._custom_getter_for_property_type()
         data["input_types"] = super()._custom_getter_for_property_input_types()
+        data["output_type"] = super()._custom_getter_for_property_output_type()
         return data
 
     def _custom_getter_for_property_type(self) -> str:
