@@ -44,6 +44,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
     SetWorkflowContextRequest,
+    SetWorkflowContextSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
@@ -104,6 +105,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsRequest,
     ListCallableWorkflowsRequest,
     RunWorkflowFromRegistryRequest,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultSuccess,
     SaveWorkflowRequest,
     SaveWorkflowResultSuccess,
 )
@@ -594,7 +599,6 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
     ("SaveWorkflowRequest", SaveWorkflowRequest),
     ("DeleteNodeRequest", lambda: DeleteNodeRequest(node_name="n")),
     ("EnsureWorkflowAndFlowRequest", lambda: EnsureWorkflowAndFlowRequest(display_name="C")),
-    ("SetWorkflowContextRequest", lambda: SetWorkflowContextRequest(display_name="C")),
 ]
 
 # What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
@@ -625,7 +629,6 @@ _FAIL_WITHOUT_AN_ID = {
     "SaveWorkflowRequest",
     "DeleteNodeRequest",
     "EnsureWorkflowAndFlowRequest",
-    "SetWorkflowContextRequest",
 }
 
 
@@ -673,6 +676,17 @@ class TestRequestsWithNoEnvelopeId:
         assert engine.open_workflows.all_open() == [a, b]
         assert _get(engine, a, "n") == ""
         assert _get(engine, b, "n") == ""
+
+    def test_opening_a_workflow_with_no_id_opens_it_beside_the_two(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+
+        result = _send(engine, SetWorkflowContextRequest(display_name="C"), None)
+
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert result.workflow_id is not None
+        assert engine.open_workflows.all_open() == [a, b, engine.open_workflows.get(result.workflow_id)]
 
     def test_clear_all_with_no_id_closes_every_open_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
@@ -1081,6 +1095,43 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert loaded is not a
         assert loaded.objects.get_filtered_subset() != {}
         assert a.objects.has("canvas")
+
+    def test_a_load_from_scratch_into_b_leaves_a_open_and_names_the_workflow_it_opened(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+        assert file_path is not None
+        _allow_several_open(engine)
+        a = _open(engine, "A")
+        b = _open(engine, "B")
+        _make_canvas(engine, a)
+
+        result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), b))
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
+        open_now = engine.open_workflows.all_open()
+        assert open_now[0] is a
+        assert b not in open_now
+        assert result.workflow_id == open_now[-1].workflow_id
+        assert a.objects.has("canvas")
+
+    def test_a_load_with_current_state_builds_into_the_workflow_it_names(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+        assert file_path is not None
+        _allow_several_open(engine)
+        a = _open(engine, "A")
+        b = _open(engine, "B")
+        _make_canvas(engine, a)
+
+        result = asyncio.run(_send_async(engine, RunWorkflowWithCurrentStateRequest(file_path=file_path), b))
+
+        assert isinstance(result, RunWorkflowWithCurrentStateResultSuccess), result.result_details
+        assert result.workflow_id == b.workflow_id
+        assert engine.open_workflows.all_open() == [a, b]
+        assert b.objects.get_filtered_subset() != {}
+        assert a.objects.get_filtered_subset().keys() == {"canvas"}
 
 
 class TestOtherSharedState:

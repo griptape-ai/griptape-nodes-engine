@@ -914,8 +914,7 @@ class WorkflowManager(EngineScoped):
 
         Builds into the current workflow, else opens the file as one.
         """
-        opens_workflow = not self.engine.context_manager.has_current_workflow()
-        return await self.runner.run_workflow(relative_file_path, opens_workflow=opens_workflow)
+        return await self.runner.run_workflow(relative_file_path, self.engine.current_workflow_or_none())
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
         """Extracts the input and output shape of the open workflow. See `shape.extract_workflow_shape`.

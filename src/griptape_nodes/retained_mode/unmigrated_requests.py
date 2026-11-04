@@ -1,8 +1,4 @@
-"""The engine request types whose handlers still rely on the workflow their clients don't name.
-
-An engine handler with no `workflow` parameter is HOST (see `RequestScope`), except for the request
-types in `AMBIENT_UNTIL_MIGRATED`, which act on the caller's workflow, else the only open one.
-Migrating a handler, by giving it a `workflow` parameter or confirming it is HOST, removes its entry.
+"""The engine request types whose clients don't name the workflow they act on yet.
 
 An OPTIONAL_WORKFLOW handler gets None when its request names no workflow, except for the request
 types in `ONLY_OPEN_UNTIL_CLIENTS_NAME`, whose clients don't name one yet: they get the only open
@@ -19,12 +15,14 @@ ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
         "ExecuteNodeRequest",
         "ExtractFlowCommandsFromImageMetadataRequest",
         "GetPublishOptionsRequest",
+        "GetWorkflowContextRequest",
         "GetTopLevelFlowRequest",
         "GetWorkflowRunCommandRequest",
         "ListFlowsInFlowRequest",
         "ListRunsRequest",
         "ResolveToolApprovalsRequest",
         "RunAgentRequest",
+        "RunWorkflowWithCurrentStateRequest",
         # Nodes calling from their own threads name no workflow yet.
         "BudgetAccessRequest",
         "DeclareModelInvocationRequest",
@@ -48,15 +46,5 @@ ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
         "ScanSequencesRequest",
         "WriteFileRequest",
         "WriteTempFileRequest",
-    }
-)
-
-AMBIENT_UNTIL_MIGRATED: frozenset[str] = frozenset(
-    {
-        "GetWorkflowContextRequest",
-        "RunWorkflowFromRegistryRequest",
-        "RunWorkflowFromScratchRequest",
-        "RunWorkflowWithCurrentStateRequest",
-        "SetWorkflowContextRequest",
     }
 )

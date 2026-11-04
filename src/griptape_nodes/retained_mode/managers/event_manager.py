@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
-from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED, ONLY_OPEN_UNTIL_CLIENTS_NAME
+from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -994,8 +994,8 @@ class EventManager(EngineScoped):
             owner: Given the request and its sender, the one engine allowed to send it, or None when
                 the request names nothing an engine owns. Only with `sender`.
             without_workflow: The scope of a callback with no `workflow` parameter. HOST for the
-                engine's handlers, except those in `AMBIENT_UNTIL_MIGRATED`. None for a library's,
-                which dispatch calls with the request alone, bound to the ambient workflow.
+                engine's handlers. None for a library's, which dispatch calls with the request alone,
+                bound to the ambient workflow.
 
         Raises:
             ValueError: The request type already has a handler.
@@ -1011,7 +1011,7 @@ class EventManager(EngineScoped):
         # A library handler that names no `workflow` stays ambient, even one taking *args or **kwargs.
         if without_workflow is not None or takes_workflow_parameter(callback):
             scope = scope_from_signature(callback)
-        if scope is None and request_type.__name__ not in AMBIENT_UNTIL_MIGRATED:
+        if scope is None:
             scope = without_workflow
         if request_type.__name__ in ONLY_OPEN_UNTIL_CLIENTS_NAME and scope is not RequestScope.OPTIONAL_WORKFLOW:
             msg = (

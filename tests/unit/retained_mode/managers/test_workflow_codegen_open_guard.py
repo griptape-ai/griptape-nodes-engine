@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # The guard files saved before carry in build_workflow().
 _SAVED_BEFORE_GUARD = """    context_manager = GriptapeNodes.ContextManager()
@@ -54,8 +55,8 @@ def _generate(engine: Engine, *, workflow_shape: WorkflowShape | None = None) ->
     )
 
 
-def _run(engine: Engine, path: Path, *, opens_workflow: bool) -> None:
-    result = asyncio.run(engine.workflow_manager.runner.run_workflow(str(path), opens_workflow=opens_workflow))
+def _run(engine: Engine, path: Path, workflow: WorkflowRuntime | None) -> None:
+    result = asyncio.run(engine.workflow_manager.runner.run_workflow(str(path), workflow))
     assert result.execution_successful, result.execution_details
 
 
@@ -74,13 +75,13 @@ class TestSavedWorkflowOpen:
         path = tmp_path / "saved.py"
         path.write_text(_generate(engine), encoding="utf-8")
 
-        _run(engine, path, opens_workflow=True)
+        _run(engine, path, None)
 
         [opened] = engine.open_workflows.all_open()
         assert engine.workflow_registry.get(opened.workflow_id).absolute_path == path.resolve()
         assert opened.objects.has("canvas")
 
-    def test_the_runner_builds_into_the_bound_workflow_however_many_are_open(
+    def test_the_runner_builds_into_the_workflow_it_is_handed_however_many_are_open(
         self, engine: Engine, tmp_path: Path
     ) -> None:
         path = tmp_path / "saved.py"
@@ -91,8 +92,7 @@ class TestSavedWorkflowOpen:
             engine.workflow_registry.register_unsaved("loading", listed=False).workflow_id
         )
 
-        with engine.bind_workflow(loading):
-            _run(engine, path, opens_workflow=False)
+        _run(engine, path, loading)
 
         assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
         assert loading.objects.has("canvas")
@@ -105,7 +105,7 @@ class TestSavedWorkflowOpen:
         signature = "async def build_workflow() -> None:\n"
         path.write_text(generated.replace(signature, signature + _SAVED_BEFORE_GUARD), encoding="utf-8")
 
-        _run(engine, path, opens_workflow=True)
+        _run(engine, path, None)
 
         [opened] = engine.open_workflows.all_open()
         assert opened.objects.has("canvas")
