@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -173,16 +174,17 @@ class StartFlowSpec(RunSpec):
     """A run of a whole flow, from a `StartFlowRequest`."""
 
     request: StartFlowRequest
+    workflow: WorkflowRuntime
     flow_name: str
 
     async def execute(self, engine: Engine) -> ResultPayload:
         try:
-            flow = engine.flow_manager.get_flow_by_name(self.flow_name)
+            flow = engine.flow_manager.get_flow_by_name_in(self.workflow, self.flow_name)
         except KeyError as err:
             return StartFlowResultFailure(
                 validation_exceptions=[err], result_details=f"Cannot start flow. Error: {err}"
             )
-        return await engine.flow_manager.execute_start_flow(self.request, self.flow_name, flow)
+        return await engine.flow_manager.execute_start_flow(self.request, self.workflow, self.flow_name, flow)
 
     def failure(self, details: str) -> ResultPayload:
         return StartFlowResultFailure(validation_exceptions=[], result_details=details)
@@ -193,20 +195,23 @@ class StartFlowFromNodeSpec(RunSpec):
     """A run of a flow from one of its nodes, from a `StartFlowFromNodeRequest`."""
 
     request: StartFlowFromNodeRequest
+    workflow: WorkflowRuntime
     flow_name: str
     node_name: str
 
     async def execute(self, engine: Engine) -> ResultPayload:
-        start_node = engine.object_manager.attempt_get_object_by_name_as_type(self.node_name, BaseNode)
+        start_node = self.workflow.objects.get_as_type(self.node_name, BaseNode)
         if not start_node:
             return self.failure(f"Provided node with name {self.node_name} does not exist")
         try:
-            flow = engine.flow_manager.get_flow_by_name(self.flow_name)
+            flow = engine.flow_manager.get_flow_by_name_in(self.workflow, self.flow_name)
         except KeyError as err:
             return StartFlowFromNodeResultFailure(
                 validation_exceptions=[err], result_details=f"Cannot start flow. Error: {err}"
             )
-        return await engine.flow_manager.execute_start_flow_from_node(self.request, self.flow_name, flow, start_node)
+        return await engine.flow_manager.execute_start_flow_from_node(
+            self.request, self.workflow, self.flow_name, flow, start_node
+        )
 
     def failure(self, details: str) -> ResultPayload:
         return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=details)
@@ -312,21 +317,24 @@ class FlowManager(EngineScoped):
             return None
         return workflow.flows
 
-    def _cleanup_flow_on_failed_deserialization(self, flow_name: str, *, pushed_flow_context: bool) -> None:
+    def _cleanup_flow_on_failed_deserialization(
+        self, workflow: WorkflowRuntime, flow_name: str, *, pushed_flow_context: bool
+    ) -> None:
         """Clean up a flow that failed during deserialization.
 
         This method deletes the flow (which cascades to delete all nodes and connections)
         and pops the flow context if it was pushed.
 
         Args:
+            workflow: The workflow the flow was deserialized into
             flow_name: The name of the flow to delete
             pushed_flow_context: Whether we pushed this flow to the context
         """
         if pushed_flow_context:
-            self.engine.context_manager.pop_flow()
+            workflow.context.pop_flow()
 
         delete_flow_request = DeleteFlowRequest(flow_name=flow_name)
-        delete_result = self.engine.handle_request(delete_flow_request)
+        delete_result = workflow.handle_request(delete_flow_request)
         if delete_result.failed():
             logger.warning(
                 "Failed to clean up flow '%s' after deserialization failure: %s",
@@ -334,15 +342,16 @@ class FlowManager(EngineScoped):
                 delete_result.result_details,
             )
 
-    def _has_connection(
+    def has_connection_in(
         self,
+        workflow: WorkflowRuntime,
         source_node: BaseNode,
         source_parameter: Parameter,
         target_node: BaseNode,
         target_parameter: Parameter,
     ) -> bool:
-        """Check if a connection exists."""
-        connected_outputs = self.get_connected_output_parameters(source_node, source_parameter)
+        """Check if a connection exists between the specified nodes and parameters."""
+        connected_outputs = self.get_connected_output_parameters_in(workflow, source_node, source_parameter)
         for connected_node, connected_param in connected_outputs:
             # By name, as the connection indexes are: a node can replace a connected parameter with
             # a same-named one, and the connection still holds the one it replaced.
@@ -351,17 +360,31 @@ class FlowManager(EngineScoped):
         return False
 
     def get_connected_output_parameters(self, node: BaseNode, param: Parameter) -> list[tuple[BaseNode, Parameter]]:
+        """Get connected output parameters.
+
+        Edge method for code not handed a workflow; engine code calls `get_connected_output_parameters_in`.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        workflow = self.engine.current_workflow()
+        return self.get_connected_output_parameters_in(workflow, node, param)
+
+    def get_connected_output_parameters_in(
+        self, workflow: WorkflowRuntime, node: BaseNode, param: Parameter
+    ) -> list[tuple[BaseNode, Parameter]]:
         """Get connected output parameters."""
         connections = []
-        if node.name in self._connections.outgoing_index:
-            outgoing_params = self._connections.outgoing_index[node.name]
+        connection_mgr = workflow.flows.connections
+        if node.name in connection_mgr.outgoing_index:
+            outgoing_params = connection_mgr.outgoing_index[node.name]
             if param.name in outgoing_params:
                 for connection_id in outgoing_params[param.name]:
-                    connection = self._connections.connections[connection_id]
+                    connection = workflow.flows.connections.connections[connection_id]
                     connections.append((connection.target_node, connection.target_parameter))
         return connections
 
-    def _get_connections_for_flow(self, flow: ControlFlow) -> list:
+    def _get_connections_for_flow(self, workflow: WorkflowRuntime, flow: ControlFlow) -> list:
         """Get connections where both nodes are in the specified flow or its child flows.
 
         For parent flows, this includes cross-flow connections between the parent and its children.
@@ -369,10 +392,11 @@ class FlowManager(EngineScoped):
         """
         flow_connections = []
         flow_name = flow.name
+        flows = workflow.flows
 
         # Get all child flow names for this flow
         child_flow_names = set()
-        for child_name, parent_name in self._name_to_parent_name.items():
+        for child_name, parent_name in flows.name_to_parent_name.items():
             if parent_name == flow_name:
                 child_flow_names.add(child_name)
 
@@ -384,15 +408,15 @@ class FlowManager(EngineScoped):
         # connections here would fail the whole save with a "node not found in UUID map" error.
         all_node_names = set(flow.nodes.keys())
         for child_flow_name in child_flow_names:
-            child_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(child_flow_name, ControlFlow)
+            child_flow = workflow.objects.get_as_type(child_flow_name, ControlFlow)
             if child_flow is None:
                 continue
-            if self.is_referenced_workflow(child_flow) or child_flow.metadata.get(TRANSIENT_KEY):
+            if self.is_referenced_workflow(workflow, child_flow) or child_flow.metadata.get(TRANSIENT_KEY):
                 continue
             all_node_names.update(child_flow.nodes.keys())
 
         # Include connections where both nodes are in this flow hierarchy
-        for connection in self._connections.connections.values():
+        for connection in flows.connections.connections.values():
             source_in_hierarchy = connection.source_node.name in all_node_names
             target_in_hierarchy = connection.target_node.name in all_node_names
 
@@ -402,8 +426,28 @@ class FlowManager(EngineScoped):
         return flow_connections
 
     def get_parent_flow(self, flow_name: str) -> str | None:
-        if flow_name in self._name_to_parent_name:
-            return self._name_to_parent_name[flow_name]
+        """The name of the flow's parent, None for the top-level flow.
+
+        Edge method for code not handed a workflow; engine code calls `get_parent_flow_in`.
+
+        Raises:
+            ValueError: No flow of that name is in the open workflow, or no workflow is open.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            msg = f"Flow with name {flow_name} doesn't exist"
+            raise ValueError(msg)
+        return self.get_parent_flow_in(workflow, flow_name)
+
+    def get_parent_flow_in(self, workflow: WorkflowRuntime, flow_name: str) -> str | None:
+        """The name of the flow's parent, None for the top-level flow.
+
+        Raises:
+            ValueError: No flow of that name is in the workflow.
+        """
+        name_to_parent_name = workflow.flows.name_to_parent_name
+        if flow_name in name_to_parent_name:
+            return name_to_parent_name[flow_name]
         msg = f"Flow with name {flow_name} doesn't exist"
         raise ValueError(msg)
 
@@ -425,6 +469,8 @@ class FlowManager(EngineScoped):
         editor already acts on, and because the editor derives group nesting from ``parent_group``
         rather than from flow parentage. An editor feature that reads flow parentage directly would
         need this promoted to a request first.
+
+        Edge method for code not handed a workflow.
 
         Args:
             flow_name: The Flow to move
@@ -456,49 +502,68 @@ class FlowManager(EngineScoped):
 
         self._name_to_parent_name[flow_name] = new_parent_flow_name
 
-    def is_referenced_workflow(self, flow: ControlFlow) -> bool:
+    def is_referenced_workflow(self, workflow: WorkflowRuntime, flow: ControlFlow) -> bool:
         """Check if this flow was created by importing a referenced workflow.
 
         Returns True if this flow originated from a workflow import operation,
         False if it was created standalone.
         """
-        return flow in self._flow_to_referenced_workflow_name
+        return flow in workflow.flows.flow_to_referenced_workflow_name
 
-    def get_referenced_workflow_name(self, flow: ControlFlow) -> str | None:
+    def get_referenced_workflow_name(self, workflow: WorkflowRuntime, flow: ControlFlow) -> str | None:
         """Get the name of the referenced workflow, if any.
 
         Returns the workflow name that was imported to create this flow,
         or None if this flow was created standalone.
         """
-        return self._flow_to_referenced_workflow_name.get(flow)
+        return workflow.flows.flow_to_referenced_workflow_name.get(flow)
+
+    def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:
+        """Find the open workflow's top-level flow, outside dispatch.
+
+        Edge method for code that calls the handler directly and is not handed a workflow; dispatch
+        calls `on_get_top_level_flow_request_in_workflow`. With no workflow open there is none.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            msg = "Attempted to get top level flow, but no such flow exists"
+            logger.debug(msg)
+            return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
+        return self.on_get_top_level_flow_request_in_workflow(request, workflow)
 
     @handles(GetTopLevelFlowRequest)
-    def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:  # noqa: ARG002 (the request has to be assigned to the method)
-        flows = self._current_flows_or_none()
-        if flows is not None:
-            for flow_name, parent in flows.name_to_parent_name.items():
-                if parent is None:
-                    return GetTopLevelFlowResultSuccess(
-                        flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
-                    )
+    def on_get_top_level_flow_request_in_workflow(
+        self,
+        request: GetTopLevelFlowRequest,  # noqa: ARG002 (the request has to be assigned to the method)
+        workflow: WorkflowRuntime | None = None,
+    ) -> ResultPayload:
+        """Find `workflow`'s top-level flow. With no workflow there is none."""
+        names = {}
+        if workflow is not None:
+            names = workflow.flows.name_to_parent_name
+        for flow_name, parent in names.items():
+            if parent is None:
+                return GetTopLevelFlowResultSuccess(
+                    flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
+                )
         msg = "Attempted to get top level flow, but no such flow exists"
         logger.debug(msg)
         return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
 
     @handles(GetFlowDetailsRequest)
-    def on_get_flow_details_request(self, request: GetFlowDetailsRequest) -> ResultPayload:
+    def on_get_flow_details_request(self, request: GetFlowDetailsRequest, workflow: WorkflowRuntime) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
 
         if flow_name is None:
             # We want to get details for whatever is at the top of the Current Context.
-            if not self.engine.context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 details = "Attempted to get Flow details from the Current Context. Failed because the Current Context was empty."
                 return GetFlowDetailsResultFailure(result_details=details)
-            flow = self.engine.context_manager.get_current_flow()
+            flow = workflow.context.get_current_flow()
             flow_name = flow.name
         else:
-            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
             if flow is None:
                 details = (
                     f"Attempted to get Flow details for '{flow_name}'. Failed because no Flow with that name exists."
@@ -506,14 +571,14 @@ class FlowManager(EngineScoped):
                 return GetFlowDetailsResultFailure(result_details=details)
 
         try:
-            parent_flow_name = self.get_parent_flow(flow_name)
+            parent_flow_name = self.get_parent_flow_in(workflow, flow_name)
         except ValueError:
             details = f"Attempted to get Flow details for '{flow_name}'. Failed because Flow does not exist in parent mapping."
             return GetFlowDetailsResultFailure(result_details=details)
 
         referenced_workflow_name = None
-        if self.is_referenced_workflow(flow):
-            referenced_workflow_name = self.get_referenced_workflow_name(flow)
+        if self.is_referenced_workflow(workflow, flow):
+            referenced_workflow_name = self.get_referenced_workflow_name(workflow, flow)
 
         flow_type = flow.metadata.get("flow_type")
 
@@ -526,22 +591,21 @@ class FlowManager(EngineScoped):
         )
 
     @handles(GetFlowMetadataRequest)
-    def on_get_flow_metadata_request(self, request: GetFlowMetadataRequest) -> ResultPayload:
+    def on_get_flow_metadata_request(self, request: GetFlowMetadataRequest, workflow: WorkflowRuntime) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
         if flow_name is None:
             # Get from the current context.
-            if not self.engine.context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 details = "Attempted to get metadata for a Flow from the Current Context. Failed because the Current Context is empty."
                 return GetFlowMetadataResultFailure(result_details=details)
 
-            flow = self.engine.context_manager.get_current_flow()
+            flow = workflow.context.get_current_flow()
             flow_name = flow.name
 
         # Does this flow exist?
         if flow is None:
-            obj_mgr = self.engine.object_manager
-            flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to get metadata for a Flow '{flow_name}', but no such Flow was found."
                 return GetFlowMetadataResultFailure(result_details=details)
@@ -552,22 +616,21 @@ class FlowManager(EngineScoped):
         return GetFlowMetadataResultSuccess(metadata=metadata, result_details=details)
 
     @handles(SetFlowMetadataRequest)
-    def on_set_flow_metadata_request(self, request: SetFlowMetadataRequest) -> ResultPayload:
+    def on_set_flow_metadata_request(self, request: SetFlowMetadataRequest, workflow: WorkflowRuntime) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
         if flow_name is None:
             # Get from the current context.
-            if not self.engine.context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 details = "Attempted to set metadata for a Flow from the Current Context. Failed because the Current Context is empty."
                 return SetFlowMetadataResultFailure(result_details=details)
 
-            flow = self.engine.context_manager.get_current_flow()
+            flow = workflow.context.get_current_flow()
             flow_name = flow.name
 
         # Does this flow exist?
         if flow is None:
-            obj_mgr = self.engine.object_manager
-            flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to set metadata for a Flow '{flow_name}', but no such Flow was found."
                 return SetFlowMetadataResultFailure(result_details=details)
@@ -579,15 +642,12 @@ class FlowManager(EngineScoped):
 
         return SetFlowMetadataResultSuccess(result_details=details)
 
-    def does_canvas_exist(self) -> bool:
+    def does_canvas_exist(self, workflow: WorkflowRuntime) -> bool:
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""
-        flows = self._current_flows_or_none()
-        if flows is None:
-            return False
-        return any([parent is None for parent in flows.name_to_parent_name.values()])  # noqa: C419
+        return any([parent is None for parent in workflow.flows.name_to_parent_name.values()])  # noqa: C419
 
     @handles(CreateFlowRequest)
-    def on_create_flow_request(self, request: CreateFlowRequest) -> ResultPayload:
+    def on_create_flow_request(self, request: CreateFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         # Who is the parent?
         parent_name = request.parent_flow_name
 
@@ -598,17 +658,17 @@ class FlowManager(EngineScoped):
         # We'll explore #1 first by seeing if the Context Manager already has a current flow,
         # which would mean the canvas is already established:
         parent = None
-        if (parent_name is None) and (self.engine.context_manager.has_current_flow()):
+        if (parent_name is None) and (workflow.context.has_current_flow()):
             # Aha! Just use that.
-            parent = self.engine.context_manager.get_current_flow()
+            parent = workflow.context.get_current_flow()
             parent_name = parent.name
 
         # TODO: FIX THIS LOGIC MESS https://github.com/griptape-ai/griptape-nodes/issues/616
 
         if parent_name is not None and parent is None:
-            parent = self.engine.object_manager.attempt_get_object_by_name_as_type(parent_name, ControlFlow)
+            parent = workflow.objects.get_as_type(parent_name, ControlFlow)
         if parent_name is None:
-            if self.does_canvas_exist():
+            if self.does_canvas_exist(workflow):
                 # We're trying to create the canvas. Ensure that parent does NOT already exist.
                 details = "Attempted to create a Flow as the Canvas (top-level Flow with no parents), but the Canvas already exists."
                 result = CreateFlowResultFailure(result_details=details)
@@ -621,31 +681,25 @@ class FlowManager(EngineScoped):
 
             return result
 
-        # We need to have a current workflow context to proceed.
-        if not self.engine.context_manager.has_current_workflow():
-            details = "Attempted to create a Flow, but no Workflow was active in the Current Context."
-            return CreateFlowResultFailure(result_details=details)
-
         # Create it.
-        final_flow_name = self.engine.object_manager.generate_name_for_object(
-            type_name="ControlFlow", requested_name=request.flow_name
-        )
+        final_flow_name = workflow.objects.generate_name(type_name="ControlFlow", requested_name=request.flow_name)
         # Check if we're creating this flow within a referenced workflow context
         # This will inform the engine to maintain a reference to the workflow
         # when serializing it. It may inform the editor to render it differently.
         workflow_manager = self.engine.workflow_manager
         flow = ControlFlow(name=final_flow_name, engine=self.engine, metadata=request.metadata)
-        self.engine.object_manager.add_object_by_name(name=final_flow_name, obj=flow)
-        self._name_to_parent_name[final_flow_name] = parent_name
+        workflow.objects.add(final_flow_name, flow)
+        flows = workflow.flows
+        flows.name_to_parent_name[final_flow_name] = parent_name
 
         # Track referenced workflow if this flow was created within a referenced workflow context
         if workflow_manager.has_current_referenced_workflow():
             referenced_workflow_name = workflow_manager.get_current_referenced_workflow()
-            self._flow_to_referenced_workflow_name[flow] = referenced_workflow_name
+            workflow.flows.flow_to_referenced_workflow_name[flow] = referenced_workflow_name
 
         # See if we need to push it as the current context.
         if request.set_as_new_context:
-            self.engine.context_manager.push_flow(flow)
+            workflow.context.push_flow(flow)
 
         # Success
         details = f"Successfully created Flow '{final_flow_name}'."
@@ -661,79 +715,78 @@ class FlowManager(EngineScoped):
 
     # This needs to have a lot of branches to check the flow in all possible situations. In Current Context, or when the name is passed in.
     @handles(DeleteFlowRequest)
-    def on_delete_flow_request(self, request: DeleteFlowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_delete_flow_request(self, request: DeleteFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         flow_name = request.flow_name
         flow = None
         if flow_name is None:
             # We want to delete whatever is at the top of the Current Context.
-            if not self.engine.context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 details = (
                     "Attempted to delete a Flow from the Current Context. Failed because the Current Context was empty."
                 )
                 result = DeleteFlowResultFailure(result_details=details)
                 return result
             # We pop it off here, but we'll re-add it using context in a moment.
-            flow = self.engine.context_manager.pop_flow()
+            flow = workflow.context.pop_flow()
 
         # Does this Flow even exist?
         if flow is None and flow_name is not None:
-            obj_mgr = self.engine.object_manager
-            flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
         if flow is None:
             details = f"Attempted to delete Flow '{flow_name}', but no Flow with that name could be found."
             result = DeleteFlowResultFailure(result_details=details)
             return result
 
         # Before the cancel below, which would start the next waiting run against the flow being deleted.
-        flows = self._current_flows()
+        flows = workflow.flows
         self._turn_away(flows, flows.run_queue.runs_for_flow(flow.name), f"its flow '{flow.name}' was deleted.")
 
         # Only cancel if the flow being deleted is the one tracked by the global control flow machine.
         # Isolated subflows (e.g., ForEach loop iterations) have their own separate ControlFlowMachine
         # and should not trigger cancellation of the global machine.
+        running_machine = workflow.flows.global_control_flow_machine
         if (
-            self.check_for_existing_running_flow()
-            and self._global_control_flow_machine is not None
-            and self._global_control_flow_machine.context.flow_name == flow.name
+            self._flow_is_running(workflow.flows)
+            and running_machine is not None
+            and running_machine.context.flow_name == flow.name
         ):
-            result = self.engine.handle_request(CancelFlowRequest(flow_name=flow.name))
+            result = workflow.handle_request(CancelFlowRequest(flow_name=flow.name))
             if result.failed():
                 details = f"Attempted to delete flow '{flow_name}'. Failed because running flow could not cancel."
                 return DeleteFlowResultFailure(result_details=details)
 
         # Let this Flow assume the Current Context while we delete everything within it.
-        with self.engine.context_manager.flow(flow=flow):
+        with workflow.context.flow(flow):
             # Delete all child Flows of this Flow.
             # Note: We use ListFlowsInCurrentContextRequest here instead of ListFlowsInFlowRequest(parent_flow_name=None)
             # because None in ListFlowsInFlowRequest means "get canvas/top-level flows". We want the flows in the
             # current context, which is the flow we're deleting.
             list_flows_request = ListFlowsInCurrentContextRequest()
-            list_flows_result = self.engine.handle_request(list_flows_request)
+            list_flows_result = workflow.handle_request(list_flows_request)
             if not isinstance(list_flows_result, ListFlowsInCurrentContextResultSuccess):
                 details = f"Attempted to delete Flow '{flow_name}', but failed while attempting to get the list of Flows owned by this Flow."
                 result = DeleteFlowResultFailure(result_details=details)
                 return result
             flow_names = list_flows_result.flow_names
-            obj_mgr = self.engine.object_manager
             for child_flow_name in flow_names:
-                child_flow = obj_mgr.attempt_get_object_by_name_as_type(child_flow_name, ControlFlow)
+                child_flow = workflow.objects.get_as_type(child_flow_name, ControlFlow)
                 if child_flow is None:
                     details = (
                         f"Attempted to delete Flow '{child_flow_name}', but no Flow with that name could be found."
                     )
                     result = DeleteFlowResultFailure(result_details=details)
                     return result
-                with self.engine.context_manager.flow(flow=child_flow):
+                with workflow.context.flow(child_flow):
                     # Delete them.
                     delete_flow_request = DeleteFlowRequest(flow_name=child_flow_name)
-                    delete_flow_result = self.engine.handle_request(delete_flow_request)
+                    delete_flow_result = workflow.handle_request(delete_flow_request)
                     if isinstance(delete_flow_result, DeleteFlowResultFailure):
                         details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Flow '{child_flow.name}'."
                         result = DeleteFlowResultFailure(result_details=details)
                         return result
             # Delete all child nodes in this Flow.
             list_nodes_request = ListNodesInFlowRequest()
-            list_nodes_result = self.engine.handle_request(list_nodes_request)
+            list_nodes_result = workflow.handle_request(list_nodes_request)
             if not isinstance(list_nodes_result, ListNodesInFlowResultSuccess):
                 details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to get the list of Nodes owned by this Flow."
                 result = DeleteFlowResultFailure(result_details=details)
@@ -741,7 +794,7 @@ class FlowManager(EngineScoped):
             node_names = list_nodes_result.node_names
             for node_name in node_names:
                 delete_node_request = DeleteNodeRequest(node_name=node_name)
-                delete_node_result = self.engine.handle_request(delete_node_request)
+                delete_node_result = workflow.handle_request(delete_node_request)
                 if isinstance(delete_node_result, DeleteNodeResultFailure):
                     details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Node '{node_name}'."
                     result = DeleteFlowResultFailure(result_details=details)
@@ -749,48 +802,50 @@ class FlowManager(EngineScoped):
 
             # If we've made it this far, we have deleted all the children Flows and their nodes.
             # Remove the flow from our map.
-            self.forget_empty_flow(flow)
+            self.forget_empty_flow(workflow, flow)
 
             # Clean up ControlFlowMachine and DAG orchestrator only if this is the global flow.
             # Isolated subflows have their own machines and should not clear the global state.
             if (
-                self._global_control_flow_machine is not None
-                and self._global_control_flow_machine.context.flow_name == flow.name
+                workflow.flows.global_control_flow_machine is not None
+                and workflow.flows.global_control_flow_machine.context.flow_name == flow.name
             ):
-                self._global_control_flow_machine = None
-                self._global_dag_builder.clear()
+                workflow.flows.global_control_flow_machine = None
+                workflow.flows.global_dag_builder.clear()
                 self._finish_run_if_over(flows)
 
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)
         return result
 
-    def forget_empty_flow(self, flow: ControlFlow) -> None:
+    def forget_empty_flow(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
         """Drop an empty flow from the records.
 
         The part of deleting a flow that a worker discarding its copy's flow shares. Not a delete:
         ``DeleteFlowRequest`` deletes the flow's nodes as well, which releases what they cached.
         """
-        self.engine.object_manager.del_obj_by_name(flow.name)
-        del self._name_to_parent_name[flow.name]
+        workflow.objects.remove(flow.name)
+        flows = workflow.flows
+        del flows.name_to_parent_name[flow.name]
 
         # Clean up referenced workflow tracking
-        if flow in self._flow_to_referenced_workflow_name:
-            del self._flow_to_referenced_workflow_name[flow]
+        if flow in flows.flow_to_referenced_workflow_name:
+            del flows.flow_to_referenced_workflow_name[flow]
 
     @handles(GetIsFlowRunningRequest)
-    def on_get_is_flow_running_request(self, request: GetIsFlowRunningRequest) -> ResultPayload:
-        obj_mgr = self.engine.object_manager
+    def on_get_is_flow_running_request(
+        self, request: GetIsFlowRunningRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         if request.flow_name is None:
             details = "Attempted to get Flow, but no flow name was provided."
             return GetIsFlowRunningResultFailure(result_details=details)
-        flow = obj_mgr.attempt_get_object_by_name_as_type(request.flow_name, ControlFlow)
+        flow = workflow.objects.get_as_type(request.flow_name, ControlFlow)
         if flow is None:
             details = f"Attempted to get Flow '{request.flow_name}', but no Flow with that name could be found."
             result = GetIsFlowRunningResultFailure(result_details=details)
             return result
         try:
-            is_running = self.check_for_existing_running_flow()
+            is_running = self._flow_is_running(workflow.flows)
         except Exception:
             details = f"Error while trying to get status of '{request.flow_name}'."
             result = GetIsFlowRunningResultFailure(result_details=details)
@@ -799,23 +854,36 @@ class FlowManager(EngineScoped):
             is_running=is_running, result_details=f"Successfully checked if flow is running: {is_running}"
         )
 
-    @handles(ListNodesInFlowRequest)
     def on_list_nodes_in_flow_request(self, request: ListNodesInFlowRequest) -> ResultPayload:
+        """Answer `request` for the open workflow, outside dispatch.
+
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_list_nodes_in_flow_request_in_workflow`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            details = "Attempted to list Nodes in a Flow. Failed because no workflow is open."
+            return ListNodesInFlowResultFailure(result_details=details)
+        return self.on_list_nodes_in_flow_request_in_workflow(request, workflow=workflow)
+
+    @handles(ListNodesInFlowRequest)
+    def on_list_nodes_in_flow_request_in_workflow(
+        self, request: ListNodesInFlowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
         if flow_name is None:
             # First check if we have a current flow
-            if not self.engine.context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 details = "Attempted to list Nodes in a Flow in the Current Context. Failed because the Current Context was empty."
                 result = ListNodesInFlowResultFailure(result_details=details)
                 return result
             # Get the current flow from context
-            flow = self.engine.context_manager.get_current_flow()
+            flow = workflow.context.get_current_flow()
             flow_name = flow.name
         # Does this Flow even exist?
         if flow is None:
-            obj_mgr = self.engine.object_manager
-            flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
         if flow is None:
             details = (
                 f"Attempted to list Nodes in Flow '{flow_name}'. Failed because no Flow with that name could be found."
@@ -834,23 +902,28 @@ class FlowManager(EngineScoped):
         return result
 
     @handles(ListFlowsInFlowRequest)
-    def on_list_flows_in_flow_request(self, request: ListFlowsInFlowRequest) -> ResultPayload:
+    def on_list_flows_in_flow_request(
+        self, request: ListFlowsInFlowRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """List the flows directly under the request's parent flow in `workflow`. With no workflow there are none."""
         if request.parent_flow_name is not None:
             # Does this Flow even exist?
-            obj_mgr = self.engine.object_manager
-            flow = obj_mgr.attempt_get_object_by_name_as_type(request.parent_flow_name, ControlFlow)
+            flow = None
+            if workflow is not None:
+                flow = workflow.objects.get_as_type(request.parent_flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to list Flows that are children of Flow '{request.parent_flow_name}', but no Flow with that name could be found."
                 result = ListFlowsInFlowResultFailure(result_details=details)
                 return result
 
-        # Create a list of all child flow names that point DIRECTLY to us. With no workflow open there are none.
+        # Create a list of all child flow names that point DIRECTLY to us.
         ret_list = []
-        flows = self._current_flows_or_none()
-        if flows is not None:
-            for flow_name, parent_name in flows.name_to_parent_name.items():
-                if parent_name == request.parent_flow_name:
-                    ret_list.append(flow_name)
+        if workflow is not None:
+            ret_list = [
+                flow_name
+                for flow_name, parent_name in workflow.flows.name_to_parent_name.items()
+                if parent_name == request.parent_flow_name
+            ]
 
         details = f"Successfully got the list of Flows that are direct children of Flow '{request.parent_flow_name}'."
 
@@ -858,8 +931,26 @@ class FlowManager(EngineScoped):
         return result
 
     def get_flow_by_name(self, flow_name: str) -> ControlFlow:
-        obj_mgr = self.engine.object_manager
-        flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+        """The open workflow's flow named `flow_name`.
+
+        Edge method for code not handed a workflow; engine code calls `get_flow_by_name_in`.
+
+        Raises:
+            KeyError: No flow of that name is in the open workflow, or no workflow is open.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            msg = f"Flow with name {flow_name} doesn't exist"
+            raise KeyError(msg)
+        return self.get_flow_by_name_in(workflow, flow_name)
+
+    def get_flow_by_name_in(self, workflow: WorkflowRuntime, flow_name: str) -> ControlFlow:
+        """The workflow's flow named `flow_name`.
+
+        Raises:
+            KeyError: No flow of that name is in the workflow.
+        """
+        flow = workflow.objects.get_as_type(flow_name, ControlFlow)
         if flow is None:
             msg = f"Flow with name {flow_name} doesn't exist"
             raise KeyError(msg)
@@ -869,6 +960,8 @@ class FlowManager(EngineScoped):
     def unresolve_all_nodes_in_flow(self, flow_name: str) -> None:
         """Reset all nodes in a flow to UNRESOLVED state.
 
+        Edge method for code not handed a workflow.
+
         Args:
             flow_name: Name of the flow whose nodes should be unresolved
         """
@@ -876,37 +969,52 @@ class FlowManager(EngineScoped):
         for node in flow.nodes.values():
             node.state = NodeResolutionState.UNRESOLVED
 
-    def handle_flow_rename(self, old_name: str, new_name: str) -> None:
+    def handle_flow_rename(self, workflow: WorkflowRuntime, old_name: str, new_name: str) -> None:
         # Replace the old flow name and its parent first.
-        parent = self._name_to_parent_name[old_name]
-        self._name_to_parent_name[new_name] = parent
-        del self._name_to_parent_name[old_name]
+        name_to_parent_name = workflow.flows.name_to_parent_name
+        parent = name_to_parent_name[old_name]
+        name_to_parent_name[new_name] = parent
+        del name_to_parent_name[old_name]
 
         # Now iterate through everyone who pointed to the old one as a parent and update it.
-        for flow_name, parent_name in self._name_to_parent_name.items():
+        for flow_name, parent_name in name_to_parent_name.items():
             if parent_name == old_name:
-                self._name_to_parent_name[flow_name] = new_name
+                name_to_parent_name[flow_name] = new_name
 
         # Let the Node Manager know about the change, too.
-        self.engine.node_manager.handle_flow_rename(old_name=old_name, new_name=new_name)
+        self.engine.node_manager.handle_flow_rename(workflow, old_name=old_name, new_name=new_name)
+
+    def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
+        """Connect two parameters in the open workflow, outside dispatch.
+
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_create_connection_request_in_workflow`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            details = f'Connection "{request.source_node_name}.{request.source_parameter_name}" to "{request.target_node_name}.{request.target_parameter_name}" failed because no workflow is open.'
+            return CreateConnectionResultFailure(result_details=details)
+        return self.on_create_connection_request_in_workflow(request, workflow)
 
     @handles(CreateConnectionRequest)
-    def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    def on_create_connection_request_in_workflow(  # noqa: PLR0911, PLR0912, PLR0915, C901
+        self, request: CreateConnectionRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         # Vet the two nodes first.
         source_node_name = request.source_node_name
         source_node = None
         if source_node_name is None:
             # First check if we have a current node
-            if not self.engine.context_manager.has_current_node():
+            if not workflow.context.has_current_node():
                 details = "Attempted to create a Connection with a source node from the Current Context. Failed because the Current Context was empty."
                 return CreateConnectionResultFailure(result_details=details)
 
             # Get the current node from context
-            source_node = self.engine.context_manager.get_current_node()
+            source_node = workflow.context.get_current_node()
             source_node_name = source_node.name
         if source_node is None:
             try:
-                source_node = self.engine.node_manager.get_node_by_name(source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError as err:
                 details = f'Connection failed: "{source_node_name}" does not exist. Error: {err}.'
 
@@ -916,16 +1024,16 @@ class FlowManager(EngineScoped):
         target_node = None
         if target_node_name is None:
             # First check if we have a current node
-            if not self.engine.context_manager.has_current_node():
+            if not workflow.context.has_current_node():
                 details = "Attempted to create a Connection with the target node from the Current Context. Failed because the Current Context was empty."
                 return CreateConnectionResultFailure(result_details=details)
 
             # Get the current node from context
-            target_node = self.engine.context_manager.get_current_node()
+            target_node = workflow.context.get_current_node()
             target_node_name = target_node.name
         if target_node is None:
             try:
-                target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                target_node = self.engine.node_manager.get_node_by_name_in(workflow, target_node_name)
             except ValueError as err:
                 details = f'Connection failed: "{target_node_name}" does not exist. Error: {err}.'
                 return CreateConnectionResultFailure(result_details=details)
@@ -934,16 +1042,16 @@ class FlowManager(EngineScoped):
         # Get the parent flows.
         source_flow_name = None
         try:
-            source_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(source_node_name)
-            self.get_flow_by_name(flow_name=source_flow_name)
+            source_flow_name = workflow.nodes.parent_flow_name(source_node_name)
+            self.get_flow_by_name_in(workflow, source_flow_name)
         except KeyError as err:
             details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" failed: {err}.'
             return CreateConnectionResultFailure(result_details=details)
 
         target_flow_name = None
         try:
-            target_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(target_node_name)
-            self.get_flow_by_name(flow_name=target_flow_name)
+            target_flow_name = workflow.nodes.parent_flow_name(target_node_name)
+            self.get_flow_by_name_in(workflow, target_flow_name)
         except KeyError as err:
             details = f'Connection "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}" failed: {err}.'
             return CreateConnectionResultFailure(result_details=details)
@@ -1024,7 +1132,7 @@ class FlowManager(EngineScoped):
 
         # Some scenarios restrict when we can have more than one connection. See if we're in such a scenario and replace the
         # existing connection instead of adding a new one.
-        connection_mgr = self._connections
+        connection_mgr = workflow.flows.connections
         # Try the OUTGOING restricted scenario first.
         restricted_scenario_connection = connection_mgr.get_existing_connection_for_restricted_scenario(
             node=source_node, parameter=source_param, is_source=True
@@ -1048,7 +1156,7 @@ class FlowManager(EngineScoped):
                 target_node_name=old_target_node_name,
                 target_parameter_name=old_target_param_name,
             )
-            delete_old_result = self.engine.handle_request(delete_old_request)
+            delete_old_result = workflow.handle_request(delete_old_request)
             if delete_old_result.failed():
                 details = f"Attempted to connect '{source_node_name}.{request.source_parameter_name}'. Failed because there was a previous connection from '{old_source_node_name}.{old_source_param_name}' to '{old_target_node_name}.{old_target_param_name}' that could not be deleted."
                 return CreateConnectionResultFailure(result_details=details)
@@ -1081,7 +1189,7 @@ class FlowManager(EngineScoped):
             else:
                 # If not true, we default to the request
                 is_node_group_internal = request.is_node_group_internal
-            conn = self._connections.add_connection(
+            conn = workflow.flows.connections.add_connection(
                 source_node=source_node,
                 source_parameter=source_param,
                 target_node=target_node,
@@ -1106,7 +1214,7 @@ class FlowManager(EngineScoped):
                     target_parameter_name=old_target_param_name,
                     initial_setup=request.initial_setup,
                 )
-                create_old_connection_result = self.engine.handle_request(create_old_connection_request)
+                create_old_connection_result = workflow.handle_request(create_old_connection_request)
                 if create_old_connection_result.failed():
                     details = "Failed attempting to restore the old Connection after failing the replacement. A thousand pardons."
             return CreateConnectionResultFailure(result_details=details)
@@ -1205,7 +1313,7 @@ class FlowManager(EngineScoped):
             # When creating a connection, pass the initial value from source to target parameter
             # Set incoming_connection_source fields to identify this as legitimate connection value passing
             # (not manual property setting) so it bypasses the INPUT+PROPERTY connection blocking logic
-            self.engine.handle_request(
+            workflow.handle_request(
                 SetParameterValueRequest(
                     parameter_name=target_param.name,
                     node_name=target_node.name,
@@ -1225,7 +1333,7 @@ class FlowManager(EngineScoped):
                     {NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
                 )
             )
-            self._connections.unresolve_future_nodes(target_node)
+            workflow.flows.connections.unresolve_future_nodes(target_node)
 
         # Check if either node is ErrorProxyNode and mark connection modification if not initial_setup
         if not request.initial_setup:
@@ -1238,8 +1346,22 @@ class FlowManager(EngineScoped):
 
         return result
 
+    def on_delete_connection_request(self, request: DeleteConnectionRequest) -> ResultPayload:
+        """Disconnect two parameters in the open workflow, outside dispatch.
+
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_delete_connection_request_in_workflow`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            details = f'Connection not deleted "{request.source_node_name}.{request.source_parameter_name}" to "{request.target_node_name}.{request.target_parameter_name}" because no workflow is open.'
+            return DeleteConnectionResultFailure(result_details=details)
+        return self.on_delete_connection_request_in_workflow(request, workflow)
+
     @handles(DeleteConnectionRequest)
-    def on_delete_connection_request(self, request: DeleteConnectionRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (complex logic, multiple edge cases)
+    def on_delete_connection_request_in_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915 (complex logic, multiple edge cases)
+        self, request: DeleteConnectionRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         # Vet the two nodes first.
         source_node_name = request.source_node_name
         target_node_name = request.target_node_name
@@ -1247,16 +1369,16 @@ class FlowManager(EngineScoped):
         target_node = None
         if source_node_name is None:
             # First check if we have a current node
-            if not self.engine.context_manager.has_current_node():
+            if not workflow.context.has_current_node():
                 details = "Attempted to delete a Connection with a source node from the Current Context. Failed because the Current Context was empty."
                 return DeleteConnectionResultFailure(result_details=details)
 
             # Get the current node from context
-            source_node = self.engine.context_manager.get_current_node()
+            source_node = workflow.context.get_current_node()
             source_node_name = source_node.name
         if source_node is None:
             try:
-                source_node = self.engine.node_manager.get_node_by_name(source_node_name)
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError as err:
                 details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1265,16 +1387,16 @@ class FlowManager(EngineScoped):
         target_node_name = request.target_node_name
         if target_node_name is None:
             # First check if we have a current node
-            if not self.engine.context_manager.has_current_node():
+            if not workflow.context.has_current_node():
                 details = "Attempted to delete a Connection with a target node from the Current Context. Failed because the Current Context was empty."
                 return DeleteConnectionResultFailure(result_details=details)
 
             # Get the current node from context
-            target_node = self.engine.context_manager.get_current_node()
+            target_node = workflow.context.get_current_node()
             target_node_name = target_node.name
         if target_node is None:
             try:
-                target_node = self.engine.node_manager.get_node_by_name(target_node_name)
+                target_node = self.engine.node_manager.get_node_by_name_in(workflow, target_node_name)
             except ValueError as err:
                 details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1284,8 +1406,8 @@ class FlowManager(EngineScoped):
         # Get the parent flows.
         source_flow_name = None
         try:
-            source_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(source_node_name)
-            self.get_flow_by_name(flow_name=source_flow_name)
+            source_flow_name = workflow.nodes.parent_flow_name(source_node_name)
+            self.get_flow_by_name_in(workflow, source_flow_name)
         except KeyError as err:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1293,8 +1415,8 @@ class FlowManager(EngineScoped):
 
         target_flow_name = None
         try:
-            target_flow_name = self.engine.node_manager.get_node_parent_flow_by_name(target_node_name)
-            self.get_flow_by_name(flow_name=target_flow_name)
+            target_flow_name = workflow.nodes.parent_flow_name(target_node_name)
+            self.get_flow_by_name_in(workflow, target_flow_name)
         except KeyError as err:
             details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
 
@@ -1305,7 +1427,7 @@ class FlowManager(EngineScoped):
         # Now validate the parameters. A node can remove a connected parameter without a request, which
         # leaves the connection holding the only reference to it; that connection must still be deletable,
         # or neither node nor their flow can be deleted.
-        stored_connection = self._connections.find_connection(
+        stored_connection = workflow.flows.connections.find_connection(
             source_node=source_node_name,
             source_parameter=request.source_parameter_name,
             target_node=target_node_name,
@@ -1328,7 +1450,8 @@ class FlowManager(EngineScoped):
             return DeleteConnectionResultFailure(result_details=details)
 
         # Vet that a Connection actually exists between them already.
-        if not self._has_connection(
+        if not self.has_connection_in(
+            workflow,
             source_node=source_node,
             source_parameter=source_param,
             target_node=target_node,
@@ -1339,7 +1462,7 @@ class FlowManager(EngineScoped):
             return DeleteConnectionResultFailure(result_details=details)
 
         # Remove the connection.
-        if not self._connections.remove_connection(
+        if not workflow.flows.connections.remove_connection(
             source_node=source_node.name,
             source_parameter=source_param.name,
             target_node=target_node.name,
@@ -1363,7 +1486,7 @@ class FlowManager(EngineScoped):
 
         # After the connection has been removed, if it doesn't have PROPERTY as a type, wipe the set parameter value and unresolve future nodes
         if ParameterMode.PROPERTY not in target_param.allowed_modes:
-            if self._is_node_executing(target_node):
+            if self._is_node_executing(workflow, target_node):
                 # The node is mid-execution on this very value. Resetting it now would make the node
                 # finish on its parameter default instead, and the run would report success with the
                 # wrong answer; marking the node unresolved would be a claim the finishing run
@@ -1371,7 +1494,7 @@ class FlowManager(EngineScoped):
                 target_node.reset_input_value_after_execution(target_param.name)
                 # Consumers still need invalidating, and this pass only unresolves targets that are
                 # already RESOLVED, so it cannot disturb another node mid-flight either.
-                self._connections.unresolve_future_nodes(target_node)
+                workflow.flows.connections.unresolve_future_nodes(target_node)
             else:
                 try:
                     # Only try to remove a value where one exists, otherwise it will generate errant warnings.
@@ -1379,7 +1502,7 @@ class FlowManager(EngineScoped):
                         target_node.remove_parameter_value(target_param.name)
                     # It removed it accurately
                     # Unresolve future nodes that depended on that value
-                    self._connections.unresolve_future_nodes(target_node)
+                    workflow.flows.connections.unresolve_future_nodes(target_node)
                     target_node.make_node_unresolved(
                         current_states_to_trigger_change_event=set(
                             {NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
@@ -1412,7 +1535,7 @@ class FlowManager(EngineScoped):
         result = DeleteConnectionResultSuccess(result_details=details)
         return result
 
-    def _is_node_executing(self, node: BaseNode) -> bool:
+    def _is_node_executing(self, workflow: WorkflowRuntime, node: BaseNode) -> bool:
         """Whether a run is currently inside this node's process method.
 
         Read from the live DAG rather than from `node.state`. The two are set in the same breath, but
@@ -1428,43 +1551,43 @@ class FlowManager(EngineScoped):
         the `DagBuilder` a node is running on; `NodeManager._find_entangled_live_node` is blind the
         same way, and cannot cancel a subflow run for the same reason.
         """
-        dag_node = self._global_dag_builder.node_to_reference.get(node.name)
+        dag_node = workflow.flows.global_dag_builder.node_to_reference.get(node.name)
         return dag_node is not None and dag_node.node_state is NodeState.PROCESSING
 
     @handles(StartFlowRequest)
-    async def on_start_flow_request(self, request: StartFlowRequest) -> ResultPayload:
+    async def on_start_flow_request(self, request: StartFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         # which flow
         flow_name = request.flow_name
         if not flow_name:
             # Fall back to the current-context flow so callers do not have to echo the name
             # EnsureWorkflowAndFlowRequest / CreateFlowRequest just returned. If nothing is in
             # context either, preserve the original "you must provide one" error.
-            if self.engine.context_manager.has_current_flow():
-                flow_name = self.engine.context_manager.get_current_flow().name
+            if workflow.context.has_current_flow():
+                flow_name = workflow.context.get_current_flow().name
             else:
                 details = (
                     "Must provide flow_name, or set a flow in the Current Context "
                     "(e.g. via EnsureWorkflowAndFlowRequest or CreateFlowRequest) first."
                 )
                 return StartFlowResultFailure(validation_exceptions=[], result_details=details)
-        return await self.start_run(StartFlowSpec(request=request, flow_name=flow_name))
+        return await self.start_run(StartFlowSpec(request=request, workflow=workflow, flow_name=flow_name))
 
     async def execute_start_flow(  # noqa: C901, PLR0911, PLR0912
-        self, request: StartFlowRequest, flow_name: str, flow: ControlFlow
+        self, request: StartFlowRequest, workflow: WorkflowRuntime, flow_name: str, flow: ControlFlow
     ) -> ResultPayload:
         # Check to see if the flow is already running.
-        if self.check_for_existing_running_flow():
+        if self._flow_is_running(workflow.flows):
             details = "Cannot start flow. Flow is already running."
             return StartFlowResultFailure(validation_exceptions=[], result_details=details)
         # A node has been provided to either start or to run up to.
         if request.flow_node_name:
             flow_node_name = request.flow_node_name
-            flow_node = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_node_name, BaseNode)
+            flow_node = workflow.objects.get_as_type(flow_node_name, BaseNode)
             if not flow_node:
                 details = f"Provided node with name {flow_node_name} does not exist"
                 return StartFlowResultFailure(validation_exceptions=[], result_details=details)
             # lets get the first control node in the flow!
-            start_node = self.get_start_node_from_node(flow, flow_node)
+            start_node = self.get_start_node_from_node_in(workflow, flow, flow_node)
             # if the start is not the node provided, set a breakpoint at the stop (we're running up until there)
             if not start_node:
                 details = f"Start node for node with name {flow_node_name} does not exist"
@@ -1474,11 +1597,14 @@ class FlowManager(EngineScoped):
         else:
             # we wont hit this if we dont have a request id, our requests always have nodes
             # If there is a request, reinitialize the queue
-            self.get_start_node_queue()  # initialize the start flow queue!
+            self.get_start_node_queue_in(workflow)  # initialize the start flow queue!
             start_node = None
         # Run Validation before starting a flow
         result = await self.on_validate_flow_dependencies_request(
-            ValidateFlowDependenciesRequest(flow_name=flow_name, flow_node_name=start_node.name if start_node else None)
+            ValidateFlowDependenciesRequest(
+                flow_name=flow_name, flow_node_name=start_node.name if start_node else None
+            ),
+            workflow,
         )
         try:
             if result.failed():
@@ -1497,9 +1623,10 @@ class FlowManager(EngineScoped):
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
         # Read the run's outcome from its own workflow, even if another opened while it ran.
-        flows = self._current_flows()
+        flows = workflow.flows
         try:
             await self.start_flow(
+                workflow,
                 flow,
                 start_node,
                 debug_mode=request.debug_mode,
@@ -1524,18 +1651,20 @@ class FlowManager(EngineScoped):
         return StartFlowResultSuccess(result_details=details)
 
     @handles(StartFlowFromNodeRequest)
-    async def on_start_flow_from_node_request(self, request: StartFlowFromNodeRequest) -> ResultPayload:
+    async def on_start_flow_from_node_request(
+        self, request: StartFlowFromNodeRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         # Resolve the node first, falling back to the current-context node when node_name is
         # omitted. flow_name on this request is deprecated; when not supplied we derive it
         # from the node's parent flow so callers do not have to keep them in sync.
         node_name = request.node_name
         if node_name is None:
-            if self.engine.context_manager.has_current_node():
-                node_name = self.engine.context_manager.get_current_node().name
+            if workflow.context.has_current_node():
+                node_name = workflow.context.get_current_node().name
             else:
                 details = "Must provide node_name, or set a node in the Current Context first."
                 return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=details)
-        start_node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
+        start_node = workflow.objects.get_as_type(node_name, BaseNode)
         if not start_node:
             details = f"Provided node with name {node_name} does not exist"
             return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=details)
@@ -1543,23 +1672,31 @@ class FlowManager(EngineScoped):
         flow_name = request.flow_name
         if not flow_name:
             try:
-                flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
+                flow_name = workflow.nodes.parent_flow_name(node_name)
             except KeyError as err:
                 details = f"Could not derive parent flow for node '{node_name}': {err}"
                 return StartFlowFromNodeResultFailure(validation_exceptions=[err], result_details=details)
         return await self.start_run(
-            StartFlowFromNodeSpec(request=request, flow_name=flow_name, node_name=start_node.name)
+            StartFlowFromNodeSpec(request=request, workflow=workflow, flow_name=flow_name, node_name=start_node.name)
         )
 
     async def execute_start_flow_from_node(  # noqa: PLR0911
-        self, request: StartFlowFromNodeRequest, flow_name: str, flow: ControlFlow, start_node: BaseNode
+        self,
+        request: StartFlowFromNodeRequest,
+        workflow: WorkflowRuntime,
+        flow_name: str,
+        flow: ControlFlow,
+        start_node: BaseNode,
     ) -> ResultPayload:
         # Check to see if the flow is already running.
-        if self.check_for_existing_running_flow():
+        if self._flow_is_running(workflow.flows):
             details = "Cannot start flow. Flow is already running."
             return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=details)
         result = await self.on_validate_flow_dependencies_request(
-            ValidateFlowDependenciesRequest(flow_name=flow_name, flow_node_name=start_node.name if start_node else None)
+            ValidateFlowDependenciesRequest(
+                flow_name=flow_name, flow_node_name=start_node.name if start_node else None
+            ),
+            workflow,
         )
         try:
             if result.failed():
@@ -1578,9 +1715,10 @@ class FlowManager(EngineScoped):
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
         # By now, it has been validated with no exceptions.
         # Read the run's outcome from its own workflow, even if another opened while it ran.
-        flows = self._current_flows()
+        flows = workflow.flows
         try:
             await self.start_flow(
+                workflow,
                 flow,
                 start_node,
                 debug_mode=request.debug_mode,
@@ -1602,7 +1740,7 @@ class FlowManager(EngineScoped):
 
         return StartFlowFromNodeResultSuccess(result_details=details)
 
-    def get_start_nodes_in_flow(self, flow: ControlFlow) -> list[BaseNode]:  # noqa: C901, PLR0912, PLR0915
+    def get_start_nodes_in_flow(self, workflow: WorkflowRuntime, flow: ControlFlow) -> list[BaseNode]:  # noqa: C901, PLR0912, PLR0915
         """Find start nodes in a specific flow.
 
         A start node is defined as:
@@ -1613,12 +1751,13 @@ class FlowManager(EngineScoped):
         Nodes that are children of SubflowNodeGroups are excluded.
 
         Args:
+            workflow: The workflow the flow belongs to
             flow: The flow to search for start nodes
 
         Returns:
             List of start nodes, prioritized as: StartNodes, control nodes, data nodes
         """
-        connections = self.get_connections()
+        connections = workflow.flows.connections
         all_nodes = list(flow.nodes.values())
         if not all_nodes:
             return []
@@ -1708,46 +1847,63 @@ class FlowManager(EngineScoped):
         return start_nodes + control_nodes + valid_data_nodes
 
     def _validate_and_get_start_node(
-        self, flow_name: str, start_node_name: str | None, flow: ControlFlow
+        self, workflow: WorkflowRuntime, flow_name: str, start_node_name: str | None, flow: ControlFlow
     ) -> BaseNode | StartLocalSubflowResultFailure:
         """Validate and get the start node for subflow execution."""
         if start_node_name is None:
-            start_nodes = self.get_start_nodes_in_flow(flow)
+            start_nodes = self.get_start_nodes_in_flow(workflow, flow)
             if not start_nodes:
                 details = f"Cannot start subflow '{flow_name}'. No start nodes found in flow."
                 return StartLocalSubflowResultFailure(result_details=details)
             return start_nodes[0]
 
         try:
-            return self.engine.node_manager.get_node_by_name(start_node_name)
+            return self.engine.node_manager.get_node_by_name_in(workflow, start_node_name)
         except ValueError as err:
             details = f"Cannot start subflow '{flow_name}'. Start node '{start_node_name}' not found: {err}"
             return StartLocalSubflowResultFailure(result_details=details)
 
+    async def on_start_local_subflow_request(self, request: StartLocalSubflowRequest) -> ResultPayload:
+        """Run a subflow of the open workflow, outside dispatch.
+
+        Edge method for code that calls the handler directly and is not handed a workflow (engine,
+        `exe_types` and node library code); dispatch calls `on_start_local_subflow_request_in_workflow`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            details = f"Attempted to run subflow '{request.flow_name}'. Failed because no workflow is open."
+            return StartLocalSubflowResultFailure(result_details=details)
+        return await self.on_start_local_subflow_request_in_workflow(request, workflow)
+
     @handles(StartLocalSubflowRequest)
-    async def on_start_local_subflow_request(self, request: StartLocalSubflowRequest) -> ResultPayload:  # noqa: C901, PLR0911
+    async def on_start_local_subflow_request_in_workflow(  # noqa: C901, PLR0911
+        self, request: StartLocalSubflowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
             details = "Must provide flow name to start a flow."
             return StartFlowResultFailure(validation_exceptions=[], result_details=details)
 
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Cannot start flow. Error: {err}"
             return StartFlowFromNodeResultFailure(validation_exceptions=[err], result_details=details)
 
-        if not self.check_for_existing_running_flow():
+        if not self._flow_is_running(workflow.flows):
             msg = "There must be a flow going to start a Subflow"
             return StartLocalSubflowResultFailure(result_details=msg)
 
-        start_node = self._validate_and_get_start_node(flow_name, request.start_node, flow)
+        start_node = self._validate_and_get_start_node(workflow, flow_name, request.start_node, flow)
         if isinstance(start_node, StartLocalSubflowResultFailure):
             return start_node
 
         # Run validation before starting the subflow
         validation_result = await self.on_validate_flow_dependencies_request(
-            ValidateFlowDependenciesRequest(flow_name=flow_name, flow_node_name=start_node.name if start_node else None)
+            ValidateFlowDependenciesRequest(
+                flow_name=flow_name, flow_node_name=start_node.name if start_node else None
+            ),
+            workflow,
         )
         if validation_result.failed():
             # Extract error details from the failed validation result
@@ -1770,7 +1926,7 @@ class FlowManager(EngineScoped):
 
         subflow_machine = ControlFlowMachine(
             flow.name,
-            dag_builder=DagBuilder(self._current_flows().connections),
+            dag_builder=DagBuilder(workflow.flows.connections),
             is_isolated=True,
             engine=self.engine,
         )
@@ -1798,18 +1954,18 @@ class FlowManager(EngineScoped):
         return StartLocalSubflowResultSuccess(result_details=f"Successfully executed local subflow '{flow_name}'")
 
     @handles(GetFlowStateRequest)
-    def on_get_flow_state_request(self, event: GetFlowStateRequest) -> ResultPayload:
+    def on_get_flow_state_request(self, event: GetFlowStateRequest, workflow: WorkflowRuntime) -> ResultPayload:
         flow_name = event.flow_name
         if not flow_name:
             details = "Could not get flow state. No flow name was provided."
             return GetFlowStateResultFailure(result_details=details)
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Could not get flow state. Error: {err}"
             return GetFlowStateResultFailure(result_details=details)
         try:
-            control_nodes, resolving_nodes, involved_nodes = self.flow_state(flow)
+            control_nodes, resolving_nodes, involved_nodes = self.flow_state_in(workflow, flow)
         except Exception as e:
             details = f"Failed to get flow state of flow with name {flow_name}. Exception occurred: {e} "
             logger.exception(details)
@@ -1823,24 +1979,24 @@ class FlowManager(EngineScoped):
         )
 
     @handles(CancelFlowRequest)
-    async def on_cancel_flow_request(self, request: CancelFlowRequest) -> ResultPayload:
+    async def on_cancel_flow_request(self, request: CancelFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
             details = "Could not cancel flow execution. No flow name was provided."
 
             return CancelFlowResultFailure(result_details=details)
         try:
-            self.get_flow_by_name(flow_name)
+            self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Could not cancel flow execution. Error: {err}"
 
             return CancelFlowResultFailure(result_details=details)
-        run = self._current_flows().run_in_progress
+        run = workflow.flows.run_in_progress
         try:
             if run is not None:
-                await self.cancel_run(run.run_id)
+                await self.cancel_run_in(workflow, run.run_id)
             else:
-                await self.cancel_flow_run()
+                await self._cancel_run(workflow.flows)
         except Exception as e:
             details = f"Could not cancel flow execution. Exception: {e}"
 
@@ -1850,17 +2006,27 @@ class FlowManager(EngineScoped):
         return CancelFlowResultSuccess(result_details=details)
 
     @handles(CancelRunRequest)
-    async def on_cancel_run_request(self, request: CancelRunRequest) -> ResultPayload:
-        cancelled = await self.cancel_run(request.run_id)
+    async def on_cancel_run_request(
+        self, request: CancelRunRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Cancel the request's run of `workflow`. With no workflow there is none to cancel."""
+        cancelled = False
+        if workflow is not None:
+            cancelled = await self.cancel_run_in(workflow, request.run_id)
         if not cancelled:
             details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
             return CancelRunResultFailure(result_details=details)
         return CancelRunResultSuccess(result_details=f"Cancelled run '{request.run_id}'.")
 
     @handles(CancelAllRunsRequest)
-    async def on_cancel_all_runs_request(self, _request: CancelAllRunsRequest) -> ResultPayload:
+    async def on_cancel_all_runs_request(
+        self, _request: CancelAllRunsRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Cancel every run of `workflow`. With no workflow there is nothing to cancel."""
+        if workflow is None:
+            return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
         try:
-            await self.cancel_all_runs()
+            await self.cancel_all_runs_in(workflow)
         except Exception as e:
             # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
             details = f"Attempted to cancel every run. Failed because the run in progress could not be cancelled: {e}"
@@ -1868,11 +2034,12 @@ class FlowManager(EngineScoped):
         return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
 
     @handles(ListRunsRequest)
-    def on_list_runs_request(self, _request: ListRunsRequest) -> ResultPayload:
+    def on_list_runs_request(self, _request: ListRunsRequest, workflow: WorkflowRuntime | None = None) -> ResultPayload:
+        """List `workflow`'s runs. With no workflow there are none."""
         runs: list[RunInfo] = []
-        flows = self._current_flows_or_none()
-        if flows is None:
+        if workflow is None:
             return ListRunsResultSuccess(runs=runs, result_details="Listed 0 run(s).")
+        flows = workflow.flows
         in_progress = flows.run_in_progress
         if in_progress is not None:
             # Waiting for another engine, which reported its place in that engine's line.
@@ -1899,22 +2066,24 @@ class FlowManager(EngineScoped):
         return ListRunsResultSuccess(runs=runs, result_details=f"Listed {len(runs)} run(s).")
 
     @handles(SingleNodeStepRequest)
-    async def on_single_node_step_request(self, request: SingleNodeStepRequest) -> ResultPayload:
+    async def on_single_node_step_request(
+        self, request: SingleNodeStepRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
             details = "Could not advance to the next step of a running workflow. No flow name was provided."
 
             return SingleNodeStepResultFailure(validation_exceptions=[], result_details=details)
         try:
-            self.get_flow_by_name(flow_name)
+            self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Could not advance to the next step of a running workflow. No flow with name {flow_name} exists. Error: {err}"
 
             return SingleNodeStepResultFailure(validation_exceptions=[err], result_details=details)
         try:
-            flow = self.get_flow_by_name(flow_name)
-            with self._continuing_run_in_progress(self._current_flows()):
-                await self.single_node_step(flow)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
+            with self._continuing_run_in_progress(workflow.flows):
+                await self.single_node_step(workflow, flow)
         except Exception as e:
             details = f"Could not advance to the next step of a running workflow. Exception: {e}"
             return SingleNodeStepResultFailure(validation_exceptions=[], result_details=details)
@@ -1925,27 +2094,29 @@ class FlowManager(EngineScoped):
         return SingleNodeStepResultSuccess(result_details=details)
 
     @handles(SingleExecutionStepRequest)
-    async def on_single_execution_step_request(self, request: SingleExecutionStepRequest) -> ResultPayload:
+    async def on_single_execution_step_request(
+        self, request: SingleExecutionStepRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
             details = "Could not advance to the next step of a running workflow. No flow name was provided."
 
             return SingleExecutionStepResultFailure(result_details=details)
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Could not advance to the next step of a running workflow. Error: {err}."
 
             return SingleExecutionStepResultFailure(result_details=details)
         change_debug_mode = request.request_id is not None
         try:
-            with self._continuing_run_in_progress(self._current_flows()):
-                await self.single_execution_step(flow, change_debug_mode)
+            with self._continuing_run_in_progress(workflow.flows):
+                await self.single_execution_step(workflow, flow, change_debug_mode)
         except Exception as e:
             # We REALLY don't want to fail here, else we'll take the whole engine down
             try:
-                if self.check_for_existing_running_flow():
-                    await self.cancel_flow_run()
+                if self._flow_is_running(workflow.flows):
+                    await self._cancel_run(workflow.flows)
             except Exception as e_inner:
                 details = f"Could not cancel flow execution. Exception: {e_inner}"
 
@@ -1956,21 +2127,23 @@ class FlowManager(EngineScoped):
         return SingleExecutionStepResultSuccess(result_details=details)
 
     @handles(ContinueExecutionStepRequest)
-    async def on_continue_execution_step_request(self, request: ContinueExecutionStepRequest) -> ResultPayload:
+    async def on_continue_execution_step_request(
+        self, request: ContinueExecutionStepRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
             details = "Failed to continue execution step because no flow name was provided"
 
             return ContinueExecutionStepResultFailure(result_details=details)
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Failed to continue execution step. Error: {err}"
 
             return ContinueExecutionStepResultFailure(result_details=details)
         try:
-            with self._continuing_run_in_progress(self._current_flows()):
-                await self.continue_executing(flow)
+            with self._continuing_run_in_progress(workflow.flows):
+                await self.continue_executing(workflow, flow)
         except Exception as e:
             details = f"Failed to continue execution step. An exception occurred: {e}."
             return ContinueExecutionStepResultFailure(result_details=details)
@@ -1978,13 +2151,13 @@ class FlowManager(EngineScoped):
         return ContinueExecutionStepResultSuccess(result_details=details)
 
     @handles(UnresolveFlowRequest)
-    def on_unresolve_flow_request(self, request: UnresolveFlowRequest) -> ResultPayload:
+    def on_unresolve_flow_request(self, request: UnresolveFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         flow_name = request.flow_name
         if not flow_name:
             details = "Failed to unresolve flow because no flow name was provided"
             return UnresolveFlowResultFailure(result_details=details)
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Failed to unresolve flow. Error: {err}"
             return UnresolveFlowResultFailure(result_details=details)
@@ -1997,22 +2170,24 @@ class FlowManager(EngineScoped):
         return UnresolveFlowResultSuccess(result_details=details)
 
     @handles(ValidateFlowDependenciesRequest)
-    async def on_validate_flow_dependencies_request(self, request: ValidateFlowDependenciesRequest) -> ResultPayload:
+    async def on_validate_flow_dependencies_request(
+        self, request: ValidateFlowDependenciesRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         # get the flow name
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Failed to validate flow. Error: {err}"
             return ValidateFlowDependenciesResultFailure(result_details=details)
         if request.flow_node_name:
             flow_node_name = request.flow_node_name
-            flow_node = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_node_name, BaseNode)
+            flow_node = workflow.objects.get_as_type(flow_node_name, BaseNode)
             if not flow_node:
                 details = f"Provided node with name {flow_node_name} does not exist"
                 return ValidateFlowDependenciesResultFailure(result_details=details)
             # Gets all nodes in that connected group to be ran
-            nodes = flow.get_all_connected_nodes(flow_node)
+            nodes = self.get_all_connected_nodes_in(workflow, flow_node)
         else:
             nodes = flow.nodes.values()
         # If we're just running the whole flow
@@ -2028,17 +2203,21 @@ class FlowManager(EngineScoped):
         )
 
     @handles(ListFlowsInCurrentContextRequest)
-    def on_list_flows_in_current_context_request(self, request: ListFlowsInCurrentContextRequest) -> ResultPayload:  # noqa: ARG002 (request isn't actually used)
-        if not self.engine.context_manager.has_current_flow():
+    def on_list_flows_in_current_context_request(
+        self,
+        request: ListFlowsInCurrentContextRequest,  # noqa: ARG002 (request isn't actually used)
+        workflow: WorkflowRuntime,
+    ) -> ResultPayload:
+        if not workflow.context.has_current_flow():
             details = "Attempted to list Flows in the Current Context. Failed because the Current Context was empty."
             return ListFlowsInCurrentContextResultFailure(result_details=details)
 
-        parent_flow = self.engine.context_manager.get_current_flow()
+        parent_flow = workflow.context.get_current_flow()
         parent_flow_name = parent_flow.name
 
         # Create a list of all child flow names that point DIRECTLY to us.
         ret_list = []
-        for flow_name, parent_name in self._name_to_parent_name.items():
+        for flow_name, parent_name in workflow.flows.name_to_parent_name.items():
             if parent_name == parent_flow_name:
                 ret_list.append(flow_name)
 
@@ -2047,7 +2226,9 @@ class FlowManager(EngineScoped):
         return ListFlowsInCurrentContextResultSuccess(flow_names=ret_list, result_details=details)
 
     @handles(AutoLayoutFlowRequest)
-    async def on_auto_layout_flow_request(self, request: AutoLayoutFlowRequest) -> ResultPayload:  # noqa: C901, PLR0912
+    async def on_auto_layout_flow_request(  # noqa: C901, PLR0912
+        self, request: AutoLayoutFlowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         """Assign editor positions to every node in a flow by topological column layout.
 
         Algorithm (Kahn-ish): walk the data+control edges internal to this flow, compute a
@@ -2062,8 +2243,8 @@ class FlowManager(EngineScoped):
         """
         flow_name = request.flow_name
         if not flow_name:
-            if self.engine.context_manager.has_current_flow():
-                flow_name = self.engine.context_manager.get_current_flow().name
+            if workflow.context.has_current_flow():
+                flow_name = workflow.context.get_current_flow().name
             else:
                 details = (
                     "Attempted to auto-layout a flow. Failed because no flow_name was provided "
@@ -2072,7 +2253,7 @@ class FlowManager(EngineScoped):
                 return AutoLayoutFlowResultFailure(result_details=details)
 
         try:
-            flow = self.get_flow_by_name(flow_name)
+            flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Attempted to auto-layout flow '{flow_name}'. Failed because: {err}"
             return AutoLayoutFlowResultFailure(result_details=details)
@@ -2090,7 +2271,7 @@ class FlowManager(EngineScoped):
         node_name_set = set(node_names)
         incoming: dict[str, set[str]] = {name: set() for name in node_names}
         outgoing: dict[str, set[str]] = {name: set() for name in node_names}
-        for connection in self._connections.connections.values():
+        for connection in workflow.flows.connections.connections.values():
             src = connection.source_node.name
             tgt = connection.target_node.name
             if src in node_name_set and tgt in node_name_set and src != tgt:
@@ -2129,12 +2310,12 @@ class FlowManager(EngineScoped):
             for row_idx, name in enumerate(sorted(layers[layer_idx])):
                 x = request.origin_x + layer_idx * request.layer_spacing
                 y = request.origin_y + row_idx * request.row_spacing
-                # Dispatch the position update through self.engine.ahandle_request so the
+                # Dispatch the position update through workflow.ahandle_request so the
                 # per-node SetNodeMetadataResultSuccess event is broadcast to subscribers.
                 # The editor listens on that event to move nodes on the canvas live; mutating
                 # node.metadata directly here would update the engine state but leave the UI
                 # stale until a reload.
-                set_metadata_result = await self.engine.ahandle_request(
+                set_metadata_result = await workflow.ahandle_request(
                     SetNodeMetadataRequest(node_name=name, metadata={"position": {"x": x, "y": y}})
                 )
                 if not isinstance(set_metadata_result, SetNodeMetadataResultSuccess):
@@ -2156,13 +2337,14 @@ class FlowManager(EngineScoped):
 
     async def start_flow(
         self,
+        workflow: WorkflowRuntime,
         flow: ControlFlow,
         start_node: BaseNode | None = None,
         *,
         debug_mode: bool = False,
     ) -> None:
         # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
-        flows = self._current_flows()
+        flows = workflow.flows
         if self._flow_is_running(flows):
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
@@ -2248,6 +2430,10 @@ class FlowManager(EngineScoped):
         self._report_places_in_line(flows)
         return run
 
+    async def cancel_run_in(self, workflow: WorkflowRuntime, run_id: str) -> bool:
+        """Cancel a run of `workflow`, returning whether there was one; see `cancel_run`."""
+        return await self.cancel_run(run_id, flows=workflow.flows)
+
     async def cancel_run(self, run_id: str, *, flows: WorkflowFlows | None = None) -> bool:
         """Cancel a run of the current workflow, or of the line `flows` names, returning whether there was one.
 
@@ -2270,14 +2456,9 @@ class FlowManager(EngineScoped):
             await self._cancel_run(flows)
         return True
 
-    async def cancel_all_runs(self) -> None:
-        """Cancel every waiting run of the current workflow, then its run in progress, without starting another.
-
-        With no workflow current there is nothing to cancel.
-        """
-        flows = self._current_flows_or_none()
-        if flows is None:
-            return
+    async def cancel_all_runs_in(self, workflow: WorkflowRuntime) -> None:
+        """Cancel every waiting run of `workflow`, then its run in progress, without starting another."""
+        flows = workflow.flows
         # The waiting runs go first: cancelling the run in progress would otherwise start the next one.
         self._turn_away(flows, flows.run_queue.snapshot(), "it was cancelled.")
         if flows.run_in_progress is not None:
@@ -2494,18 +2675,22 @@ class FlowManager(EngineScoped):
             _current_run_id.reset(token)
             self._finish_run_if_over(flows)
 
+    def check_for_existing_running_flow_in(self, workflow: WorkflowRuntime) -> bool:
+        """Whether the workflow has a run in progress."""
+        return self._flow_is_running(workflow.flows)
+
     def check_for_existing_running_flow(self) -> bool:
         flows = self._current_flows_or_none()
         if flows is None:
             return False
         return self._flow_is_running(flows)
 
-    def running_flow_is_stopping_after_failure(self) -> bool:
-        """True while the running flow has failed and is waiting for its other nodes to finish."""
-        flows = self._current_flows_or_none()
-        if flows is None or flows.global_control_flow_machine is None:
+    def running_flow_is_stopping_after_failure(self, workflow: WorkflowRuntime) -> bool:
+        """True while the workflow's running flow has failed and is waiting for its other nodes to finish."""
+        machine = workflow.flows.global_control_flow_machine
+        if machine is None:
             return False
-        return flows.global_control_flow_machine.context.resolution_machine.is_stopping_after_failure()
+        return machine.context.resolution_machine.is_stopping_after_failure()
 
     def execution_is_advancing(self) -> bool:
         """True while a coroutine is already driving the running flow's machines.
@@ -2641,9 +2826,21 @@ class FlowManager(EngineScoped):
         return queue_item.node
 
     def clear_execution_queue(self, flow: ControlFlow) -> None:
-        """Clear all nodes from the global execution queue."""
-        if self._global_control_flow_machine and self._global_control_flow_machine.context.flow_name == flow.name:
-            self._global_flow_queue.queue.clear()
+        """Clear all nodes from the global execution queue, nothing when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `clear_execution_queue_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return
+        self.clear_execution_queue_in(workflow, flow)
+
+    def clear_execution_queue_in(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
+        """Clear all nodes from the workflow's execution queue when `flow` is the one it is running."""
+        flows = workflow.flows
+        machine = flows.global_control_flow_machine
+        if machine and machine.context.flow_name == flow.name:
+            flows.global_flow_queue.queue.clear()
 
     def has_connection(
         self,
@@ -2652,8 +2849,15 @@ class FlowManager(EngineScoped):
         target_node: BaseNode,
         target_parameter: Parameter,
     ) -> bool:
-        """Check if a connection exists between the specified nodes and parameters."""
-        return self._has_connection(source_node, source_parameter, target_node, target_parameter)
+        """Check if a connection exists between the specified nodes and parameters.
+
+        Edge method for code not handed a workflow; engine code calls `has_connection_in`.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        workflow = self.engine.current_workflow()
+        return self.has_connection_in(workflow, source_node, source_parameter, target_node, target_parameter)
 
     # Internal execution queue helper methods to consolidate redundant operations
     async def _handle_flow_start_if_not_running(
@@ -2686,9 +2890,11 @@ class FlowManager(EngineScoped):
             if machine is not None:
                 await machine.start_flow(start_node, debug_mode=debug_mode)
 
-    async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
-        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
-        flows = self._current_flows()
+    async def resolve_singular_node(
+        self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False
+    ) -> None:
+        """Run one node of the workflow, joining the run in progress if there is one."""
+        flows = workflow.flows
         # We are now going to have different behavior depending on how the node is behaving.
         if self._flow_is_running(flows):
             # Now we know something is running, it's ParallelResolutionMachine, and that we are in single_node_resolution.
@@ -2769,9 +2975,13 @@ class FlowManager(EngineScoped):
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
             )
 
-    async def single_execution_step(self, flow: ControlFlow, change_debug_mode: bool) -> None:  # noqa: FBT001
-        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
-        flows = self._current_flows()
+    async def single_execution_step(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,
+        change_debug_mode: bool,  # noqa: FBT001
+    ) -> None:
+        flows = workflow.flows
         # do a granular step
         await self._handle_flow_start_if_not_running(
             flows,
@@ -2794,9 +3004,8 @@ class FlowManager(EngineScoped):
         if machine.resolution_machine.is_complete():
             flows.global_single_node_resolution = False
 
-    async def single_node_step(self, flow: ControlFlow) -> None:
-        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
-        flows = self._current_flows()
+    async def single_node_step(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
+        flows = workflow.flows
         # It won't call single_node_step without an existing flow running from US.
         await self._handle_flow_start_if_not_running(
             flows,
@@ -2822,9 +3031,8 @@ class FlowManager(EngineScoped):
         # Start the next resolution step now please.
         await self._handle_post_execution_queue_processing(flows, debug_mode=True)
 
-    async def continue_executing(self, flow: ControlFlow) -> None:
-        # The run holds its workflow's run state, so it never acts on another workflow opened while it waits.
-        flows = self._current_flows()
+    async def continue_executing(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
+        flows = workflow.flows
         await self._handle_flow_start_if_not_running(
             flows,
             flow,
@@ -2858,18 +3066,30 @@ class FlowManager(EngineScoped):
             node.set_entry_control_parameter(None)
 
     def flow_state(self, flow: ControlFlow) -> tuple[list[str], list[str], list[str]]:
-        if not self.check_for_existing_running_flow():
+        """The control, resolving and involved node names of the open workflow's run, empty when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `flow_state_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
             return [], [], []
-        if self._global_control_flow_machine is None:
+        return self.flow_state_in(workflow, flow)
+
+    def flow_state_in(self, workflow: WorkflowRuntime, flow: ControlFlow) -> tuple[list[str], list[str], list[str]]:
+        """The control, resolving and involved node names of the workflow's run."""
+        if not self._flow_is_running(workflow.flows):
             return [], [], []
-        control_flow_context = self._global_control_flow_machine.context
+        flows = workflow.flows
+        if flows.global_control_flow_machine is None:
+            return [], [], []
+        control_flow_context = flows.global_control_flow_machine.context
         current_control_nodes = (
             [control_flow_node.name for control_flow_node in control_flow_context.current_nodes]
             if control_flow_context.current_nodes is not None
             else []
         )
-        if self._global_single_node_resolution:
-            involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
+        if flows.global_single_node_resolution:
+            involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
         else:
             involved_nodes = self.get_involved_node_names(flow)
 
@@ -2912,20 +3132,46 @@ class FlowManager(EngineScoped):
         return involved_node_names
 
     def get_start_node_from_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:
+        """The node a run of `flow` starts from to reach `node`.
+
+        Edge method for code not handed a workflow; engine code calls `get_start_node_from_node_in`.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        workflow = self.engine.current_workflow()
+        return self.get_start_node_from_node_in(workflow, flow, node)
+
+    def get_start_node_from_node_in(
+        self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode
+    ) -> BaseNode | None:
+        """The node a run of `flow` starts from to reach `node`."""
         # backwards chain in control outputs.
         if node not in flow.nodes.values():
             return None
         # Go back through incoming control connections to get the start node
         curr_node = node
-        prev_node = self.get_prev_node(flow, curr_node)
+        prev_node = self.get_prev_node_in(workflow, flow, curr_node)
         # Fencepost loop - get the first previous node name and then we go
         while prev_node:
             curr_node = prev_node
-            prev_node = self.get_prev_node(flow, prev_node)
+            prev_node = self.get_prev_node_in(workflow, flow, prev_node)
         return curr_node
 
-    def get_prev_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:  # noqa: ARG002
-        connections = self.get_connections()
+    def get_prev_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:
+        """The node whose control output leads into `node`.
+
+        Edge method for code not handed a workflow; engine code calls `get_prev_node_in`.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        workflow = self.engine.current_workflow()
+        return self.get_prev_node_in(workflow, flow, node)
+
+    def get_prev_node_in(self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode) -> BaseNode | None:  # noqa: ARG002
+        """The node whose control output leads into `node`."""
+        connections = workflow.flows.connections
         if node.name in connections.incoming_index:
             parameters = connections.incoming_index[node.name]
             for parameter_name in parameters:
@@ -2942,17 +3188,28 @@ class FlowManager(EngineScoped):
         return None
 
     def get_start_node_queue(self) -> Queue | None:
+        """Fill the open workflow's run queue with the nodes a run starts from, None when there are none.
+
+        Edge method for code not handed a workflow; engine code calls `get_start_node_queue_in`.
+
+        Raises:
+            OpenWorkflowError: No workflow is open, or more than one is.
+        """
+        return self.get_start_node_queue_in(self.engine.current_workflow())
+
+    def get_start_node_queue_in(self, workflow: WorkflowRuntime) -> Queue | None:
+        """Fill the workflow's run queue with the nodes a run starts from, None when there are none."""
         # For cross-flow execution, we consider ALL nodes across ALL (non-referenced) flows.
         # Referenced subflows are executed explicitly via StartLocalSubflowRequest and must not
         # participate in the top-level queue; SubflowNodeGroup children run inside their group's
         # subflow. Both are ownership/scope decisions and live here, NOT in the classifier, so
         # the classifier stays scope-agnostic and is shared with isolated subflow execution.
-        self._global_flow_queue.queue.clear()
+        workflow.flows.global_flow_queue.queue.clear()
 
-        all_flows = self.engine.object_manager.get_filtered_subset(type=ControlFlow)
+        all_flows = workflow.objects.get_filtered_subset(type=ControlFlow)
         scope_nodes: list[BaseNode] = []
         for current_flow in all_flows.values():
-            if self.is_referenced_workflow(current_flow):
+            if self.is_referenced_workflow(workflow, current_flow):
                 continue
             scope_nodes.extend(current_flow.nodes.values())
         scope_nodes = self.exclude_subflow_group_children(scope_nodes)
@@ -2961,17 +3218,17 @@ class FlowManager(EngineScoped):
         if not scope_nodes:
             return None
 
-        categories = self.classify_nodes_for_dag(scope_nodes)
+        categories = self.classify_nodes_for_dag_in(workflow, scope_nodes)
 
         # populate the global flow queue with node type information
         for node in categories.start_nodes:
-            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.START_NODE))
+            workflow.flows.global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.START_NODE))
         for node in categories.control_nodes:
-            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.CONTROL_NODE))
+            workflow.flows.global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.CONTROL_NODE))
         for node in categories.data_sink_nodes:
-            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.DATA_NODE))
+            workflow.flows.global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.DATA_NODE))
 
-        return self._global_flow_queue
+        return workflow.flows.global_flow_queue
 
     @staticmethod
     def exclude_subflow_group_children(nodes: list[BaseNode]) -> list[BaseNode]:
@@ -2986,7 +3243,18 @@ class FlowManager(EngineScoped):
         """
         return [node for node in nodes if not isinstance(node.parent_group, SubflowNodeGroup)]
 
-    def classify_nodes_for_dag(self, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
+    def classify_nodes_for_dag(self, nodes: list[BaseNode]) -> DagNodeCategories:
+        """Bucket nodes of the open workflow into start / control-entry / data-sink roles for DAG seeding.
+
+        Edge method for code not handed a workflow; engine code calls `classify_nodes_for_dag_in`.
+
+        Raises:
+            NoOpenWorkflowError: No workflow is current.
+        """
+        workflow = self.engine.current_workflow()
+        return self.classify_nodes_for_dag_in(workflow, nodes)
+
+    def classify_nodes_for_dag_in(self, workflow: WorkflowRuntime, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
         """Bucket a scope of nodes into start / control-entry / data-sink roles for DAG seeding.
 
         This is scope-agnostic: callers decide which nodes are in scope (a whole flow's worth of
@@ -3002,7 +3270,7 @@ class FlowManager(EngineScoped):
         data_nodes: list[BaseNode] = []
         start_nodes: list[BaseNode] = []
         control_nodes: list[BaseNode] = []
-        cn_mgr = self.get_connections()
+        cn_mgr = workflow.flows.connections
         for node in nodes:
             # if it's a start node, start here!
             if isinstance(node, StartNode):
@@ -3090,6 +3358,7 @@ class FlowManager(EngineScoped):
         return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes)
 
     def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
+        """Edge method for code not handed a workflow."""
         global_connections = self.get_connections()
         connections = []
         if node.name in global_connections.incoming_index:
@@ -3102,6 +3371,7 @@ class FlowManager(EngineScoped):
         return connections
 
     def get_connected_output_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
+        """Edge method for code not handed a workflow."""
         global_connections = self.get_connections()
         connections = []
         if node.name in global_connections.outgoing_index:
@@ -3119,6 +3389,7 @@ class FlowManager(EngineScoped):
         node: BaseNode,
         param: Parameter,
     ) -> list[tuple[BaseNode, Parameter]]:
+        """Edge method for code not handed a workflow."""
         global_connections = self.get_connections()
         connections = []
         if node.name in global_connections.incoming_index:
@@ -3130,7 +3401,36 @@ class FlowManager(EngineScoped):
         return connections
 
     def get_connections_on_node(self, node: BaseNode) -> list[BaseNode] | None:
-        connections = self.get_connections()
+        """Edge method for code not handed a workflow."""
+        return self._connected_nodes(self.get_connections(), node)
+
+    def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:
+        """Edge method for code not handed a workflow; engine code calls `get_all_connected_nodes_in`."""
+        return self._all_connected_nodes(self.get_connections(), node)
+
+    def get_all_connected_nodes_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode]:
+        """Every node reachable from `node` through the workflow's connections, `node` first."""
+        return self._all_connected_nodes(workflow.flows.connections, node)
+
+    def _all_connected_nodes(self, connections: Connections, node: BaseNode) -> list[BaseNode]:
+        discovered = {}
+        processed = {}
+        queue = Queue()
+        queue.put(node)
+        discovered[node] = True
+        while not queue.empty():
+            curr_node = queue.get()
+            processed[curr_node] = True
+            next_nodes = self._connected_nodes(connections, curr_node)
+            if next_nodes:
+                for next_node in next_nodes:
+                    if next_node not in discovered:
+                        discovered[next_node] = True
+                        queue.put(next_node)
+        return list(processed.keys())
+
+    @staticmethod
+    def _connected_nodes(connections: Connections, node: BaseNode) -> list[BaseNode]:
         # get all of the connection ids
         connected_nodes = []
         # Handle outgoing connections
@@ -3156,25 +3456,10 @@ class FlowManager(EngineScoped):
         # Return all connected nodes. No duplicates
         return connected_nodes
 
-    def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:
-        discovered = {}
-        processed = {}
-        queue = Queue()
-        queue.put(node)
-        discovered[node] = True
-        while not queue.empty():
-            curr_node = queue.get()
-            processed[curr_node] = True
-            next_nodes = self.get_connections_on_node(curr_node)
-            if next_nodes:
-                for next_node in next_nodes:
-                    if next_node not in discovered:
-                        discovered[next_node] = True
-                        queue.put(next_node)
-        return list(processed.keys())
-
     def is_node_connected(self, start_node: BaseNode, node: BaseNode) -> list[str]:
         """Check if node is in the forward control path from start_node, returning boundary nodes if connected.
+
+        Edge method for code not handed a workflow.
 
         Returns:
             list[str]: Names of nodes that have direct connections to 'node' and are in the forward control path,
@@ -3206,33 +3491,50 @@ class FlowManager(EngineScoped):
 
         return boundary_nodes
 
-    def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:
+    def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:  # noqa: ARG002
+        """The node and its upstream nodes, only the node when no workflow is open.
+
+        Edge method for code not handed a workflow; engine code calls `get_node_dependencies_in`.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return [node]
+        return self.get_node_dependencies_in(workflow, node)
+
+    def get_node_dependencies_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode]:
         """Get all upstream nodes that the given node depends on.
 
         This method performs a breadth-first search starting from the given node and working backwards through its non-control input connections to identify all nodes that must run before this node can be resolved.
         It ignores control connections, since we're only focusing on node dependencies.
 
         Args:
-            flow (ControlFlow): The flow containing the node
+            workflow (WorkflowRuntime): The workflow whose connections are followed
             node (BaseNode): The node to find dependencies for
 
         Returns:
             list[BaseNode]: A list of all nodes that the given node depends on, including the node itself (as the first element)
         """
+        connections = workflow.flows.connections
         node_list = [node]
         node_queue = Queue()
         node_queue.put(node)
         while not node_queue.empty():
             curr_node = node_queue.get()
-            input_connections = self.get_connected_input_from_node(flow, curr_node)
-            if input_connections:
-                for input_node, input_parameter in input_connections:
-                    if (
-                        ParameterTypeBuiltin.CONTROL_TYPE.value != input_parameter.output_type
-                        and input_node not in node_list
-                    ):
-                        node_list.append(input_node)
-                        node_queue.put(input_node)
+            input_connection_ids = [
+                connection_id
+                for connection_ids in connections.incoming_index.get(curr_node.name, {}).values()
+                for connection_id in connection_ids
+            ]
+            for connection_id in input_connection_ids:
+                connection = connections.connections[connection_id]
+                input_node = connection.source_node
+                input_parameter = connection.source_parameter
+                if (
+                    ParameterTypeBuiltin.CONTROL_TYPE.value != input_parameter.output_type
+                    and input_node not in node_list
+                ):
+                    node_list.append(input_node)
+                    node_queue.put(input_node)
         return node_list
 
     @staticmethod

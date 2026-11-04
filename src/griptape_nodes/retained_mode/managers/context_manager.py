@@ -242,13 +242,16 @@ class ContextManager(EngineScoped):
         )
 
     @handles(EnsureWorkflowAndFlowRequest)
-    def on_ensure_workflow_and_flow_request(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
+    def on_ensure_workflow_and_flow_request(
+        self, request: EnsureWorkflowAndFlowRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 
-        Delegates the workflow side to SetWorkflowContextRequest so the unsaved-registry-key
-        scheme ("unsaved:<workflow id>") stays the single source of truth for scratch workflows;
-        composes that with CreateFlowRequest so callers can go from a blank engine to
-        CreateNode in a single round trip.
+        Uses the open `workflow`, and otherwise opens one. Delegates opening to
+        SetWorkflowContextRequest so the unsaved-registry-key scheme ("unsaved:<workflow id>")
+        stays the single source of truth for scratch workflows; composes that with
+        CreateFlowRequest so callers can go from a blank engine to CreateNode in a single round
+        trip.
         """
         # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
         from griptape_nodes.retained_mode.events.flow_events import (
@@ -257,9 +260,9 @@ class ContextManager(EngineScoped):
         )
 
         created_workflow = False
-        if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
-            workflow_id = self.get_current_workflow_id()
+        if workflow is not None:
+            workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+            workflow_id = workflow.workflow_id
         else:
             set_workflow_result = self.engine.handle_request(
                 SetWorkflowContextRequest(
@@ -268,7 +271,11 @@ class ContextManager(EngineScoped):
                     working_directory=request.working_directory,
                 )
             )
-            if not isinstance(set_workflow_result, SetWorkflowContextSuccess):
+            # The success names the workflow it opened; its id field is optional only for older engines.
+            if (
+                not isinstance(set_workflow_result, SetWorkflowContextSuccess)
+                or set_workflow_result.workflow_id is None
+            ):
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while setting the workflow: "
@@ -277,13 +284,14 @@ class ContextManager(EngineScoped):
                 )
             workflow_name = set_workflow_result.workflow_name
             workflow_id = set_workflow_result.workflow_id
+            workflow = self.engine.open_workflows.get(workflow_id)
             created_workflow = True
 
         created_flow = False
-        if self.has_current_flow():
-            flow_name = self.get_current_flow().name
+        if workflow.context.has_current_flow():
+            flow_name = workflow.context.get_current_flow().name
         else:
-            create_flow_result = self.engine.handle_request(
+            create_flow_result = workflow.handle_request(
                 CreateFlowRequest(
                     parent_flow_name=None,
                     flow_name=request.flow_name,
@@ -291,9 +299,9 @@ class ContextManager(EngineScoped):
                 )
             )
             if not isinstance(create_flow_result, CreateFlowResultSuccess):
-                # Roll the workflow push back so a partial failure does not leave hanging state.
+                # Close the workflow this request opened so a partial failure does not leave hanging state.
                 if created_workflow:
-                    self.pop_workflow()
+                    self.engine.close_workflow(workflow)
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while creating the flow: "

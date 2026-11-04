@@ -154,11 +154,11 @@ class TestASyncCloseStopsTheRun:
         calls: list[str] = []
         flow_manager = engine.flow_manager
 
-        async def cancel() -> None:
+        async def cancel(_workflow: object) -> None:
             calls.append("cancel")
 
         with (
-            patch.object(flow_manager, "cancel_all_runs", AsyncMock(side_effect=cancel)),
+            patch.object(flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=cancel)),
             patch.object(flow_manager, "reset_global_execution_state", side_effect=lambda: calls.append("reset")),
         ):
             engine.context_manager.pop_workflow()

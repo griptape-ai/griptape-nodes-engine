@@ -28,7 +28,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.objects import WorkflowObjects
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -48,7 +48,7 @@ class ObjectManager(EngineScoped):
         _event_manager.register_request_handlers(self)
 
     @handles(RenameObjectRequest)
-    def on_rename_object_request(self, request: RenameObjectRequest) -> ResultPayload:
+    def on_rename_object_request(self, request: RenameObjectRequest, workflow: WorkflowRuntime) -> ResultPayload:
         # Does the source object exist?
         if request.object_name == request.requested_name:
             unchanged = RenameObjectResultSuccess(
@@ -59,18 +59,18 @@ class ObjectManager(EngineScoped):
             # undo slot that would replay as a no-op.
             unchanged.altered_workflow_state = False
             return unchanged
-        source_obj = self.attempt_get_object_by_name(request.object_name)
+        source_obj = workflow.objects.get(request.object_name)
         if source_obj is None:
             details = f"Attempted to rename object '{request.object_name}', but no object of that name could be found."
             return RenameObjectResultFailure(next_available_name=None, result_details=details)
 
         # Is there a collision?
-        requested_name_obj = self.attempt_get_object_by_name(request.requested_name)
+        requested_name_obj = workflow.objects.get(request.requested_name)
         if requested_name_obj is None:
             final_name = request.requested_name
         else:
             # Collision. Decide what to do.
-            next_name = self.generate_name_for_object(
+            next_name = workflow.objects.generate_name(
                 type_name=source_obj.__class__.__name__, requested_name=request.requested_name
             )
 
@@ -86,15 +86,15 @@ class ObjectManager(EngineScoped):
             # Let the object's manager know. TODO: https://github.com/griptape-ai/griptape-nodes/issues/869
         match source_obj:
             case ControlFlow():
-                self.engine.flow_manager.handle_flow_rename(old_name=request.object_name, new_name=final_name)
+                self.engine.flow_manager.handle_flow_rename(workflow, old_name=request.object_name, new_name=final_name)
             case BaseNode():
-                self.engine.node_manager.handle_node_rename(old_name=request.object_name, new_name=final_name)
+                self.engine.node_manager.handle_node_rename(workflow, old_name=request.object_name, new_name=final_name)
             case _:
                 details = f"Attempted to rename an object named '{request.object_name}', but that object wasn't of a type supported for rename."
                 return RenameObjectResultFailure(next_available_name=None, result_details=details)
 
         # Update the object table.
-        self.engine.current_workflow().objects.rename(request.object_name, final_name)
+        workflow.objects.rename(request.object_name, final_name)
 
         details = f"Successfully renamed object '{request.object_name}' to '{final_name}'."
         log_level = logging.DEBUG
@@ -107,7 +107,7 @@ class ObjectManager(EngineScoped):
             result_details = details
         return RenameObjectResultSuccess(final_name=final_name, result_details=result_details)
 
-    @handles(ClearAllObjectStateRequest, scope=RequestScope.OPTIONAL_WORKFLOW)
+    @handles(ClearAllObjectStateRequest)
     async def on_clear_all_object_state_request(
         self, request: ClearAllObjectStateRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
@@ -156,7 +156,11 @@ class ObjectManager(EngineScoped):
         return self._objects_or_empty().generate_name(type_name=type_name, requested_name=requested_name)
 
     def add_object_by_name(self, name: str, obj: object) -> None:
-        objects = self.engine.current_workflow().objects
+        """Edge method for code not handed a workflow; engine code calls `add_object_by_name_in`."""
+        self.add_object_by_name_in(self.engine.current_workflow(), name, obj)
+
+    def add_object_by_name_in(self, workflow: WorkflowRuntime, name: str, obj: object) -> None:
+        objects = workflow.objects
         objects.add(name, obj)
         if isinstance(obj, BaseNode):
             # The workflow holding the node queues its changes, so they go when it closes.
@@ -178,7 +182,11 @@ class ObjectManager(EngineScoped):
         return self._objects_or_empty().get_as_type(name, cast_type)
 
     def del_obj_by_name(self, name: str) -> None:
-        objects = self.engine.current_workflow().objects
+        """Edge method for code not handed a workflow; engine code calls `del_obj_by_name_in`."""
+        self.del_obj_by_name_in(self.engine.current_workflow(), name)
+
+    def del_obj_by_name_in(self, workflow: WorkflowRuntime, name: str) -> None:
+        objects = workflow.objects
         # Does the object have any children? delete those
         obj = objects.get(name)
         if obj is None:
@@ -188,10 +196,10 @@ class ObjectManager(EngineScoped):
             for child in children:
                 obj.remove_child(child)
                 if isinstance(child, BaseNode):
-                    self.engine.handle_request(DeleteNodeRequest(child.name))
+                    workflow.handle_request(DeleteNodeRequest(child.name))
                     return
                 if isinstance(child, Parameter) and isinstance(obj, BaseNode):
-                    self.engine.handle_request(RemoveParameterFromNodeRequest(child.name, obj.name))
+                    workflow.handle_request(RemoveParameterFromNodeRequest(child.name, obj.name))
                     return
         if isinstance(obj, BaseNode):
             obj.set_change_listener(None)

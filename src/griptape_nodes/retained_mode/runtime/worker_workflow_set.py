@@ -11,6 +11,8 @@ from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntim
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import RequestDispatcher
+
 
 class WorkerWorkflowSet:
     """A worker's runtimes for its orchestrator's open workflows, by the orchestrator's workflow id.
@@ -22,7 +24,13 @@ class WorkerWorkflowSet:
     node belongs to while the node runs (`running`).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dispatcher: RequestDispatcher) -> None:
+        """Make an empty set.
+
+        Args:
+            dispatcher: The engine's request dispatch, handed to each runtime for the requests it sends.
+        """
+        self._dispatcher = dispatcher
         self._by_id: dict[str, WorkflowRuntime] = {}
         self._running_nodes: Counter[str] = Counter()
 
@@ -30,7 +38,7 @@ class WorkerWorkflowSet:
         """The runtime kept for the orchestrator workflow with this id, made if there is none yet."""
         workflow = self._by_id.get(workflow_id)
         if workflow is None:
-            workflow = WorkflowRuntime(workflow_id)
+            workflow = WorkflowRuntime(workflow_id, self._dispatcher)
             self._by_id[workflow_id] = workflow
         return workflow
 

@@ -121,7 +121,7 @@ def _manager_on(
         # Libraries still loading and no flow open, so the run's instructions carry
         # neither the node types nor a flow.
         library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
-        context_manager=SimpleNamespace(has_current_flow=lambda: False),
+        only_open_workflow_or_none=lambda: None,
     )
     return manager
 

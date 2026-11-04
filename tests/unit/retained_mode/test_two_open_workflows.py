@@ -1,7 +1,7 @@
 """Two workflows open in one engine at once, driven through dispatch with envelope workflow ids.
 
 Not a feature test: the engine opens one workflow at a time. Each test drives the foundation with a
-second workflow open next to the first (`OpenWorkflowSet(allow_several_open=True)`, a test seam), to
+second workflow open next to the first (`OpenWorkflowSet(engine, allow_several_open=True)`, a test seam), to
 check that each workflow's state and teardown stay its own. A gap later work closes is a strict xfail
 with the gap as its reason.
 """
@@ -235,7 +235,7 @@ def spike_library() -> Iterator[None]:
 
 def _allow_several_open(engine: Engine) -> None:
     """Swap in an open set that lets a second workflow open next to the first (the spike's one switch)."""
-    engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
 
 
 def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
@@ -582,6 +582,7 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
 
 # What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
 _FAIL_WITHOUT_AN_ID = {
+    "ResolveMacroPathRequest {workspace_dir}",
     "ResolveMacroPathRequest {workflow_dir}",
     "GetWorkflowContextRequest",
     "ListFlowsInCurrentContextRequest",
@@ -1129,14 +1130,6 @@ class TestOtherSharedState:
 
         assert sent[0].open_workflow_id == _ORCHESTRATOR_A
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "FINDING j4: DeleteWorkflowRequest closes the deleted workflow only when it is the current one. "
-            "Deleting B from A's tab is refused safely instead: the "
-            "registry will not remove an open workflow's entry ('Failed because it is open. Close it first')."
-        ),
-    )
     def test_deleting_a_workflow_open_in_another_tab_closes_it(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:

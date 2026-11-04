@@ -29,6 +29,7 @@ class TestNodeManagerBatchSetNodeMetadata:
 
     def test_batch_set_node_metadata_empty_request_succeeds(self, engine: Engine) -> None:
         """Test that an empty batch request succeeds without errors."""
+        engine.context_manager.push_workflow(workflow_name="workflow")
         # Create an empty batch request
         request = BatchSetNodeMetadataRequest(node_metadata_updates={})
 
@@ -42,6 +43,7 @@ class TestNodeManagerBatchSetNodeMetadata:
 
     def test_batch_set_node_metadata_all_nodes_not_found_fails(self, engine: Engine) -> None:
         """Test that batch update fails when all nodes are not found."""
+        engine.context_manager.push_workflow(workflow_name="workflow")
         # Create request with non-existent nodes
         request = BatchSetNodeMetadataRequest(
             node_metadata_updates={
@@ -298,7 +300,9 @@ class TestSerializeNodeWithoutLibraryMetadata:
 
         engine.object_manager.add_object_by_name(node.name, node)
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node.name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         create_command = result.serialized_node_commands.create_node_command
@@ -312,6 +316,7 @@ class TestUnresolveNodeRequest:
     """Tests for the on_unresolve_node_request handler."""
 
     def test_node_not_found_returns_failure(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="workflow")
         result = engine.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
         assert isinstance(result, UnresolveNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
@@ -321,11 +326,8 @@ class TestUnresolveNodeRequest:
         mock_node.name = "test_node"
         mock_node.state = NodeResolutionState.RESOLVING
         mock_node.parameter_output_values = MagicMock()
-        with patch.object(
-            engine.object_manager,
-            "attempt_get_object_by_name_as_type",
-            return_value=mock_node,
-        ):
+        engine.context_manager.push_workflow(workflow_name="workflow")
+        with patch.object(engine.current_workflow().objects, "get_as_type", return_value=mock_node):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
         assert isinstance(result, UnresolveNodeResultFailure)
@@ -339,17 +341,11 @@ class TestUnresolveNodeRequest:
         mock_node.state = NodeResolutionState.RESOLVED
         mock_node.parameter_output_values = MagicMock()
         mock_connections = MagicMock()
+        engine.context_manager.push_workflow(workflow_name="workflow")
+        workflow = engine.current_workflow()
         with (
-            patch.object(
-                engine.object_manager,
-                "attempt_get_object_by_name_as_type",
-                return_value=mock_node,
-            ),
-            patch.object(
-                engine.flow_manager,
-                "get_connections",
-                return_value=mock_connections,
-            ),
+            patch.object(workflow.objects, "get_as_type", return_value=mock_node),
+            patch.object(workflow.flows, "connections", mock_connections),
         ):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
@@ -366,17 +362,11 @@ class TestUnresolveNodeRequest:
         mock_node.state = NodeResolutionState.UNRESOLVED
         mock_node.parameter_output_values = MagicMock()
         mock_connections = MagicMock()
+        engine.context_manager.push_workflow(workflow_name="workflow")
+        workflow = engine.current_workflow()
         with (
-            patch.object(
-                engine.object_manager,
-                "attempt_get_object_by_name_as_type",
-                return_value=mock_node,
-            ),
-            patch.object(
-                engine.flow_manager,
-                "get_connections",
-                return_value=mock_connections,
-            ),
+            patch.object(workflow.objects, "get_as_type", return_value=mock_node),
+            patch.object(workflow.flows, "connections", mock_connections),
         ):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
@@ -649,11 +639,12 @@ class TestDeserializeNodeFromCommandsRetargetsElementCommands:
             return create_result if req is request.serialized_node_commands.create_node_command else success
 
         mock_node = MagicMock(spec=BaseNode)
-        mock_engine.handle_request.side_effect = fake_handle_request
-        mock_engine.object_manager.attempt_get_object_by_name_as_type.return_value = mock_node
+        workflow = MagicMock()
+        workflow.handle_request.side_effect = fake_handle_request
+        workflow.objects.get_as_type.return_value = mock_node
 
         with patch.object(NodeManager, "_cleanup_node_on_failed_deserialization"):
-            result = manager.on_deserialize_node_from_commands(request)
+            result = manager.on_deserialize_node_from_commands(request, workflow)
 
         assert isinstance(result, DeserializeNodeFromCommandsResultSuccess)
         assert result.node_name == copy_name
