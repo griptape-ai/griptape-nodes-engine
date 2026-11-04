@@ -19,8 +19,10 @@ from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, _handl
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.exe_types.base_iterative_nodes import _incoming_connection_exists, _outgoing_connection_exists
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import ControlNode, DataNode
+from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.events.app_events import EngineHeartbeatRequest, GetEngineVersionRequest
 from griptape_nodes.retained_mode.events.base_events import (
@@ -872,6 +874,46 @@ class TestNodeCodeActsOnItsOwnWorkflow:
 
         # Nothing is bound, so an ambient read would fail with two open.
         assert [source.name for source, _ in canvas.get_connected_input_from_node(node)] == ["source"]
+
+    def test_variable_substitution_with_nothing_bound_follows_each_nodes_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """A workflow with substitution off resolves no variables, while the other one still does."""
+        a, b = two_open
+        _make_node(engine, a, "_ValueNode", "in_a")
+        _make_node(engine, b, "_ValueNode", "in_b")
+        a.variables.substitution_enabled = False
+
+        # Nothing is bound, so an ambient read would fail with two open.
+        assert VariableResolver.is_substitution_enabled(engine, a) is False
+        assert VariableResolver.is_substitution_enabled(engine, b) is True
+        assert VariableResolver.get_variables_without_memoizing(engine, a, "in_a") is None
+        assert VariableResolver.get_variables_without_memoizing(engine, b, "in_b") is not None
+
+    def test_a_loop_node_with_nothing_bound_reads_its_own_workflows_connections(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """Loop start and end nodes check their hidden connections in the workflow they are in."""
+        _, b = two_open
+        for name in ("source", "n"):
+            _make_node(engine, b, "_ValueNode", name)
+        connected = _send(
+            engine,
+            CreateConnectionRequest(
+                source_node_name="source",
+                source_parameter_name="value",
+                target_node_name="n",
+                target_parameter_name="value",
+            ),
+            b,
+        )
+        assert connected.succeeded(), connected.result_details
+        source = engine.node_manager.get_node_by_name_in(b, "source")
+        node = engine.node_manager.get_node_by_name_in(b, "n")
+
+        # Nothing is bound, so an ambient read would fail with two open and answer False.
+        assert _outgoing_connection_exists(source, "source", "value") is True
+        assert _incoming_connection_exists(node, "n", "value") is True
 
 
 def _drain(queue: asyncio.Queue) -> list[Any]:

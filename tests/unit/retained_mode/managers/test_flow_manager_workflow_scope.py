@@ -308,6 +308,15 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         explicit.assert_called_once_with(engine.current_workflow(), *args)
         assert returned is explicit.return_value
 
+    def test_unresolving_a_flow_hands_the_open_workflow_to_its_explicit_twin(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        flow_manager = engine.flow_manager
+
+        with patch.object(flow_manager, "unresolve_all_nodes_in_flow_in") as explicit:
+            flow_manager.unresolve_all_nodes_in_flow("canvas")
+
+        explicit.assert_called_once_with(engine.current_workflow(), "canvas")
+
     @pytest.mark.asyncio
     async def test_edge_methods_report_failure_with_no_workflow_open(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager

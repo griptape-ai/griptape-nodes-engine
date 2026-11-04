@@ -16,7 +16,6 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     RIGHT_PARAMETERS_KEY,
     SubflowNodeGroup,
 )
-from griptape_nodes.exe_types.node_types import NodeResolutionState
 
 DEFAULT_MAX_ITERATIONS = 3
 
@@ -131,9 +130,7 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
         # Reset all nodes to UNRESOLVED so they re-execute. The DAG builder
         # skips RESOLVED upstream dependencies, so without this reset nodes
         # won't be added to the DAG and won't run on subsequent iterations.
-        flow = self.engine.flow_manager.get_flow_by_name_in(self._require_workflow(), flow_name)
-        for node in flow.nodes.values():
-            node.state = NodeResolutionState.UNRESOLVED
+        self.engine.flow_manager.unresolve_all_nodes_in_flow_in(self._require_workflow(), flow_name)
 
     def _on_complete(self, *, condition_met: bool, iterations: int) -> None:  # noqa: ARG002
         """Called after all loop iterations are finished, before the node resolves.

@@ -220,7 +220,7 @@ class VariableResolver:
     ) -> dict[str, str | int] | None:
         """Return the variable dict if substitution is enabled, else None.
 
-        Checks the per-aprocess cache first to avoid repeated singleton lookups.
+        Checks the per-aprocess cache first to avoid repeating the workflow's variable lookup.
         Returns None if: substitution is disabled, node has no parent flow,
         or the cache indicates the flow lookup already failed (_NO_FLOW).
 

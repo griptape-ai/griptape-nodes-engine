@@ -861,8 +861,8 @@ class FlowManager(EngineScoped):
     def on_list_nodes_in_flow_request(self, request: ListNodesInFlowRequest) -> ResultPayload:
         """Answer `request` for the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_list_nodes_in_flow_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_list_nodes_in_flow_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -964,12 +964,24 @@ class FlowManager(EngineScoped):
     def unresolve_all_nodes_in_flow(self, flow_name: str) -> None:
         """Reset all nodes in a flow to UNRESOLVED state.
 
-        Edge method for code not handed a workflow.
+        Edge method for code not handed a workflow; engine and `exe_types` code calls
+        `unresolve_all_nodes_in_flow_in`.
 
         Args:
             flow_name: Name of the flow whose nodes should be unresolved
+
+        Raises:
+            KeyError: No flow of that name is in the open workflow, or no workflow is open.
         """
-        flow = self.get_flow_by_name(flow_name)
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            msg = f"Flow with name {flow_name} doesn't exist"
+            raise KeyError(msg)
+        self.unresolve_all_nodes_in_flow_in(workflow, flow_name)
+
+    def unresolve_all_nodes_in_flow_in(self, workflow: WorkflowRuntime, flow_name: str) -> None:
+        """Reset all nodes in `workflow`'s flow `flow_name` to UNRESOLVED state."""
+        flow = self.get_flow_by_name_in(workflow, flow_name)
         for node in flow.nodes.values():
             node.state = NodeResolutionState.UNRESOLVED
 
@@ -991,8 +1003,8 @@ class FlowManager(EngineScoped):
     def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
         """Connect two parameters in the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_create_connection_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_create_connection_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -1353,8 +1365,8 @@ class FlowManager(EngineScoped):
     def on_delete_connection_request(self, request: DeleteConnectionRequest) -> ResultPayload:
         """Disconnect two parameters in the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_delete_connection_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_delete_connection_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -1870,8 +1882,8 @@ class FlowManager(EngineScoped):
     async def on_start_local_subflow_request(self, request: StartLocalSubflowRequest) -> ResultPayload:
         """Run a subflow of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_start_local_subflow_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_start_local_subflow_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:

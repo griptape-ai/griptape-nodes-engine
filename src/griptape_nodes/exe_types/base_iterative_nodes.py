@@ -4,7 +4,7 @@ import asyncio
 import logging
 from abc import abstractmethod
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import (
     ControlParameterInput,
@@ -25,15 +25,12 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
 )
 
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.engine import Engine
 
-
-def _outgoing_connection_exists(engine: Engine, source_node: str, source_param: str) -> bool:
+def _outgoing_connection_exists(asker: BaseNode, source_node: str, source_param: str) -> bool:
     """Check if a source node/parameter has any outgoing connections.
 
     Args:
-        engine: Engine to ask about the workflow
+        asker: The node asking, whose workflow holds the connection
         source_node: Name of the node that would be sending the connection
         source_param: Name of the parameter on that node
 
@@ -43,18 +40,20 @@ def _outgoing_connection_exists(engine: Engine, source_node: str, source_param: 
     Asked as a request rather than read from a local connection index: connections are
     workflow state, and the orchestrator is the only place that holds all of it.
     """
-    result = engine.handle_request(ListConnectionsForNodeRequest(node_name=source_node, broadcast_result=False))
+    result = asker._handle_request_in_workflow(
+        ListConnectionsForNodeRequest(node_name=source_node, broadcast_result=False)
+    )
     if not isinstance(result, ListConnectionsForNodeResultSuccess):
         return False
 
     return any(connection.source_parameter_name == source_param for connection in result.outgoing_connections)
 
 
-def _incoming_connection_exists(engine: Engine, target_node: str, target_param: str) -> bool:
+def _incoming_connection_exists(asker: BaseNode, target_node: str, target_param: str) -> bool:
     """Check if a target node/parameter has any incoming connections.
 
     Args:
-        engine: Engine to ask about the workflow
+        asker: The node asking, whose workflow holds the connection
         target_node: Name of the node that would be receiving the connection
         target_param: Name of the parameter on that node
 
@@ -64,7 +63,9 @@ def _incoming_connection_exists(engine: Engine, target_node: str, target_param: 
     Asked as a request rather than read from a local connection index: connections are
     workflow state, and the orchestrator is the only place that holds all of it.
     """
-    result = engine.handle_request(ListConnectionsForNodeRequest(node_name=target_node, broadcast_result=False))
+    result = asker._handle_request_in_workflow(
+        ListConnectionsForNodeRequest(node_name=target_node, broadcast_result=False)
+    )
     if not isinstance(result, ListConnectionsForNodeResultSuccess):
         return False
 
@@ -508,7 +509,7 @@ class BaseIterativeStartNode(BaseNode):
         node_type = self._get_base_node_type_name()
 
         # Check if exec_out has outgoing connections
-        if not _outgoing_connection_exists(self.engine, self.name, self.exec_out.name):
+        if not _outgoing_connection_exists(self, self.name, self.exec_out.name):
             exec_out_display_name = self._get_exec_out_display_name()
             errors.append(
                 Exception(
@@ -531,7 +532,7 @@ class BaseIterativeStartNode(BaseNode):
         # Check if all hidden signal connections exist (only if end_node is connected)
         if self.end_node:
             # Check trigger_next_iteration_signal connection
-            if not _incoming_connection_exists(self.engine, self.name, self.trigger_next_iteration_signal.name):
+            if not _incoming_connection_exists(self, self.name, self.trigger_next_iteration_signal.name):
                 errors.append(
                     Exception(
                         f"{self.name}: Missing hidden signal connection. "
@@ -541,7 +542,7 @@ class BaseIterativeStartNode(BaseNode):
                 )
 
             # Check break_loop_signal connection
-            if not _incoming_connection_exists(self.engine, self.name, self.break_loop_signal.name):
+            if not _incoming_connection_exists(self, self.name, self.break_loop_signal.name):
                 errors.append(
                     Exception(
                         f"{self.name}: Missing hidden signal connection. "
@@ -887,9 +888,7 @@ class BaseIterativeEndNode(BaseNode):
             )
 
         # Check if all hidden signal connections exist (only if start_node is connected)
-        if self.start_node and not _incoming_connection_exists(
-            self.engine, self.name, "loop_end_condition_met_signal_input"
-        ):
+        if self.start_node and not _incoming_connection_exists(self, self.name, "loop_end_condition_met_signal_input"):
             errors.append(
                 Exception(
                     f"{self.name}: Missing hidden signal connection. "
@@ -907,7 +906,7 @@ class BaseIterativeEndNode(BaseNode):
         connected_controls = []
 
         for control_name in control_names:
-            if _incoming_connection_exists(self.engine, self.name, control_name):
+            if _incoming_connection_exists(self, self.name, control_name):
                 connected_controls.append(control_name)  # noqa: PERF401
 
         if not connected_controls:
@@ -1024,7 +1023,7 @@ class BaseIterativeEndNode(BaseNode):
 
         # 4. Default control flow: Start → End: exec_out → add_item (default "happy path")
         # Only create this connection if the exec_out parameter doesn't already have a connection
-        if not _outgoing_connection_exists(self.engine, start_node.name, IterativeNodeParam.EXEC_OUT.value):
+        if not _outgoing_connection_exists(self, start_node.name, IterativeNodeParam.EXEC_OUT.value):
             self._handle_request_in_workflow(
                 CreateConnectionRequest(
                     source_node_name=start_node.name,
