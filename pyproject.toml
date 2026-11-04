@@ -42,17 +42,12 @@ dependencies = [
   "cattrs>=26.1.0",
   "attrs>=25.4.0",
   "fileseq>=3.2.0",
-  # Floor at 2.29.0: that release ("Support FastMCP 4 and MCP SDK v2 in `MCPToolset` alongside
-  # FastMCP 3", pydantic/pydantic-ai#6738) is the first where the `[mcp]` extra's `fastmcp-slim`
-  # floor supports the mcp 2.x module layout our own `mcp>=2.0,<3` pin (above) resolves to.
-  # Below this, `pydantic_ai/mcp.py` imports symbols (e.g. `mcp.shared.context.RequestContext`)
-  # that mcp 2.x moved/renamed, so `agent_manager` fails to import at construction time.
-  # PR #5449 raised the `mcp` ceiling without checking this; PR #5493 papered over the fallout
-  # for pydantic-ai-skills but left this one. Lift no lower than this floor.
+  # Floor at 2.29.0 (pydantic/pydantic-ai#6738): the first release whose `[mcp]` extra supports
+  # the mcp 2.x our `mcp>=2.0,<3` pin resolves to. Below it, `pydantic_ai/mcp.py` imports symbols
+  # mcp 2.x moved, such as `mcp.shared.context.RequestContext`, and `agent_manager` fails to import.
   "pydantic-ai-slim[mcp,openai]>=2.29.0",
   # Floor at 0.58: the first release whose `FileSystem.read_file` returns images and PDFs, which
-  # the skills guide promises. agents/pydantic_ai/skills.py also relies on `Skills.load` skipping
-  # a `SKILL.md` with bad frontmatter instead of failing the whole library (0.57).
+  # the skills guide promises.
   "pydantic-ai-harness[skills]>=0.58",
 ]
 
