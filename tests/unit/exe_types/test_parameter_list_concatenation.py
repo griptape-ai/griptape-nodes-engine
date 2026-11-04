@@ -72,6 +72,29 @@ class TestRowInputTypes:
 
         assert row.input_types == ["int", "list[int]", "list"]
 
+    def test_a_restored_row_already_widened_is_not_widened_again(self, node: MockNode) -> None:
+        refs = _refs(node)
+        widened = ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
+        row = Parameter(name="saved_row", tooltip="t", input_types=widened, parent_container_name="refs")
+
+        refs.add_child(row)
+
+        assert row.input_types == widened
+
+    def test_a_restored_row_keeps_its_types_when_the_list_was_saved_list_shaped(self, node: MockNode) -> None:
+        refs = _refs(node)
+        refs.input_types = refs.input_types
+        row = Parameter(
+            name="saved_row",
+            tooltip="t",
+            input_types=["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"],
+            parent_container_name="refs",
+        )
+
+        refs.add_child(row)
+
+        assert row.input_types == ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
+
     def test_clearing_input_types_leaves_old_and_new_rows_alike(self, node: MockNode) -> None:
         refs = _refs(node)
         old_row = refs.add_child_parameter()
@@ -119,3 +142,16 @@ class TestConcatenation:
 class TestRulesSentToTheEditor:
     def test_an_empty_list_reports_what_its_rows_accept(self, node: MockNode) -> None:
         assert _refs(node).to_dict()["row_input_types"] == ["ImageUrlArtifact", "list[ImageUrlArtifact]", "list"]
+
+
+class TestSavedTypes:
+    def test_a_list_saves_its_item_types(self, node: MockNode) -> None:
+        assert _refs(node).save_dict()["input_types"] == ["ImageUrlArtifact"]
+
+    def test_a_list_restored_from_its_save_keeps_its_item_types(self, node: MockNode) -> None:
+        refs = _refs(node)
+        list_shaped = refs.input_types
+
+        refs.input_types = refs.save_dict()["input_types"]
+
+        assert refs.input_types == list_shaped

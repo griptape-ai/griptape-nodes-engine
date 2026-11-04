@@ -293,6 +293,12 @@ class ParameterList(ParameterContainer):
         data["row_input_types"] = self.row_input_types
         return data
 
+    def save_dict(self) -> dict[str, Any]:
+        """Save the item types, which is what the `input_types` setter restores on load."""
+        data = super().save_dict()
+        data["input_types"] = super()._custom_getter_for_property_input_types()
+        return data
+
     def _custom_getter_for_property_type(self) -> str:
         base_type = super()._custom_getter_for_property_type()
         result = f"list[{base_type}]"
@@ -398,7 +404,7 @@ class ParameterList(ParameterContainer):
             name=name,
             tooltip=self.tooltip,
             type=self._type,
-            input_types=self._input_types,
+            input_types=super()._custom_getter_for_property_input_types(),
             output_type=self._output_type,
             default_value=self.default_value,
             tooltip_as_input=self.tooltip_as_input,
@@ -504,7 +510,8 @@ class ParameterList(ParameterContainer):
             # Saved rows also need the container's item converters and input types.
             missing = [converter for converter in self._item_converters if converter not in child._converters]
             child._converters = [*missing, *child._converters]
-            self._widen_row_input_types(child)
+            # A row keeps its own item types: a saved list's own types may be list-shaped.
+            child.input_types = self._with_list_variants(self._without_list_variants(child.input_types))
         super().add_child(child)
 
         # Mark the parent node as unresolved since the parameter structure changed
@@ -547,6 +554,15 @@ class ParameterList(ParameterContainer):
     def _with_list_variants(item_types: list[str]) -> list[str]:
         """Accept bare `list` because runtime-built lists cannot always declare one item type."""
         return [*item_types, *(f"list[{item_type}]" for item_type in item_types), "list"]
+
+    @staticmethod
+    def _without_list_variants(input_types: list[str]) -> list[str]:
+        """Return the item types `input_types` was widened from, or `input_types` if it was not widened."""
+        item_count = len(input_types) // 2
+        item_types = input_types[:item_count]
+        if input_types == ParameterList._with_list_variants(item_types):
+            return item_types
+        return input_types
 
 
 class ParameterKeyValuePair(Parameter):
