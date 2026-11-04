@@ -13618,3 +13618,172 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         pm = self._project_manager("{no_such_directory}/{file_name_base}.{file_extension}")
 
         assert self._resolve_workflow_dir(pm) == self._expected_dir()
+
+
+class TestRefreshProjectTemplates:
+    """Test ProjectManager.on_refresh_project_templates_request."""
+
+    VALID_PROJECT_YAML = TestLoadRegisteredProjects.VALID_PROJECT_YAML
+
+    @pytest.fixture
+    def pm(self) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.get_config_value.return_value = []
+        mock_config_manager.read_config_file_value.return_value = None
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    def _engine_reading_disk(self) -> MagicMock:
+        """An engine whose ReadFileRequest reads the real file, failing when it does not exist."""
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            ReadFileResultFailure,
+            ReadFileResultSuccess,
+        )
+
+        def read_file(request: Any) -> object:
+            path = Path(request.file_path)
+            if not path.is_file():
+                return ReadFileResultFailure(
+                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="not found"
+                )
+            content = path.read_text()
+            return ReadFileResultSuccess(
+                content=content,
+                file_size=len(content),
+                mime_type="text/plain",
+                encoding="utf-8",
+                result_details="ok",
+            )
+
+        mock_engine = MagicMock()
+        mock_engine.config_manager.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
+        mock_engine.ahandle_request = AsyncMock(side_effect=read_file)
+        return mock_engine
+
+    def _register(self, pm: ProjectManager, entries: list[str]) -> None:
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        def get_config_value_side_effect(key: str, default: object = None, **_: object) -> object:
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return entries
+            return default
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+
+    @pytest.mark.asyncio
+    async def test_directory_mounted_after_boot_loads_on_refresh(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A registered directory that was unreachable at boot loads on refresh and leaves no failure behind."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectTemplatesRequest,
+            RefreshProjectTemplatesRequest,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        drive = tmp_path / "drive"
+        self._register(pm, [str(drive)])
+        mock_engine = self._engine_reading_disk()
+
+        with (
+            patch.object(pm, "_engine", mock_engine),
+            patch.object(pm, "_register_project_path"),
+            patch.object(pm, "_build_unloaded_id_index", new=AsyncMock(return_value={})),
+        ):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            before = await pm.on_list_project_templates_request(ListProjectTemplatesRequest())
+            assert before.successfully_loaded == []
+            assert [info.project_id for info in before.failed_to_load] == [str(canonicalize_for_identity(drive))]
+
+            project_file = drive / "show" / WORKSPACE_PROJECT_FILE
+            project_file.parent.mkdir(parents=True)
+            project_file.write_text(self.VALID_PROJECT_YAML)
+
+            result = await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert result.succeeded()
+        assert str(canonicalize_for_identity(project_file)) in pm._successfully_loaded_project_templates
+        # The boot-time MISSING entry under the directory path is what kept it in failed_to_load.
+        assert canonicalize_for_identity(drive) not in pm._registered_template_status
+
+    @pytest.mark.asyncio
+    async def test_still_missing_file_stays_failed(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A registered file that is still unreachable is listed as failed after refresh."""
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        missing = canonicalize_for_identity(tmp_path / "missing.yml")
+        self._register(pm, [str(missing)])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert pm._registered_template_status[missing].status == ProjectValidationStatus.MISSING
+
+    @pytest.mark.asyncio
+    async def test_loaded_project_keeps_its_status(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """Refresh does not drop the status of a registered project that is already loaded."""
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        project_file = canonicalize_for_identity(tmp_path / "project.yml")
+        project_file.write_text(self.VALID_PROJECT_YAML)
+        self._register(pm, [str(project_file)])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            status_before = pm._registered_template_status[project_file]
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert pm._registered_template_status[project_file] is status_before
+
+    @pytest.mark.asyncio
+    async def test_failure_inside_directory_that_is_gone_is_cleared(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A discovered file that failed and has since been removed is no longer reported as failed."""
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        drive = tmp_path / "drive"
+        broken = drive / "broken" / WORKSPACE_PROJECT_FILE
+        broken.parent.mkdir(parents=True)
+        broken.write_text("not: [valid")
+        good = drive / "good" / WORKSPACE_PROJECT_FILE
+        good.parent.mkdir()
+        good.write_text(self.VALID_PROJECT_YAML)
+        self._register(pm, [str(drive)])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            assert canonicalize_for_identity(broken) in pm._registered_template_status
+
+            broken.unlink()
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert canonicalize_for_identity(broken) not in pm._registered_template_status
+        assert str(canonicalize_for_identity(good)) in pm._successfully_loaded_project_templates
+
+    @pytest.mark.asyncio
+    async def test_failure_outside_registered_paths_is_kept(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A failure discovery won't revisit, such as an unregistered file loaded by hand, survives refresh."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        unregistered = canonicalize_for_identity(tmp_path / "elsewhere" / "project.yml")
+        pm._registered_template_status[unregistered] = ProjectValidationInfo(status=ProjectValidationStatus.MISSING)
+        self._register(pm, [str(tmp_path / "drive")])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert unregistered in pm._registered_template_status

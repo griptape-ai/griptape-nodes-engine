@@ -51,6 +51,7 @@ from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_r
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
+    canonicalize_for_identity_preserving_symlinks,
     resolve_file_path,
     resolve_path_safely,
 )
@@ -108,6 +109,8 @@ from griptape_nodes.retained_mode.events.project_events import (
     PreviewImportProjectResultFailure,
     PreviewImportProjectResultSuccess,
     ProjectTemplateInfo,
+    RefreshProjectTemplatesRequest,
+    RefreshProjectTemplatesResultSuccess,
     ResolveProjectWorkspaceRequest,
     ResolveProjectWorkspaceResultSuccess,
     SaveProjectTemplateRequest,
@@ -748,6 +751,10 @@ class ProjectManager(EngineScoped):
         # Track validation status for ALL load attempts (including MISSING/UNUSABLE)
         # This allows UI to query why a project failed to load
         self._registered_template_status: dict[Path, ProjectValidationInfo] = {}
+
+        # Serializes RefreshProjectTemplatesRequest. Discovery shares the boot id-index and clears it
+        # when it finishes, so two overlapping refreshes would clear it under each other.
+        self._refresh_project_templates_lock = anyio.Lock()
 
         # Snapshot of os.environ entries mutated by the currently-active project.
         # Maps env var name -> original value (or None if the var was not set before).
@@ -1522,6 +1529,56 @@ class ProjectManager(EngineScoped):
             failed_to_load=failed_to_load,
             result_details=f"Successfully listed project templates. Loaded: {len(successfully_loaded)}, Failed: {len(failed_to_load)}",
         )
+
+    @handles(RefreshProjectTemplatesRequest, scope=RequestScope.HOST)
+    async def on_refresh_project_templates_request(
+        self, _request: RefreshProjectTemplatesRequest
+    ) -> RefreshProjectTemplatesResultSuccess:
+        """Re-run registered-project discovery so projects that became reachable after boot load.
+
+        Failure statuses that discovery will revisit are dropped first, so whatever is still
+        unreachable is recorded again and whatever now loads stops being listed as failed. That is
+        every unloaded entry at or under a registered path. A directory entry that was unmounted at
+        boot was recorded as a missing file under the directory's own path, which a successful scan
+        never overwrites. Each registered path is matched both with and without following links,
+        since a path recorded before its drive mounted may resolve elsewhere once it has.
+        Failures discovery doesn't revisit, such as a boot project or an unregistered path loaded
+        by hand, are kept.
+        """
+        async with self._refresh_project_templates_lock:
+            newly_loaded = await self._refresh_registered_projects()
+
+        return RefreshProjectTemplatesResultSuccess(
+            result_details=f"Re-checked registered project paths. Newly loaded: {newly_loaded}",
+        )
+
+    async def _refresh_registered_projects(self) -> int:
+        """Drop the failure statuses discovery will revisit, re-run it, and return how many projects newly loaded."""
+        registered_entries: list[str | dict | PerPlatformProjectPath] = (
+            self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
+        )
+        registered_roots: set[Path] = set()
+        for path_str in self._select_registered_entry_paths(registered_entries):
+            registered_roots.add(canonicalize_for_identity(path_str))
+            registered_roots.add(canonicalize_for_identity_preserving_symlinks(path_str))
+        loaded_paths = {
+            info.project_file_path
+            for info in self._successfully_loaded_project_templates.values()
+            if info.project_file_path is not None
+        }
+        stale_paths = [
+            path
+            for path, validation in self._registered_template_status.items()
+            if path not in loaded_paths
+            and not validation.is_usable()
+            and any(path.is_relative_to(root) for root in registered_roots)
+        ]
+        for stale_path in stale_paths:
+            del self._registered_template_status[stale_path]
+
+        loaded_before = len(self._successfully_loaded_project_templates)
+        await self._load_registered_projects()
+        return len(self._successfully_loaded_project_templates) - loaded_before
 
     async def _build_loaded_template_info(
         self,
@@ -5353,7 +5410,7 @@ class ProjectManager(EngineScoped):
         """Load project templates from paths persisted in user config.
 
         Called after workspace project loading so that user-registered paths
-        are available in the template list. Paths already loaded (e.g., the
+        are available in the template list, and again by RefreshProjectTemplatesRequest. Paths already loaded (e.g., the
         workspace project) are skipped. Missing or invalid files are skipped
         with a warning rather than raising.
 
@@ -5396,7 +5453,7 @@ class ProjectManager(EngineScoped):
                 result = await self.on_load_project_template_request(load_request)
                 if result.failed():
                     logger.warning(
-                        "Failed to load registered project '%s' on startup: %s",
+                        "Failed to load registered project '%s': %s",
                         canonical_path,
                         result.result_details,
                     )
@@ -5451,16 +5508,31 @@ class ProjectManager(EngineScoped):
     ) -> list[Path]:
         """Resolve persisted projects_to_register entries to canonical file paths.
 
-        Coerces raw dicts (from JSON/YAML config) into the per-platform model so
-        select_project_path can apply the active-platform key and `default`
-        fallback uniformly, selects the active-platform path, then canonicalizes
-        it (expand ~/env vars + absolutize + follow symlinks) so different
-        spellings of the same file collide. Entries with no path for the active
-        platform, or that fail validation, are skipped with a warning. Duplicate
-        canonical paths are de-duplicated so each file is processed once.
+        Canonicalizes each active-platform path (expand ~/env vars + absolutize +
+        follow symlinks) so different spellings of the same file collide.
+        Duplicate canonical paths are de-duplicated so each file is processed once.
         """
         resolved: list[Path] = []
         seen: set[Path] = set()
+        for path_str in self._select_registered_entry_paths(registered_entries):
+            canonical_path = canonicalize_for_identity(path_str)
+            if canonical_path in seen:
+                continue
+            seen.add(canonical_path)
+            resolved.append(canonical_path)
+        return resolved
+
+    def _select_registered_entry_paths(
+        self, registered_entries: list[str | dict | PerPlatformProjectPath]
+    ) -> list[str]:
+        """Select the active-platform path string of each persisted projects_to_register entry.
+
+        Coerces raw dicts (from JSON/YAML config) into the per-platform model so
+        select_project_path can apply the active-platform key and `default`
+        fallback uniformly. Entries with no path for the active platform, or that
+        fail validation, are skipped with a warning.
+        """
+        selected: list[str] = []
         for entry in registered_entries:
             if isinstance(entry, dict):
                 try:
@@ -5482,12 +5554,8 @@ class ProjectManager(EngineScoped):
                     entry,
                 )
                 continue
-            canonical_path = canonicalize_for_identity(path_str)
-            if canonical_path in seen:
-                continue
-            seen.add(canonical_path)
-            resolved.append(canonical_path)
-        return resolved
+            selected.append(path_str)
+        return selected
 
     async def _load_projects_from_directory(self, directory: Path) -> None:
         """Discover and load every project file under a registered directory.
