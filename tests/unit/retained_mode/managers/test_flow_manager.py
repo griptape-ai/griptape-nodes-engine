@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.commands import encode_commands
 
 
@@ -164,6 +165,15 @@ def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands) -> Gen
         Path(path).unlink(missing_ok=True)
 
 
+def _a_workflow(engine: Engine) -> WorkflowRuntime:
+    """The open workflow, opening one when none is, for handlers called directly with the workflow they act on."""
+    workflow = engine.current_workflow_or_none()
+    if workflow is None:
+        engine.context_manager.push_workflow(workflow_name="extracting")
+        workflow = engine.current_workflow()
+    return workflow
+
+
 class TestExtractFlowCommandsFromImageMetadata:
     """Covers the non-error success paths for images that carry no workflow payload."""
 
@@ -173,7 +183,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_without_metadata)
 
-        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request, _a_workflow(engine))
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands is None
@@ -185,7 +195,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_unrelated_metadata)
 
-        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request, _a_workflow(engine))
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands is None
@@ -195,7 +205,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path="/does/not/exist.png")
 
-        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request, _a_workflow(engine))
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
@@ -205,7 +215,7 @@ class TestExtractFlowCommandsFromImageMetadata:
             file_url_or_path=image_with_flow_commands, deserialize=True
         )
 
-        result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
+        result = engine.handle_request(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         assert "Failed to deserialize" in str(result.result_details)
@@ -216,7 +226,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_flow_commands)
 
-        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request)
+        result = flow_manager.serialization.on_extract_flow_commands_from_image_metadata(request, _a_workflow(engine))
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
         assert result.serialized_flow_commands == empty_flow_commands
@@ -235,7 +245,7 @@ class TestExtractFlowCommandsFromImageMetadata:
         path = _image_with_flow_commands_text(text)
         try:
             result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
-                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
+                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
             )
         finally:
             Path(path).unlink(missing_ok=True)
@@ -255,7 +265,7 @@ class TestExtractFlowCommandsFromImageMetadata:
 
         with patch.object(Image, "open", _open):
             engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
-                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path)
+                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
             )
 
         (image,) = opened
@@ -405,7 +415,7 @@ class TestStartFlowFailureMessage:
     async def test_start_flow_reports_exception(self, ready_flow_manager: Any, engine: Engine) -> None:
         with patch.object(ready_flow_manager, "start_flow", side_effect=RuntimeError("boom")):
             result = await ready_flow_manager.on_start_flow_request(
-                StartFlowRequest(flow_name="f"), engine.current_workflow()
+                StartFlowRequest(flow_name="f"), _a_workflow(engine)
             )
 
         assert isinstance(result, StartFlowResultFailure)
@@ -1344,7 +1354,7 @@ class TestRunsEndCleanly:
             patch.object(flow_manager, "_cancel_run", side_effect=stop_the_flow),
         ):
             await flow_manager.start_run(_Spec("flow", first))
-            await flow_manager.cancel_all_runs()
+            await flow_manager.cancel_all_runs_in(engine.current_workflow())
 
         result = await asyncio.wait_for(late[0].outcome, timeout=1.0)
         assert "did not start: it was cancelled" in str(result.result_details)
@@ -1608,7 +1618,7 @@ class TestRunRequests:
         waiting = [asyncio.ensure_future(flow_manager.start_run(_Spec(name, waits))) for name in ("second", "third")]
         await asyncio.sleep(0)
 
-        result = flow_manager.on_list_runs_request(ListRunsRequest())
+        result = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
 
         assert isinstance(result, ListRunsResultSuccess)
         assert [(run.flow_name, run.state, run.position) for run in result.runs] == [
@@ -1637,9 +1647,9 @@ class TestRunRequests:
         assert run is not None
 
         flow_manager.report_run_waiting_for_engine(run.run_id, 2)
-        waiting = flow_manager.on_list_runs_request(ListRunsRequest())
+        waiting = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
         flow_manager.report_run_waiting_for_engine(run.run_id, 0)
-        admitted = flow_manager.on_list_runs_request(ListRunsRequest())
+        admitted = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
 
         assert isinstance(waiting, ListRunsResultSuccess)
         assert isinstance(admitted, ListRunsResultSuccess)
@@ -1666,7 +1676,9 @@ class TestRunRequests:
         await asyncio.sleep(0)
         waiting_run = flow_manager.submit_run(_Spec("second", second))
 
-        result = await flow_manager.on_cancel_run_request(CancelRunRequest(run_id=waiting_run.run_id))
+        result = await flow_manager.on_cancel_run_request(
+            CancelRunRequest(run_id=waiting_run.run_id), engine.current_workflow()
+        )
         first_may_end.set()
         await asyncio.wait_for(running, timeout=1.0)
 
@@ -1677,7 +1689,9 @@ class TestRunRequests:
 
     @pytest.mark.asyncio
     async def test_cancelling_a_run_that_does_not_exist_fails(self, engine: Engine) -> None:
-        result = await engine.flow_manager.on_cancel_run_request(CancelRunRequest(run_id="no-such-run"))
+        result = await engine.flow_manager.on_cancel_run_request(
+            CancelRunRequest(run_id="no-such-run"), engine.current_workflow()
+        )
 
         assert isinstance(result, CancelRunResultFailure)
         assert "no run with that id" in str(result.result_details)
@@ -1763,7 +1777,7 @@ class TestRunResultsNameTheirRun:
         waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("second", second)))
         await asyncio.sleep(0)
 
-        result = await flow_manager.on_cancel_all_runs_request(CancelAllRunsRequest())
+        result = await flow_manager.on_cancel_all_runs_request(CancelAllRunsRequest(), engine.current_workflow())
         first_may_end.set()
         await asyncio.wait_for(running, timeout=1.0)
 
@@ -1780,7 +1794,7 @@ class TestCancelAllRunsWhenIdle:
         flow_manager = engine.flow_manager
 
         with patch.object(flow_manager, "_cancel_run") as cancel_run:
-            await flow_manager.cancel_all_runs()
+            await flow_manager.cancel_all_runs_in(engine.current_workflow())
 
         cancel_run.assert_not_called()
 
@@ -1805,7 +1819,7 @@ class TestRunsNameTheirRequest:
         with patch("griptape_nodes.retained_mode.managers.flow_manager.current_request_id", return_value="client-7"):
             waiting_run = flow_manager.submit_run(_Spec("flow", second))
 
-        listed = flow_manager.on_list_runs_request(ListRunsRequest())
+        listed = flow_manager.on_list_runs_request(ListRunsRequest(), engine.current_workflow())
 
         assert isinstance(listed, ListRunsResultSuccess)
         assert [run.request_id for run in listed.runs if run.run_id == waiting_run.run_id] == ["client-7"]

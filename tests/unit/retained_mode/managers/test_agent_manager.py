@@ -1370,7 +1370,7 @@ class TestExplainAgentRunError:
         assert refusal is not None
         halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
 
-        async def refused(_request: RunAgentRequest) -> None:
+        async def refused(_request: RunAgentRequest, _workflow: object) -> None:
             raise halt
 
         monkeypatch.setattr(providers_manager, "_run_agent", refused)
@@ -1385,7 +1385,7 @@ class TestExplainAgentRunError:
     async def test_any_other_failure_is_framed_as_an_agent_error(
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def broken(_request: RunAgentRequest) -> None:
+        async def broken(_request: RunAgentRequest, _workflow: object) -> None:
             msg = "the provider hung up"
             raise RuntimeError(msg)
 
@@ -1547,7 +1547,7 @@ class TestRunAgentResultPayloadContract:
             # Libraries still loading and no flow open, so the run's instructions carry
             # neither the node types nor a flow.
             library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
-            context_manager=SimpleNamespace(has_current_flow=lambda: False),
+            only_open_workflow_or_none=lambda: None,
         )
         return manager
 
@@ -1558,7 +1558,7 @@ class TestRunAgentResultPayloadContract:
     ) -> None:
         manager = self._manager(monkeypatch, result)
 
-        payload = await manager._run_agent(_run_request())
+        payload = await manager._run_agent(_run_request(), None)
 
         assert isinstance(payload, RunAgentResultSuccess)
         assert "truncated" in payload.output, f"the {branch} branch omits `truncated` from its payload"
@@ -1572,7 +1572,7 @@ class TestRunAgentResultPayloadContract:
         """One shape for all outcomes, so the frontend needs no per-branch handling."""
         manager = self._manager(monkeypatch, result)
 
-        payload = await manager._run_agent(_run_request())
+        payload = await manager._run_agent(_run_request(), None)
 
         assert isinstance(payload, RunAgentResultSuccess)
         assert set(payload.output) == {
@@ -1592,7 +1592,7 @@ class TestRunAgentResultPayloadContract:
         manager = self._manager(monkeypatch, result)
         manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
 
-        await manager._run_agent(_run_request())
+        await manager._run_agent(_run_request(), None)
 
         assert recorded == [], "cancelled run must not record a RunRecord"
 
@@ -1613,7 +1613,7 @@ class TestRunAgentResultPayloadContract:
             provider_name="my-ollama",
             additional_mcp_servers=["brave"],
         )
-        await manager._run_agent(req)
+        await manager._run_agent(req, None)
 
         assert len(recorded) == 1
         r = recorded[0]
@@ -1639,7 +1639,7 @@ class TestRunAgentResultPayloadContract:
             provider_name="my-ollama",
             model_name="gpt-4o",
         )
-        await manager._run_agent(req)
+        await manager._run_agent(req, None)
 
         assert len(recorded) == 1
         assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"

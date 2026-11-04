@@ -69,9 +69,8 @@ def _open_workflow(engine: Engine) -> WorkflowRuntime:
     return engine.current_workflow()
 
 
-# FlowManager requests still in `AMBIENT_UNTIL_MIGRATED`: with no workflow named they act on the only open
-# one, and they answer with nothing open. Every other one acts on a workflow.
-_UNSCOPED_REQUESTS = {
+# They answer with no workflow, and use the one they are handed.
+_OPTIONAL_WORKFLOW_REQUESTS = {
     GetTopLevelFlowRequest,
     ListFlowsInFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
@@ -101,10 +100,62 @@ class TestFlowManagerScopes:
 
         assert scopes, "FlowManager registers no handlers"
         for request_type, scope in scopes.items():
-            expected: RequestScope | None = RequestScope.WORKFLOW
-            if request_type in _UNSCOPED_REQUESTS:
-                expected = None
+            expected = RequestScope.WORKFLOW
+            if request_type in _OPTIONAL_WORKFLOW_REQUESTS:
+                expected = RequestScope.OPTIONAL_WORKFLOW
             assert scope is expected, f"{request_type.__name__} is {scope}, expected {expected}"
+
+
+class TestTopLevelFlowWithNoEnvelopeId:
+    """The editor names no workflow yet, and reads `flow_name=None` as "nothing is loaded"."""
+
+    def test_answers_for_the_only_open_workflow(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        flow_name = _create_canvas(engine)
+
+        result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
+
+        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
+        assert result.flow_name == flow_name
+
+    def test_answers_none_with_nothing_open(self, engine: Engine) -> None:
+        result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
+
+        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
+        assert result.flow_name is None
+
+
+class TestCancelWithNoEnvelopeId:
+    """Cancelling binds the open workflow it falls back to: nodes' own cancellation reads the binding."""
+
+    @pytest.mark.asyncio
+    async def test_cancelling_every_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+        seen: list[WorkflowRuntime | None] = []
+
+        async def cancel_all_runs_in(_workflow: WorkflowRuntime) -> None:
+            seen.append(engine.current_workflow_or_none())
+
+        with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
+            result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
+
+        assert result.succeeded(), result.result_details
+        assert seen == [workflow]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+        seen: list[WorkflowRuntime | None] = []
+
+        async def cancel_run_in(_workflow: WorkflowRuntime, _run_id: str) -> bool:
+            seen.append(engine.current_workflow_or_none())
+            return True
+
+        with patch.object(engine.flow_manager, "cancel_run_in", cancel_run_in):
+            result = (await engine.event_manager.ahandle_request(CancelRunRequest(run_id="run"))).result
+
+        assert result.succeeded(), result.result_details
+        assert seen == [workflow]
 
 
 class TestHandlersActOnTheWorkflowTheyAreHanded:

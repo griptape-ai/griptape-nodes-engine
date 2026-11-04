@@ -518,15 +518,34 @@ class FlowManager(EngineScoped):
         """
         return workflow.flows.flow_to_referenced_workflow_name.get(flow)
 
+    def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:
+        """Find the open workflow's top-level flow, outside dispatch.
+
+        Edge method for code that calls the handler directly and is not handed a workflow; dispatch
+        calls `on_get_top_level_flow_request_in_workflow`. With no workflow open there is none.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            msg = "Attempted to get top level flow, but no such flow exists"
+            logger.debug(msg)
+            return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
+        return self.on_get_top_level_flow_request_in_workflow(request, workflow)
+
     @handles(GetTopLevelFlowRequest)
-    def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:  # noqa: ARG002 (the request has to be assigned to the method)
-        flows = self._current_flows_or_none()
-        if flows is not None:
-            for flow_name, parent in flows.name_to_parent_name.items():
-                if parent is None:
-                    return GetTopLevelFlowResultSuccess(
-                        flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
-                    )
+    def on_get_top_level_flow_request_in_workflow(
+        self,
+        request: GetTopLevelFlowRequest,  # noqa: ARG002 (the request has to be assigned to the method)
+        workflow: WorkflowRuntime | None = None,
+    ) -> ResultPayload:
+        """Find `workflow`'s top-level flow. With no workflow there is none."""
+        names = {}
+        if workflow is not None:
+            names = workflow.flows.name_to_parent_name
+        for flow_name, parent in names.items():
+            if parent is None:
+                return GetTopLevelFlowResultSuccess(
+                    flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
+                )
         msg = "Attempted to get top level flow, but no such flow exists"
         logger.debug(msg)
         return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
@@ -883,23 +902,28 @@ class FlowManager(EngineScoped):
         return result
 
     @handles(ListFlowsInFlowRequest)
-    def on_list_flows_in_flow_request(self, request: ListFlowsInFlowRequest) -> ResultPayload:
+    def on_list_flows_in_flow_request(
+        self, request: ListFlowsInFlowRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """List the flows directly under the request's parent flow in `workflow`. With no workflow there are none."""
         if request.parent_flow_name is not None:
             # Does this Flow even exist?
-            obj_mgr = self.engine.object_manager
-            flow = obj_mgr.attempt_get_object_by_name_as_type(request.parent_flow_name, ControlFlow)
+            flow = None
+            if workflow is not None:
+                flow = workflow.objects.get_as_type(request.parent_flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to list Flows that are children of Flow '{request.parent_flow_name}', but no Flow with that name could be found."
                 result = ListFlowsInFlowResultFailure(result_details=details)
                 return result
 
-        # Create a list of all child flow names that point DIRECTLY to us. With no workflow open there are none.
+        # Create a list of all child flow names that point DIRECTLY to us.
         ret_list = []
-        flows = self._current_flows_or_none()
-        if flows is not None:
-            for flow_name, parent_name in flows.name_to_parent_name.items():
-                if parent_name == request.parent_flow_name:
-                    ret_list.append(flow_name)
+        if workflow is not None:
+            ret_list = [
+                flow_name
+                for flow_name, parent_name in workflow.flows.name_to_parent_name.items()
+                if parent_name == request.parent_flow_name
+            ]
 
         details = f"Successfully got the list of Flows that are direct children of Flow '{request.parent_flow_name}'."
 
@@ -1970,9 +1994,9 @@ class FlowManager(EngineScoped):
         run = workflow.flows.run_in_progress
         try:
             if run is not None:
-                await self.cancel_run(run.run_id)
+                await self.cancel_run_in(workflow, run.run_id)
             else:
-                await self.cancel_flow_run()
+                await self._cancel_run(workflow.flows)
         except Exception as e:
             details = f"Could not cancel flow execution. Exception: {e}"
 
@@ -1982,17 +2006,27 @@ class FlowManager(EngineScoped):
         return CancelFlowResultSuccess(result_details=details)
 
     @handles(CancelRunRequest)
-    async def on_cancel_run_request(self, request: CancelRunRequest) -> ResultPayload:
-        cancelled = await self.cancel_run(request.run_id)
+    async def on_cancel_run_request(
+        self, request: CancelRunRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Cancel the request's run of `workflow`. With no workflow there is none to cancel."""
+        cancelled = False
+        if workflow is not None:
+            cancelled = await self.cancel_run_in(workflow, request.run_id)
         if not cancelled:
             details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
             return CancelRunResultFailure(result_details=details)
         return CancelRunResultSuccess(result_details=f"Cancelled run '{request.run_id}'.")
 
     @handles(CancelAllRunsRequest)
-    async def on_cancel_all_runs_request(self, _request: CancelAllRunsRequest) -> ResultPayload:
+    async def on_cancel_all_runs_request(
+        self, _request: CancelAllRunsRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Cancel every run of `workflow`. With no workflow there is nothing to cancel."""
+        if workflow is None:
+            return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
         try:
-            await self.cancel_all_runs()
+            await self.cancel_all_runs_in(workflow)
         except Exception as e:
             # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
             details = f"Attempted to cancel every run. Failed because the run in progress could not be cancelled: {e}"
@@ -2000,11 +2034,12 @@ class FlowManager(EngineScoped):
         return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
 
     @handles(ListRunsRequest)
-    def on_list_runs_request(self, _request: ListRunsRequest) -> ResultPayload:
+    def on_list_runs_request(self, _request: ListRunsRequest, workflow: WorkflowRuntime | None = None) -> ResultPayload:
+        """List `workflow`'s runs. With no workflow there are none."""
         runs: list[RunInfo] = []
-        flows = self._current_flows_or_none()
-        if flows is None:
+        if workflow is None:
             return ListRunsResultSuccess(runs=runs, result_details="Listed 0 run(s).")
+        flows = workflow.flows
         in_progress = flows.run_in_progress
         if in_progress is not None:
             # Waiting for another engine, which reported its place in that engine's line.
@@ -2395,6 +2430,10 @@ class FlowManager(EngineScoped):
         self._report_places_in_line(flows)
         return run
 
+    async def cancel_run_in(self, workflow: WorkflowRuntime, run_id: str) -> bool:
+        """Cancel a run of `workflow`, returning whether there was one; see `cancel_run`."""
+        return await self.cancel_run(run_id, flows=workflow.flows)
+
     async def cancel_run(self, run_id: str, *, flows: WorkflowFlows | None = None) -> bool:
         """Cancel a run of the current workflow, or of the line `flows` names, returning whether there was one.
 
@@ -2417,14 +2456,9 @@ class FlowManager(EngineScoped):
             await self._cancel_run(flows)
         return True
 
-    async def cancel_all_runs(self) -> None:
-        """Cancel every waiting run of the current workflow, then its run in progress, without starting another.
-
-        With no workflow current there is nothing to cancel.
-        """
-        flows = self._current_flows_or_none()
-        if flows is None:
-            return
+    async def cancel_all_runs_in(self, workflow: WorkflowRuntime) -> None:
+        """Cancel every waiting run of `workflow`, then its run in progress, without starting another."""
+        flows = workflow.flows
         # The waiting runs go first: cancelling the run in progress would otherwise start the next one.
         self._turn_away(flows, flows.run_queue.snapshot(), "it was cancelled.")
         if flows.run_in_progress is not None:

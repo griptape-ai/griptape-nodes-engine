@@ -38,5 +38,5 @@ class WorkflowFlows:
         # driver may end it: its flow may not have started yet (still validating) or may have just been
         # cancelled, and the paths that end a paused run must not mistake either for the run being over.
         self.driving = False
-        # True while cancel_all_runs awaits the run in progress, so a run submitted meanwhile waits to be turned away.
+        # True while cancel_all_runs_in awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self.cancelling_all = False

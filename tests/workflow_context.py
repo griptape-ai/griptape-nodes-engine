@@ -32,7 +32,14 @@ def unsaved_workflow_open(engine: Engine) -> Iterator[Workflow]:
     """
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     try:
-        engine.context_manager.push_workflow(workflow_name="unsaved")
-        yield engine.context_manager.get_current_workflow()
+        yield push_unsaved_workflow(engine)
     finally:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+def push_unsaved_workflow(
+    engine: Engine, display_name: str = "unsaved", *, working_directory: str | None = None
+) -> Workflow:
+    """Open a new unsaved workflow named `display_name` and return its registry entry."""
+    engine.context_manager.push_workflow(workflow_name=display_name, working_directory=working_directory)
+    return engine.context_manager.get_current_workflow()

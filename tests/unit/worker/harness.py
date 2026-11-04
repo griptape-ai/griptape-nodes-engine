@@ -39,9 +39,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
+from griptape_nodes.utils.async_utils import call_function
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from griptape_nodes.retained_mode.events.base_events import EventRequest, RequestPayload, ResultPayload
 
@@ -66,34 +68,26 @@ class InProcessWorkerHarness:
     _worker_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def install_remote_handler(self, request_type: type[RequestPayload]) -> None:
-        """Register a RemoteHandler on the worker for ``request_type``.
+        """Register a forwarding handler on the worker for ``request_type``, as ``register_remote_handlers`` does.
 
-        Mirrors production ``register_remote_handlers``: while the worker side is
-        inside a ``node_execution_scope``, dispatches to the orchestrator-
-        side EventManager. Outside the scope, delegates to whatever handler was
-        already registered on the worker (if any).
+        While the worker side is inside a ``node_execution_scope``, dispatch forwards to the
+        orchestrator-side EventManager. Outside the scope, it calls whatever handler was already
+        registered on the worker. With none, a placeholder that raises is registered first.
         """
-
-        async def _forward(request: RequestPayload) -> ResultPayload:
-            result_event = await self.orchestrator.ahandle_request(request)
-            return result_event.result
-
         original = self.worker.get_manager_for_request_type(request_type)
+        if original is None:
 
-        async def remote(request: RequestPayload) -> ResultPayload:
-            if self.worker.in_node_execution():
-                return await _forward(request)
-            if original is None:
+            async def missing(request: RequestPayload, workflow: object | None = None) -> ResultPayload:  # noqa: ARG001
                 msg = (
-                    f"Harness RemoteHandler for {request_type.__name__} was invoked "
+                    f"Harness RemoteHandler for {type(request).__name__} was invoked "
                     "outside a node_execution_scope and no local worker handler is registered."
                 )
                 raise RuntimeError(msg)
-            return await _invoke_handler(original, request)
 
-        if original is not None:
-            self.worker.remove_manager_from_request_type(request_type)
-        self.worker.assign_manager_to_request_type(request_type, remote)
+            self.worker.assign_manager_to_request_type(request_type, missing)
+            original = missing
+        assert not isinstance(original, ForwardingHandler)
+        self.worker.replace_manager_for_request_type(request_type, _HarnessForwarder(original=original, harness=self))
 
     async def start(self) -> None:
         """Start the worker-side dispatch loop. Safe to call multiple times."""
@@ -174,13 +168,22 @@ class InProcessWorkerHarness:
         )
 
 
-async def _invoke_handler(handler: Any, request: RequestPayload) -> ResultPayload:
-    """Call a handler that may be sync or async; mirrors ``call_function`` without the import cycle."""
-    import inspect
+@dataclass
+class _HarnessForwarder(ForwardingHandler):
+    """Forwards to the harness's orchestrator while the worker runs a node, else calls `original`."""
 
-    if inspect.iscoroutinefunction(handler):
-        return await handler(request)
-    return handler(request)
+    original: Callable[..., Any]
+    harness: InProcessWorkerHarness
+
+    def forwards_now(self) -> bool:
+        return self.harness.worker.in_node_execution()
+
+    async def forward(self, request: RequestPayload) -> ResultPayload:
+        result_event = await self.harness.orchestrator.ahandle_request(request)
+        return result_event.result
+
+    async def handle_locally(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:
+        return await call_function(self.original, request, **kwargs)
 
 
 def _payload_to_dict(payload: Any) -> dict[str, Any]:

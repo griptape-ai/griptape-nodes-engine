@@ -26,14 +26,19 @@ from griptape_nodes.retained_mode.events.budget_events import (
     ReportUsageResultFailure,
     ReportUsageResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers import budget_manager as budget_manager_module
 from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError
 from griptape_nodes.utils.http_utils import request_with_retry
+from tests.workflow_context import push_unsaved_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 BASE_URL = "https://cloud.example.test"
 
@@ -54,10 +59,9 @@ def _mock_engine(*, credential: str | None = "gt-key") -> MagicMock:
         ProjectChainEntry(id="shot-6", name="Shot 6"),
         ProjectChainEntry(id="star-wars-x", name="Star Wars X"),
     ]
-    engine.context_manager.has_current_workflow.return_value = True
-    engine.context_manager.get_current_workflow_name.return_value = "poster_flow"
     engine.get_engine_id.return_value = "engine-1"
     engine.get_session_id.return_value = "session-1"
+    engine.only_open_workflow_or_none.return_value = None
     secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": credential}
     engine.secrets_manager.get_secret.side_effect = lambda name, **_: secrets.get(name)
     return engine
@@ -193,7 +197,6 @@ class TestBudgetCheckAllowed:
         assert _sent(http) == {
             "tags": {
                 "project": ["shot-6", "star-wars-x"],
-                "workflow": "poster_flow",
                 "node_type": "AnthropicPrompt",
                 "node_id": "node-7",
                 "engine_id": "engine-1",
@@ -216,7 +219,6 @@ class TestBudgetCheckAllowed:
         http.return_value = _response(200, {"allowed": True})
         engine = _mock_engine()
         engine.project_manager.get_project_chain.return_value = []
-        engine.context_manager.has_current_workflow.return_value = False
         engine.get_engine_id.return_value = None
         engine.get_session_id.return_value = None
 
@@ -441,7 +443,6 @@ class TestReportUsage:
             "declared_cost_micro_usd": 12345,
             "tags": {
                 "project": ["shot-6", "star-wars-x"],
-                "workflow": "poster_flow",
                 "node_type": "AnthropicPrompt",
                 "node_id": "node-7",
                 "engine_id": "engine-1",
@@ -717,6 +718,77 @@ class TestReportQueue:
 
         assert posted.wait(timeout=5)
         assert [body["n"] for body in calls] == [1, 2]
+
+
+class TestWorkflowTag:
+    """A check or report is tagged with the workflow its envelope names, through the engine's dispatch."""
+
+    @pytest.fixture
+    def budget_engine(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Engine:
+        """The engine, with a Cloud credential and usage reports posted on the spot."""
+        secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": "gt-key"}
+        monkeypatch.setattr(engine.secrets_manager, "get_secret", lambda name, **_: secrets.get(name))
+        monkeypatch.setattr(engine.budget_manager, "_reports", _InlineQueue(engine.budget_manager))
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_a_check_is_tagged_with_the_workflow_its_envelope_names(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        http.return_value = _response(200, {"allowed": True})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+
+        result = (
+            await budget_engine.event_manager.ahandle_request(
+                BudgetAccessRequest(model="gpt-5-nano"),
+                result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+            )
+        ).result
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
+        assert _sent(http)["tags"]["workflow"] == workflow.name
+
+    @pytest.mark.asyncio
+    async def test_a_report_is_tagged_with_the_workflow_its_envelope_names(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        http.return_value = _response(201, {"spend_id": "s-1"})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+
+        result = (
+            await budget_engine.event_manager.ahandle_request(
+                ReportUsageRequest(declared_cost_micro_usd=1),
+                result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+            )
+        ).result
+
+        assert isinstance(result, ReportUsageResultSuccess), result.result_details
+        assert _sent(http)["tags"]["workflow"] == workflow.name
+
+    @pytest.mark.asyncio
+    async def test_a_check_naming_no_workflow_is_tagged_with_the_only_open_one(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        """As a node calls from its library's own thread pool: no envelope id and no binding."""
+        http.return_value = _response(200, {"allowed": True})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+
+        result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
+        assert _sent(http)["tags"]["workflow"] == workflow.name
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_open_a_check_carries_no_workflow_tag(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        http.return_value = _response(200, {"allowed": True})
+        budget_engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
+        assert "workflow" not in _sent(http)["tags"]
 
 
 class TestWiring:
