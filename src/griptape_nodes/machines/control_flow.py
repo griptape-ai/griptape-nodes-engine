@@ -122,7 +122,7 @@ class ResolveNodeState(State):
             current_node.prepare_to_run_again()
             # Now broadcast that we have a current control node.
             context.engine.event_manager.put_event(
-                current_node.execution_event(CurrentControlNodeEvent(node_name=current_node.name))
+                context.workflow.execution_event(CurrentControlNodeEvent(node_name=current_node.name))
             )
             logger.debug("Resolving %s", current_node.name)
         if not context.paused:

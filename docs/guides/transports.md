@@ -111,7 +111,7 @@ Results are delivered on the `response_topic` you named, to every connection tha
 {"type": "subscribe", "topic": "my-app/response", "payload": {}}
 ```
 
-Results then arrive as messages whose `type` is `success_result` or `failure_result`, with your `request_id` inside `payload`. A result's `open_workflow_id` names the open workflow the request acted on: the one you named, or the run's own workflow for a request a run sent while it ran.
+Results then arrive as messages whose `type` is `success_result` or `failure_result`, with your `request_id` inside `payload`. A result's `open_workflow_id` names the open workflow the request acted on. That is the one you named, or, when you left it out, the one the engine chose: the only open workflow, a run's own workflow for a request the run sent, or the workflow a load opened. It is `null` when the request acted on no workflow, such as `EngineHeartbeatRequest`.
 
 While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each one has a `workflow_id` naming the open workflow it belongs to, so you can tell which tab it is for when node names repeat across workflows. It is `null` for events that belong to no workflow, such as publishing progress.
 

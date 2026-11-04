@@ -382,8 +382,10 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events.
 
     Args:
-        open_workflow_id: The request envelope's `open_workflow_id`, echoed back: the open workflow
-            the request ran in. A result payload's own `workflow_id` is something else. For
+        open_workflow_id: The open workflow the request acted on: the envelope's `open_workflow_id`
+            when it named one, else the workflow dispatch bound the request to, such as the only
+            open workflow, a run's own workflow, or the workflow a load opened. None when it acted
+            on no workflow. A result payload's own `workflow_id` is something else. For
             example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
             Save As is a copy that is not open.
         engine_id: The engine that sent the result. A client that reached it through a session
@@ -463,7 +465,9 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """An event from running a flow. `workflow_id` names the open workflow it belongs to, None for a host event.
 
-    Build one with `WorkflowRuntime.execution_event` or `BaseNode.execution_event`.
+    Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
+    for an event a node reports about itself, naming the workflow it joined. Both go through
+    `build_execution_event`.
     """
 
     payload: E
@@ -515,6 +519,11 @@ class ExecutionGriptapeNodeEvent(BaseEvent):
     def get_request(self) -> Payload:
         """Get the request from the wrapped event."""
         return self.wrapped_event.get_request()
+
+
+def build_execution_event(payload: ExecutionPayload, workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
+    """An execution event naming the open workflow `workflow_id` it belongs to, or None for no workflow."""
+    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=workflow_id))
 
 
 @dataclass

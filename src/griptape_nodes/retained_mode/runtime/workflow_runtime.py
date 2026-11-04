@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
-from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
+from griptape_nodes.retained_mode.events.base_events import build_execution_event
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
@@ -13,7 +13,12 @@ from griptape_nodes.retained_mode.runtime.objects import WorkflowObjects
 from griptape_nodes.retained_mode.runtime.variables import WorkflowVariables
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload, RequestPayload, ResultPayload
+    from griptape_nodes.retained_mode.events.base_events import (
+        ExecutionGriptapeNodeEvent,
+        ExecutionPayload,
+        RequestPayload,
+        ResultPayload,
+    )
 
 
 class RequestDispatcher(Protocol):
@@ -69,4 +74,4 @@ class WorkflowRuntime:
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event that belongs to this workflow."""
-        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=self.workflow_id))
+        return build_execution_event(payload, self.workflow_id)

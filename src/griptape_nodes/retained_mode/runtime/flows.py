@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.machines.dag_builder import DagBuilder
-from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
+from griptape_nodes.retained_mode.events.base_events import build_execution_event
 from griptape_nodes.retained_mode.managers.run_queue import RunQueue
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.machines.control_flow import ControlFlowMachine
-    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload
+    from griptape_nodes.retained_mode.events.base_events import ExecutionGriptapeNodeEvent, ExecutionPayload
     from griptape_nodes.retained_mode.managers.flow_manager import QueueItem
     from griptape_nodes.retained_mode.managers.run_queue import Run
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -51,4 +51,4 @@ class WorkflowFlows:
         workflow_id = None
         if self._workflow is not None:
             workflow_id = self._workflow.workflow_id
-        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=workflow_id))
+        return build_execution_event(payload, workflow_id)

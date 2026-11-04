@@ -819,8 +819,8 @@ class TestEventsNameTheirWorkflow:
         queue: asyncio.Queue = asyncio.Queue()
         engine.event_manager.initialize_queue(queue)
 
-        # Node code runs bound to its workflow.
-        with engine.bind_workflow(b):
+        # Named by the node's workflow, not by whatever is bound, so a raw thread's chunks route too.
+        with engine.bind_workflow(NO_WORKFLOW):
             node.append_value_to_parameter("value", "chunk")
 
         progress = [e for e in _drain(queue) if isinstance(e, ProgressEvent)]

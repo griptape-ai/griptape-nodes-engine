@@ -37,10 +37,10 @@ from griptape_nodes.exe_types.parameter_mutation import _sanctioned_mutation
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
     ExecutionGriptapeNodeEvent,
     ProgressEvent,
     RequestPayload,
+    build_execution_event,
 )
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueRequest,
@@ -588,9 +588,7 @@ class BaseNode(ABC):
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event about this node, naming the workflow it joined (None when it never joined one)."""
-        return ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=payload, workflow_id=self._event_workflow_id())
-        )
+        return build_execution_event(payload, self._event_workflow_id())
 
     def _event_workflow_id(self) -> str | None:
         """The id of the workflow this node's events name: the one it joined, or None."""

@@ -2126,8 +2126,9 @@ class EventManager(EngineScoped):
     def _result_workflow_id(context: ResultContext) -> str | None:
         """The open workflow a result names: the one the envelope named, else the one the request was bound to.
 
-        A request a run sends through `WorkflowRuntime.handle_request` names its workflow by binding
-        rather than by envelope id, and its result still says which workflow it acted on.
+        A request with no envelope id is bound by dispatch to the only open workflow, by a run's
+        `WorkflowRuntime.handle_request` to the run's workflow, or by a load to the workflow it
+        opened (`Engine.enter_opened_workflow`). Its result still says which workflow it acted on.
         """
         open_workflow_id = context.get("open_workflow_id")
         if open_workflow_id is not None:
