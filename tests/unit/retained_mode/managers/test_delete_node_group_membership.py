@@ -73,7 +73,7 @@ class TestDeleteNodeRequestPrunesGroup:
         parent_flow = engine.flow_manager.get_flow_by_name(flow_result.flow_name)
         parent_flow.add_node(group)
         engine.object_manager.add_object_by_name(group.name, group)
-        engine.node_manager._name_to_parent_flow_name[group.name] = flow_result.flow_name
+        engine.current_workflow().nodes.name_to_parent_flow_name[group.name] = flow_result.flow_name
         group.add_nodes_to_group([child])
 
         delete_result = engine.handle_request(DeleteNodeRequest(node_name=child.name))

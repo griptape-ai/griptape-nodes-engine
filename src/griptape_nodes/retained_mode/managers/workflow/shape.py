@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
-from griptape_nodes.retained_mode.events.flow_events import GetTopLevelFlowRequest, GetTopLevelFlowResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import WorkflowShape
 
 if TYPE_CHECKING:
@@ -15,6 +14,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 ParameterShapeInfo = dict[str, Any]  # Parameter metadata dict from convert_parameter_to_minimal_dict
 NodeParameterMap = dict[str, ParameterShapeInfo]  # {param_name: param_info}
@@ -31,7 +31,7 @@ class WorkflowShapeType(StrEnum):
 
 
 def extract_workflow_shape(
-    flow_manager: FlowManager, workflow_name: str, flow_name: str | None = None
+    flow_manager: FlowManager, workflow: WorkflowRuntime, workflow_name: str, flow_name: str | None = None
 ) -> dict[str, Any]:
     """Extracts the input and output shape for a workflow.
 
@@ -41,22 +41,20 @@ def extract_workflow_shape(
 
     Args:
         flow_manager: Resolves the flow to inspect.
+        workflow: The open workflow whose flow is inspected.
         workflow_name: Registry key used in error messages.
         flow_name: Specific flow to inspect. If None, the top-level flow is used.
     """
     workflow_shape: dict[str, Any] = {WorkflowShapeType.INPUT: {}, WorkflowShapeType.OUTPUT: {}}
 
     if flow_name is None:
-        result = flow_manager.on_get_top_level_flow_request(GetTopLevelFlowRequest())
-        if result.failed():
+        top_level_flow_names = [name for name, parent in workflow.flows.name_to_parent_name.items() if parent is None]
+        if not top_level_flow_names:
             details = f"Workflow '{workflow_name}' does not have a top-level flow."
             raise ValueError(details)
-        flow_name = cast("GetTopLevelFlowResultSuccess", result).flow_name
-        if flow_name is None:
-            details = f"Workflow '{workflow_name}' does not have a top-level flow."
-            raise ValueError(details)
+        flow_name = top_level_flow_names[0]
 
-    control_flow = flow_manager.get_flow_by_name(flow_name)
+    control_flow = flow_manager.get_flow_by_name_in(workflow, flow_name)
     nodes = control_flow.nodes
 
     start_nodes: list[StartNode] = []

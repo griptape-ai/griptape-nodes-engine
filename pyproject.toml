@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.106.0"
+version = "0.107.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.16"
@@ -27,7 +27,6 @@ dependencies = [
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
   "watchfiles>=1.1.0",
-  "typer>=0.15.0",
   # Ceiling: default libraries pin transformers/tokenizers that need huggingface-hub<2. Library
   # installs floor at the engine's version, so 2.x here fails them and marks them FLAWED (issue 5752).
   "huggingface-hub>=1.9.0,<2",
@@ -96,7 +95,7 @@ test = [
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
   "pytest-timeout>=2.4.0",
-  "coverage>=7.0.0",
+  "coverage>=7.9.0",
 ]
 
 [build-system]
@@ -108,6 +107,11 @@ module-name = "griptape_nodes"
 
 [tool.uv.sources]
 griptape-cloud-client = { git = "https://github.com/griptape-ai/griptape-cloud-python-client", rev = "main" }
+
+[tool.coverage.run]
+# sys.monitoring stops tracing a line once it has run, unlike the default tracer on 3.12 that
+# traces every line every time. It does not support branch coverage on 3.12.
+core = "sysmon"
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
@@ -198,7 +202,7 @@ ignore = [
 # surface that separately-versioned callers bind to, so they have no Engine to be handed.
 "src/griptape_nodes/retained_mode/griptape_nodes.py" = ["TID251"]
 "src/griptape_nodes/retained_mode/retained_mode.py" = ["TID251"]
-"src/griptape_nodes/cli/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/managers/model_download_process.py" = ["TID251"]
 "src/griptape_nodes/api_client/**" = ["TID251"]
 "src/griptape_nodes/servers/**" = ["TID251"]
 "src/griptape_nodes/bootstrap/**" = ["TID251"]

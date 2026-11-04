@@ -6,7 +6,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -15,6 +15,7 @@ from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    EventRequest,
     EventResultFailure,
     EventResultSuccess,
     ExecutionEvent,
@@ -34,6 +35,7 @@ from griptape_nodes.retained_mode.events.execution_events import NodeFinishProce
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.worker_events import CheckLeaseRequest, CheckLeaseResultSuccess
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -51,6 +53,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     require_request_sender,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class TestEventsWhileRebuildingACopy:
@@ -319,6 +322,36 @@ class TestHandleRequestLoopSafety:
 
 
 @dataclass(kw_only=True)
+class _ProbeFailure(ResultPayloadFailure):
+    """Minimal failure payload paired with _ProbeRequest."""
+
+
+class TestResultEngineId:
+    """Every result dispatch builds names the engine that sent it."""
+
+    @pytest.mark.asyncio
+    async def test_a_success_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeResult(result_details="ok"))
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+    def test_a_failure_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeFailure(result_details="no"))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert not event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+
+@dataclass(kw_only=True)
 class _ForwardableProbeRequest(RequestPayload):
     """Minimal request used to drive the worker-forwarding path in tests."""
 
@@ -362,13 +395,14 @@ class TestHandleRequestForwardingFromRunningLoop:
                 result=_ForwardableProbeResult(result_details="forwarded"),
             )
 
-        # Register a RemoteHandler shape: dispatch table entry points at it directly.
-        # ``handle_request`` detects RemoteHandler via isinstance and routes onto the WS loop.
+        # Install a RemoteHandler as a worker does. ``handle_request`` sees a ForwardingHandler and
+        # routes onto the WS loop.
         async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
             return _ForwardableProbeResult(result_details="local")
 
+        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, original)
         remote = RemoteHandler(original=original, event_manager=event_manager)
-        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
+        event_manager.replace_manager_for_request_type(_ForwardableProbeRequest, remote)
         event_manager._websocket_event_loop = ws_loop
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
@@ -1615,6 +1649,36 @@ class TestPostDispatchHooks:
         assert seen_engines == [engine]
 
     @pytest.mark.asyncio
+    async def test_hook_sees_the_workflow_its_request_acted_on(self) -> None:
+        """The fresh context drops the workflow binding, so the hook gets the request's back.
+
+        Without it a hook reading the current workflow would see none, or, with several
+        open, fail to choose one, though the request it observes acted on a named workflow.
+        """
+        engine = Engine()
+        event_manager = engine.event_manager
+        event_manager.initialize_queue(asyncio.Queue())
+        workflow = WorkflowRuntime("bound", MagicMock())
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
+
+        seen_workflows: list[WorkflowRuntime | None] = []
+
+        async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
+            seen_workflows.append(engine.current_workflow_or_none())
+
+        event_manager.add_post_dispatch_hook(_ProbeRequest, hook)
+
+        with engine.bind_workflow(workflow):
+            await event_manager.ahandle_request(_ProbeRequest())
+        await _drain_post_dispatch_hooks(event_manager)
+
+        assert seen_workflows == [workflow]
+
+    @pytest.mark.asyncio
     async def test_every_dispatch_gets_its_own_hook_invocation(self) -> None:
         """Nothing is dropped or coalesced, however slow the hook is relative to dispatch."""
         event_manager = EventManager()
@@ -1856,8 +1920,13 @@ class TestTheRequestSender:
         [
             (RequiredSender.ENGINE, {}, False),
             (RequiredSender.ENGINE, {"sender": RequestSender(engine_id="artist")}, True),
+            (RequiredSender.ANY_SESSION, {}, False),
+            (RequiredSender.ANY_SESSION, {"sender": RequestSender(engine_id="artist")}, False),
+            (RequiredSender.ANY_SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+            (RequiredSender.SESSION, {}, False),
             (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist")}, False),
             (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="s1")}, True),
+            (RequiredSender.SESSION, {"sender": RequestSender(engine_id="artist", session_id="unknown")}, False),
         ],
     )
     @pytest.mark.asyncio
@@ -1874,11 +1943,30 @@ class TestTheRequestSender:
 
         event_manager = EventManager()
         event_manager.register_request_handlers(_Owner())
+        event_manager.recognize_sessions(lambda sender: sender.session_id == "s1")
 
         result = await event_manager.ahandle_request(_ProbeRequest(), result_context=context)
 
         assert bool(handled) == runs
         assert result.succeeded() == runs
+
+    @pytest.mark.asyncio
+    async def test_a_session_request_is_refused_while_nothing_recognizes_sessions(self) -> None:
+        event_manager = self._manager_recording_senders([], sender=RequiredSender.SESSION)
+
+        result = await event_manager.ahandle_request(
+            _ProbeRequest(), result_context={"sender": RequestSender(engine_id="artist", session_id="s1")}
+        )
+
+        assert not result.succeeded()
+        assert "has not registered with this engine" in str(result.result.result_details)
+
+    def test_only_one_manager_may_recognize_sessions(self) -> None:
+        event_manager = EventManager()
+        event_manager.recognize_sessions(lambda _sender: True)
+
+        with pytest.raises(ValueError, match="already has one"):
+            event_manager.recognize_sessions(lambda _sender: True)
 
     @pytest.mark.asyncio
     async def test_a_request_no_engine_sent_has_no_sender(self) -> None:
@@ -2272,3 +2360,63 @@ class TestNodeProcessEventTranslation:
             )
 
         assert received == [finish, finish]
+
+
+class _RecordingWorkerRequestClient:
+    """Stands in for a worker's RequestClient, recording where each request goes and answering it."""
+
+    def __init__(self, answer: dict) -> None:
+        self.answer = answer
+        self.sent: list[dict] = []
+
+    async def request_from_worker(
+        self,
+        event_request: EventRequest,
+        request_topic: str,
+        worker_response_topic: str,
+        timeout_ms: int | None = None,
+    ) -> dict:
+        self.sent.append(
+            {
+                "request": event_request.request,
+                "request_topic": request_topic,
+                "response_topic": worker_response_topic,
+                "timeout_ms": timeout_ms,
+            }
+        )
+        return self.answer
+
+
+class TestAWorkerRequestingAnotherEngine:
+    """A worker another engine runs reaches that engine, not its orchestrator, as one of that engine's clients."""
+
+    @pytest.mark.asyncio
+    async def test_publishes_on_that_engine_s_topic_and_hears_back_on_its_own(self, engine: Engine) -> None:
+        client = _RecordingWorkerRequestClient(
+            {
+                "event_type": "EventResultSuccess",
+                "result_type": CheckLeaseResultSuccess.__name__,
+                "result": {"result_details": "held"},
+            }
+        )
+        engine.event_manager.configure_worker_forwarding(
+            request_client=client,  # type: ignore[arg-type]
+            orchestrator_request_topic="sessions/artist-sess/request",
+            worker_response_topic="sessions/artist-sess/workers/w1/response",
+            websocket_event_loop=asyncio.get_running_loop(),
+            timeout_ms=5000,
+        )
+        request = CheckLeaseRequest(lease_id="lease-1", worker_engine_id="w1")
+
+        with patch.object(engine, "get_engine_id", return_value="w1"):
+            result = await engine.event_manager.request_engine_from_worker("gpu-01", request)
+
+        assert isinstance(result, CheckLeaseResultSuccess)
+        assert client.sent == [
+            {
+                "request": request,
+                "request_topic": "engines/gpu-01/request",
+                "response_topic": "engines/w1/response",
+                "timeout_ms": 5000,
+            }
+        ]

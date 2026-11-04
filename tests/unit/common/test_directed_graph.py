@@ -232,3 +232,21 @@ class TestDirectedGraph:
         # These operations should not raise errors
         graph.remove_node("nonexistent")
         graph.clear()
+
+    def test_get_successors_returns_direct_targets_only(self) -> None:
+        """get_successors names the nodes one edge downstream, not the whole reachable set."""
+        graph = DirectedGraph()
+        graph.add_edge("a", "b")
+        graph.add_edge("a", "c")
+        graph.add_edge("b", "d")
+
+        assert graph.get_successors("a") == {"b", "c"}
+        assert graph.get_successors("b") == {"d"}
+
+    def test_get_successors_empty_for_leaf_or_unknown_node(self) -> None:
+        """A node with no outgoing edges, or one not in the graph, has no successors."""
+        graph = DirectedGraph()
+        graph.add_edge("a", "b")
+
+        assert graph.get_successors("b") == set()
+        assert graph.get_successors("missing") == set()

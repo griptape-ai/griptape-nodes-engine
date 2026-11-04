@@ -7,6 +7,7 @@ starts another run and checks what it does while the first goes on and once it e
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ResolveNodeRequest,
     ResolveNodeResultSuccess,
     RunQueuedEvent,
+    SingleNodeStepRequest,
     StartFlowFromNodeRequest,
     StartFlowFromNodeResultSuccess,
 )
@@ -230,3 +232,36 @@ async def test_a_paused_debug_run_keeps_the_machine_until_it_ends(engine: Engine
 
     assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
     assert _state(engine, "Next") is NodeResolutionState.RESOLVED
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_debug_run_cancelled_while_a_step_checks_a_node_ends_when_the_step_returns(
+    engine: Engine, flow_name: str
+) -> None:
+    """The cancel resets the machines at once, but the step keeps checking the node in its thread."""
+    _set_parameter(engine, "Holder", "gate_file", "")
+    validating, release = threading.Event(), threading.Event()
+
+    def slow_validate() -> None:
+        validating.set()
+        release.wait(_RUN_TIMEOUT_SECONDS)
+
+    engine.node_manager.get_node_by_name("Holder").validate_before_node_run = slow_validate
+    paused = await engine.ahandle_request(StartFlowFromNodeRequest(node_name="Holder", debug_mode=True))
+    assert isinstance(paused, StartFlowFromNodeResultSuccess), paused
+
+    step = asyncio.create_task(engine.ahandle_request(SingleNodeStepRequest(flow_name=flow_name)))
+    assert await asyncio.to_thread(validating.wait, _RUN_TIMEOUT_SECONDS), "the step never checked the node"
+    cancelled = await engine.ahandle_request(CancelFlowRequest(flow_name=flow_name))
+    assert isinstance(cancelled, CancelFlowResultSuccess), cancelled
+
+    waiting = asyncio.create_task(engine.ahandle_request(StartFlowFromNodeRequest(node_name="Next")))
+    await asyncio.sleep(_WAITING_SECONDS)
+    assert not waiting.done(), "a run started while the cancelled run's step was still checking a node"
+
+    release.set()
+    await _finish(step)
+    assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
+    assert _state(engine, "Next") is NodeResolutionState.RESOLVED
+    assert _state(engine, "Holder") is not NodeResolutionState.RESOLVED

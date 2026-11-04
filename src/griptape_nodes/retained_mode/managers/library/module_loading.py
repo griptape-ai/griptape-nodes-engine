@@ -9,18 +9,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pydantic.errors import PydanticUserError
+
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import (
     WorkflowNode,
     WorkflowNodeDefinitionError,
     build_workflow_node_class,
-    ensure_workflow_registered,
 )
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity_preserving_symlinks,
     relative_to_keeping_or_following_links,
     resolve_workspace_path,
 )
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.node_library.library_registry import (
     Library,
     LibraryRegistry,
@@ -29,6 +31,7 @@ from griptape_nodes.node_library.library_registry import (
     WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.retained_mode.beta_features import library_config_slug
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import AppPayload, ExecutionPayload
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
@@ -36,6 +39,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AppEventListenerRegistrationProblem,
     BeforeLibraryCallbackProblem,
     ExecutionEventListenerRegistrationProblem,
+    MCPToolRegistrationProblem,
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
@@ -58,6 +62,7 @@ from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from collections.abc import Set as AbstractSet
     from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
@@ -577,7 +582,8 @@ class LibraryModuleLoading(EngineScoped):
                 handlers = advanced_library.get_request_handlers()
                 for request_type, handler in handlers:
                     event_manager = self.engine.event_manager
-                    event_manager.assign_manager_to_request_type(request_type, handler)
+                    # Ambient unless its `workflow` parameter declares a scope, so existing libraries keep working.
+                    event_manager.assign_manager_to_request_type(request_type, handler, without_workflow=None)
                     library._registered_request_handler_types.append(request_type)
                 if handlers:
                     logger.debug(
@@ -592,6 +598,14 @@ class LibraryModuleLoading(EngineScoped):
                     library_data.name,
                     err,
                 )
+
+        # Validated against the request handlers, so this must run after they register.
+        if advanced_library:
+            try:
+                self._register_mcp_tools(advanced_library, library)
+            except Exception as err:
+                library_info.problems.append(MCPToolRegistrationProblem(error_message=str(err)))
+                logger.error("Failed to register MCP tools for library '%s': %s", library_data.name, err)
 
         # Register post-dispatch hooks declared by the library
         if advanced_library:
@@ -758,6 +772,47 @@ class LibraryModuleLoading(EngineScoped):
                 library_name,
                 err,
             )
+
+    def _register_mcp_tools(self, advanced_library: AdvancedNodeLibrary, library: Library) -> None:
+        """Store the library's MCP tools on it, or raise without storing any if one is invalid."""
+        library_name = library.get_library_data().name
+        tools = advanced_library.get_mcp_tools()
+        if tools and not library_config_slug(library_name):
+            msg = (
+                f"Attempted to expose MCP tools from library '{library_name}'. Failed because the library's "
+                f"name has no letters or digits to build its address from, /mcp/libraries/<name>/. "
+                f"Add some to the library's name."
+            )
+            raise ValueError(msg)
+        handled_types = library.get_registered_request_handler_types()
+        for tool in tools:
+            if not isinstance(tool, MCPTool):
+                msg = (
+                    f"Attempted to expose an MCP tool from library '{library_name}'. "
+                    f"Failed because '{tool}' is not an MCPTool. Each entry from get_mcp_tools() must be "
+                    f"an MCPTool naming a request type."
+                )
+                raise TypeError(msg)
+            request_name = getattr(tool.request_type, "__name__", tool.request_type)
+            if tool.request_type not in handled_types:
+                msg = (
+                    f"Attempted to expose '{request_name}' as an MCP tool from library '{library_name}'. "
+                    f"Failed because the library does not handle that request. Return it from "
+                    f"get_request_handlers() too."
+                )
+                raise ValueError(msg)
+            try:
+                tool.input_schema()
+            except PydanticUserError as err:
+                msg = (
+                    f"Attempted to expose '{request_name}' as an MCP tool from library '{library_name}'. "
+                    f"Failed because its fields can't be described to an agent: {err}"
+                )
+                raise ValueError(msg) from err
+
+        library._mcp_tools = list(tools)
+        if tools:
+            logger.debug("Exposed %d MCP tool(s) for library '%s'", len(tools), library_name)
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
         """Create a stable namespace for a dynamic module.
@@ -1054,33 +1109,45 @@ class LibraryModuleLoading(EngineScoped):
         self.list_workflow_node_workflow(node_class, library_info)
         return True
 
-    def list_workflow_node_workflow(self, node_class: type[WorkflowNode], library_info: LibraryInfo) -> None:
+    def list_workflow_node_workflow(
+        self,
+        node_class: type[WorkflowNode],
+        library_info: LibraryInfo,
+        *,
+        found_workflow_ids: AbstractSet[str] = frozenset(),
+    ) -> str | None:
         """List the workflow behind a library's workflow node in the registry as library-provided.
 
         Listed like the workflows in the library's `workflows` list: browsable before any node is
-        placed. A registry refresh clears every workflow and calls this again, so the key follows the
-        current workspace. A workflow elsewhere in the workspace is the user's own file, so it stays
-        editable and the workspace scan lists it. The scan skips everything under a non-sandbox
-        library's directory, which includes libraries installed into the workspace.
+        placed. A registry refresh calls this again, so the entry follows the current workspace and
+        takes the node type's metadata, which a library reload reads again. An entry in
+        `found_workflow_ids`, which the same refresh already found through the library's
+        `workflows` list, keeps the metadata it read. A workflow elsewhere in the workspace is the
+        user's own file, so it stays editable and the workspace scan lists it. The scan skips
+        everything under a non-sandbox library's directory, which includes libraries installed into
+        the workspace.
+
+        Returns the id of the workflow's entry, or None when the scan lists it or it could not be listed.
         """
         workspace_path = self.engine.config_manager.workspace_path
         if self._is_users_workflow(node_class.workflow_file_path, workspace_path, library_info):
-            return
+            return None
         node_class.workflow_metadata.is_griptape_provided = True
+        workflow_registry = self.engine.workflow_registry
+        existing = workflow_registry.find_by_path(node_class.workflow_file_path)
+        if existing is not None and existing.workflow_id in found_workflow_ids:
+            return existing.workflow_id
         try:
-            ensure_workflow_registered(
-                workspace_path,
-                self.engine.workflow_registry,
-                node_class.workflow_file_path,
-                node_class.workflow_metadata,
-            )
-        except (KeyError, ValueError):
+            workflow = workflow_registry.refresh_file(node_class.workflow_file_path, node_class.workflow_metadata)
+        except ValueError:
             logger.warning(
                 "Library '%s' could not list the workflow '%s' behind node type '%s'.",
                 library_info.library_name,
                 node_class.workflow_file_path,
                 node_class.__name__,
             )
+            return None
+        return workflow.workflow_id
 
     @staticmethod
     def _is_users_workflow(workflow_file_path: Path, workspace_path: Path, library_info: LibraryInfo) -> bool:

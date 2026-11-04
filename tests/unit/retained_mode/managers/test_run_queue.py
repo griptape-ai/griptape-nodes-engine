@@ -17,9 +17,11 @@ def _run(run_id: str) -> Run:
         run_id=run_id,
         spec=MagicMock(),
         flow_name="flow",
+        flows=MagicMock(),
         queued_at=datetime.now(tz=UTC),
         state=RunState.QUEUED,
         outcome=asyncio.get_running_loop().create_future(),
+        ended=asyncio.get_running_loop().create_future(),
         context=contextvars.copy_context(),
     )
 

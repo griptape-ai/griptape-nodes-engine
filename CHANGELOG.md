@@ -12,6 +12,105 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.106.0] - 2026-11-02
+
+### Added
+
+- `claude-haiku-5-5` is available in Griptape Cloud model dropdowns and the chat sidebar, with
+  image input. [#5987](https://github.com/griptape-ai/griptape-nodes-engine/issues/5987)
+- `DescribeNodeTypeRequest` now reports each parameter's `element_type` and, for a `ParameterList`, its
+  `max_items`, so clients can tell multi-input parameters from plain list inputs without creating a node.
+  [#5918](https://github.com/griptape-ai/griptape-nodes-engine/issues/5918)
+- A library's nodes can now run on another computer's Griptape Nodes engine while you keep working
+  in your own editor. Several people can share that computer: it runs one person's run at a time,
+  frees the previous person's models when it passes to the next, and the run toolbar shows a run
+  that waits for it as queued. See
+  [Running Nodes on Another Computer](https://docs.griptapenodes.com/en/stable/guides/run_nodes_on_another_computer/).
+- Node libraries can read the inputs and outputs of an imported workflow's flow with
+  `GetWorkflowShapeRequest`, which also works from a node running in a worker.
+  [griptape-nodes-library-standard#883](https://github.com/griptape-ai/griptape-nodes-library-standard/issues/883)
+- `LoadMetadataForAllLibrariesRequest` now takes `include_git_info`. Pass `false` to skip the git
+  lookups behind `git_remote` and `git_ref`, which take several git processes per library, when
+  only the library schemas are needed.
+  [#5943](https://github.com/griptape-ai/griptape-nodes-engine/issues/5943)
+- MCP clients can now call `GetFlowSummaryRequest` to see a flow's nodes, the values set on them,
+  their multi-inputs, and their connections in one compact request, instead of
+  `ListNodesInFlowRequest` and a full `GetAllNodeInfoRequest` per node. Outputs, run results, and UI
+  state are left out. [#5967](https://github.com/griptape-ai/griptape-nodes-engine/issues/5967)
+- Model downloads can be paused with `PauseModelDownloadRequest` and resumed with
+  `ResumeModelDownloadRequest`, and stay paused across engine restarts. Resuming skips files that
+  already finished. Nodes won't run on a paused or failed download.
+  [#4563](https://github.com/griptape-ai/griptape-nodes-engine/issues/4563)
+- Three strict-mode rules flag node code that behaves differently in a separate process than
+  in-process: `graph-access-while-loading` (asking about connections or other nodes while the node
+  loads), `state-read-bypassing-requests` (reading a manager instead of sending a request), and
+  `state-outside-parameters` (keeping state set by `after_value_set` or a connection hook on the
+  node instead of in a parameter). Each warns where the node runs in-process and fails the node's run
+  in a separate process.
+  [#5955](https://github.com/griptape-ai/griptape-nodes-engine/issues/5955)
+- `validate_empty_parameter()` takes a `skip_if_connected` option for use in
+  `validate_before_workflow_run`, which runs before connections deliver their values. With it, a
+  parameter that a connection feeds is not reported as blank.
+  [#5889](https://github.com/griptape-ai/griptape-nodes-engine/issues/5889)
+
+### Changed
+
+- **Breaking:** A node whose library runs in a separate process now runs there on a copy loaded the
+  way a saved workflow reopens, with the same parameters and types as the node in the editor,
+  including parameters added in the editor, by requests, and by its value hooks. `after_value_set`
+  no longer runs in that process, and nothing the node's code sends while the copy loads reaches the
+  workflow. A node whose `process` relied on state its `after_value_set` set needs to keep that
+  state in a parameter; see
+  [Node Isolation with Workers](docs/development/custom_nodes/node_isolation_with_workers.md#the-rules-that-keep-a-worker-identical-to-running-in-process).
+  [#5955](https://github.com/griptape-ai/griptape-nodes-engine/issues/5955)
+- The built-in chat now starts each message with the available node types and the current flow, so
+  it builds a change in one `EventRequestBatch` call instead of first making discovery calls.
+  [#5909](https://github.com/griptape-ai/griptape-nodes-engine/issues/5909)
+- `StartFlowRequest`, `StartFlowFromNodeRequest`, and `ResolveNodeRequest` sent while another run
+  is in progress now wait for that run to finish and then start, instead of failing with "Flow is
+  already running". Waiting runs start in the order they were sent, and a new `RunQueuedEvent` tells
+  the editor each waiting run's place in line, with the `request_id` of the request that submitted
+  it. Their results now carry the run's `run_id`. The new `ListRunsRequest` lists the run in
+  progress and the waiting runs, `CancelRunRequest` withdraws a waiting run or stops the run in
+  progress, and `CancelAllRunsRequest` cancels every run. Running a node while another node is
+  running still adds it to that run, as before.
+- A node's `validate_before_node_run` now runs in a worker thread instead of on the engine's event
+  loop, so a slow check, such as reading a large or remote file, no longer freezes the editor and
+  other flows while it runs. The node still waits for its own checks before it runs, and a failed
+  check stops the run as before.
+  [#5963](https://github.com/griptape-ai/griptape-nodes-engine/issues/5963)
+
+### Fixed
+
+- Workflow nodes that import their workflows at the same time, in parallel branches or in a loop
+  set to "Run Group Items All at Once", no longer mix up which workflow each node's flow came from.
+  Before, a node's flow could be saved as a reference to another node's workflow.
+  [#5665](https://github.com/griptape-ai/griptape-nodes-engine/issues/5665)
+- In a reopened workflow, removing or replacing a connection into a parameter its node rebuilt while
+  loading, such as a ControlNet's provider settings, no longer fails with "Connection does not
+  exist". Deleting that node no longer fails either. A connection into a parameter its node no
+  longer has can also be removed, along with both of its nodes and their flow.
+- A `ForEach Group`, `For Loop Group`, or `Retry Group` no longer fails to start with "Failed while
+  restoring the saved value of '<node>.<parameter>'" when a body node's connected input holds a value
+  that its own range no longer allows, such as a crop coordinate left over from a wider image. The
+  loop body copy now leaves out values that its connections supply, in both execution modes. As a
+  result, a body node's `validate_before_workflow_run` sees a connected input's default rather than
+  the value shown on the canvas, the same as a node at the top level of the workflow.
+  [#5889](https://github.com/griptape-ai/griptape-nodes-engine/issues/5889)
+- A list fed by a connection keeps its items when its node is pasted together with the node feeding
+  it, instead of coming back empty until that node runs again.
+  [#5955](https://github.com/griptape-ai/griptape-nodes-engine/issues/5955)
+- Setting a parameter that has a hard-limited slider or a min/max range to `None` no longer fails
+  with "'>' not supported between instances of 'NoneType' and 'float'". `None` passed over a
+  connection into an optional number parameter now goes through instead of stopping the flow.
+  [#6063](https://github.com/griptape-ai/griptape-nodes-engine/issues/6063)
+- A restarted model download no longer shows progress from 0%. Files finished on an earlier
+  attempt now count as downloaded and toward the total.
+  [#6087](https://github.com/griptape-ai/griptape-nodes-engine/issues/6087)
+- When a saved value cannot be restored while a workflow or loop body is rebuilt, the error now
+  includes the reason, such as "must be between 0 and 50", instead of only naming the parameter.
+  [#5889](https://github.com/griptape-ai/griptape-nodes-engine/issues/5889)
+
 ## [0.105.0] - 2026-10-27
 
 ### Added
@@ -726,7 +825,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.105.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...HEAD
+[0.106.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.105.0...v0.106.0
 [0.105.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.2...v0.105.0
 [0.104.2]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.1...v0.104.2
 [0.104.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.0...v0.104.1

@@ -47,6 +47,7 @@ MODEL_CHOICES_ARGS = [
     {"name": "claude-sonnet-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-opus-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-opus-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
+    {"name": "claude-haiku-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-haiku-4-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": False},
     # Google
     {"name": "gemini-3.6-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},

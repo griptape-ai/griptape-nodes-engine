@@ -281,20 +281,14 @@ def ensure_workflow_registered(
     registration and silently hide a workflow the author had listed deliberately.
 
     Raises:
-        KeyError: The key was claimed concurrently.
-        ValueError: The workflow file is no longer on disk.
+        ValueError: The workflow file is no longer on disk, or its path or key was claimed concurrently.
     """
     path_for_key = _workspace_relative_workflow_path(workspace_path, workflow_file_path)
     registry_key = derive_registry_key(path_for_key)
     if workflow_registry.has_workflow_with_name(registry_key):
         return registry_key
 
-    workflow_registry.generate_new_workflow(
-        registry_key=registry_key,
-        metadata=workflow_metadata,
-        file_path=path_for_key,
-    )
-    return registry_key
+    return workflow_registry.register_file(path_for_key, workflow_metadata).name
 
 
 def _workspace_relative_workflow_path(workspace_path: Path, workflow_file_path: Path) -> str:

@@ -559,6 +559,7 @@ class TestUnsendableResults:
             request=_PayloadHoldingAnything(request_id="req-1"),
             result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
             request_id="req-1",
+            engine_id="engine-1",
         )
 
         data = json.loads(_failure_dumps(event))
@@ -566,6 +567,7 @@ class TestUnsendableResults:
         assert data["event_type"] == "EventResultFailure"
         assert data["result_type"] == "GenericResultFailure"
         assert data["request_id"] == "req-1"
+        assert data["engine_id"] == "engine-1"
         assert (
             "'_NoJsonForm' value has no plain-data form"
             in data["result"]["result_details"]["result_details"][0]["message"]

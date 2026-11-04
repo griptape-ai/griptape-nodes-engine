@@ -104,7 +104,8 @@ _PATH_FAILURE_TO_FILE_IO: dict[PathResolutionFailureReason, FileIOFailureReason]
 }
 
 
-def _make_file_load_error(result: ResultPayload) -> FileLoadError:
+def file_load_error_from_result(result: ResultPayload) -> FileLoadError:
+    """The FileLoadError for a failed GetPathForMacroRequest, or any other failed result."""
     if isinstance(result, GetPathForMacroResultFailure):
         return FileLoadError(
             failure_reason=_PATH_FAILURE_TO_FILE_IO[result.failure_reason],
@@ -134,7 +135,7 @@ def _resolve_macro_path(macro_path: MacroPath) -> str:
         GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
     if not isinstance(result, GetPathForMacroResultSuccess):
-        raise _make_file_load_error(result)
+        raise file_load_error_from_result(result)
     return str(result.absolute_path)
 
 
@@ -144,7 +145,7 @@ async def _aresolve_macro_path(macro_path: MacroPath) -> str:
         GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
     if not isinstance(result, GetPathForMacroResultSuccess):
-        raise _make_file_load_error(result)
+        raise file_load_error_from_result(result)
     return str(result.absolute_path)
 
 
@@ -876,6 +877,11 @@ class FileDestination:
     @property
     def location(self) -> str:
         return self._file.location
+
+    @property
+    def existing_file_policy(self) -> ExistingFilePolicy:
+        """What a write does when a file is already at the destination."""
+        return self._existing_file_policy
 
     @property
     def name(self) -> str:

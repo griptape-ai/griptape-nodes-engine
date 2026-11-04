@@ -13,6 +13,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
+from griptape_nodes.node_library.workflow_registry import new_workflow_id
 from griptape_nodes.retained_mode.events.connection_events import DeleteConnectionRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
@@ -31,15 +32,24 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AlterParameterDetailsRequest,
     SetParameterValueRequest,
 )
-from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.events.worker_events import (
+    CheckLeaseRequest,
+    CheckLeaseResultFailure,
+    CheckLeaseResultSuccess,
+    WorkerGoneError,
+)
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+from griptape_nodes.retained_mode.managers.worker_manager import EngineLease
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import UndecodedValue, encode_value
 from tests.simulated_worker import simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata as ExecutionNodeMetadata
@@ -84,10 +94,12 @@ def _make_routed_node(
     return node
 
 
-def _make_mock_obj_mgr(existing_node: MagicMock | BaseNode | None = None) -> MagicMock:
-    mock_obj_mgr = MagicMock()
-    mock_obj_mgr.attempt_get_object_by_name_as_type.return_value = existing_node
-    return mock_obj_mgr
+def _make_workflow(existing_node: MagicMock | BaseNode | None = None) -> MagicMock:
+    """The orchestrator's workflow, holding `existing_node` when one is given."""
+    workflow = MagicMock()
+    workflow.objects.get_as_type.return_value = existing_node
+    workflow.nodes.orch_worker_requests = {}
+    return workflow
 
 
 def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) -> MagicMock:
@@ -121,7 +133,6 @@ def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) 
 
 def _make_node_manager(
     *,
-    object_manager: MagicMock | None = None,
     library_manager: MagicMock | None = None,
     worker_manager: MagicMock | None = None,
     event_manager: EventManager | None = None,
@@ -132,7 +143,6 @@ def _make_node_manager(
     `in_node_execution()` with a truthy mock whether the scope was opened or not.
     """
     mock_engine = MagicMock()
-    mock_engine.object_manager = object_manager
     mock_engine.library_manager = library_manager
     if event_manager is not None:
         mock_engine.event_manager = event_manager
@@ -140,6 +150,8 @@ def _make_node_manager(
     # cannot be in. Routing awaits it, so it needs to be awaitable.
     worker_manager = worker_manager or MagicMock()
     worker_manager.wait_until_executable = AsyncMock()
+    worker_manager.acquire_lease = AsyncMock(return_value=None)
+    worker_manager.lease_refusal = AsyncMock(return_value=None)
     mock_engine.worker_manager = worker_manager
     return NodeManager(MagicMock(), engine=mock_engine)
 
@@ -156,30 +168,30 @@ class TestExecuteNodeOrchestratorPath:
     @pytest.mark.asyncio
     async def test_missing_node_fails_without_fallback_to_create(self) -> None:
         """Orchestrator lookup miss returns failure; LibraryRegistry.create_node NOT called."""
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
+        workflow = _make_workflow(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         with patch.object(LibraryRegistry, "create_node") as mock_create:
             request = ExecuteNodeRequest(
                 node_name="nonexistent_node",
                 node_metadata=cast("ExecutionNodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}),
             )
-            result = await node_manager.on_execute_node_request(request)
+            result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
         assert "not found" in str(result.result_details).lower()
         mock_create.assert_not_called()
-        mock_obj_mgr.add_object_by_name.assert_not_called()
+        workflow.objects.add.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reuses_existing_node(self) -> None:
         """Node already in ObjectManager: skip creation, execute in place."""
         mock_node = _make_mock_node()
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         with patch.object(LibraryRegistry, "create_node") as mock_create:
             request = ExecuteNodeRequest(
@@ -187,11 +199,11 @@ class TestExecuteNodeOrchestratorPath:
                 parameter_values={"input_param": "input_value"},
                 node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
             )
-            result = await node_manager.on_execute_node_request(request)
+            result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_create.assert_not_called()
-        mock_obj_mgr.add_object_by_name.assert_not_called()
+        workflow.objects.add.assert_not_called()
         mock_node.set_parameter_value.assert_called_once_with("input_param", "input_value")
         mock_node.aprocess.assert_awaited_once()
 
@@ -208,8 +220,8 @@ class TestExecuteNodeOrchestratorPath:
         mock_node.aprocess = AsyncMock(
             side_effect=lambda: scope_open_during_run.append(event_manager.in_node_execution())
         )
+        workflow = _make_workflow(existing_node=mock_node)
         node_manager = _make_node_manager(
-            object_manager=_make_mock_obj_mgr(existing_node=mock_node),
             library_manager=_make_mock_library_manager(is_worker=False),
             event_manager=event_manager,
         )
@@ -217,7 +229,7 @@ class TestExecuteNodeOrchestratorPath:
         request = ExecuteNodeRequest(
             node_name="test_node", node_metadata=cast("ExecutionNodeMetadata", {"node_type": "T"})
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert scope_open_during_run == [True]
@@ -226,14 +238,14 @@ class TestExecuteNodeOrchestratorPath:
     @pytest.mark.asyncio
     async def test_no_params(self) -> None:
         mock_node = _make_mock_node()
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="test_node", node_metadata=cast("ExecutionNodeMetadata", {"node_type": "T"})
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_not_called()
@@ -243,15 +255,15 @@ class TestExecuteNodeOrchestratorPath:
     async def test_set_parameter_fails(self) -> None:
         mock_node = _make_mock_node()
         mock_node.set_parameter_value.side_effect = ValueError("bad value")
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="test_node",
             parameter_values={"bad_param": "bad_value"},
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "bad_param" in str(result.result_details)
@@ -261,12 +273,12 @@ class TestExecuteNodeOrchestratorPath:
     async def test_aprocess_fails(self) -> None:
         mock_node = _make_mock_node()
         mock_node.aprocess.side_effect = RuntimeError("process exploded")
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(node_name="test_node")
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "process exploded" in str(result.result_details)
@@ -274,15 +286,15 @@ class TestExecuteNodeOrchestratorPath:
     @pytest.mark.asyncio
     async def test_multiple_params(self) -> None:
         mock_node = _make_mock_node()
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="test_node",
             parameter_values={"param_a": 1, "param_b": "two", "param_c": [3]},
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         expected_param_count = 3
@@ -294,15 +306,15 @@ class TestExecuteNodeOrchestratorPath:
         mock_node = _make_mock_node()
         # Pre-populate parameter_values so each hydrate lookup finds a match.
         mock_node.parameter_values = {"param_a": 1, "param_b": "two", "param_c": [3]}
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="test_node",
             parameter_values=dict(mock_node.parameter_values),
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_not_called()
@@ -313,15 +325,15 @@ class TestExecuteNodeOrchestratorPath:
         """Identity-skip does not fire when the incoming value differs from current."""
         mock_node = _make_mock_node()
         mock_node.parameter_values = {"param_a": 1}  # existing, but stale
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="test_node",
             parameter_values={"param_a": 999},  # differs from current
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_called_once_with("param_a", 999)
@@ -330,15 +342,15 @@ class TestExecuteNodeOrchestratorPath:
     async def test_untagged_artifact_dict_becomes_an_artifact(self) -> None:
         """An editor-set or older-saved-workflow dict shaped like an artifact hydrates before being applied."""
         mock_node = _make_mock_node()
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
+        workflow = _make_workflow(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="test_node",
             parameter_values={"image": {"type": "ImageUrlArtifact", "value": "https://example.com/a.png"}},
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         set_name, set_value = mock_node.set_parameter_value.call_args[0]
@@ -375,15 +387,15 @@ class TestExecuteNodeLocalRouteHydratesUntaggedDicts:
         node = _ImageInputDataNode(
             "image_node", metadata={"node_type": "ImageInputDataNode", "library": "some_library"}
         )
-        mock_obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        workflow = _make_workflow(existing_node=node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
-        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+        node_manager = _make_node_manager(library_manager=lib_mgr)
 
         request = ExecuteNodeRequest(
             node_name="image_node",
             parameter_values={"image": {"type": "ImageUrlArtifact", "value": "https://example.com/a.png"}},
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert isinstance(node.seen_image, ImageUrlArtifact)
@@ -494,7 +506,12 @@ def worker_engine(engine: Engine, library_name: str) -> Engine:  # noqa: ARG001
     return engine
 
 
+# The workflow the orchestrator has open, which a worker builds its copy in.
+_ORCHESTRATOR_WORKFLOW_ID = "00000000000000000000000000000abc"
+
+
 def _request_for(node_type: str, name: str = "Echo", **fields: Any) -> ExecuteNodeRequest:
+    fields.setdefault("orchestrator_workflow_id", _ORCHESTRATOR_WORKFLOW_ID)
     return ExecuteNodeRequest(
         node_name=name,
         node_metadata=cast("ExecutionNodeMetadata", {"node_type": node_type, "library": _LIBRARY_NAME}),
@@ -503,8 +520,12 @@ def _request_for(node_type: str, name: str = "Echo", **fields: Any) -> ExecuteNo
 
 
 def _what_the_worker_holds(engine: Engine) -> set[str]:
-    """The names of every object left in the worker's object store."""
-    return set(engine.object_manager.get_filtered_subset())
+    """The names of every object left in the runtimes the worker keeps."""
+    held: set[str] = set()
+    for workflow in engine.worker_workflows.all_kept():
+        with engine.bind_workflow(workflow):
+            held |= set(engine.object_manager.get_filtered_subset())
+    return held
 
 
 _WORKER_COPIES_FLOW = "__worker_node_copies__"
@@ -529,12 +550,49 @@ class TestTheWorkerLoadsACopy:
         assert result.parameter_output_values["source"] == "Echo@abc"
 
     @pytest.mark.asyncio
+    async def test_a_workflow_file_gone_since_dispatch_still_runs_the_node(
+        self, worker_engine: Engine, tmp_path: Path
+    ) -> None:
+        """The orchestrator still has the workflow open at that path, so the worker registers it in that folder."""
+        moved_away = tmp_path / "shots" / "lighting.py"
+        lighting_workflow_id = new_workflow_id()
+
+        result = await worker_engine.ahandle_request(
+            _request_for(
+                "_EchoNode",
+                orchestrator_workflow_id=lighting_workflow_id,
+                workflow_name="shots/lighting",
+                workflow_file_path=str(moved_away),
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        entry = worker_engine.workflow_registry.get(lighting_workflow_id)
+        assert entry.file_path is None
+        assert entry.working_directory == str(moved_away.parent)
+
+    @pytest.mark.asyncio
     async def test_the_copy_and_its_flow_are_gone_after_the_run(self, worker_engine: Engine) -> None:
         result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "x"}))
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         assert _what_the_worker_holds(worker_engine) == {_WORKER_COPIES_FLOW}
-        assert "Echo" not in worker_engine.node_manager._name_to_parent_flow_name
+        for workflow in worker_engine.worker_workflows.all_kept():
+            assert "Echo" not in workflow.nodes.name_to_parent_flow_name
+
+    @pytest.mark.asyncio
+    async def test_a_node_sent_with_no_workflow_open_is_refused(self, worker_engine: Engine) -> None:
+        """The copy is built in the orchestrator's workflow, so with none open there is nowhere to build it."""
+        result = await worker_engine.ahandle_request(_request_for("_EchoNode", orchestrator_workflow_id=None))
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert str(result.result_details) == (
+            "Attempted to run a node in a separate process. Failed because no workflow was open when it was sent. "
+            "Open a workflow and run it again."
+        )
+        assert result.error is not None
+        assert isinstance(result.exception, ContextManager.OrchestratorWorkflowError)
+        assert _what_the_worker_holds(worker_engine) == set()
 
     @pytest.mark.asyncio
     async def test_the_structure_it_was_sent_is_built_before_the_values_are_set(self, worker_engine: Engine) -> None:
@@ -630,7 +688,9 @@ class TestTheWorkerLoadsACopy:
         assert _what_the_worker_holds(worker_engine) == {_WORKER_COPIES_FLOW}
 
     def test_discarding_a_flow_that_is_already_gone_does_nothing(self, worker_engine: Engine) -> None:
-        worker_engine.node_manager._discard_worker_copy("__worker_node_copies___gone")
+        worker_engine.node_manager._discard_worker_copy(
+            WorkflowRuntime("kept", worker_engine), "__worker_node_copies___gone"
+        )
 
         assert _what_the_worker_holds(worker_engine) == set()
 
@@ -645,7 +705,11 @@ class TestTheWorkerLoadsACopy:
     @pytest.mark.asyncio
     async def test_a_copy_that_cannot_take_the_nodes_name_is_refused(self, worker_engine: Engine) -> None:
         """Requests the node's code sends name the orchestrator's node, so a renamed copy would answer for nothing."""
-        worker_engine.object_manager.add_object_by_name("Echo", object())
+        workflow = worker_engine.context_manager.adopt_orchestrator_workflow(
+            _ORCHESTRATOR_WORKFLOW_ID, None, None, None
+        )
+        with worker_engine.run_in_worker_workflow(workflow):
+            worker_engine.object_manager.add_object_by_name("Echo", object())
 
         result = await worker_engine.ahandle_request(_request_for("_EchoNode"))
 
@@ -654,7 +718,9 @@ class TestTheWorkerLoadsACopy:
 
     @pytest.mark.asyncio
     async def test_missing_metadata_fails(self, worker_engine: Engine) -> None:
-        result = await worker_engine.ahandle_request(ExecuteNodeRequest(node_name="nonexistent_node"))
+        result = await worker_engine.ahandle_request(
+            ExecuteNodeRequest(node_name="nonexistent_node", orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID)
+        )
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
@@ -663,7 +729,9 @@ class TestTheWorkerLoadsACopy:
     async def test_missing_node_type_in_metadata_fails(self, worker_engine: Engine) -> None:
         result = await worker_engine.ahandle_request(
             ExecuteNodeRequest(
-                node_name="some_node", node_metadata=cast("ExecutionNodeMetadata", {"library": _LIBRARY_NAME})
+                node_name="some_node",
+                node_metadata=cast("ExecutionNodeMetadata", {"library": _LIBRARY_NAME}),
+                orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
             )
         )
 
@@ -707,6 +775,7 @@ class TestTheWorkerLoadsACopy:
                     node_metadata=cast(
                         "ExecutionNodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}
                     ),
+                    orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
                 )
             )
 
@@ -753,6 +822,78 @@ def _create_echo_node(engine: Engine, flow_name: str) -> BaseNode:
     )
     assert isinstance(result, CreateNodeResultSuccess), result
     return engine.node_manager.get_node_by_name(result.node_name)
+
+
+class TestAWorkerAnotherEngineRuns:
+    """A worker another engine runs asks that engine, before each node, whether the node's lease holds it."""
+
+    @pytest.mark.asyncio
+    async def test_runs_the_node_once_that_engine_says_the_lease_holds_it(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        held = CheckLeaseResultSuccess(result_details="held")
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=held)
+        ) as ask:
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert ask.await_args is not None
+        engine_id, check = ask.await_args.args
+        assert engine_id == "gpu-01"
+        assert isinstance(check, CheckLeaseRequest)
+        assert check.lease_id == "lease-1"
+        assert check.worker_engine_id == worker_engine.get_engine_id()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_node_when_that_engine_says_the_lease_does_not_hold_it(
+        self, worker_engine: Engine
+    ) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        not_held = CheckLeaseResultFailure(result_details="that engine is not holding itself for your run now.")
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=not_held)
+        ):
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "not holding itself for your run" in str(result.result_details)
+        for workflow in worker_engine.worker_workflows.all_kept():
+            assert "Echo" not in workflow.nodes.name_to_parent_flow_name
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_node_sent_without_a_lease(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
+            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "without a lease" in str(result.result_details)
+        ask.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refuses_the_node_when_that_engine_does_not_answer(self, worker_engine: Engine) -> None:
+        worker_engine.worker_manager._host_engine_id = "gpu-01"
+        with patch.object(
+            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(side_effect=TimeoutError)
+        ):
+            result = await worker_engine.ahandle_request(
+                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
+            )
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "did not answer" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_worker_on_this_machine_asks_no_engine(self, worker_engine: Engine) -> None:
+        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
+            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        ask.assert_not_awaited()
 
 
 class TestPreparingTheRequestForAWorker:
@@ -849,11 +990,12 @@ class TestPreparingTheRequestForAWorker:
         engine.handle_request(SetParameterValueRequest(node_name=node.name, parameter_name="text", value="edited"))
 
         with simulated_worker(engine, _LIBRARY_NAME) as worker:
-            result = await engine.ahandle_request(
+            result = await engine.current_workflow().ahandle_request(
                 ExecuteNodeRequest(
                     node_name=node.name,
                     node_metadata=cast("ExecutionNodeMetadata", dict(node.metadata)),
                     local_object_source=node.local_object_source,
+                    orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
                 )
             )
 
@@ -875,7 +1017,7 @@ class TestExecuteNodeWorkerRoute:
     @pytest.mark.asyncio
     async def test_routes_to_worker_and_returns_worker_result(self) -> None:
         node = _make_routed_node()
-        obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        workflow = _make_workflow(existing_node=node)
 
         wm = MagicMock()
         wm.route_to_worker = AsyncMock(
@@ -889,19 +1031,80 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr._is_worker = False
         lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
 
-        node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         request = ExecuteNodeRequest(
             node_name="worker_node",
             node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert result.parameter_output_values == {"out": 42}
         wm.route_to_worker.assert_awaited_once()
         # The orchestrator stub must not have run aprocess; the worker did.
         node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_node_for_another_engine_picks_its_worker_once_its_lease_holds_that_engine(self) -> None:
+        """That engine may stop the worker while the lease waits, and the second wait starts it again."""
+        node = _make_routed_node()
+        workflow = _make_workflow(existing_node=node)
+        lib_mgr = MagicMock()
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        wm = MagicMock()
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
+        calls: list[str] = []
+        lease = EngineLease(lease_id="lease-1", host_engine_id="eng-2", run_id=None)
+        sent: list[str | None] = []
+        success = {"result_type": ExecuteNodeResultSuccess.__name__, "result": {"result_details": "ok"}}
+
+        def run(event_request: Any, *_args: Any) -> dict:
+            calls.append("run")
+            sent.append(event_request.request.lease_id)
+            return success
+
+        wm.worker_unavailable_reason.return_value = None
+        wm.wait_until_executable = AsyncMock(side_effect=lambda *_, **__: calls.append("wait"))
+        wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
+        lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
+        wm.route_to_worker = AsyncMock(side_effect=run)
+        wm.release_after_node = MagicMock(side_effect=lambda *_: calls.append("release"))
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request, workflow)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert calls == ["wait", "acquire", "wait", "pick", "run", "release"]
+        assert sent == ["lease-1"], "the worker there checks the lease the node was sent under"
+        wm.release_after_node.assert_called_once_with(lease)
+
+    @pytest.mark.asyncio
+    async def test_a_node_whose_worker_there_could_not_start_asks_that_engine_for_nothing(self) -> None:
+        """An engine that never answered the start would never answer the lease either."""
+        node = _make_routed_node()
+        workflow = _make_workflow(existing_node=node)
+        lib_mgr = MagicMock()
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        wm = MagicMock()
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
+        wm.wait_until_executable = AsyncMock()
+        wm.worker_unavailable_reason.return_value = "engine eng-2 did not answer."
+        wm.acquire_lease = AsyncMock()
+        lib_mgr.workers.get_worker_for_library.return_value = None
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        await node_manager.on_execute_node_request(request, workflow)
+
+        wm.acquire_lease.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
@@ -913,7 +1116,7 @@ class TestExecuteNodeWorkerRoute:
         survive onto the result rather than being reconstructed here.
         """
         node = _make_routed_node()
-        obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        workflow = _make_workflow(existing_node=node)
 
         gone = WorkerGoneError("worker 'eng-id' stopped responding and was shut down")
         wm = MagicMock()
@@ -923,13 +1126,13 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr._is_worker = False
         lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
 
-        node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         request = ExecuteNodeRequest(
             node_name="worker_node",
             node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "stopped responding and was shut down" in str(result.result_details)
@@ -939,7 +1142,7 @@ class TestExecuteNodeWorkerRoute:
     @pytest.mark.asyncio
     async def test_worker_failure_returns_failure(self) -> None:
         node = _make_routed_node()
-        obj_mgr = _make_mock_obj_mgr(existing_node=node)
+        workflow = _make_workflow(existing_node=node)
 
         wm = MagicMock()
         wm.route_to_worker = AsyncMock(
@@ -953,13 +1156,13 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr._is_worker = False
         lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
 
-        node_manager = _make_node_manager(object_manager=obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         request = ExecuteNodeRequest(
             node_name="worker_node",
             node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
         )
-        result = await node_manager.on_execute_node_request(request)
+        result = await node_manager.on_execute_node_request(request, workflow)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "worker exploded" in str(result.result_details)
@@ -991,17 +1194,14 @@ class TestExecuteNodeWorkerValues:
             }
         )
         lib_mgr = _make_orchestrator_library_manager()
-        node_manager = _make_node_manager(
-            object_manager=_make_mock_obj_mgr(existing_node=_make_routed_node()),
-            library_manager=lib_mgr,
-            worker_manager=wm,
-        )
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         result = await node_manager.on_execute_node_request(
             ExecuteNodeRequest(
                 node_name="worker_node",
                 node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
-            )
+            ),
+            _make_workflow(existing_node=_make_routed_node()),
         )
 
         assert isinstance(result, ExecuteNodeResultSuccess)
@@ -1014,18 +1214,15 @@ class TestExecuteNodeWorkerValues:
         wm = MagicMock()
         wm.route_to_worker = AsyncMock()
         lib_mgr = _make_orchestrator_library_manager()
-        node_manager = _make_node_manager(
-            object_manager=_make_mock_obj_mgr(existing_node=_make_routed_node()),
-            library_manager=lib_mgr,
-            worker_manager=wm,
-        )
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         result = await node_manager.on_execute_node_request(
             ExecuteNodeRequest(
                 node_name="worker_node",
                 parameter_values={"handle": _NoPlainDataForm()},
                 node_metadata=cast("ExecutionNodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
-            )
+            ),
+            _make_workflow(existing_node=_make_routed_node()),
         )
 
         assert isinstance(result, ExecuteNodeResultFailure)
@@ -1068,13 +1265,12 @@ class TestExecuteNodePrivateExecutionRoute:
     ) -> ExecuteNodeResultSuccess | ExecuteNodeResultFailure:
         lib_mgr = _make_mock_library_manager(is_worker=False)
         lib_mgr.workers.get_worker_for_library.return_value = library_worker
-        node_manager = _make_node_manager(
-            object_manager=_make_mock_obj_mgr(existing_node=node), library_manager=lib_mgr, worker_manager=wm
-        )
+        workflow = _make_workflow(existing_node=node)
+        node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         # Set after the node manager is built, which installs its own mock. The library's own wait
         # comes first and passes; only the Isolated Execution worker's wait can fail here.
-        async def wait_until_executable(key: str | None) -> None:
+        async def wait_until_executable(key: str | None, *, start_stopped: bool = True) -> None:  # noqa: ARG001
             if key is None and load_failure is not None:
                 raise RuntimeError(load_failure)
 
@@ -1084,10 +1280,10 @@ class TestExecuteNodePrivateExecutionRoute:
             node_metadata=cast("ExecutionNodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}),
         )
         if scope_owner is None:
-            result = await node_manager.on_execute_node_request(request)
+            result = await node_manager.on_execute_node_request(request, workflow)
         else:
             with isolated_execution_scope(scope_owner):
-                result = await node_manager.on_execute_node_request(request)
+                result = await node_manager.on_execute_node_request(request, workflow)
         assert isinstance(result, ExecuteNodeResultSuccess | ExecuteNodeResultFailure)
         return result
 

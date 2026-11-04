@@ -1,9 +1,9 @@
-"""Tests for when RemoteHandler forwards versus answers locally.
+"""Tests for when a request dispatched to a RemoteHandler is forwarded versus answered locally.
 
-RemoteHandler is the single chokepoint where a worker services a request whose authoritative state
-lives on the orchestrator. What decides its behavior is one thing: whether the worker is inside a
-node-execution scope. Inside, it forwards; outside (bootstrap, library load, node construction) it
-delegates to the handler it replaced, so a node's ``__init__`` can still call ``add_parameter``.
+A RemoteHandler is the single chokepoint where a worker services a request whose authoritative state
+lives on the orchestrator. What decides whether dispatch forwards through it is one thing: whether the
+worker is inside a node-execution scope. Inside, it forwards; outside (bootstrap, library load, node
+construction) it calls the handler it replaced, so a node's ``__init__`` can still call ``add_parameter``.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
+    ResultPayload,
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -77,13 +78,26 @@ def _make_handler_with_fake_forward(event_manager: EventManager) -> RemoteHandle
     return RemoteHandler(original=original, event_manager=event_manager)
 
 
+class _Installed:
+    """A RemoteHandler registered for _ProbeRequest, as a worker registers it, dispatched through its event manager."""
+
+    def __init__(self, handler: RemoteHandler) -> None:
+        self.event_manager = handler.event_manager
+        self.event_manager.assign_manager_to_request_type(_ProbeRequest, handler.original)
+        self.event_manager.replace_manager_for_request_type(_ProbeRequest, handler)
+
+    async def __call__(self, request: RequestPayload) -> ResultPayload:
+        result_event = await self.event_manager.ahandle_request(request)
+        return result_event.result
+
+
 class TestRemoteHandlerRouting:
     """Node-execution scope is the whole routing decision."""
 
     @pytest.mark.asyncio
     async def test_in_node_execution_forwards(self) -> None:
         event_manager = EventManager()
-        handler = _make_handler_with_fake_forward(event_manager)
+        handler = _Installed(_make_handler_with_fake_forward(event_manager))
 
         with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="m1"))
@@ -101,7 +115,7 @@ class TestRemoteHandlerRouting:
             local_calls.append(request)
             return _ProbeResult(seen_by="local", result_details="local")
 
-        handler = RemoteHandler(original=original, event_manager=event_manager)
+        handler = _Installed(RemoteHandler(original=original, event_manager=event_manager))
 
         result = await handler(_ProbeRequest(marker="m2"))
 
@@ -113,7 +127,7 @@ class TestRemoteHandlerRouting:
     async def test_forwards_whenever_the_scope_is_open_not_only_inside_aprocess(self) -> None:
         """The gate is the refcount alone: no ``aprocess_scope()`` is entered here."""
         event_manager = EventManager()
-        handler = _make_handler_with_fake_forward(event_manager)
+        handler = _Installed(_make_handler_with_fake_forward(event_manager))
 
         with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="scope only"))
@@ -140,7 +154,7 @@ class TestRemoteHandlerRouting:
             )
 
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
-        handler = RemoteHandler(original=original, event_manager=event_manager)
+        handler = _Installed(RemoteHandler(original=original, event_manager=event_manager))
 
         with event_manager.node_execution_scope():
             await handler(_ProbeRequest(marker="first"))
@@ -195,7 +209,8 @@ class TestRemoteHandlerRouting:
         assert isinstance(installed, RemoteHandler)
 
         with event_manager.node_execution_scope():
-            result = await installed(ListConnectionsForNodeRequest(node_name="some-node"))
+            result_event = await event_manager.ahandle_request(ListConnectionsForNodeRequest(node_name="some-node"))
+        result = result_event.result
 
         assert isinstance(result, ListConnectionsForNodeResultSuccess)
         assert len(forwarded_calls) == 1

@@ -43,6 +43,7 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
+    ResultPayload,
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
@@ -59,6 +60,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -66,6 +68,13 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
     from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+
+
+# Workflow ids in the form the registry mints.
+_IDLE_WORKFLOW_ID = "361f2196d4584af88fa4b3600657c25f"
+_BUSY_WORKFLOW_ID = "2287671f711164a037bd38f349ccfd4c"
+_CLOSED_WORKFLOW_ID = "d8aa87c26072342180185408ae0f4c1c"
+_OPEN_WORKFLOW_ID = "a933aec213adcc9ec281ca7604260fa4"
 
 
 @dataclass(kw_only=True)
@@ -82,8 +91,17 @@ class _ProbeResult(ResultPayloadSuccess):
     seen_by: str
 
 
+async def _dispatch(handler: RemoteHandler, request: RequestPayload) -> ResultPayload:
+    """Dispatch `request` through `handler`'s event manager, with `handler` registered as a worker registers it."""
+    event_manager = handler.event_manager
+    event_manager.assign_manager_to_request_type(type(request), handler.original)
+    event_manager.replace_manager_for_request_type(type(request), handler)
+    result_event = await event_manager.ahandle_request(request)
+    return result_event.result
+
+
 class TestRemoteHandlerScopeGate:
-    """RemoteHandler must forward in-scope and delegate out-of-scope."""
+    """Dispatch forwards through a RemoteHandler in-scope and delegates out-of-scope."""
 
     @pytest.mark.asyncio
     async def test_out_of_scope_delegates_to_original(self) -> None:
@@ -97,11 +115,35 @@ class TestRemoteHandlerScopeGate:
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
         assert not event_manager.in_node_execution()
-        result = await handler(_ProbeRequest(marker="m1"))
+        result = await _dispatch(handler, _ProbeRequest(marker="m1"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "local:m1"
         assert call_count["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_passes_the_workflow_through(self) -> None:
+        event_manager = EventManager()
+        workflow = object()
+        seen: dict[str, object] = {}
+
+        async def original(request: _ProbeRequest, workflow: object) -> _ProbeResult:
+            seen["workflow"] = workflow
+            return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
+
+        handler = RemoteHandler(original=original, event_manager=event_manager)
+
+        await handler.handle_locally(_ProbeRequest(marker="m1"), workflow=workflow)
+
+        assert seen["workflow"] is workflow
+
+    def test_forwards_now_only_while_a_node_runs(self) -> None:
+        event_manager = EventManager()
+        handler = RemoteHandler(original=MagicMock(), event_manager=event_manager)
+
+        assert not handler.forwards_now()
+        with event_manager.node_execution_scope():
+            assert handler.forwards_now()
 
     @pytest.mark.asyncio
     async def test_in_scope_forwards_to_orchestrator(self) -> None:
@@ -129,7 +171,7 @@ class TestRemoteHandlerScopeGate:
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
         with event_manager.node_execution_scope():
-            result = await handler(_ProbeRequest(marker="m2"))
+            result = await _dispatch(handler, _ProbeRequest(marker="m2"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "orchestrator"
@@ -146,7 +188,7 @@ class TestRemoteHandlerScopeGate:
 
         handler = RemoteHandler(original=sync_original, event_manager=event_manager)
 
-        result = await handler(_ProbeRequest(marker="s1"))
+        result = await _dispatch(handler, _ProbeRequest(marker="s1"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "sync:s1"
@@ -159,6 +201,20 @@ class _StubResult(ResultPayloadSuccess):
 
 class TestInstallRemoteHandlersSwap:
     """register_remote_handlers forwards everything except the local-only exclusions."""
+
+    def test_swap_keeps_the_registered_scope(self) -> None:
+        """The wrapper takes its original's signature, so dispatch keeps calling it as it called the original."""
+        event_manager = EventManager()
+
+        async def original(_request: RequestPayload, workflow: object) -> _StubResult:  # noqa: ARG001
+            return _StubResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(CreateNodeRequest, original)
+
+        register_remote_handlers(event_manager)
+
+        assert isinstance(event_manager.get_manager_for_request_type(CreateNodeRequest), RemoteHandler)
+        assert event_manager.get_scope_for_request_type(CreateNodeRequest) is RequestScope.WORKFLOW
 
     def test_swap_replaces_every_registered_handler(self) -> None:
         event_manager = EventManager()
@@ -191,8 +247,8 @@ class TestInstallRemoteHandlersSwap:
         event_manager = EventManager()
         locals_registered: dict[type[RequestPayload], Any] = {}
         for request_type in LOCAL_ONLY_REQUEST_TYPES:
-
-            async def original(_request: RequestPayload) -> _StubResult:
+            # Optional, so it registers for any request type, including one that falls back to the only open workflow.
+            async def original(_request: RequestPayload, workflow: object | None = None) -> _StubResult:  # noqa: ARG001
                 return _StubResult(result_details="local")
 
             locals_registered[request_type] = original
@@ -355,6 +411,47 @@ class TestDropAllLocalObjectsHandler:
         assert release_threads[0] != threading.get_ident()
 
     @pytest.mark.asyncio
+    async def test_closes_the_runtimes_kept_for_the_orchestrators_workflows_except_one_a_node_runs_in(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator tore its workflow down, so a later node of it gets a fresh runtime."""
+        engine.context_manager.adopt_orchestrator_workflow(_IDLE_WORKFLOW_ID, None, None, None)
+        busy = engine.context_manager.adopt_orchestrator_workflow(_BUSY_WORKFLOW_ID, None, None, None)
+
+        with engine.run_in_worker_workflow(busy):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds(_IDLE_WORKFLOW_ID)
+        assert engine.workflow_registry.find_by_id(_IDLE_WORKFLOW_ID) is None
+        assert engine.worker_workflows.find(_BUSY_WORKFLOW_ID) is busy
+
+    @pytest.mark.asyncio
+    async def test_naming_a_workflow_closes_only_its_runtime_and_releases_only_its_objects(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator closed one workflow while another stays open, so the other's runtime and objects stay."""
+        closed = engine.context_manager.adopt_orchestrator_workflow(_CLOSED_WORKFLOW_ID, None, None, None)
+        still_open = engine.context_manager.adopt_orchestrator_workflow(_OPEN_WORKFLOW_ID, None, None, None)
+        manager = engine.resource_manager
+        with engine.run_in_worker_workflow(closed):
+            closed_key = manager.put_local_object(object(), owner="Lib A", source="N", key="closed")
+        with engine.run_in_worker_workflow(still_open):
+            open_key = manager.put_local_object(object(), owner="Lib A", source="N", key="open")
+
+        result = await _handle_drop_all_local_objects(
+            DropAllLocalObjectsRequest(workflow_id=_CLOSED_WORKFLOW_ID), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds(_CLOSED_WORKFLOW_ID)
+        assert engine.worker_workflows.find(_OPEN_WORKFLOW_ID) is still_open
+        assert manager.entry_for(closed_key) is None
+        assert manager.entry_for(open_key) is not None
+
+    @pytest.mark.asyncio
     async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
         with patch.object(engine.resource_manager, "drop_all_local_objects", side_effect=RuntimeError("boom")):
             result = await _handle_drop_all_local_objects(
@@ -495,7 +592,8 @@ def _route_probe_through_a_remote_handler(event_manager: EventManager) -> None:
     async def original(request: _ProbeRequest) -> _ProbeResult:
         return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
 
-    event_manager.assign_manager_to_request_type(
+    event_manager.assign_manager_to_request_type(_ProbeRequest, original)
+    event_manager.replace_manager_for_request_type(
         _ProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
     )
 
@@ -562,6 +660,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         worker_settled = _install_adoption(event_manager, project_manager)
         handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
         assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
 
         result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
 
@@ -578,6 +677,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         worker_settled = _install_adoption(event_manager, project_manager)
         handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
         assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
 
         result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
 
