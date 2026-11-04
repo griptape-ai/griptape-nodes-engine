@@ -41,6 +41,7 @@ WORKFLOW_METADATA_BLOCK_NAME = "script"
 # PEP 723-style inline metadata block: a "# /// <name>" opener, comment-prefixed body lines,
 # and a "# ///" closer.
 _METADATA_BLOCK_PATTERN = re.compile(r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
+_METADATA_BLOCK_OPENER = "# /// "
 
 _TOOL_TABLE = "tool"
 _GRIPTAPE_NODES_TABLE = "griptape-nodes"
@@ -218,8 +219,26 @@ class WorkflowMetadata(BaseModel):
 
 
 def find_metadata_blocks(workflow_content: str, block_name: str) -> list[re.Match[str]]:
-    """Return every inline metadata block in `workflow_content` whose name is `block_name`."""
-    return [match for match in _METADATA_BLOCK_PATTERN.finditer(workflow_content) if match.group("type") == block_name]
+    """Return every inline metadata block in `workflow_content` whose name is `block_name`.
+
+    Equivalent to `_METADATA_BLOCK_PATTERN.finditer`, but only tries the pattern where a line starts
+    with the block opener. Trying it at every character is slow on workflows that embed large
+    serialized values.
+    """
+    matches = []
+    position = 0
+    while (opener := workflow_content.find(_METADATA_BLOCK_OPENER, position)) != -1:
+        match = None
+        if opener == 0 or workflow_content[opener - 1] == "\n":
+            match = _METADATA_BLOCK_PATTERN.match(workflow_content, opener)
+        if match is None:
+            position = opener + 1
+            continue
+        if match.group("type") == block_name:
+            matches.append(match)
+        # Resume after the block, as finditer does, so a block nested in another's body isn't found.
+        position = match.end()
+    return matches
 
 
 def strip_metadata_comment_prefixes(metadata_block: re.Match[str]) -> str:
