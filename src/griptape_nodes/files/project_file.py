@@ -35,10 +35,21 @@ def _attempt_map_to_project(absolute_path: Path) -> str | None:
 
 
 def file_destination_from_spec(spec: FileDestinationSpec) -> FileDestination:
-    """Rebuild the destination ``FileDestination.to_spec`` described, keeping its project mapping."""
+    """Rebuild the destination ``FileDestination.to_spec`` described, keeping its project mapping.
+
+    The only way to rebuild a file destination from its spec, so the mapping can't be dropped.
+    """
+    destination_type = FileDestination
     if spec.map_to_project:
-        return ProjectFileDestination.from_spec(spec)
-    return FileDestination.from_spec(spec)
+        destination_type = ProjectFileDestination
+    return destination_type(
+        spec.file_path,
+        existing_file_policy=spec.existing_file_policy,
+        append=spec.append,
+        create_parents=spec.create_parents,
+        file_metadata=spec.file_metadata,
+        coerce_extension_to_match_bytes=spec.coerce_extension_to_match_bytes,
+    )
 
 
 class ProjectFileDestination(FileDestination):

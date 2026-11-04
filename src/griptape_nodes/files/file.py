@@ -979,18 +979,6 @@ class FileDestination:
             map_to_project=False,
         )
 
-    @classmethod
-    def from_spec(cls, spec: FileDestinationSpec) -> FileDestination:
-        """Rebuild a destination from ``to_spec`` output. ``spec.map_to_project`` is not consulted here."""
-        return cls(
-            spec.file_path,
-            existing_file_policy=spec.existing_file_policy,
-            append=spec.append,
-            create_parents=spec.create_parents,
-            file_metadata=spec.file_metadata,
-            coerce_extension_to_match_bytes=spec.coerce_extension_to_match_bytes,
-        )
-
 
 @runtime_checkable
 class FileDestinationProvider(Protocol):
