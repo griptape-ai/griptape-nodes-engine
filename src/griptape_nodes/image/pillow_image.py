@@ -223,7 +223,7 @@ class PillowImage(GriptapeImage):
         return self._MODE_INFO.get(self._image.mode, _ModeInfo(3, self._image.mode))
 
     def _derive(self, image: Image.Image) -> PillowImage:
-        return PillowImage(image, self._format, source=None)
+        return type(self)(image, self._format, source=None)
 
     @classmethod
     def open(cls, source: bytes | Path) -> PillowImage:

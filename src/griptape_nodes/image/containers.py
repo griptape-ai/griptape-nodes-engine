@@ -13,6 +13,7 @@ from griptape_nodes.image.png_text_chunks import PNG_SIGNATURE, png_chunk
 EXIF_HEADER = b"Exif\x00\x00"
 
 _JPEG_SOI = b"\xff\xd8"
+_JPEG_EOI = b"\xff\xd9"
 _JPEG_APP0 = 0xE0
 _JPEG_APP1 = 0xE1
 _JPEG_SOS = 0xDA
@@ -59,6 +60,16 @@ def read_exif(data: bytes, image_format: ImageFormat | None) -> bytes | None:
 class ImageSize(NamedTuple):
     width: int
     height: int
+
+
+def is_complete(data: bytes, image_format: ImageFormat) -> bool:
+    """Whether a JPEG or PNG runs to its end marker (EOI, IEND), as one cut short in transit doesn't."""
+    if image_format == ImageFormat.JPEG:
+        return data.startswith(_JPEG_SOI) and data.rstrip(b"\x00").endswith(_JPEG_EOI)
+    if image_format == ImageFormat.PNG:
+        chunks = _png_chunks(data)
+        return bool(chunks) and chunks[-1].kind == b"IEND" and chunks[-1].payload_end + 4 <= len(data)
+    return False
 
 
 def jpeg_size(data: bytes) -> ImageSize | None:
