@@ -84,6 +84,9 @@ docs = [
   "mkdocs-material>=9.6.9",
   "mkdocs>=1.5.2",
   "mkdocstrings[python]>=0.29.1",
+  # 1.x depends on `griffe`, which shares the `griffe` package directory with `griffelib`
+  # (pulled in by pydantic-ai-slim). Installing both corrupts it.
+  "mkdocstrings-python>=2.0",
   "mkdocs-llmstxt>=0.5.0",
   "mkdocs-redirects>=1.2.2,<1.2.4",
   "pymdown-extensions>=10.17",
