@@ -1,6 +1,7 @@
 """Unit tests for workflow_metadata.py provenance collection functions."""
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -8,6 +9,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
+    _collect_workflow_info,
     _parameter_values_of,
     collect_sidecar_provenance,
     collect_workflow_metadata,
@@ -22,6 +24,48 @@ def _make_param(
     param.exclude_from_metadata = exclude_from_metadata
     param.allowed_modes = modes if modes is not None else {ParameterMode.INPUT, ParameterMode.PROPERTY}
     return param, value
+
+
+class TestCollectWorkflowInfo:
+    def test_returns_name_when_registry_lookup_fails(self) -> None:
+        engine = Mock()
+        engine.workflow_registry.get_workflow_by_name.side_effect = KeyError("not found")
+
+        result = _collect_workflow_info(engine, "my_workflow")
+
+        assert result == {"name": "my_workflow"}
+
+    def test_includes_dates_and_version_when_present(self) -> None:
+        workflow = Mock()
+        workflow.metadata.creation_date = datetime(2026, 1, 1, tzinfo=UTC)
+        workflow.metadata.last_modified_date = datetime(2026, 6, 1, tzinfo=UTC)
+        workflow.metadata.engine_version_created_with = "1.2.3"
+        workflow.metadata.description = None
+
+        engine = Mock()
+        engine.workflow_registry.get_workflow_by_name.return_value = workflow
+
+        result = _collect_workflow_info(engine, "my_workflow")
+
+        assert result["name"] == "my_workflow"
+        assert "created" in result
+        assert "modified" in result
+        assert result["engine_version"] == "1.2.3"
+        assert "description" not in result
+
+    def test_omits_none_metadata_fields(self) -> None:
+        workflow = Mock()
+        workflow.metadata.creation_date = None
+        workflow.metadata.last_modified_date = None
+        workflow.metadata.engine_version_created_with = None
+        workflow.metadata.description = None
+
+        engine = Mock()
+        engine.workflow_registry.get_workflow_by_name.return_value = workflow
+
+        result = _collect_workflow_info(engine, "my_workflow")
+
+        assert result == {"name": "my_workflow"}
 
 
 class TestParameterValuesOf:
