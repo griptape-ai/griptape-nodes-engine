@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 import anyio
 import pytest
 import static_ffmpeg.run
-from PIL import Image
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
 
@@ -44,6 +43,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils import ffmpeg_cache
+from tests.unit.image.sample_images import RED, encode, size_of, solid
 from tests.workflow_context import unsaved_workflow_open
 
 if TYPE_CHECKING:
@@ -772,8 +772,7 @@ class TestGeneratePreview:
         image_path = temp_dir / "test_source.jpg"
 
         # Create a simple test image (100x100 red square)
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
 
         return image_path
 
@@ -817,9 +816,9 @@ class TestGeneratePreview:
         assert preview_path.exists()
 
         # Verify preview dimensions
-        with Image.open(str(preview_path)) as preview_img:
-            assert preview_img.width <= 50  # noqa: PLR2004
-            assert preview_img.height <= 50  # noqa: PLR2004
+        width, height = size_of(preview_path.read_bytes())
+        assert width <= 50  # noqa: PLR2004
+        assert height <= 50  # noqa: PLR2004
 
         # Verify no metadata file
         metadata_path = anyio.Path(str(preview_path) + ".json")
@@ -938,11 +937,11 @@ class TestGeneratePreview:
         preview_dir = test_image_path.parent / ".griptape-nodes-previews"
         preview_path = preview_dir / f"{test_image_path.name}.webp"
 
-        with Image.open(str(preview_path)) as preview_img:
-            assert preview_img.width <= 30  # noqa: PLR2004
-            assert preview_img.height <= 40  # noqa: PLR2004
-            # Verify aspect ratio preserved (source is 100x100, so should be square)
-            assert preview_img.width == preview_img.height
+        width, height = size_of(preview_path.read_bytes())
+        assert width <= 30  # noqa: PLR2004
+        assert height <= 40  # noqa: PLR2004
+        # Verify aspect ratio preserved (source is 100x100, so should be square)
+        assert width == height
 
     @pytest.mark.asyncio
     async def test_generate_preview_specific_format(
@@ -1258,8 +1257,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
     def test_image_path(self, temp_dir: Path) -> Path:
         """Create a real test image file."""
         image_path = temp_dir / "test_source.jpg"
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture
@@ -1386,8 +1384,7 @@ class TestGetPreviewForArtifact:
         image_path = temp_dir / "test_source.jpg"
 
         # Create a simple test image (100x100 red square)
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
 
         return image_path
 

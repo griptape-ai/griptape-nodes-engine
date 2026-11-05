@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Self
 
-from griptape_nodes.image.griptape_image import DEFAULT_THUMBNAIL_SIZE
-from griptape_nodes.image.metadata import TRANSPOSING_ORIENTATIONS
+from griptape_nodes.image.exif import TRANSPOSING_ORIENTATIONS
 
 if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.image.griptape_image import GriptapeImage
+
+# Bounds ``GriptapeImagePipeline.thumbnail`` shrinks to by default; the preview generators' default size
+DEFAULT_THUMBNAIL_SIZE = 1024
 
 _UPRIGHT = 1
 
@@ -25,16 +27,10 @@ class Orient:
 
 @dataclass(frozen=True)
 class Thumbnail:
-    """Shrink to fit within the bounds, keeping the aspect ratio. Never enlarges.
-
-    ``transposed`` marks a thumbnail moved ahead of an orientation that swaps width and height,
-    its bounds swapped to match. A backend whose size rounding isn't symmetric in width and
-    height (Pillow's) rounds in the upright frame, so the result matches shrinking after orienting.
-    """
+    """Shrink to fit within the bounds, keeping the aspect ratio. Never enlarges."""
 
     max_width: int
     max_height: int
-    transposed: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,16 +75,17 @@ class GriptapeImagePipeline:
 
     Steps run in the order queued, except that an EXIF transpose ahead of a ``thumbnail`` runs
     after it, on the smaller image, with the bounds swapped for a 90 degree turn. The output is
-    the same; the rotation costs a fraction as much. Running steps together also lets a backend
-    start from a reduced-size decode when the first step shrinks the image.
+    the same; the rotation costs a fraction as much.
 
-        with open_image(data) as source:
+        with GriptapeImage.open(data) as source:
             pipeline = GriptapeImagePipeline(source)
             pipeline.exif_transpose().thumbnail(512, 512).round_corners(0.02)
             with pipeline.end() as preview:
                 encoded = preview.encode(ImageFormat.WEBP)
 
-    The source image is left as it was; ``end`` returns a new image for the caller to close.
+    The source image is left as it was; ``end`` returns a new image for the caller to close. It
+    carries the source's metadata, updated to describe the new pixels: an EXIF transpose resets
+    the Orientation tag, and steps that resize update the EXIF pixel dimensions.
     """
 
     def __init__(self, image: GriptapeImage) -> None:
@@ -191,4 +188,4 @@ def plan_steps(steps: list[PipelineStep | _ExifTranspose], orientation: int) -> 
 def _bounds_before_orienting(thumbnail: Thumbnail, orientation: int) -> Thumbnail:
     if orientation not in TRANSPOSING_ORIENTATIONS:
         return thumbnail
-    return replace(thumbnail, max_width=thumbnail.max_height, max_height=thumbnail.max_width, transposed=True)
+    return replace(thumbnail, max_width=thumbnail.max_height, max_height=thumbnail.max_width)

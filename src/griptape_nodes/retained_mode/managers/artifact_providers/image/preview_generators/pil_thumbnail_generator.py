@@ -7,7 +7,13 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
 
-from griptape_nodes.image import DEFAULT_THUMBNAIL_SIZE, GriptapeImagePipeline, ImageFormat, open_image
+from griptape_nodes.image import (
+    DEFAULT_THUMBNAIL_SIZE,
+    GriptapeImage,
+    GriptapeImagePipeline,
+    ImageFormat,
+    ImageMetadata,
+)
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     ReadFileRequest,
@@ -29,7 +35,7 @@ if TYPE_CHECKING:
 
 
 class PILThumbnailParameters(BaseGeneratorParameters):
-    """Parameters for PIL thumbnail generation."""
+    """Parameters for thumbnail generation."""
 
     max_width: PositiveInt = Field(
         default=DEFAULT_THUMBNAIL_SIZE,
@@ -162,9 +168,12 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
                 f"Attempted to generate a thumbnail. Failed because {self.preview_format} is not a known image format."
             )
             raise TypeError(msg)
-        with open_image(image_data) as source, GriptapeImagePipeline(source) as pipeline:
+        with GriptapeImage.open(image_data) as source, GriptapeImagePipeline(source) as pipeline:
             # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
             # fit within the max dimensions, preserving aspect ratio
             pipeline.exif_transpose().thumbnail(self.params.max_width, self.params.max_height)
             with pipeline.end() as thumbnail:
-                return thumbnail.encode(preview_format)
+                # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+                return thumbnail.encode(
+                    preview_format, metadata=ImageMetadata(icc_profile=thumbnail.metadata.icc_profile)
+                )

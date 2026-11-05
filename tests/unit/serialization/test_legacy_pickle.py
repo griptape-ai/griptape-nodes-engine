@@ -9,9 +9,9 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 import pytest
-from PIL import Image
 
 from griptape_nodes.exe_types.node_types import NodeDependencies
+from griptape_nodes.image.png_text_chunks import read_text_chunks
 from griptape_nodes.retained_mode.events.arbitrary_python_events import RunArbitraryPythonStringRequest
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, SerializedFlowCommands
 from griptape_nodes.retained_mode.events.node_events import (
@@ -91,7 +91,7 @@ class TestLibraryModuleNames:
 class TestLegacyPayloads:
     @pytest.mark.usefixtures("library_name")
     def test_image_commands_come_back_with_their_value_pool_encoded(self, engine: Engine) -> None:
-        text = Image.open(FIXTURES / "pickle_era_image_library_values.png").info[FLOW_COMMANDS_KEY]
+        text = read_text_chunks((FIXTURES / "pickle_era_image_library_values.png").read_bytes())[FLOW_COMMANDS_KEY]
 
         commands = read_legacy_image_flow_commands(text, engine.library_manager.module_loading.stable_module_names())
 
