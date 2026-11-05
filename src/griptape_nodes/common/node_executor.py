@@ -51,8 +51,6 @@ from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WOR
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
     ExecutionPayload,
     ForwardedException,
     ProgressEvent,
@@ -350,7 +348,7 @@ class NodeExecutor(EngineScoped):
             return
 
         start_event = self._node_start_process_event(workflow, node, loop_body_scope)
-        self._put_execution_event(start_event)
+        self._put_execution_event(workflow, start_event)
         outcome = NodeProcessOutcome.FAILED
         failure: Exception | None = None
         token = current_node_execution_id.set(start_event.execution_id)
@@ -366,7 +364,9 @@ class NodeExecutor(EngineScoped):
             raise
         finally:
             current_node_execution_id.reset(token)
-            self._put_execution_event(self._node_finish_process_event(start_event, outcome=outcome, failure=failure))
+            self._put_execution_event(
+                workflow, self._node_finish_process_event(start_event, outcome=outcome, failure=failure)
+            )
 
     async def _run_node(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
         """Run the given node by the path its type and execution environment call for.
@@ -509,8 +509,8 @@ class NodeExecutor(EngineScoped):
         except KeyError:
             return None
 
-    def _put_execution_event(self, payload: ExecutionPayload) -> None:
-        self.engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+    def _put_execution_event(self, workflow: WorkflowRuntime, payload: ExecutionPayload) -> None:
+        self.engine.event_manager.put_event(workflow.execution_event(payload))
 
     @staticmethod
     def _outcome_after_return(node: BaseNode) -> NodeProcessOutcome:
