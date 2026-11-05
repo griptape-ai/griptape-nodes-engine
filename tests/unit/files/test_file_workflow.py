@@ -109,14 +109,14 @@ class TestAHandleBuiltInBoundCode:
         bind(a)
         file = File("{outputs}/out.png")
 
-        assert _in_raw_thread(file.resolve) == "/a/out.png"
+        assert Path(_in_raw_thread(file.resolve)) == Path("/a/out.png")
         assert file.workflow is a.runtime
 
     def test_a_named_workflow_wins_over_the_binding(self, bind: Callable[[_RecordingWorkflow], None]) -> None:
         bind(_RecordingWorkflow("/a/out.png"))
         b = _RecordingWorkflow("/b/out.png")
 
-        assert File("{outputs}/out.png", workflow=b.runtime).resolve() == "/b/out.png"
+        assert Path(File("{outputs}/out.png", workflow=b.runtime).resolve()) == Path("/b/out.png")
 
     def test_a_destination_writes_in_its_workflow_and_returns_a_file_for_it(
         self, bind: Callable[[_RecordingWorkflow], None]
@@ -149,7 +149,7 @@ class TestAHandleBuiltInBoundCode:
         destination = DirectoryDestination("{outputs}/renders")
 
         assert _in_raw_thread(directory.resolve) == Path("/a/renders")
-        assert _in_raw_thread(destination.resolve) == "/a/renders"
+        assert Path(_in_raw_thread(destination.resolve)) == Path("/a/renders")
 
     def test_sequences_resolve_in_the_workflow_they_were_built_in_from_a_raw_thread(
         self, bind: Callable[[_RecordingWorkflow], None]
@@ -162,7 +162,7 @@ class TestAHandleBuiltInBoundCode:
         entry = _in_raw_thread(lambda: sequence.entry(7))
         entry_destination = _in_raw_thread(lambda: destination.entry(7))
 
-        assert entry.location == "/a/frames/0007.png"
+        assert Path(entry.location) == Path("/a/frames/0007.png")
         assert entry.workflow is a.runtime
         assert entry_destination.workflow is a.runtime
         assert sequence.directory.workflow is a.runtime
@@ -244,7 +244,7 @@ class TestTheOtherBuilders:
             destination = _in_raw_thread(parameter.build_directory)
 
         assert seen == [a.runtime]
-        assert destination.resolve() == "/a/renders"
+        assert Path(destination.resolve()) == Path("/a/renders")
 
     def test_build_sequence_builds_in_the_nodes_workflow_on_a_raw_thread(self, engine: Engine) -> None:
         a = _RecordingWorkflow("/a/frames/####.png")
