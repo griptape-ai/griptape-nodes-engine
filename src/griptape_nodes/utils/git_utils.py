@@ -1314,7 +1314,10 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         ]
         sparse_checkout_file.write_text("\n".join(patterns), encoding="utf-8")
 
-        run(["fetch", "--depth=1", "origin", ref], f"Git fetch failed for {ref}")
+        # Sparse checkout only limits the working tree; the fetch would still download every
+        # file in the commit. blob:none defers file contents, so checkout fetches just the
+        # library JSON. A server without filter support ignores it and sends everything.
+        run(["fetch", "--depth=1", "--filter=blob:none", "origin", ref], f"Git fetch failed for {ref}")
         run(["checkout", "FETCH_HEAD"], "Git checkout failed")
 
         library_json_path = find_file_in_directory(temp_path, "griptape[-_]nodes[-_]library.json")
