@@ -14,7 +14,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
     WorkflowShape,
 )
-from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializedFlowCommands,
 )
 from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeType
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import is_plain_data
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 
@@ -359,7 +360,9 @@ class WorkflowCodeGenerator(EngineScoped):
         """Recursively walk through object tree, calling process_class_fn for each class found.
 
         This unified helper handles the common pattern of recursively traversing nested objects
-        to find all class instances. Used by both patching and import collection.
+        to find all class instances. Used by both patching and import collection. It stops at the
+        engine and at workflow runtimes, which a node holds a reference to, so walking one node
+        doesn't reach every other node and manager.
 
         Args:
             obj: Object to traverse (can contain nested lists, dicts, class instances)
@@ -378,7 +381,7 @@ class WorkflowCodeGenerator(EngineScoped):
             visited = set()
 
         obj_id = id(obj)
-        if obj_id in visited:
+        if obj_id in visited or isinstance(obj, (Engine, WorkflowRuntime)):
             return
         visited.add(obj_id)
 

@@ -163,6 +163,8 @@ class ObjectManager(EngineScoped):
         objects = workflow.objects
         objects.add(name, obj)
         if isinstance(obj, BaseNode):
+            # The one place a node joins a workflow, so every node in `workflow.objects` knows it.
+            obj._set_workflow(workflow)
             # The workflow holding the node queues its changes, so they go when it closes.
             obj.set_change_listener(objects.note_queued_changes)
 
