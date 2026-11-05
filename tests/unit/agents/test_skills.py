@@ -233,6 +233,16 @@ class TestAddSkill:
         with pytest.raises(SkillWriteError, match="already exists"):
             await add_skill([own, shared], compose_skill_file("house-style", "Something.", "Body."))
 
+    async def test_a_name_taken_in_another_unicode_form_is_refused(self, tmp_path: Path) -> None:
+        own = tmp_path / "own"
+        shared = tmp_path / "shared"
+        _write_skill(shared, "house-\ufb01le")  # the "fi" ligature, which the loader normalizes to "fi"
+
+        with pytest.raises(SkillWriteError, match="already exists"):
+            await add_skill([own, shared], compose_skill_file("house-file", "Something.", "Body."))
+
+        assert not (own / "house-file").exists()
+
     async def test_no_folder_is_refused(self) -> None:
         with pytest.raises(SkillWriteError, match="No skills folder"):
             await add_skill([], compose_skill_file("house-style", "Something.", "Body."))

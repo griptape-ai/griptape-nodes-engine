@@ -11,6 +11,7 @@ import logging
 import posixpath
 import shutil
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -143,16 +144,31 @@ async def add_skill(libraries: Sequence[Path], content: str) -> DiscoveredSkill:
         msg = "No skills folder is set. Add one to the agent.skills_directories setting."
         raise SkillWriteError(msg)
     name = _declared_name(content)
-    for existing in libraries:
-        try:
-            taken = (existing / name).exists()
-        except OSError as e:
-            msg = f"Could not check {existing} for a skill named '{name}': {e.strerror or e}."
-            raise SkillWriteError(msg) from e
-        if taken:
-            msg = f"A skill named '{name}' already exists in {existing}. Pick another name or remove that one first."
-            raise SkillWriteError(msg)
+    checked = await _check_skill(name, content)
+    await _refuse_taken_name(libraries, name, checked.name)
 
+    library = libraries[0]
+    target = library / name
+    try:
+        target.mkdir(parents=True)
+        (target / SKILL_FILE_NAME).write_text(content, encoding="utf-8")
+    except OSError as e:
+        msg = f"Could not write the skill into {library}: {e.strerror or e}."
+        raise SkillWriteError(msg) from e
+    # By folder, not name: the loader normalizes a name, so the two can differ in Unicode form.
+    for skill in await discover_skills([library]):
+        if skill.folder == target:
+            return skill
+    msg = f"Wrote the skill into {library}, but it could not be read back."
+    raise SkillWriteError(msg)
+
+
+async def _check_skill(name: str, content: str) -> DiscoveredSkill:
+    """Load ``content`` from a scratch folder named ``name``, as it would load once written.
+
+    Raises:
+        SkillWriteError: ``name`` is not a usable folder name, or the skill would not load.
+    """
     with tempfile.TemporaryDirectory() as staging:
         staged = Path(staging) / name
         try:
@@ -164,18 +180,33 @@ async def add_skill(libraries: Sequence[Path], content: str) -> DiscoveredSkill:
         (checked,) = await discover_skills([Path(staging)])
     if checked.problem is not None:
         raise SkillWriteError(checked.problem)
+    return checked
 
-    library = libraries[0]
-    target = library / name
-    try:
-        target.mkdir(parents=True)
-        (target / SKILL_FILE_NAME).write_text(content, encoding="utf-8")
-    except OSError as e:
-        msg = f"Could not write the skill into {library}: {e.strerror or e}."
-        raise SkillWriteError(msg) from e
-    # By folder, not name: the loader normalizes a name, so the two can differ in Unicode form.
-    (written,) = [skill for skill in await discover_skills([library]) if skill.folder == target]
-    return written
+
+async def _refuse_taken_name(libraries: Sequence[Path], name: str, normalized: str) -> None:
+    """Raise when a folder named ``name``, or a skill whose loaded name is ``normalized``, is in ``libraries``.
+
+    Raises:
+        SkillWriteError: The name is taken, or a folder cannot be checked.
+    """
+    for existing in libraries:
+        try:
+            taken = (existing / name).exists()
+        except OSError as e:
+            msg = f"Could not check {existing} for a skill named '{name}': {e.strerror or e}."
+            raise SkillWriteError(msg) from e
+        if taken:
+            msg = f"A skill named '{name}' already exists in {existing}. Pick another name or remove that one first."
+            raise SkillWriteError(msg)
+
+    # The loader compares names in NFKC form, so a name spelled differently on disk can still be taken.
+    for existing in await discover_skills(libraries):
+        if unicodedata.normalize("NFKC", existing.name) == normalized:
+            msg = (
+                f"A skill named '{normalized}' already exists in {existing.library}. "
+                "Pick another name or remove that one first."
+            )
+            raise SkillWriteError(msg)
 
 
 def remove_skill(folder: Path) -> None:
