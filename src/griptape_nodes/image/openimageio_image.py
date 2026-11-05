@@ -63,6 +63,9 @@ class OpenImageIOImage(GriptapeImage):
     ``optimize`` splices the new EXIF (and PNG text) into the source bytes, without re-encoding the
     unchanged pixels. The source's other metadata is kept, where a re-encode drops it: the ICC
     profile, and in a JPEG XMP, IPTC, and comments.
+
+    Previews of large JPEGs are slower than Pillow's. OpenImageIO 3.2 has no reduced-size JPEG
+    decode (no equivalent of Pillow's ``draft``), so a thumbnail decodes the full image first.
     """
 
     _ENCODE_EXTENSIONS: ClassVar[dict[ImageFormat, str]] = {
