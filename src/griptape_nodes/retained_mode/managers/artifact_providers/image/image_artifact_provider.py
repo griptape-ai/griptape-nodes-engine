@@ -71,10 +71,16 @@ class ImageArtifactProvider(BaseArtifactProvider):
         """Extract original image metadata: displayed dimensions, format, and color model."""
         try:
             path = Path(source_path)
-            with open_image(path) as source, source.exif_transposed() as img:
+            with open_image(path) as img:
+                # Report the dimensions the image displays at, without decoding and rotating it
+                width = img.width
+                height = img.height
+                exif = img.metadata.exif
+                if exif is not None and exif.swaps_dimensions:
+                    width, height = height, width
                 return ImageArtifactMetadata(
-                    width=img.width,
-                    height=img.height,
+                    width=width,
+                    height=height,
                     format=path.suffix.lstrip(".").upper(),
                     channels=img.channels,
                     color_space=img.color_space,
