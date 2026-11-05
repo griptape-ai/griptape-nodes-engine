@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from griptape_nodes.utils.git_utils import (
+    GitCloneError,
+    LibraryJsonCheckout,
     extract_repo_name_from_url,
     is_git_repository,
     is_git_url,
     normalize_github_url,
     parse_commit_datetime,
     parse_git_url_with_ref,
+    sparse_checkout_library_json,
 )
+
+GIT_UTILS_MODULE = "griptape_nodes.utils.git_utils"
+COMMIT_SHA = "a" * 40
 
 
 class TestParseGitUrlWithRef:
@@ -356,3 +366,68 @@ class TestParseCommitDatetime:
 
     def test_returns_none_for_unparsable_string(self) -> None:
         assert parse_commit_datetime("not-a-date") is None
+
+
+class FakeGit:
+    """Stand-in for _run_git that records each call and writes library JSON on checkout."""
+
+    def __init__(self, library_json: str | None) -> None:
+        self.library_json = library_json
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str], *, cwd: Path, **_kwargs: object) -> str:
+        self.calls.append(args)
+        if "checkout" in args and self.library_json is not None:
+            (cwd / "griptape_nodes_library.json").write_text(self.library_json, encoding="utf-8")
+        if "rev-parse" in args:
+            return COMMIT_SHA
+        return ""
+
+    def call_for(self, subcommand: str) -> list[str]:
+        return next(call for call in self.calls if subcommand in call)
+
+
+def _sparse_checkout(fake_git: FakeGit, ref: str = "HEAD") -> LibraryJsonCheckout:
+    with (
+        patch(f"{GIT_UTILS_MODULE}._run_git", side_effect=fake_git),
+        patch(f"{GIT_UTILS_MODULE}._try_git", return_value="2024-01-15T12:30:00+00:00"),
+    ):
+        return sparse_checkout_library_json("https://github.com/user/repo", ref=ref)
+
+
+class TestSparseCheckoutLibraryJson:
+    """Test sparse_checkout_library_json without running git."""
+
+    def test_fetches_without_file_contents(self) -> None:
+        fake_git = FakeGit(json.dumps({"metadata": {"library_version": "1.2.3"}}))
+
+        _sparse_checkout(fake_git, ref="stable")
+
+        fetch = fake_git.call_for("fetch")
+        assert fetch[fetch.index("fetch") :] == ["fetch", "--depth=1", "--filter=blob:none", "origin", "stable"]
+
+    def test_disables_housekeeping_for_every_git_call(self) -> None:
+        fake_git = FakeGit(json.dumps({"metadata": {"library_version": "1.2.3"}}))
+
+        _sparse_checkout(fake_git)
+
+        assert fake_git.calls
+        for call in fake_git.calls:
+            assert call[:4] == ["-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+
+    def test_returns_checked_out_library_metadata(self) -> None:
+        library_data = {"metadata": {"library_version": "1.2.3"}}
+        fake_git = FakeGit(json.dumps(library_data))
+
+        result = _sparse_checkout(fake_git)
+
+        assert result == (
+            "1.2.3",
+            COMMIT_SHA,
+            datetime(2024, 1, 15, 12, 30, 0, tzinfo=UTC),
+            library_data,
+        )
+
+    def test_raises_when_checkout_has_no_library_json(self) -> None:
+        with pytest.raises(GitCloneError, match="No library JSON file found"):
+            _sparse_checkout(FakeGit(None))
