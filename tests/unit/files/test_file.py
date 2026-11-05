@@ -1,12 +1,10 @@
 """Unit tests for File and FileDestination."""
 
 import base64
-from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from PIL import Image
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
@@ -31,6 +29,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     MacroPath,
     PathResolutionFailureReason,
 )
+from tests.unit.image.sample_images import encode, solid
 
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
@@ -1273,18 +1272,12 @@ class TestFileResolveUrls:
         assert Path(result) == tmp_path / "outputs" / "clip.mp4"
 
 
-def _pil_bytes(fmt: str, mode: str = "RGB") -> bytes:
-    buf = BytesIO()
-    Image.new(mode, (1, 1), color=0 if mode == "P" else "white").save(buf, format=fmt)
-    return buf.getvalue()
-
-
 def _png_bytes() -> bytes:
-    return _pil_bytes("PNG")
+    return encode(solid(1, 1), "png")
 
 
 def _jpeg_bytes() -> bytes:
-    return _pil_bytes("JPEG")
+    return encode(solid(1, 1), "jpg")
 
 
 @pytest.fixture

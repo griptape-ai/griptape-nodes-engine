@@ -49,7 +49,7 @@ class BaseArtifactProvider(EngineScoped, ABC):
     including supported formats and preview generation capabilities.
 
     Metadata is defined as class methods for zero-cost introspection without instantiation.
-    Instance attributes may hold heavyweight dependencies (e.g., PIL, ffmpeg) loaded lazily.
+    Instance attributes may hold heavyweight dependencies (e.g., OpenImageIO, ffmpeg) loaded lazily.
     """
 
     def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:

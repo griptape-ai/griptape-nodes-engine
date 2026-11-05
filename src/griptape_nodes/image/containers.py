@@ -1,27 +1,38 @@
-"""Read and replace the EXIF block of encoded JPEG, PNG, and WEBP bytes, without decoding pixels.
+"""Read and replace metadata in encoded JPEG, PNG, WEBP, and TIFF bytes, without decoding pixels.
 
-For backends whose libraries don't expose the raw EXIF block (OpenImageIO) or only expose it
-after a full decode (OpenCV).
+OpenImageIO exposes EXIF only as parsed attributes, and reading even those means opening the
+file, so the raw blocks are read from and spliced into the container directly.
 """
 
 import struct
+import zlib
 from typing import NamedTuple
 
+from griptape_nodes.image.exif import EXIF_HEADER, tiff_extra_metadata_kinds, tiff_metadata
 from griptape_nodes.image.formats import ImageFormat
 from griptape_nodes.image.png_text_chunks import PNG_SIGNATURE, png_chunk
-
-EXIF_HEADER = b"Exif\x00\x00"
 
 _JPEG_SOI = b"\xff\xd8"
 _JPEG_EOI = b"\xff\xd9"
 _JPEG_APP0 = 0xE0
 _JPEG_APP1 = 0xE1
+_JPEG_APP2 = 0xE2
+_JPEG_APP13 = 0xED
 _JPEG_SOS = 0xDA
 _JPEG_FILL = 0xFF
 _JPEG_STANDALONE_MARKERS = frozenset({0x01, *range(0xD0, 0xD8)})
 _JPEG_MAX_SEGMENT_BYTES = 0xFFFF
-# SOF0-SOF15, less DHT (C4), JPG (C8), and DAC (CC), which share the range
-_JPEG_START_OF_FRAME_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+
+_JPEG_ICC_HEADER = b"ICC_PROFILE\x00"
+# After the header, each ICC segment holds its sequence number and the segment count
+_JPEG_ICC_SEQUENCE_BYTES = 2
+_JPEG_XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+_JPEG_IPTC_HEADER = b"Photoshop 3.0\x00"
+# iCCP: profile name, NUL, compression method, then the zlib stream
+_PNG_ICC_MIN_BYTES = 3
+# Real profiles run to a few hundred kilobytes. A larger one is treated as absent, so a small chunk
+# can't expand to fill memory.
+MAX_ICC_PROFILE_BYTES = 16 * 1024 * 1024
 
 _WEBP_HEADER_BYTES = 12
 _WEBP_VP8X_EXIF_FLAG = 0x08
@@ -57,9 +68,40 @@ def read_exif(data: bytes, image_format: ImageFormat | None) -> bytes | None:
     return None
 
 
-class ImageSize(NamedTuple):
-    width: int
-    height: int
+def read_icc_profile(data: bytes, image_format: ImageFormat | None) -> bytes | None:
+    """Return the ICC profile from JPEG APP2 segments, a PNG iCCP chunk, a WEBP ICCP chunk, or a TIFF IFD0."""
+    if image_format in (ImageFormat.JPEG, ImageFormat.MPO):
+        return _jpeg_icc_profile(data)
+    if image_format == ImageFormat.PNG:
+        return _png_icc_profile(data)
+    if image_format == ImageFormat.WEBP:
+        for chunk in _webp_chunks(data):
+            if chunk.kind == b"ICCP":
+                return data[chunk.payload_start : chunk.payload_end] or None
+        return None
+    if image_format == ImageFormat.TIFF:
+        return tiff_metadata(data).icc_profile
+    return None
+
+
+def read_extra_metadata_kinds(data: bytes, image_format: ImageFormat | None) -> list[str]:
+    """Name the metadata a JPEG, WEBP, or TIFF holds besides EXIF and its color profile ("XMP", "IPTC", ...).
+
+    ``ImageMetadata`` doesn't carry these, so re-encoding the pixels loses them.
+    """
+    kinds = []
+    if image_format in (ImageFormat.JPEG, ImageFormat.MPO):
+        for segment in _jpeg_segments(data):
+            payload = data[segment.payload_start : segment.payload_end]
+            if segment.kind == _JPEG_APP1 and payload.startswith(_JPEG_XMP_HEADER) and "XMP" not in kinds:
+                kinds.append("XMP")
+            if segment.kind == _JPEG_APP13 and payload.startswith(_JPEG_IPTC_HEADER) and "IPTC" not in kinds:
+                kinds.append("IPTC")
+    elif image_format == ImageFormat.WEBP and any(chunk.kind == b"XMP " for chunk in _webp_chunks(data)):
+        kinds.append("XMP")
+    elif image_format == ImageFormat.TIFF:
+        kinds = tiff_extra_metadata_kinds(data)
+    return kinds
 
 
 def is_complete(data: bytes, image_format: ImageFormat) -> bool:
@@ -72,13 +114,9 @@ def is_complete(data: bytes, image_format: ImageFormat) -> bool:
     return False
 
 
-def jpeg_size(data: bytes) -> ImageSize | None:
-    """Return the dimensions a JPEG's start-of-frame header records, or None if there isn't one."""
-    for segment in _jpeg_segments(data):
-        if segment.kind in _JPEG_START_OF_FRAME_MARKERS and segment.payload_end - segment.payload_start >= 5:  # noqa: PLR2004
-            height, width = struct.unpack(">HH", data[segment.payload_start + 1 : segment.payload_start + 5])
-            return ImageSize(width, height)
-    return None
+def fits_jpeg_segment(exif: bytes) -> bool:
+    """Whether an EXIF block fits the one APP1 segment a JPEG holds it in."""
+    return len(EXIF_HEADER) + len(exif) + 2 <= _JPEG_MAX_SEGMENT_BYTES
 
 
 def replace_jpeg_exif(encoded: bytes, exif: bytes | None) -> bytes:
@@ -90,7 +128,7 @@ def replace_jpeg_exif(encoded: bytes, exif: bytes | None) -> bytes:
     segment_payload = b""
     if exif is not None:
         segment_payload = EXIF_HEADER + exif
-        if len(segment_payload) + 2 > _JPEG_MAX_SEGMENT_BYTES:
+        if not fits_jpeg_segment(exif):
             msg = "Attempted to write EXIF into a JPEG. Failed because the EXIF block is larger than a JPEG segment holds."
             raise ValueError(msg)
 
@@ -141,6 +179,48 @@ def add_webp_exif(encoded: bytes, exif: bytes, *, width: int, height: int, has_a
         chunks = b"VP8X" + struct.pack("<I", len(canvas)) + canvas + chunks
     chunks += b"EXIF" + struct.pack("<I", len(exif)) + exif + b"\x00" * (len(exif) & 1)
     return b"RIFF" + struct.pack("<I", len(chunks) + 4) + b"WEBP" + chunks
+
+
+def _jpeg_icc_profile(data: bytes) -> bytes | None:
+    """Join the profile a JPEG splits across APP2 segments, in their sequence order."""
+    parts: dict[int, bytes] = {}
+    for segment in _jpeg_segments(data):
+        payload = data[segment.payload_start : segment.payload_end]
+        if segment.kind != _JPEG_APP2 or not payload.startswith(_JPEG_ICC_HEADER):
+            continue
+        body = payload[len(_JPEG_ICC_HEADER) :]
+        if len(body) < _JPEG_ICC_SEQUENCE_BYTES:
+            continue
+        parts[body[0]] = body[_JPEG_ICC_SEQUENCE_BYTES:]
+    if not parts:
+        return None
+    return b"".join(parts[sequence] for sequence in sorted(parts))
+
+
+def _png_icc_profile(data: bytes) -> bytes | None:
+    for chunk in _png_chunks(data):
+        if chunk.kind == b"IDAT":
+            return None
+        if chunk.kind != b"iCCP":
+            continue
+        payload = data[chunk.payload_start : chunk.payload_end]
+        name_end = payload.find(b"\x00")
+        if name_end < 0 or len(payload) < name_end + _PNG_ICC_MIN_BYTES:
+            return None
+        return _decompressed_profile(payload[name_end + 2 :])
+    return None
+
+
+def _decompressed_profile(data: bytes) -> bytes | None:
+    """Decompress an iCCP profile, or return None if it's invalid or decompresses past ``MAX_ICC_PROFILE_BYTES``."""
+    decompressor = zlib.decompressobj()
+    try:
+        profile = decompressor.decompress(data, MAX_ICC_PROFILE_BYTES)
+    except zlib.error:
+        return None
+    if decompressor.unconsumed_tail or not profile:
+        return None
+    return profile
 
 
 def _jpeg_segments(data: bytes) -> list[_Segment]:

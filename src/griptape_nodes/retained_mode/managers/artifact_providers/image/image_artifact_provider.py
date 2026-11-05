@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.drivers.image_metadata.image_metadata_driver_registry import (
     ImageMetadataDriverRegistry,
 )
-from griptape_nodes.image import open_image
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.image.formats import sniff_image_extension
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import collect_workflow_metadata
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
@@ -41,7 +41,7 @@ class ImageArtifactMetadata(BaseArtifactMetadata):
 class ImageArtifactProvider(BaseArtifactProvider):
     """Provider for image artifacts.
 
-    Images are decoded through ``griptape_nodes.image``, whose backend ``GTN_IMAGE_BACKEND`` selects.
+    Images are decoded through ``griptape_nodes.image``.
     """
 
     def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
@@ -68,20 +68,23 @@ class ImageArtifactProvider(BaseArtifactProvider):
 
     @classmethod
     def get_artifact_metadata(cls, source_path: str) -> ImageArtifactMetadata | None:
-        """Extract original image metadata: displayed dimensions, format, and color model."""
+        """Extract original image metadata: displayed dimensions, format, and color model, from the header alone."""
         try:
             path = Path(source_path)
-            with open_image(path) as img:
-                # Report the dimensions the image displays at, without decoding and rotating it
+            with GriptapeImage.open(path) as img:
+                # Report the dimensions the image displays at, without decoding or rotating it
                 width = img.width
                 height = img.height
                 exif = img.metadata.exif
                 if exif is not None and exif.swaps_dimensions:
                     width, height = height, width
+                image_format = path.suffix.lstrip(".").upper()
+                if img.format is not None:
+                    image_format = str(img.format)
                 return ImageArtifactMetadata(
                     width=width,
                     height=height,
-                    format=path.suffix.lstrip(".").upper(),
+                    format=image_format,
                     channels=img.channels,
                     color_space=img.color_space,
                     file_size=path.stat().st_size,
@@ -144,7 +147,7 @@ class ImageArtifactProvider(BaseArtifactProvider):
             return data
 
         try:
-            image = open_image(data)
+            image = GriptapeImage.open(data)
         except Exception as e:
             logger.warning("Attempted to open image data for %s. Failed because: %s", file_name, e)
             return data
