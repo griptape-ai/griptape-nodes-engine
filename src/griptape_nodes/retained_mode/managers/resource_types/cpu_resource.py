@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from griptape_nodes.retained_mode.managers.resource_components.capability_field import (
@@ -7,6 +8,7 @@ from griptape_nodes.retained_mode.managers.resource_components.capability_field 
 )
 from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
+from griptape_nodes.retained_mode.managers.resource_types.os_resource import current_architecture
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import Requirements
@@ -106,3 +108,11 @@ class CPUResourceType(ResourceType):
 
         sorted_instances = sorted(compatible_instances, key=sort_key, reverse=True)
         return sorted_instances[0]
+
+
+def detect_cpu_capabilities() -> dict[str, Any]:
+    """Describe this machine's CPU."""
+    return {
+        "cores": os.cpu_count() or 1,
+        "architecture": current_architecture(),
+    }
