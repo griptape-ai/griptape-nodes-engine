@@ -1,4 +1,3 @@
-- `File`, `FileDestination`, `Directory`, `FileSequence` and their destinations now keep the workflow
-  they were built in, and take a `workflow` argument to name one. A file a node builds, including
-  with `ProjectFileParameter.build_file()` called from a `threading.Thread` or a thread pool, now
-  resolves `{outputs}` and the other project macros in the node's workflow.
+- `File`, `FileDestination`, `Directory` and `FileSequence` now keep the workflow they were built in,
+  or take one as `workflow`, so node code that writes from a `threading.Thread` or thread pool
+  resolves `{outputs}` in the node's workflow.
