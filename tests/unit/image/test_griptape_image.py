@@ -1131,3 +1131,17 @@ class TestTiffExif:
             GriptapeImagePipeline(image).exif_transpose().end() as upright,
         ):
             assert (upright.width, upright.height) == (4, 8)
+
+
+class TestLosslessWebp:
+    def test_lossless_webp_keeps_every_pixel(self) -> None:
+        pixels = noise(16, 16, 4)
+        with GriptapeImage.from_array(pixels) as image:
+            reread = decode(image.encode(ImageFormat.WEBP, lossless=True))
+        # libwebp, as with Pillow's default, clears the color of fully transparent pixels
+        visible = pixels[:, :, 3] > 0
+        assert np.array_equal(reread[visible], pixels[visible])
+
+    def test_lossless_jpeg_is_refused(self) -> None:
+        with GriptapeImage.from_array(noise(4, 4)) as image, pytest.raises(ValueError, match="always lossy"):
+            image.encode(ImageFormat.JPEG, lossless=True)

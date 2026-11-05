@@ -417,6 +417,7 @@ class GriptapeImage:
         *,
         quality: int | None = None,
         optimize: bool = False,
+        lossless: bool = False,
         metadata: ImageMetadata | None = None,
     ) -> bytes:
         """Encode the image.
@@ -437,6 +438,8 @@ class GriptapeImage:
             image_format: Target format
             quality: Lossy quality 1-100 for JPEG/WEBP; None uses the format's default
             optimize: Spend extra time for a smaller file where the format supports it
+            lossless: Store WEBP without loss, ignoring ``quality``. The other formats ``encode``
+                writes are lossless already, except JPEG, which can't be.
             metadata: Metadata to write. None writes the image's own; ``ImageMetadata()`` writes none.
                 PNG holds all of it; JPEG, WEBP, and TIFF hold EXIF and the color profile; BMP,
                 GIF, TGA, and EXR hold none.
@@ -451,6 +454,9 @@ class GriptapeImage:
         if extension is None:
             msg = f"Attempted to save an image as {image_format}. Failed because that format can't be written."
             raise ValueError(msg)
+        if lossless and image_format == ImageFormat.JPEG:
+            msg = "Attempted to save an image as lossless JPEG. Failed because JPEG is always lossy."
+            raise ValueError(msg)
 
         source = self._source
         own_metadata = metadata is None
@@ -464,13 +470,16 @@ class GriptapeImage:
         if (
             source is not None
             and writes_some
+            and not lossless
             and self._can_splice(source, image_format, quality, requested, optimize=optimize)
         ):
             encoded = source
             if not own_metadata:
                 encoded = _spliced(source, image_format, requested, dropped)
         else:
-            encoded = self._reencoded(image_format, extension, quality, requested, dropped, optimize=optimize)
+            encoded = self._reencoded(
+                image_format, extension, quality, requested, dropped, optimize=optimize, lossless=lossless
+            )
             if own_metadata or requested.exif or requested.text:
                 dropped.extend(self._extra_metadata_kinds())
         if dropped:
@@ -521,6 +530,7 @@ class GriptapeImage:
         dropped: list[str],
         *,
         optimize: bool,
+        lossless: bool = False,
     ) -> bytes:
         """Encode the pixels with ``requested``'s color profile, then write the rest of it into the container.
 
@@ -534,7 +544,7 @@ class GriptapeImage:
             buf = to_rgb(buf)
         if _is_float(buf) and image_format not in self._FLOAT_FORMATS and not self._holds_display_values():
             buf = _display_referred(buf)
-        spec = self._output_spec(buf, image_format, quality, optimize=optimize)
+        spec = self._output_spec(buf, image_format, quality, optimize=optimize, lossless=lossless)
         icc_profile = None
         if requested.icc_profile is not None and image_format in self._ICC_FORMATS:
             icc_profile = requested.icc_profile
@@ -594,7 +604,13 @@ class GriptapeImage:
         return with_exif
 
     def _output_spec(
-        self, buf: oiio.ImageBuf, image_format: ImageFormat, quality: int | None, *, optimize: bool
+        self,
+        buf: oiio.ImageBuf,
+        image_format: ImageFormat,
+        quality: int | None,
+        *,
+        optimize: bool,
+        lossless: bool = False,
     ) -> oiio.ImageSpec:
         """Return a spec for writing ``buf`` with no metadata, so only what ``encode`` is given gets written."""
         source_spec = buf.spec()
@@ -605,6 +621,8 @@ class GriptapeImage:
             quality = self._DEFAULT_QUALITY.get(image_format)
         if image_format == ImageFormat.JPEG and quality is not None:
             spec.attribute("compression", f"jpeg:{quality}")
+        elif image_format == ImageFormat.WEBP and lossless:
+            spec.attribute("compression", "lossless")
         elif image_format == ImageFormat.WEBP and quality is not None:
             spec.attribute("compression", f"webp:{quality}")
             # libwebp's fastest method. Higher ones search harder for a smaller file, and dominate
