@@ -266,11 +266,12 @@ class ProjectOutputParameter(abc.ABC):
     def _in_node_workflow(self) -> Iterator[None]:
         """Bind the node's workflow for the block, so a destination built in it keeps that workflow.
 
-        Only for upstream providers such as `FileOutputSettings`, which live in node libraries and
-        build their destination without naming a workflow. The builders here pass the node's
-        workflow explicitly. Without the binding, a provider called from a plain thread or a
-        thread pool would build a destination with no workflow. A node in no workflow builds as
-        the calling code is bound.
+        For upstream providers such as `FileOutputSettings`. Library code reaches the engine
+        through the facade, which acts as the caller is bound, so the engine binds the node's
+        workflow around library code it calls on the node's behalf. Without it, a provider called
+        from a plain thread or a thread pool would act on no workflow, or fail with several open.
+        The builders here pass the node's workflow explicitly instead. A node in no workflow
+        builds as the calling code is bound.
         """
         workflow = self._node.workflow
         if workflow is None:
