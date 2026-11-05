@@ -5,7 +5,7 @@ raised, and `check_for_existing_running_flow` reads that state. So anything that
 the cleanup: if it does not reset the machine on the way out, the engine reports a run in progress
 forever, the Run button never clears, and every later start is refused.
 
-The graceful path is `cancel_flow_run`, but it awaits every node's cancellation and can fail in its
+The graceful path is `_cancel_run`, but it awaits every node's cancellation and can fail in its
 own right. When it does, the reset still has to happen -- a failure to cancel politely must not be
 the reason the engine wedges permanently -- and it must not replace the error that actually ended
 the run, which is the one worth reporting.

@@ -82,7 +82,7 @@ class TestRunSeconds:
         flow_manager._global_control_flow_machine = machine
         flow_manager.check_for_existing_running_flow = MagicMock(return_value=True)
 
-        await flow_manager.cancel_flow_run()
+        await flow_manager._cancel_run(flow_manager._current_flows())
 
         payloads = [call.args[0].wrapped_event.payload for call in engine.event_manager.put_event.call_args_list]
         cancelled = [p for p in payloads if isinstance(p, ControlFlowCancelledEvent)]

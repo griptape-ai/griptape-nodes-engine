@@ -119,7 +119,7 @@ class TestEngineIndependence:
         second = Engine()
 
         first.open_workflows.open("first")
-        first.object_manager.add_object_by_name("shared_name", object())
+        first.object_manager.add_object_by_name_in(first.current_workflow(), "shared_name", object())
 
         assert first.object_manager.has_object_with_name("shared_name")
         assert not second.object_manager.has_object_with_name("shared_name")

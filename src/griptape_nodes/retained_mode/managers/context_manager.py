@@ -626,58 +626,6 @@ class ContextManager(EngineScoped):
         """
         return self.get_current_workflow().name
 
-    def get_current_workflow_file_path(self) -> str | None:
-        """Get the absolute path of the current Workflow's file, if it has one.
-
-        Read from the workflow's registry entry, which saves, renames and moves keep current.
-
-        Returns:
-            The absolute file path, or None for an unsaved workflow.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        absolute_path = self.get_current_workflow().absolute_path
-        if absolute_path is None:
-            return None
-        return str(absolute_path)
-
-    def get_current_workflow_working_directory(self) -> str | None:
-        """Get the folder the current Workflow belongs to, if one was supplied.
-
-        This is the folder a workflow was created in before it had a file of its own -- the
-        folder the caller was browsing at the time. It is a DIRECTORY, whereas
-        `get_current_workflow_file_path` returns a FILE whose parent is the directory.
-
-        Only meaningful while the workflow is unsaved: `workflow_dir` prefers the file path
-        whenever there is one, so this stops mattering the moment the workflow is saved. It is
-        deliberately not cleared on save -- the file path simply wins.
-
-        Returns:
-            The absolute directory path, or None when no folder was supplied.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        return self.get_current_workflow().working_directory
-
-    def move_current_workflow_onto(self, workflow_id: str) -> None:
-        """Make the registry entry `workflow_id` the current Workflow, keeping the open flows.
-
-        For the one case where an open workflow becomes a different registry entry: saving an
-        open library workflow writes a copy, and the editor keeps working in the copy.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        current = self._current_or_none()
-        if current is None:
-            msg = "No active Workflow context"
-            raise self.NoActiveWorkflowError(msg)
-
-        # The open workflow's runtime follows it, so a request naming the copy's id reaches it.
-        self.engine.open_workflows.move(current, workflow_id)
-
     def get_current_flow(self) -> ControlFlow:
         """Get the current Flow object.
 
