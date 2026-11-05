@@ -266,6 +266,23 @@ class TestUserComment:
         assert EXIF_USER_COMMENT_TAG not in reread._ifd0
         assert reread[EXIF_USER_COMMENT_TAG] == "hello"
 
+    def test_primary_comment_lands_in_ifd0_beside_the_exif_ifd_one(self) -> None:
+        exif = Exif()
+        exif[EXIF_USER_COMMENT_TAG] = "camera"
+        exif.set_primary(EXIF_USER_COMMENT_TAG, "workflow")
+
+        reread = Exif.from_bytes(exif.to_bytes())
+
+        # A plain string, as Pillow-based readers expect, not the spec's character-coded form
+        assert reread._ifd0[EXIF_USER_COMMENT_TAG].raw == b"workflow\x00"
+        assert EXIF_USER_COMMENT_TAG in reread._exif_ifd
+        assert reread[EXIF_USER_COMMENT_TAG] == "workflow"
+        assert dict(reread.items())[EXIF_USER_COMMENT_TAG] == "workflow"
+
+    def test_set_primary_refuses_a_sub_ifd_pointer(self) -> None:
+        with pytest.raises(ValueError, match="locates other tags"):
+            Exif().set_primary(EXIF_GPSINFO_TAG, 0)
+
 
 class TestEditing:
     def test_new_exif_is_empty(self) -> None:

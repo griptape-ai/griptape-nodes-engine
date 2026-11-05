@@ -272,6 +272,8 @@ class TestReading:
             (encode(solid(6, 4, (128, 255)), "png"), (6, 4, 2, PixelType.UINT8)),
             (encode(np.zeros((4, 6, 3), dtype=np.float16), "exr"), (6, 4, 3, PixelType.HALF)),
         ],
+        # EXR bytes carry a timestamp, so ids from them differ between xdist workers
+        ids=["jpeg", "png16", "palette", "gray_alpha", "exr"],
     )
     def test_reads_the_header_without_decoding(self, source: bytes, expected: tuple) -> None:
         with GriptapeImage.open(source) as image:
@@ -655,6 +657,25 @@ class TestMetadata:
         assert metadata["Make"] == "Camera Maker"
         assert EXIF_USERCOMMENT_TAG in Exif.from_bytes(block)
         assert read_spec(injected).getattribute("Make") == "Camera Maker"
+
+    def test_exif_driver_writes_user_comment_where_earlier_releases_read_it(self) -> None:
+        camera = _camera_exif()
+        camera[EXIF_USERCOMMENT_TAG] = "a camera comment"
+        source = _with_exif(encode(solid(8, 8), "jpg"), camera)
+
+        with GriptapeImage.open(source) as image:
+            injected = ExifMetadataDriver().inject_metadata(image, {"gtn_key": "value"})
+
+        block = read_exif(injected, ImageFormat.JPEG)
+        assert block is not None
+        exif = Exif.from_bytes(block)
+        # IFD0 holds the workflow, as Pillow's getexif() reads it; the sub-IFD keeps the camera's comment
+        assert EXIF_USERCOMMENT_TAG in exif._ifd0
+        assert exif.get(EXIF_USERCOMMENT_TAG) == '{"gtn_key":"value"}'
+        with GriptapeImage.open(injected) as image:
+            assert ExifMetadataDriver().extract_metadata(image)["gtn_key"] == "value"
+        exif._ifd0.pop(EXIF_USERCOMMENT_TAG)
+        assert exif.get(EXIF_USERCOMMENT_TAG) == "a camera comment"
 
     @pytest.mark.parametrize("color", [RED, (*RED, 128)])
     def test_exif_round_trips_through_webp(self, color: tuple[int, ...]) -> None:
