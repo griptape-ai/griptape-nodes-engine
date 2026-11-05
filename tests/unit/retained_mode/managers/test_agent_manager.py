@@ -312,6 +312,20 @@ class TestAgentSkills:
         assert config.values["agent.disabled_skills"] == []
 
     @pytest.mark.asyncio
+    async def test_deleting_your_copy_keeps_a_shared_copy_off(
+        self, manager: AgentManager, config: _FakeConfig, tmp_path: Path
+    ) -> None:
+        _write_skill(tmp_path / "ws" / ".agents/skills", "house-style")
+        _write_skill(tmp_path / "shared", "house-style")
+        config.values["agent.disabled_skills"] = ["house-style"]
+
+        result = await manager.on_handle_delete_agent_skill_request(DeleteAgentSkillRequest(name="house-style"))
+
+        assert isinstance(result, DeleteAgentSkillResultSuccess)
+        assert config.values["agent.disabled_skills"] == ["house-style"]
+        assert await manager._offered_skill_folders() == []
+
+    @pytest.mark.asyncio
     async def test_delete_leaves_shared_skills_alone(self, manager: AgentManager, tmp_path: Path) -> None:
         folder = _write_skill(tmp_path / "shared", "house-style")
 

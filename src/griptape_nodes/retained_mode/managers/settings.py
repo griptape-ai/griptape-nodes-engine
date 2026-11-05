@@ -25,6 +25,7 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 AGENT_SKILLS_DIRECTORIES_KEY = "agent.skills_directories"
+AGENT_DISABLED_SKILLS_KEY = "agent.disabled_skills"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
 DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
 DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
@@ -524,7 +525,11 @@ class AgentSettings(BaseModel):
     )
     disabled_skills: list[str] = Field(
         default_factory=list,
-        description="Names of skills the agent does not use, even though they are in a skills folder.",
+        json_schema_extra={"env_var_format": "json_list"},
+        description=(
+            "Names of skills the agent does not use, even though they are in a skills folder. "
+            "The environment variable takes a JSON list, e.g. GTN_CONFIG_AGENT__DISABLED_SKILLS='[\"old-style\"]'."
+        ),
     )
 
     @field_validator("skills_directories", mode="before")
@@ -532,6 +537,12 @@ class AgentSettings(BaseModel):
     def validate_skills_directories(cls, v: Any, info: ValidationInfo) -> Any:
         """Parse the JSON list a GTN_CONFIG_AGENT__SKILLS_DIRECTORIES variable carries."""
         return _json_list_from_env(AGENT_SKILLS_DIRECTORIES_KEY, v, info)
+
+    @field_validator("disabled_skills", mode="before")
+    @classmethod
+    def validate_disabled_skills(cls, v: Any, info: ValidationInfo) -> Any:
+        """Parse the JSON list a GTN_CONFIG_AGENT__DISABLED_SKILLS variable carries."""
+        return _json_list_from_env(AGENT_DISABLED_SKILLS_KEY, v, info)
 
 
 class LibraryDependencyInstallBehavior(StrEnum):

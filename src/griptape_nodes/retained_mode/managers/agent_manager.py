@@ -1662,7 +1662,8 @@ class AgentManager(EngineScoped):
         except SkillWriteError as e:
             return DeleteAgentSkillResultFailure(result_details=f"Attempted to delete skill '{name}'. {e}")
         disabled = self._disabled_skills()
-        if name in disabled:
+        # A copy in another folder takes over the name, and stays off if the user turned the name off.
+        if name in disabled and len(matches) == 1:
             self.engine.config_manager.set_config_value(
                 "agent.disabled_skills", [entry for entry in disabled if entry != name]
             )
