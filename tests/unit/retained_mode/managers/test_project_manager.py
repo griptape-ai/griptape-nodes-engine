@@ -62,7 +62,7 @@ _OTHER_PEER_WORKFLOW_ID = "1f2e3d4c5b6a79808f9e8d7c6b5a4f3e"
 
 
 _HANDED_WORKFLOW_ID = "0000000000000000000000000000a001"
-_HANDED_WORKFLOW = WorkflowRuntime(_HANDED_WORKFLOW_ID, dispatcher=MagicMock())
+_HANDED_WORKFLOW = WorkflowRuntime(_HANDED_WORKFLOW_ID, engine=MagicMock())
 
 
 def _engine_with_nothing_open(project_manager: ProjectManager) -> MagicMock:
@@ -92,7 +92,7 @@ def _hand_workflow(
     entry.name = name
     engine = _engine_with_nothing_open(project_manager)
     engine.workflow_registry.get.side_effect = {_HANDED_WORKFLOW_ID: entry}.__getitem__
-    return WorkflowRuntime(_HANDED_WORKFLOW_ID, dispatcher=MagicMock())
+    return WorkflowRuntime(_HANDED_WORKFLOW_ID, engine=MagicMock())
 
 
 def _stub_config_for_listing(mock_config: Mock, *, global_workspace: str = "/global/ws") -> None:
@@ -13648,7 +13648,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         cast("MagicMock", pm._engine).workflow_registry.get.return_value = registered_unsaved
         with patch.object(ProjectManager, "_get_builtin_variable_value", counting_get_builtin):
             project_info = pm._successfully_loaded_project_templates[cast("str", pm._current_project_id)]
-            return pm._resolve_workflow_dir(project_info, WorkflowRuntime("unsaved-workflow", dispatcher=MagicMock()))
+            return pm._resolve_workflow_dir(project_info, WorkflowRuntime("unsaved-workflow", engine=MagicMock()))
 
     def test_default_macro_answers_the_workspace_root(self) -> None:
         """The shipped `{workspace_dir}/{sub_dirs?:/}...` macro puts a workflow at the root."""

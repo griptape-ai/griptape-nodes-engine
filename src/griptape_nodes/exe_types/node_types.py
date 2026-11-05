@@ -62,6 +62,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.variable_types import VariableScope  # noqa: TC001 - read at runtime by the converter
 from griptape_nodes.traits.options import Options
@@ -472,11 +473,15 @@ class BaseNode(ABC):
         the surface for separately-versioned library code and saved workflow files.
 
         For a node built without an explicit engine -- which is every node the engine itself
-        creates -- this resolves the ambient one, so the lookup is the same process-wide
-        resolution the facade would have done. What the migration buys is not per-node isolation
+        creates -- this is the engine holding the workflow the node joined, so its managers and its
+        workflow always belong to one engine. Before the node joins one, such as during its
+        ``__init__``, it resolves the ambient engine, the same process-wide resolution the facade
+        would have done. What the migration buys is not per-node isolation
         but the classification it forced: questions about workflow state now travel as requests,
         which is what makes them answerable from inside a worker.
         """
+        if self._engine is None and self._workflow is not None:
+            return self._workflow.engine
         if self._engine is None:
             # Deferred import: griptape_nodes.retained_mode.engine pulls in the manager graph,
             # which pulls in the event payloads, which import this module for
@@ -587,15 +592,23 @@ class BaseNode(ABC):
         self._workflow = workflow
 
     def _handle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
-        """Send `request` through the workflow this node joined, or through its engine while it has joined none."""
+        """Send `request` through the workflow this node joined.
+
+        A node that never joined one, such as during its ``__init__`` or a helper a library builds
+        without adding it, sends through its engine bound to no workflow. Requests about the engine
+        still answer, and a request that acts on a workflow fails rather than act on whichever
+        workflow the caller happens to be in.
+        """
         if self._workflow is None:
-            return self.engine.handle_request(request)
+            with self.engine.bind_workflow(NO_WORKFLOW):
+                return self.engine.handle_request(request)
         return self._workflow.handle_request(request)
 
     async def _ahandle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
         """Like `_handle_request_in_workflow`, awaiting the request."""
         if self._workflow is None:
-            return await self.engine.ahandle_request(request)
+            with self.engine.bind_workflow(NO_WORKFLOW):
+                return await self.engine.ahandle_request(request)
         return await self._workflow.ahandle_request(request)
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
