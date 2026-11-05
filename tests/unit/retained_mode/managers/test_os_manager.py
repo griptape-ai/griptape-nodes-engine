@@ -65,6 +65,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Platform
+from tests.unit.image.sample_images import RED, encode, solid
 from tests.workflow_context import unsaved_workflow_open
 
 # Windows MAX_PATH constant for tests
@@ -287,12 +288,12 @@ class TestReadFileRequest:
 
 
 class TestReadFileRequestImagePreview:
-    """Test ReadFileRequest's image thumbnail generation: Pillow always runs first.
+    """Test ReadFileRequest's image thumbnail generation.
 
-    Size only matters once Pillow has already failed to decode the file -- base64-encoding a
-    multi-hundred-MB file whole is what hung the engine on large/multi-part images it can't open
-    (EXR sequences, for one). A large file Pillow *can* decode must still get a thumbnail. See
-    os_manager.py's _generate_thumbnail_from_image_content.
+    Over the size cap, only formats cheap to decode are decoded: a big JPEG still gets a
+    thumbnail, while a big EXR, slow to decode, and anything that fails to decode get the
+    no-preview sentinel rather than being base64-encoded whole, which hung the engine on EXR
+    sequences. See os_manager.py's _generate_thumbnail_from_image_content.
     """
 
     # Minimal valid 1x1 red PNG, built by hand so the test has no binary fixture dependency.
@@ -311,8 +312,8 @@ class TestReadFileRequestImagePreview:
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_large_pillow_decodable_file_is_still_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
-        """A file over the size cap that Pillow can decode (e.g. a big JPEG) still gets a thumbnail."""
+    def test_large_decodable_file_is_still_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
+        """A file over the size cap that decodes (e.g. a big JPEG) still gets a thumbnail."""
         file_path = tmp_path / "huge.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
@@ -324,10 +325,29 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result.content, str)
         assert result.content.startswith("data:image/webp;base64,")
 
-    def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, tmp_path: Path) -> None:
-        """A file over the size cap that Pillow can't decode must never be base64-encoded whole."""
+    def test_oversized_file_of_a_slow_format_is_not_decoded(self, engine: Engine, tmp_path: Path) -> None:
+        """A file over the size cap in a format slow to decode (EXR) gets no preview, without decoding."""
         file_path = tmp_path / "huge.exr"
-        content = b"not a real exr, just needs to fail a Pillow decode"
+        content = encode(solid(4, 4, RED), "exr")
+        file_path.write_bytes(content)
+
+        with (
+            patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(content) - 1),
+            patch(
+                "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes",
+            ) as mock_create_preview,
+        ):
+            request = ReadFileRequest(file_path=str(file_path))
+            result = engine.handle_request(request)
+
+        mock_create_preview.assert_not_called()
+        assert isinstance(result, ReadFileResultSuccess)
+        assert result.content == OSManager._NO_PREVIEW_DATA_URL
+
+    def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, tmp_path: Path) -> None:
+        """A file over the size cap that can't be decoded must never be base64-encoded whole."""
+        file_path = tmp_path / "huge.png"
+        content = b"\x89PNG\r\n\x1a\n" + b"not a real png, just needs to fail to decode"
         file_path.write_bytes(content)
 
         with (
@@ -345,8 +365,8 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == OSManager._NO_PREVIEW_DATA_URL
 
-    def test_pillow_decodable_format_is_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
-        """A format Pillow can decode (PNG) gets its 200px WEBP thumbnail."""
+    def test_decodable_format_is_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
+        """A format that decodes (PNG) gets its 200px WEBP thumbnail."""
         file_path = tmp_path / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
@@ -358,7 +378,7 @@ class TestReadFileRequestImagePreview:
         assert result.content.startswith("data:image/webp;base64,")
 
     def test_undecodable_file_under_cap_returns_original_bytes(self, engine: Engine, tmp_path: Path) -> None:
-        """A format Pillow can't open, under the size cap, returns the raw bytes, never a hang."""
+        """A file that can't be decoded, under the size cap, returns the raw bytes, never a hang."""
         file_path = tmp_path / "test.exr"
         content = b"not a real exr, just needs to never be decoded"
         file_path.write_bytes(content)
@@ -375,7 +395,7 @@ class TestReadFileRequestImagePreview:
     def test_should_transform_image_content_to_thumbnail_false_skips_decoding(
         self, engine: Engine, tmp_path: Path
     ) -> None:
-        """Opting out of thumbnailing returns the raw bytes without ever calling Pillow."""
+        """Opting out of thumbnailing returns the raw bytes without ever decoding them."""
         file_path = tmp_path / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 

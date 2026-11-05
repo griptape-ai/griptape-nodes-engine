@@ -12,15 +12,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from asyncio_thread_runner import ThreadRunner
-from PIL import Image, ImageFile
-from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
-from griptape_nodes.image import IMAGE_BACKEND_ENV_VAR, PILLOW_BACKEND
+from griptape_nodes.image import GriptapeImage
+from griptape_nodes.image.png_text_chunks import insert_text_chunks
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -70,6 +69,7 @@ from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.commands import encode_commands
+from tests.unit.image.sample_images import BLUE, GREEN, RED, encode, solid
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -124,7 +124,7 @@ class _ClassifyControlNode(ControlNode):
 def image_without_metadata() -> Generator[str, None, None]:
     """A plain PNG with no embedded text chunks."""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        Image.new("RGB", (4, 4), color="red").save(f, format="PNG")
+        f.write(encode(solid(4, 4, RED), "png"))
         path = f.name
     try:
         yield path
@@ -136,9 +136,7 @@ def image_without_metadata() -> Generator[str, None, None]:
 def image_with_unrelated_metadata() -> Generator[str, None, None]:
     """A PNG that has metadata but no gtn flow commands key."""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        info = PngInfo()
-        info.add_text("Description", "not a workflow")
-        Image.new("RGB", (4, 4), color="green").save(f, format="PNG", pnginfo=info)
+        f.write(insert_text_chunks(encode(solid(4, 4, GREEN), "png"), {"Description": "not a workflow"}))
         path = f.name
     try:
         yield path
@@ -148,9 +146,7 @@ def image_with_unrelated_metadata() -> Generator[str, None, None]:
 
 def _image_with_flow_commands_text(text: str) -> str:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        info = PngInfo()
-        info.add_text(FLOW_COMMANDS_KEY, text)
-        Image.new("RGB", (4, 4), color="blue").save(f, format="PNG", pnginfo=info)
+        f.write(insert_text_chunks(encode(solid(4, 4, BLUE), "png"), {FLOW_COMMANDS_KEY: text}))
         return f.name
 
 
@@ -266,24 +262,20 @@ class TestExtractFlowCommandsFromImageMetadata:
     def test_closes_the_image_when_flow_commands_are_damaged(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Watches Pillow's file handle, so pin the Pillow backend
-        monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, PILLOW_BACKEND)
         path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}))
-        opened: list[ImageFile.ImageFile] = []
-        real_open = Image.open
+        closed: list[GriptapeImage] = []
+        real_close = GriptapeImage.close
 
-        def _open(*args: Any, **kwargs: Any) -> ImageFile.ImageFile:
-            image = real_open(*args, **kwargs)
-            opened.append(image)
-            return image
+        def _close(image: GriptapeImage) -> None:
+            closed.append(image)
+            real_close(image)
 
-        with patch.object(Image, "open", _open):
-            engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
-                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
-            )
+        monkeypatch.setattr(GriptapeImage, "close", _close)
+        engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
+            ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
+        )
 
-        (image,) = opened
-        assert image.fp is None
+        assert len(closed) == 1
         Path(path).unlink()
 
 

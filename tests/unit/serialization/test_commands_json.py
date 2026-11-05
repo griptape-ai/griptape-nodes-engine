@@ -20,9 +20,8 @@ import pytest
 from griptape.artifacts import ImageUrlArtifact
 from griptape.mixins.serializable_mixin import SerializableMixin
 from griptape.rules import Rule, Ruleset
-from PIL import Image
-from PIL.PngImagePlugin import PngInfo
 
+from griptape_nodes.image.png_text_chunks import insert_text_chunks
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
@@ -32,6 +31,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeserializeFlowFromCommandsRequest,
     DeserializeFlowFromCommandsResultSuccess,
     ExtractFlowCommandsFromImageMetadataRequest,
+    ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
@@ -57,6 +57,7 @@ from griptape_nodes.retained_mode.events.parameter_events import AddParameterToN
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, _serialize_flow
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
 from griptape_nodes.serialization.values import TYPE_KEY, ValueEncodeError, dump_json, is_plain_data
+from tests.unit.image.sample_images import encode, solid
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -453,16 +454,26 @@ class TestCopyPaste:
 
 
 class TestImageMetadata:
+    def test_unreadable_image_is_a_failure(self, engine: Engine, tmp_path: Path) -> None:
+        # Starts like a BMP, so it opens, but its header can't be read
+        image_path = tmp_path / "corrupt.bmp"
+        image_path.write_bytes(b"BM" + bytes(64))
+
+        result = engine.handle_request(ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path)))
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert "Failed to read the image's metadata" in str(result.result_details)
+
     def test_image_restores_values_with_their_types(
         self, engine: Engine, library_name: str, flow_name: str, tmp_path: Path
     ) -> None:
         _create_node(engine, library_name, flow_name, "A")
         flow_commands_text = _serialize_flow(engine.current_workflow(), flow_name)
         assert flow_commands_text is not None
-        info = PngInfo()
-        info.add_text(FLOW_COMMANDS_KEY, flow_commands_text)
         image_path = tmp_path / "workflow.png"
-        Image.new("RGB", (4, 4)).save(image_path, format="PNG", pnginfo=info)
+        image_path.write_bytes(
+            insert_text_chunks(encode(solid(4, 4, (0, 0, 0)), "png"), {FLOW_COMMANDS_KEY: flow_commands_text})
+        )
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         engine.context_manager.push_workflow(workflow_name="restored")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
