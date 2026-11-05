@@ -15,11 +15,11 @@ import errno
 import logging
 import os
 import posixpath
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Never
 
-from pydantic_ai.capabilities import AbstractCapability, Capability
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.workspaces import FileEntry, ReadOnlyWorkspace, Workspace, WorkspaceReadOnlyError
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.skills import Skills
@@ -64,19 +64,6 @@ class SkillLibrary:
 
     skills: list[LoadedSkill] = field(default_factory=list)
     skipped: list[SkippedSkill] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class WorkspaceSkills:
-    """The skills one run offers the model.
-
-    Attributes:
-        names: The skills in the catalog, sorted.
-        capabilities: One deferred capability per skill, plus the read-only file tools over their folders.
-    """
-
-    names: list[str] = field(default_factory=list)
-    capabilities: list[AbstractCapability[Any]] = field(default_factory=list)
 
 
 class ReadOnlySkillsBackend:
@@ -221,23 +208,16 @@ async def read_skill_library(library: Path) -> SkillLibrary:
     return SkillLibrary(skills=skills, skipped=list(catalog.skipped))
 
 
-def offer_skills(skills: Sequence[LoadedSkill]) -> WorkspaceSkills:
-    """Build what a run offers the model from skills already read and chosen.
+def offer_skills(folders: Sequence[Path]) -> list[AbstractCapability[Any]]:
+    """The capabilities that offer the model the skills in `folders`, already read and chosen.
 
-    The run's file tools reach only these skills' folders, each at the path its
-    instructions name.
+    Each folder appears at `/<folder name>` in the run's read-only workspace, where harness
+    `Skills` reads it and the `FileSystem` tools reach its bundled files.
     """
-    offered = sorted(skills, key=lambda skill: skill.definition.name)
-    if not offered:
-        return WorkspaceSkills()
-
-    # Keyed by folder name, which is what the skill's instructions name. It can differ in Unicode form from the skill's.
-    backend = ReadOnlySkillsBackend(
-        {posixpath.basename(skill.definition.directory): skill.directory for skill in offered}
-    )
-    capabilities: list[AbstractCapability[Any]] = [SkillsWorkspace(backend), FileSystem()]
-    capabilities.extend(_skill_capability(skill.definition) for skill in offered)
-    return WorkspaceSkills(names=[skill.definition.name for skill in offered], capabilities=capabilities)
+    if not folders:
+        return []
+    backend = ReadOnlySkillsBackend({folder.name: folder for folder in folders})
+    return [SkillsWorkspace(backend), FileSystem(), Skills("/")]
 
 
 def _warn_about_spec_gaps(skill: SkillDefinition, library: Path) -> None:
@@ -258,17 +238,6 @@ def _warn_about_spec_gaps(skill: SkillDefinition, library: Path) -> None:
             library,
             ", ".join(skill.ignored_behavioral_fields),
         )
-
-
-def _skill_capability(skill: SkillDefinition) -> Capability[Any]:
-    """The deferred capability the model loads to get `skill`'s instructions."""
-    # Read through `workspace=`, harness leaves the skill's directory out of its instructions.
-    # `offer_skills` puts the folder at that same path in the run's workspace, so the directory applies.
-    instructions = replace(skill, in_run_workspace=True).render()
-    # The catalog lists each skill as a `- name: description` line. Indenting continuation lines,
-    # as harness does, keeps a multiline description from starting a line that reads as another entry.
-    description = skill.description.replace("\n", "\n  ")
-    return Capability(id=skill.name, description=description, instructions=[instructions], defer_loading=True)
 
 
 def _parts(path: str) -> list[str]:

@@ -96,14 +96,14 @@ async def _drive(
             return
         yield "done"
 
-    selection = None
+    skill_folders: list[Path] = []
     if offer_skills:
         if libraries is None:
             libraries = [runner.workspace_root / ".agents/skills"]
-        selection = select_skills(await discover_skills(libraries), disabled=set())
+        skill_folders = [skill.folder for skill in select_skills(await discover_skills(libraries), disabled=set())]
 
     runner._agent = Agent(FunctionModel(stream_function=stream))
-    result = await runner.run("Go.", skills=selection)
+    result = await runner.run("Go.", skill_folders=skill_folders)
 
     for message in runner.storage.load_history(result.thread_id):
         if not isinstance(message, ModelRequest):

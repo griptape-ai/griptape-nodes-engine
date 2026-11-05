@@ -33,7 +33,6 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ToolCall,
     ToolResult,
 )
-from griptape_nodes.agents.skills import SkillSelection
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -141,9 +140,9 @@ from tests.unit.utils.test_budget_refusal import a_refusal_body
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
 
-async def _no_skills() -> SkillSelection:
+async def _no_skills() -> list[Path]:
     """Offer a run no skills."""
-    return SkillSelection(skills=[])
+    return []
 
 
 @pytest.fixture
@@ -245,14 +244,14 @@ class TestAgentSkills:
         )
         assert isinstance(off, SetAgentSkillEnabledResultSuccess)
         assert config.values["agent.disabled_skills"] == ["house-style"]
-        assert (await manager._skill_selection()).names == []
+        assert await manager._offered_skill_folders() == []
 
         on = await manager.on_handle_set_agent_skill_enabled_request(
             SetAgentSkillEnabledRequest(name="house-style", enabled=True)
         )
         assert isinstance(on, SetAgentSkillEnabledResultSuccess)
         assert config.values["agent.disabled_skills"] == []
-        assert (await manager._skill_selection()).names == ["house-style"]
+        assert [folder.name for folder in await manager._offered_skill_folders()] == ["house-style"]
 
     @pytest.mark.asyncio
     async def test_turning_off_an_unknown_skill_fails(self, manager: AgentManager) -> None:
@@ -272,7 +271,7 @@ class TestAgentSkills:
         assert isinstance(result, CreateAgentSkillResultSuccess)
         assert result.skill is not None
         assert result.skill.path == str(tmp_path / "ws" / ".agents/skills" / "house-style")
-        assert (await manager._skill_selection()).names == ["house-style"]
+        assert [folder.name for folder in await manager._offered_skill_folders()] == ["house-style"]
 
     @pytest.mark.asyncio
     async def test_create_reports_an_invalid_skill(self, manager: AgentManager) -> None:
@@ -1731,7 +1730,7 @@ class TestRunAgentResultPayloadContract:
             only_open_workflow_or_none=lambda: None,
         )
         # These tests are about the result payload, so offer no skills.
-        monkeypatch.setattr(manager, "_skill_selection", _no_skills)
+        monkeypatch.setattr(manager, "_offered_skill_folders", _no_skills)
         return manager
 
     @pytest.mark.asyncio

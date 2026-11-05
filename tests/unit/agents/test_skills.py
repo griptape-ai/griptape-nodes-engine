@@ -90,7 +90,6 @@ class TestDiscoverSkills:
 
         assert (winner.library, winner.description, winner.problem) == (own, "Ours.", None)
         assert loser.library == shared
-        assert loser.loaded is None
         assert str(own) in (loser.problem or "")
 
     async def test_a_broken_skill_does_not_hide_a_later_one_with_its_name(self, tmp_path: Path) -> None:
@@ -188,8 +187,7 @@ class TestSelectSkills:
 
         selection = select_skills(await discover_skills([tmp_path]), {"turned-off"})
 
-        assert selection.names == ["kept"]
-        assert selection.skills[0].directory == tmp_path / "kept"
+        assert [skill.folder for skill in selection] == [tmp_path / "kept"]
 
 
 @pytest.mark.asyncio

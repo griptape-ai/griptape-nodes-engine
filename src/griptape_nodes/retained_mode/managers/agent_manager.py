@@ -65,7 +65,6 @@ from griptape_nodes.agents.pydantic_ai.tool_approval import (
 from griptape_nodes.agents.skills import (
     DEFAULT_SKILLS_DIRECTORY,
     DiscoveredSkill,
-    SkillSelection,
     SkillWriteError,
     add_skill,
     compose_skill_file,
@@ -960,7 +959,7 @@ class AgentManager(EngineScoped):
         )
         attribution_headers = await self._attribution_headers(provider_name)
         workflow_context = await self._workflow_context(workflow)
-        skills = await self._skill_selection()
+        skill_folders = await self._offered_skill_folders()
 
         event_manager = self.engine.event_manager
 
@@ -991,7 +990,7 @@ class AgentManager(EngineScoped):
                 extra_headers=attribution_headers,
                 approval=approval,
                 deferred_tool_results=deferred_tool_results,
-                skills=skills,
+                skill_folders=skill_folders,
             )
 
     async def _workflow_context(self, workflow: WorkflowRuntime | None) -> _WorkflowContext:
@@ -1584,10 +1583,10 @@ class AgentManager(EngineScoped):
             return []
         return [str(name) for name in configured]
 
-    async def _skill_selection(self) -> SkillSelection:
-        """The skills this run offers the model, read fresh so edits land on the next message."""
+    async def _offered_skill_folders(self) -> list[Path]:
+        """The folders of the skills this run offers the model, read fresh so edits land on the next message."""
         skills = await discover_skills(self._skills_directories())
-        return select_skills(skills, set(self._disabled_skills()))
+        return [skill.folder for skill in select_skills(skills, set(self._disabled_skills()))]
 
     @handles(ListAgentSkillsRequest)
     async def on_handle_list_agent_skills_request(self, _: ListAgentSkillsRequest) -> ResultPayload:

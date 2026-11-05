@@ -58,7 +58,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
 )
 from griptape_nodes.agents.pydantic_ai.mcp_servers import grant_keys_for_call
 from griptape_nodes.agents.pydantic_ai.model import build_model
-from griptape_nodes.agents.pydantic_ai.skills import WorkspaceSkills, offer_skills
+from griptape_nodes.agents.pydantic_ai.skills import offer_skills
 from griptape_nodes.agents.pydantic_ai.tool_approval import (
     ToolApprovalDeps,
     ends_in_tool_results,
@@ -78,7 +78,6 @@ if TYPE_CHECKING:
     from pydantic_ai.toolsets import AbstractToolset
     from pydantic_ai.usage import UsageLimits
 
-    from griptape_nodes.agents.skills import SkillSelection
     from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
@@ -278,7 +277,7 @@ class PydanticAgentRunner:
         extra_headers: Mapping[str, str] | None = None,
         approval: ToolApprovalDeps | None = None,
         deferred_tool_results: DeferredToolResults | None = None,
-        skills: SkillSelection | None = None,
+        skill_folders: Sequence[Path] = (),
     ) -> AgentRunResult:
         """Run the agent against ``prompt``, streaming events and saving history.
 
@@ -330,7 +329,7 @@ class PydanticAgentRunner:
                 waiting on. Required exactly when the thread has such calls;
                 with a ``prompt`` too, the prompt follows the answers in the same
                 request to the model.
-            skills: The skills to offer the model this run. ``None`` offers none.
+            skill_folders: The folders of the skills to offer the model this run.
 
         Returns:
             An :class:`AgentRunResult` describing the new state of the thread.
@@ -358,16 +357,14 @@ class PydanticAgentRunner:
             model_history = await history_rehydrator(history)
         run_id = thread_id[:8]
 
-        offered = WorkspaceSkills()
-        if skills is not None:
-            offered = offer_skills(skills.skills)
+        skill_capabilities = offer_skills(skill_folders)
 
         logger.debug(
             "[run %s] start: model=%s history_len=%d skills=%s run_toolsets=%d prompt=%r",
             run_id,
             self.model_name,
             len(history),
-            offered.names,
+            sorted(folder.name for folder in skill_folders),
             len(extra_toolsets or []),
             _prompt_preview(prompt),
         )
@@ -395,7 +392,7 @@ class PydanticAgentRunner:
                     deps=approval or ToolApprovalDeps(),
                     usage_limits=self.usage_limits,
                     event_stream_handler=event_handler,
-                    capabilities=offered.capabilities or None,
+                    capabilities=skill_capabilities or None,
                     toolsets=list(extra_toolsets) if extra_toolsets else None,
                     instructions=extra_instructions or None,
                     model_settings={"extra_headers": dict(extra_headers)} if extra_headers else None,

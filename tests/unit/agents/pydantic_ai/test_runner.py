@@ -447,7 +447,10 @@ async def test_selected_skill_reaches_the_model_on_a_run(tmp_path: Path) -> None
     runner = _runner_with_function_model(workspace, threads_dir, stream)
     await runner.run(
         "Use the demo skill.",
-        skills=select_skills(await discover_skills([workspace / ".agents/skills"]), disabled=set()),
+        skill_folders=[
+            skill.folder
+            for skill in select_skills(await discover_skills([workspace / ".agents/skills"]), disabled=set())
+        ],
     )
 
     assert len(offered) == 1

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from griptape_nodes.agents.pydantic_ai.skills import LoadedSkill, read_skill_library
+from griptape_nodes.agents.pydantic_ai.skills import read_skill_library
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     canonicalize_for_identity_preserving_symlinks,
@@ -49,7 +49,6 @@ class DiscoveredSkill:
         folder: The skill's own folder.
         problem: Why the agent cannot use it, or ``None`` when it can.
         model_invocable: False when its ``SKILL.md`` sets ``disable-model-invocation: true``.
-        loaded: The skill as read, when it has no problem.
     """
 
     name: str
@@ -58,18 +57,6 @@ class DiscoveredSkill:
     folder: Path
     problem: str | None = None
     model_invocable: bool = True
-    loaded: LoadedSkill | None = None
-
-
-@dataclass(frozen=True)
-class SkillSelection:
-    """The skills one agent run offers the model."""
-
-    skills: list[LoadedSkill]
-
-    @property
-    def names(self) -> list[str]:
-        return [skill.definition.name for skill in self.skills]
 
 
 def resolve_skills_directories(configured: Sequence[str], workspace: Path) -> list[Path]:
@@ -118,7 +105,6 @@ async def discover_skills(libraries: Sequence[Path]) -> list[DiscoveredSkill]:
                     library=library,
                     folder=loaded.directory,
                     model_invocable=definition.model_invocable,
-                    loaded=loaded,
                 )
             )
         found.extend(_unloadable(library, skipped) for skipped in contents.skipped if skipped.reason == "invalid")
@@ -126,15 +112,9 @@ async def discover_skills(libraries: Sequence[Path]) -> list[DiscoveredSkill]:
     return discovered
 
 
-def select_skills(skills: Sequence[DiscoveredSkill], disabled: Collection[str]) -> SkillSelection:
+def select_skills(skills: Sequence[DiscoveredSkill], disabled: Collection[str]) -> list[DiscoveredSkill]:
     """Pick the skills a run offers: every one that loads, the model may use, and the user has on."""
-    return SkillSelection(
-        skills=[
-            skill.loaded
-            for skill in skills
-            if skill.loaded is not None and skill.model_invocable and skill.name not in disabled
-        ]
-    )
+    return [skill for skill in skills if skill.problem is None and skill.model_invocable and skill.name not in disabled]
 
 
 def compose_skill_file(name: str, description: str, instructions: str) -> str:

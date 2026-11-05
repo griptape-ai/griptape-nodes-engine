@@ -23,7 +23,6 @@ from griptape_nodes.agents.pydantic_ai.tool_approval import (
     TOOL_DENIED_BY_USER_MESSAGE,
     TOOL_STOPPED_WHILE_RUNNING_MESSAGE,
 )
-from griptape_nodes.agents.skills import SkillSelection
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import (
     CancelAgentRequest,
@@ -64,9 +63,9 @@ async def _no_attribution(_request: object) -> GetAttributionContextResultFailur
     return GetAttributionContextResultFailure(result_details="no project")
 
 
-async def _no_skills() -> SkillSelection:
+async def _no_skills() -> list[Path]:
     """Offer a run no skills."""
-    return SkillSelection(skills=[])
+    return []
 
 
 class _Harness:
@@ -135,7 +134,7 @@ def _manager_on(
         library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
         only_open_workflow_or_none=lambda: None,
     )
-    monkeypatch.setattr(manager, "_skill_selection", _no_skills)
+    monkeypatch.setattr(manager, "_offered_skill_folders", _no_skills)
     return manager
 
 
