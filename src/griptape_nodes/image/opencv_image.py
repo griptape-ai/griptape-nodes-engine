@@ -248,7 +248,7 @@ class OpenCVImage(GriptapeImage):
         return pixels
 
     def _derive(self, pixels: np.ndarray) -> OpenCVImage:
-        return OpenCVImage(source=None, pixels=pixels, image_format=self._format)
+        return type(self)(source=None, pixels=pixels, image_format=self._format)
 
     def _encode_params(self, image_format: ImageFormat, quality: int | None) -> list[int]:
         if quality is None:

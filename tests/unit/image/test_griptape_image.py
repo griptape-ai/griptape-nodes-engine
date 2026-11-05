@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import pytest
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.drivers.image_metadata.exif_metadata_driver import EXIF_USERCOMMENT_TAG, ExifMetadataDriver
 from griptape_nodes.image import (
@@ -190,7 +191,6 @@ class TestReading:
         assert text == {"k": "v"}
         assert isinstance(image, OpenCVImage)
         assert image._pixels is None
-
 
     def test_pillow_reads_png_metadata_without_decoding(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, PILLOW_BACKEND)
@@ -392,6 +392,15 @@ class TestPipeline:
         assert decoded.getpixel((0, 0)) == (255, 255, 255, 255)
         assert decoded.getpixel((50, 50)) == (255, 0, 0, 255)
 
+    def test_steps_keep_the_backend_subclass(self) -> None:
+        with open_image(_encode(Image.new("RGB", (40, 20)), "PNG")) as image:
+            subclass = type("Subclass", (type(image),), {})
+            image.__class__ = subclass
+            with GriptapeImagePipeline(image).thumbnail(10, 10).to_rgba().end() as result:
+                result_type = type(result)
+
+        assert result_type is subclass
+
     def test_leaves_the_source_unchanged(self) -> None:
         with open_image(_encode(Image.new("RGB", (40, 20)), "PNG")) as image:
             with GriptapeImagePipeline(image).thumbnail(10, 10).end():
@@ -560,6 +569,60 @@ class TestOpenImageIOEdgeCases:
     def test_open_rejects_data_that_is_not_an_image(self) -> None:
         with pytest.raises(ValueError, match="could not read"):
             OpenImageIOImage.open(b"<html>not an image</html>")
+
+    def test_rewrites_png_metadata_without_decoding(self) -> None:
+        source = Image.new("RGB", (8, 8))
+        info = PngInfo()
+        info.add_text("kept", "old")
+        info.add_text("replaced", "old")
+        png = _encode(source, "PNG", pnginfo=info)
+
+        image = OpenImageIOImage.open(png)
+        rewritten = image.encode(ImageFormat.PNG, metadata=ImageMetadata(text={"replaced": "new"}))
+
+        assert image._buf is None
+        assert read_text_chunks(rewritten) == {"replaced": "new"}
+        assert rewritten.count(b"tEXt") == 1
+
+    def test_rewrites_jpeg_exif_without_decoding(self) -> None:
+        jpeg = _encode(Image.new("RGB", (8, 8), "red"), "JPEG")
+        exif = Exif()
+        exif[_EXIF_MAKE_TAG] = "Camera Maker"
+
+        image = OpenImageIOImage.open(jpeg)
+        rewritten = image.encode(ImageFormat.JPEG, metadata=ImageMetadata(exif=exif))
+
+        assert image._buf is None
+        assert _exif_of(rewritten)[_EXIF_MAKE_TAG] == "Camera Maker"
+        assert rewritten == replace_jpeg_exif(jpeg, exif.to_bytes())
+
+    def test_quality_reencodes_the_source(self) -> None:
+        jpeg = _encode(Image.effect_noise((64, 64), 64).convert("RGB"), "JPEG", quality=95)
+
+        with OpenImageIOImage.open(jpeg) as image:
+            encoded = image.encode(ImageFormat.JPEG, quality=20)
+
+        assert len(encoded) < len(jpeg)
+
+    def test_truncated_source_is_rejected(self) -> None:
+        png = _encode(Image.effect_noise((64, 64), 64), "PNG")
+
+        image = OpenImageIOImage.open(png[: len(png) // 2])
+
+        with pytest.raises(ValueError, match="could not read"):
+            image.encode(ImageFormat.PNG, metadata=ImageMetadata(text={"k": "v"}))
+
+    def test_transformed_pixels_are_reencoded(self) -> None:
+        png = _encode(Image.new("RGB", (40, 20)), "PNG")
+
+        with (
+            OpenImageIOImage.open(png) as image,
+            GriptapeImagePipeline(image).thumbnail(10, 10).end() as small,
+        ):
+            encoded = small.encode(ImageFormat.PNG)
+
+        size = Image.open(BytesIO(encoded)).size
+        assert size == (10, 5)
 
 
 class TestOpenCVEdgeCases:
