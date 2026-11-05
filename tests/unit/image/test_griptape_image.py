@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageCms
 from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.drivers.image_metadata.exif_metadata_driver import EXIF_USERCOMMENT_TAG, ExifMetadataDriver
@@ -531,6 +531,58 @@ class TestMetadata:
 
         written = _exif_of(jpeg)
         assert written[_EXIF_MAKE_TAG] == "Camera Maker"
+
+
+@pytest.fixture(params=[PILLOW_BACKEND, OPENIMAGEIO_BACKEND])
+def icc_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run the test once per backend that keeps ICC profiles. OpenCV drops them."""
+    monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, request.param)
+    return request.param
+
+
+def _srgb_profile() -> bytes:
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def _icc_of(data: bytes) -> bytes | None:
+    return Image.open(BytesIO(data)).info.get("icc_profile")
+
+
+@pytest.mark.usefixtures("icc_backend")
+class TestColorProfile:
+    @pytest.mark.parametrize("source_format", ["JPEG", "PNG", "WEBP", "TIFF"])
+    @pytest.mark.parametrize("image_format", [ImageFormat.PNG, ImageFormat.TIFF])
+    def test_pipeline_output_keeps_the_profile(self, source_format: str, image_format: ImageFormat) -> None:
+        profile = _srgb_profile()
+        source = _encode(Image.new("RGB", (16, 8), (10, 200, 30)), source_format, icc_profile=profile)
+
+        with (
+            open_image(source) as image,
+            GriptapeImagePipeline(image).exif_transpose().thumbnail(8, 8).round_corners(0.25).end() as small,
+        ):
+            encoded = small.encode(image_format)
+
+        assert _icc_of(encoded) == profile
+
+    @pytest.mark.parametrize("image_format", [ImageFormat.PNG, ImageFormat.TIFF])
+    def test_reencoding_the_source_keeps_the_profile(self, image_format: ImageFormat) -> None:
+        profile = _srgb_profile()
+        source = _encode(Image.new("RGB", (8, 8)), "TIFF", icc_profile=profile)
+        exif = Exif()
+        exif[_EXIF_MAKE_TAG] = "Camera Maker"
+
+        with open_image(source) as image:
+            encoded = image.encode(image_format, optimize=True, metadata=ImageMetadata(exif=exif))
+
+        assert _icc_of(encoded) == profile
+
+    def test_flatten_drops_the_profile(self) -> None:
+        source = _encode(Image.new("RGBA", (8, 8), (10, 200, 30, 128)), "PNG", icc_profile=_srgb_profile())
+
+        with open_image(source) as image, GriptapeImagePipeline(image).flatten().end() as flat:
+            encoded = flat.encode(ImageFormat.PNG)
+
+        assert _icc_of(encoded) is None
 
 
 class TestOpenImageIOEdgeCases:

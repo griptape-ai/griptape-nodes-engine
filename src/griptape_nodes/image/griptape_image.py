@@ -160,8 +160,10 @@ class GriptapeImage(ABC):
             quality: Lossy quality 1-100 for JPEG/WEBP; None uses the format's default
             optimize: Spend extra time for a smaller file where the format supports it
             metadata: Metadata to embed; the parts ``image_format`` has no place for are dropped.
-                The image's own EXIF and PNG text are not written unless passed here; a backend
-                may keep its other metadata (ICC profile, XMP) when it reuses the source bytes.
+                The image's own EXIF and PNG text are not written unless passed here. Pillow and
+                OpenImageIO write the source's ICC profile into PNG and TIFF, through every pipeline
+                step but ``flatten``. A backend may keep other metadata (XMP) when it reuses the
+                source bytes.
 
         Returns:
             The encoded file bytes

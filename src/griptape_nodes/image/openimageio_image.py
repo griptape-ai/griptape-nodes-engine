@@ -41,6 +41,8 @@ _BOX_FILTER_MIN_SHRINK = 3
 # back out on write, which rounds 8-bit color under partial alpha.
 _UNASSOCIATED_ALPHA = "oiio:UnassociatedAlpha"
 
+_ICC_PROFILE = "ICCProfile"
+
 
 class _Decoded(NamedTuple):
     buf: oiio.ImageBuf
@@ -61,8 +63,11 @@ class OpenImageIOImage(GriptapeImage):
 
     Encoding an opened, complete JPEG or PNG back to its own format with no ``quality`` or
     ``optimize`` splices the new EXIF (and PNG text) into the source bytes, without re-encoding the
-    unchanged pixels. The source's other metadata is kept, where a re-encode drops it: the ICC
-    profile, and in a JPEG XMP, IPTC, and comments.
+    unchanged pixels. The source's other metadata is kept, where a re-encode drops it: in a JPEG
+    XMP, IPTC, and comments.
+
+    The source's ICC profile follows its pixels through every pipeline step but ``flatten``, and a
+    re-encode writes it to PNG and TIFF, as Pillow does. A splice keeps it in any format.
 
     Previews of large JPEGs are slower than Pillow's. OpenImageIO 3.2 has no reduced-size JPEG
     decode (no equivalent of Pillow's ``draft``), so a thumbnail decodes the full image first.
@@ -99,6 +104,10 @@ class OpenImageIOImage(GriptapeImage):
         "double": PixelType.DOUBLE,
     }
 
+    # Formats a re-encode writes the ICC profile into: the ones whose Pillow writers carry it over
+    # from the source, so a profile survives the same encodes under either backend
+    _ICC_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset({ImageFormat.PNG, ImageFormat.TIFF})
+
     # Pillow's defaults, so previews come out the same size whichever backend wrote them
     _DEFAULT_QUALITY: ClassVar[dict[ImageFormat, int]] = {ImageFormat.JPEG: 75, ImageFormat.WEBP: 80}
 
@@ -109,11 +118,14 @@ class OpenImageIOImage(GriptapeImage):
         source_path: Path | None,
         buf: oiio.ImageBuf | None,
         image_format: ImageFormat | None,
+        icc_profile: bytes | None = None,
     ) -> None:
         self._source = source
         self._source_path = source_path
         self._buf = buf
         self._format = image_format
+        # Read from the source when it decodes; carried over by pipeline steps
+        self._icc_profile = icc_profile
 
     @property
     def width(self) -> int:
@@ -164,6 +176,7 @@ class OpenImageIOImage(GriptapeImage):
         self._source = None
         self._source_path = None
         self._buf = None
+        self._icc_profile = None
 
     def encode(
         self,
@@ -189,6 +202,12 @@ class OpenImageIOImage(GriptapeImage):
             # PNG is the only format here that holds gray with alpha
             buf = _to_rgba(buf)
         spec = self._output_spec(buf, image_format, quality, optimize=optimize)
+        if self._icc_profile is not None and image_format in self._ICC_FORMATS:
+            spec.attribute(
+                _ICC_PROFILE,
+                oiio.TypeDesc(f"uint8[{len(self._icc_profile)}]"),
+                np.frombuffer(self._icc_profile, dtype=np.uint8),
+            )
         with _temporary_path(extension) as path:
             encoded = _write_file(buf, spec, path)
         # OpenImageIO writes an empty EXIF block into PNG and JPEG
@@ -244,6 +263,9 @@ class OpenImageIOImage(GriptapeImage):
     def _apply_step(self, step: PipelineStep | None) -> OpenImageIOImage:  # noqa: PLR0911
         if step is None:
             return self._derive(self._decoded().copy())
+        if isinstance(step, Flatten):
+            # A new canvas, as Pillow's flatten is, so it carries no profile
+            return self._derive(_flattened(self._decoded(), step), keep_icc_profile=False)
         if isinstance(step, Thumbnail):
             return self._derive(self._thumbnail(step))
         if isinstance(step, Orient):
@@ -252,9 +274,7 @@ class OpenImageIOImage(GriptapeImage):
             return self._derive(_to_rgb(self._decoded()))
         if isinstance(step, ToRGBA):
             return self._derive(_to_rgba(self._decoded()))
-        if isinstance(step, RoundCorners):
-            return self._derive(_rounded(self._decoded(), step))
-        return self._derive(_flattened(self._decoded(), step))
+        return self._derive(_rounded(self._decoded(), step))
 
     def _thumbnail(self, step: Thumbnail) -> oiio.ImageBuf:
         buf = self._decoded()
@@ -325,14 +345,19 @@ class OpenImageIOImage(GriptapeImage):
                 decoded = _read_file(path)
         if self._format is None:
             self._format = ImageFormat.from_name(decoded.file_format_name)
+        self._icc_profile = _icc_profile(decoded.buf)
         self._buf = decoded.buf
         return decoded.buf
 
-    def _derive(self, buf: oiio.ImageBuf) -> OpenImageIOImage:
+    def _derive(self, buf: oiio.ImageBuf, *, keep_icc_profile: bool = True) -> OpenImageIOImage:
+        """Wrap a step's output. Call after the step reads this image's pixels, which reads an opened source's profile."""
         # The source's metadata, Orientation included, may no longer describe the pixels
         for attribute in [attribute.name for attribute in buf.spec().extra_attribs]:
             buf.specmod().erase_attribute(attribute)
-        return type(self)(source=None, source_path=None, buf=buf, image_format=self._format)
+        icc_profile = None
+        if keep_icc_profile:
+            icc_profile = self._icc_profile
+        return type(self)(source=None, source_path=None, buf=buf, image_format=self._format, icc_profile=icc_profile)
 
     @classmethod
     def open(cls, source: bytes | Path) -> OpenImageIOImage:
@@ -392,6 +417,13 @@ def _read_file(path: Path) -> _Decoded:
     if _alpha_channel(buf) is not None and buf.spec().get_int_attribute(_UNASSOCIATED_ALPHA, 0) != 1:
         buf = _checked(oiio.ImageBufAlgo.unpremult(buf))
     return _Decoded(buf, file_format_name)
+
+
+def _icc_profile(buf: oiio.ImageBuf) -> bytes | None:
+    profile = buf.spec().getattribute(_ICC_PROFILE)
+    if profile is None or len(profile) == 0:
+        return None
+    return bytes(profile)
 
 
 def _spliced(
