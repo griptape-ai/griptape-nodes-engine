@@ -104,6 +104,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
 )
+from griptape_nodes.retained_mode.events.config_events import ConfigValueSource
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultFailure,
@@ -176,12 +177,21 @@ class _FakeConfig:
     def __init__(self, workspace: Path, values: dict[str, object] | None = None) -> None:
         self.workspace_path = workspace
         self.values: dict[str, object] = dict(values or {})
+        self.shadows: dict[str, ConfigValueSource] = {}
+        self.writes_fail = False
 
     def get_config_value(self, key: str, default: object = None) -> object:
         return self.values.get(key, default)
 
-    def set_config_value(self, key: str, value: object) -> None:
-        self.values[key] = value
+    def set_config_value(self, key: str, value: object) -> bool:
+        if self.writes_fail:
+            return False
+        if key not in self.shadows:
+            self.values[key] = value
+        return True
+
+    def shadowed_by(self, key: str) -> ConfigValueSource | None:
+        return self.shadows.get(key)
 
 
 def _write_skill(library: Path, name: str) -> Path:
@@ -252,6 +262,36 @@ class TestAgentSkills:
         assert isinstance(on, SetAgentSkillEnabledResultSuccess)
         assert config.values["agent.disabled_skills"] == []
         assert [folder.name for folder in await manager._offered_skill_folders()] == ["house-style"]
+
+    @pytest.mark.asyncio
+    async def test_a_toggle_fails_when_the_environment_sets_the_disabled_skills(
+        self, manager: AgentManager, config: _FakeConfig, tmp_path: Path
+    ) -> None:
+        _write_skill(tmp_path / "shared", "house-style")
+        config.shadows["agent.disabled_skills"] = ConfigValueSource(
+            layer="env", env_var="GTN_CONFIG_AGENT__DISABLED_SKILLS"
+        )
+
+        result = await manager.on_handle_set_agent_skill_enabled_request(
+            SetAgentSkillEnabledRequest(name="house-style", enabled=False)
+        )
+
+        assert isinstance(result, SetAgentSkillEnabledResultFailure)
+        assert "GTN_CONFIG_AGENT__DISABLED_SKILLS" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_a_toggle_fails_when_the_settings_cannot_be_saved(
+        self, manager: AgentManager, config: _FakeConfig, tmp_path: Path
+    ) -> None:
+        _write_skill(tmp_path / "shared", "house-style")
+        config.writes_fail = True
+
+        result = await manager.on_handle_set_agent_skill_enabled_request(
+            SetAgentSkillEnabledRequest(name="house-style", enabled=False)
+        )
+
+        assert isinstance(result, SetAgentSkillEnabledResultFailure)
+        assert "could not be saved" in str(result.result_details)
 
     @pytest.mark.asyncio
     async def test_turning_off_an_unknown_skill_fails(self, manager: AgentManager) -> None:

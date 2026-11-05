@@ -1583,6 +1583,18 @@ class AgentManager(EngineScoped):
             return []
         return [str(name) for name in configured]
 
+    def _write_disabled_skills(self, names: list[str]) -> str | None:
+        """Store `names` as `agent.disabled_skills`. Returns why that didn't take effect, or None when it did."""
+        config = self.engine.config_manager
+        # Checked first: a higher layer keeps winning the merge, so the user's copy would be saved but unused.
+        shadow = config.shadowed_by("agent.disabled_skills")
+        if shadow is not None:
+            location = shadow.env_var or shadow.path or f"the {shadow.layer} settings"
+            return f"agent.disabled_skills is set by {location}, which the editor can't change"
+        if not config.set_config_value("agent.disabled_skills", names):
+            return "the settings file could not be saved"
+        return None
+
     async def _offered_skill_folders(self) -> list[Path]:
         """The folders of the skills this run offers the model, read fresh so edits land on the next message."""
         skills = await discover_skills(self._skills_directories())
@@ -1609,11 +1621,15 @@ class AgentManager(EngineScoped):
             return SetAgentSkillEnabledResultFailure(
                 result_details=f"Attempted to turn off skill '{name}'. Failed because no skill with that name is in the skills folders."
             )
+        state = "on" if request.enabled else "off"
         updated = [entry for entry in disabled if entry != name]
         if not request.enabled:
             updated.append(name)
-        self.engine.config_manager.set_config_value("agent.disabled_skills", sorted(updated))
-        state = "on" if request.enabled else "off"
+        problem = self._write_disabled_skills(sorted(updated))
+        if problem is not None:
+            return SetAgentSkillEnabledResultFailure(
+                result_details=f"Attempted to turn skill '{name}' {state}. Failed because {problem}."
+            )
         return SetAgentSkillEnabledResultSuccess(result_details=f"Turned skill '{name}' {state}.")
 
     @handles(CreateAgentSkillRequest)
@@ -1664,9 +1680,9 @@ class AgentManager(EngineScoped):
         disabled = self._disabled_skills()
         # A copy in another folder takes over the name, and stays off if the user turned the name off.
         if name in disabled and len(matches) == 1:
-            self.engine.config_manager.set_config_value(
-                "agent.disabled_skills", [entry for entry in disabled if entry != name]
-            )
+            problem = self._write_disabled_skills([entry for entry in disabled if entry != name])
+            if problem is not None:
+                logger.warning("Deleted skill '%s' but left it in agent.disabled_skills, because %s.", name, problem)
         return DeleteAgentSkillResultSuccess(result_details=f"Deleted skill '{name}' from {own[0].library}.")
 
     @handles(ListAgentProvidersRequest)
