@@ -62,6 +62,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
     GetExecutionDeviceRequest,
     GetExecutionDeviceResultSuccess,
 )
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextError
 from griptape_nodes.retained_mode.variable_types import VariableScope  # noqa: TC001 - read at runtime by the converter
 from griptape_nodes.traits.options import Options
@@ -71,7 +72,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload
+    from griptape_nodes.retained_mode.events.base_events import ExecutionPayload, ResultPayload
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -472,11 +473,15 @@ class BaseNode(ABC):
         the surface for separately-versioned library code and saved workflow files.
 
         For a node built without an explicit engine -- which is every node the engine itself
-        creates -- this resolves the ambient one, so the lookup is the same process-wide
-        resolution the facade would have done. What the migration buys is not per-node isolation
+        creates -- this is the engine holding the workflow the node joined, so its managers and its
+        workflow always belong to one engine. Before the node joins one, such as during its
+        ``__init__``, it resolves the ambient engine, the same process-wide resolution the facade
+        would have done. What the migration buys is not per-node isolation
         but the classification it forced: questions about workflow state now travel as requests,
         which is what makes them answerable from inside a worker.
         """
+        if self._engine is None and self._workflow is not None:
+            return self._workflow.engine
         if self._engine is None:
             # Deferred import: griptape_nodes.retained_mode.engine pulls in the manager graph,
             # which pulls in the event payloads, which import this module for
@@ -585,6 +590,26 @@ class BaseNode(ABC):
     def _set_workflow(self, workflow: WorkflowRuntime) -> None:
         """Record the workflow whose objects this node joined. Only the ObjectManager calls this."""
         self._workflow = workflow
+
+    def _handle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
+        """Send `request` through the workflow this node joined.
+
+        A node that never joined one, such as during its ``__init__`` or a helper a library builds
+        without adding it, sends through its engine bound to no workflow. Requests about the engine
+        still answer, and a request that acts on a workflow fails rather than act on whichever
+        workflow the caller happens to be in.
+        """
+        if self._workflow is None:
+            with self.engine.bind_workflow(NO_WORKFLOW):
+                return self.engine.handle_request(request)
+        return self._workflow.handle_request(request)
+
+    async def _ahandle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
+        """Like `_handle_request_in_workflow`, awaiting the request."""
+        if self._workflow is None:
+            with self.engine.bind_workflow(NO_WORKFLOW):
+                return await self.engine.ahandle_request(request)
+        return await self._workflow.ahandle_request(request)
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event about this node, naming the workflow it joined (None when it never joined one)."""
@@ -1294,7 +1319,9 @@ class BaseNode(ABC):
 
     def kill_parameter_children(self, parameter: Parameter) -> None:
         for child in parameter.find_elements_by_type(Parameter):
-            self.engine.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
+            self._handle_request_in_workflow(
+                RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name)
+            )
 
     def get_parameter_value(self, param_name: str) -> Any:
         """The value a node reads, with a held object substituted for the key standing in for it.
@@ -1472,7 +1499,7 @@ class BaseNode(ABC):
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Runs before the entire workflow is run."""
-        if VariableResolver.is_substitution_enabled(self.engine):
+        if VariableResolver.is_substitution_enabled(self.engine, self._workflow):
             for param in self.parameters:
                 if not param.allow_variable_substitution:
                     continue
@@ -1958,7 +1985,9 @@ class BaseNode(ABC):
         executing in an isolated process holds only a transient copy of itself, so reading
         its own process's connection index would answer from almost nothing.
         """
-        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        result = self._handle_request_in_workflow(
+            ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False)
+        )
         if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
         return any(connection.target_parameter_name == param_name for connection in result.incoming_connections)
@@ -2005,13 +2034,13 @@ class BaseNode(ABC):
 
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""
-        variables = VariableResolver.get_variables_if_enabled(self.engine, self.name)
+        variables = VariableResolver.get_variables_if_enabled(self.engine, self._workflow, self.name)
         if variables is None:
             return value
         return VariableResolver.resolve_value(value, variables, self.name)
 
     def _resolve_variables_in_string(self, text: str) -> str:
-        variables = VariableResolver.get_variables_if_enabled(self.engine, self.name)
+        variables = VariableResolver.get_variables_if_enabled(self.engine, self._workflow, self.name)
         if variables is None:
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
@@ -2050,7 +2079,7 @@ class BaseNode(ABC):
         # get_variables_without_memoizing, not get_variables_if_enabled: this runs
         # outside aprocess_scope(), where the latter's memo write has no reset token
         # and would leave a stale variable dict on the surrounding context.
-        variables = VariableResolver.get_variables_without_memoizing(self.engine, self.name)
+        variables = VariableResolver.get_variables_without_memoizing(self.engine, self._workflow, self.name)
         if variables is None:
             return True
         return VariableResolver.would_substitute(raw_value, variables)
@@ -2069,7 +2098,7 @@ class BaseNode(ABC):
         connection never gets substituted, so its output is genuine and its
         stored value must stay writable.
         """
-        if not VariableResolver.is_substitution_enabled(self.engine):
+        if not VariableResolver.is_substitution_enabled(self.engine, self._workflow):
             return None
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
@@ -2631,7 +2660,9 @@ class SuccessFailureNode(BaseNode):
 
     def _has_outgoing_connections(self, parameter: Parameter) -> bool:
         """Check if a specific parameter has outgoing connections."""
-        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        result = self._handle_request_in_workflow(
+            ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False)
+        )
         if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
         return any(connection.source_parameter_name == parameter.name for connection in result.outgoing_connections)
@@ -2913,7 +2944,7 @@ class ErrorProxyNode(BaseNode):
                 is_user_defined=False,  # Don't serialize this parameter
                 initial_setup=True,  # Allows setting non-settable parameters and prevents resolution cascades during workflow loading
             )
-            result = self.engine.handle_request(request)
+            result = self._handle_request_in_workflow(request)
 
             # Check if parameter creation was successful
             from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess

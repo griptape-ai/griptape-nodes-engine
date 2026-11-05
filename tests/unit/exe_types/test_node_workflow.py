@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -10,7 +11,12 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    GetTopLevelFlowRequest,
+    GetTopLevelFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultSuccess,
@@ -132,3 +138,27 @@ class TestNodeWorkflow:
 
         assert _ValueNode in reached
         assert not any(issubclass(cls, (Engine, WorkflowRuntime)) for cls in reached)
+
+
+class TestNodeEngine:
+    def test_a_node_in_a_workflow_uses_that_workflows_engine(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """Node code on a thread bound to another engine still drives the engine holding its workflow."""
+        node = _create_node(engine, workflow)
+
+        with patch("griptape_nodes.retained_mode.engine.current_engine", return_value=MagicMock(spec=Engine)):
+            assert node.engine is engine
+
+    def test_a_node_in_no_workflow_sends_requests_that_act_on_no_workflow(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        """A request about a workflow fails rather than act on the workflow the caller is in."""
+        node = MockNode(name="helper")
+        in_workflow = workflow.handle_request(GetTopLevelFlowRequest())
+        assert isinstance(in_workflow, GetTopLevelFlowResultSuccess)
+        assert in_workflow.flow_name == "canvas"
+
+        with engine.bind_workflow(workflow):
+            result = node._handle_request_in_workflow(GetTopLevelFlowRequest())
+
+        assert isinstance(result, GetTopLevelFlowResultSuccess)
+        assert result.flow_name is None

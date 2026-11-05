@@ -162,6 +162,8 @@ class ObjectManager(EngineScoped):
     def add_object_by_name_in(self, workflow: WorkflowRuntime, name: str, obj: object) -> None:
         objects = workflow.objects
         objects.add(name, obj)
+        if isinstance(obj, ControlFlow):
+            obj._set_workflow(workflow)
         if isinstance(obj, BaseNode):
             # The one place a node joins a workflow, so every node in `workflow.objects` knows it.
             obj._set_workflow(workflow)

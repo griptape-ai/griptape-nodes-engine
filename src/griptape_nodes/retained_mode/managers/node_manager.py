@@ -2218,8 +2218,8 @@ class NodeManager(EngineScoped):
     def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
         """Remove a parameter from a node of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -2806,8 +2806,8 @@ class NodeManager(EngineScoped):
     def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
         """Set a parameter value on a node of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
