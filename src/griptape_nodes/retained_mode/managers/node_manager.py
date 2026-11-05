@@ -979,7 +979,7 @@ class NodeManager(EngineScoped):
             node_class_name = node.__class__.__name__
 
             # Get the opposing EndNode
-            # TODO: (griptape) Get paired classes implemented so we dont need to do name stuff. https://github.com/griptape-ai/griptape-nodes/issues/1549
+            # TODO: (griptape) Get paired classes implemented so we dont need to do name stuff. https://github.com/griptape-ai/griptape-nodes-engine/issues/1549
             end_class_name = node_class_name.replace("Start", "End")
 
             # Check and see if the class exists
@@ -2516,19 +2516,19 @@ class NodeManager(EngineScoped):
         elif request.default_value is not None:
             parameter.default_value = request.default_value
         if request.mode_allowed_input is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/828
             if request.mode_allowed_input is True:
                 parameter.allowed_modes.add(ParameterMode.INPUT)
             else:
                 parameter.allowed_modes.discard(ParameterMode.INPUT)
         if request.mode_allowed_property is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/828
             if request.mode_allowed_property is True:
                 parameter.allowed_modes.add(ParameterMode.PROPERTY)
             else:
                 parameter.allowed_modes.discard(ParameterMode.PROPERTY)
         if request.mode_allowed_output is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/828
             if request.mode_allowed_output is True:
                 parameter.allowed_modes.add(ParameterMode.OUTPUT)
             else:
@@ -2658,14 +2658,14 @@ class NodeManager(EngineScoped):
             if isinstance(result, AlterParameterDetailsResultFailure):
                 return result
 
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/827
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/827
         # Now change all the values on the Element.
         self.modify_alterable_fields(request, element)
 
         # The rest of these are not alterable
         if isinstance(element, Parameter):
             if hasattr(element, "user_defined") and element.user_defined is False and request.request_id:  # type: ignore[attr-defined]
-                # TODO: https://github.com/griptape-ai/griptape-nodes/issues/826
+                # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/826
                 details = f"Attempted to alter details for Element '{request.parameter_name}' from Node '{node_name}'. Could only alter some values because the Element was not user-defined (i.e., critical to the Node implementation). Only user-defined Elements can be totally modified from a Node."
                 return AlterParameterDetailsResultSuccess(
                     result_details=ResultDetails(message=details, level=logging.WARNING)
@@ -2674,7 +2674,7 @@ class NodeManager(EngineScoped):
 
         # This field requires the node as well
         if request.default_value is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/825
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/825
             node.parameter_values[request.parameter_name] = request.default_value
 
         details = f"Successfully altered details for Element '{request.parameter_name}' from Node '{node_name}'."
@@ -4498,7 +4498,7 @@ class NodeManager(EngineScoped):
             # Get the library metadata so we can get the version.
             library_metadata_request = GetLibraryMetadataRequest(library=library_used)
             # Call LibraryManager directly to avoid error toasts when library is unavailable (expected for ErrorProxyNode)
-            # Per https://github.com/griptape-ai/griptape-nodes/issues/1940
+            # Per https://github.com/griptape-ai/griptape-nodes-engine/issues/1940
             library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
                 library_metadata_request
             )
@@ -6480,7 +6480,7 @@ class NodeManager(EngineScoped):
             return ResetNodeToDefaultsResultFailure(result_details=details)
         new_node_name = create_result.node_name
 
-        # TODO: (griptape-nodes) Don't rely on manually copying metadata fields. https://github.com/griptape-ai/griptape-nodes/issues/2862
+        # TODO: (griptape-nodes) Don't rely on manually copying metadata fields. https://github.com/griptape-ai/griptape-nodes-engine/issues/2862
         # Copy only position and size from original node's metadata to preserve layout.
         # We don't copy the full metadata because it contains instance-specific data that shouldn't be transferred.
         artifact_metadata = all_info_result.metadata

@@ -663,7 +663,7 @@ class FlowManager(EngineScoped):
             parent = workflow.context.get_current_flow()
             parent_name = parent.name
 
-        # TODO: FIX THIS LOGIC MESS https://github.com/griptape-ai/griptape-nodes/issues/616
+        # TODO: FIX THIS LOGIC MESS https://github.com/griptape-ai/griptape-nodes-engine/issues/616
 
         if parent_name is not None and parent is None:
             parent = workflow.objects.get_as_type(parent_name, ControlFlow)
@@ -1078,7 +1078,7 @@ class FlowManager(EngineScoped):
 
         target_param = target_node.get_parameter_by_name(request.target_parameter_name)
         if target_param is None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/860
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/860
             details = f'Connection failed: "{target_node_name}.{request.target_parameter_name}" not found'
             return CreateConnectionResultFailure(result_details=details)
         # Validate parameter modes accept this type of connection.
@@ -1326,7 +1326,7 @@ class FlowManager(EngineScoped):
 
         # Mark all downstream nodes as dirty when connection is created
         # This ensures dependency graph changes propagate even if values don't change
-        # Matches the pattern used in connection deletion (https://github.com/griptape-ai/griptape-nodes/blob/9f299338193edc4a10f60728172c1ad214d1eb46/src/griptape_nodes/retained_mode/managers/flow_manager.py#L1227)
+        # Matches the pattern used in connection deletion (https://github.com/griptape-ai/griptape-nodes-engine/blob/9f299338193edc4a10f60728172c1ad214d1eb46/src/griptape_nodes/retained_mode/managers/flow_manager.py#L1227)
         if not is_control_parameter and not request.initial_setup:
             target_node.make_node_unresolved(
                 current_states_to_trigger_change_event=set(

@@ -2534,7 +2534,7 @@ class TestWorkflowManager:
     ) -> None:
         """build_workflow() must register every library named in node_libraries_referenced.
 
-        Regression test for https://github.com/griptape-ai/griptape-nodes/issues/4584:
+        Regression test for https://github.com/griptape-ai/griptape-nodes-engine/issues/4584:
         when a generated workflow is run as a standalone script via LocalWorkflowExecutor,
         no engine-side library bootstrap runs before build_workflow(), so the file itself
         must register its declared libraries to avoid every CreateNodeRequest collapsing

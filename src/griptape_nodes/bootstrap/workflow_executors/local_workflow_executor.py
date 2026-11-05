@@ -102,7 +102,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
-        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
+        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
         if exc_val is not None and self._save_on_failure_path is not None:
             await self._save_failed_workflow(exc_val)
 

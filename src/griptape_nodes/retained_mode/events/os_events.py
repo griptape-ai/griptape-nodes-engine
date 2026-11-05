@@ -530,7 +530,7 @@ class ReadFileRequest(RequestPayload):
         encoding: Text encoding to use if file is detected as text (default: 'utf-8')
         workspace_only: If True, constrain to workspace directory. If False, allow system-wide access.
                         If None, workspace constraints don't apply (e.g., cloud environments).
-                        TODO: Remove workspace_only parameter - see https://github.com/griptape-ai/griptape-nodes/issues/2753
+                        TODO: Remove workspace_only parameter - see https://github.com/griptape-ai/griptape-nodes-engine/issues/2753
         should_transform_image_content_to_thumbnail: If True, convert image files to thumbnail data URLs.
                         If False, return raw image bytes. Default True for backwards compatibility.
 
@@ -541,7 +541,9 @@ class ReadFileRequest(RequestPayload):
     file_path: str | None = None
     file_entry: FileSystemEntry | None = None
     encoding: str = "utf-8"
-    workspace_only: bool | None = True  # TODO: Remove - see https://github.com/griptape-ai/griptape-nodes/issues/2753
+    workspace_only: bool | None = (
+        True  # TODO: Remove - see https://github.com/griptape-ai/griptape-nodes-engine/issues/2753
+    )
     should_transform_image_content_to_thumbnail: bool = True
 
 
