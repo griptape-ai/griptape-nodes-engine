@@ -1447,14 +1447,16 @@ class InspectLibraryRepoRequest(RequestPayload):
     validating library compatibility, checking library versions remotely.
 
     Args:
-        git_url: Git repository URL (supports GitHub shorthand like "user/repo")
-        ref: Branch, tag, or commit to inspect (defaults to "HEAD")
+        git_url: Git repository URL (supports GitHub shorthand like "user/repo"), optionally
+                 followed by @ref (e.g., "user/repo@stable")
+        ref: Branch, tag, or commit to inspect. Overrides a url@ref suffix. Defaults to the
+             suffix, or "HEAD" when there is none.
 
     Results: InspectLibraryRepoResultSuccess (with library metadata) | InspectLibraryRepoResultFailure (invalid URL, network error, no library JSON found)
     """
 
     git_url: str
-    ref: str = "HEAD"
+    ref: str | None = None
 
 
 @dataclass
