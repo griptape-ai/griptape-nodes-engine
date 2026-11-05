@@ -5081,25 +5081,22 @@ class ProjectManager(EngineScoped):
         msg = f"Unknown builtin variable: {var_name}"
         raise ValueError(msg)
 
-    def workflow_context_for_dispatch(self) -> WorkflowContextSnapshot:
-        """This engine's workflow context, in the form another engine can adopt.
+    def workflow_context_for_dispatch(self, workflow: WorkflowRuntime) -> WorkflowContextSnapshot:
+        """`workflow`'s context, in the form another engine can adopt.
 
         Raw context, not resolved paths: the adopting engine then derives every workflow-dependent
         value through its own normal code paths, so the two cannot drift and a new derived value
         needs no new handoff.
-
-        Empty when this process has no workflow -- there is nothing to lend, and the peer keeps
-        answering from its own equally-empty context, so both degrade identically.
         """
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_workflow():
-            return WorkflowContextSnapshot()
-
+        entry = self.engine.workflow_registry.get(workflow.workflow_id)
+        file_path = None
+        if entry.absolute_path is not None:
+            file_path = str(entry.absolute_path)
         return WorkflowContextSnapshot(
-            workflow_id=context_manager.get_current_workflow_id(),
-            name=context_manager.get_current_workflow_name(),
-            file_path=context_manager.get_current_workflow_file_path(),
-            working_directory=context_manager.get_current_workflow_working_directory(),
+            workflow_id=entry.workflow_id,
+            name=entry.name,
+            file_path=file_path,
+            working_directory=entry.working_directory,
         )
 
     def _resolve_builtin_workspace_dir(self) -> str:

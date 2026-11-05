@@ -17,6 +17,7 @@ import pytest
 
 from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, _handle_drop_all_local_objects
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import ControlNode, DataNode
@@ -114,6 +115,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotNamedError, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.retained_mode.variable_types import VariableScope
@@ -496,6 +498,58 @@ class TestRunInOneEditTheOther:
         assert _ParkNode.ran_in == {"park_a": a, "park_b": b}
         assert _get(engine, a, "park_a", "result") == "done:a"
         assert _get(engine, b, "park_b", "result") == "done:b"
+
+    @pytest.mark.asyncio
+    async def test_a_run_started_with_nothing_bound_runs_in_the_workflow_it_is_handed(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """The machines and the node executor find their workflow from the run, never from the binding."""
+        a, b = two_open
+        _make_node(engine, b, "_ParkNode", "park")
+        _set(engine, b, "park", "b")
+        flow = engine.flow_manager.get_flow_by_name_in(b, "canvas")
+        node = engine.node_manager.get_node_by_name_in(b, "park")
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            await asyncio.wait_for(engine.flow_manager.start_flow(b, flow, node), 5)
+
+        assert _ParkNode.ran_in == {"park": b}
+        assert _get(engine, b, "park", "result") == "done:b"
+        assert a.flows.global_control_flow_machine is None
+
+    @pytest.mark.asyncio
+    async def test_executing_a_node_runs_it_in_the_workflow_it_joined(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """With the same node name in both workflows, the node's own workflow decides, not the caller's."""
+        a, b = two_open
+        for workflow, value in ((a, "a"), (b, "b")):
+            _make_node(engine, workflow, "_ParkNode", "park")
+            _set(engine, workflow, "park", value)
+        node_in_b = engine.node_manager.get_node_by_name_in(b, "park")
+
+        with engine.bind_workflow(a):
+            await asyncio.wait_for(NodeExecutor(engine=engine).execute(node_in_b), 5)
+
+        assert _get(engine, b, "park", "result") == "done:b"
+        assert _get(engine, a, "park", "result") is None
+
+    def test_packaging_with_nothing_bound_takes_the_nodes_out_of_their_workflows_queue(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """A loop or group packaging its body edits the queue of the workflow it runs in."""
+        _a, b = two_open
+        _make_node(engine, b, "_ValueNode", "body")
+        _make_node(engine, b, "_ValueNode", "after")
+        body = engine.node_manager.get_node_by_name_in(b, "body")
+        after = engine.node_manager.get_node_by_name_in(b, "after")
+        b.flows.global_flow_queue.put(QueueItem(node=body, dag_execution_type=DagExecutionType.CONTROL_NODE))
+        b.flows.global_flow_queue.put(QueueItem(node=after, dag_execution_type=DagExecutionType.CONTROL_NODE))
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            NodeExecutor(engine=engine)._remove_packaged_nodes_from_queue(b, {"body"}, "group")
+
+        assert [item.node for item in b.flows.global_flow_queue.queue] == [after]
 
 
 class TestCloseOneWhileTheOtherRuns:
