@@ -10,7 +10,7 @@ from typing import ClassVar, NamedTuple
 import numpy as np
 import OpenImageIO as oiio  # noqa: N813
 
-from griptape_nodes.image.containers import add_webp_exif, read_exif, replace_jpeg_exif, replace_png_exif
+from griptape_nodes.image.containers import add_webp_exif, is_complete, read_exif, replace_jpeg_exif, replace_png_exif
 from griptape_nodes.image.formats import ImageFormat, sniff_image_format
 from griptape_nodes.image.griptape_image import GriptapeImage, PixelType
 from griptape_nodes.image.metadata import EXIF_ORIENTATION_TAG, Exif, ImageMetadata
@@ -27,6 +27,15 @@ _UPRIGHT = 1
 # Chunks OpenImageIO adds to every PNG besides its empty EXIF: color tags claiming sRGB whatever the
 # source was. Dropped so output matches the other backends: untagged, with only the EXIF it's given.
 _PNG_DROPPED_CHUNKS = frozenset({b"sRGB", b"gAMA", b"cHRM"})
+
+# Text chunks, dropped from a source PNG whose metadata is rewritten in place, so only the text
+# ``encode`` is given ends up in the output, as when it re-encodes
+_PNG_TEXT_CHUNKS = frozenset({b"tEXt", b"zTXt", b"iTXt"})
+
+# Shrink factor from which a thumbnail uses a box filter, about 4x faster than the tent filter. On
+# photographic content they differ by about 1/255; detail near the pixel scale (fine stripes,
+# halftone) can alias by tens of levels, which previews accept.
+_BOX_FILTER_MIN_SHRINK = 3
 
 # Keeps alpha as stored in the file. OpenImageIO otherwise premultiplies on read and divides it
 # back out on write, which rounds 8-bit color under partial alpha.
@@ -49,6 +58,11 @@ class OpenImageIOImage(GriptapeImage):
     in memory needs ``IOProxy``, which the Python bindings don't expose, so in-memory sources and
     encodes go through a temporary file. The bindings also expose EXIF only as parsed attributes,
     so the block is read from and spliced into the container directly, for JPEG, PNG, and WEBP.
+
+    Encoding an opened, complete JPEG or PNG back to its own format with no ``quality`` or
+    ``optimize`` splices the new EXIF (and PNG text) into the source bytes, without re-encoding the
+    unchanged pixels. The source's other metadata is kept, where a re-encode drops it: the ICC
+    profile, and in a JPEG XMP, IPTC, and comments.
     """
 
     _ENCODE_EXTENSIONS: ClassVar[dict[ImageFormat, str]] = {
@@ -61,6 +75,9 @@ class OpenImageIOImage(GriptapeImage):
         ImageFormat.TGA: ".tga",
         ImageFormat.EXR: ".exr",
     }
+
+    # Formats whose source bytes can take new metadata without touching the pixel data
+    _SPLICEABLE_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset({ImageFormat.PNG, ImageFormat.JPEG})
 
     # Formats whose EXIF is read straight from the container; the rest report only the
     # orientation OpenImageIO parsed
@@ -158,23 +175,25 @@ class OpenImageIOImage(GriptapeImage):
             msg = f"Attempted to save an image as {image_format}. Failed because the OpenImageIO image backend cannot write that format."
             raise ValueError(msg)
 
-        out = self._clean_copy(image_format, quality, optimize=optimize)
-        with _temporary_path(extension) as path:
-            if not out.write(str(path)):
-                msg = f"Attempted to save an image as {image_format}. Failed because OpenImageIO could not encode it: {out.geterror()}"
-                raise ValueError(msg)
-            encoded = path.read_bytes()
-
         exif_block = None
         if metadata is not None and metadata.exif is not None:
             exif_block = metadata.exif.to_bytes()
+        if self._source is not None and self._can_splice(self._source, image_format, quality, optimize=optimize):
+            return _spliced(self._source, image_format, exif_block, metadata)
+
+        buf = self._decoded()
+        if buf.nchannels == _GRAYSCALE_ALPHA_CHANNELS and image_format != ImageFormat.PNG:
+            # PNG is the only format here that holds gray with alpha
+            buf = _to_rgba(buf)
+        spec = self._output_spec(buf, image_format, quality, optimize=optimize)
+        with _temporary_path(extension) as path:
+            encoded = _write_file(buf, spec, path)
         # OpenImageIO writes an empty EXIF block into PNG and JPEG
         if image_format == ImageFormat.PNG:
             encoded = replace_png_exif(encoded, exif_block, dropped_chunks=_PNG_DROPPED_CHUNKS)
         elif image_format == ImageFormat.JPEG:
             encoded = replace_jpeg_exif(encoded, exif_block)
         elif image_format == ImageFormat.WEBP and exif_block is not None:
-            spec = out.spec()
             encoded = add_webp_exif(
                 encoded,
                 exif_block,
@@ -185,6 +204,21 @@ class OpenImageIOImage(GriptapeImage):
         if metadata is not None and metadata.text and image_format == ImageFormat.PNG:
             encoded = insert_text_chunks(encoded, metadata.text)
         return encoded
+
+    def _can_splice(self, source: bytes, image_format: ImageFormat, quality: int | None, *, optimize: bool) -> bool:
+        """Whether ``encode`` can rewrite the source's metadata in place of re-encoding its pixels.
+
+        Only an opened image has a source: derived images don't, so pixels a pipeline step changed
+        always take the encoder. So does a source with no end marker (EOI, IEND). The check is
+        structural only: a source with a bad CRC or corrupt compressed data is spliced as is.
+        """
+        return (
+            image_format == self._format
+            and image_format in self._SPLICEABLE_FORMATS
+            and quality is None
+            and not optimize
+            and is_complete(source, image_format)
+        )
 
     def _exif(self) -> Exif | None:
         if self._source is None:
@@ -235,17 +269,18 @@ class OpenImageIOImage(GriptapeImage):
             source = oiio.ImageBufAlgo.premult(buf)
         # resize widens the filter by the shrink factor, so a tent filter antialiases. Lanczos3
         # takes about 8x longer on a 4000x3000 source.
-        resized = _checked(oiio.ImageBufAlgo.resize(source, "triangle", roi=roi))
+        filter_name = "triangle"
+        if scale * _BOX_FILTER_MIN_SHRINK <= 1:
+            filter_name = "box"
+        resized = _checked(oiio.ImageBufAlgo.resize(source, filter_name, roi=roi))
         if has_alpha:
             resized = _checked(oiio.ImageBufAlgo.unpremult(resized))
         return resized
 
-    def _clean_copy(self, image_format: ImageFormat, quality: int | None, *, optimize: bool) -> oiio.ImageBuf:
-        """Copy the pixels into a buffer with no metadata, so only what ``encode`` is given gets written."""
-        buf = self._decoded()
-        if buf.nchannels == _GRAYSCALE_ALPHA_CHANNELS and image_format != ImageFormat.PNG:
-            # PNG is the only format here that holds gray with alpha
-            buf = _to_rgba(buf)
+    def _output_spec(
+        self, buf: oiio.ImageBuf, image_format: ImageFormat, quality: int | None, *, optimize: bool
+    ) -> oiio.ImageSpec:
+        """Return a spec for writing ``buf`` with no metadata, so only what ``encode`` is given gets written."""
         source_spec = buf.spec()
         spec = oiio.ImageSpec(source_spec.width, source_spec.height, buf.nchannels, source_spec.format)
         spec.channelnames = source_spec.channelnames
@@ -256,12 +291,13 @@ class OpenImageIOImage(GriptapeImage):
             spec.attribute("compression", f"jpeg:{quality}")
         elif image_format == ImageFormat.WEBP and quality is not None:
             spec.attribute("compression", f"webp:{quality}")
-        elif image_format == ImageFormat.PNG and optimize:
-            spec.attribute("compression", "zip:9")
-
-        out = oiio.ImageBuf(spec)
-        out.copy_pixels(buf)
-        return out
+            # libwebp's fastest method. Higher ones search harder for a smaller file, and dominate
+            # the cost at preview sizes.
+            spec.attribute("webp:method", 0)
+        elif image_format == ImageFormat.PNG:
+            # The PNG writer ignores "compression". optimize spends time for size.
+            spec.attribute("png:compressionLevel", 6 if optimize else 1)
+        return spec
 
     def _decoded(self) -> oiio.ImageBuf:
         """Return the pixels, decoding the source on first use.
@@ -293,7 +329,7 @@ class OpenImageIOImage(GriptapeImage):
         # The source's metadata, Orientation included, may no longer describe the pixels
         for attribute in [attribute.name for attribute in buf.spec().extra_attribs]:
             buf.specmod().erase_attribute(attribute)
-        return OpenImageIOImage(source=None, source_path=None, buf=buf, image_format=self._format)
+        return type(self)(source=None, source_path=None, buf=buf, image_format=self._format)
 
     @classmethod
     def open(cls, source: bytes | Path) -> OpenImageIOImage:
@@ -353,6 +389,42 @@ def _read_file(path: Path) -> _Decoded:
     if _alpha_channel(buf) is not None and buf.spec().get_int_attribute(_UNASSOCIATED_ALPHA, 0) != 1:
         buf = _checked(oiio.ImageBufAlgo.unpremult(buf))
     return _Decoded(buf, file_format_name)
+
+
+def _spliced(
+    source: bytes, image_format: ImageFormat, exif_block: bytes | None, metadata: ImageMetadata | None
+) -> bytes:
+    """Return a JPEG or PNG ``source`` with its EXIF and PNG text replaced by ``exif_block`` and ``metadata``'s text."""
+    if image_format == ImageFormat.JPEG:
+        return replace_jpeg_exif(source, exif_block)
+    encoded = replace_png_exif(source, exif_block, dropped_chunks=_PNG_TEXT_CHUNKS)
+    if metadata is not None and metadata.text:
+        encoded = insert_text_chunks(encoded, metadata.text)
+    return encoded
+
+
+def _write_file(buf: oiio.ImageBuf, spec: oiio.ImageSpec, path: Path) -> bytes:
+    """Write ``buf``'s pixels to ``path`` under ``spec`` and return the file's bytes.
+
+    Through an ``ImageOutput`` opened with ``spec``, so ``buf``'s own metadata isn't written and
+    its pixels aren't copied into a metadata-free buffer first.
+
+    Raises:
+        ValueError: If OpenImageIO cannot encode the pixels
+    """
+    out = oiio.ImageOutput.create(str(path))
+    if out is None:
+        msg = (
+            f"Attempted to save an image. Failed because OpenImageIO has no writer for {path.suffix}: {oiio.geterror()}"
+        )
+        raise ValueError(msg)
+    try:
+        if not out.open(str(path), spec) or not buf.write(out):
+            msg = f"Attempted to save an image. Failed because OpenImageIO could not encode it: {out.geterror() or buf.geterror()}"
+            raise ValueError(msg)
+    finally:
+        out.close()
+    return path.read_bytes()
 
 
 def _alpha_channel(buf: oiio.ImageBuf) -> int | None:
