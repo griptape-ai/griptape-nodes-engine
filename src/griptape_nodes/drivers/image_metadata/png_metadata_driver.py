@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
-from griptape_nodes.image import ImageFormat, ImageMetadata
+from griptape_nodes.image import ImageFormat
 
 if TYPE_CHECKING:
     from griptape_nodes.image import GriptapeImage
@@ -30,7 +31,7 @@ class PngMetadataDriver(BaseImageMetadataDriver):
     def inject_metadata(self, image: GriptapeImage, metadata: dict[str, str]) -> bytes:
         """Inject metadata into PNG text chunks.
 
-        Re-encodes the image with its existing text chunks plus the new metadata.
+        Writes the image's existing text chunks plus the new metadata, keeping its EXIF and color profile.
         New metadata overwrites existing keys with same name.
 
         Args:
@@ -46,7 +47,7 @@ class PngMetadataDriver(BaseImageMetadataDriver):
         text_metadata = {key: value for key, value in image.metadata.text.items() if key not in metadata}
         for key, value in metadata.items():
             text_metadata[key] = str(value)
-        return image.encode(ImageFormat.PNG, metadata=ImageMetadata(text=text_metadata))
+        return image.encode(ImageFormat.PNG, metadata=replace(image.metadata, text=text_metadata))
 
     def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract all text chunks from PNG image.

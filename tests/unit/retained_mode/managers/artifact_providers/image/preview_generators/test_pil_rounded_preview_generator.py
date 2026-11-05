@@ -6,12 +6,13 @@ from pathlib import Path
 
 import anyio
 import pytest
-from PIL import Image
 from pydantic import ValidationError
 
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
     PILRoundedPreviewGenerator,
 )
+from tests.unit.image.sample_images import BLUE, RED, encode, solid
 
 
 @pytest.fixture
@@ -19,8 +20,7 @@ def temp_test_image() -> Generator[str, None, None]:
     """Create a temporary test image."""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         # Create a simple red 200x100 image
-        img = Image.new("RGB", (200, 100), color="red")
-        img.save(f, format="PNG")
+        f.write(encode(solid(200, 100, RED), "png"))
         temp_path = f.name
 
     yield temp_path
@@ -36,8 +36,7 @@ def temp_transparent_image() -> Generator[str, None, None]:
     """Create a temporary test image with transparency."""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         # Create RGBA image with semi-transparent red
-        img = Image.new("RGBA", (200, 100), color=(255, 0, 0, 128))
-        img.save(f, format="PNG")
+        f.write(encode(solid(200, 100, (*RED, 128)), "png"))
         temp_path = f.name
 
     yield temp_path
@@ -246,8 +245,8 @@ class TestPILRoundedPreviewGeneratorGeneration:
         assert output_path.exists()
 
         # Verify image properties
-        with Image.open(output_path) as img:
-            assert img.mode == "RGBA"
+        with GriptapeImage.open(output_path) as img:
+            assert img.color_space == "RGBA"
             # Image should be resized to fit 150x150
             assert img.width <= 150  # noqa: PLR2004
             assert img.height <= 150  # noqa: PLR2004
@@ -304,8 +303,8 @@ class TestPILRoundedPreviewGeneratorGeneration:
         assert output_path.exists()
 
         # Verify output has transparency
-        with Image.open(output_path) as img:
-            assert img.mode == "RGBA"
+        with GriptapeImage.open(output_path) as img:
+            assert img.color_space == "RGBA"
 
     @pytest.mark.asyncio
     async def test_generate_png_output(self, temp_test_image: str, temp_output_dir: str) -> None:
@@ -321,8 +320,8 @@ class TestPILRoundedPreviewGeneratorGeneration:
         result_filename = await generator.attempt_generate_preview()
 
         output_path = Path(temp_output_dir) / result_filename
-        with Image.open(output_path) as img:
-            assert img.mode == "RGBA"
+        with GriptapeImage.open(output_path) as img:
+            assert img.color_space == "RGBA"
             assert img.format == "PNG"
 
     @pytest.mark.asyncio
@@ -339,9 +338,9 @@ class TestPILRoundedPreviewGeneratorGeneration:
         result_filename = await generator.attempt_generate_preview()
 
         output_path = Path(temp_output_dir) / result_filename
-        with Image.open(output_path) as img:
+        with GriptapeImage.open(output_path) as img:
             # WEBP can be RGBA
-            assert img.mode in ("RGBA", "RGB")
+            assert img.color_space in ("RGBA", "RGB")
             assert img.format == "WEBP"
 
     @pytest.mark.asyncio
@@ -358,9 +357,9 @@ class TestPILRoundedPreviewGeneratorGeneration:
         result_filename = await generator.attempt_generate_preview()
 
         output_path = Path(temp_output_dir) / result_filename
-        with Image.open(output_path) as img:
+        with GriptapeImage.open(output_path) as img:
             # JPEG should be RGB (no alpha)
-            assert img.mode == "RGB"
+            assert img.color_space == "RGB"
             assert img.format == "JPEG"
 
     @pytest.mark.asyncio
@@ -378,7 +377,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
         result_filename = await generator.attempt_generate_preview()
 
         output_path = Path(temp_output_dir) / result_filename
-        with Image.open(output_path) as img:
+        with GriptapeImage.open(output_path) as img:
             # Should be scaled down to 100x50 to fit in 100x100 while preserving 2:1 ratio
             assert img.width == 100  # noqa: PLR2004
             assert img.height == 50  # noqa: PLR2004
@@ -388,8 +387,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
         """Test with very small image."""
         # Create tiny 10x10 image
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tiny_img = Image.new("RGB", (10, 10), color="blue")
-            tiny_img.save(f, format="PNG")
+            f.write(encode(solid(10, 10, BLUE), "png"))
             tiny_path = f.name
 
         try:
@@ -406,7 +404,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
             output_path = Path(temp_output_dir) / result_filename
             assert output_path.exists()
 
-            with Image.open(output_path) as img:
+            with GriptapeImage.open(output_path) as img:
                 # Small image should remain 10x10
                 assert img.width == 10  # noqa: PLR2004
                 assert img.height == 10  # noqa: PLR2004

@@ -11,11 +11,11 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # uncompressed, where image viewers that only show plain text chunks can still read it.
 COMPRESS_TEXT_LONGER_THAN = 1024
 
-# Pillow refuses to read a compressed text chunk that decompresses past this many bytes
-# (PngImagePlugin.MAX_TEXT_CHUNK), so text above it is written uncompressed.
+# Readers such as Pillow, which node libraries open these PNG files with, refuse a compressed text chunk
+# that decompresses past this many bytes, so text above it is written uncompressed.
 MAX_COMPRESSED_TEXT_BYTES = 1024 * 1024
 
-# Reading stops once the text read so far passes this, as Pillow does (PngImagePlugin.MAX_TEXT_MEMORY)
+# Reading stops once the text read so far passes this, the limit Pillow's reader also applies
 MAX_TOTAL_TEXT_BYTES = 64 * MAX_COMPRESSED_TEXT_BYTES
 
 _CHUNK_HEADER_BYTES = 8
@@ -29,7 +29,7 @@ class TextChunk(NamedTuple):
 
 
 def should_compress_text(text: str) -> bool:
-    """Decide whether a text chunk can be compressed and still be read back by Pillow.
+    """Decide whether a text chunk can be compressed and still be read back by common PNG readers.
 
     Mirrors the encoding the chunk is written with (latin-1, then utf-8) to check the size a
     reader will actually decompress.
@@ -138,7 +138,7 @@ def _decompress_text(data: bytes) -> bytes:
 
 
 def _encode_text_chunk(key: str, text: str) -> bytes:
-    """Encode one text chunk the way Pillow's PngInfo.add_text does: latin-1 if it fits, else iTXt."""
+    """Encode one text chunk: tEXt or zTXt in latin-1 if the text fits it, else iTXt in utf-8."""
     compress = should_compress_text(text)
     key_bytes = key.encode("latin-1")
     try:

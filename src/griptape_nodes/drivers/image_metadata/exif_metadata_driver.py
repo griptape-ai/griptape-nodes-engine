@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from PIL.ExifTags import GPSTAGS, TAGS
-
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
-from griptape_nodes.image import EXIF_GPSINFO_TAG, Exif, ImageMetadata
+from griptape_nodes.image import EXIF_GPSINFO_TAG, Exif
+from griptape_nodes.image.exif_tags import GPS_TAGS, TAGS
 
 if TYPE_CHECKING:
     from griptape_nodes.image import GriptapeImage
@@ -18,6 +18,8 @@ logger = logging.getLogger("griptape_nodes")
 
 # EXIF tag IDs
 EXIF_USERCOMMENT_TAG = 0x9286
+# Binary data in a camera maker's private layout, unreadable as text
+EXIF_MAKERNOTE_TAG = 0x927C
 
 # GPS coordinate tuple length
 GPS_COORD_TUPLE_LENGTH = 3
@@ -30,14 +32,14 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
     and writing custom metadata to EXIF UserComment field as JSON.
     Preserves all existing EXIF data when writing.
     All EXIF-specific logic is encapsulated in this driver. Tags are read and written through
-    ``Exif``; pixels go through whichever GriptapeImage backend is active.
+    ``Exif``.
     """
 
     def get_supported_formats(self) -> list[str]:
         """Return list of GriptapeImage format names this driver supports.
 
         Returns:
-            List containing "JPEG", "TIFF", "MPO"
+            List containing "JPEG", "TIFF", "MPO", "WEBP"
         """
         return ["JPEG", "TIFF", "MPO", "WEBP"]
 
@@ -45,7 +47,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         """Inject metadata into EXIF UserComment field as JSON.
 
         Serializes metadata dictionary to JSON and stores in EXIF UserComment.
-        Preserves all existing EXIF tags.
+        Preserves all existing EXIF tags and the color profile.
 
         Args:
             image: Source image to inject metadata into
@@ -71,7 +73,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         exif_data[EXIF_USERCOMMENT_TAG] = metadata_json
 
         # Save with updated EXIF
-        return image.encode(image.format, metadata=ImageMetadata(exif=exif_data))
+        return image.encode(image.format, metadata=replace(image.metadata, exif=exif_data))
 
     def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract ALL EXIF metadata including standard tags, GPS data, and custom UserComment.
@@ -156,8 +158,8 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             # Get tag name
             tag_name = TAGS.get(tag_id, f"Tag_{tag_id}")
 
-            # Skip UserComment and GPSInfo, we'll handle them separately
-            if tag_id in (EXIF_USERCOMMENT_TAG, EXIF_GPSINFO_TAG):
+            # Skip UserComment and GPSInfo, we'll handle them separately, and MakerNote, which isn't text
+            if tag_id in (EXIF_USERCOMMENT_TAG, EXIF_GPSINFO_TAG, EXIF_MAKERNOTE_TAG):
                 continue
 
             # Convert value to string
@@ -177,7 +179,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             return
 
         for gps_tag_id, gps_value in gps_ifd.items():
-            gps_tag_name = GPSTAGS.get(gps_tag_id, f"GPSTag_{gps_tag_id}")
+            gps_tag_name = GPS_TAGS.get(gps_tag_id, f"GPSTag_{gps_tag_id}")
 
             # Format GPS coordinate values specially
             if gps_tag_id in (1, 2, 3, 4):  # GPSLatitudeRef, GPSLatitude, GPSLongitudeRef, GPSLongitude
@@ -201,7 +203,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
 
         # Parse JSON from UserComment field
         try:
-            # Pillow handles the character code prefix, but might return bytes or string
+            # Exif decodes the character code prefix to text; a malformed tag can still come back as bytes
             if isinstance(user_comment, bytes):
                 comment_str = user_comment.decode("utf-8", errors="ignore").strip("\x00")
             else:

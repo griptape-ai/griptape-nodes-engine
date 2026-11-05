@@ -3,14 +3,13 @@
 import base64
 from pathlib import Path
 
-from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat, open_image
+from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat, ImageMetadata
 from griptape_nodes.retained_mode.griptape_nodes import logger
 
 # Color models that JPEG/WEBP previews are flattened out of before encoding
-_CONVERT_TO_RGB_FOR_LOSSY = {"RGBA", "Grayscale+Alpha", "Palette"}
+_CONVERT_TO_RGB_FOR_LOSSY = {"RGBA", "Grayscale+Alpha"}
 _LOSSY_FORMATS = {ImageFormat.WEBP, ImageFormat.JPEG}
-# Sources that never hold alpha or a palette, so their color model needn't be read (which decodes
-# the full image on some backends, before a reduced-size decode could apply)
+# Sources that never hold alpha, so their color model needn't be checked
 _NO_ALPHA_FORMATS = {ImageFormat.JPEG, ImageFormat.MPO}
 
 
@@ -29,15 +28,15 @@ def create_image_preview(
     Returns:
         Base64 encoded data URL of the preview, or None if failed
     """
-    # Check if it's an SVG file - PIL cannot open SVG files
+    # SVG is vector graphics, which the image decoder can't rasterize
     # TODO: Add SVG support using cairosvg or similar library to rasterize SVG files: https://github.com/griptape-ai/griptape-nodes-engine/issues/3721
     # before creating previews
     if image_path.suffix.lower() == ".svg":
-        logger.debug(f"SVG file detected, cannot create preview with PIL (vector graphics not supported): {image_path}")
+        logger.debug(f"SVG file detected, cannot create a preview (vector graphics not supported): {image_path}")
         return None
 
     try:
-        with open_image(image_path) as source:
+        with GriptapeImage.open(image_path) as source:
             data_url = _render_preview_data_url(source, max_width, max_height, quality, image_format)
             logger.debug(
                 f"Created preview for {image_path}: {source.width}x{source.height} -> {len(data_url)} characters"
@@ -45,12 +44,6 @@ def create_image_preview(
             return data_url
 
     except Exception as e:
-        # Check if error is due to SVG format
-        if "cannot identify image file" in str(e).lower() and image_path.suffix.lower() == ".svg":
-            logger.debug(
-                f"SVG file detected, cannot create preview with PIL (vector graphics not supported): {image_path}"
-            )
-            return None
         logger.warning(f"Failed to create preview for {image_path}: {e}")
         return None
 
@@ -76,21 +69,15 @@ def create_image_preview_from_bytes(
         # before creating previews
         content_start = image_bytes[:100].decode("utf-8", errors="ignore").lower()
         if "<svg" in content_start:
-            logger.debug("SVG file detected, cannot create preview with PIL (vector graphics not supported)")
+            logger.debug("SVG file detected, cannot create a preview (vector graphics not supported)")
             return None
 
-        with open_image(image_bytes) as source:
+        with GriptapeImage.open(image_bytes) as source:
             data_url = _render_preview_data_url(source, max_width, max_height, quality, image_format)
             logger.debug(f"Created preview from bytes: {len(image_bytes)} bytes -> {len(data_url)} characters")
             return data_url
 
     except Exception as e:
-        # Check if error is due to SVG format
-        if "cannot identify image file" in str(e).lower():
-            content_start = image_bytes[:100].decode("utf-8", errors="ignore").lower()
-            if "<svg" in content_start:
-                logger.debug("SVG file detected, cannot create preview with PIL (vector graphics not supported)")
-                return None
         logger.warning(f"Failed to create preview from bytes: {e}")
         return None
 
@@ -105,7 +92,7 @@ def get_image_info(image_path: Path) -> dict | None:
         Dictionary with image info (width, height, format, color_space), or None if failed
     """
     try:
-        with open_image(image_path) as img:
+        with GriptapeImage.open(image_path) as img:
             # Report the dimensions the image displays at, without decoding and rotating it
             width = img.width
             height = img.height
@@ -148,7 +135,13 @@ def _render_preview_data_url(
             pipeline.to_rgb()
         pipeline.thumbnail(max_width, max_height)
         with pipeline.end() as preview:
-            preview_bytes = preview.encode(target, quality=quality, optimize=True)
+            # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+            preview_bytes = preview.encode(
+                target,
+                quality=quality,
+                optimize=True,
+                metadata=ImageMetadata(icc_profile=preview.metadata.icc_profile),
+            )
 
     base64_data = base64.b64encode(preview_bytes).decode("utf-8")
     mime_type = f"image/{image_format.lower()}"

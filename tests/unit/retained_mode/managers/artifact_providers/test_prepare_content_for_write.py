@@ -17,7 +17,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry 
 
 _MODULE = "griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider"
 COLLECT_PATH = f"{_MODULE}.collect_workflow_metadata"
-IMAGE_OPEN_PATH = f"{_MODULE}.open_image"
+IMAGE_OPEN_PATH = f"{_MODULE}.GriptapeImage.open"
 DRIVER_REGISTRY_PATH = f"{_MODULE}.ImageMetadataDriverRegistry.get_driver_for_format"
 
 

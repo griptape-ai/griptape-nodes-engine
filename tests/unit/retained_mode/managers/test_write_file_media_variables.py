@@ -2,12 +2,10 @@
 
 import subprocess
 from collections.abc import Generator
-from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from PIL import Image
 from static_ffmpeg import run as static_ffmpeg_run
 
 from griptape_nodes.common.macro_parser import ParsedMacro
@@ -42,13 +40,12 @@ from griptape_nodes.retained_mode.managers.artifact_providers.video.video_artifa
     VideoArtifactMetadata,
     VideoArtifactProvider,
 )
+from tests.unit.image.sample_images import encode, solid
 from tests.workflow_context import unsaved_workflow_open
 
 
 def _png_bytes(width: int, height: int) -> bytes:
-    buffer = BytesIO()
-    Image.new("RGB", (width, height)).save(buffer, format="PNG")
-    return buffer.getvalue()
+    return encode(solid(width, height, (0, 0, 0)), "png")
 
 
 async def _write(engine: Engine, template: str, content: bytes | str, **kwargs: object) -> object:

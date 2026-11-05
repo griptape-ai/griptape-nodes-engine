@@ -17,7 +17,7 @@ class ImageFormat(StrEnum):
 
     PNG = "PNG"
     JPEG = "JPEG"
-    # A JPEG holding more than one frame, as some cameras write. Pillow reports it separately.
+    # A JPEG holding more than one frame, as some cameras write. Sniffing reports it as JPEG.
     MPO = "MPO"
     WEBP = "WEBP"
     TIFF = "TIFF"

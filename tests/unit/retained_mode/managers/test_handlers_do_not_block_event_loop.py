@@ -15,12 +15,10 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
-from PIL import Image
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
@@ -38,6 +36,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_gene
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
     PILThumbnailGenerator,
 )
+from tests.unit.image.sample_images import BLUE, RED, encode, size_of, solid
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -88,9 +87,7 @@ async def _assert_engine_answers_while_parked(engine: Engine, step: _SlowStep) -
 
 
 def _png_bytes() -> bytes:
-    buffer = BytesIO()
-    Image.new("RGB", (64, 64), "red").save(buffer, format="PNG")
-    return buffer.getvalue()
+    return encode(solid(64, 64, RED), "png")
 
 
 @pytest.fixture
@@ -228,7 +225,7 @@ class TestReadFileThumbnail:
         source = tmp_path / "source.png"
         source.write_bytes(_png_bytes())
         step = _SlowStep()
-        # Pillow runs before any registry lookup, so this exercises the off-loop encode directly.
+        # Decoding runs before any registry lookup, so this exercises the off-loop encode directly.
         monkeypatch.setattr(engine.os_manager, "_image_bytes_to_preview_data_url", lambda _data: step.run("data:thumb"))
 
         read = asyncio.create_task(engine.ahandle_request(ReadFileRequest(file_path=str(source), workspace_only=False)))
@@ -407,19 +404,19 @@ class TestPreviewGenerators:
     @pytest.mark.parametrize(
         "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
     )
-    @pytest.mark.parametrize("mode", ["RGB", "RGBA"])
+    @pytest.mark.parametrize("color", [BLUE, (*BLUE, 255)], ids=["RGB", "RGBA"])
     async def test_preview_is_still_rendered_from_the_source_image(
-        self, engine: Engine, tmp_path: Path, generator_type: type, mode: str
+        self, engine: Engine, tmp_path: Path, generator_type: type, color: tuple[int, ...]
     ) -> None:
         source = tmp_path / "source.png"
-        Image.new(mode, (200, 100), "blue").save(source)
+        source.write_bytes(encode(solid(200, 100, color), "png"))
         generator = _make_generator(generator_type, engine, source, tmp_path / "previews")
 
         file_name = await generator.attempt_generate_preview()
 
-        with Image.open(tmp_path / "previews" / file_name) as preview:
-            assert preview.width == 32  # noqa: PLR2004
-            assert preview.height <= 32  # noqa: PLR2004
+        width, height = size_of((tmp_path / "previews" / file_name).read_bytes())
+        assert width == 32  # noqa: PLR2004
+        assert height <= 32  # noqa: PLR2004
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
