@@ -12,6 +12,27 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.106.1] - 2026-11-05
+
+### Added
+
+- A list parameter's element details now include `row_input_types`, the types a new entry accepts,
+  even when the list has no entries yet. An editor can use it instead of copying the engine's rules.
+
+### Changed
+
+- A list parameter connected to a whole list now keeps its own entries. The node reads the
+  connected list's items first, then the entries added by hand, instead of ignoring the entries.
+
+### Fixed
+
+- Saving or copying a node keeps the item types of its lists. A list whose type a node set while
+  running, such as Display List's, loads as `list[Thing]` instead of `list[list[Thing]]`, and a row
+  the node typed on its own, such as an `int` row beside `str` rows, keeps its value instead of
+  failing to load. Workflows saved before this fix still load their list types as saved.
+- A loop no longer counts the entries of a list twice when the list is also connected as a whole
+  list. After the loop ran, the list read, and saved, its own entries a second time.
+
 ## [0.106.0] - 2026-11-02
 
 ### Added
@@ -825,7 +846,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.1...HEAD
+[0.106.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...v0.106.1
 [0.106.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.105.0...v0.106.0
 [0.105.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.2...v0.105.0
 [0.104.2]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.1...v0.104.2
