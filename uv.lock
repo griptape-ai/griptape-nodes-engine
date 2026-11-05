@@ -796,7 +796,7 @@ requires-dist = [
     { name = "json-repair", specifier = ">=0.46.1" },
     { name = "mcp", specifier = ">=2.0,<3" },
     { name = "opencv-python-headless", specifier = ">=5.0" },
-    { name = "openimageio", specifier = ">=3.0" },
+    { name = "openimageio", specifier = ">=3.2" },
     { name = "packaging", specifier = ">=25.0" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "portalocker", specifier = ">=2.10.0" },
