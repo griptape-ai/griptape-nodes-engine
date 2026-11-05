@@ -1,14 +1,19 @@
-"""Rounded image preview generator using PIL/Pillow."""
+"""Rounded image preview generator."""
 
 from __future__ import annotations
 
-from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PIL import Image, ImageDraw, ImageOps
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
 
+from griptape_nodes.image import (
+    DEFAULT_THUMBNAIL_SIZE,
+    GriptapeImage,
+    GriptapeImagePipeline,
+    ImageFormat,
+    ImageMetadata,
+)
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     ReadFileRequest,
@@ -30,17 +35,17 @@ if TYPE_CHECKING:
 
 
 class PILRoundedParameters(BaseGeneratorParameters):
-    """Parameters for PIL rounded preview generation."""
+    """Parameters for rounded preview generation."""
 
     max_width: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum width in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
     )
 
     max_height: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum height in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
@@ -58,7 +63,7 @@ class PILRoundedParameters(BaseGeneratorParameters):
 class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
     """Generate image previews with rounded corners and transparent backgrounds.
 
-    Uses PIL/Pillow to create thumbnails with rounded corners. Corners are transparent
+    Creates thumbnails with rounded corners. Corners are transparent
     for PNG/WEBP output formats, or composited onto white background for JPEG.
     """
 
@@ -161,7 +166,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             msg = "Source file is text, not binary image data"
             raise TypeError(msg)
 
-        # Step 3: Process image with PIL, off the event loop
+        # Step 3: Process the image off the event loop
         output_bytes = await to_thread(self._render_rounded_preview, image_data)
 
         # Step 4: Write output file
@@ -183,66 +188,18 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
 
     def _render_rounded_preview(self, image_data: bytes) -> bytes:
         """Decode, shrink, round the corners of and re-encode the image. CPU-bound, so callers run it off the event loop."""
-        with Image.open(BytesIO(image_data)) as raw_img:
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            img = ImageOps.exif_transpose(raw_img)
-            # Resize to fit max dimensions (preserves aspect ratio)
-            # Access validated parameters via self.params - fully type-safe
-            img.thumbnail((self.params.max_width, self.params.max_height), Image.Resampling.LANCZOS)
-
-            # Convert to RGBA for alpha channel support
-            if img.mode != "RGBA":
-                rgba_img = img.convert("RGBA")
-            else:
-                rgba_img = img
-
-            # Apply rounded corners
-            rounded_img = self._apply_rounded_corners(rgba_img)
-
-            # Handle format-specific output
-            if self.preview_format.lower() in ("jpg", "jpeg"):
+        preview_format = ImageFormat.from_name(self.preview_format)
+        if preview_format is None:
+            msg = f"Attempted to generate a rounded preview. Failed because {self.preview_format} is not a known image format."
+            raise TypeError(msg)
+        with GriptapeImage.open(image_data) as source, GriptapeImagePipeline(source) as pipeline:
+            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
+            # fit within the max dimensions, preserving aspect ratio
+            pipeline.exif_transpose().thumbnail(self.params.max_width, self.params.max_height)
+            pipeline.round_corners(self.params.corner_radius_percent / 100.0)
+            if preview_format == ImageFormat.JPEG:
                 # JPEG doesn't support transparency - composite onto white background
-                white_background = Image.new("RGB", rounded_img.size, (255, 255, 255))
-                white_background.paste(rounded_img, (0, 0), rounded_img)
-                final_img = white_background
-            else:
-                # PNG/WEBP support transparency
-                final_img = rounded_img
-
-            # Save to buffer
-            output_buffer = BytesIO()
-            # Normalize format for PIL (JPG -> JPEG)
-            pil_format = "JPEG" if self.preview_format.lower() == "jpg" else self.preview_format.upper()
-            final_img.save(output_buffer, format=pil_format)
-            output_bytes = output_buffer.getvalue()
-        return output_bytes
-
-    def _apply_rounded_corners(self, img: Image.Image) -> Image.Image:
-        """Apply rounded corners to image using alpha mask.
-
-        Args:
-            img: Source image (RGBA mode)
-
-        Returns:
-            RGBA image with transparent rounded corners
-        """
-        # Calculate pixel radius from percentage of smaller dimension
-        smaller_dimension = min(img.width, img.height)
-        radius_pixels = int((self.params.corner_radius_percent / 100.0) * smaller_dimension)
-
-        # Skip if no rounding requested (0% or rounds to 0 pixels)
-        if radius_pixels <= 0:
-            return img
-
-        # Clamp radius to prevent over-rounding
-        max_radius = smaller_dimension // 2
-        effective_radius = min(radius_pixels, max_radius)
-
-        # Create mask for rounded corners
-        mask = Image.new("L", img.size, 0)
-        draw = ImageDraw.Draw(mask)
-        draw.rounded_rectangle([(0, 0), (img.width - 1, img.height - 1)], radius=effective_radius, fill=255)
-
-        # Apply mask to alpha channel
-        img.putalpha(mask)
-        return img
+                pipeline.flatten((255, 255, 255))
+            with pipeline.end() as preview:
+                # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+                return preview.encode(preview_format, metadata=ImageMetadata(icc_profile=preview.metadata.icc_profile))

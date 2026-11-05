@@ -1,31 +1,15 @@
 """PNG metadata injection and extraction driver using text chunks."""
 
-from io import BytesIO
+from __future__ import annotations
 
-from PIL import Image, PngImagePlugin
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
+from griptape_nodes.image import ImageFormat
 
-# Text longer than this, such as an embedded workflow, is stored compressed. Shorter text stays
-# uncompressed, where image viewers that only show plain text chunks can still read it.
-_COMPRESS_TEXT_LONGER_THAN = 1024
-
-
-def _should_compress_text(text: str) -> bool:
-    """Decide whether a text chunk can be compressed and still be read back.
-
-    Pillow rejects a zTXt/iTXt chunk whose decompressed size exceeds
-    PngImagePlugin.MAX_TEXT_CHUNK, raising ValueError from Image.open. Mirror the
-    encoding add_text falls back to (latin-1, then utf-8) to check the size Pillow
-    will actually decompress.
-    """
-    if len(text) <= _COMPRESS_TEXT_LONGER_THAN:
-        return False
-    try:
-        encoded_length = len(text.encode("latin-1"))
-    except UnicodeEncodeError:
-        encoded_length = len(text.encode("utf-8"))
-    return encoded_length <= PngImagePlugin.MAX_TEXT_CHUNK
+if TYPE_CHECKING:
+    from griptape_nodes.image import GriptapeImage
 
 
 class PngMetadataDriver(BaseImageMetadataDriver):
@@ -37,21 +21,21 @@ class PngMetadataDriver(BaseImageMetadataDriver):
     """
 
     def get_supported_formats(self) -> list[str]:
-        """Return list of PIL format strings this driver supports.
+        """Return list of GriptapeImage format names this driver supports.
 
         Returns:
             List containing "PNG"
         """
         return ["PNG"]
 
-    def inject_metadata(self, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
+    def inject_metadata(self, image: GriptapeImage, metadata: dict[str, str]) -> bytes:
         """Inject metadata into PNG text chunks.
 
-        Creates PngInfo with existing text chunks and adds new metadata.
+        Writes the image's existing text chunks plus the new metadata, keeping its EXIF and color profile.
         New metadata overwrites existing keys with same name.
 
         Args:
-            pil_image: PIL Image to inject metadata into
+            image: Source PNG to inject metadata into
             metadata: Dictionary of key-value pairs to inject
 
         Returns:
@@ -60,34 +44,18 @@ class PngMetadataDriver(BaseImageMetadataDriver):
         Raises:
             Exception: On PNG save errors
         """
-        # Create PNG info object
-        png_info = PngImagePlugin.PngInfo()
-
-        # Preserve existing text chunks
-        for key, value in pil_image.info.items():
-            # Only preserve string key-value pairs (text chunks), skip binary data
-            # Don't preserve keys that will be overwritten by new metadata
-            if isinstance(key, str) and isinstance(value, str) and key not in metadata:
-                png_info.add_text(key, value, zip=_should_compress_text(value))
-
-        # Add new metadata
+        text_metadata = {key: value for key, value in image.metadata.text.items() if key not in metadata}
         for key, value in metadata.items():
-            text = str(value)
-            png_info.add_text(key, text, zip=_should_compress_text(text))
+            text_metadata[key] = str(value)
+        return image.encode(ImageFormat.PNG, metadata=replace(image.metadata, text=text_metadata))
 
-        # Save with metadata
-        output_buffer = BytesIO()
-        pil_image.save(output_buffer, format="PNG", pnginfo=png_info)
-        return output_buffer.getvalue()
-
-    def extract_metadata(self, pil_image: Image.Image) -> dict[str, str]:
+    def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract all text chunks from PNG image.
 
         Args:
-            pil_image: PIL Image to extract metadata from
+            image: Source PNG to extract metadata from
 
         Returns:
             Dictionary of all PNG text chunks, empty dict if none found
         """
-        # PIL unpacks PNG text chunks directly into pil_image.info
-        return {key: value for key, value in pil_image.info.items() if isinstance(key, str) and isinstance(value, str)}
+        return dict(image.metadata.text)

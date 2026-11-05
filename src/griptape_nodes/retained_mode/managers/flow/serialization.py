@@ -4,12 +4,10 @@ import copy
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx2
-from PIL import Image
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup
@@ -18,6 +16,7 @@ from griptape_nodes.exe_types.node_types import (
     NodeDependencies,
     VariableReference,
 )
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -1251,7 +1250,7 @@ class FlowSerialization(EngineScoped):
             raise FlowDeserializationError(msg)
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
-    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
+    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, PLR0912, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
@@ -1275,7 +1274,7 @@ class FlowSerialization(EngineScoped):
             try:
                 response = httpx2.get(file_url_or_path, timeout=30.0)
                 response.raise_for_status()
-                pil_image = Image.open(BytesIO(response.content))
+                image = GriptapeImage.open(response.content)
             except Exception as e:
                 return ExtractFlowCommandsFromImageMetadataResultFailure(
                     result_details=f"Failed to download or open image from URL: {e}",
@@ -1298,18 +1297,26 @@ class FlowSerialization(EngineScoped):
 
             # Read PNG image and extract metadata
             try:
-                pil_image = Image.open(file_url_or_path)
+                image = GriptapeImage.open(path_obj)
             except Exception as e:
                 return ExtractFlowCommandsFromImageMetadataResultFailure(
                     result_details=f"Failed to open image file: {e}",
                     file_path=file_url_or_path,
                 )
 
+        # Closed once read: a failure reading the commands can keep this frame, and the open file,
+        # alive until garbage collection, and Windows won't delete or replace an open file.
+        try:
+            metadata = image.metadata.text
+        except ValueError as e:
+            return ExtractFlowCommandsFromImageMetadataResultFailure(
+                result_details=f"Failed to read the image's metadata: {e}",
+                file_path=file_url_or_path,
+            )
+        finally:
+            image.close()
+
         # An image without embedded flow commands is a valid state, not an error.
-        metadata = pil_image.info if hasattr(pil_image, "info") else {}
-        # Closed now: a failure reading the commands can keep this frame, and the open file, alive
-        # until garbage collection, and Windows won't delete or replace an open file.
-        pil_image.close()
         if not metadata:
             return ExtractFlowCommandsFromImageMetadataResultSuccess(
                 result_details=f"Image has no metadata: {file_url_or_path}",
