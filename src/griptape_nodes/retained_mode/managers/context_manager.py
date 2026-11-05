@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import BaseNodeElement
@@ -98,13 +99,15 @@ class ContextManager(EngineScoped):
 
         _manager: ContextManager
         _flow: ControlFlow
+        _exit_flow: Callable[[], None]
 
         def __init__(self, manager: ContextManager, flow: ControlFlow):
             self._manager = manager
             self._flow = flow
 
         def __enter__(self) -> ControlFlow:
-            return self._manager.push_flow(self._flow)
+            self._exit_flow = self._manager.enter_flow(self._flow)
+            return self._flow
 
         def __exit__(
             self,
@@ -112,7 +115,7 @@ class ContextManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self._manager.pop_flow()
+            self._exit_flow()
 
     class NodeContext:
         """A context manager for a Node within a Flow."""
@@ -581,7 +584,7 @@ class ContextManager(EngineScoped):
             return False
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
         return current_flow.has_current_node()
 
     def has_current_element(self) -> bool:
@@ -590,7 +593,7 @@ class ContextManager(EngineScoped):
             return False
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
         current_node = current_flow._node_stack[-1]
         return current_node.has_current_element()
 
@@ -657,7 +660,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveFlowError(msg)
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
         return current_flow.get_current_node()
 
     def get_current_element(self) -> BaseNodeElement:
@@ -675,7 +678,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveFlowError(msg)
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "No active Node context"
@@ -811,6 +814,18 @@ class ContextManager(EngineScoped):
         self.engine.close_workflow(workflow)
         return name
 
+    def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:
+        """Push a Flow context for a `with` block and return the action that exits it.
+
+        Raises:
+            NoActiveWorkflowError: If no Workflow context is active.
+        """
+        if not self.has_current_workflow():
+            msg = f"Cannot enter a Flow context '{flow.name}' without an active Workflow context"
+            raise self.NoActiveWorkflowError(msg)
+
+        return self._current_context().enter_flow(flow)
+
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
         """Push a new Flow context onto the stack for the current Workflow.
 
@@ -863,7 +878,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveFlowError(msg)
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
         result = current_flow.push_node(node)
         return result
 
@@ -882,7 +897,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveFlowError(msg)
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
         result = current_flow.pop_node()
         return result
 
@@ -904,7 +919,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveFlowError(msg)
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "Cannot enter an Element context without an active Node context"
@@ -928,7 +943,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveFlowError(msg)
 
         current_workflow = self._current_context()
-        current_flow = current_workflow._flow_stack[-1]
+        current_flow = current_workflow.current_flow_state()
 
         if not current_flow.has_current_node():
             msg = "Cannot pop Element: no active Node context"
