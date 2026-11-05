@@ -8,7 +8,7 @@ Once every client names it, the entry goes.
 
 ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
     {
-        # The editor and the MCP server name no workflow yet.
+        # The editor names no workflow yet, nor does an MCP client that sends no header and opened none.
         "CancelAllRunsRequest",
         "CancelRunRequest",
         "EnsureWorkflowAndFlowRequest",
