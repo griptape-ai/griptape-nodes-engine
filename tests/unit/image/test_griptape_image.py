@@ -192,6 +192,18 @@ class TestReading:
         assert image._pixels is None
 
 
+    def test_pillow_reads_png_metadata_without_decoding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, PILLOW_BACKEND)
+        png = _encode(Image.new("RGB", (2, 2)), "PNG")
+
+        image = open_image(png)
+        metadata = image.metadata
+
+        assert metadata == ImageMetadata()
+        assert isinstance(image, PillowImage)
+        assert image._image._im is None
+
+
 class TestPixelDepth:
     @pytest.mark.parametrize("deep_backend", [OPENCV_BACKEND, OPENIMAGEIO_BACKEND])
     def test_keeps_sixteen_bit_color_through_a_png_round_trip(
