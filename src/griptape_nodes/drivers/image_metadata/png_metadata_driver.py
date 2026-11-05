@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
+from griptape_nodes.image import ImageFormat, ImageMetadata
 
 if TYPE_CHECKING:
     from griptape_nodes.image import GriptapeImage
@@ -42,10 +43,10 @@ class PngMetadataDriver(BaseImageMetadataDriver):
         Raises:
             Exception: On PNG save errors
         """
-        text_metadata = {key: value for key, value in image.text_metadata.items() if key not in metadata}
+        text_metadata = {key: value for key, value in image.metadata.text.items() if key not in metadata}
         for key, value in metadata.items():
             text_metadata[key] = str(value)
-        return image.encode("PNG", text_metadata=text_metadata)
+        return image.encode(ImageFormat.PNG, metadata=ImageMetadata(text=text_metadata))
 
     def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract all text chunks from PNG image.
@@ -56,4 +57,4 @@ class PngMetadataDriver(BaseImageMetadataDriver):
         Returns:
             Dictionary of all PNG text chunks, empty dict if none found
         """
-        return image.text_metadata
+        return dict(image.metadata.text)

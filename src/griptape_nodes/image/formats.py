@@ -1,16 +1,68 @@
-"""Magic-byte sniffing for common image formats."""
+"""Image container formats, and magic-byte sniffing for the common ones."""
+
+from __future__ import annotations
+
+from enum import StrEnum
 
 # The ISO BMFF brand sits at offset 8-12, the longest header inspected below.
 SNIFF_MIN_HEADER_BYTES = 12
 
-# Sniffed extension -> format name as GriptapeImage.format reports it
-_FORMAT_NAMES = {
-    "png": "PNG",
-    "jpg": "JPEG",
-    "gif": "GIF",
-    "webp": "WEBP",
-    "bmp": "BMP",
-    "tiff": "TIFF",
+
+class ImageFormat(StrEnum):
+    """An image container format.
+
+    Members are ``str`` subclasses equal to their upper-case name, so ``ImageFormat.JPEG == "JPEG"``.
+    Use ``from_name`` to turn a format name or file extension in any spelling into a member.
+    """
+
+    PNG = "PNG"
+    JPEG = "JPEG"
+    # A JPEG holding more than one frame, as some cameras write. Pillow reports it separately.
+    MPO = "MPO"
+    WEBP = "WEBP"
+    TIFF = "TIFF"
+    BMP = "BMP"
+    GIF = "GIF"
+    TGA = "TGA"
+    EXR = "EXR"
+
+    @property
+    def extension(self) -> str:
+        """The usual file extension, without a dot ("jpg" for JPEG)."""
+        return _EXTENSIONS[self]
+
+    @classmethod
+    def from_name(cls, name: str) -> ImageFormat | None:
+        """Return the format a name or file extension refers to ("jpg", ".JPEG", "tif", "targa"), or None."""
+        upper = name.strip().lstrip(".").upper()
+        upper = _ALIASES.get(upper, upper)
+        if upper not in cls.__members__:
+            return None
+        return cls[upper]
+
+
+_ALIASES = {"JPG": "JPEG", "JPE": "JPEG", "TIF": "TIFF", "TARGA": "TGA", "OPENEXR": "EXR"}
+
+_EXTENSIONS = {
+    ImageFormat.PNG: "png",
+    ImageFormat.JPEG: "jpg",
+    ImageFormat.MPO: "mpo",
+    ImageFormat.WEBP: "webp",
+    ImageFormat.TIFF: "tiff",
+    ImageFormat.BMP: "bmp",
+    ImageFormat.GIF: "gif",
+    ImageFormat.TGA: "tga",
+    ImageFormat.EXR: "exr",
+}
+
+# Sniffed extension -> format
+_SNIFFED_FORMATS = {
+    "png": ImageFormat.PNG,
+    "jpg": ImageFormat.JPEG,
+    "gif": ImageFormat.GIF,
+    "webp": ImageFormat.WEBP,
+    "bmp": ImageFormat.BMP,
+    "tiff": ImageFormat.TIFF,
 }
 
 
@@ -38,9 +90,9 @@ def sniff_image_extension(data: bytes) -> str | None:  # noqa: PLR0911
     return None
 
 
-def sniff_image_format(data: bytes) -> str | None:
-    """Return the format name (``"PNG"``, ``"JPEG"``, ...) the header of ``data`` identifies, or None."""
+def sniff_image_format(data: bytes) -> ImageFormat | None:
+    """Return the format the header of ``data`` identifies, or None."""
     extension = sniff_image_extension(data)
     if extension is None:
         return None
-    return _FORMAT_NAMES[extension]
+    return _SNIFFED_FORMATS[extension]
