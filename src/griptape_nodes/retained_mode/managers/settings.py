@@ -26,6 +26,7 @@ WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 AGENT_SKILLS_DIRECTORIES_KEY = "agent.skills_directories"
 AGENT_DISABLED_SKILLS_KEY = "agent.disabled_skills"
+DEFAULT_AGENT_SKILLS_DIRECTORY = ".agents/skills"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
 DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
 DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
@@ -514,7 +515,7 @@ class AgentSettings(BaseModel):
         description="Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
     )
     skills_directories: list[str] = Field(
-        default_factory=lambda: [".agents/skills"],
+        default_factory=lambda: [DEFAULT_AGENT_SKILLS_DIRECTORY],
         json_schema_extra={"env_var_format": "json_list"},
         description=(
             "Folders the agent loads skills from. A relative path is resolved against the workspace directory. "

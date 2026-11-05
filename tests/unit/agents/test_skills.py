@@ -257,6 +257,18 @@ class TestRemoveSkill:
 
         assert not folder.exists()
 
+    def test_removes_only_the_link_to_a_linked_skill(self, tmp_path: Path) -> None:
+        target = _write_skill(tmp_path / "elsewhere", "linked")
+        link = tmp_path / "library" / "linked"
+        link.parent.mkdir()
+        link.symlink_to(target, target_is_directory=True)
+
+        remove_skill(link)
+
+        assert not link.exists()
+        assert not link.is_symlink()
+        assert (target / "SKILL.md").is_file()
+
     def test_refuses_a_folder_that_is_not_a_skill(self, tmp_path: Path) -> None:
         (tmp_path / "other").mkdir()
 

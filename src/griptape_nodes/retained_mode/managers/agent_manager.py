@@ -63,7 +63,6 @@ from griptape_nodes.agents.pydantic_ai.tool_approval import (
     pending_tool_calls,
 )
 from griptape_nodes.agents.skills import (
-    DEFAULT_SKILLS_DIRECTORY,
     DiscoveredSkill,
     SkillWriteError,
     add_skill,
@@ -203,6 +202,11 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.retained_mode.managers.settings import (
+    AGENT_DISABLED_SKILLS_KEY,
+    AGENT_SKILLS_DIRECTORIES_KEY,
+    DEFAULT_AGENT_SKILLS_DIRECTORY,
+)
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import (
@@ -1565,20 +1569,21 @@ class AgentManager(EngineScoped):
     def _skills_directories(self) -> list[Path]:
         """The skills folders from `agent.skills_directories`, the first created if missing."""
         config = self.engine.config_manager
-        configured = config.get_config_value("agent.skills_directories", default=[DEFAULT_SKILLS_DIRECTORY])
+        configured = config.get_config_value(AGENT_SKILLS_DIRECTORIES_KEY, default=[DEFAULT_AGENT_SKILLS_DIRECTORY])
         if not isinstance(configured, list):
             logger.warning(
-                "Ignored the agent.skills_directories setting because it is not a list of folders. Using %s.",
-                DEFAULT_SKILLS_DIRECTORY,
+                "Ignored the %s setting because it is not a list of folders. Using %s.",
+                AGENT_SKILLS_DIRECTORIES_KEY,
+                DEFAULT_AGENT_SKILLS_DIRECTORY,
             )
-            configured = [DEFAULT_SKILLS_DIRECTORY]
+            configured = [DEFAULT_AGENT_SKILLS_DIRECTORY]
         directories = resolve_skills_directories([str(entry) for entry in configured], config.workspace_path)
         if directories:
             self._ensure_skills_directory(directories[0])
         return directories
 
     def _disabled_skills(self) -> list[str]:
-        configured = self.engine.config_manager.get_config_value("agent.disabled_skills", default=[])
+        configured = self.engine.config_manager.get_config_value(AGENT_DISABLED_SKILLS_KEY, default=[])
         if not isinstance(configured, list):
             return []
         return [str(name) for name in configured]
@@ -1587,11 +1592,11 @@ class AgentManager(EngineScoped):
         """Store `names` as `agent.disabled_skills`. Returns why that didn't take effect, or None when it did."""
         config = self.engine.config_manager
         # Checked first: a higher layer keeps winning the merge, so the user's copy would be saved but unused.
-        shadow = config.shadowed_by("agent.disabled_skills")
+        shadow = config.shadowed_by(AGENT_DISABLED_SKILLS_KEY)
         if shadow is not None:
             location = shadow.env_var or shadow.path or f"the {shadow.layer} settings"
-            return f"agent.disabled_skills is set by {location}, which the editor can't change"
-        if not config.set_config_value("agent.disabled_skills", names):
+            return f"{AGENT_DISABLED_SKILLS_KEY} is set by {location}, which the editor can't change"
+        if not config.set_config_value(AGENT_DISABLED_SKILLS_KEY, names):
             return "the settings file could not be saved"
         return None
 
@@ -1682,7 +1687,9 @@ class AgentManager(EngineScoped):
         if name in disabled and len(matches) == 1:
             problem = self._write_disabled_skills([entry for entry in disabled if entry != name])
             if problem is not None:
-                logger.warning("Deleted skill '%s' but left it in agent.disabled_skills, because %s.", name, problem)
+                logger.warning(
+                    "Deleted skill '%s' but left it in %s, because %s.", name, AGENT_DISABLED_SKILLS_KEY, problem
+                )
         return DeleteAgentSkillResultSuccess(result_details=f"Deleted skill '{name}' from {own[0].library}.")
 
     @handles(ListAgentProvidersRequest)

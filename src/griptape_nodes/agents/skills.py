@@ -23,6 +23,7 @@ from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     canonicalize_for_identity_preserving_symlinks,
 )
+from griptape_nodes.retained_mode.managers.settings import AGENT_SKILLS_DIRECTORIES_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
@@ -31,7 +32,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-DEFAULT_SKILLS_DIRECTORY = ".agents/skills"
 SKILL_FILE_NAME = "SKILL.md"
 
 
@@ -141,7 +141,7 @@ async def add_skill(libraries: Sequence[Path], content: str) -> DiscoveredSkill:
             already exists, or the folder cannot be written.
     """
     if not libraries:
-        msg = "No skills folder is set. Add one to the agent.skills_directories setting."
+        msg = f"No skills folder is set. Add one to the {AGENT_SKILLS_DIRECTORIES_KEY} setting."
         raise SkillWriteError(msg)
     name = _declared_name(content)
     checked = await _check_skill(name, content)
@@ -212,6 +212,8 @@ async def _refuse_taken_name(libraries: Sequence[Path], name: str, normalized: s
 def remove_skill(folder: Path) -> None:
     """Delete the skill in ``folder`` and everything it bundles.
 
+    A symlinked skill folder loses only the link, so the skill it points to is kept.
+
     Raises:
         SkillWriteError: ``folder`` is not a skill, or cannot be deleted.
     """
@@ -223,7 +225,10 @@ def remove_skill(folder: Path) -> None:
         msg = f"{folder} is not a skill folder, so it was left alone."
         raise SkillWriteError(msg)
     try:
-        shutil.rmtree(folder)
+        if folder.is_symlink():
+            folder.unlink()
+        else:
+            shutil.rmtree(folder)
     except OSError as e:
         msg = f"Could not delete {folder}: {e.strerror or e}."
         raise SkillWriteError(msg) from e
