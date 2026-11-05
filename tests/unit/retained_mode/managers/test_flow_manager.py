@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from asyncio_thread_runner import ThreadRunner
@@ -20,7 +20,10 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
+from griptape_nodes.exe_types.workflow_node_errors import SubflowNodeFailedError
+from griptape_nodes.machines.control_flow import ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagNodeCategories
+from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelAllRunsRequest,
@@ -37,12 +40,15 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartFlowRequest,
     StartFlowResultFailure,
     StartFlowResultSuccess,
+    StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     CreateFlowRequest,
     CreateFlowResultSuccess,
     DeleteFlowRequest,
+    DeleteFlowResultSuccess,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
@@ -50,10 +56,12 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
-from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
+from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_module
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager, StartFlowFromNodeSpec, StartFlowSpec
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
@@ -451,6 +459,85 @@ class TestStartFlowFailureMessage:
 
         assert isinstance(result, StartFlowFromNodeResultFailure)
         assert str(result.result_details) == "Attempted to run flow 'f'. Failed due to: boom"
+
+
+class TestStartLocalSubflowFailure:
+    """A failed subflow hands back the exception of the node that failed in it."""
+
+    @pytest.fixture
+    def resolution_machine(self) -> Mock:
+        machine = Mock(spec=ParallelResolutionMachine)
+        machine.is_errored.return_value = True
+        machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
+        return machine
+
+    @pytest.fixture
+    def subflow_failure(self) -> SubflowNodeFailedError:
+        raised = ValueError("boom")
+        return SubflowNodeFailedError("n", NodeErrorDetails(message="boom"), raised)
+
+    @pytest.fixture
+    def workflow(self) -> Mock:
+        workflow = Mock(spec=WorkflowRuntime)
+        workflow.flows = WorkflowFlows()
+        return workflow
+
+    @pytest.fixture
+    def flow_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch, resolution_machine: Mock) -> FlowManager:
+        flow_manager = engine.flow_manager
+        validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
+        start_node = Mock(spec=BaseNode)
+        start_node.name = "start"
+        subflow_machine = Mock(spec=ControlFlowMachine)
+        subflow_machine.start_flow = AsyncMock(spec=ControlFlowMachine.start_flow)
+        subflow_machine.resolution_machine = resolution_machine
+        monkeypatch.setattr(flow_manager, "get_flow_by_name_in", Mock(spec=flow_manager.get_flow_by_name_in))
+        monkeypatch.setattr(
+            flow_manager, "_flow_is_running", Mock(spec=flow_manager._flow_is_running, return_value=True)
+        )
+        validate_start_node = Mock(spec=flow_manager._validate_and_get_start_node, return_value=start_node)
+        monkeypatch.setattr(flow_manager, "_validate_and_get_start_node", validate_start_node)
+        monkeypatch.setattr(
+            flow_manager,
+            "on_validate_flow_dependencies_request",
+            AsyncMock(spec=flow_manager.on_validate_flow_dependencies_request, return_value=validated),
+        )
+        monkeypatch.setattr(
+            flow_manager_module, "ControlFlowMachine", Mock(spec=ControlFlowMachine, return_value=subflow_machine)
+        )
+        return flow_manager
+
+    @pytest.mark.asyncio
+    async def test_failure_carries_the_failing_nodes_exception(
+        self,
+        flow_manager: FlowManager,
+        workflow: Mock,
+        resolution_machine: Mock,
+        subflow_failure: SubflowNodeFailedError,
+    ) -> None:
+        resolution_machine.take_error_exception.return_value = subflow_failure
+
+        result = await flow_manager.on_start_local_subflow_request_in_workflow(
+            StartLocalSubflowRequest(flow_name="f"), workflow
+        )
+
+        assert isinstance(result, StartLocalSubflowResultFailure)
+        assert result.exception is subflow_failure
+        assert str(result.result_details) == "Node 'n' encountered a problem: boom"
+
+    @pytest.mark.asyncio
+    async def test_failure_without_a_failing_node_has_no_exception(
+        self, flow_manager: FlowManager, workflow: Mock, resolution_machine: Mock
+    ) -> None:
+        resolution_machine.take_error_exception.return_value = None
+
+        result = await flow_manager.on_start_local_subflow_request_in_workflow(
+            StartLocalSubflowRequest(flow_name="f"), workflow
+        )
+
+        assert isinstance(result, StartLocalSubflowResultFailure)
+        assert result.exception is None
+        assert str(result.result_details) == "Node 'n' encountered a problem: boom"
 
 
 class TestListNodesInFlowRequest:
@@ -1022,6 +1109,120 @@ class TestDeleteIterationFlows:
 
         for _, flow_name, _ in deserialized_flows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None
+
+
+class TestGetEnclosingFlow:
+    """`get_enclosing_flow` steps up to the owner of an iteration flow, and to the parent for any other flow."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_returns_the_parent_for_an_ordinary_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_parent_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        assert engine.flow_manager.get_enclosing_flow(engine.current_workflow(), child.flow_name) == top.flow_name
+        assert engine.flow_manager.get_enclosing_flow(engine.current_workflow(), top.flow_name) is None
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_returns_the_owner_for_an_iteration_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_owner_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        owner = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="owner", set_as_new_context=False)
+        )
+        assert isinstance(owner, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, owner.flow_name)
+
+        assert flow_manager.get_enclosing_flow(engine.current_workflow(), iteration.flow_name) == owner.flow_name
+        # The parent link is left alone.
+        assert flow_manager.get_parent_flow_in(engine.current_workflow(), iteration.flow_name) == top.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_iteration_flow_forgets_its_owner(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_delete_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, top.flow_name)
+
+        delete_result = engine.handle_request(DeleteFlowRequest(flow_name=iteration.flow_name))
+
+        assert isinstance(delete_result, DeleteFlowResultSuccess), delete_result
+        assert iteration.flow_name not in engine.current_workflow().flows.iteration_flow_to_owner_flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_ignores_an_owner_that_is_no_longer_a_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_stale_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, "gone_flow")
+
+        assert flow_manager.get_enclosing_flow(engine.current_workflow(), iteration.flow_name) == top.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_owner_flow_forgets_the_entries_that_point_to_it(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_delete_owner_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        owner = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="owner", set_as_new_context=False)
+        )
+        assert isinstance(owner, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, owner.flow_name)
+
+        delete_result = engine.handle_request(DeleteFlowRequest(flow_name=owner.flow_name))
+
+        assert isinstance(delete_result, DeleteFlowResultSuccess), delete_result
+        assert iteration.flow_name not in engine.current_workflow().flows.iteration_flow_to_owner_flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_renaming_a_flow_renames_it_as_an_iteration_flow_and_as_an_owner(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine.context_manager.push_workflow("enclosing_rename_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        monkeypatch.setattr(
+            engine.node_manager, "handle_flow_rename", Mock(spec=engine.node_manager.handle_flow_rename)
+        )
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), top.flow_name, "owner_a")
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), "iteration_b", top.flow_name)
+
+        flow_manager.handle_flow_rename(engine.current_workflow(), top.flow_name, "top_renamed")
+        try:
+            assert engine.current_workflow().flows.iteration_flow_to_owner_flow_name == {
+                "top_renamed": "owner_a",
+                "iteration_b": "top_renamed",
+            }
+        finally:
+            # Only the manager's maps were renamed, so put the name back for the object cleanup.
+            flow_manager.handle_flow_rename(engine.current_workflow(), "top_renamed", top.flow_name)
 
 
 class TestReparentFlow:
