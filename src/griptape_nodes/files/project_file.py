@@ -100,6 +100,22 @@ class ProjectFileDestination(FileDestination):
         Raises:
             ValueError: If the filename is a URL that names no local file.
         """
+        return cls._from_situation(filename, situation, None, **extra_vars)
+
+    @classmethod
+    def _from_situation(
+        cls,
+        filename: str,
+        situation: str,
+        workflow: "WorkflowRuntime | None",
+        /,
+        **extra_vars: str | int,
+    ) -> "ProjectFileDestination":
+        """`from_situation`, looking the situation up and writing in `workflow`.
+
+        `workflow` is positional-only so a macro variable named `workflow` stays in `extra_vars`.
+        None looks up and writes as the caller is bound.
+        """
         # Classify the input before any path handling: FilenameParts.from_filename is a
         # plain Path() split with no URL awareness, so a URL that reaches it is mangled
         # rather than rejected. `file:///something.png` split that way yields
@@ -161,7 +177,7 @@ class ProjectFileDestination(FileDestination):
             # bypass an absolute filename takes below.
             filename = local_path_from_uri
 
-        resolved = resolve_situation(situation, FALLBACK_MACRO_TEMPLATE)
+        resolved = resolve_situation(situation, FALLBACK_MACRO_TEMPLATE, workflow=workflow)
         situation_obj = resolved.situation_obj
         existing_file_policy = resolved.existing_file_policy
         create_dirs = resolved.create_parents
@@ -184,6 +200,7 @@ class ProjectFileDestination(FileDestination):
                 existing_file_policy=existing_file_policy,
                 create_parents=create_dirs,
                 file_metadata=None,
+                workflow=workflow,
             )
 
         variables: dict[str, str | int] = {
@@ -227,4 +244,5 @@ class ProjectFileDestination(FileDestination):
             existing_file_policy=existing_file_policy,
             create_parents=create_dirs,
             file_metadata=file_metadata,
+            workflow=workflow,
         )

@@ -135,7 +135,7 @@ class ProjectOutputParameter(abc.ABC):
         """Return the destination from the first connected upstream node that implements ``provider_type``.
 
         Returns None if no connected node implements the provider protocol. The provider builds
-        the destination in the node's workflow (see `_in_node_workflow`).
+        the destination with the node's workflow bound (see `_in_node_workflow`).
 
         Args:
             provider_type: ``runtime_checkable`` Protocol the upstream node must satisfy
@@ -266,9 +266,11 @@ class ProjectOutputParameter(abc.ABC):
     def _in_node_workflow(self) -> Iterator[None]:
         """Bind the node's workflow for the block, so a destination built in it keeps that workflow.
 
-        A destination keeps the workflow it was built in, and writes there from any thread. Node
-        code can build one on a plain thread or in a thread pool, which do not carry the node's
-        binding. A node in no workflow builds as the calling code is bound.
+        Only for upstream providers such as `FileOutputSettings`, which live in node libraries and
+        build their destination without naming a workflow. The builders here pass the node's
+        workflow explicitly. Without the binding, a provider called from a plain thread or a
+        thread pool would build a destination with no workflow. A node in no workflow builds as
+        the calling code is bound.
         """
         workflow = self._node.workflow
         if workflow is None:

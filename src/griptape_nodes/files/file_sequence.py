@@ -23,7 +23,6 @@ from griptape_nodes.common.sequences import scan as sequences_scan
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import file as file_mod
 from griptape_nodes.files import project_file, workflow_requests
-from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
 
 if typing.TYPE_CHECKING:
@@ -383,6 +382,7 @@ def build_versioned_sequence_destination(
     *,
     existing_file_policy: os_events.ExistingFilePolicy = os_events.ExistingFilePolicy.OVERWRITE,
     create_parents: bool = True,
+    workflow: WorkflowRuntime | None = None,
 ) -> FileSequenceDestination:
     """Find the next available version index and return a locked FileSequenceDestination.
 
@@ -394,6 +394,8 @@ def build_versioned_sequence_destination(
             variable for versioning.
         existing_file_policy: Policy for individual entry files. Defaults to OVERWRITE.
         create_parents: Whether to create parent directories. Defaults to True.
+        workflow: The workflow to version and write in. Defaults to the workflow the calling
+            code is bound to (see ``File``).
 
     Returns:
         FileSequenceDestination with a locked _index version. When the template has no
@@ -414,10 +416,11 @@ def build_versioned_sequence_destination(
             macro_path,
             existing_file_policy=existing_file_policy,
             create_parents=create_parents,
+            workflow=workflow,
         )
 
-    index_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-        os_events.GetNextVersionIndexRequest(macro_path=dir_macro)
+    index_result = workflow_requests.handle_request_in(
+        workflow, os_events.GetNextVersionIndexRequest(macro_path=dir_macro)
     )
     if not isinstance(index_result, os_events.GetNextVersionIndexResultSuccess):
         msg = (
@@ -432,6 +435,7 @@ def build_versioned_sequence_destination(
         locked_macro,
         existing_file_policy=existing_file_policy,
         create_parents=create_parents,
+        workflow=workflow,
     )
 
 

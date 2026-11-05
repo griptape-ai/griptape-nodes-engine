@@ -279,8 +279,16 @@ class File:
     For a pre-configured write handle with baked-in write policy, use
     ``FileDestination`` instead.
 
-    Macros resolve in the workflow the file was built for, so a File built in node code and read
-    or written from a plain thread or a thread pool still acts on the node's workflow.
+    Which workflow a File acts on:
+
+    - Built with ``workflow=``, or where a workflow is bound (node code in ``process()`` or
+      ``aprocess()``): that workflow, from any thread. A File built in node code and written
+      from a plain thread or a thread pool still writes in the node's workflow.
+    - Built where none is bound (a plain thread, host code, a node's ``__init__``): no workflow
+      is kept, and each read or write acts as the code calling it is bound. The same File then
+      writes in the node's workflow when ``aprocess()`` uses it, and needs no workflow for a
+      plain path read on the host. Called from a plain thread while several workflows are open,
+      a macro path fails instead of guessing which workflow was meant.
     """
 
     def __init__(
@@ -303,8 +311,7 @@ class File:
             file_metadata: Optional caller-provided context to include in the sidecar
                 metadata file alongside auto-collected workflow metadata.
             workflow: The workflow to resolve macros and send requests in. Defaults to the
-                workflow the calling code is bound to. A File built where none is bound acts as
-                the code using it is bound.
+                workflow the calling code is bound to, or none (see the class docstring).
         """
         self._file_metadata = file_metadata
         self._workflow = workflow if workflow is not None else workflow_building_now()

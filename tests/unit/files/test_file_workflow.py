@@ -14,7 +14,6 @@ from unittest import mock
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.exe_types.param_components import project_directory_parameter, project_file_sequence_parameter
 from griptape_nodes.exe_types.param_components.project_directory_parameter import ProjectDirectoryParameter
 from griptape_nodes.exe_types.param_components.project_file_parameter import ProjectFileParameter
 from griptape_nodes.exe_types.param_components.project_file_sequence_parameter import ProjectFileSequenceParameter
@@ -23,12 +22,19 @@ from griptape_nodes.files.file import File, FileDestination
 from griptape_nodes.files.file_sequence import FileSequence, FileSequenceDestination
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events import connection_events
-from griptape_nodes.retained_mode.events.os_events import WriteFileRequest, WriteFileResultSuccess
+from griptape_nodes.retained_mode.events.os_events import (
+    GetNextVersionIndexRequest,
+    GetNextVersionIndexResultSuccess,
+    WriteFileRequest,
+    WriteFileResultSuccess,
+)
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultFailure,
     MacroPath,
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
@@ -58,6 +64,10 @@ class _RecordingWorkflow:
             return WriteFileResultSuccess(result_details="ok", final_file_path=self.folder, bytes_written=3)
         if isinstance(request, AttemptMapAbsolutePathToProjectRequest):
             return AttemptMapAbsolutePathToProjectResultSuccess(result_details="ok", mapped_path=None)
+        if isinstance(request, GetSituationRequest):
+            return GetSituationResultFailure(result_details="no project situations")
+        if isinstance(request, GetNextVersionIndexRequest):
+            return GetNextVersionIndexResultSuccess(result_details="ok", index=1)
         msg = f"Unexpected {type(request).__name__}"
         raise AssertionError(msg)
 
@@ -201,6 +211,7 @@ class TestBuildFile:
 
         destination = _in_raw_thread(parameter.build_file)
 
+        assert [type(request) for request in a.requests] == [GetSituationRequest]
         assert destination.workflow is a.runtime
 
     def test_an_upstream_destination_built_on_a_raw_thread_writes_in_the_nodes_workflow(self, engine: Engine) -> None:
@@ -229,34 +240,22 @@ class TestBuildFile:
 
 
 class TestTheOtherBuilders:
-    """`build_directory` and `build_sequence` build bound to the node's workflow, so their destinations keep it."""
+    """`build_directory` and `build_sequence` look the situation up and build in the node's workflow."""
 
     def test_build_directory_builds_in_the_nodes_workflow_on_a_raw_thread(self, engine: Engine) -> None:
         a = _RecordingWorkflow("/a/renders")
-        seen: list[object] = []
-
-        def build(*_args: object, **_kwargs: object) -> DirectoryDestination:
-            seen.append(bound_workflow.get())
-            return DirectoryDestination("{outputs}/renders")
-
         parameter = ProjectDirectoryParameter(_saver_node(engine, a), "output_dir", default_dirname="renders")
-        with mock.patch.object(project_directory_parameter, "_build_directory_destination_from_situation", build):
-            destination = _in_raw_thread(parameter.build_directory)
 
-        assert seen == [a.runtime]
+        destination = _in_raw_thread(parameter.build_directory)
+
+        assert [type(request) for request in a.requests] == [GetSituationRequest]
         assert Path(destination.resolve()) == Path("/a/renders")
 
     def test_build_sequence_builds_in_the_nodes_workflow_on_a_raw_thread(self, engine: Engine) -> None:
         a = _RecordingWorkflow("/a/frames/####.png")
-        seen: list[object] = []
-
-        def build(*_args: object, **_kwargs: object) -> FileSequenceDestination:
-            seen.append(bound_workflow.get())
-            return FileSequenceDestination(_sequence_macro())
-
         parameter = ProjectFileSequenceParameter(_saver_node(engine, a), "output_frames", default_filename="f.png")
-        with mock.patch.object(project_file_sequence_parameter, "_build_sequence_destination_from_situation", build):
-            destination = _in_raw_thread(parameter.build_sequence)
 
-        assert seen == [a.runtime]
+        destination = _in_raw_thread(parameter.build_sequence)
+
+        assert [type(request) for request in a.requests] == [GetSituationRequest, GetNextVersionIndexRequest]
         assert destination.entry(7).workflow is a.runtime

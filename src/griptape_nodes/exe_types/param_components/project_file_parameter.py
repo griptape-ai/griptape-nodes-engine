@@ -116,9 +116,9 @@ class ProjectFileParameter(ProjectOutputParameter):
         if "node_name" not in extra_vars:
             extra_vars["node_name"] = self._node.name
 
-        with self._in_node_workflow():
-            return ProjectFileDestination.from_situation(
-                filename,
-                self._situation_name,
-                **extra_vars,
-            )
+        return ProjectFileDestination._from_situation(
+            filename,
+            self._situation_name,
+            self._node.workflow,
+            **extra_vars,
+        )
