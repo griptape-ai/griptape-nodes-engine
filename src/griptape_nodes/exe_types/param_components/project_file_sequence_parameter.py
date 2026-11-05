@@ -93,6 +93,9 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
         Returns:
             FileSequenceDestination with a versioned MacroPath and baked-in policy.
 
+        Either way the destination writes in the node's workflow, so it can be built and used
+        from any thread.
+
         Raises:
             ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None.
             FileSequenceError: If no available version index can be found.
@@ -108,7 +111,8 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
         value = self._node.get_parameter_value(self._name)
         filename = value if isinstance(value, str) and value else self._default_value
 
-        return _build_sequence_destination_from_situation(filename, self._situation_name, **extra_vars)
+        with self._in_node_workflow():
+            return _build_sequence_destination_from_situation(filename, self._situation_name, **extra_vars)
 
 
 def _build_sequence_destination_from_situation(

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, cast, runtime_checkable
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.files.path_utils import (
@@ -18,6 +19,7 @@ from griptape_nodes.files.path_utils import (
     resolve_file_path,
     resolve_path_safely,
 )
+from griptape_nodes.files.workflow_requests import ahandle_request_in, handle_request_in, workflow_building_now
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
@@ -40,7 +42,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SidecarContent,
     SituationMetadata,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -118,11 +119,12 @@ def file_load_error_from_result(result: ResultPayload) -> FileLoadError:
     )
 
 
-def _resolve_macro_path(macro_path: MacroPath) -> str:
+def _resolve_macro_path(macro_path: MacroPath, workflow: WorkflowRuntime | None) -> str:
     """Dispatch GetPathForMacroRequest and return the resolved absolute path string.
 
     Args:
         macro_path: The MacroPath to resolve.
+        workflow: The workflow to resolve it in, or None to resolve it as the caller is bound.
 
     Returns:
         Resolved absolute path string.
@@ -130,29 +132,30 @@ def _resolve_macro_path(macro_path: MacroPath) -> str:
     Raises:
         FileLoadError: If macro resolution fails.
     """
-    result = GriptapeNodes.handle_request(
-        GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
+    result = handle_request_in(
+        workflow, GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
     if not isinstance(result, GetPathForMacroResultSuccess):
         raise file_load_error_from_result(result)
     return str(result.absolute_path)
 
 
-async def _aresolve_macro_path(macro_path: MacroPath) -> str:
+async def _aresolve_macro_path(macro_path: MacroPath, workflow: WorkflowRuntime | None) -> str:
     """Async version of _resolve_macro_path."""
-    result = await GriptapeNodes.ahandle_request(
-        GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
+    result = await ahandle_request_in(
+        workflow, GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
     if not isinstance(result, GetPathForMacroResultSuccess):
         raise file_load_error_from_result(result)
     return str(result.absolute_path)
 
 
-def _resolve_file_path(file_path: str | MacroPath) -> str:
+def _resolve_file_path(file_path: str | MacroPath, workflow: WorkflowRuntime | None) -> str:
     """Resolve a file path, handling MacroPath resolution if needed.
 
     Args:
         file_path: A plain path string or a MacroPath.
+        workflow: The workflow to resolve a MacroPath in, or None to resolve it as the caller is bound.
 
     Returns:
         A resolved path string.
@@ -162,14 +165,15 @@ def _resolve_file_path(file_path: str | MacroPath) -> str:
     """
     if isinstance(file_path, str):
         return file_path
-    return _resolve_macro_path(file_path)
+    return _resolve_macro_path(file_path, workflow)
 
 
-async def _aresolve_file_path(file_path: str | MacroPath) -> str:
+async def _aresolve_file_path(file_path: str | MacroPath, workflow: WorkflowRuntime | None) -> str:
     """Async version of _resolve_file_path.
 
     Args:
         file_path: A plain path string or a MacroPath.
+        workflow: The workflow to resolve a MacroPath in, or None to resolve it as the caller is bound.
 
     Returns:
         A resolved path string.
@@ -179,7 +183,7 @@ async def _aresolve_file_path(file_path: str | MacroPath) -> str:
     """
     if isinstance(file_path, str):
         return file_path
-    return await _aresolve_macro_path(file_path)
+    return await _aresolve_macro_path(file_path, workflow)
 
 
 def _resolve_plain_path(path_str: str) -> str:
@@ -274,6 +278,9 @@ class File:
 
     For a pre-configured write handle with baked-in write policy, use
     ``FileDestination`` instead.
+
+    Macros resolve in the workflow the file was built for, so a File built in node code and read
+    or written from a plain thread or a thread pool still acts on the node's workflow.
     """
 
     def __init__(
@@ -281,6 +288,7 @@ class File:
         file_path: str | MacroPath,
         *,
         file_metadata: SidecarContent | None = None,
+        workflow: WorkflowRuntime | None = None,
     ) -> None:
         """Store file reference. No I/O is performed.
 
@@ -294,8 +302,12 @@ class File:
                 (which contains macro variables).
             file_metadata: Optional caller-provided context to include in the sidecar
                 metadata file alongside auto-collected workflow metadata.
+            workflow: The workflow to resolve macros and send requests in. Defaults to the
+                workflow the calling code is bound to. A File built where none is bound acts as
+                the code using it is bound.
         """
         self._file_metadata = file_metadata
+        self._workflow = workflow if workflow is not None else workflow_building_now()
         if isinstance(file_path, str):
             try:
                 parsed = ParsedMacro(file_path)
@@ -338,7 +350,7 @@ class File:
             FileLoadError: If macro resolution fails (e.g. no project loaded).
         """
         if isinstance(self._file_path, MacroPath):
-            return _resolve_macro_path(self._file_path)
+            return _resolve_macro_path(self._file_path, self._workflow)
         return _resolve_plain_path(self._file_path)
 
     @property
@@ -351,6 +363,11 @@ class File:
         if isinstance(self._file_path, MacroPath):
             return self._file_path.parsed_macro.template
         return self._file_path
+
+    @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The workflow this file resolves macros and sends requests in, or None for the caller's."""
+        return self._workflow
 
     @property
     def name(self) -> str:
@@ -637,13 +654,13 @@ class File:
             FileLoadError: If the file cannot be read.
         """
         request = ReadFileRequest(
-            file_path=_resolve_file_path(self._file_path),
+            file_path=_resolve_file_path(self._file_path, self._workflow),
             encoding=encoding,
             should_transform_image_content_to_thumbnail=False,
             # The failure is raised as FileLoadError for the caller to report.
             failure_log_level=logging.DEBUG,
         )
-        result = GriptapeNodes.handle_request(request)
+        result = handle_request_in(self._workflow, request)
 
         if isinstance(result, ReadFileResultFailure):
             raise FileLoadError(
@@ -669,12 +686,12 @@ class File:
             FileLoadError: If the file cannot be read.
         """
         request = ReadFileRequest(
-            file_path=await _aresolve_file_path(self._file_path),
+            file_path=await _aresolve_file_path(self._file_path, self._workflow),
             encoding=encoding,
             should_transform_image_content_to_thumbnail=False,
             failure_log_level=logging.DEBUG,
         )
-        result = await GriptapeNodes.ahandle_request(request)
+        result = await ahandle_request_in(self._workflow, request)
 
         if isinstance(result, ReadFileResultFailure):
             raise FileLoadError(
@@ -735,7 +752,7 @@ class File:
             file_metadata=self._build_file_metadata(),
             coerce_extension_to_match_bytes=coerce_extension_to_match_bytes,
         )
-        result = GriptapeNodes.handle_request(request)
+        result = handle_request_in(self._workflow, request)
 
         if isinstance(result, WriteFileResultFailure):
             raise FileWriteError(
@@ -787,7 +804,7 @@ class File:
             file_metadata=self._build_file_metadata(),
             coerce_extension_to_match_bytes=coerce_extension_to_match_bytes,
         )
-        result = await GriptapeNodes.ahandle_request(request)
+        result = await ahandle_request_in(self._workflow, request)
 
         if isinstance(result, WriteFileResultFailure):
             raise FileWriteError(
@@ -836,6 +853,7 @@ class FileDestination:
         create_parents: bool = True,
         file_metadata: SidecarContent | None = None,
         coerce_extension_to_match_bytes: bool = True,
+        workflow: WorkflowRuntime | None = None,
     ) -> None:
         """Store file path and write configuration. No I/O is performed.
 
@@ -853,8 +871,10 @@ class FileDestination:
                 rewrites the on-disk suffix to match the sniffed bytes when
                 they disagree. If False, the write fails with an
                 ``EXTENSION_MISMATCH`` error and no file is left on disk.
+            workflow: The workflow to write in. Defaults to the workflow the calling code is
+                bound to (see ``File``).
         """
-        self._file = File(file_path, file_metadata=file_metadata)
+        self._file = File(file_path, file_metadata=file_metadata, workflow=workflow)
         self._existing_file_policy = existing_file_policy
         self._append = append
         self._create_parents = create_parents
@@ -876,6 +896,11 @@ class FileDestination:
     @property
     def location(self) -> str:
         return self._file.location
+
+    @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The workflow this destination writes in, or None for the caller's."""
+        return self._file.workflow
 
     @property
     def existing_file_policy(self) -> ExistingFilePolicy:
@@ -905,7 +930,7 @@ class FileDestination:
             create_parents=self._create_parents,
             coerce_extension_to_match_bytes=self._coerce_extension_to_match_bytes,
         )
-        return File(str(path))
+        return File(str(path), workflow=self._file.workflow)
 
     async def awrite_bytes(self, content: bytes) -> File:
         """Async version of write_bytes().
@@ -926,7 +951,7 @@ class FileDestination:
             create_parents=self._create_parents,
             coerce_extension_to_match_bytes=self._coerce_extension_to_match_bytes,
         )
-        return File(str(path))
+        return File(str(path), workflow=self._file.workflow)
 
     def write_text(self, content: str, encoding: str = "utf-8") -> File:
         """Write text to the file using the configured write policy.
@@ -948,7 +973,7 @@ class FileDestination:
             append=self._append,
             create_parents=self._create_parents,
         )
-        return File(str(path))
+        return File(str(path), workflow=self._file.workflow)
 
     async def awrite_text(self, content: str, encoding: str = "utf-8") -> File:
         """Async version of write_text().
@@ -970,7 +995,7 @@ class FileDestination:
             append=self._append,
             create_parents=self._create_parents,
         )
-        return File(str(path))
+        return File(str(path), workflow=self._file.workflow)
 
 
 @runtime_checkable

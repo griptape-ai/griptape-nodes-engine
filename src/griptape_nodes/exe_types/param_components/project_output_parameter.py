@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import typing
 
 from griptape_nodes.exe_types import core_types
@@ -11,7 +12,7 @@ from griptape_nodes.retained_mode.events import connection_events
 from griptape_nodes.traits import button as button_mod
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from griptape_nodes.exe_types import node_types
 
@@ -133,7 +134,8 @@ class ProjectOutputParameter(abc.ABC):
     ) -> DestinationT | None:
         """Return the destination from the first connected upstream node that implements ``provider_type``.
 
-        Returns None if no connected node implements the provider protocol.
+        Returns None if no connected node implements the provider protocol. The provider builds
+        the destination in the node's workflow (see `_in_node_workflow`).
 
         Args:
             provider_type: ``runtime_checkable`` Protocol the upstream node must satisfy
@@ -151,13 +153,15 @@ class ProjectOutputParameter(abc.ABC):
         if not isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
             return None
 
+        workflow = self._node._require_workflow()
         for conn in result.incoming_connections:
             if conn.target_parameter_name != self._name:
                 continue
-            source_node = self._node._require_workflow().objects.get(conn.source_node_name)
+            source_node = workflow.objects.get(conn.source_node_name)
             if not isinstance(source_node, provider_type):
                 continue
-            destination = get_destination(source_node)
+            with self._in_node_workflow():
+                destination = get_destination(source_node)
             if destination is None:
                 msg = (
                     f"Attempted to build {destination_type_name} for {self._node.name}.{self._name}. "
@@ -257,3 +261,18 @@ class ProjectOutputParameter(abc.ABC):
             response=button_details,
             altered_workflow_state=True,
         )
+
+    @contextlib.contextmanager
+    def _in_node_workflow(self) -> Iterator[None]:
+        """Bind the node's workflow for the block, so a destination built in it keeps that workflow.
+
+        A destination keeps the workflow it was built in, and writes there from any thread. Node
+        code can build one on a plain thread or in a thread pool, which do not carry the node's
+        binding. A node in no workflow builds as the calling code is bound.
+        """
+        workflow = self._node.workflow
+        if workflow is None:
+            yield
+            return
+        with self._node.engine.bind_workflow(workflow):
+            yield

@@ -22,12 +22,14 @@ from griptape_nodes.common import macro_parser, sequences
 from griptape_nodes.common.sequences import scan as sequences_scan
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import file as file_mod
-from griptape_nodes.files import project_file
+from griptape_nodes.files import project_file, workflow_requests
 from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
 
 if typing.TYPE_CHECKING:
     import collections.abc
+
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class FileSequenceError(Exception):
@@ -76,7 +78,9 @@ def strip_sequence_token(stem: str) -> str:
     return base
 
 
-def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int) -> str:
+def _resolve_entry_path(
+    macro_path: project_events.MacroPath, entry_number: int, workflow: WorkflowRuntime | None
+) -> str:
     """Resolve macro variables then use fileseq to format the entry number.
 
     Supports all sequence token formats fileseq understands: ``####``,
@@ -85,6 +89,7 @@ def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int)
     Args:
         macro_path: MacroPath whose template contains a sequence token slot.
         entry_number: Frame/entry index to substitute.
+        workflow: The workflow to resolve the macro in, or None to resolve it as the caller is bound.
 
     Returns:
         Absolute path string for the given entry.
@@ -92,11 +97,12 @@ def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int)
     Raises:
         FileSequenceError: If the macro path cannot be resolved.
     """
-    resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+    resolve_result = workflow_requests.handle_request_in(
+        workflow,
         project_events.GetPathForMacroRequest(
             parsed_macro=macro_path.parsed_macro,
             variables=macro_path.variables,
-        )
+        ),
     )
     if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
         msg = f"Attempted to get entry {entry_number}. Failed to resolve sequence path: {resolve_result.result_details}"
@@ -119,17 +125,22 @@ class FileSequence:
 
     Use ``entry(n)`` to get a ``File`` for reading a specific entry, and
     ``scan()`` to discover what is present on disk.
+
+    Macros resolve in the workflow the sequence was built for (see ``File``).
     """
 
-    def __init__(self, macro_path: project_events.MacroPath) -> None:
+    def __init__(self, macro_path: project_events.MacroPath, *, workflow: WorkflowRuntime | None = None) -> None:
         """Store the hash-pattern macro. No I/O is performed.
 
         Args:
             macro_path: MacroPath whose template contains a ``####`` slot and
                 whose variables dict holds all resolved values (including a
                 locked ``_index`` when versioning is in effect).
+            workflow: The workflow to resolve macros in. Defaults to the workflow the calling
+                code is bound to (see ``File``).
         """
         self._macro_path = macro_path
+        self._workflow = workflow if workflow is not None else workflow_requests.workflow_building_now()
 
     @property
     def location(self) -> str:
@@ -153,7 +164,8 @@ class FileSequence:
         """
         dir_template = str(pathlib.PurePosixPath(self.location).parent)
         return directory_mod.Directory(
-            project_events.MacroPath(macro_parser.ParsedMacro(dir_template), self._macro_path.variables)
+            project_events.MacroPath(macro_parser.ParsedMacro(dir_template), self._macro_path.variables),
+            workflow=self._workflow,
         )
 
     def entry(self, entry_number: int) -> file_mod.File:
@@ -168,7 +180,9 @@ class FileSequence:
         Raises:
             FileSequenceError: If the macro path cannot be resolved.
         """
-        return file_mod.File(_resolve_entry_path(self._macro_path, entry_number))
+        return file_mod.File(
+            _resolve_entry_path(self._macro_path, entry_number, self._workflow), workflow=self._workflow
+        )
 
     def scan(
         self,
@@ -195,22 +209,24 @@ class FileSequence:
         Raises:
             FileSequenceError: If the macro path cannot be resolved.
         """
-        resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+        resolve_result = workflow_requests.handle_request_in(
+            self._workflow,
             project_events.GetPathForMacroRequest(
                 parsed_macro=self._macro_path.parsed_macro,
                 variables=self._macro_path.variables,
-            )
+            ),
         )
         if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
             msg = f"Attempted to scan sequence. Failed to resolve macro path: {resolve_result.result_details}"
             raise FileSequenceError(msg)
-        scan_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+        scan_result = workflow_requests.handle_request_in(
+            self._workflow,
             os_events.ScanSequencesRequest(
                 path=str(resolve_result.absolute_path),
                 policy=policy,
                 start_number=start,
                 end_number=end,
-            )
+            ),
         )
         if not isinstance(scan_result, os_events.ScanSequencesResultSuccess):
             msg = f"Attempted to scan sequence. Failed to scan path '{resolve_result.absolute_path}': {scan_result.result_details}"
@@ -228,11 +244,13 @@ class _EntryWriteDestination(project_file.ProjectFileDestination):
         existing_file_policy: os_events.ExistingFilePolicy,
         create_parents: bool,
         on_written: collections.abc.Callable[[file_mod.File], None],
+        workflow: WorkflowRuntime | None = None,
     ) -> None:
         super().__init__(
             entry_path,
             existing_file_policy=existing_file_policy,
             create_parents=create_parents,
+            workflow=workflow,
         )
         self._on_written = on_written
 
@@ -273,6 +291,7 @@ class FileSequenceDestination:
         *,
         existing_file_policy: os_events.ExistingFilePolicy = os_events.ExistingFilePolicy.OVERWRITE,
         create_parents: bool = True,
+        workflow: WorkflowRuntime | None = None,
     ) -> None:
         """Store the hash-pattern macro and write configuration. No I/O is performed.
 
@@ -282,8 +301,11 @@ class FileSequenceDestination:
                 when versioning is in effect.
             existing_file_policy: How to handle existing entry files. Defaults to OVERWRITE.
             create_parents: If True, create parent directories automatically. Defaults to True.
+            workflow: The workflow to write in. Defaults to the workflow the calling code is
+                bound to (see ``File``).
         """
         self._macro_path = macro_path
+        self._workflow = workflow if workflow is not None else workflow_requests.workflow_building_now()
         self._existing_file_policy = existing_file_policy
         self._create_parents = create_parents
         self._written_sequence: FileSequence | None = None
@@ -321,16 +343,18 @@ class FileSequenceDestination:
             existing_file_policy=self._existing_file_policy,
             create_parents=self._create_parents,
             on_written=self._on_entry_written,
+            workflow=self._workflow,
         )
 
     def _resolve_fseq(self) -> fileseq_filesequence.FileSequence:
         """Resolve the macro path to a fileseq FileSequence, caching the result."""
         if self._fseq is None:
-            resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+            resolve_result = workflow_requests.handle_request_in(
+                self._workflow,
                 project_events.GetPathForMacroRequest(
                     parsed_macro=self._macro_path.parsed_macro,
                     variables=self._macro_path.variables,
-                )
+                ),
             )
             if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
                 msg = f"Attempted to prepare sequence for writing. Failed to resolve macro path: {resolve_result.result_details}"
@@ -351,7 +375,7 @@ class FileSequenceDestination:
     def _on_entry_written(self, written_file: file_mod.File) -> None:  # noqa: ARG002
         """Record that an entry was written to expose the FileSequence descriptor."""
         if self._written_sequence is None:
-            self._written_sequence = FileSequence(self._macro_path)
+            self._written_sequence = FileSequence(self._macro_path, workflow=self._workflow)
 
 
 def build_versioned_sequence_destination(
