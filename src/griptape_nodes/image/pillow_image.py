@@ -116,11 +116,18 @@ class PillowImage(GriptapeImage):
             text = {
                 key: value for key, value in self._image.info.items() if isinstance(key, str) and isinstance(value, str)
             }
-        pillow_exif = self._image.getexif()
         exif = None
+        pillow_exif = self._pillow_exif()
         if pillow_exif:
             exif = Exif.from_bytes(pillow_exif.tobytes())
         return ImageMetadata(text=text, exif=exif)
+
+    def _pillow_exif(self) -> Image.Exif | None:
+        # A PNG's getexif() decodes every pixel looking for an eXIf chunk after IDAT. The text
+        # above is read only from chunks before IDAT too, so keep to those.
+        if self._format == ImageFormat.PNG and "exif" not in self._image.info:
+            return None
+        return self._image.getexif()
 
     def close(self) -> None:
         self._image.close()
