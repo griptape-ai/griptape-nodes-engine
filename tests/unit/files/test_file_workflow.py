@@ -14,7 +14,10 @@ from unittest import mock
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.exe_types.param_components import project_directory_parameter, project_file_sequence_parameter
+from griptape_nodes.exe_types.param_components.project_directory_parameter import ProjectDirectoryParameter
 from griptape_nodes.exe_types.param_components.project_file_parameter import ProjectFileParameter
+from griptape_nodes.exe_types.param_components.project_file_sequence_parameter import ProjectFileSequenceParameter
 from griptape_nodes.files.directory import Directory, DirectoryDestination
 from griptape_nodes.files.file import File, FileDestination
 from griptape_nodes.files.file_sequence import FileSequence, FileSequenceDestination
@@ -223,3 +226,37 @@ class TestBuildFile:
         destination = _in_raw_thread(parameter.build_file)
 
         assert destination.workflow is a.runtime
+
+
+class TestTheOtherBuilders:
+    """`build_directory` and `build_sequence` build bound to the node's workflow, so their destinations keep it."""
+
+    def test_build_directory_builds_in_the_nodes_workflow_on_a_raw_thread(self, engine: Engine) -> None:
+        a = _RecordingWorkflow("/a/renders")
+        seen: list[object] = []
+
+        def build(*_args: object, **_kwargs: object) -> DirectoryDestination:
+            seen.append(bound_workflow.get())
+            return DirectoryDestination("{outputs}/renders")
+
+        parameter = ProjectDirectoryParameter(_saver_node(engine, a), "output_dir", default_dirname="renders")
+        with mock.patch.object(project_directory_parameter, "_build_directory_destination_from_situation", build):
+            destination = _in_raw_thread(parameter.build_directory)
+
+        assert seen == [a.runtime]
+        assert destination.resolve() == "/a/renders"
+
+    def test_build_sequence_builds_in_the_nodes_workflow_on_a_raw_thread(self, engine: Engine) -> None:
+        a = _RecordingWorkflow("/a/frames/####.png")
+        seen: list[object] = []
+
+        def build(*_args: object, **_kwargs: object) -> FileSequenceDestination:
+            seen.append(bound_workflow.get())
+            return FileSequenceDestination(_sequence_macro())
+
+        parameter = ProjectFileSequenceParameter(_saver_node(engine, a), "output_frames", default_filename="f.png")
+        with mock.patch.object(project_file_sequence_parameter, "_build_sequence_destination_from_situation", build):
+            destination = _in_raw_thread(parameter.build_sequence)
+
+        assert seen == [a.runtime]
+        assert destination.entry(7).workflow is a.runtime
