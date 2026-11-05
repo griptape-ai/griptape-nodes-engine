@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowWithCurrentStateResultSuccess,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext, current_request_type
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     LibraryNotRegisteredProblem,
@@ -50,6 +51,7 @@ from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -233,7 +235,7 @@ class WorkflowRunner(EngineScoped):
         )
 
     @handles(RunWorkflowFromRegistryRequest)
-    async def on_run_workflow_from_registry_request(
+    async def on_run_workflow_from_registry_request(  # noqa: PLR0911
         self, request: RunWorkflowFromRegistryRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Open the registered workflow and run its file into it.
@@ -282,7 +284,18 @@ class WorkflowRunner(EngineScoped):
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Open the workflow before running its file, so the file builds into it. A failed run closes it below.
-            opened = self.engine.context_manager.open_workflow(request.workflow_name)
+            # The open refuses when the request is bound to another open workflow or this one is already
+            # open, cases the check above can't see once several workflows may be open.
+            try:
+                opened = self.engine.context_manager.open_workflow(request.workflow_name)
+            except ContextManager.WorkflowAlreadyOpenError as err:
+                return RunWorkflowFromRegistryResultFailure(result_details=str(err))
+            except OpenWorkflowError:
+                details = (
+                    f"Attempted to run workflow '{request.workflow_name}'. Failed because it is already open. "
+                    "Close it first, or run it with a clean slate from its own tab."
+                )
+                return RunWorkflowFromRegistryResultFailure(result_details=details)
             # run file
             execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=opened)
 

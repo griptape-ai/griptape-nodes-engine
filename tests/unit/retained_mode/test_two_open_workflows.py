@@ -105,6 +105,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsRequest,
     ListCallableWorkflowsRequest,
     RunWorkflowFromRegistryRequest,
+    RunWorkflowFromRegistryResultFailure,
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
@@ -1074,6 +1075,46 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         assert _failed_for_no_workflow_named(result), result.result_details
         assert engine.open_workflows.all_open() == [a, b]
+
+    def test_a_load_without_a_clean_slate_into_an_open_tab_fails_with_a_registry_failure(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        """Naming an open workflow without a clean slate is refused as the request's own failure."""
+        _allow_several_open(engine)
+        a = _open(engine, "A")
+        b = _open(engine, "B")
+
+        result = asyncio.run(
+            _send_async(
+                engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=False), b
+            )
+        )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultFailure), result.result_details
+        assert engine.open_workflows.all_open() == [a, b]
+
+    def test_loading_a_workflow_that_is_already_open_fails_with_a_registry_failure(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        _allow_several_open(engine)
+        a = _open(engine, "A")
+
+        async def load_unbound() -> ResultPayload:
+            with engine.bind_workflow(NO_WORKFLOW):
+                return await engine.ahandle_request(
+                    RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=False)
+                )
+
+        loaded = asyncio.run(load_unbound())
+        assert loaded.succeeded(), loaded.result_details
+        open_before = engine.open_workflows.all_open()
+
+        result = asyncio.run(load_unbound())
+
+        assert isinstance(result, RunWorkflowFromRegistryResultFailure), result.result_details
+        assert "already open" in str(result.result_details)
+        assert engine.open_workflows.all_open() == open_before
+        assert a in open_before
 
     def test_loading_a_saved_file_into_a_new_tab_leaves_a_alone(self, engine: Engine, saved_workflow_name: str) -> None:
         _allow_several_open(engine)
