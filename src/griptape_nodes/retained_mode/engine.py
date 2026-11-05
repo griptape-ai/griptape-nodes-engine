@@ -36,6 +36,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
+    OpenWorkflowInfo,
 )
 from griptape_nodes.retained_mode.events.base_events import (
     GriptapeNodeEvent,
@@ -1019,40 +1020,58 @@ class Engine:
         return instance_info
 
     def _get_current_workflow_info(self) -> dict[str, Any]:
-        """Get information about the currently loaded workflow.
+        """The heartbeat's workflow fields: every open workflow, and the one opened last as the current one.
 
-        Returns workflow name, file path, and status information if available.
+        What the engine has open, not the current workflow: the heartbeat is a host request bound
+        to no workflow, and a worker's runtimes never show here. With several open, the one opened
+        last is likely the tab the user just opened.
         """
-        workflow_info = {
+        workflow_info: dict[str, Any] = {
             "current_workflow": None,
             "current_workflow_id": None,
             "workflow_file_path": None,
             "has_active_flow": False,
+            "open_workflows": [],
         }
 
         try:
-            context_manager = self._context_manager
-
-            # What the engine has open, not the current workflow: the heartbeat is a host request
-            # bound to no workflow, and a worker's runtimes never show here.
-            open_workflows = self._open_workflows.all_open()
-            if len(open_workflows) != 1:
-                return workflow_info
-            with self.bind_workflow(open_workflows[0]):
-                if not context_manager.has_current_workflow():
-                    return workflow_info
-                workflow = context_manager.get_current_workflow()
-                workflow_info["current_workflow"] = workflow.name
-                workflow_info["current_workflow_id"] = workflow.workflow_id
-                workflow_info["has_active_flow"] = context_manager.has_current_flow()
-                # None for unsaved workflows.
-                if workflow.absolute_path is not None:
-                    workflow_info["workflow_file_path"] = str(workflow.absolute_path)
-
+            open_workflows = self._open_workflows_info()
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
+            return workflow_info
+        if not open_workflows:
+            return workflow_info
 
+        current = open_workflows[-1]
+        workflow_info["current_workflow"] = current.name
+        workflow_info["current_workflow_id"] = current.workflow_id
+        workflow_info["workflow_file_path"] = current.workflow_file_path
+        workflow_info["has_active_flow"] = current.has_active_flow
+        workflow_info["open_workflows"] = open_workflows
         return workflow_info
+
+    def _open_workflows_info(self) -> list[OpenWorkflowInfo]:
+        """What the heartbeat reports of each open workflow, in the order they were opened."""
+        context_manager = self._context_manager
+        infos: list[OpenWorkflowInfo] = []
+        for open_workflow in self._open_workflows.all_open():
+            with self.bind_workflow(open_workflow):
+                if not context_manager.has_current_workflow():
+                    continue
+                workflow = context_manager.get_current_workflow()
+                # None for unsaved workflows.
+                file_path = None
+                if workflow.absolute_path is not None:
+                    file_path = str(workflow.absolute_path)
+                infos.append(
+                    OpenWorkflowInfo(
+                        workflow_id=workflow.workflow_id,
+                        name=workflow.name,
+                        workflow_file_path=file_path,
+                        has_active_flow=context_manager.has_current_flow(),
+                    )
+                )
+        return infos
 
 
 def current_engine() -> Engine:
