@@ -135,7 +135,7 @@ Macros such as `{outputs}` resolve against the workflow your node is in. A `File
 
 ```python
 with ThreadPoolExecutor() as pool:
-    pool.map(lambda job: self._output_file.build_file().write_bytes(render(job)), jobs)
+    list(pool.map(lambda job: self._output_file.build_file().write_bytes(render(job)), jobs))
 ```
 
 Code on a plain thread or in a pool doesn't know which workflow it works for, so a handle built there with `ProjectFileDestination.from_situation()` or `File(...)` has no workflow of its own. Build it in `process()` or `aprocess()` and hand it to the thread, or pass `workflow=self.workflow` to the `File`, `FileDestination`, `Directory`, or `FileSequence` constructor.
