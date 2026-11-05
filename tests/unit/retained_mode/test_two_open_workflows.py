@@ -1054,26 +1054,26 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert len(open_now) == 2  # noqa: PLR2004
         assert a.objects.has("survivor")
 
-    def test_a_clean_slate_load_with_no_id_closes_every_open_workflow_and_loads(
-        self, engine: Engine, saved_workflow_name: str
+    @pytest.mark.parametrize("request_type", ["registry", "scratch"])
+    def test_a_clean_slate_load_with_no_id_refuses_while_several_are_open(
+        self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
+        """A tab that names no workflow must not close every other tab's workflow."""
         _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
-
-        result = asyncio.run(
-            _send_async(
-                engine,
-                RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=True),
-                None,
-            )
+        request: RequestPayload = RunWorkflowFromRegistryRequest(
+            workflow_name=saved_workflow_name, run_with_clean_slate=True
         )
+        if request_type == "scratch":
+            file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+            assert file_path is not None
+            request = RunWorkflowFromScratchRequest(file_path=file_path)
 
-        assert result.succeeded(), result.result_details
-        open_now = engine.open_workflows.all_open()
-        assert a not in open_now
-        assert b not in open_now
-        assert len(open_now) == 1
+        result = asyncio.run(_send_async(engine, request, None))
+
+        assert _failed_for_no_workflow_named(result), result.result_details
+        assert engine.open_workflows.all_open() == [a, b]
 
     def test_loading_a_saved_file_into_a_new_tab_leaves_a_alone(self, engine: Engine, saved_workflow_name: str) -> None:
         _allow_several_open(engine)

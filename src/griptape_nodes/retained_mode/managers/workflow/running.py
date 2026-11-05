@@ -166,7 +166,7 @@ class WorkflowRunner(EngineScoped):
     async def on_run_workflow_from_scratch_request(
         self, request: RunWorkflowFromScratchRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
-        """Close `workflow`, or with None every open workflow, then open the file as a workflow."""
+        """Close `workflow`, if the request acts on one, then open the file as a workflow."""
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with self.engine.workflow_manager.squelch_workflow_altered():
             # Check if file path exists
@@ -178,11 +178,12 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # Start with a clean slate.
-            clear_all_result = await self._clear_for_clean_slate(workflow)
-            if not clear_all_result.succeeded():
-                details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+            # Start with a clean slate in the workflow the request acts on. Other open workflows stay.
+            if workflow is not None:
+                clear_all_result = await self._clear_for_clean_slate(workflow)
+                if not clear_all_result.succeeded():
+                    details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
+                    return RunWorkflowFromScratchResultFailure(result_details=details)
 
             # Run the file, goddamn it
             execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=None)
@@ -237,7 +238,7 @@ class WorkflowRunner(EngineScoped):
     ) -> ResultPayload:
         """Open the registered workflow and run its file into it.
 
-        With a clean slate, closes `workflow` first, or with None every open workflow.
+        With a clean slate, closes `workflow` first, if the request acts on one.
         """
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
@@ -273,8 +274,8 @@ class WorkflowRunner(EngineScoped):
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate:
-                # Start with a clean slate.
+            if request.run_with_clean_slate and workflow is not None:
+                # Start with a clean slate in the workflow the request acts on. Other open workflows stay.
                 clear_all_result = await self._clear_for_clean_slate(workflow)
                 if not clear_all_result.succeeded():
                     details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
@@ -434,12 +435,9 @@ class WorkflowRunner(EngineScoped):
             return
         self.engine.enter_opened_workflow(opened)
 
-    async def _clear_for_clean_slate(self, workflow: WorkflowRuntime | None) -> ResultPayload:
-        """Close `workflow`, or with None every open workflow, before a file opens as a new one."""
-        clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-        if workflow is not None:
-            return await workflow.ahandle_request(clear_all_request)
-        return await self.engine.ahandle_request(clear_all_request)
+    async def _clear_for_clean_slate(self, workflow: WorkflowRuntime) -> ResultPayload:
+        """Close `workflow` before a file opens as a new one."""
+        return await workflow.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
     async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
         """Ensure `workflow`, which a file just built into, has a current flow."""

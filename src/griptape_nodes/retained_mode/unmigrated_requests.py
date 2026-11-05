@@ -23,6 +23,9 @@ ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
         "ResolveToolApprovalsRequest",
         "RunAgentRequest",
         "RunWorkflowWithCurrentStateRequest",
+        # A clean slate closes the workflow these name. Naming none must not close every open one.
+        "RunWorkflowFromRegistryRequest",
+        "RunWorkflowFromScratchRequest",
         # Nodes calling from their own threads name no workflow yet.
         "BudgetAccessRequest",
         "DeclareModelInvocationRequest",
