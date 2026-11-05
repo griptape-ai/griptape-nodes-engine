@@ -3931,7 +3931,7 @@ class OSManager(EngineScoped):
         for file_path, _ in files_with_times:
             try:
                 # Delete the file.
-                # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
+                # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes-engine/issues/3765
                 file_path.unlink()
                 removed_count += 1
 

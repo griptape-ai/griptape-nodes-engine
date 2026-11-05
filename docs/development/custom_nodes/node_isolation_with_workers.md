@@ -106,7 +106,7 @@ installs and is the escape hatch for index URLs and other arguments your
 install legitimately needs.
 
 The schema:
-[`Dependencies`](https://github.com/griptape-ai/griptape-nodes/blob/main/src/griptape_nodes/node_library/library_registry.py)
+[`Dependencies`](https://github.com/griptape-ai/griptape-nodes-engine/blob/main/src/griptape_nodes/node_library/library_registry.py)
 in `library_registry.py`.
 
 The older `worker_mode_compatibility` and `suggested_worker_mode`

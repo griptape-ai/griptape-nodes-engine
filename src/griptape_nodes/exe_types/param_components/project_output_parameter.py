@@ -190,7 +190,7 @@ class ProjectOutputParameter(abc.ABC):
                 altered_workflow_state=False,
             )
 
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4097
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4097
         # Replace with a non-RM utility for creating sibling nodes relative to a given node.
         # Until then this is the one remaining path from exe_types to the facade: RetainedMode is
         # a re-export, so the TID251 ban does not see it. It resolves the ambient engine, which is

@@ -1221,7 +1221,7 @@ class WorkflowSaver(EngineScoped):
             # TODO: store the macro form (e.g. "{workspace_dir}/foo.py") in the
             # registry so out-of-workspace save locations stay portable across
             # machines. Tracked in
-            # https://github.com/griptape-ai/griptape-nodes/issues/2047.
+            # https://github.com/griptape-ai/griptape-nodes-engine/issues/2047.
             return str(path)
         return str(relative)
 

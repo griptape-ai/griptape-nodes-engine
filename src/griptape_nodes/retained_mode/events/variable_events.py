@@ -417,7 +417,7 @@ class Substitutable:
     """A single value available for {VAR} substitution.
 
     DEPRECATED with ListSubstitutablesRequest — ListVariablesResultSuccess.layers
-    supersedes source/read_only. TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+    supersedes source/read_only. TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
 
     Attributes:
         name: The token name (what goes inside the braces, e.g. "workspace_dir")
@@ -441,7 +441,7 @@ class ListSubstitutablesRequest(RequestPayload, GraphAccessMixin):
     which supersedes Substitutable's source/read_only metadata: derive the group
     from layer (PROJECT → macro-ish) and read_only from layer + permission.
     Kept as a compatibility shim for GUI versions that still send it.
-    TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete after
+    TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete after
     the GUI migrates (griptape-ai/griptape-vsl-gui#2668).
 
     Args:
@@ -505,7 +505,7 @@ class ResolveSubstitutionRequest(RequestPayload, GraphAccessMixin):
 
     Same layered walk; build a name→value dict from the result's variables.
     No engine-internal callers remain — kept only for out-of-tree scripts.
-    TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+    TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
 
     When ``names`` is non-empty, looks up each name individually and fails
     (all-or-nothing) if any name is not found in scope.
@@ -601,7 +601,7 @@ class SetVariablesRequest(RequestPayload, GraphAccessMixin):
 
     Batch write of multiple variable values atomically (all-or-nothing). Use
     SetVariableValueRequest per variable instead.
-    TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+    TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
 
     All variable names are validated to exist in scope before any value is
     written. If any variable is not found the entire batch is rejected and

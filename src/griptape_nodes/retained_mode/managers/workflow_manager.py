@@ -156,7 +156,7 @@ class WorkflowCandidate(NamedTuple):
 class WorkflowManager(EngineScoped):
     WORKFLOW_METADATA_HEADER: ClassVar[str] = WORKFLOW_METADATA_HEADER
     MAX_MINOR_VERSION_DEVIATION: ClassVar[int] = (
-        100  # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1219 <- make the versioning enforcement softer after we get a release going
+        100  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/1219 <- make the versioning enforcement softer after we get a release going
     )
 
     WorkflowStatus = WorkflowStatus
@@ -626,7 +626,7 @@ class WorkflowManager(EngineScoped):
             registered_libraries: Registered library names, or None to fetch them here.
         """
         # We have valid dependencies, etc.
-        # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes/issues/617
+        # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes-engine/issues/617
         problems = []
         had_critical_error = False
 

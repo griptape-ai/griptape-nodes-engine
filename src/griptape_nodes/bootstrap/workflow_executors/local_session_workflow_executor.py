@@ -82,7 +82,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         GriptapeNodes.SessionManager().remove_session(self._session_id)
 
-        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
+        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
 
     async def arun(
         self,

@@ -310,7 +310,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # shape — that's what makes the file runnable as a CLI program. Shapeless workflows
         # have no input/output surface and are loaded by the engine via `await build_workflow()`
         # (see WorkflowManager.run_workflow), so they don't need a `__main__` guard.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4205 — decide how shapeless
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4205 — decide how shapeless
         # workflows should behave when invoked directly (build-only vs build + StartFlowRequest)
         # and emit an appropriate `__main__` guard.
         workflow_execution_code = self._generate_workflow_execution(
@@ -498,7 +498,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # Construct a default LocalWorkflowExecutor only when the caller did not supply one.
         # `**kwargs` is splatted into the constructor; a typo'd kwarg surfaces as a TypeError
         # from LocalWorkflowExecutor.__init__.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/3771 Update for workflows that call other workflows - need to include referenced workflows in the list
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/3771 Update for workflows that call other workflows - need to include referenced workflows in the list
         executor_assign = ast.If(
             test=ast.Compare(
                 left=ast.Name(id="workflow_executor", ctx=ast.Load()),
@@ -683,7 +683,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # Delegate executor-level CLI flags to LocalWorkflowExecutor.add_cli_arguments(parser).
         # This replaces hand-rolled --storage-backend / --project-file-path / --save-on-failure
         # add_argument calls so that future executor-level flags can be added without bumping
-        # the workflow file schema. See https://github.com/griptape-ai/griptape-nodes/issues/4599.
+        # the workflow file schema. See https://github.com/griptape-ai/griptape-nodes-engine/issues/4599.
         add_arg_calls.append(
             ast.Expr(
                 value=ast.Call(

@@ -86,7 +86,7 @@ class StartFlowRequest(RequestPayload, GraphAccessMixin):
     Results: StartFlowResultSuccess | StartFlowResultFailure (with validation exceptions)
     """
 
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
     flow_node_name: str | None = None
     debug_mode: bool = False
@@ -203,7 +203,7 @@ class CancelFlowRequest(RequestPayload, GraphAccessMixin):
     Results: CancelFlowResultSuccess | CancelFlowResultFailure (cancellation error)
     """
 
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 
@@ -335,7 +335,7 @@ class UnresolveFlowRequest(RequestPayload, GraphAccessMixin):
     Results: UnresolveFlowResultSuccess | UnresolveFlowResultFailure (unresolve error)
     """
 
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 
@@ -358,7 +358,7 @@ class UnresolveFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class SingleExecutionStepRequest(RequestPayload, GraphAccessMixin):
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 
@@ -377,7 +377,7 @@ class SingleExecutionStepResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class SingleNodeStepRequest(RequestPayload, GraphAccessMixin):
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 
@@ -397,7 +397,7 @@ class SingleNodeStepResultFailure(ResolveNodeResultFailure):
 @dataclass
 @PayloadRegistry.register
 class ContinueExecutionStepRequest(RequestPayload, GraphAccessMixin):
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 
@@ -424,7 +424,7 @@ class GetFlowStateRequest(RequestPayload, GraphAccessMixin):
     Results: GetFlowStateResultSuccess (with control/resolving nodes) | GetFlowStateResultFailure (flow not found)
     """
 
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 
@@ -460,7 +460,7 @@ class GetIsFlowRunningRequest(RequestPayload, GraphAccessMixin):
     Results: GetIsFlowRunningResultSuccess (with running status) | GetIsFlowRunningResultFailure (flow not found)
     """
 
-    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes/issues/1663
+    # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
 

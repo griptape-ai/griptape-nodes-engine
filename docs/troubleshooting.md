@@ -198,7 +198,7 @@ A known, elusive bug. In almost all cases it's harmless and doesn't affect your 
 
 1. You can usually disregard it and keep working.
 1. If it's blocking you, restart the engine and it should clear up.
-1. If you can reproduce it, we'd be grateful if you'd [log a bug](https://github.com/griptape-ai/griptape-nodes/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) with any context about what led to it.
+1. If you can reproduce it, we'd be grateful if you'd [log a bug](https://github.com/griptape-ai/griptape-nodes-engine/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) with any context about what led to it.
 
 ## "ssl.SSLCertVerificationError" / the engine won't run
 
