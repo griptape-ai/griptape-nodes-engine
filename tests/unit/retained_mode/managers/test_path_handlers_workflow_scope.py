@@ -64,6 +64,7 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarC
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
 from griptape_nodes.retained_mode.managers.artifact_providers import ImageArtifactProvider
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.managers.filesystem.file_writing import FileWriter
 from griptape_nodes.retained_mode.managers.filesystem.sequences import FileSequences
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
@@ -99,7 +100,14 @@ _OPTIONAL_WORKFLOW_REQUESTS: set[type[RequestPayload]] = {
     GeneratePreviewFromDefaultsRequest,
     GetPreviewForArtifactRequest,
 }
-_HANDLER_CLASSES: tuple[type, ...] = (ProjectManager, OSManager, FileSequences, StaticFilesManager, ArtifactManager)
+_HANDLER_CLASSES: tuple[type, ...] = (
+    ProjectManager,
+    OSManager,
+    FileSequences,
+    FileWriter,
+    StaticFilesManager,
+    ArtifactManager,
+)
 
 
 def _declared_scopes(

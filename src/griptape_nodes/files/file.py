@@ -721,7 +721,7 @@ class File:
             FileWriteError: If the file cannot be written.
         """
         # Pass the original file path (str or MacroPath) through to the request.
-        # OSManager.on_write_file_request resolves macros internally so it can apply
+        # FileWriter.on_write_file_request resolves macros internally so it can apply
         # the auto-index seed for CREATE_NEW saves and walk the original macro on
         # collision. Pre-resolving here would lose both pieces of context.
         # https://github.com/griptape-ai/griptape-nodes-engine/issues/4875
