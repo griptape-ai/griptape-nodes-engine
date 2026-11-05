@@ -29,9 +29,8 @@ class RequestScope(StrEnum):
         envelope names, else the caller's, else none. A request type in
         `ONLY_OPEN_UNTIL_CLIENTS_NAME` gets the only open one before none, and fails when several are open.
 
-    A library handler with no `workflow` parameter, and an engine handler listed in
-    `AMBIENT_UNTIL_MIGRATED`, have no scope: dispatch calls them with the request alone, bound to the
-    caller's workflow or the only open one.
+    A library handler with no `workflow` parameter has no scope: dispatch calls it with the request
+    alone, bound to the caller's workflow or the only open one.
     """
 
     HOST = "host"
