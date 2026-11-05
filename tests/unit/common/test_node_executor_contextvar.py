@@ -16,14 +16,15 @@ from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResu
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
-def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
-    """A workflow whose requests go to the executor's engine."""
-    return WorkflowRuntime("wf", executor.engine)
+def _in_workflow_of(executor: NodeExecutor, node: Any) -> Any:
+    """`node`, joined to a workflow whose requests go to the executor's engine."""
+    node._require_workflow.return_value = WorkflowRuntime("wf", executor.engine)
+    return node
 
 
 async def _execute(node: Any) -> None:
     executor = _make_executor()
-    await executor.execute(_workflow_of(executor), node)
+    await executor.execute(_in_workflow_of(executor, node))
 
 
 def _make_executor() -> NodeExecutor:
@@ -62,7 +63,7 @@ class TestNodeExecutorContextVar:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
-        await executor.execute(_workflow_of(executor), node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         assert captured == ["TestNode"]
 
@@ -74,7 +75,7 @@ class TestNodeExecutorContextVar:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
-        await executor.execute(_workflow_of(executor), node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         assert current_executing_node_name.get() is None
 
@@ -88,7 +89,7 @@ class TestNodeExecutorContextVar:
         mock_engine.ahandle_request = AsyncMock(side_effect=RuntimeError("node failed"))
 
         with pytest.raises(RuntimeError, match="node failed"):
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         assert current_executing_node_name.get() is None
 
@@ -110,8 +111,8 @@ class TestNodeExecutorContextVar:
         mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
 
         await asyncio.gather(
-            executor.execute(_workflow_of(executor), node_a),
-            executor.execute(_workflow_of(executor), node_b),
+            executor.execute(_in_workflow_of(executor, node_a)),
+            executor.execute(_in_workflow_of(executor, node_b)),
         )
 
         assert results["NodeA"] == "NodeA"

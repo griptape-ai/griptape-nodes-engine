@@ -45,9 +45,15 @@ def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
     return WorkflowRuntime("wf", executor.engine)
 
 
+def _in_workflow_of(executor: NodeExecutor, node: Any) -> Any:
+    """`node`, joined to a workflow whose requests go to the executor's engine."""
+    node._require_workflow.return_value = _workflow_of(executor)
+    return node
+
+
 async def _execute(node: Any) -> None:
     executor = _make_executor()
-    await executor.execute(_workflow_of(executor), node)
+    await executor.execute(_in_workflow_of(executor, node))
 
 
 def _make_executor() -> NodeExecutor:
@@ -78,7 +84,7 @@ class TestLocalExecuteCopyBack:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=result)
-        await executor.execute(_workflow_of(executor), node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         assert node.parameter_output_values == {"out": 42}
         node.set_parameter_value.assert_not_called()
@@ -102,7 +108,7 @@ class TestLocalExecuteCopyBack:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
         with patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit:
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         assert mock_emit.call_count == 1
         assert node.parameter_output_values == {"out": 42}
@@ -126,7 +132,7 @@ class TestLocalExecuteCopyBack:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
         with patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit:
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         # Two fresh keys; each __setitem__ sees old_value None != new_value.
         assert mock_emit.call_count == _EXPECTED_FRESH_OUTPUT_EMITS

@@ -329,16 +329,21 @@ class NodeExecutor(EngineScoped):
         msg = f"Could not find PublishWorkflowRequest handler for library {library_name}"
         raise ValueError(msg)
 
-    async def execute(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
-        """Execute the given node, sending NodeStartProcessEvent before it runs and NodeFinishProcessEvent after.
+    async def execute(self, node: BaseNode) -> None:
+        """Execute the given node in the workflow it joined, sending NodeStartProcessEvent before it runs and NodeFinishProcessEvent after.
 
         The events use the synchronous put_event so the finish event still goes out from a cancelled
-        task. Nodes the engine added to a loop body run without either event.
+        task. Nodes the engine added to a loop body run without either event. The node's own
+        workflow is the one it runs in, so the node lookup, the worker's paths and cancellation
+        can't disagree with the helpers below, which read it from the node too.
 
         Args:
-            workflow: The workflow the node runs in
             node: The BaseNode to execute
+
+        Raises:
+            WorkflowContextError: The node never joined a workflow.
         """
+        workflow = node._require_workflow()
         loop_body_scope = current_loop_body_scope.get()
         if loop_body_scope is not None and loop_body_scope.is_engine_node(node.name):
             await self._run_node(workflow, node)

@@ -27,14 +27,15 @@ from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowR
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
-def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
-    """A workflow whose requests go to the executor's engine."""
-    return WorkflowRuntime("wf", executor.engine)
+def _in_workflow_of(executor: NodeExecutor, node: Any) -> Any:
+    """`node`, joined to a workflow whose requests go to the executor's engine."""
+    node._require_workflow.return_value = WorkflowRuntime("wf", executor.engine)
+    return node
 
 
 async def _execute(node: Any) -> None:
     executor = _make_executor()
-    await executor.execute(_workflow_of(executor), node)
+    await executor.execute(_in_workflow_of(executor, node))
 
 
 def _make_executor() -> NodeExecutor:
@@ -110,7 +111,7 @@ class TestExecuteSubflowNodeGroupBranches:
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_private.assert_awaited_once_with(node)
         mock_library.assert_not_awaited()
@@ -129,7 +130,7 @@ class TestExecuteSubflowNodeGroupBranches:
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_library.assert_awaited_once_with(node, "some_library_name")
         mock_private.assert_not_awaited()
@@ -143,7 +144,7 @@ class TestExecuteSubflowNodeGroupBranches:
 
         executor = _make_executor()
         with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock):
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         node.subflow_execution_component.clear_execution_state.assert_called_once()
 
@@ -320,7 +321,7 @@ class TestExecuteUnexpectedResultType:
         mock_engine.ahandle_request = AsyncMock(return_value=not_a_payload)
 
         with pytest.raises(RuntimeError, match="Weird"):
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
 
 class TestExecuteSuccessReturnsNone:
@@ -339,7 +340,7 @@ class TestExecuteSuccessReturnsNone:
         mock_engine.ahandle_request = AsyncMock(
             return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"x": 1}),
         )
-        result = await executor.execute(_workflow_of(executor), node)
+        result = await executor.execute(_in_workflow_of(executor, node))
 
         assert result is None
 

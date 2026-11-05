@@ -517,6 +517,23 @@ class TestRunInOneEditTheOther:
         assert _get(engine, b, "park", "result") == "done:b"
         assert a.flows.global_control_flow_machine is None
 
+    @pytest.mark.asyncio
+    async def test_executing_a_node_runs_it_in_the_workflow_it_joined(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """With the same node name in both workflows, the node's own workflow decides, not the caller's."""
+        a, b = two_open
+        for workflow, value in ((a, "a"), (b, "b")):
+            _make_node(engine, workflow, "_ParkNode", "park")
+            _set(engine, workflow, "park", value)
+        node_in_b = engine.node_manager.get_node_by_name_in(b, "park")
+
+        with engine.bind_workflow(a):
+            await asyncio.wait_for(NodeExecutor(engine=engine).execute(node_in_b), 5)
+
+        assert _get(engine, b, "park", "result") == "done:b"
+        assert _get(engine, a, "park", "result") is None
+
     def test_packaging_with_nothing_bound_takes_the_nodes_out_of_their_workflows_queue(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:

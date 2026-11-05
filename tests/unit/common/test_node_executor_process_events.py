@@ -35,14 +35,15 @@ from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDeta
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
-def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
-    """The workflow `_make_executor` made for the executor's nodes."""
-    return cast("MagicMock", executor.engine).test_workflow
+def _in_workflow_of(executor: NodeExecutor, node: Any) -> Any:
+    """`node`, joined to the workflow `_make_executor` made for the executor's nodes."""
+    node._require_workflow.return_value = cast("MagicMock", executor.engine).test_workflow
+    return node
 
 
 async def _execute(node: Any) -> None:
     executor = _make_executor()
-    await executor.execute(_workflow_of(executor), node)
+    await executor.execute(_in_workflow_of(executor, node))
 
 
 def _make_executor() -> NodeExecutor:
@@ -126,7 +127,7 @@ class TestOrder:
             return _success_result()
 
         mock_engine.ahandle_request = AsyncMock(side_effect=dispatch)
-        await executor.execute(_workflow_of(executor), _make_node())
+        await executor.execute(_in_workflow_of(executor, _make_node()))
 
         assert len(seen_at_dispatch) == 1
         assert [type(payload) for payload in seen_at_dispatch[0]] == [NodeStartProcessEvent]
@@ -146,7 +147,7 @@ class TestOrder:
                 seen_at_finish.append((current_executing_node_name.get(), current_node_execution_id.get()))
 
         mock_engine.event_manager.put_event.side_effect = put_event
-        await executor.execute(_workflow_of(executor), _make_node())
+        await executor.execute(_in_workflow_of(executor, _make_node()))
 
         assert seen_at_finish == [(None, None)]
 
@@ -159,7 +160,7 @@ class TestFields:
         executor = _make_executor()
         node = _make_node(name="Greeter", library="Greeting Library")
 
-        await executor.execute(_workflow_of(executor), node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         start, finish = _start_and_finish(executor)
         for event in (start, finish):
@@ -176,7 +177,7 @@ class TestFields:
     async def test_start_and_finish_of_one_run_share_an_execution_id(self) -> None:
         executor = _make_executor()
 
-        await executor.execute(_workflow_of(executor), _make_node())
+        await executor.execute(_in_workflow_of(executor, _make_node()))
 
         start, finish = _start_and_finish(executor)
         assert start.execution_id
@@ -187,8 +188,8 @@ class TestFields:
         executor = _make_executor()
         node = _make_node()
 
-        await executor.execute(_workflow_of(executor), node)
-        await executor.execute(_workflow_of(executor), node)
+        await executor.execute(_in_workflow_of(executor, node))
+        await executor.execute(_in_workflow_of(executor, node))
 
         execution_ids = {event.execution_id for event in _node_events(executor)}
         assert len(execution_ids) == 2  # noqa: PLR2004
@@ -199,7 +200,7 @@ class TestFields:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.test_workflow.nodes.parent_flow_name.side_effect = KeyError("Node could not be found.")
 
-        await executor.execute(_workflow_of(executor), _make_node())
+        await executor.execute(_in_workflow_of(executor, _make_node()))
 
         start, finish = _start_and_finish(executor)
         assert start.flow_name is None
@@ -209,7 +210,7 @@ class TestFields:
     async def test_node_with_no_library_reports_no_library(self) -> None:
         executor = _make_executor()
 
-        await executor.execute(_workflow_of(executor), _make_node(library=None))
+        await executor.execute(_in_workflow_of(executor, _make_node(library=None)))
 
         start = _start_and_finish(executor).start
         assert start.specific_library_name is None
@@ -228,7 +229,7 @@ class TestOutcome:
         )
 
         with pytest.raises(ExecuteNodeFailedError) as caught:
-            await executor.execute(_workflow_of(executor), _make_node(name="Broken"))
+            await executor.execute(_in_workflow_of(executor, _make_node(name="Broken")))
 
         finish = _start_and_finish(executor).finish
         assert finish.outcome == NodeProcessOutcome.FAILED
@@ -244,7 +245,7 @@ class TestOutcome:
         )
 
         with pytest.raises(ExecuteNodeFailedError):
-            await executor.execute(_workflow_of(executor), _make_node(name="Broken"))
+            await executor.execute(_in_workflow_of(executor, _make_node(name="Broken")))
 
         finish = _start_and_finish(executor).finish
         assert finish.outcome == NodeProcessOutcome.FAILED
@@ -261,7 +262,7 @@ class TestOutcome:
             patch.object(NodeExecutor, "handle_loop_execution", new_callable=AsyncMock, side_effect=raised),
             pytest.raises(RuntimeError),
         ):
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         finish = _start_and_finish(executor).finish
         assert finish.outcome == NodeProcessOutcome.FAILED
@@ -275,7 +276,7 @@ class TestOutcome:
         mock_engine.ahandle_request = AsyncMock(side_effect=asyncio.CancelledError())
 
         with pytest.raises(asyncio.CancelledError):
-            await executor.execute(_workflow_of(executor), _make_node())
+            await executor.execute(_in_workflow_of(executor, _make_node()))
 
         finish = _start_and_finish(executor).finish
         assert finish.outcome == NodeProcessOutcome.CANCELLED
@@ -287,7 +288,7 @@ class TestOutcome:
         node = _make_node()
         node.is_cancellation_requested = True
 
-        await executor.execute(_workflow_of(executor), node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         finish = _start_and_finish(executor).finish
         assert finish.outcome == NodeProcessOutcome.CANCELLED
@@ -310,7 +311,7 @@ class TestEveryRoute:
         node = _make_spec_node(spec, "LoopOrGroup")
 
         with patch.object(NodeExecutor, route, new_callable=AsyncMock) as mock_route:
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_route.assert_awaited_once_with(node)
         start, finish = _start_and_finish(executor)
@@ -332,7 +333,7 @@ class TestEveryRoute:
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock),
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock),
         ):
-            await executor.execute(_workflow_of(executor), node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         start, finish = _start_and_finish(executor)
         assert start.node_name == "Group"
@@ -349,10 +350,10 @@ class TestNesting:
         body_node = _make_node(name="Body")
 
         async def run_body(_loop_node: Any) -> None:
-            await executor.execute(_workflow_of(executor), body_node)
+            await executor.execute(_in_workflow_of(executor, body_node))
 
         with patch.object(NodeExecutor, "handle_loop_execution", new_callable=AsyncMock, side_effect=run_body):
-            await executor.execute(_workflow_of(executor), loop_node)
+            await executor.execute(_in_workflow_of(executor, loop_node))
 
         loop_start, body_start, body_finish, loop_finish = _node_events(executor)
         assert loop_start.node_name == "EndLoop"
@@ -369,14 +370,14 @@ class TestNesting:
 
         async def run_bodies_concurrently(_loop_node: Any) -> None:
             await asyncio.gather(
-                asyncio.ensure_future(executor.execute(_workflow_of(executor), _make_node(name="Body"))),
-                asyncio.ensure_future(executor.execute(_workflow_of(executor), _make_node(name="Body"))),
+                asyncio.ensure_future(executor.execute(_in_workflow_of(executor, _make_node(name="Body")))),
+                asyncio.ensure_future(executor.execute(_in_workflow_of(executor, _make_node(name="Body")))),
             )
 
         with patch.object(
             NodeExecutor, "handle_loop_execution", new_callable=AsyncMock, side_effect=run_bodies_concurrently
         ):
-            await executor.execute(_workflow_of(executor), loop_node)
+            await executor.execute(_in_workflow_of(executor, loop_node))
 
         events = _node_events(executor)
         loop_start = events[0]
@@ -399,7 +400,7 @@ class TestLoopBodyScope:
         scope = LoopBodyScope(canvas_node_names={"Body_1": "Body"}, engine_node_names=frozenset())
 
         with entered_loop_body_scope(scope):
-            await executor.execute(_workflow_of(executor), _make_node(name="Body_1"))
+            await executor.execute(_in_workflow_of(executor, _make_node(name="Body_1")))
 
         start, finish = _start_and_finish(executor)
         assert start.node_name == "Body"
@@ -413,7 +414,7 @@ class TestLoopBodyScope:
         scope = LoopBodyScope(canvas_node_names={}, engine_node_names=frozenset({"Start_Package_MultiNode_1"}))
 
         with entered_loop_body_scope(scope):
-            await executor.execute(_workflow_of(executor), _make_node(name="Start_Package_MultiNode_1"))
+            await executor.execute(_in_workflow_of(executor, _make_node(name="Start_Package_MultiNode_1")))
 
         mock_engine.ahandle_request.assert_awaited_once()
         assert _node_events(executor) == []

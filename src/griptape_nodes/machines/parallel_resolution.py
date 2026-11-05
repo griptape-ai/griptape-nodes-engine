@@ -665,7 +665,7 @@ class ExecuteDagState(State):
         executor = context.engine.flow_manager.node_executor
         started_at = time.perf_counter()
         try:
-            await executor.execute(context.workflow, current_node.node_reference)
+            await executor.execute(current_node.node_reference)
         finally:
             current_node.run_seconds = time.perf_counter() - started_at
 
