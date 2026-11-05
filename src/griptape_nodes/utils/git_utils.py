@@ -1295,7 +1295,10 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         temp_path = Path(temp_dir)
 
         def run(args: list[str], error_msg: str) -> str:
-            return _run_git(args, error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
+            # Each fetch, including checkout's lazy blob fetch, otherwise spawns a
+            # housekeeping process for a repository that is about to be deleted.
+            no_housekeeping = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+            return _run_git([*no_housekeeping, *args], error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
 
         run(["init"], "Git init failed")
         run(["remote", "add", "origin", remote_url], "Git remote add failed")
