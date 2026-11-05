@@ -327,12 +327,31 @@ class Exif:
             return default
         return _decoded(tag, entry, self._byte_order)
 
+    def set_primary(self, tag: int, value: Any) -> None:
+        """Set a tag in IFD0, even one the EXIF spec places in the Exif sub-IFD, leaving that copy alone.
+
+        Lookups read IFD0 first, so this value is the one ``get`` returns. Text is stored as a plain
+        UTF-8 string, as Pillow writes IFD0 text, even for UserComment, whose spec form has a
+        character code prefix that Pillow-based readers don't strip.
+
+        Raises:
+            ValueError: If ``tag`` is a sub-IFD pointer or ``value`` has no EXIF representation
+        """
+        if tag in _POINTER_TAGS:
+            msg = f"Attempted to set EXIF tag {tag:#06x}. Failed because that tag locates other tags and is written automatically."
+            raise ValueError(msg)
+        if isinstance(value, str):
+            self._ifd0[tag] = _Entry(_ASCII, value.encode("utf-8") + b"\x00")
+            return
+        self._ifd0[tag] = _encoded(tag, value, self._ifd0.get(tag), self._byte_order)
+
     def items(self) -> ItemsView[int, Any]:
         """Tags of IFD0 and the Exif sub-IFD, less the pointers that locate the sub-IFDs."""
         merged = {}
         for directory in (self._ifd0, self._exif_ifd):
             for tag, entry in directory.items():
-                if tag not in _POINTER_TAGS:
+                # IFD0 wins, as it does for lookups
+                if tag not in _POINTER_TAGS and tag not in merged:
                     merged[tag] = _decoded(tag, entry, self._byte_order)
         return merged.items()
 

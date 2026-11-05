@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Self
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Self, assert_never
 
 import numpy as np
 import OpenImageIO as oiio  # noqa: N813
@@ -33,7 +33,71 @@ from griptape_nodes.image.exif import (
 )
 from griptape_nodes.image.formats import ImageFormat, sniff_image_format
 from griptape_nodes.image.metadata import ImageMetadata
-from griptape_nodes.image.pipeline import Flatten, Orient, PipelineStep, RoundCorners, Thumbnail, ToRGB, ToRGBA
+from griptape_nodes.image.operations import (
+    GRAYSCALE_ALPHA_CHANNELS,
+    GRAYSCALE_CHANNELS,
+    RGB_CHANNELS,
+    RGBA_CHANNELS,
+    alpha_channel,
+    blurred,
+    buffer_from_pixels,
+    checked,
+    composited,
+    cropped,
+    dilated,
+    edges,
+    enhanced,
+    eroded,
+    flipped_horizontal,
+    flipped_vertical,
+    float_pixels,
+    inverted,
+    max_value,
+    native_pixels,
+    new_image,
+    padded,
+    resized,
+    rotated,
+    to_gray,
+    to_rgb,
+    to_rgba,
+    with_alpha,
+    with_line,
+    with_rectangle,
+    with_text,
+)
+from griptape_nodes.image.pipeline import (
+    Apply,
+    Brightness,
+    Color,
+    Composite,
+    Contrast,
+    Crop,
+    Dilate,
+    DrawLine,
+    DrawRectangle,
+    DrawText,
+    Erode,
+    FindEdges,
+    Flatten,
+    FlipHorizontal,
+    FlipVertical,
+    GaussianBlur,
+    Invert,
+    Orient,
+    Pad,
+    PipelineStep,
+    Resize,
+    Rotate,
+    RoundCorners,
+    Saturation,
+    SetAlpha,
+    Thumbnail,
+    ToGray,
+    ToRGB,
+    ToRGBA,
+    ToUint8,
+)
 from griptape_nodes.image.png_text_chunks import insert_text_chunks, read_text_chunks
 
 if TYPE_CHECKING:
@@ -42,10 +106,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-_GRAYSCALE_CHANNELS = 1
-_GRAYSCALE_ALPHA_CHANNELS = 2
-_RGB_CHANNELS = 3
-_RGBA_CHANNELS = 4
 _ALPHA = 3
 _UPRIGHT = 1
 
@@ -223,6 +283,9 @@ class GriptapeImage:
         "double": PixelType.DOUBLE,
     }
 
+    # Formats whose OpenImageIO writers refuse one-channel gray
+    _COLOR_ONLY_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset({ImageFormat.WEBP, ImageFormat.GIF})
+
     # Formats that store float pixels as they are; the rest get display values
     _FLOAT_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset({ImageFormat.EXR, ImageFormat.TIFF})
 
@@ -298,11 +361,11 @@ class GriptapeImage:
     def color_space(self) -> str:
         """Human-readable color model: "RGB", "RGBA", "Grayscale", or "Grayscale+Alpha"."""
         channels = self.channels
-        if channels == _GRAYSCALE_CHANNELS:
+        if channels == GRAYSCALE_CHANNELS:
             return "Grayscale"
-        if channels == _GRAYSCALE_ALPHA_CHANNELS:
+        if channels == GRAYSCALE_ALPHA_CHANNELS:
             return "Grayscale+Alpha"
-        if channels == _RGBA_CHANNELS:
+        if channels == RGBA_CHANNELS:
             return "RGBA"
         return "RGB"
 
@@ -340,12 +403,21 @@ class GriptapeImage:
         self._extra_kinds = None
         self._header = None
 
+    def to_array(self) -> np.ndarray:
+        """Return a height x width x channels NumPy copy of the pixels, in their own type, alpha unassociated and last.
+
+        Raises:
+            ValueError: If the image was closed or can't be decoded
+        """
+        return native_pixels(self._decoded())
+
     def encode(
         self,
         image_format: ImageFormat,
         *,
         quality: int | None = None,
         optimize: bool = False,
+        lossless: bool = False,
         metadata: ImageMetadata | None = None,
     ) -> bytes:
         """Encode the image.
@@ -366,6 +438,8 @@ class GriptapeImage:
             image_format: Target format
             quality: Lossy quality 1-100 for JPEG/WEBP; None uses the format's default
             optimize: Spend extra time for a smaller file where the format supports it
+            lossless: Store WEBP without loss, ignoring ``quality``. The other formats ``encode``
+                writes are lossless already, except JPEG, which can't be.
             metadata: Metadata to write. None writes the image's own; ``ImageMetadata()`` writes none.
                 PNG holds all of it; JPEG, WEBP, and TIFF hold EXIF and the color profile; BMP,
                 GIF, TGA, and EXR hold none.
@@ -380,6 +454,9 @@ class GriptapeImage:
         if extension is None:
             msg = f"Attempted to save an image as {image_format}. Failed because that format can't be written."
             raise ValueError(msg)
+        if lossless and image_format == ImageFormat.JPEG:
+            msg = "Attempted to save an image as lossless JPEG. Failed because JPEG is always lossy."
+            raise ValueError(msg)
 
         source = self._source
         own_metadata = metadata is None
@@ -393,13 +470,16 @@ class GriptapeImage:
         if (
             source is not None
             and writes_some
+            and not lossless
             and self._can_splice(source, image_format, quality, requested, optimize=optimize)
         ):
             encoded = source
             if not own_metadata:
                 encoded = _spliced(source, image_format, requested, dropped)
         else:
-            encoded = self._reencoded(image_format, extension, quality, requested, dropped, optimize=optimize)
+            encoded = self._reencoded(
+                image_format, extension, quality, requested, dropped, optimize=optimize, lossless=lossless
+            )
             if own_metadata or requested.exif or requested.text:
                 dropped.extend(self._extra_metadata_kinds())
         if dropped:
@@ -450,18 +530,21 @@ class GriptapeImage:
         dropped: list[str],
         *,
         optimize: bool,
+        lossless: bool = False,
     ) -> bytes:
         """Encode the pixels with ``requested``'s color profile, then write the rest of it into the container.
 
         Appends what was lost to ``dropped``.
         """
         buf = self._decoded()
-        if buf.nchannels == _GRAYSCALE_ALPHA_CHANNELS and image_format != ImageFormat.PNG:
+        if buf.nchannels == GRAYSCALE_ALPHA_CHANNELS and image_format != ImageFormat.PNG:
             # PNG is the only format here that holds gray with alpha
-            buf = _to_rgba(buf)
+            buf = to_rgba(buf)
+        elif buf.nchannels == GRAYSCALE_CHANNELS and image_format in self._COLOR_ONLY_FORMATS:
+            buf = to_rgb(buf)
         if _is_float(buf) and image_format not in self._FLOAT_FORMATS and not self._holds_display_values():
             buf = _display_referred(buf)
-        spec = self._output_spec(buf, image_format, quality, optimize=optimize)
+        spec = self._output_spec(buf, image_format, quality, optimize=optimize, lossless=lossless)
         icc_profile = None
         if requested.icc_profile is not None and image_format in self._ICC_FORMATS:
             icc_profile = requested.icc_profile
@@ -505,7 +588,7 @@ class GriptapeImage:
                 exif_block,
                 width=spec.width,
                 height=spec.height,
-                has_alpha=spec.nchannels == _RGBA_CHANNELS,
+                has_alpha=spec.nchannels == RGBA_CHANNELS,
             )
         elif image_format == ImageFormat.TIFF and exif is not None:
             encoded = self._tiff_with_exif(encoded, exif, dropped)
@@ -521,7 +604,13 @@ class GriptapeImage:
         return with_exif
 
     def _output_spec(
-        self, buf: oiio.ImageBuf, image_format: ImageFormat, quality: int | None, *, optimize: bool
+        self,
+        buf: oiio.ImageBuf,
+        image_format: ImageFormat,
+        quality: int | None,
+        *,
+        optimize: bool,
+        lossless: bool = False,
     ) -> oiio.ImageSpec:
         """Return a spec for writing ``buf`` with no metadata, so only what ``encode`` is given gets written."""
         source_spec = buf.spec()
@@ -532,6 +621,8 @@ class GriptapeImage:
             quality = self._DEFAULT_QUALITY.get(image_format)
         if image_format == ImageFormat.JPEG and quality is not None:
             spec.attribute("compression", f"jpeg:{quality}")
+        elif image_format == ImageFormat.WEBP and lossless:
+            spec.attribute("compression", "lossless")
         elif image_format == ImageFormat.WEBP and quality is not None:
             spec.attribute("compression", f"webp:{quality}")
             # libwebp's fastest method. Higher ones search harder for a smaller file, and dominate
@@ -605,21 +696,94 @@ class GriptapeImage:
             return self._apply_step(None)
         return current
 
-    def _apply_step(self, step: PipelineStep | None) -> GriptapeImage:  # noqa: PLR0911
+    def _apply_step(self, step: PipelineStep | None) -> GriptapeImage:
         """Return a new image with ``step`` applied, or an unchanged copy for None."""
-        if step is None:
-            return self._derive(self._decoded().copy(), step)
-        if isinstance(step, Flatten):
-            return self._derive(_flattened(self._decoded(), step), step)
-        if isinstance(step, Thumbnail):
-            return self._derive(self._thumbnail(step), step)
-        if isinstance(step, Orient):
-            return self._derive(_oriented(self._decoded(), step.orientation), step)
-        if isinstance(step, ToRGB):
-            return self._derive(_to_rgb(self._decoded()), step)
-        if isinstance(step, ToRGBA):
-            return self._derive(_to_rgba(self._decoded()), step)
-        return self._derive(_rounded(self._decoded(), step), step)
+        return self._derive(self._step_pixels(step), step)
+
+    def _step_pixels(self, step: PipelineStep | None) -> oiio.ImageBuf:  # noqa: C901, PLR0911, PLR0912
+        """Return the pixels ``step`` makes from this image's."""
+        buf = self._decoded()
+        match step:
+            case None:
+                return buf.copy()
+            case Thumbnail():
+                return self._thumbnail(step)
+            case Orient():
+                return _oriented(buf, step.orientation)
+            case ToRGB():
+                return to_rgb(buf)
+            case ToRGBA():
+                return to_rgba(buf)
+            case RoundCorners():
+                return _rounded(buf, step)
+            case Flatten():
+                return _flattened(buf, step)
+            case Resize():
+                return resized(buf, step.width, step.height, step.resize_filter)
+            case Crop():
+                return cropped(buf, step)
+            case Rotate():
+                return rotated(buf, step)
+            case FlipHorizontal():
+                return flipped_horizontal(buf)
+            case FlipVertical():
+                return flipped_vertical(buf)
+            case Pad():
+                return padded(buf, step)
+            case ToGray():
+                return to_gray(buf)
+            case ToUint8():
+                return self._uint8_pixels()
+            case Brightness() | Contrast() | Saturation():
+                return enhanced(buf, step)
+            case Invert():
+                return inverted(buf)
+            case GaussianBlur():
+                return blurred(buf, step.radius)
+            case Dilate():
+                return dilated(buf, step.size)
+            case Erode():
+                return eroded(buf, step.size)
+            case FindEdges():
+                return edges(buf)
+            case Composite():
+                return composited(buf, self._encoded_like_self(step.overlay), step)
+            case SetAlpha():
+                alpha = step.alpha
+                if isinstance(alpha, GriptapeImage):
+                    return with_alpha(buf, alpha._decoded())
+                return with_alpha(buf, alpha)
+            case DrawText():
+                return with_text(buf, step)
+            case DrawRectangle():
+                return with_rectangle(buf, step)
+            case DrawLine():
+                return with_line(buf, step)
+            case Apply():
+                return _applied(buf, step)
+            case _:
+                assert_never(step)
+
+    def _encodes_display(self) -> bool:
+        """Whether the pixels hold display values: integer pixels always do, float ones may be scene-linear."""
+        return not _is_float(self._decoded()) or self._holds_display_values()
+
+    def _encoded_like_self(self, other: GriptapeImage) -> oiio.ImageBuf:
+        """Return ``other``'s pixels with the same encoding as this image's, so the two can be mixed."""
+        buf = other._decoded()
+        if self._encodes_display() == other._encodes_display():
+            return buf
+        if self._encodes_display():
+            return _display_referred(buf)
+        return _scene_linear(buf)
+
+    def _uint8_pixels(self) -> oiio.ImageBuf:
+        buf = self._decoded()
+        if self.pixel_type == PixelType.UINT8:
+            return buf.copy()
+        if _is_float(buf) and not self._holds_display_values():
+            buf = _display_referred(buf)
+        return checked(buf.copy(oiio.UINT8))
 
     def _thumbnail(self, step: Thumbnail) -> oiio.ImageBuf:
         buf = self._decoded()
@@ -630,7 +794,7 @@ class GriptapeImage:
         width = max(1, round(spec.width * scale))
         height = max(1, round(spec.height * scale))
         roi = oiio.ROI(0, width, 0, height, 0, 1, 0, buf.nchannels)
-        has_alpha = _alpha_channel(buf) is not None
+        has_alpha = alpha_channel(buf) is not None
         # Filtering unassociated color would bleed the color of transparent pixels into the edges
         source = buf
         if has_alpha:
@@ -640,9 +804,9 @@ class GriptapeImage:
         filter_name = "triangle"
         if scale * _BOX_FILTER_MIN_SHRINK <= 1:
             filter_name = "box"
-        resized = _checked(oiio.ImageBufAlgo.resize(source, filter_name, roi=roi))
+        resized = checked(oiio.ImageBufAlgo.resize(source, filter_name, roi=roi))
         if has_alpha:
-            resized = _checked(oiio.ImageBufAlgo.unpremult(resized))
+            resized = checked(oiio.ImageBufAlgo.unpremult(resized))
         return resized
 
     def _derive(self, buf: oiio.ImageBuf, step: PipelineStep | None) -> GriptapeImage:
@@ -661,6 +825,8 @@ class GriptapeImage:
         exif = metadata.exif
         if exif is not None:
             _describe_pixels(exif, buf.spec(), oriented=isinstance(step, Orient))
+        # Float pixels a step computed from integer ones hold the same display values, scaled to 0-1
+        display_encoded = self._holds_display_values() or not _is_float(self._decoded())
         return type(self)(
             source=None,
             source_path=None,
@@ -668,7 +834,7 @@ class GriptapeImage:
             image_format=self._format,
             metadata=replace(metadata, exif=exif, icc_profile=icc_profile),
             extra_metadata_kinds=self._extra_metadata_kinds(),
-            display_encoded=self._holds_display_values(),
+            display_encoded=display_encoded,
         )
 
     def _spec(self) -> oiio.ImageSpec:
@@ -752,6 +918,42 @@ class GriptapeImage:
             image._format = ImageFormat.from_name(image._read_header().file_format_name)
         return image
 
+    @classmethod
+    def from_array(cls, pixels: np.ndarray, metadata: ImageMetadata | None = None) -> GriptapeImage:
+        """Make an image from a height x width (x channels) NumPy array.
+
+        One channel is gray, two gray and alpha, three RGB, four RGBA, with unassociated alpha.
+        Integer types use their full range; float pixels are 0-1 and, as with EXR, taken as
+        scene-linear unless ``metadata`` carries a color profile. The array is copied. The image
+        has no format until it's encoded.
+
+        Raises:
+            ValueError: If the array's shape or type isn't one an image can have
+        """
+        PixelType.from_numpy(pixels.dtype)
+        buf = buffer_from_pixels(np.array(pixels))
+        if metadata is None:
+            metadata = ImageMetadata()
+        return cls(
+            source=None, source_path=None, buf=buf, image_format=None, metadata=metadata, extra_metadata_kinds=[]
+        )
+
+    @classmethod
+    def new(cls, width: int, height: int, color: Color = (0, 0, 0)) -> GriptapeImage:
+        """Make an 8-bit image of one color: gray, gray and alpha, RGB, or RGBA, as many channels as ``color`` has.
+
+        Raises:
+            ValueError: If the size isn't positive or the color doesn't have 1-4 values
+        """
+        return cls(
+            source=None,
+            source_path=None,
+            buf=new_image(width, height, color),
+            image_format=None,
+            metadata=ImageMetadata(),
+            extra_metadata_kinds=[],
+        )
+
 
 class _temporary_path:  # noqa: N801
     """A closed temporary file path, removed on exit. Closed so OpenImageIO can open it on Windows."""
@@ -822,7 +1024,7 @@ def _icc_profile_fits(icc_profile: bytes, channels: int) -> bool:
     RGB they decode to.
     """
     color_space = icc_profile[_ICC_COLOR_SPACE]
-    if channels >= _RGB_CHANNELS:
+    if channels >= RGB_CHANNELS:
         return color_space == _ICC_RGB
     return color_space == _ICC_GRAY
 
@@ -852,14 +1054,39 @@ def _read_file(path: Path) -> _Decoded:
         msg = f"Attempted to decode an image. Failed because OpenImageIO could not read it: {buf.geterror()}"
         raise ValueError(msg)
     file_format_name = buf.file_format_name
-    if buf.nchannels == _GRAYSCALE_ALPHA_CHANNELS:
+    if buf.nchannels == GRAYSCALE_ALPHA_CHANNELS:
         buf.specmod().channelnames = ("Y", "A")
         buf.specmod().alpha_channel = 1
+    elif buf.spec().alpha_channel >= buf.nchannels:
+        # The GIF reader names an alpha channel past the last one, so premultiplying reads the next
+        # pixel's red as alpha. The channel named "A" is the alpha.
+        buf.specmod().alpha_channel = _named_alpha_channel(buf.spec().channelnames)
     # Formats that store associated alpha (EXR, some TIFF) ignore the config; unassociate them so
     # every buffer held is unassociated
-    if _alpha_channel(buf) is not None and buf.spec().get_int_attribute(_UNASSOCIATED_ALPHA, 0) != 1:
-        buf = _checked(oiio.ImageBufAlgo.unpremult(buf))
+    if alpha_channel(buf) is not None and buf.spec().get_int_attribute(_UNASSOCIATED_ALPHA, 0) != 1:
+        buf = checked(oiio.ImageBufAlgo.unpremult(buf))
     return _Decoded(buf, file_format_name)
+
+
+def _named_alpha_channel(channel_names: Sequence[str]) -> int:
+    """Return the index of the channel named "A", or -1 for none."""
+    if "A" not in channel_names:
+        return -1
+    return list(channel_names).index("A")
+
+
+def _applied(buf: oiio.ImageBuf, step: Apply) -> oiio.ImageBuf:
+    """Run an ``Apply`` step's function on the pixels.
+
+    Raises:
+        ValueError: If the function doesn't return an array an image can hold
+    """
+    result = step.function(native_pixels(buf))
+    if not isinstance(result, np.ndarray):
+        msg = f"Attempted to apply a function to an image's pixels. Failed because it returned {type(result).__name__}, not an array."
+        raise ValueError(msg)  # noqa: TRY004 - the function's result, not this call's argument
+    PixelType.from_numpy(result.dtype)
+    return buffer_from_pixels(result)
 
 
 def _icc_profile(spec: oiio.ImageSpec) -> bytes | None:
@@ -907,22 +1134,29 @@ def _write_file(buf: oiio.ImageBuf, spec: oiio.ImageSpec, path: Path) -> bytes:
     return path.read_bytes()
 
 
-def _alpha_channel(buf: oiio.ImageBuf) -> int | None:
-    alpha = buf.spec().alpha_channel
-    if alpha < 0:
-        return None
-    return alpha
-
-
-def _checked(buf: oiio.ImageBuf) -> oiio.ImageBuf:
-    if buf.has_error:
-        msg = f"Attempted to transform an image. Failed because OpenImageIO reported: {buf.geterror()}"
-        raise ValueError(msg)
-    return buf
-
-
 def _is_float(buf: oiio.ImageBuf) -> bool:
     return str(buf.spec().format) in ("half", "float", "double")
+
+
+def _scene_linear(buf: oiio.ImageBuf) -> oiio.ImageBuf:
+    """Return display (sRGB) pixels as scene-linear float, the inverse of ``_display_referred``, alpha unchanged.
+
+    Raises:
+        ValueError: If OpenImageIO cannot read the pixels
+    """
+    pixels = float_pixels(buf)
+    encoded = np.clip(pixels, 0.0, 1.0)
+    linear = np.where(
+        encoded <= _SRGB_LINEAR_LIMIT * 12.92, encoded / 12.92, np.power((encoded + 0.055) / 1.055, 2.4)
+    ).astype(np.float32)
+    source_spec = buf.spec()
+    alpha = alpha_channel(buf)
+    if alpha is not None:
+        linear[:, :, alpha] = pixels[:, :, alpha]
+    out = oiio.ImageBuf(np.ascontiguousarray(linear))
+    out.specmod().channelnames = source_spec.channelnames
+    out.specmod().alpha_channel = source_spec.alpha_channel
+    return out
 
 
 def _display_referred(buf: oiio.ImageBuf) -> oiio.ImageBuf:
@@ -940,19 +1174,13 @@ def _display_referred(buf: oiio.ImageBuf) -> oiio.ImageBuf:
         np.float32
     )
     source_spec = buf.spec()
-    alpha = _alpha_channel(buf)
+    alpha = alpha_channel(buf)
     if alpha is not None:
         encoded[:, :, alpha] = linear[:, :, alpha]
     out = oiio.ImageBuf(np.ascontiguousarray(encoded))
     out.specmod().channelnames = source_spec.channelnames
     out.specmod().alpha_channel = source_spec.alpha_channel
     return out
-
-
-def _max_value(dtype: np.dtype) -> float:
-    if np.issubdtype(dtype, np.integer):
-        return float(np.iinfo(dtype).max)
-    return 1.0
 
 
 def _oriented(buf: oiio.ImageBuf, orientation: int) -> oiio.ImageBuf:  # noqa: PLR0911
@@ -962,44 +1190,24 @@ def _oriented(buf: oiio.ImageBuf, orientation: int) -> oiio.ImageBuf:  # noqa: P
     the buffer's own metadata.
     """
     if orientation == 2:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.flop(buf))
+        return checked(oiio.ImageBufAlgo.flop(buf))
     if orientation == 3:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.rotate180(buf))
+        return checked(oiio.ImageBufAlgo.rotate180(buf))
     if orientation == 4:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.flip(buf))
+        return checked(oiio.ImageBufAlgo.flip(buf))
     if orientation == 5:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.transpose(buf))
+        return checked(oiio.ImageBufAlgo.transpose(buf))
     if orientation == 6:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.rotate90(buf))
+        return checked(oiio.ImageBufAlgo.rotate90(buf))
     if orientation == 7:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.rotate180(_checked(oiio.ImageBufAlgo.transpose(buf))))
+        return checked(oiio.ImageBufAlgo.rotate180(checked(oiio.ImageBufAlgo.transpose(buf))))
     if orientation == 8:  # noqa: PLR2004
-        return _checked(oiio.ImageBufAlgo.rotate270(buf))
+        return checked(oiio.ImageBufAlgo.rotate270(buf))
     return buf.copy()
 
 
-def _to_rgb(buf: oiio.ImageBuf) -> oiio.ImageBuf:
-    order: tuple[int | float, ...] = (0, 1, 2)
-    if buf.nchannels in (_GRAYSCALE_CHANNELS, _GRAYSCALE_ALPHA_CHANNELS):
-        order = (0, 0, 0)
-    return _checked(oiio.ImageBufAlgo.channels(buf, order, ("R", "G", "B")))
-
-
-def _to_rgba(buf: oiio.ImageBuf) -> oiio.ImageBuf:
-    channels = buf.nchannels
-    if channels == _RGBA_CHANNELS:
-        return buf.copy()
-    if channels == _GRAYSCALE_CHANNELS:
-        order: tuple[int | float, ...] = (0, 0, 0, 1.0)
-    elif channels == _GRAYSCALE_ALPHA_CHANNELS:
-        order = (0, 0, 0, 1)
-    else:
-        order = (0, 1, 2, 1.0)
-    return _checked(oiio.ImageBufAlgo.channels(buf, order, ("R", "G", "B", "A")))
-
-
 def _rounded(buf: oiio.ImageBuf, step: RoundCorners) -> oiio.ImageBuf:
-    rgba = _to_rgba(buf)
+    rgba = to_rgba(buf)
     spec = rgba.spec()
     radius = step.radius_pixels(spec.width, spec.height)
     if radius <= 0:
@@ -1010,25 +1218,25 @@ def _rounded(buf: oiio.ImageBuf, step: RoundCorners) -> oiio.ImageBuf:
         msg = f"Attempted to round an image's corners. Failed because OpenImageIO could not read its pixels: {rgba.geterror()}"
         raise ValueError(msg)  # noqa: TRY004 - a failed read, not a wrong argument type
     coverage = _rounded_rectangle_coverage(spec.width, spec.height, radius)
-    alpha_max = _max_value(pixels.dtype)
+    alpha_max = max_value(pixels.dtype)
     pixels[:, :, _ALPHA] = (coverage * alpha_max).astype(pixels.dtype)
     # An ImageBuf straight over the NumPy array, no file involved
     return oiio.ImageBuf(pixels)
 
 
 def _flattened(buf: oiio.ImageBuf, step: Flatten) -> oiio.ImageBuf:
-    rgba = _to_rgba(buf)
+    rgba = to_rgba(buf)
     spec = rgba.spec()
     foreground = oiio.ImageBufAlgo.premult(rgba)
     red, green, blue = step.background
     canvas = oiio.ImageBufAlgo.fill(
         (red / 255.0, green / 255.0, blue / 255.0, 1.0),
-        oiio.ROI(0, spec.width, 0, spec.height, 0, 1, 0, _RGBA_CHANNELS),
+        oiio.ROI(0, spec.width, 0, spec.height, 0, 1, 0, RGBA_CHANNELS),
     )
-    composited = _checked(oiio.ImageBufAlgo.over(foreground, canvas))
-    rgb = _checked(oiio.ImageBufAlgo.channels(composited, (0, 1, 2), ("R", "G", "B")))
+    composited = checked(oiio.ImageBufAlgo.over(foreground, canvas))
+    rgb = checked(oiio.ImageBufAlgo.channels(composited, (0, 1, 2), ("R", "G", "B")))
     # over computes in float; return to the source's pixel type
-    out = oiio.ImageBuf(oiio.ImageSpec(spec.width, spec.height, _RGB_CHANNELS, spec.format))
+    out = oiio.ImageBuf(oiio.ImageSpec(spec.width, spec.height, RGB_CHANNELS, spec.format))
     out.copy_pixels(rgb)
     return out
 

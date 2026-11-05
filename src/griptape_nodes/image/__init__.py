@@ -13,12 +13,14 @@ from griptape_nodes.image.metadata import (
     ExifRational,
     ImageMetadata,
 )
-from griptape_nodes.image.pipeline import DEFAULT_THUMBNAIL_SIZE, GriptapeImagePipeline
+from griptape_nodes.image.operations import TextSize, text_size
+from griptape_nodes.image.pipeline import DEFAULT_THUMBNAIL_SIZE, Color, GriptapeImagePipeline, ResizeFilter, TextAlign
 
 __all__ = [
     "DEFAULT_THUMBNAIL_SIZE",
     "EXIF_GPSINFO_TAG",
     "EXIF_ORIENTATION_TAG",
+    "Color",
     "Exif",
     "ExifRational",
     "GriptapeImage",
@@ -26,4 +28,8 @@ __all__ = [
     "ImageFormat",
     "ImageMetadata",
     "PixelType",
+    "ResizeFilter",
+    "TextAlign",
+    "TextSize",
+    "text_size",
 ]
