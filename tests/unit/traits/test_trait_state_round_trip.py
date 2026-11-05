@@ -46,7 +46,10 @@ from griptape_nodes.traits.widget import Widget
             NumbersSelector({"x": 1}, step=2, overall_min=0, overall_max=10),
             {"defaults": {"x": 1}, "step": 2, "overall_min": 0, "overall_max": 10},
         ),
-        (Widget("editor", "widgets"), {"name": "editor", "library": "widgets"}),
+        (
+            Widget("editor", "widgets", synced_parameters=["left", "top"]),
+            {"name": "editor", "library": "widgets", "synced_parameters": ["left", "top"]},
+        ),
     ],
 )
 def test_trait_reports_plain_constructor_state(trait: Any, state: dict[str, Any]) -> None:
@@ -96,3 +99,13 @@ def test_apply_state_uses_trait_validation() -> None:
     trait.apply_state({"icon_size": "unknown"})
 
     assert trait.icon_size == "small"
+
+
+def test_widget_synced_parameters_survive_a_save_and_load() -> None:
+    """A widget rebuilt from saved state keeps the parameters it syncs."""
+    saved = Widget("editor", "widgets", synced_parameters=["left", "top"]).to_state()
+    rebuilt = Widget("editor", "widgets")
+
+    rebuilt.apply_state(saved)
+
+    assert rebuilt.synced_parameters == ["left", "top"]
