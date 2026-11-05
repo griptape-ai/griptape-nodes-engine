@@ -20,6 +20,7 @@ MAX_TOTAL_TEXT_BYTES = 64 * MAX_COMPRESSED_TEXT_BYTES
 
 _CHUNK_HEADER_BYTES = 8
 _CHUNK_CRC_BYTES = 4
+_TEXT_CHUNK_TYPES = (b"tEXt", b"zTXt", b"iTXt")
 
 
 class TextChunk(NamedTuple):
@@ -57,11 +58,13 @@ def read_text_chunks(png: bytes) -> dict[str, str]:
     while position + _CHUNK_HEADER_BYTES <= len(png):
         length, chunk_type = struct.unpack(">I4s", png[position : position + _CHUNK_HEADER_BYTES])
         data_start = position + _CHUNK_HEADER_BYTES
-        data = png[data_start : data_start + length]
         position = data_start + length + _CHUNK_CRC_BYTES
         if chunk_type == b"IEND":
             break
-        chunk = _decode_text_chunk(chunk_type, data)
+        # Only text payloads are sliced, so pixel data is never copied
+        if chunk_type not in _TEXT_CHUNK_TYPES:
+            continue
+        chunk = _decode_text_chunk(chunk_type, png[data_start : data_start + length])
         if chunk is None:
             continue
         total_bytes += len(chunk.text)
