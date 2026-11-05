@@ -65,37 +65,35 @@ def _make_inputs(directory: Path) -> dict[str, Path]:
 
 
 def _operation(name: str, data: bytes) -> None:
-    from griptape_nodes.image import open_image
+    from griptape_nodes.image import GriptapeImagePipeline, ImageFormat, ImageMetadata, open_image
 
     if name == "read_text_metadata":
         with open_image(data) as image:
-            _ = image.text_metadata
+            _ = image.metadata.text
     elif name == "inject_png_metadata":
         # PngMetadataDriver.inject_metadata
         with open_image(data) as image:
-            texts = {**image.text_metadata, "gtn_workflow": WORKFLOW_TEXT}
-            image.encode("PNG", text_metadata=texts)
+            texts = {**image.metadata.text, "gtn_workflow": WORKFLOW_TEXT}
+            image.encode(ImageFormat.PNG, metadata=ImageMetadata(text=texts))
     elif name == "inject_exif_metadata":
         # ExifMetadataDriver.inject_metadata
         with open_image(data) as image:
-            image.encode(image.format or "JPEG", exif_bytes=image.exif_bytes)
+            image.encode(image.format or ImageFormat.JPEG, metadata=ImageMetadata(exif=image.metadata.exif))
     elif name == "webp_preview":
-        # utils.image_preview: orient, to RGB, fit 512x512, WEBP q85
-        with open_image(data) as image, image.exif_transposed() as upright, upright.to_rgb() as rgb:
-            rgb.thumbnail(512, 512).encode("WEBP", quality=85, optimize=True)
+        # utils.image_preview on a JPEG: orient, fit 512x512, WEBP q85
+        with open_image(data) as image, GriptapeImagePipeline(image) as pipeline:
+            pipeline.exif_transpose().thumbnail(512, 512)
+            with pipeline.end() as preview:
+                preview.encode(ImageFormat.WEBP, quality=85, optimize=True)
     elif name == "rounded_jpeg_preview":
-        # PILRoundedPreviewGenerator with JPEG output
-        with (
-            open_image(data) as image,
-            image.exif_transposed() as upright,
-            upright.thumbnail(1024, 1024) as thumbnail,
-            thumbnail.with_rounded_corners(40) as rounded,
-            rounded.flattened((255, 255, 255)) as flat,
-        ):
-            flat.encode("JPEG")
+        # PILRoundedPreviewGenerator with JPEG output and its default 2% radius
+        with open_image(data) as image, GriptapeImagePipeline(image) as pipeline:
+            pipeline.exif_transpose().thumbnail(1024, 1024).round_corners(0.02).flatten((255, 255, 255))
+            with pipeline.end() as preview:
+                preview.encode(ImageFormat.JPEG)
     elif name == "full_png_reencode":
         with open_image(data) as image:
-            image.encode("PNG")
+            image.encode(ImageFormat.PNG)
     else:
         msg = f"Unknown operation {name}"
         raise ValueError(msg)
@@ -124,13 +122,13 @@ def _warm_up(data: bytes) -> None:
     """Load the backend's codec for this format on a tiny image, leaving no large freed memory to reuse."""
     from PIL import Image
 
-    from griptape_nodes.image import open_image
+    from griptape_nodes.image import GriptapeImagePipeline, ImageFormat, open_image
 
-    image_format = Image.open(BytesIO(data)).format or "PNG"
+    image_format = ImageFormat(Image.open(BytesIO(data)).format or "PNG")
     buffer = BytesIO()
     Image.new("RGB", (16, 16)).save(buffer, format=image_format)
-    with open_image(buffer.getvalue()) as image:
-        image.thumbnail(8, 8).encode(image_format)
+    with open_image(buffer.getvalue()) as image, GriptapeImagePipeline(image).thumbnail(8, 8).end() as small:
+        small.encode(image_format)
 
 
 def _child(backend: str, operation: str, input_path: Path, repeat: int) -> None:

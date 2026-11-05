@@ -1327,7 +1327,7 @@ class FlowSerialization(EngineScoped):
                 )
 
         # An image without embedded flow commands is a valid state, not an error.
-        metadata = image.text_metadata
+        metadata = image.metadata.text
         # Closed now: a failure reading the commands can keep this frame, and the open file, alive
         # until garbage collection, and Windows won't delete or replace an open file.
         image.close()

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
 
-from griptape_nodes.image import open_image
+from griptape_nodes.image import DEFAULT_THUMBNAIL_SIZE, GriptapeImagePipeline, ImageFormat, open_image
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     ReadFileRequest,
@@ -32,14 +32,14 @@ class PILThumbnailParameters(BaseGeneratorParameters):
     """Parameters for PIL thumbnail generation."""
 
     max_width: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum width in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
     )
 
     max_height: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum height in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
@@ -156,11 +156,15 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
 
     def _render_thumbnail(self, image_data: bytes) -> bytes:
         """Decode, shrink and re-encode the image. CPU-bound, so callers run it off the event loop."""
-        with (
-            open_image(image_data) as source,
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            source.exif_transposed() as upright,
-            # Preserves aspect ratio, fits within max dimensions
-            upright.thumbnail(self.params.max_width, self.params.max_height) as thumbnail,
-        ):
-            return thumbnail.encode(self.preview_format)
+        preview_format = ImageFormat.from_name(self.preview_format)
+        if preview_format is None:
+            msg = (
+                f"Attempted to generate a thumbnail. Failed because {self.preview_format} is not a known image format."
+            )
+            raise TypeError(msg)
+        with open_image(image_data) as source, GriptapeImagePipeline(source) as pipeline:
+            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
+            # fit within the max dimensions, preserving aspect ratio
+            pipeline.exif_transpose().thumbnail(self.params.max_width, self.params.max_height)
+            with pipeline.end() as thumbnail:
+                return thumbnail.encode(preview_format)

@@ -3,11 +3,15 @@
 import base64
 from pathlib import Path
 
-from griptape_nodes.image import GriptapeImage, normalize_format_name, open_image
+from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat, open_image
 from griptape_nodes.retained_mode.griptape_nodes import logger
 
 # Color models that JPEG/WEBP previews are flattened out of before encoding
 _CONVERT_TO_RGB_FOR_LOSSY = {"RGBA", "Grayscale+Alpha", "Palette"}
+_LOSSY_FORMATS = {ImageFormat.WEBP, ImageFormat.JPEG}
+# Sources that never hold alpha or a palette, so their color model needn't be read (which decodes
+# the full image on some backends, before a reduced-size decode could apply)
+_NO_ALPHA_FORMATS = {ImageFormat.JPEG, ImageFormat.MPO}
 
 
 def create_image_preview(
@@ -101,11 +105,17 @@ def get_image_info(image_path: Path) -> dict | None:
         Dictionary with image info (width, height, format, color_space), or None if failed
     """
     try:
-        with open_image(image_path) as source, source.exif_transposed() as img:
+        with open_image(image_path) as img:
+            # Report the dimensions the image displays at, without decoding and rotating it
+            width = img.width
+            height = img.height
+            exif = img.metadata.exif
+            if exif is not None and exif.swaps_dimensions:
+                width, height = height, width
             return {
-                "width": img.width,
-                "height": img.height,
-                "format": source.format,
+                "width": width,
+                "height": height,
+                "format": img.format,
                 "color_space": img.color_space,
                 "size_bytes": image_path.stat().st_size,
             }
@@ -117,18 +127,28 @@ def get_image_info(image_path: Path) -> dict | None:
 def _render_preview_data_url(
     source: GriptapeImage, max_width: int, max_height: int, quality: int, image_format: str
 ) -> str:
-    """Shrink ``source`` to fit the bounds and return it encoded as a base64 data URL."""
-    # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-    with source.exif_transposed() as upright:
-        # Convert to RGB if necessary (for WebP/JPEG output)
-        if normalize_format_name(image_format) in ("WEBP", "JPEG") and upright.color_space in _CONVERT_TO_RGB_FOR_LOSSY:
-            converted = upright.to_rgb()
-        else:
-            converted = upright
+    """Shrink ``source`` to fit the bounds and return it encoded as a base64 data URL.
 
-        # Calculate new size maintaining aspect ratio
-        with converted, converted.thumbnail(max_width, max_height) as preview:
-            preview_bytes = preview.encode(image_format, quality=quality, optimize=True)
+    Raises:
+        ValueError: If ``image_format`` is not a known image format
+    """
+    target = ImageFormat.from_name(image_format)
+    if target is None:
+        msg = f"Attempted to create an image preview. Failed because {image_format} is not a known image format."
+        raise ValueError(msg)
+    with GriptapeImagePipeline(source) as pipeline:
+        # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
+        pipeline.exif_transpose()
+        # Convert to RGB if necessary (for WebP/JPEG output)
+        if (
+            target in _LOSSY_FORMATS
+            and source.format not in _NO_ALPHA_FORMATS
+            and source.color_space in _CONVERT_TO_RGB_FOR_LOSSY
+        ):
+            pipeline.to_rgb()
+        pipeline.thumbnail(max_width, max_height)
+        with pipeline.end() as preview:
+            preview_bytes = preview.encode(target, quality=quality, optimize=True)
 
     base64_data = base64.b64encode(preview_bytes).decode("utf-8")
     mime_type = f"image/{image_format.lower()}"

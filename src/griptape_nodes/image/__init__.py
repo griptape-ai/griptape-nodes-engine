@@ -10,10 +10,13 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from griptape_nodes.image.griptape_image import GriptapeImage, normalize_format_name
+from griptape_nodes.image.formats import ImageFormat
+from griptape_nodes.image.griptape_image import DEFAULT_THUMBNAIL_SIZE, GriptapeImage, PixelType
+from griptape_nodes.image.metadata import EXIF_GPSINFO_TAG, EXIF_ORIENTATION_TAG, Exif, ImageMetadata
 from griptape_nodes.image.opencv_image import OpenCVImage
 from griptape_nodes.image.openimageio_image import OpenImageIOImage
 from griptape_nodes.image.pillow_image import PillowImage
+from griptape_nodes.image.pipeline import GriptapeImagePipeline
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -59,15 +62,22 @@ def open_image(source: bytes | Path) -> GriptapeImage:
 
 
 __all__ = [
+    "DEFAULT_THUMBNAIL_SIZE",
+    "EXIF_GPSINFO_TAG",
+    "EXIF_ORIENTATION_TAG",
     "IMAGE_BACKEND_ENV_VAR",
     "OPENCV_BACKEND",
     "OPENIMAGEIO_BACKEND",
     "PILLOW_BACKEND",
+    "Exif",
     "GriptapeImage",
+    "GriptapeImagePipeline",
+    "ImageFormat",
+    "ImageMetadata",
     "OpenCVImage",
     "OpenImageIOImage",
     "PillowImage",
+    "PixelType",
     "image_backend_name",
-    "normalize_format_name",
     "open_image",
 ]

@@ -2,27 +2,30 @@
 
 from __future__ import annotations
 
-import struct
 from typing import TYPE_CHECKING, ClassVar
 
 import cv2
 import numpy as np
 
-from griptape_nodes.image.formats import sniff_image_format
-from griptape_nodes.image.griptape_image import GriptapeImage, normalize_format_name
+from griptape_nodes.image.containers import EXIF_HEADER, jpeg_size, read_exif
+from griptape_nodes.image.formats import ImageFormat, sniff_image_format
+from griptape_nodes.image.griptape_image import GriptapeImage, PixelType
+from griptape_nodes.image.metadata import Exif, ImageMetadata
+from griptape_nodes.image.pipeline import Flatten, Orient, PipelineStep, RoundCorners, Thumbnail, ToRGB, ToRGBA
 from griptape_nodes.image.png_text_chunks import insert_text_chunks, read_text_chunks
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-_EXIF_HEADER = b"Exif\x00\x00"
-_EXIF_ORIENTATION_TAG = 0x0112
-_IFD_ENTRY_BYTES = 12
-
 _GRAYSCALE_CHANNELS = 1
 _RGB_CHANNELS = 3
 _RGBA_CHANNELS = 4
 _ALPHA = 3
+
+# Decode a JPEG at reduced size only if it still leaves at least this many times the thumbnail's
+# pixels per side, the margin Pillow's Image.thumbnail keeps (reducing_gap) so the final resize
+# still antialiases
+_REDUCING_GAP = 2.0
 
 
 class OpenCVImage(GriptapeImage):
@@ -30,38 +33,53 @@ class OpenCVImage(GriptapeImage):
 
     Pixels keep the source's bit depth (16-bit PNG and TIFF stay 16-bit) and OpenCV's B, G, R(, A)
     channel order. Decoding is deferred until pixels or dimensions are first needed, so reading
-    only ``text_metadata`` never decodes the image.
+    only ``metadata`` of a JPEG, PNG, or WEBP never decodes the image.
     """
 
-    _ENCODE_EXTENSIONS: ClassVar[dict[str, str]] = {
-        "PNG": ".png",
-        "JPEG": ".jpg",
-        "WEBP": ".webp",
-        "TIFF": ".tiff",
-        "BMP": ".bmp",
-        "GIF": ".gif",
+    _ENCODE_EXTENSIONS: ClassVar[dict[ImageFormat, str]] = {
+        ImageFormat.PNG: ".png",
+        ImageFormat.JPEG: ".jpg",
+        ImageFormat.WEBP: ".webp",
+        ImageFormat.TIFF: ".tiff",
+        ImageFormat.BMP: ".bmp",
+        ImageFormat.GIF: ".gif",
     }
 
     # Formats that only hold 8 bits per channel; deeper images are scaled down before encoding
-    _EIGHT_BIT_FORMATS: ClassVar[set[str]] = {"JPEG", "WEBP", "BMP", "GIF"}
+    _EIGHT_BIT_FORMATS: ClassVar[set[ImageFormat]] = {
+        ImageFormat.JPEG,
+        ImageFormat.WEBP,
+        ImageFormat.BMP,
+        ImageFormat.GIF,
+    }
 
     # OpenCV writes EXIF only for these
-    _EXIF_FORMATS: ClassVar[set[str]] = {"JPEG", "PNG", "WEBP"}
+    _EXIF_FORMATS: ClassVar[set[ImageFormat]] = {ImageFormat.JPEG, ImageFormat.PNG, ImageFormat.WEBP}
+
+    # Formats whose EXIF is read straight from the container; the rest need a full decode
+    _CONTAINER_EXIF_FORMATS: ClassVar[set[ImageFormat]] = {ImageFormat.JPEG, ImageFormat.PNG, ImageFormat.WEBP}
 
     # Pillow's defaults, so previews come out the same size whichever backend wrote them
-    _DEFAULT_QUALITY: ClassVar[dict[str, int]] = {"JPEG": 75, "WEBP": 80}
+    _DEFAULT_QUALITY: ClassVar[dict[ImageFormat, int]] = {ImageFormat.JPEG: 75, ImageFormat.WEBP: 80}
+
+    # Reduced-size JPEG decodes, largest reduction first. IGNORE_ORIENTATION leaves EXIF orientation
+    # to the pipeline, as IMREAD_UNCHANGED does.
+    _REDUCED_DECODES: ClassVar[dict[int, int]] = {
+        8: cv2.IMREAD_REDUCED_COLOR_8 | cv2.IMREAD_IGNORE_ORIENTATION,
+        4: cv2.IMREAD_REDUCED_COLOR_4 | cv2.IMREAD_IGNORE_ORIENTATION,
+        2: cv2.IMREAD_REDUCED_COLOR_2 | cv2.IMREAD_IGNORE_ORIENTATION,
+    }
 
     def __init__(
         self,
         *,
         source: bytes | None,
         pixels: np.ndarray | None,
-        image_format: str | None,
+        image_format: ImageFormat | None,
     ) -> None:
         self._source = source
         self._pixels = pixels
         self._format = image_format
-        self._exif: bytes | None = None
 
     @property
     def width(self) -> int:
@@ -72,15 +90,12 @@ class OpenCVImage(GriptapeImage):
         return self._decoded().shape[0]
 
     @property
-    def format(self) -> str | None:
+    def format(self) -> ImageFormat | None:
         return self._format
 
     @property
     def channels(self) -> int:
-        pixels = self._decoded()
-        if pixels.ndim == 2:  # noqa: PLR2004
-            return _GRAYSCALE_CHANNELS
-        return pixels.shape[2]
+        return _channel_count(self._decoded())
 
     @property
     def color_space(self) -> str:
@@ -92,127 +107,125 @@ class OpenCVImage(GriptapeImage):
         return "RGB"
 
     @property
-    def bit_depth(self) -> int:
-        return self._decoded().dtype.itemsize * 8
+    def pixel_type(self) -> PixelType:
+        return PixelType.from_numpy(self._decoded().dtype)
 
     @property
-    def text_metadata(self) -> dict[str, str]:
-        if self._source is None or self._format != "PNG":
-            return {}
-        return read_text_chunks(self._source)
-
-    @property
-    def exif_bytes(self) -> bytes | None:
+    def metadata(self) -> ImageMetadata:
         if self._source is None:
-            return None
-        self._decoded()
-        return self._exif
+            return ImageMetadata()
+        text = {}
+        if self._format == ImageFormat.PNG:
+            text = read_text_chunks(self._source)
+        exif = None
+        exif_block = self._exif_block()
+        if exif_block is not None:
+            exif = Exif.from_bytes(exif_block)
+        if not exif:
+            exif = None
+        return ImageMetadata(text=text, exif=exif)
 
     def close(self) -> None:
         self._source = None
         self._pixels = None
 
-    def exif_transposed(self) -> OpenCVImage:
-        pixels = self._decoded()
-        orientation = _exif_orientation(self.exif_bytes)
-        return self._derive(_apply_orientation(pixels, orientation))
-
-    def thumbnail(self, max_width: int, max_height: int) -> OpenCVImage:
-        pixels = self._decoded()
-        height, width = pixels.shape[:2]
-        scale = min(max_width / width, max_height / height)
-        if scale >= 1:
-            return self._derive(pixels.copy())
-        size = (max(1, round(width * scale)), max(1, round(height * scale)))
-        return self._derive(cv2.resize(pixels, size, interpolation=cv2.INTER_AREA))
-
-    def to_rgb(self) -> OpenCVImage:
-        pixels = self._decoded()
-        channels = self.channels
-        if channels == _GRAYSCALE_CHANNELS:
-            return self._derive(cv2.cvtColor(pixels, cv2.COLOR_GRAY2BGR))
-        if channels == _RGBA_CHANNELS:
-            return self._derive(cv2.cvtColor(pixels, cv2.COLOR_BGRA2BGR))
-        return self._derive(pixels.copy())
-
-    def to_rgba(self) -> OpenCVImage:
-        pixels = self._decoded()
-        channels = self.channels
-        if channels == _GRAYSCALE_CHANNELS:
-            return self._derive(cv2.cvtColor(pixels, cv2.COLOR_GRAY2BGRA))
-        if channels == _RGB_CHANNELS:
-            return self._derive(cv2.cvtColor(pixels, cv2.COLOR_BGR2BGRA))
-        return self._derive(pixels.copy())
-
-    def with_rounded_corners(self, radius: int) -> OpenCVImage:
-        rgba = self.to_rgba()._decoded()
-        if radius <= 0:
-            return self._derive(rgba)
-
-        height, width = rgba.shape[:2]
-        mask = np.zeros((height, width), dtype=np.uint8)
-        right = width - 1
-        bottom = height - 1
-        cv2.rectangle(mask, (radius, 0), (right - radius, bottom), 255, thickness=cv2.FILLED)
-        cv2.rectangle(mask, (0, radius), (right, bottom - radius), 255, thickness=cv2.FILLED)
-        for center in (
-            (radius, radius),
-            (right - radius, radius),
-            (radius, bottom - radius),
-            (right - radius, bottom - radius),
-        ):
-            cv2.circle(mask, center, radius, 255, thickness=cv2.FILLED, lineType=cv2.LINE_AA)
-
-        alpha_max = _max_value(rgba.dtype)
-        rgba[:, :, _ALPHA] = (mask.astype(np.float64) / 255.0 * alpha_max).astype(rgba.dtype)
-        return self._derive(rgba)
-
-    def flattened(self, background: tuple[int, int, int]) -> OpenCVImage:
-        rgba = self.to_rgba()._decoded()
-        value_max = _max_value(rgba.dtype)
-        alpha = rgba[:, :, _ALPHA : _ALPHA + 1].astype(np.float64) / value_max
-        # background is RGB at 8 bits; pixels are BGR at the image's depth
-        red, green, blue = background
-        canvas = np.array([blue, green, red], dtype=np.float64) / 255.0 * value_max
-        composited = rgba[:, :, :_ALPHA].astype(np.float64) * alpha + canvas * (1.0 - alpha)
-        if np.issubdtype(rgba.dtype, np.integer):
-            composited = np.round(composited)
-        return self._derive(composited.astype(rgba.dtype))
-
     def encode(
         self,
-        image_format: str,
+        image_format: ImageFormat,
         *,
         quality: int | None = None,
         optimize: bool = False,  # noqa: ARG002 - OpenCV has no equivalent
-        exif_bytes: bytes | None = None,
-        text_metadata: dict[str, str] | None = None,
+        metadata: ImageMetadata | None = None,
     ) -> bytes:
-        target = normalize_format_name(image_format)
-        extension = self._ENCODE_EXTENSIONS.get(target)
+        extension = self._ENCODE_EXTENSIONS.get(image_format)
         if extension is None:
-            msg = f"Attempted to save an image as {target}. Failed because the OpenCV image backend cannot write that format."
+            msg = f"Attempted to save an image as {image_format}. Failed because the OpenCV image backend cannot write that format."
             raise ValueError(msg)
 
         pixels = self._decoded()
-        if target in self._EIGHT_BIT_FORMATS:
+        if image_format in self._EIGHT_BIT_FORMATS:
             pixels = _to_eight_bit(pixels)
 
-        params = self._encode_params(target, quality)
-        if exif_bytes is not None and target in self._EXIF_FORMATS:
-            ok, buffer = cv2.imencodeWithMetadata(
-                extension, pixels, [cv2.IMAGE_METADATA_EXIF], [np.frombuffer(exif_bytes, np.uint8)], params
-            )
+        params = self._encode_params(image_format, quality)
+        exif = None
+        if metadata is not None and image_format in self._EXIF_FORMATS:
+            exif = metadata.exif
+        if exif is not None:
+            exif_block = np.frombuffer(exif.to_bytes(), np.uint8)
+            ok, buffer = cv2.imencodeWithMetadata(extension, pixels, [cv2.IMAGE_METADATA_EXIF], [exif_block], params)
         else:
             ok, buffer = cv2.imencode(extension, pixels, params)
         if not ok:
-            msg = f"Attempted to save an image as {target}. Failed because OpenCV could not encode it."
+            msg = f"Attempted to save an image as {image_format}. Failed because OpenCV could not encode it."
             raise ValueError(msg)
 
         encoded = buffer.tobytes()
-        if text_metadata and target == "PNG":
-            encoded = insert_text_chunks(encoded, text_metadata)
+        if metadata is not None and metadata.text and image_format == ImageFormat.PNG:
+            encoded = insert_text_chunks(encoded, metadata.text)
         return encoded
+
+    def _exif_block(self) -> bytes | None:
+        """Read the source's EXIF from the container where it can be found without decoding, else from a full decode."""
+        if self._source is None:
+            return None
+        if self._format in self._CONTAINER_EXIF_FORMATS:
+            return read_exif(self._source, self._format)
+        pixels, metadata_types, blocks = cv2.imdecodeWithMetadata(
+            np.frombuffer(self._source, np.uint8), cv2.IMREAD_UNCHANGED
+        )
+        if pixels is not None and pixels.size > 0 and self._pixels is None:
+            self._pixels = pixels
+        for metadata_type, block in zip(metadata_types, blocks, strict=True):
+            if metadata_type == cv2.IMAGE_METADATA_EXIF:
+                return bytes(block).removeprefix(EXIF_HEADER)
+        return None
+
+    def _apply_step(self, step: PipelineStep | None) -> OpenCVImage:  # noqa: PLR0911
+        if step is None:
+            return self._derive(self._decoded().copy())
+        if isinstance(step, Thumbnail):
+            return self._derive(self._thumbnail(step))
+        if isinstance(step, Orient):
+            return self._derive(_apply_orientation(self._decoded(), step.orientation))
+        if isinstance(step, ToRGB):
+            return self._derive(_to_rgb(self._decoded()))
+        if isinstance(step, ToRGBA):
+            return self._derive(_to_rgba(self._decoded()))
+        if isinstance(step, RoundCorners):
+            return self._derive(_rounded(self._decoded(), step))
+        return self._derive(_flattened(self._decoded(), step))
+
+    def _thumbnail(self, step: Thumbnail) -> np.ndarray:
+        reduced = self._reduced_jpeg_decode(step)
+        if reduced is not None:
+            return reduced
+        pixels = self._decoded()
+        height, width = pixels.shape[:2]
+        scale = min(step.max_width / width, step.max_height / height)
+        if scale >= 1:
+            return pixels.copy()
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        return cv2.resize(pixels, size, interpolation=cv2.INTER_AREA)
+
+    def _reduced_jpeg_decode(self, step: Thumbnail) -> np.ndarray | None:
+        """Shrink a not-yet-decoded JPEG source by decoding it at 1/2, 1/4, or 1/8 size first, or return None.
+
+        A grayscale JPEG comes back as three-channel gray, since the reduced decodes are color only.
+        """
+        if self._pixels is not None or self._source is None or self._format != ImageFormat.JPEG:
+            return None
+        size = jpeg_size(self._source)
+        if size is None:
+            return None
+        scale = min(step.max_width / size.width, step.max_height / size.height)
+        factor = next((factor for factor in self._REDUCED_DECODES if scale * factor * _REDUCING_GAP <= 1), None)
+        if factor is None:
+            return None
+        reduced = cv2.imdecode(np.frombuffer(self._source, np.uint8), self._REDUCED_DECODES[factor])
+        if reduced is None or reduced.size == 0:
+            return None
+        target = (max(1, round(size.width * scale)), max(1, round(size.height * scale)))
+        return cv2.resize(reduced, target, interpolation=cv2.INTER_AREA)
 
     def _decoded(self) -> np.ndarray:
         """Return the pixels, decoding the source on first use.
@@ -226,31 +239,25 @@ class OpenCVImage(GriptapeImage):
             msg = "Attempted to read an image's pixels. Failed because the image was closed."
             raise ValueError(msg)
 
-        # IMREAD_UNCHANGED keeps bit depth and alpha, and leaves EXIF orientation to exif_transposed
-        pixels, metadata_types, metadata = cv2.imdecodeWithMetadata(
-            np.frombuffer(self._source, np.uint8), cv2.IMREAD_UNCHANGED
-        )
+        # IMREAD_UNCHANGED keeps bit depth and alpha, and leaves EXIF orientation to the pipeline
+        pixels = cv2.imdecode(np.frombuffer(self._source, np.uint8), cv2.IMREAD_UNCHANGED)
         if pixels is None or pixels.size == 0:
             msg = "Attempted to decode an image. Failed because OpenCV does not recognize the data as an image."
             raise ValueError(msg)
-
-        for metadata_type, block in zip(metadata_types, metadata, strict=True):
-            if metadata_type == cv2.IMAGE_METADATA_EXIF:
-                self._exif = bytes(block).removeprefix(_EXIF_HEADER)
         self._pixels = pixels
         return pixels
 
     def _derive(self, pixels: np.ndarray) -> OpenCVImage:
         return OpenCVImage(source=None, pixels=pixels, image_format=self._format)
 
-    def _encode_params(self, target: str, quality: int | None) -> list[int]:
+    def _encode_params(self, image_format: ImageFormat, quality: int | None) -> list[int]:
         if quality is None:
-            quality = self._DEFAULT_QUALITY.get(target)
+            quality = self._DEFAULT_QUALITY.get(image_format)
         if quality is None:
             return []
-        if target == "JPEG":
+        if image_format == ImageFormat.JPEG:
             return [cv2.IMWRITE_JPEG_QUALITY, quality]
-        if target == "WEBP":
+        if image_format == ImageFormat.WEBP:
             return [cv2.IMWRITE_WEBP_QUALITY, quality]
         return []
 
@@ -277,6 +284,12 @@ class OpenCVImage(GriptapeImage):
         return cls(source=data, pixels=None, image_format=image_format)
 
 
+def _channel_count(pixels: np.ndarray) -> int:
+    if pixels.ndim == 2:  # noqa: PLR2004
+        return _GRAYSCALE_CHANNELS
+    return pixels.shape[2]
+
+
 def _max_value(dtype: np.dtype) -> float:
     if np.issubdtype(dtype, np.integer):
         return float(np.iinfo(dtype).max)
@@ -290,8 +303,64 @@ def _to_eight_bit(pixels: np.ndarray) -> np.ndarray:
     return np.clip(np.round(scaled), 0, 255).astype(np.uint8)
 
 
+def _to_rgb(pixels: np.ndarray) -> np.ndarray:
+    channels = _channel_count(pixels)
+    if channels == _GRAYSCALE_CHANNELS:
+        return cv2.cvtColor(pixels, cv2.COLOR_GRAY2BGR)
+    if channels == _RGBA_CHANNELS:
+        return cv2.cvtColor(pixels, cv2.COLOR_BGRA2BGR)
+    return pixels.copy()
+
+
+def _to_rgba(pixels: np.ndarray) -> np.ndarray:
+    channels = _channel_count(pixels)
+    if channels == _GRAYSCALE_CHANNELS:
+        return cv2.cvtColor(pixels, cv2.COLOR_GRAY2BGRA)
+    if channels == _RGB_CHANNELS:
+        return cv2.cvtColor(pixels, cv2.COLOR_BGR2BGRA)
+    return pixels.copy()
+
+
+def _rounded(pixels: np.ndarray, step: RoundCorners) -> np.ndarray:
+    rgba = _to_rgba(pixels)
+    height, width = rgba.shape[:2]
+    radius = step.radius_pixels(width, height)
+    if radius <= 0:
+        return rgba
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    right = width - 1
+    bottom = height - 1
+    cv2.rectangle(mask, (radius, 0), (right - radius, bottom), 255, thickness=cv2.FILLED)
+    cv2.rectangle(mask, (0, radius), (right, bottom - radius), 255, thickness=cv2.FILLED)
+    for center in (
+        (radius, radius),
+        (right - radius, radius),
+        (radius, bottom - radius),
+        (right - radius, bottom - radius),
+    ):
+        cv2.circle(mask, center, radius, 255, thickness=cv2.FILLED, lineType=cv2.LINE_AA)
+
+    alpha_max = _max_value(rgba.dtype)
+    rgba[:, :, _ALPHA] = (mask.astype(np.float64) / 255.0 * alpha_max).astype(rgba.dtype)
+    return rgba
+
+
+def _flattened(pixels: np.ndarray, step: Flatten) -> np.ndarray:
+    rgba = _to_rgba(pixels)
+    value_max = _max_value(rgba.dtype)
+    alpha = rgba[:, :, _ALPHA : _ALPHA + 1].astype(np.float64) / value_max
+    # background is RGB at 8 bits; pixels are BGR at the image's depth
+    red, green, blue = step.background
+    canvas = np.array([blue, green, red], dtype=np.float64) / 255.0 * value_max
+    composited = rgba[:, :, :_ALPHA].astype(np.float64) * alpha + canvas * (1.0 - alpha)
+    if np.issubdtype(rgba.dtype, np.integer):
+        composited = np.round(composited)
+    return composited.astype(rgba.dtype)
+
+
 def _apply_orientation(pixels: np.ndarray, orientation: int) -> np.ndarray:  # noqa: PLR0911
-    """Rotate and flip ``pixels`` for an EXIF orientation value (1-8)."""
+    """Rotate and flip ``pixels`` for an EXIF orientation value (2-8)."""
     if orientation == 2:  # noqa: PLR2004
         return cv2.flip(pixels, 1)
     if orientation == 3:  # noqa: PLR2004
@@ -307,30 +376,3 @@ def _apply_orientation(pixels: np.ndarray, orientation: int) -> np.ndarray:  # n
     if orientation == 8:  # noqa: PLR2004
         return cv2.rotate(pixels, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return pixels.copy()
-
-
-def _exif_orientation(exif: bytes | None) -> int:
-    """Read the orientation tag from IFD0 of a TIFF-structured EXIF block. 1 (upright) if absent."""
-    if exif is None or len(exif) < 8:  # noqa: PLR2004
-        return 1
-    if exif[:2] == b"II":
-        endian = "<"
-    elif exif[:2] == b"MM":
-        endian = ">"
-    else:
-        return 1
-
-    (ifd_offset,) = struct.unpack(f"{endian}I", exif[4:8])
-    if ifd_offset + 2 > len(exif):
-        return 1
-    (entry_count,) = struct.unpack(f"{endian}H", exif[ifd_offset : ifd_offset + 2])
-    for index in range(entry_count):
-        entry_start = ifd_offset + 2 + index * _IFD_ENTRY_BYTES
-        entry = exif[entry_start : entry_start + _IFD_ENTRY_BYTES]
-        if len(entry) < _IFD_ENTRY_BYTES:
-            return 1
-        tag, _value_type, _count = struct.unpack(f"{endian}HHI", entry[:8])
-        if tag == _EXIF_ORIENTATION_TAG:
-            (orientation,) = struct.unpack(f"{endian}H", entry[8:10])
-            return orientation
-    return 1

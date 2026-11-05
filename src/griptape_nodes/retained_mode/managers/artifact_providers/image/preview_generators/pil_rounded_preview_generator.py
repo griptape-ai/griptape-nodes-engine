@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
 
-from griptape_nodes.image import open_image
+from griptape_nodes.image import DEFAULT_THUMBNAIL_SIZE, GriptapeImagePipeline, ImageFormat, open_image
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     ReadFileRequest,
@@ -25,7 +25,6 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
 from griptape_nodes.utils.async_utils import to_thread
 
 if TYPE_CHECKING:
-    from griptape_nodes.image import GriptapeImage
     from griptape_nodes.retained_mode.engine import Engine
 
 
@@ -33,14 +32,14 @@ class PILRoundedParameters(BaseGeneratorParameters):
     """Parameters for PIL rounded preview generation."""
 
     max_width: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum width in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
     )
 
     max_height: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum height in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
@@ -183,25 +182,17 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
 
     def _render_rounded_preview(self, image_data: bytes) -> bytes:
         """Decode, shrink, round the corners of and re-encode the image. CPU-bound, so callers run it off the event loop."""
-        with (
-            open_image(image_data) as source,
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            source.exif_transposed() as upright,
-            # Resize to fit max dimensions (preserves aspect ratio)
-            upright.thumbnail(self.params.max_width, self.params.max_height) as thumbnail,
-            thumbnail.with_rounded_corners(self._corner_radius_pixels(thumbnail)) as rounded,
-        ):
-            # Handle format-specific output
-            if self.preview_format.lower() in ("jpg", "jpeg"):
+        preview_format = ImageFormat.from_name(self.preview_format)
+        if preview_format is None:
+            msg = f"Attempted to generate a rounded preview. Failed because {self.preview_format} is not a known image format."
+            raise TypeError(msg)
+        with open_image(image_data) as source, GriptapeImagePipeline(source) as pipeline:
+            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
+            # fit within the max dimensions, preserving aspect ratio
+            pipeline.exif_transpose().thumbnail(self.params.max_width, self.params.max_height)
+            pipeline.round_corners(self.params.corner_radius_percent / 100.0)
+            if preview_format == ImageFormat.JPEG:
                 # JPEG doesn't support transparency - composite onto white background
-                with rounded.flattened((255, 255, 255)) as flattened:
-                    return flattened.encode(self.preview_format)
-            # PNG/WEBP support transparency
-            return rounded.encode(self.preview_format)
-
-    def _corner_radius_pixels(self, image: GriptapeImage) -> int:
-        """Corner radius in pixels: a percentage of the smaller dimension, at most half of it."""
-        smaller_dimension = min(image.width, image.height)
-        radius_pixels = int((self.params.corner_radius_percent / 100.0) * smaller_dimension)
-        # Clamp radius to prevent over-rounding
-        return min(radius_pixels, smaller_dimension // 2)
+                pipeline.flatten((255, 255, 255))
+            with pipeline.end() as preview:
+                return preview.encode(preview_format)

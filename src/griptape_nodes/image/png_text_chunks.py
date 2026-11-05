@@ -2,6 +2,7 @@
 
 import struct
 import zlib
+from collections.abc import Mapping
 from typing import NamedTuple
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -70,7 +71,7 @@ def read_text_chunks(png: bytes) -> dict[str, str]:
     return texts
 
 
-def insert_text_chunks(png: bytes, texts: dict[str, str]) -> bytes:
+def insert_text_chunks(png: bytes, texts: Mapping[str, str]) -> bytes:
     """Return ``png`` with a text chunk per entry of ``texts`` inserted before the first IDAT chunk.
 
     Text goes ahead of the pixel data because readers such as Pillow only report the text chunks
