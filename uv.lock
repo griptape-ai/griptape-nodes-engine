@@ -723,8 +723,7 @@ dependencies = [
     { name = "pillow" },
     { name = "portalocker" },
     { name = "pydantic" },
-    { name = "pydantic-ai-harness" },
-    { name = "pydantic-ai-skills" },
+    { name = "pydantic-ai-harness", extra = ["skills"] },
     { name = "pydantic-ai-slim", extra = ["mcp", "openai"] },
     { name = "python-dotenv" },
     { name = "rich" },
@@ -798,9 +797,8 @@ requires-dist = [
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "portalocker", specifier = ">=2.10.0" },
     { name = "pydantic", specifier = ">=2.10.6" },
-    { name = "pydantic-ai-harness", specifier = ">=0.28,<0.52" },
-    { name = "pydantic-ai-skills", specifier = ">=2.0,<3" },
-    { name = "pydantic-ai-slim", extras = ["mcp", "openai"], specifier = ">=2.29.0" },
+    { name = "pydantic-ai-harness", extras = ["skills"], specifier = ">=0.58" },
+    { name = "pydantic-ai-slim", extras = ["mcp", "openai"], specifier = ">=2.58" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "rich", specifier = ">=14.1.0" },
     { name = "ruamel-yaml", specifier = ">=0.18.15" },
@@ -2081,36 +2079,21 @@ email = [
 
 [[package]]
 name = "pydantic-ai-harness"
-version = "0.29.1"
+version = "0.64.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "genai-prices" },
     { name = "httpx" },
     { name = "pydantic-ai-slim" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4e/06/64db2f6a1132e96404e5af877c5570ba0f630ac0011335e5253c1ee7b342/pydantic_ai_harness-0.29.1.tar.gz", hash = "sha256:023066aa00dd75a1b31dde529d01ffdb13c929bcb9bc5d6b803fb5ef131c35f0", size = 2490023, upload-time = "2026-09-08T04:25:32.869Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/25/31/0a3bac1221446c2cd131201f4c6f990b8ddb0fcaa4e4f02751522ac4e652/pydantic_ai_harness-0.64.0.tar.gz", hash = "sha256:8e79db35cfed2940db468644f04da2b8dc0862e0fd2544ee72c3cf65dbf5b8a5", size = 1437166, upload-time = "2026-10-31T00:22:37.399Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e3/d2/9da26f8ab0887c249f230b1c5c6ac68cc58335d249ef10edced4c88a5372/pydantic_ai_harness-0.29.1-py3-none-any.whl", hash = "sha256:d11af43c3b9360547a1e1a9da4fc8feef6f328514f881f44f32ad436dbd2cc65", size = 784763, upload-time = "2026-09-08T04:25:30.772Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/93/c028862cc71391ad5f3befe1d1979ea4dec271b686cea72a22f432c81e99/pydantic_ai_harness-0.64.0-py3-none-any.whl", hash = "sha256:cb4f5c592c08975433adf58bfaf52671e51705d5c41c5db42f31788f934d44f2", size = 1754157, upload-time = "2026-10-31T00:22:21.974Z" },
 ]
 
 [package.optional-dependencies]
 skills = [
     { name = "pyyaml" },
-]
-
-[[package]]
-name = "pydantic-ai-skills"
-version = "2.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "anyio" },
-    { name = "pydantic-ai-harness", extra = ["skills"] },
-    { name = "pydantic-ai-slim" },
-    { name = "pyyaml" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/cf/d5/f3059f89077f257e43475ad81878d5ee7e03c501579bf9a7b05166a7e18a/pydantic_ai_skills-2.0.0.tar.gz", hash = "sha256:25fd5f14268f68d25d68e38bc94fb93323092d3b7d96db0b5e499c074e3d40c7", size = 9110556, upload-time = "2026-09-06T01:44:21.651Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/86/8a/b05c3540dfe4e1491aa3f3de06d320bb93b61dbe49b805e2d5c4465c47b5/pydantic_ai_skills-2.0.0-py3-none-any.whl", hash = "sha256:d3bed993fe65a7a4a1c6e37c71914e9594cec86114e446a332f203f2cdc755f2", size = 73558, upload-time = "2026-09-06T01:44:20.268Z" },
 ]
 
 [[package]]
