@@ -6,10 +6,10 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from PIL import Image
 from PIL.ExifTags import GPSTAGS, TAGS
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
+from griptape_nodes.image import EXIF_GPSINFO_TAG, Exif, ImageMetadata
 
 if TYPE_CHECKING:
     from griptape_nodes.image import GriptapeImage
@@ -18,9 +18,6 @@ logger = logging.getLogger("griptape_nodes")
 
 # EXIF tag IDs
 EXIF_USERCOMMENT_TAG = 0x9286
-EXIF_GPSINFO_TAG = 0x8825  # 34853
-
-_EXIF_HEADER = b"Exif\x00\x00"
 
 # GPS coordinate tuple length
 GPS_COORD_TUPLE_LENGTH = 3
@@ -32,8 +29,8 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
     Supports reading ALL EXIF metadata (standard tags, GPS data, custom UserComment)
     and writing custom metadata to EXIF UserComment field as JSON.
     Preserves all existing EXIF data when writing.
-    All EXIF-specific logic is encapsulated in this driver. Pillow's ``Image.Exif`` parses and
-    rebuilds the EXIF block only; pixels go through whichever GriptapeImage backend is active.
+    All EXIF-specific logic is encapsulated in this driver. Tags are read and written through
+    ``Exif``; pixels go through whichever GriptapeImage backend is active.
     """
 
     def get_supported_formats(self) -> list[str]:
@@ -65,7 +62,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             raise ValueError(msg)
 
         # Get existing EXIF data to preserve it
-        exif_data = self._load_exif(image)
+        exif_data = image.metadata.exif or Exif()
 
         # Serialize metadata to JSON for UserComment field
         metadata_json = json.dumps(metadata, separators=(",", ":"))
@@ -74,7 +71,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         exif_data[EXIF_USERCOMMENT_TAG] = metadata_json
 
         # Save with updated EXIF
-        return image.encode(image.format, exif_bytes=exif_data.tobytes().removeprefix(_EXIF_HEADER))
+        return image.encode(image.format, metadata=ImageMetadata(exif=exif_data))
 
     def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract ALL EXIF metadata including standard tags, GPS data, and custom UserComment.
@@ -90,7 +87,7 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         Returns:
             Dictionary of all metadata key-value pairs, empty dict if no EXIF data
         """
-        exif_data = self._load_exif(image)
+        exif_data = image.metadata.exif
         if not exif_data:
             return {}
 
@@ -106,13 +103,6 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         self._extract_user_comment_metadata(exif_data, metadata)
 
         return metadata
-
-    def _load_exif(self, image: GriptapeImage) -> Image.Exif:
-        exif_data = Image.Exif()
-        exif_bytes = image.exif_bytes
-        if exif_bytes is not None:
-            exif_data.load(exif_bytes)
-        return exif_data
 
     def _exif_value_to_string(self, value: Any) -> str:
         """Convert EXIF value to readable string format.
@@ -155,11 +145,11 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         else:
             return f"{decimal_degrees:.6f}"
 
-    def _extract_standard_tags(self, exif_data: Any, metadata: dict[str, str]) -> None:
+    def _extract_standard_tags(self, exif_data: Exif, metadata: dict[str, str]) -> None:
         """Extract standard EXIF tags.
 
         Args:
-            exif_data: EXIF data object from PIL
+            exif_data: Parsed EXIF tags
             metadata: Dictionary to populate with standard tags (modified in-place)
         """
         for tag_id, value in exif_data.items():
@@ -173,16 +163,16 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             # Convert value to string
             metadata[tag_name] = self._exif_value_to_string(value)
 
-    def _extract_gps_metadata(self, exif_data: Any, metadata: dict[str, str]) -> None:
+    def _extract_gps_metadata(self, exif_data: Exif, metadata: dict[str, str]) -> None:
         """Extract GPS metadata from EXIF data.
 
         Formats GPS coordinates as decimal degrees and prefixes all GPS tags with 'GPS_'.
 
         Args:
-            exif_data: EXIF data object from PIL
+            exif_data: Parsed EXIF tags
             metadata: Dictionary to populate with GPS metadata (modified in-place)
         """
-        gps_ifd = exif_data.get_ifd(EXIF_GPSINFO_TAG)
+        gps_ifd = exif_data.gps
         if not gps_ifd:
             return
 
@@ -198,11 +188,11 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             else:
                 metadata[f"GPS_{gps_tag_name}"] = self._exif_value_to_string(gps_value)
 
-    def _extract_user_comment_metadata(self, exif_data: Any, metadata: dict[str, str]) -> None:
+    def _extract_user_comment_metadata(self, exif_data: Exif, metadata: dict[str, str]) -> None:
         """Extract custom metadata from EXIF UserComment field.
 
         Args:
-            exif_data: EXIF data object from PIL
+            exif_data: Parsed EXIF tags
             metadata: Dictionary to populate with custom metadata (modified in-place)
         """
         user_comment = exif_data.get(EXIF_USERCOMMENT_TAG)
