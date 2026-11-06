@@ -20,6 +20,7 @@ from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.node_loading import loading_node_name
 from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
 from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.app_events import OpenedWorkflowResult
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     BaseEvent,
@@ -232,7 +233,11 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 class ResultContext(TypedDict, total=False):
-    """Request envelope fields dispatch carries to the result. All but `sender` are echoed on the result envelope."""
+    """Request envelope fields dispatch carries to the result.
+
+    `request_id` and `response_topic` are echoed on the result envelope. Its `open_workflow_id` is
+    the workflow the request acted on (see `EventManager._result_workflow_id`).
+    """
 
     response_topic: str | None
     request_id: str | None
@@ -252,10 +257,15 @@ class _RequestWorkflowError(Exception):
 class _RequestWorkflow:
     """What dispatch binds while a request runs, and the workflow it hands a handler whose scope takes one."""
 
-    # False keeps the caller's binding, so a binding the handler makes outlives the request.
-    rebinds: bool
     binding: WorkflowRuntime | NoWorkflow | None
     workflow: WorkflowRuntime | None
+
+    @property
+    def acted_on_workflow_id(self) -> str | None:
+        """Id of the workflow the request runs bound to, which it acts on, or None."""
+        if self.binding is None or self.binding is NO_WORKFLOW:
+            return None
+        return self.binding.workflow_id
 
 
 @dataclass(frozen=True)
@@ -264,10 +274,6 @@ class _HandlerCall:
 
     function: Callable[..., Any]
     request_workflow: _RequestWorkflow
-
-
-# A call a worker forwards resolves no workflow here, so its caller's binding stays for the forward to name.
-_KEEP_CALLER_BINDING = _RequestWorkflow(rebinds=False, binding=None, workflow=None)
 
 
 @dataclass(frozen=True)
@@ -683,7 +689,11 @@ class EventManager(EngineScoped):
             self._post_dispatch_hooks[request_type] = remaining
 
     def _fire_post_dispatch_hooks(self, request: RequestPayload, result: ResultPayload) -> None:
-        """Schedule every hook registered for this request's exact type."""
+        """Schedule every hook registered for this request's exact type.
+
+        Hooks run bound as the request ran, except after a request that opened a workflow: they
+        run bound to the workflow it opened, which its result names.
+        """
         request_type = type(request)
 
         # Snapshot under the lock so a concurrent add/remove on another thread cannot
@@ -696,6 +706,11 @@ class EventManager(EngineScoped):
 
         active = _active_post_dispatch_hooks.get()
         workflow = bound_workflow.get()
+        if isinstance(result, OpenedWorkflowResult) and result.open_workflow is not None:
+            # Not open here when a worker relays the result of an open it forwarded.
+            opened = self.engine.open_workflows.find(result.open_workflow.workflow_id)
+            if opened is not None:
+                workflow = opened
         for callback in hooks:
             # Identity, not `(request_type, callback) in active`: membership compares with
             # `__eq__`, and a callable `@dataclass` compares by field value, so a hook
@@ -1394,8 +1409,13 @@ class EventManager(EngineScoped):
         callback_result: ResultPayload,
         *,
         context: ResultContext,
+        request_workflow: _RequestWorkflow | None,
     ) -> EventResultSuccess | EventResultFailure:
-        """Core logic for handling requests, shared between sync and async methods."""
+        """Core logic for handling requests, shared between sync and async methods.
+
+        `request_workflow` is what dispatch decided the request acts on, or None for a request
+        refused before dispatch decided.
+        """
         operation_depth_mgr = self.engine.operation_depth_manager
         workflow_mgr = self.engine.workflow_manager
 
@@ -1426,7 +1446,7 @@ class EventManager(EngineScoped):
 
             # Some requests have fields marked as "omit_from_result" which should be removed from the request
             self._scrub_omitted_request_fields(request)
-            result_workflow_id = self._result_workflow_id(context)
+            result_workflow_id = self._result_workflow_id(callback_result, request_workflow, context)
             if callback_result.succeeded():
                 result_event = EventResultSuccess(
                     request=request,
@@ -1457,7 +1477,7 @@ class EventManager(EngineScoped):
         return result_event
 
     def _result_for_handler_exception(
-        self, request: RP, exception: Exception, *, context: ResultContext
+        self, request: RP, exception: Exception, *, context: ResultContext, request_workflow: _RequestWorkflow
     ) -> EventResultSuccess | EventResultFailure:
         """Build the failure result event for a handler that raised instead of returning one.
 
@@ -1470,6 +1490,7 @@ class EventManager(EngineScoped):
             request,
             GenericResultFailure(exception=exception, result_details=result_details),
             context=context,
+            request_workflow=request_workflow,
         )
 
     def _handler_call(
@@ -1488,7 +1509,8 @@ class EventManager(EngineScoped):
         local_callback: Callable
         if isinstance(callback, ForwardingHandler):
             if callback.forwards_now():
-                return _HandlerCall(function=callback.forward, request_workflow=_KEEP_CALLER_BINDING)
+                caller_binding = _RequestWorkflow(binding=bound_workflow.get(), workflow=None)
+                return _HandlerCall(function=callback.forward, request_workflow=caller_binding)
             local_callback = callback.handle_locally
         else:
             local_callback = callback
@@ -1522,9 +1544,6 @@ class EventManager(EngineScoped):
           that names nothing falls back to the only open workflow (see `_optional_workflow`).
         - With no scope, see `_unscoped_request_workflow`.
 
-        A scoped request with no envelope id whose binding is its caller's keeps the caller's
-        binding rather than taking a token, as an unscoped one does.
-
         Raises:
             _RequestWorkflowError: The envelope id names no open workflow, or the caller is bound to
                 a workflow that has closed, or a WORKFLOW request names no workflow, or names nothing
@@ -1549,14 +1568,9 @@ class EventManager(EngineScoped):
             workflow = self._optional_workflow(request, named)
         elif scope is RequestScope.WORKFLOW:
             workflow = self._workflow_for_workflow_request(request, named)
-        binding: WorkflowRuntime | NoWorkflow = NO_WORKFLOW
-        if workflow is not None:
-            binding = workflow
-
-        # A nested request bound as its caller is keeps the caller's binding, so a workflow its
-        # handler opens or closes is the caller's too.
-        inherits = open_workflow_id is None and sender is None and bound_workflow.get() is binding
-        return _RequestWorkflow(rebinds=not inherits, binding=binding, workflow=workflow)
+        if workflow is None:
+            return _RequestWorkflow(binding=NO_WORKFLOW, workflow=None)
+        return _RequestWorkflow(binding=workflow, workflow=workflow)
 
     def _optional_workflow(
         self, request: RequestPayload, named: WorkflowRuntime | NoWorkflow | None
@@ -1627,20 +1641,17 @@ class EventManager(EngineScoped):
     ) -> _RequestWorkflow:
         """The binding for a request whose handler declares no scope.
 
-        A request whose envelope or sender names a workflow, or none, is bound to it. Otherwise the
-        caller's binding stays, and unbound work is bound to the only open workflow, so a run it
+        A request whose envelope or sender names a workflow, or none, is bound to it. Otherwise it
+        keeps the caller's binding, and unbound work is bound to the only open workflow, so a run it
         starts keeps that workflow across awaits as one started with an id does. With none open, or
-        several, it stays unbound, but still takes a token: a binding its handler makes then ends
-        with the request rather than outliving it in the caller.
+        several, it stays unbound.
         """
-        if addressed:
-            return _RequestWorkflow(rebinds=True, binding=named, workflow=None)
-        if named is not None:
-            return _RequestWorkflow(rebinds=False, binding=named, workflow=None)
+        if addressed or named is not None:
+            return _RequestWorkflow(binding=named, workflow=None)
         open_workflows = self.engine.open_workflows.all_open()
         if len(open_workflows) != 1:
-            return _RequestWorkflow(rebinds=True, binding=None, workflow=None)
-        return _RequestWorkflow(rebinds=True, binding=open_workflows[0], workflow=None)
+            return _RequestWorkflow(binding=None, workflow=None)
+        return _RequestWorkflow(binding=open_workflows[0], workflow=None)
 
     def _workflow_for_workflow_request(
         self, request: RequestPayload, named: WorkflowRuntime | NoWorkflow | None
@@ -1685,10 +1696,8 @@ class EventManager(EngineScoped):
     @staticmethod
     def _bind_request_workflow(
         request_workflow: _RequestWorkflow,
-    ) -> contextvars.Token[WorkflowRuntime | NoWorkflow | None] | None:
-        """Bind what `request_workflow` binds, returning the token to reset, or None when the caller's binding stays."""
-        if not request_workflow.rebinds:
-            return None
+    ) -> contextvars.Token[WorkflowRuntime | NoWorkflow | None]:
+        """Bind what `request_workflow` binds, returning the token to reset."""
         return bound_workflow.set(request_workflow.binding)
 
     async def ahandle_request(
@@ -1702,9 +1711,10 @@ class EventManager(EngineScoped):
         Args:
             request: The request to handle
             result_context: The request envelope's fields: response_topic, request_id, sender, and
-                open_workflow_id, the open workflow the request runs in, echoed on the result. The
-                handler runs bound to that open workflow; one that names no open workflow fails the
-                request. A HOST handler ignores open_workflow_id (see `RequestScope`).
+                open_workflow_id, the open workflow the request runs in. The handler runs bound to
+                that open workflow; one that names no open workflow fails the request. A HOST
+                handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
+                the workflow the request acted on (see `_result_workflow_id`).
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
@@ -1720,12 +1730,12 @@ class EventManager(EngineScoped):
 
         refusal = self._refusal_for_sender(request, result_context)
         if refusal is not None:
-            return self._handle_request_core(request, refusal, context=result_context)
+            return self._handle_request_core(request, refusal, context=result_context, request_workflow=None)
 
         try:
             handler_call = self._handler_call(callback, request, result_context)
         except _RequestWorkflowError as err:
-            return self._handle_request_core(request, err.failure, context=result_context)
+            return self._handle_request_core(request, err.failure, context=result_context, request_workflow=None)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
@@ -1735,6 +1745,7 @@ class EventManager(EngineScoped):
                 request,
                 short_circuit,
                 context=result_context,
+                request_workflow=handler_call.request_workflow,
             )
 
         # Expose the dispatching request type to detectors (see current_request_type).
@@ -1754,19 +1765,21 @@ class EventManager(EngineScoped):
                     if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
                         self._flush_tracked_parameter_changes()
             except Exception as exc:
-                return self._result_for_handler_exception(request, exc, context=result_context)
+                return self._result_for_handler_exception(
+                    request, exc, context=result_context, request_workflow=handler_call.request_workflow
+                )
 
             return self._handle_request_core(
                 request,
                 cast("ResultPayload", result_payload),
                 context=result_context,
+                request_workflow=handler_call.request_workflow,
             )
         finally:
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
-            if binding_token is not None:
-                bound_workflow.reset(binding_token)
+            bound_workflow.reset(binding_token)
 
     @staticmethod
     def _report_graph_access_while_loading(request: RequestPayload) -> None:
@@ -1810,9 +1823,10 @@ class EventManager(EngineScoped):
         Args:
             request: The request to handle
             result_context: The request envelope's fields: response_topic, request_id, sender, and
-                open_workflow_id, the open workflow the request runs in, echoed on the result. The
-                handler runs bound to that open workflow; one that names no open workflow fails the
-                request. A HOST handler ignores open_workflow_id (see `RequestScope`).
+                open_workflow_id, the open workflow the request runs in. The handler runs bound to
+                that open workflow; one that names no open workflow fails the request. A HOST
+                handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
+                the workflow the request acted on (see `_result_workflow_id`).
         """
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
@@ -1828,12 +1842,12 @@ class EventManager(EngineScoped):
 
         refusal = self._refusal_for_sender(request, result_context)
         if refusal is not None:
-            return self._handle_request_core(request, refusal, context=result_context)
+            return self._handle_request_core(request, refusal, context=result_context, request_workflow=None)
 
         try:
             handler_call = self._handler_call(callback, request, result_context)
         except _RequestWorkflowError as err:
-            return self._handle_request_core(request, err.failure, context=result_context)
+            return self._handle_request_core(request, err.failure, context=result_context, request_workflow=None)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
@@ -1843,6 +1857,7 @@ class EventManager(EngineScoped):
                 request,
                 short_circuit,
                 context=result_context,
+                request_workflow=handler_call.request_workflow,
             )
 
         # Expose the dispatching request type to detectors (see current_request_type).
@@ -1861,19 +1876,21 @@ class EventManager(EngineScoped):
                     if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
                         self._flush_tracked_parameter_changes()
             except Exception as exc:
-                return self._result_for_handler_exception(request, exc, context=result_context)
+                return self._result_for_handler_exception(
+                    request, exc, context=result_context, request_workflow=handler_call.request_workflow
+                )
 
             return self._handle_request_core(
                 request,
                 cast("ResultPayload", result_payload),
                 context=result_context,
+                request_workflow=handler_call.request_workflow,
             )
         finally:
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
-            if binding_token is not None:
-                bound_workflow.reset(binding_token)
+            bound_workflow.reset(binding_token)
 
     def _invoke_handler_from_sync(
         self, registered: Callable | ForwardingHandler, callback: Callable, request: RequestPayload
@@ -2123,20 +2140,21 @@ class EventManager(EngineScoped):
             node.emit_parameter_changes()
 
     @staticmethod
-    def _result_workflow_id(context: ResultContext) -> str | None:
-        """The open workflow a result names: the one the envelope named, else the one the request was bound to.
+    def _result_workflow_id(
+        result: ResultPayload, request_workflow: _RequestWorkflow | None, context: ResultContext
+    ) -> str | None:
+        """The open workflow a result's envelope names: the one the request acted on, or None.
 
-        A request with no envelope id is bound by dispatch to the only open workflow, by a run's
-        `WorkflowRuntime.handle_request` to the run's workflow, or by a load to the workflow it
-        opened (`Engine.enter_opened_workflow`). Its result still says which workflow it acted on.
+        That is the workflow dispatch bound the request to (see `_request_workflow`), so None for a
+        HOST request whatever its envelope named. A request that opened a workflow names the one it
+        opened. A request refused before dispatch decided (`request_workflow` None) names what its
+        envelope named, so the client that sent it can tell the failure is its own.
         """
-        open_workflow_id = context.get("open_workflow_id")
-        if open_workflow_id is not None:
-            return open_workflow_id
-        binding = bound_workflow.get()
-        if binding is None or binding is NO_WORKFLOW:
-            return None
-        return binding.workflow_id
+        if isinstance(result, OpenedWorkflowResult) and result.open_workflow is not None:
+            return result.open_workflow.workflow_id
+        if request_workflow is None:
+            return context.get("open_workflow_id")
+        return request_workflow.acted_on_workflow_id
 
 
 class EventSuppressionContext:

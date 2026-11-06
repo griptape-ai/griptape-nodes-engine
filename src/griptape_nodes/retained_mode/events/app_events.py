@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
@@ -51,6 +51,19 @@ class OpenWorkflowInfo:
     name: str
     workflow_file_path: str | None
     has_active_flow: bool
+
+
+@runtime_checkable
+class OpenedWorkflowResult(Protocol):
+    """A result of a request that opened a workflow, which names the workflow on its envelope.
+
+    Dispatch labels the result with `open_workflow`'s id, not the workflow the request was sent in.
+
+    Args:
+        open_workflow: The workflow the request opened, or None when it opened none.
+    """
+
+    open_workflow: OpenWorkflowInfo | None
 
 
 @dataclass
