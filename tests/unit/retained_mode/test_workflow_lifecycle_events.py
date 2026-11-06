@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -44,8 +45,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryResultFailure,
     RunWorkflowFromRegistryResultSuccess,
     RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultFailure,
     RunWorkflowFromScratchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultFailure,
     RunWorkflowWithCurrentStateResultSuccess,
     SaveWorkflowRequest,
     SaveWorkflowResultSuccess,
@@ -59,7 +62,6 @@ from griptape_nodes.servers.mcp import _handle_in_named_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -313,6 +315,54 @@ class TestRunWorkflowFromFile:
         assert opened is not None
         assert _lifecycle_events(_drain(queue)) == [WorkflowOpenedEvent(open_workflow=opened)]
         assert result_event.open_workflow_id == opened.workflow_id
+
+
+class TestRunWorkflowFromFileThatFails:
+    @pytest.fixture
+    def broken_file_path(self, engine: Engine, saved_workflow_name: str) -> str:
+        """A saved workflow file that raises once it has been opened."""
+        file_path = _saved_file_path(engine, saved_workflow_name)
+        complete_file_path = Path(engine.workflow_registry.get_complete_file_path(relative_file_path=file_path))
+        with complete_file_path.open("a", encoding="utf-8") as file:
+            file.write("\nraise RuntimeError('broken')\n")
+        return file_path
+
+    def test_from_scratch_closes_the_workflow_it_opened(
+        self, engine: Engine, broken_file_path: str, queue: asyncio.Queue
+    ) -> None:
+        result_event = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=broken_file_path), None))
+
+        assert isinstance(result_event.result, RunWorkflowFromScratchResultFailure)
+        assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(_drain(queue)) == []
+
+    def test_with_current_state_closes_the_workflow_it_opened(
+        self, engine: Engine, broken_file_path: str, queue: asyncio.Queue
+    ) -> None:
+        request = RunWorkflowWithCurrentStateRequest(file_path=broken_file_path)
+
+        result_event = asyncio.run(_send_async(engine, request, None))
+
+        assert isinstance(result_event.result, RunWorkflowWithCurrentStateResultFailure)
+        assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(_drain(queue)) == []
+
+    def test_with_current_state_keeps_the_workflow_it_built_into(
+        self, engine: Engine, broken_file_path: str, queue: asyncio.Queue
+    ) -> None:
+        result = engine.handle_request(SetWorkflowContextRequest(display_name="target"))
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert result.workflow_id is not None
+        target = engine.open_workflows.get(result.workflow_id)
+        _drain(queue)
+
+        result_event = asyncio.run(
+            _send_async(engine, RunWorkflowWithCurrentStateRequest(file_path=broken_file_path), target.workflow_id)
+        )
+
+        assert isinstance(result_event.result, RunWorkflowWithCurrentStateResultFailure)
+        assert engine.open_workflows.all_open() == [target]
+        assert _lifecycle_events(_drain(queue)) == []
 
 
 class TestClosing:

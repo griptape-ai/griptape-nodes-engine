@@ -188,6 +188,8 @@ class WorkflowRunner(EngineScoped):
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
+            if execution_result.workflow_id is not None:
+                await self._close_failed_load(execution_result.workflow_id)
             return RunWorkflowFromScratchResultFailure(
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
             )
@@ -227,6 +229,9 @@ class WorkflowRunner(EngineScoped):
                 open_workflow=opened_workflow,
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
+        # Only a workflow this load opened is closed: one it built into was the caller's, open before.
+        if workflow is None and execution_result.workflow_id is not None:
+            await self._close_failed_load(execution_result.workflow_id)
         return RunWorkflowWithCurrentStateResultFailure(
             result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
         )
