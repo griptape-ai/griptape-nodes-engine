@@ -138,7 +138,7 @@ with ThreadPoolExecutor() as pool:
     list(pool.map(lambda job: self._output_file.build_file().write_bytes(render(job)), jobs))
 ```
 
-Code on a plain thread or in a pool doesn't know which workflow it works for, so a handle built there with `ProjectFileDestination.from_situation()` or `File(...)` has no workflow of its own. Build it in `process()` or `aprocess()` and hand it to the thread, or pass `workflow=self.workflow` to the `File`, `FileDestination`, `Directory`, or `FileSequence` constructor.
+Code on a plain thread or in a pool doesn't know which workflow it works for, so a handle built there with `ProjectFileDestination.from_situation()` or `File(...)` has no workflow of its own. Build it in `process()` or `aprocess()` and hand it to the thread, or name the workflow: call `ProjectFileDestination.from_situation_in_workflow(self.workflow, ...)`, or pass `workflow=self.workflow` to the `File`, `FileDestination`, `Directory`, or `FileSequence` constructor.
 
 ## Migration from StaticFilesManager
 

@@ -100,21 +100,22 @@ class ProjectFileDestination(FileDestination):
         Raises:
             ValueError: If the filename is a URL that names no local file.
         """
-        return cls._from_situation(filename, situation, None, **extra_vars)
+        return cls.from_situation_in_workflow(None, filename, situation, **extra_vars)
 
     @classmethod
-    def _from_situation(
+    def from_situation_in_workflow(
         cls,
-        filename: str,
-        situation: str,
         workflow: "WorkflowRuntime | None",
         /,
+        filename: str,
+        situation: str,
         **extra_vars: str | int,
     ) -> "ProjectFileDestination":
         """`from_situation`, looking the situation up and writing in `workflow`.
 
-        `workflow` is positional-only so a macro variable named `workflow` stays in `extra_vars`.
-        None looks up and writes as the caller is bound.
+        Pass a node's `self.workflow` from code on a plain thread or in a thread pool, which has
+        no workflow of its own. None looks up and writes as the caller is bound. `workflow` is
+        positional-only so a macro variable named `workflow` stays in `extra_vars`.
         """
         # Classify the input before any path handling: FilenameParts.from_filename is a
         # plain Path() split with no URL awareness, so a URL that reaches it is mangled

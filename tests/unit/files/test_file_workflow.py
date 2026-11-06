@@ -150,6 +150,16 @@ class TestAHandleBuiltInBoundCode:
 
         assert destination.workflow is a.runtime
 
+    def test_a_destination_from_a_situation_built_in_a_raw_thread_uses_the_workflow_it_names(self) -> None:
+        a = _RecordingWorkflow("/a/out.png")
+
+        destination = _in_raw_thread(
+            lambda: ProjectFileDestination.from_situation_in_workflow(a.runtime, "out.png", "save_node_output")
+        )
+
+        assert destination.workflow is a.runtime
+        assert [type(request) for request in a.requests] == [GetSituationRequest]
+
     def test_directories_resolve_in_the_workflow_they_were_built_in_from_a_raw_thread(
         self, bind: Callable[[_RecordingWorkflow], None]
     ) -> None:
