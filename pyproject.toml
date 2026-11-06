@@ -25,6 +25,11 @@ dependencies = [
   # so a 3.0 release cannot silently kill the MCP server thread again (see issue 5216).
   "mcp>=2.0,<3",
   "pillow>=11.3.0",
+  # Spike: second GriptapeImage backend (griptape_nodes.image), selected with GTN_IMAGE_BACKEND=opencv.
+  # 5.0 is the first release with imdecodeWithMetadata/imencodeWithMetadata for EXIF.
+  "opencv-python-headless>=5.0",
+  # Spike: third GriptapeImage backend, selected with GTN_IMAGE_BACKEND=openimageio.
+  "openimageio>=3.2",
   "static-ffmpeg>=3.0",
   "watchfiles>=1.1.0",
   # Ceiling: default libraries pin transformers/tokenizers that need huggingface-hub<2. Library

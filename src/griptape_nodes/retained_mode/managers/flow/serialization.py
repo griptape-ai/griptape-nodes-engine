@@ -4,12 +4,10 @@ import copy
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx2
-from PIL import Image
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup
@@ -18,6 +16,7 @@ from griptape_nodes.exe_types.node_types import (
     NodeDependencies,
     VariableReference,
 )
+from griptape_nodes.image import open_image
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -1275,7 +1274,7 @@ class FlowSerialization(EngineScoped):
             try:
                 response = httpx2.get(file_url_or_path, timeout=30.0)
                 response.raise_for_status()
-                pil_image = Image.open(BytesIO(response.content))
+                image = open_image(response.content)
             except Exception as e:
                 return ExtractFlowCommandsFromImageMetadataResultFailure(
                     result_details=f"Failed to download or open image from URL: {e}",
@@ -1298,7 +1297,7 @@ class FlowSerialization(EngineScoped):
 
             # Read PNG image and extract metadata
             try:
-                pil_image = Image.open(file_url_or_path)
+                image = open_image(path_obj)
             except Exception as e:
                 return ExtractFlowCommandsFromImageMetadataResultFailure(
                     result_details=f"Failed to open image file: {e}",
@@ -1306,10 +1305,10 @@ class FlowSerialization(EngineScoped):
                 )
 
         # An image without embedded flow commands is a valid state, not an error.
-        metadata = pil_image.info if hasattr(pil_image, "info") else {}
+        metadata = image.metadata.text
         # Closed now: a failure reading the commands can keep this frame, and the open file, alive
         # until garbage collection, and Windows won't delete or replace an open file.
-        pil_image.close()
+        image.close()
         if not metadata:
             return ExtractFlowCommandsFromImageMetadataResultSuccess(
                 result_details=f"Image has no metadata: {file_url_or_path}",
