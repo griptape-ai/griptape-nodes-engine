@@ -227,6 +227,39 @@ class FilenameParts(NamedTuple):
         return cls(directory=path.parent, stem=path.stem, extension=path.suffix.lstrip("."))
 
 
+def with_default_extension(file_name: str, default_file_name: str) -> str:
+    """Give an extension-less filename the extension of a default filename.
+
+    Save macros join ``{file_name_base}.{file_extension}``, so a filename with no
+    extension resolves to a bare trailing dot (``image_v001.``), a name some
+    filesystems reject. Trailing dots and spaces are dropped for the same reason.
+
+    Args:
+        file_name: Filename or path as the user entered it (e.g. "shot" or "renders/shot").
+        default_file_name: Filename whose extension fills the gap (e.g. "image.png").
+
+    Returns:
+        ``file_name`` without trailing dots or spaces, plus the default's extension when
+        it has none of its own.
+
+    Raises:
+        ValueError: If ``file_name`` names a folder rather than a file: its last
+            component is empty or only dots and spaces (``"renders/"``, ``"renders/.."``).
+    """
+    last_component = re.split(r"[/\\]", file_name)[-1]
+    if not last_component.rstrip(". "):
+        msg = (
+            f"Attempted to save to '{file_name}'. Failed because that names a folder, not a file. "
+            f"Add the file name you want, for example '{default_file_name}'."
+        )
+        raise ValueError(msg)
+    stripped = file_name.rstrip(". ")
+    default_extension = Path(default_file_name).suffix
+    if Path(stripped).suffix or not default_extension:
+        return stripped
+    return f"{stripped}{default_extension}"
+
+
 def _parse_unc_host(netloc: str, path: str) -> str | None:
     """Validate a non-local netloc as a UNC host and build the UNC path, or None if invalid.
 

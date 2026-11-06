@@ -85,7 +85,8 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
         If an upstream node implements ``FileSequenceDestinationProvider``, its
         ``FileSequenceDestination`` is retrieved directly. Otherwise the parameter's
         string value (filename or #### pattern) is parsed and combined with the
-        situation macro.
+        situation macro. A value with no extension takes the extension of the
+        default filename.
 
         Args:
             **extra_vars: Additional variables for the macro (e.g., sub_dirs="renders")
@@ -94,7 +95,8 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
             FileSequenceDestination with a versioned MacroPath and baked-in policy.
 
         Raises:
-            ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None.
+            ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None,
+                or if the parameter's value names a folder rather than a file.
             FileSequenceError: If no available version index can be found.
         """
         upstream = self._get_upstream_destination(
@@ -107,6 +109,7 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
 
         value = self._node.get_parameter_value(self._name)
         filename = value if isinstance(value, str) and value else self._default_value
+        filename = path_utils.with_default_extension(filename, self._default_value)
 
         return _build_sequence_destination_from_situation(filename, self._situation_name, **extra_vars)
 
