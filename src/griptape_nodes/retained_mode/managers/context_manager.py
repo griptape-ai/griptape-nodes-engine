@@ -14,6 +14,9 @@ from griptape_nodes.node_library.workflow_registry import (
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.context_events import (
+    CloseWorkflowRequest,
+    CloseWorkflowResultFailure,
+    CloseWorkflowResultSuccess,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
@@ -26,6 +29,7 @@ from griptape_nodes.retained_mode.events.context_events import (
 from griptape_nodes.retained_mode.managers.event_manager import current_request_type
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -227,6 +231,22 @@ class ContextManager(EngineScoped):
             workflow_id=opened.workflow_id,
             open_workflow=self.engine.open_workflow_info(opened),
             result_details=msg,
+        )
+
+    @handles(CloseWorkflowRequest)
+    async def on_close_workflow_request(self, request: CloseWorkflowRequest) -> ResultPayload:
+        workflow = self.engine.open_workflows.find(request.workflow_id)
+        details = f"Workflow '{request.workflow_id}' is already closed."
+        if workflow is not None:
+            workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+            try:
+                await self.engine.aclose_workflow(workflow)
+            except OpenWorkflowError as err:
+                msg = f"Attempted to close workflow '{workflow_name}'. Failed because {err}"
+                return CloseWorkflowResultFailure(result_details=msg)
+            details = f"Closed workflow '{workflow_name}'."
+        return CloseWorkflowResultSuccess(
+            workflow_id=request.workflow_id, already_closed=workflow is None, result_details=details
         )
 
     @handles(GetWorkflowContextRequest)
