@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.project_events import (
+    ActivateWorkspaceProjectRequest,
     GetCurrentProjectRequest,
     GetCurrentProjectResultSuccess,
     GetPathForMacroRequest,
@@ -79,12 +80,18 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         """Async context manager entry: initialize queue and broadcast app initialization."""
         GriptapeNodes.EventManager().initialize_queue()
 
-        # Activate the user-specified project BEFORE broadcasting AppInitializationComplete.
-        # At this point ProjectManager._initialization_complete is still False, so the
-        # project switch skips the heavy library reload that would otherwise clear the
-        # flow/nodes already created at module import time.
+        # Activate the project BEFORE broadcasting AppInitializationComplete: the
+        # user-specified one, else the one the config names (project_file, else the
+        # workspace griptape-nodes-project.yml). At this point
+        # ProjectManager._initialization_complete is still False, so the project switch
+        # skips the heavy library reload that would otherwise clear the flow/nodes
+        # already created at module import time. Activating the configured project here,
+        # rather than leaving it to AppInitializationComplete, makes a configured project
+        # that fails to activate fail the run instead of falling back to system defaults.
         if self._project_file_path is not None:
             await self._load_project(self._project_file_path)
+        else:
+            await self._activate_workspace_project()
 
         await GriptapeNodes.EventManager().abroadcast_app_event(
             AppInitializationComplete(
@@ -151,6 +158,22 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             raise LocalExecutorError(msg)
 
         logger.info("Loaded and activated project template from %s", project_file_path)
+
+    async def _activate_workspace_project(self) -> None:
+        """Activate the project the config names, failing if it is named but cannot be activated.
+
+        With no configured project the request succeeds without changing anything, and the
+        run stays on system defaults.
+        """
+        result = await GriptapeNodes.ahandle_request(ActivateWorkspaceProjectRequest())
+        if result.failed():
+            msg = (
+                "Attempted to activate the configured project before running the workflow. "
+                f"Failed because: {result.result_details}"
+            )
+            raise LocalExecutorError(msg)
+
+        logger.debug("Workspace project activation: %s", result.result_details)
 
     def _submit_output(self, output: dict) -> None:
         self.output = output
