@@ -33,6 +33,14 @@ class FileFormat(Trait):
         super().__init__(element_id="FileFormat")
         self.kind = FileFormatKind(kind)
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FileFormat):
+            return NotImplemented
+        return self.kind == other.kind
+
+    def __hash__(self) -> int:
+        return hash((FileFormat, self.kind))
+
     def to_state(self) -> dict[str, Any]:
         return {"kind": self.kind.value}
 
