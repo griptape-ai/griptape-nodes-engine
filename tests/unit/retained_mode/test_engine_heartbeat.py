@@ -109,6 +109,12 @@ class TestEngineHeartbeatRunId:
         assert after.engine_run_id is not None
         assert after.engine_run_id != before.engine_run_id
 
+    def test_is_the_engines_own_run_id(self, engine: Engine) -> None:
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-own"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.engine_run_id == engine.engine_run_id
+
 
 class TestEngineHeartbeatOpenWorkflows:
     """Heartbeat lists the open workflows, and reports the one opened last as the current one."""

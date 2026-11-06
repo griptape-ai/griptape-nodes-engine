@@ -433,6 +433,11 @@ class Engine:
     def worker_workflows(self) -> WorkerWorkflowSet:
         return self._worker_workflows
 
+    @property
+    def engine_run_id(self) -> str:
+        """Id minted when this engine started, never saved. A new one means workflow ids from before name nothing."""
+        return self._engine_run_id
+
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
     # the compat surface has to live here. Engine-internal code uses the snake_case

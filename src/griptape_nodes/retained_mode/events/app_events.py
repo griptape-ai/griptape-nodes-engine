@@ -152,6 +152,9 @@ class AppInitializationComplete(AppPayload):
     # URL of the static file server the host process runs for this workspace. The engine serves
     # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
+    # `Engine.engine_run_id`, which the host process passes so a client that reconnects sees a
+    # restart without waiting for a heartbeat.
+    engine_run_id: str | None = None
 
 
 @dataclass
