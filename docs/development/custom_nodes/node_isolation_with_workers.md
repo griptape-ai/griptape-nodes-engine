@@ -133,6 +133,28 @@ other:
 
 Only `process` goes to the worker.
 
+A node that runs other nodes in the flows of the main engine process, such
+as the node Griptape Nodes makes from a workflow file, can't run in a
+worker. It reads the flows it imports directly, and those exist only in
+the main engine process. To keep such a node out of workers, even when its
+library declares execution dependencies, set `is_worker_compatible = False`
+on its class. The node then never runs in a worker, neither its library's
+worker nor an Isolated Execution worker:
+
+```python
+class RunMyWorkflow(ControlNode):
+    is_worker_compatible = False
+```
+
+The nodes inside the workflow it runs are sent to their own libraries'
+workers as usual.
+
+Note that older library nodes may instead set
+`node.metadata["workflow_node"] = True`. The engine still honors that key
+as a fallback and never runs the node in a worker, but the key exists for
+the editor: it shows the node with a "View Subflow" button. Prefer
+`is_worker_compatible = False` to keep a node out of workers.
+
 ## What you give up
 
 Cross-process serialization tax. When your worker-side node calls

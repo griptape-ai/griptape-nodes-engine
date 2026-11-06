@@ -342,6 +342,11 @@ class BaseNode(ABC):
     # nothing that runs the node reads: a reopened workflow and a worker's copy never have them.
     attributes_outside_parameters: ClassVar[frozenset[str]] = frozenset()
 
+    # A fact about the node class. A node that drives other nodes in the flows of the
+    # main engine process (such as a Workflow node) sets this to False, so it never runs
+    # in a worker, neither its library's worker nor an Isolated Execution worker.
+    is_worker_compatible: ClassVar[bool] = True
+
     # Owned by a flow
     name: str
     metadata: dict[Any, Any]

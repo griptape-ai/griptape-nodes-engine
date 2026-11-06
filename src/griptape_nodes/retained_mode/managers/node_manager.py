@@ -65,6 +65,7 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.exe_types.workflow_node import WORKFLOW_NODE_KEY
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
@@ -3521,6 +3522,10 @@ class NodeManager(EngineScoped):
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
+
+        A node whose class sets `is_worker_compatible = False` is the exception and
+        never runs in a worker. Additionally, a node that sets the `WORKFLOW_NODE_KEY`
+        metadata key is also never sent to a worker, as a legacy fallback.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3543,7 +3548,11 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node. The orchestrator found
         # its node in `workflow` above.
-        if node is not None and workflow is not None:
+        #
+        # Check first if the target node is worker compatible. For example, a Workflow
+        # node is not (the nodes inside its subflow are routed on their own, so each
+        # still reaches its own library's worker).
+        if node is not None and workflow is not None and self._is_worker_compatible(node):
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that
@@ -3592,6 +3601,18 @@ class NodeManager(EngineScoped):
                     result_details=f"Node '{request.node_name}' violated strict-mode rule(s) [{rules}].",
                 )
         return ctx.result
+
+    def _is_worker_compatible(self, node: BaseNode) -> bool:
+        """Say whether a node may be sent to a worker.
+
+        The class attribute `is_worker_compatible` is the mechanism. The
+        `WORKFLOW_NODE_KEY` metadata check is a fallback for library nodes that set only
+        the key (e.g. the standard library's SubflowWorkflowNode); remove it once
+        libraries set the class attribute.
+        """
+        if not node.is_worker_compatible:
+            return False
+        return not node.metadata.get(WORKFLOW_NODE_KEY)
 
     def _prepare_for_worker(self, node: BaseNode, request: ExecuteNodeRequest) -> ExecuteNodeResultFailure | None:
         """Fill `request` with what a worker loads its copy of `node` from. Returns a failure or None.

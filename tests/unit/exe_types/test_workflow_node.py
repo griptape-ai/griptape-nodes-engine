@@ -282,6 +282,20 @@ class TestResolveLiveRoutes:
 
 
 class TestBuildWorkflowNodeClass:
+    def test_workflow_nodes_are_not_worker_compatible(self) -> None:
+        shape = WorkflowShape(
+            inputs={"Start Flow": {"text": _param("text")}},
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+
+        built_class = build_workflow_node_class(
+            node_type="ShoutWorkflow",
+            workflow_file_path=Path("/library/shout_workflow.py"),
+            workflow_metadata=_metadata(shape),
+        )
+
+        assert built_class.is_worker_compatible is False
+
     def test_class_name_and_attributes(self) -> None:
         shape = WorkflowShape(
             inputs={"Start Flow": {"text": _param("text")}},
