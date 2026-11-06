@@ -78,9 +78,9 @@ class OpenWorkflowSet:
     def move(self, workflow: WorkflowRuntime, workflow_id: str) -> None:
         """Keep an open workflow open under another id, as when saving it writes a copy it continues in.
 
-        The old id stops naming it: an open workflow has exactly one id. The editor learns the new id
-        from the workflow context. An MCP client, whose header can't change mid-run, reaches it
-        through `find_following_moves`.
+        Call `Engine.move_open_workflow`, which tells clients. The old id stops naming it: an open
+        workflow has exactly one id. The editor learns the new id from the workflow context. An MCP
+        client, whose header can't change mid-run, reaches it through `find_following_moves`.
 
         Raises:
             OpenWorkflowError: That runtime is not open, or another workflow is open under the new id.

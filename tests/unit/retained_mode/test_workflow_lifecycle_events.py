@@ -54,6 +54,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.servers.mcp import _handle_in_named_workflow
 
 if TYPE_CHECKING:
@@ -201,14 +202,49 @@ class TestSetWorkflowContext:
         assert _lifecycle_events(_drain(queue)) == []
         assert result_event.open_workflow_id is None
 
-    def test_ensure_announces_the_workflow_it_opened_once(self, engine: Engine, queue: asyncio.Queue) -> None:
-        result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="new"))
 
-        assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
-        announced = _lifecycle_events(_drain(queue))
-        assert len(announced) == 1
-        assert isinstance(announced[0], WorkflowOpenedEvent)
-        assert announced[0].open_workflow.workflow_id == result.workflow_id
+class TestEnsureWorkflowAndFlow:
+    def test_announces_the_workflow_it_opened_once_with_its_flow(self, engine: Engine, queue: asyncio.Queue) -> None:
+        bound_in_hook: list[object] = []
+
+        def record_binding(_request: EnsureWorkflowAndFlowRequest, _result: ResultPayload) -> None:
+            bound_in_hook.append(bound_workflow.get())
+
+        engine.event_manager.add_post_dispatch_hook(EnsureWorkflowAndFlowRequest, record_binding)
+        try:
+            result_event = _send(engine, EnsureWorkflowAndFlowRequest(display_name="new", flow_name="canvas"), None)
+        finally:
+            engine.event_manager.remove_post_dispatch_hook(EnsureWorkflowAndFlowRequest, record_binding)
+
+        assert isinstance(result_event.result, EnsureWorkflowAndFlowResultSuccess), result_event.result.result_details
+        assert result_event.result.flow_name == "canvas"
+        opened = result_event.result.open_workflow
+        assert opened is not None
+        assert opened.has_active_flow
+        assert _lifecycle_events(_drain(queue)) == [WorkflowOpenedEvent(open_workflow=opened)]
+        assert result_event.open_workflow_id == opened.workflow_id
+        assert bound_in_hook == [engine.open_workflows.get(opened.workflow_id)]
+
+    def test_announces_nothing_when_the_flow_cannot_be_created(self, engine: Engine, queue: asyncio.Queue) -> None:
+        failure = ResultPayloadFailure(result_details="no flow")
+
+        with patch.object(ContextManager, "_create_top_level_flow", return_value=failure):
+            result_event = _send(engine, EnsureWorkflowAndFlowRequest(display_name="new"), None)
+
+        assert isinstance(result_event, EventResultFailure)
+        assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(_drain(queue)) == []
+
+    def test_reusing_the_open_workflow_announces_nothing(self, engine: Engine, queue: asyncio.Queue) -> None:
+        workflow = _open_with_set_context(engine, "open")
+        _drain(queue)
+
+        result_event = _send(engine, EnsureWorkflowAndFlowRequest(), workflow.workflow_id)
+
+        assert isinstance(result_event.result, EnsureWorkflowAndFlowResultSuccess), result_event.result.result_details
+        assert result_event.result.open_workflow is None
+        assert _lifecycle_events(_drain(queue)) == []
+        assert result_event.open_workflow_id == workflow.workflow_id
 
 
 class TestRunWorkflowFromRegistry:
@@ -364,12 +400,68 @@ class TestClosing:
         assert failure is None
         assert _lifecycle_events(_drain(queue)) == [WorkflowClosedEvent(open_workflow_id=workflow.workflow_id)]
 
+    def test_hooks_after_a_close_act_on_no_workflow(self, engine: Engine) -> None:
+        workflow = _open_with_set_context(engine, "closing")
+        bound_in_hook: list[object] = []
+
+        def record_binding(_request: CloseWorkflowRequest, _result: ResultPayload) -> None:
+            bound_in_hook.append(bound_workflow.get())
+
+        engine.event_manager.add_post_dispatch_hook(CloseWorkflowRequest, record_binding)
+        try:
+            result_event = asyncio.run(_send_async(engine, CloseWorkflowRequest(), workflow.workflow_id))
+        finally:
+            engine.event_manager.remove_post_dispatch_hook(CloseWorkflowRequest, record_binding)
+
+        assert result_event.succeeded(), result_event.result.result_details
+        assert bound_in_hook == [NO_WORKFLOW]
+
     def test_a_workflow_never_announced_closes_without_an_event(self, engine: Engine, queue: asyncio.Queue) -> None:
         unannounced = engine.open_workflow(engine.workflow_registry.register_unsaved("quiet", listed=False).workflow_id)
 
         engine.close_workflow(unannounced)
 
         assert _lifecycle_events(_drain(queue)) == []
+
+
+class TestMovingAnOpenWorkflow:
+    """A save of a Griptape-provided workflow moves the open workflow onto its copy's id."""
+
+    def test_an_announced_workflow_is_closed_under_its_old_id_and_opened_under_the_new(
+        self, engine: Engine, queue: asyncio.Queue
+    ) -> None:
+        workflow = _open_with_set_context(engine, "library")
+        old_workflow_id = workflow.workflow_id
+        copy_id = engine.workflow_registry.register_unsaved("copy", listed=False).workflow_id
+        _drain(queue)
+
+        engine.move_open_workflow(workflow, copy_id)
+
+        assert _lifecycle_events(_drain(queue)) == [
+            WorkflowClosedEvent(open_workflow_id=old_workflow_id),
+            WorkflowOpenedEvent(
+                open_workflow=engine.open_workflow_info(workflow), replaced_workflow_id=old_workflow_id
+            ),
+        ]
+        assert workflow.workflow_id == copy_id
+
+    def test_a_workflow_never_announced_moves_without_an_event(self, engine: Engine, queue: asyncio.Queue) -> None:
+        unannounced = engine.open_workflow(engine.workflow_registry.register_unsaved("quiet", listed=False).workflow_id)
+        copy_id = engine.workflow_registry.register_unsaved("copy", listed=False).workflow_id
+
+        engine.move_open_workflow(unannounced, copy_id)
+
+        assert _lifecycle_events(_drain(queue)) == []
+
+    def test_its_later_close_names_the_new_id(self, engine: Engine, queue: asyncio.Queue) -> None:
+        workflow = _open_with_set_context(engine, "library")
+        copy_id = engine.workflow_registry.register_unsaved("copy", listed=False).workflow_id
+        engine.move_open_workflow(workflow, copy_id)
+        _drain(queue)
+
+        engine.close_workflow(workflow)
+
+        assert _lifecycle_events(_drain(queue)) == [WorkflowClosedEvent(open_workflow_id=copy_id)]
 
 
 class TestWorkers:
