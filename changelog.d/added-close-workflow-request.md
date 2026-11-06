@@ -1,5 +1,3 @@
-- `CloseWorkflowRequest` closes the open workflow its `workflow_id` names and leaves any others
-  open, whichever workflow the request envelope names. A workflow that is not open succeeds with
-  `already_closed`. `ClearAllObjectStateRequest` always closes every open workflow, whatever the
-  envelope names.
+- `CloseWorkflowRequest`, also an MCP tool, closes the workflow its `workflow_id` names and succeeds
+  with `already_closed` when it isn't open. `ClearAllObjectStateRequest` closes every open workflow.
   [#6205](https://github.com/griptape-ai/griptape-nodes-engine/issues/6205)

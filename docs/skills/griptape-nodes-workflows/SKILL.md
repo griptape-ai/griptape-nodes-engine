@@ -448,6 +448,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
+| Close a workflow, leaving the others open                                           | `CloseWorkflowRequest(workflow_id=...)`                                                                                                                   |
 | Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes
