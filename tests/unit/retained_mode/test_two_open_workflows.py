@@ -830,7 +830,7 @@ class TestEventsNameTheirWorkflow:
         execution_events = [e for e in events if isinstance(e, ExecutionGriptapeNodeEvent)]
         result_events = [e for e in events if isinstance(e, GriptapeNodeEvent)]
         assert execution_events, "the run emitted no execution events"
-        assert {e.wrapped_event.workflow_id for e in execution_events} == {a.workflow_id}
+        assert {e.wrapped_event.open_workflow_id for e in execution_events} == {a.workflow_id}
         assert result_events, "the run emitted no results"
         assert {e.wrapped_event.open_workflow_id for e in result_events} == {a.workflow_id}
 
@@ -848,7 +848,7 @@ class TestEventsNameTheirWorkflow:
         node.append_value_to_parameter("value", "chunk")
 
         progress = [e for e in _drain(queue) if isinstance(e, ProgressEvent)]
-        assert [event.workflow_id for event in progress] == [b.workflow_id]
+        assert [event.open_workflow_id for event in progress] == [b.workflow_id]
 
 
 class TestNodeCodeActsOnItsOwnWorkflow:
