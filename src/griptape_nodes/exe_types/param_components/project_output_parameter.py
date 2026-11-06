@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import abc
-import contextlib
 import typing
 
 from griptape_nodes.exe_types import core_types
@@ -12,7 +11,7 @@ from griptape_nodes.retained_mode.events import connection_events
 from griptape_nodes.traits import button as button_mod
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
 
     from griptape_nodes.exe_types import node_types
 
@@ -135,7 +134,7 @@ class ProjectOutputParameter(abc.ABC):
         """Return the destination from the first connected upstream node that implements ``provider_type``.
 
         Returns None if no connected node implements the provider protocol. The provider builds
-        the destination with the node's workflow bound (see `_in_node_workflow`).
+        the destination with the node's workflow bound.
 
         Args:
             provider_type: ``runtime_checkable`` Protocol the upstream node must satisfy
@@ -160,7 +159,10 @@ class ProjectOutputParameter(abc.ABC):
             source_node = workflow.objects.get(conn.source_node_name)
             if not isinstance(source_node, provider_type):
                 continue
-            with self._in_node_workflow():
+            # Library code reaches the engine through the facade, which acts as the caller is
+            # bound. Binding the node's workflow lets a provider such as `FileOutputSettings`
+            # build a destination for it from a plain thread or a thread pool.
+            with self._node.engine.bind_workflow(workflow):
                 destination = get_destination(source_node)
             if destination is None:
                 msg = (
@@ -261,21 +263,3 @@ class ProjectOutputParameter(abc.ABC):
             response=button_details,
             altered_workflow_state=True,
         )
-
-    @contextlib.contextmanager
-    def _in_node_workflow(self) -> Iterator[None]:
-        """Bind the node's workflow for the block, so a destination built in it keeps that workflow.
-
-        For upstream providers such as `FileOutputSettings`. Library code reaches the engine
-        through the facade, which acts as the caller is bound, so the engine binds the node's
-        workflow around library code it calls on the node's behalf. Without it, a provider called
-        from a plain thread or a thread pool would act on no workflow, or fail with several open.
-        The builders here pass the node's workflow explicitly instead. A node in no workflow
-        builds as the calling code is bound.
-        """
-        workflow = self._node.workflow
-        if workflow is None:
-            yield
-            return
-        with self._node.engine.bind_workflow(workflow):
-            yield
