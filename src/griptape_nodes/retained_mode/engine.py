@@ -653,25 +653,6 @@ class Engine:
         finally:
             bound_workflow.reset(token)
 
-    def enter_opened_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on `workflow`, which the current request just opened, for the rest of that request.
-
-        A load acts on the workflow it opens, so the loaded file builds into it. Only the current
-        context is bound, so dispatch's token reset ends the binding with the request.
-        """
-        bound_workflow.set(workflow)
-
-    def leave_closed_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on no workflow for the rest of the current work, if it acted on `workflow`, which it just closed.
-
-        Bound to NO_WORKFLOW rather than unbound, so the rest of the work never falls back to another
-        open workflow. A load bound to the workflow it closes then acts on the one it opens
-        (`enter_opened_workflow`). Only the current context is rebound: tasks spawned earlier keep their
-        binding, so a run that wakes after the close never reaches the next workflow.
-        """
-        if bound_workflow.get() is workflow:
-            bound_workflow.set(NO_WORKFLOW)
-
     @contextmanager
     def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:
         """Run a worker's node in the runtime it keeps for the node's orchestrator workflow.
@@ -900,7 +881,6 @@ class Engine:
             )
             raise OpenWorkflowError(msg)
         self._open_workflows.close(workflow)
-        self.leave_closed_workflow(workflow)
 
         # Every key referring to a held object kept for it lived on a node just deleted, so each entry
         # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.

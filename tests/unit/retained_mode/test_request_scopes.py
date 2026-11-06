@@ -225,27 +225,25 @@ class TestScopesThatTakeAWorkflow:
         assert calls.workflows == [b]
 
     @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
-    def test_a_binding_the_handler_makes_reaches_a_caller_it_inherited_from(
-        self, engine: Engine, scope: RequestScope
-    ) -> None:
-        """Closing the caller's workflow inside a nested request leaves the caller bound to no workflow too."""
+    def test_a_binding_the_handler_makes_ends_with_the_request(self, engine: Engine, scope: RequestScope) -> None:
+        """A nested request takes its own binding token, so a binding its handler makes never reaches the caller."""
         workflow = _open_workflow(engine)
 
-        def close_handler(request: RequestPayload, workflow: WorkflowRuntime | None = None) -> ResultPayload:  # noqa: ARG001
+        def rebinding_handler(request: RequestPayload, workflow: WorkflowRuntime | None = None) -> ResultPayload:  # noqa: ARG001
             bound_workflow.set(NO_WORKFLOW)
             return _ScopeProbeResult(result_details="ran")
 
-        def workflow_close_handler(request: RequestPayload, workflow: WorkflowRuntime) -> ResultPayload:
-            return close_handler(request, workflow)
+        def workflow_rebinding_handler(request: RequestPayload, workflow: WorkflowRuntime) -> ResultPayload:
+            return rebinding_handler(request, workflow)
 
         if scope is RequestScope.WORKFLOW:
-            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, workflow_close_handler)
+            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, workflow_rebinding_handler)
         else:
-            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, close_handler)
+            engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, rebinding_handler)
 
         with engine.bind_workflow(workflow):
             engine.handle_request(_ScopeProbeRequest())
-            assert engine.current_workflow_or_none() is None
+            assert engine.current_workflow_or_none() is workflow
 
 
 class TestWorkflowScope:
@@ -419,7 +417,7 @@ class TestHostScope:
 
         assert result_event.succeeded()
         assert not isinstance(result_event.result, WorkflowNotOpenResultFailure)
-        assert result_event.open_workflow_id == NOT_OPEN_ID
+        assert result_event.open_workflow_id is None
         assert calls.current == [None]
 
     def test_it_acts_on_no_workflow_even_when_the_envelope_names_the_open_one(
@@ -694,6 +692,72 @@ class TestAddressingFailures:
 
         assert seen == [result_event.result]
         assert isinstance(result_event.result, WorkflowNotOpenResultFailure)
+
+
+class TestResultLabels:
+    """A result's envelope names the workflow its request acted on, not the one the client sent it in."""
+
+    def test_a_host_result_names_no_workflow_though_the_envelope_named_the_open_one(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        workflow = _open_workflow(engine)
+        _register(engine, calls, RequestScope.HOST, _ScopeProbeRequest)
+
+        result_event = engine.event_manager.handle_request(
+            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+        )
+
+        assert result_event.succeeded()
+        assert result_event.open_workflow_id is None
+
+    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
+    def test_a_scoped_result_names_the_workflow_its_handler_was_handed(
+        self, engine: Engine, calls: _Calls, scope: RequestScope
+    ) -> None:
+        _a, b = _open_two(engine)
+        _register(engine, calls, scope, _ScopeProbeRequest)
+
+        result_event = engine.event_manager.handle_request(
+            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=b.workflow_id)
+        )
+
+        assert calls.workflows == [b]
+        assert result_event.open_workflow_id == b.workflow_id
+
+    def test_a_workflow_result_with_no_envelope_id_names_the_workflow_it_acted_on(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        workflow = _open_workflow(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+
+        assert result_event.open_workflow_id == workflow.workflow_id
+
+    def test_an_unscoped_result_names_the_workflow_its_caller_bound(self, engine: Engine, calls: _Calls) -> None:
+        _a, b = _open_two(engine)
+        engine.event_manager.assign_manager_to_request_type(
+            _ScopeProbeRequest, calls.host_handler, without_workflow=None
+        )
+
+        with engine.bind_workflow(b):
+            bound_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+        unbound_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+
+        assert bound_event.open_workflow_id == b.workflow_id
+        # Unbound with two open, it acts on neither.
+        assert unbound_event.open_workflow_id is None
+
+    def test_a_request_that_names_no_workflow_while_two_are_open_fails_naming_none(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        _open_two(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+
+        assert isinstance(result_event.result, WorkflowNotNamedResultFailure)
+        assert result_event.open_workflow_id is None
 
 
 class TestRemoteHandlerOutOfNodeExecution:

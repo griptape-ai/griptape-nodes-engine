@@ -26,7 +26,6 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
-from griptape_nodes.retained_mode.managers.event_manager import current_request_type
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
@@ -775,8 +774,8 @@ class ContextManager(EngineScoped):
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
-        workflow is refused, and so is a push the open workflows have no room for. A request that opens a workflow acts on it for the rest of the request
-        (`Engine.enter_opened_workflow`).
+        workflow is refused, and so is a push the open workflows have no room for. Opening binds
+        nothing: work that builds into the opened workflow binds it (`Engine.bind_workflow`).
 
         Args:
             workflow_name: The legacy registry name of the Workflow to enter. A name the registry
@@ -826,12 +825,7 @@ class ContextManager(EngineScoped):
 
         if working_directory is not None:
             workflow.working_directory = working_directory
-        opened = self.engine.open_workflow(workflow.workflow_id)
-        if current_request_type() is not None:
-            # Outside a request nothing is bound: the work acts on the only open workflow, so no
-            # binding is left behind in a context a later close does not reach.
-            self.engine.enter_opened_workflow(opened)
-        return opened
+        return self.engine.open_workflow(workflow.workflow_id)
 
     def _find_or_register_open_file(self, file_path: str) -> Workflow:
         """The registry entry for a workflow file being opened, registered unlisted when there is none.
