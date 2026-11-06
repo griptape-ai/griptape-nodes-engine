@@ -325,7 +325,7 @@ class Client:
             raise ConnectionError(msg)
 
         serialized = json.dumps(message)
-        # TODO: Block large payloads https://github.com/griptape-ai/griptape-nodes/issues/4124
+        # TODO: Block large payloads https://github.com/griptape-ai/griptape-nodes-engine/issues/4124
         if len(serialized) > LARGE_PAYLOAD_WARNING_THRESHOLD:
             logger.warning(
                 "Sending large WebSocket message: type=%s (%s), size=%d bytes. "

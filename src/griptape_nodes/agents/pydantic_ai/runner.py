@@ -5,7 +5,8 @@ This module is the single point of contact between the request-handling layer
 point :meth:`PydanticAgentRunner.run` that:
 
   * builds (or reuses) a Pydantic AI ``Agent`` configured with the Griptape
-    Cloud model, the skills capability, and any MCP servers the caller passed,
+    Cloud model and the skills capability, with the toolsets the caller passes
+    for the run,
   * loads message history for the requested thread from the storage driver,
   * runs the conversation while emitting Griptape Nodes ``AgentStreamEvent``
     tokens through the supplied sink so the chat sidebar UI streams as before,
@@ -48,7 +49,6 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.tools import DeferredToolRequests
-from pydantic_ai_skills import SkillsCapability
 
 from griptape_nodes.agents.pydantic_ai.image_tools import (
     IMAGE_TOOL_NAME,
@@ -58,6 +58,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
 )
 from griptape_nodes.agents.pydantic_ai.mcp_servers import grant_keys_for_call
 from griptape_nodes.agents.pydantic_ai.model import build_model
+from griptape_nodes.agents.pydantic_ai.skills import WorkspaceSkills, load_workspace_skills
 from griptape_nodes.agents.pydantic_ai.tool_approval import (
     ToolApprovalDeps,
     ends_in_tool_results,
@@ -205,7 +206,6 @@ class PydanticAgentRunner:
     system_prompt: str | None = None
     provider: str = ProviderID.GRIPTAPE_CLOUD
     base_url: str | None = None
-    mcp_servers: list[AbstractToolset[Any]] = field(default_factory=list)
     image_config: ImageGenerationToolsetConfig | None = None
     static_files_manager: StaticFilesManager | None = None
     auto_load_skills: bool = True
@@ -217,12 +217,8 @@ class PydanticAgentRunner:
     _image_toolset: ImageGenerationToolset | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        toolsets: list[Any] = list(self.mcp_servers)
         instructions = self._build_instructions()
-        agent_kwargs: dict[str, Any] = {
-            "instructions": instructions,
-            "toolsets": toolsets or None,
-        }
+        agent_kwargs: dict[str, Any] = {"instructions": instructions}
         if self.system_prompt:
             agent_kwargs["system_prompt"] = self.system_prompt
         # `build_model` resolves `settings=None` to the catalog preset for this
@@ -243,11 +239,10 @@ class PydanticAgentRunner:
             self._image_toolset = register_image_tools(self._agent, self.image_config, self.static_files_manager)
         resolved_settings = model.settings or {}
         logger.debug(
-            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills_library=%s "
+            "PydanticAgentRunner ready: model=%s workspace=%s image_tool=%s skills_library=%s "
             "usage_limits=%s max_tokens=%s",
             self.model_name,
             self.workspace_root,
-            len(self.mcp_servers),
             self._image_toolset is not None,
             self._skills_library(),
             self.usage_limits,
@@ -274,100 +269,16 @@ class PydanticAgentRunner:
             return None
         return skills_dir
 
-    def _build_skills_capabilities(self) -> list[SkillsCapability]:
-        """Build the skills capability exposing ``.agents/skills`` to the agent.
+    async def _load_skills(self) -> WorkspaceSkills:
+        """Read the skills in ``.agents/skills`` for one run.
 
-        Built per run rather than per runner: discovery is a construction-time
-        snapshot, so rebuilding it each turn is what makes an edited skill land
-        without restarting the engine. ``scripts=False`` leaves
-        ``run_skill_script`` unregistered because the workspace already exposes a
-        gated shell tool and skills here ship no scripts.
-
-        Returns an empty list when skills are disabled, the directory is absent,
-        no skill in it loads, or this platform cannot load skills, so the run
-        proceeds without skills instead of failing.
+        Read per run rather than per runner, so an edited skill lands without
+        restarting the engine. Empty when skills are disabled or the directory is absent.
         """
         skills_dir = self._skills_library()
         if skills_dir is None:
-            return []
-        try:
-            capability = self._load_skills(skills_dir)
-            if capability is None:
-                capability = self._load_usable_skills(skills_dir)
-        except NotImplementedError as e:
-            # Raised for the whole library, not one skill, so probing skill by skill cannot help.
-            logger.warning(
-                "Attempted to load skills from %s. Failed because this platform does not support them: %s",
-                skills_dir,
-                e,
-            )
-            return []
-        if capability is None:
-            return []
-        return [capability]
-
-    def _load_skills(
-        self,
-        skills_dir: Path,
-        include: list[str] | None = None,
-        *,
-        index_resources: bool = True,
-    ) -> SkillsCapability | None:
-        """Build a capability over ``skills_dir``, or ``None`` when the loader rejects a skill.
-
-        The loader validates every selected skill while constructing and raises on the
-        first one it rejects, so this succeeds only when all of them load. ``ValueError``
-        is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
-        skills rather than the run.
-
-        ``index_resources=False`` skips indexing bundled *resources*, which a probe does
-        not need and which is the bulk of what makes probing expensive. Scripts are still
-        discovered, so a library shipping them pays more per probe than one that does not.
-        """
-        exclude_resources = None if index_resources else ["*"]
-        try:
-            return SkillsCapability(
-                directories=[skills_dir],
-                scripts=False,
-                include=include,
-                exclude_resources=exclude_resources,
-            )
-        except (ValueError, OSError) as e:
-            logger.warning(
-                "Attempted to load skills %s from %s. Failed because of: %s",
-                include if include is not None else "(all)",
-                skills_dir,
-                e,
-            )
-            return None
-
-    def _load_usable_skills(self, skills_dir: Path) -> SkillsCapability | None:
-        """Build a capability over only the skills in ``skills_dir`` that load on their own.
-
-        One rejected ``SKILL.md`` fails the whole library, so probe each skill by name
-        first: ``include`` filters before the loader parses anything, which pins a
-        rejection to the skill that caused it and keeps the others. Returns ``None`` when
-        nothing survives.
-
-        Probing costs a construction per skill, and every construction walks the whole
-        library's bundled files, so probes skip indexing its resources: a probe only has
-        to answer whether the frontmatter parses, and the survivors' resources are indexed
-        by the build below.
-        """
-        try:
-            candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
-        except OSError as e:
-            logger.warning("Attempted to list the skills in %s. Failed because of: %s", skills_dir, e)
-            return None
-
-        usable = [
-            name
-            for name in candidates
-            if self._load_skills(skills_dir, include=[name], index_resources=False) is not None
-        ]
-        if not usable:
-            return None
-        return self._load_skills(skills_dir, include=usable)
+            return WorkspaceSkills()
+        return await load_workspace_skills(skills_dir)
 
     @property
     def agent(self) -> Agent[Any, str]:
@@ -424,11 +335,11 @@ class PydanticAgentRunner:
                 so any in-place edit would leak back onto disk. ``None`` sends
                 the loaded history to the model unchanged.
             extra_toolsets: Toolsets to attach to this run only, on top of the
-                ones baked into the agent. Pydantic AI treats run-level toolsets
-                as additive, so these do not replace ``mcp_servers``. Use this
-                for toolsets whose configuration can change between runs - an
-                MCP server the user just edited - so the run picks up the
-                current config without rebuilding the agent.
+                ones registered on the agent. Use this for toolsets whose
+                configuration can change between runs - an MCP server the user
+                just edited, or the engine's own server addressed to the run's
+                workflow - so the run picks up the current config without
+                rebuilding the agent.
             extra_instructions: Instructions to append for this run only, in the
                 same additive spirit. Guidance that belongs to a toolset passed
                 via ``extra_toolsets`` travels here, so the two stay in sync.
@@ -470,15 +381,14 @@ class PydanticAgentRunner:
             model_history = await history_rehydrator(history)
         run_id = thread_id[:8]
 
-        # Rebuilt every run so skill edits land without an engine restart.
-        capabilities = self._build_skills_capabilities()
+        skills = await self._load_skills()
 
         logger.debug(
             "[run %s] start: model=%s history_len=%d skills=%s run_toolsets=%d prompt=%r",
             run_id,
             self.model_name,
             len(history),
-            [name for capability in capabilities for name in capability.skill_names],
+            skills.names,
             len(extra_toolsets or []),
             _prompt_preview(prompt),
         )
@@ -506,7 +416,7 @@ class PydanticAgentRunner:
                     deps=approval or ToolApprovalDeps(),
                     usage_limits=self.usage_limits,
                     event_stream_handler=event_handler,
-                    capabilities=capabilities or None,
+                    capabilities=skills.capabilities or None,
                     toolsets=list(extra_toolsets) if extra_toolsets else None,
                     instructions=extra_instructions or None,
                     model_settings={"extra_headers": dict(extra_headers)} if extra_headers else None,

@@ -742,7 +742,7 @@ class StaticFilesManager(EngineScoped):
     ) -> str:
         """Save a static file for the open workflow; see `save_static_file_in`.
 
-        Edge method for code that is not handed a workflow (engine, `exe_types` and node library code).
+        Edge method for node library code, which is not handed a workflow.
         """
         return self.save_static_file_in(
             self.engine.current_workflow_or_none(),

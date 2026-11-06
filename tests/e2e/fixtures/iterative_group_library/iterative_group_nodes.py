@@ -99,7 +99,7 @@ class DoublerDataNode(DataNode):
 
     It has an outgoing data connection (to the next control node), so it is an interior node, not
     a terminal sink. It has no control connections in use, so it is a plain ``DataNode``. This is
-    the shape ``classify_nodes_for_dag`` buckets into neither ``control_nodes`` nor
+    the shape ``classify_nodes_for_dag_in`` buckets into neither ``control_nodes`` nor
     ``data_sink_nodes`` -- the gap this fixture exists to exercise.
     """
 

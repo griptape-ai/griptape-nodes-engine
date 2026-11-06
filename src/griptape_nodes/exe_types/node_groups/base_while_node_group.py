@@ -130,7 +130,7 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
         # Reset all nodes to UNRESOLVED so they re-execute. The DAG builder
         # skips RESOLVED upstream dependencies, so without this reset nodes
         # won't be added to the DAG and won't run on subsequent iterations.
-        self.engine.flow_manager.unresolve_all_nodes_in_flow(flow_name)
+        self.engine.flow_manager.unresolve_all_nodes_in_flow_in(self._require_workflow(), flow_name)
 
     def _on_complete(self, *, condition_met: bool, iterations: int) -> None:  # noqa: ARG002
         """Called after all loop iterations are finished, before the node resolves.

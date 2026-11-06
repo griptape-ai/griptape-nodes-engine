@@ -62,7 +62,7 @@ self.add_parameter(
 
 ## Widget JS Function Signature
 
-Widgets are ES module default exports. The function receives a container DOM element and a props object, and must return a cleanup function:
+Widgets are ES module default exports. The function receives a container DOM element and a props object, and must return a cleanup function. To receive changes after the widget mounts, return an object with `cleanup` and `update` instead (see [Live Parameter Sync](#live-parameter-sync)):
 
 ```javascript
 export default function MyWidget(container, props) {
@@ -87,6 +87,96 @@ export default function MyWidget(container, props) {
 | `onChange` | `function` | Callback to send updated value to the framework  |
 | `disabled` | `boolean`  | Whether the widget should be read-only           |
 | `height`   | `number`   | Suggested height in pixels (may be 0 or absent)  |
+
+## Live Parameter Sync
+
+Many widgets edit values that also have their own parameters on the node. A crop editor, for example, edits the same `left`, `top`, `width` and `height` that the node shows as sliders. List those parameters in the `Widget` trait's `synced_parameters`, and the widget reads and writes them directly. Each value then has one copy, the parameter, so the node never copies values into the widget or back, and the widget and the sliders follow each other while the user drags either one.
+
+### Declaring Synced Parameters
+
+```python
+from griptape_nodes.exe_types.param_types.parameter_dict import ParameterDict
+from griptape_nodes.traits.widget import Widget
+
+self.add_parameter(
+    ParameterDict(
+        name="my_editor",
+        default_value={"image_url": ""},
+        traits={
+            Widget(
+                name="MyEditorWidget",
+                library="My Library",
+                synced_parameters=["left", "top", "width", "height"],
+            )
+        },
+    )
+)
+```
+
+- Each name in `synced_parameters` is a parameter on the same node, of any type. In this example the node also has `left`, `top`, `width` and `height` parameters, such as sliders.
+- The widget's own parameter holds only what is not a parameter, such as an image URL the node prepares for display. Don't copy a synced parameter into it. If a key in the widget's value has the same name as a synced parameter, the parameter's value wins.
+- Nodes don't need connection hooks or locked-state handling. The editor works out which synced parameters have an incoming connection and passes them to the widget as `props.locked`.
+
+### Reading and Writing Synced Parameters
+
+| Prop           | Description                                                                                                                                                                                                                                                          |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `value`        | The widget's own value with each synced parameter's current value merged in under its name. While a control is being dragged, its in-progress value is merged in. This applies when the widget's value is a dict. Any other value type reaches the widget unchanged. |
+| `onChange`     | Commits as usual. Keys that name a synced parameter are set on that parameter, the same way its own control would set it. The rest is saved to the widget's own parameter. Unchanged values and locked parameters are skipped.                                       |
+| `onLiveChange` | Takes a dict of synced parameter names and in-progress values. The parameters' controls on the node move with the drag. The values stay in the editor and are not sent to the engine. The next `onChange` commits them.                                              |
+| `locked`       | `string[]` of synced parameters that have an incoming connection. Always present when `synced_parameters` is set. It is editor state, not part of the value, and is never saved with the workflow.                                                                   |
+
+A widget that returns `{ cleanup, update }` has `update` called whenever any of these change: its own value, a synced parameter's committed or in-progress value, or the locked list.
+
+```javascript
+export default function MyEditorWidget(container, props) {
+  let { value, onChange, onLiveChange } = props;
+  let locked = props.locked || [];
+  let left = value.left ?? 0;
+  let dragging = false;
+
+  function handleUpdate(newProps) {
+    value = newProps.value || {};
+    onChange = newProps.onChange;
+    onLiveChange = newProps.onLiveChange;
+    locked = newProps.locked || [];
+    // During a drag the incoming value is this widget's own live value, so keep the local one.
+    if (!dragging && "left" in value) left = value.left;
+    render();
+  }
+
+  handle.addEventListener("pointerdown", () => {
+    dragging = !locked.includes("left");
+  });
+
+  handle.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    left = positionFrom(e);
+    onLiveChange?.({ left });
+    render();
+  });
+
+  handle.addEventListener("pointerup", () => {
+    if (!dragging) return;
+    dragging = false;
+    // Pass the whole value: keys left out are removed from the widget's own parameter.
+    onChange({ ...value, left });
+  });
+
+  // ... setup, render() ...
+
+  return { cleanup, update: handleUpdate };
+}
+```
+
+**Widget requirements:**
+
+1. **Return `{ cleanup, update }`.** A widget that returns only a cleanup function, or nothing, keeps the value it was mounted with.
+1. **Pass the whole value to `onChange`.** The synced keys go to their parameters, and everything else replaces the widget's own value, so a key you leave out is removed from it.
+1. **Keep `update` cheap.** It runs on every frame of a drag. Update what changed instead of rebuilding the DOM.
+1. **Respect `props.locked`.** A locked parameter is driven by a connection, so disable direct manipulation of it, for example with a not-allowed cursor on a locked handle. The editor ignores live and committed values for locked parameters.
+
+Synced parameters need an editor that supports them. An older editor ignores `synced_parameters`, and the widget sees only its own value.
 
 ## Critical Patterns and Pitfalls
 

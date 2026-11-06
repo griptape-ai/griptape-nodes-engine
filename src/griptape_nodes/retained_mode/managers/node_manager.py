@@ -1009,7 +1009,7 @@ class NodeManager(EngineScoped):
             node_class_name = node.__class__.__name__
 
             # Get the opposing EndNode
-            # TODO: (griptape) Get paired classes implemented so we dont need to do name stuff. https://github.com/griptape-ai/griptape-nodes/issues/1549
+            # TODO: (griptape) Get paired classes implemented so we dont need to do name stuff. https://github.com/griptape-ai/griptape-nodes-engine/issues/1549
             end_class_name = node_class_name.replace("Start", "End")
 
             # Check and see if the class exists
@@ -2364,8 +2364,8 @@ class NodeManager(EngineScoped):
     def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
         """Remove a parameter from a node of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -2662,19 +2662,19 @@ class NodeManager(EngineScoped):
         elif request.default_value is not None:
             parameter.default_value = request.default_value
         if request.mode_allowed_input is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/828
             if request.mode_allowed_input is True:
                 parameter.allowed_modes.add(ParameterMode.INPUT)
             else:
                 parameter.allowed_modes.discard(ParameterMode.INPUT)
         if request.mode_allowed_property is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/828
             if request.mode_allowed_property is True:
                 parameter.allowed_modes.add(ParameterMode.PROPERTY)
             else:
                 parameter.allowed_modes.discard(ParameterMode.PROPERTY)
         if request.mode_allowed_output is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/828
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/828
             if request.mode_allowed_output is True:
                 parameter.allowed_modes.add(ParameterMode.OUTPUT)
             else:
@@ -2804,14 +2804,14 @@ class NodeManager(EngineScoped):
             if isinstance(result, AlterParameterDetailsResultFailure):
                 return result
 
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/827
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/827
         # Now change all the values on the Element.
         self.modify_alterable_fields(request, element)
 
         # The rest of these are not alterable
         if isinstance(element, Parameter):
             if hasattr(element, "user_defined") and element.user_defined is False and request.request_id:  # type: ignore[attr-defined]
-                # TODO: https://github.com/griptape-ai/griptape-nodes/issues/826
+                # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/826
                 details = f"Attempted to alter details for Element '{request.parameter_name}' from Node '{node_name}'. Could only alter some values because the Element was not user-defined (i.e., critical to the Node implementation). Only user-defined Elements can be totally modified from a Node."
                 return AlterParameterDetailsResultSuccess(
                     result_details=ResultDetails(message=details, level=logging.WARNING)
@@ -2820,7 +2820,7 @@ class NodeManager(EngineScoped):
 
         # This field requires the node as well
         if request.default_value is not None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/825
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/825
             node.parameter_values[request.parameter_name] = request.default_value
 
         details = f"Successfully altered details for Element '{request.parameter_name}' from Node '{node_name}'."
@@ -2952,8 +2952,8 @@ class NodeManager(EngineScoped):
     def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
         """Set a parameter value on a node of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -4082,7 +4082,7 @@ class NodeManager(EngineScoped):
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
         # registration, keeping both sides in sync. The id is what
-        # cancel_worker_execution dispatches as CancelExecuteNodeRequest.target_request_id.
+        # cancel_worker_execution_in dispatches as CancelExecuteNodeRequest.target_request_id.
         if not request.request_id:
             request.request_id = str(uuid4())
         target_request_id = request.request_id
@@ -4128,8 +4128,8 @@ class NodeManager(EngineScoped):
             return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
         return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
 
-    async def cancel_worker_execution(self, node_name: str) -> None:
-        """Dispatch CancelExecuteNodeRequest to the worker running node_name.
+    async def cancel_worker_execution_in(self, workflow: WorkflowRuntime, node_name: str) -> None:
+        """Dispatch CancelExecuteNodeRequest to the worker running `workflow`'s node `node_name`.
 
         No-op when the node is not currently routed to a worker (either because
         it runs locally or because no ExecuteNodeRequest is in flight). The
@@ -4138,13 +4138,8 @@ class NodeManager(EngineScoped):
         cooperative cancellation is signalled via task.cancel() on the
         orchestrator's own route_to_worker await, which unblocks here as soon
         as the cancel event has been put on the wire.
-
-        Edge method for code not handed a workflow.
         """
-        nodes = self._current_nodes_or_none()
-        if nodes is None:
-            return
-        entry = nodes.orch_worker_requests.get(node_name)
+        entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry
@@ -4644,7 +4639,7 @@ class NodeManager(EngineScoped):
             # Get the library metadata so we can get the version.
             library_metadata_request = GetLibraryMetadataRequest(library=library_used)
             # Call LibraryManager directly to avoid error toasts when library is unavailable (expected for ErrorProxyNode)
-            # Per https://github.com/griptape-ai/griptape-nodes/issues/1940
+            # Per https://github.com/griptape-ai/griptape-nodes-engine/issues/1940
             library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
                 library_metadata_request
             )
@@ -6626,7 +6621,7 @@ class NodeManager(EngineScoped):
             return ResetNodeToDefaultsResultFailure(result_details=details)
         new_node_name = create_result.node_name
 
-        # TODO: (griptape-nodes) Don't rely on manually copying metadata fields. https://github.com/griptape-ai/griptape-nodes/issues/2862
+        # TODO: (griptape-nodes) Don't rely on manually copying metadata fields. https://github.com/griptape-ai/griptape-nodes-engine/issues/2862
         # Copy only position and size from original node's metadata to preserve layout.
         # We don't copy the full metadata because it contains instance-specific data that shouldn't be transferred.
         artifact_metadata = all_info_result.metadata

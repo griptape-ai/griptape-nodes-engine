@@ -155,7 +155,7 @@ def resolve_discovery_path(entry: LibraryRegistration, workspace_path: Path) -> 
     workspace libraries directory, so they never need a `libraries_to_register`
     entry. Returns None when the path does not exist on disk.
     """
-    # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
+    # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes-engine/issues/4396
     library_path = resolve_workspace_path(Path(entry.path), workspace_path)
     if not library_path.exists():
         return None

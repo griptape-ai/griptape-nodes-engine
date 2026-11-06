@@ -717,7 +717,7 @@ class LibraryGitOperations(EngineScoped):
 
         # Perform sparse checkout to get library JSON
         try:
-            checkout = sparse_checkout_library_json(normalized_url, ref)
+            checkout = await asyncio.to_thread(sparse_checkout_library_json, normalized_url, ref)
         except GitError as e:
             details = f"Failed to inspect library from {normalized_url}: {e}"
             return InspectLibraryRepoResultFailure(result_details=details)

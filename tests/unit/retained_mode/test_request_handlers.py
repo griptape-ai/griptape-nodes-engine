@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
-from griptape_nodes.retained_mode.events.context_events import GetWorkflowContextRequest
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handles, scope_from_signature
@@ -229,31 +228,6 @@ class TestRegistrationReadsTheScope:
         event_manager.register_request_handlers(_Base())
 
         assert event_manager.get_scope_for_request_type(_PingRequest) is RequestScope.HOST
-
-    def test_a_request_type_not_yet_migrated_keeps_no_scope(self) -> None:
-        """Its handler still reads the ambient workflow, so it must not become HOST.
-
-        `GetWorkflowContextRequest` stays in `AMBIENT_UNTIL_MIGRATED` until entry points name their workflow.
-        """
-
-        def on_get_workflow_context(request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG001
-            return GenericResultFailure(result_details="unused")
-
-        event_manager = EventManager()
-
-        event_manager.assign_manager_to_request_type(GetWorkflowContextRequest, on_get_workflow_context)
-
-        assert event_manager.get_scope_for_request_type(GetWorkflowContextRequest) is None
-
-    def test_a_handler_that_takes_a_workflow_is_scoped_even_when_not_yet_migrated(self) -> None:
-        def on_get_workflow_context(request: GetWorkflowContextRequest, workflow: object) -> ResultPayload:  # noqa: ARG001
-            return GenericResultFailure(result_details="unused")
-
-        event_manager = EventManager()
-
-        event_manager.assign_manager_to_request_type(GetWorkflowContextRequest, on_get_workflow_context)
-
-        assert event_manager.get_scope_for_request_type(GetWorkflowContextRequest) is RequestScope.WORKFLOW
 
     def test_without_workflow_none_leaves_a_handler_with_no_workflow_parameter_unscoped(self) -> None:
         """As for a library's handler, which keeps reading the ambient workflow."""

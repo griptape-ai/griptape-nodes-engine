@@ -67,7 +67,7 @@ class HostWorkflowReadRecorder:
         """The HOST request a client sent that this dispatch is for, if any.
 
         A HOST request is bound to no workflow. A request bound to a workflow is for that workflow. A
-        request with no scope is in `AMBIENT_UNTIL_MIGRATED`, or is a library's: its reads are its own,
+        request with no scope is a library's: its reads are its own,
         not the HOST request's that sent it. Any other request keeps what the work that issued it was
         for: a nested request that gets no workflow because a HOST request issued it is still for that
         HOST request.

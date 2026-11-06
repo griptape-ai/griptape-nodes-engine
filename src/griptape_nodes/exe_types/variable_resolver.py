@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -183,8 +184,11 @@ class VariableResolver:
         _aprocess_variable_cache.reset(token)  # type: ignore[arg-type]
 
     @staticmethod
-    def is_substitution_enabled(engine: Engine) -> bool:
-        """Return True if variable substitution is enabled for the active workflow.
+    def is_substitution_enabled(engine: Engine, workflow: WorkflowRuntime | None) -> bool:
+        """Return True if variable substitution is enabled for `workflow`, or with None, the open workflow.
+
+        A node passes the workflow it joined, and None while it has joined none, such as during its
+        ``__init__``.
 
         KNOWN LIMITATION in a worker: this reads a local manager whose map is never populated.
         SetVariableSubstitutionEnabledRequest writes it, and a generated workflow file emits that as
@@ -206,13 +210,17 @@ class VariableResolver:
         Fixing it properly means resolving the answer once per execution and carrying it,
         rather than asking per value.
         """
-        return engine.workflow_manager.variable_substitution.is_enabled()
+        if workflow is None:
+            return engine.workflow_manager.variable_substitution.is_enabled()
+        return workflow.variables.substitution_enabled
 
     @staticmethod
-    def get_variables_if_enabled(engine: Engine, node_name: str) -> dict[str, str | int] | None:
+    def get_variables_if_enabled(
+        engine: Engine, workflow: WorkflowRuntime | None, node_name: str
+    ) -> dict[str, str | int] | None:
         """Return the variable dict if substitution is enabled, else None.
 
-        Checks the per-aprocess cache first to avoid repeated singleton lookups.
+        Checks the per-aprocess cache first to avoid repeating the workflow's variable lookup.
         Returns None if: substitution is disabled, node has no parent flow,
         or the cache indicates the flow lookup already failed (_NO_FLOW).
 
@@ -229,7 +237,7 @@ class VariableResolver:
         """
         # Same local read as is_substitution_enabled, and the same worker limitation applies;
         # see the note there.
-        if not engine.workflow_manager.variable_substitution.is_enabled():
+        if not VariableResolver.is_substitution_enabled(engine, workflow):
             return None
 
         cached = _aprocess_variable_cache.get()
@@ -245,13 +253,18 @@ class VariableResolver:
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
         try:
-            flow_name = engine.node_manager.get_node_parent_flow_by_name(node_name)
+            if workflow is None:
+                flow_name = engine.node_manager.get_node_parent_flow_by_name(node_name)
+            else:
+                flow_name = workflow.nodes.parent_flow_name(node_name)
         except KeyError:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
-        result = engine.handle_request(
-            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
-        )
+        request = ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+        if workflow is None:
+            result = engine.handle_request(request)
+        else:
+            result = workflow.handle_request(request)
         if not isinstance(result, ListVariablesResultSuccess):
             logger.debug("Variable substitution skipped for node %s: %s", node_name, result.result_details)
             _aprocess_variable_cache.set(_NO_FLOW)
@@ -309,7 +322,9 @@ class VariableResolver:
         return VariableResolver._contains_string(value, rewrites)
 
     @staticmethod
-    def get_variables_without_memoizing(engine: Engine, node_name: str) -> dict[str, str | int] | None:
+    def get_variables_without_memoizing(
+        engine: Engine, workflow: WorkflowRuntime | None, node_name: str
+    ) -> dict[str, str | int] | None:
         """Like `get_variables_if_enabled`, but never leaves the memo cache set.
 
         ``get_variables_if_enabled`` memoises its lookup into the ContextVar without
@@ -320,10 +335,10 @@ class VariableResolver:
         outside ``aprocess_scope()``. An already-populated cache is left untouched.
         """
         if _aprocess_variable_cache.get() is not None:
-            return VariableResolver.get_variables_if_enabled(engine, node_name)
+            return VariableResolver.get_variables_if_enabled(engine, workflow, node_name)
         token = _aprocess_variable_cache.set(None)
         try:
-            return VariableResolver.get_variables_if_enabled(engine, node_name)
+            return VariableResolver.get_variables_if_enabled(engine, workflow, node_name)
         finally:
             _aprocess_variable_cache.reset(token)
 

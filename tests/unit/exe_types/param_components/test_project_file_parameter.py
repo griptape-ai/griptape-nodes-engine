@@ -26,7 +26,7 @@ _SPEC = destination_events.FileDestinationSpec(
 def _make_param(result: object) -> ProjectFileParameter:
     node = mock.MagicMock()
     node.name = "Saver"
-    node.engine.handle_request.return_value = result
+    node._handle_request_in_workflow.return_value = result
     return ProjectFileParameter(node, "output_file", default_filename="default.png")
 
 
@@ -38,7 +38,7 @@ class TestBuildFileFromConnectedSettings:
 
         param.build_file()
 
-        cast("mock.MagicMock", param._node).engine.handle_request.assert_called_once_with(
+        cast("mock.MagicMock", param._node)._handle_request_in_workflow.assert_called_once_with(
             destination_events.GetConnectedFileDestinationRequest(node_name="Saver", parameter_name="output_file")
         )
 

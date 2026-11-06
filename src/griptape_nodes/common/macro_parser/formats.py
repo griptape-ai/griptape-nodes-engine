@@ -421,7 +421,7 @@ class DateFormat(FormatSpec):
 
     def apply(self, _value: str | int) -> str:
         """Apply date formatting."""
-        # TODO(https://github.com/griptape-ai/griptape-nodes/issues/2717): Implement date formatting
+        # TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/2717): Implement date formatting
         msg = "DateFormat not yet fully implemented"
         raise MacroResolutionError(
             msg,
@@ -430,7 +430,7 @@ class DateFormat(FormatSpec):
 
     def reverse(self, value: str) -> str:
         """Attempt to parse date string."""
-        # TODO(https://github.com/griptape-ai/griptape-nodes/issues/2717): Implement date parsing
+        # TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/2717): Implement date parsing
         return value
 
 

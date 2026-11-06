@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
-from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED, ONLY_OPEN_UNTIL_CLIENTS_NAME
+from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -994,8 +994,8 @@ class EventManager(EngineScoped):
             owner: Given the request and its sender, the one engine allowed to send it, or None when
                 the request names nothing an engine owns. Only with `sender`.
             without_workflow: The scope of a callback with no `workflow` parameter. HOST for the
-                engine's handlers, except those in `AMBIENT_UNTIL_MIGRATED`. None for a library's,
-                which dispatch calls with the request alone, bound to the ambient workflow.
+                engine's handlers. None for a library's, which dispatch calls with the request alone,
+                bound to the ambient workflow.
 
         Raises:
             ValueError: The request type already has a handler.
@@ -1011,7 +1011,7 @@ class EventManager(EngineScoped):
         # A library handler that names no `workflow` stays ambient, even one taking *args or **kwargs.
         if without_workflow is not None or takes_workflow_parameter(callback):
             scope = scope_from_signature(callback)
-        if scope is None and request_type.__name__ not in AMBIENT_UNTIL_MIGRATED:
+        if scope is None:
             scope = without_workflow
         if request_type.__name__ in ONLY_OPEN_UNTIL_CLIENTS_NAME and scope is not RequestScope.OPTIONAL_WORKFLOW:
             msg = (
@@ -1426,6 +1426,7 @@ class EventManager(EngineScoped):
 
             # Some requests have fields marked as "omit_from_result" which should be removed from the request
             self._scrub_omitted_request_fields(request)
+            result_workflow_id = self._result_workflow_id(context)
             if callback_result.succeeded():
                 result_event = EventResultSuccess(
                     request=request,
@@ -1433,7 +1434,7 @@ class EventManager(EngineScoped):
                     result=callback_result,
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
-                    open_workflow_id=context.get("open_workflow_id"),
+                    open_workflow_id=result_workflow_id,
                     engine_id=self.engine.get_engine_id(),
                 )
             else:
@@ -1443,7 +1444,7 @@ class EventManager(EngineScoped):
                     result=callback_result,
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
-                    open_workflow_id=context.get("open_workflow_id"),
+                    open_workflow_id=result_workflow_id,
                     engine_id=self.engine.get_engine_id(),
                 )
 
@@ -2121,6 +2122,22 @@ class EventManager(EngineScoped):
         for node in self.engine.object_manager.take_nodes_with_queued_changes():
             node.emit_parameter_changes()
 
+    @staticmethod
+    def _result_workflow_id(context: ResultContext) -> str | None:
+        """The open workflow a result names: the one the envelope named, else the one the request was bound to.
+
+        A request with no envelope id is bound by dispatch to the only open workflow, by a run's
+        `WorkflowRuntime.handle_request` to the run's workflow, or by a load to the workflow it
+        opened (`Engine.enter_opened_workflow`). Its result still says which workflow it acted on.
+        """
+        open_workflow_id = context.get("open_workflow_id")
+        if open_workflow_id is not None:
+            return open_workflow_id
+        binding = bound_workflow.get()
+        if binding is None or binding is NO_WORKFLOW:
+            return None
+        return binding.workflow_id
+
 
 class EventSuppressionContext:
     """Keep engine-internal bookkeeping off the websocket while it happens.
@@ -2353,7 +2370,9 @@ class EventTranslationContext:
         # Create new wrapped_event with translated payload
         wrapped_class = type(wrapped_event)
         try:
-            new_wrapped = wrapped_class(payload=translated_payload)
+            new_wrapped = wrapped_class(
+                payload=translated_payload, workflow_id=getattr(wrapped_event, "workflow_id", None)
+            )
         except Exception:
             return None
 

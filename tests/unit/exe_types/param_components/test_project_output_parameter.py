@@ -40,7 +40,7 @@ class _ConcreteParam(project_output_parameter.ProjectOutputParameter):
 def _make_param(result: object, param_name: str = "output") -> _ConcreteParam:
     mock_node = mock.MagicMock()
     mock_node.name = "MyNode"
-    mock_node.engine.handle_request.return_value = result
+    mock_node._handle_request_in_workflow.return_value = result
     return _ConcreteParam(mock_node, param_name, default_value="default.txt", situation="save_node_output")
 
 
@@ -65,14 +65,14 @@ def _get(param: _ConcreteParam) -> object | None:
 class TestGetUpstreamDestination:
     """Tests for _get_upstream_destination, which asks for the destination a connected settings node supplies."""
 
-    def test_sends_the_request_through_the_nodes_engine(self) -> None:
+    def test_sends_the_request_through_the_nodes_workflow(self) -> None:
         param = _make_param(
             destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=None, result_details="ok")
         )
 
         _get(param)
 
-        _mock_node(param).engine.handle_request.assert_called_once_with(_request(param))
+        _mock_node(param)._handle_request_in_workflow.assert_called_once_with(_request(param))
 
     def test_returns_none_when_no_settings_node_is_connected(self) -> None:
         param = _make_param(
@@ -113,7 +113,7 @@ class TestGetUpstreamDestination:
 
         _get(param)
 
-        _mock_node(param).engine.object_manager.attempt_get_object_by_name.assert_not_called()
+        _mock_node(param)._require_workflow.return_value.objects.get.assert_not_called()
 
     def test_allowed_modes_default(self) -> None:
         param = _make_param(None)

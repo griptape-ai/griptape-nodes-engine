@@ -928,13 +928,13 @@ class AgentManager(EngineScoped):
             payload = _run_event_to_payload(event, thread_id)
             if payload is None:
                 return
-            event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=payload),
-                ),
-            )
+            # A chat about a workflow belongs to it, so its events name that workflow.
+            if workflow is not None:
+                event_manager.put_event(workflow.execution_event(payload))
+                return
+            event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
 
-        library_toolsets = self._library_toolsets(library_mcp_server_names)
+        library_toolsets = self._library_toolsets(library_mcp_server_names, workflow)
         # Nothing may sit between this and the `async with` that releases
         # it: a server left with a stray use count is never shut down.
         mcp = await self._acquire_mcp_toolsets(mcp_server_names)
@@ -946,7 +946,7 @@ class AgentManager(EngineScoped):
                 cancel_event=active.cancel_event,
                 persist_prompt=persist_prompt,
                 history_rehydrator=_rehydrate_history,
-                extra_toolsets=[*mcp.lease.toolsets, *library_toolsets],
+                extra_toolsets=[self._engine_mcp_toolset(workflow), *mcp.lease.toolsets, *library_toolsets],
                 extra_instructions=_compose_run_instructions(workflow_context, mcp.instructions),
                 extra_headers=attribution_headers,
                 approval=approval,
@@ -1442,10 +1442,11 @@ class AgentManager(EngineScoped):
         """Return the cached agent for this provider/model, building it if needed.
 
         The runner carries only what is fixed for the life of an agent: the
-        model, the engine's own MCP server, and the base instructions. Anything
-        the user can edit mid-session - their MCP servers and the rules attached
-        to them - is passed to :meth:`PydanticAgentRunner.run` instead, so an
-        edit takes effect on the next run rather than the next engine restart.
+        model and the base instructions. Anything that can change between runs -
+        the user's MCP servers and the rules attached to them, and the workflow
+        the engine's own MCP server acts on - is passed to
+        :meth:`PydanticAgentRunner.run` instead, so it takes effect on the next run
+        rather than the next engine restart.
         """
         provider = self._get_provider(provider_name)
         provider_type = provider.type
@@ -1483,12 +1484,6 @@ class AgentManager(EngineScoped):
 
         workspace_root = Path(config_manager.workspace_path)
         self._ensure_skills_directory(workspace_root)
-        # The engine's own MCP server is the only one baked into the agent: the
-        # engine owns its lifetime and its address cannot change mid-session.
-        mcp_servers: list[AbstractToolset[Any]] = [
-            streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/"),
-        ]
-
         runner = PydanticAgentRunner(
             model_name=model_name,
             provider=provider_type,
@@ -1498,13 +1493,22 @@ class AgentManager(EngineScoped):
             storage=self._thread_storage,
             instructions=_build_agent_instructions(include_image_tool=image_config is not None),
             system_prompt=self._system_prompt_extra or None,
-            mcp_servers=mcp_servers,
             image_config=image_config,
             static_files_manager=self.static_files_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def _engine_mcp_toolset(self, workflow: WorkflowRuntime | None) -> AbstractToolset[Any]:
+        """The engine's own MCP server, addressed to `workflow`, for one run.
+
+        Built per run because the cached runner is shared by chats about different workflows.
+        """
+        workflow_id = None
+        if workflow is not None:
+            workflow_id = workflow.workflow_id
+        return streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/", workflow_id=workflow_id)
 
     def _ensure_skills_directory(self, workspace_root: Path) -> None:
         """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
@@ -1729,8 +1733,8 @@ class AgentManager(EngineScoped):
         )
         return _MCPAttachment(lease=lease, instructions=instructions)
 
-    def _library_toolsets(self, names: list[str]) -> list[AbstractToolset[Any]]:
-        """Build a toolset for each named library MCP server, skipping names no loaded library serves."""
+    def _library_toolsets(self, names: list[str], workflow: WorkflowRuntime | None) -> list[AbstractToolset[Any]]:
+        """Build a toolset for each named library MCP server, addressed to `workflow`, skipping names no loaded library serves."""
         read_only_by_slug: dict[str, set[str]] = {}
         for library in list_library_mcp_tools():
             read_only = read_only_by_slug.setdefault(library.slug, set())
@@ -1742,12 +1746,17 @@ class AgentManager(EngineScoped):
                 "MCP tools, so the agent will run without them. Check the library is loaded.",
                 ", ".join(sorted(unavailable)),
             )
+        workflow_id = None
+        if workflow is not None:
+            workflow_id = workflow.workflow_id
         toolsets: list[AbstractToolset[Any]] = []
         for name in dict.fromkeys(names):
             if name not in read_only_by_slug:
                 continue
             read_only = frozenset(read_only_by_slug[name])
-            toolsets.append(streamable_http_library(name, self._library_mcp_url(name), read_only))
+            toolsets.append(
+                streamable_http_library(name, self._library_mcp_url(name), read_only, workflow_id=workflow_id)
+            )
         return toolsets
 
     def _library_mcp_url(self, slug: str) -> str:

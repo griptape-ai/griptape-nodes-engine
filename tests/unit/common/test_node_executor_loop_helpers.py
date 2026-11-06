@@ -18,7 +18,7 @@ These tests cover small, near-pure helpers that decide loop control flow:
 
 import logging
 from typing import Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -33,6 +33,12 @@ from griptape_nodes.retained_mode.events.node_events import (
     NodeDependencies,
     SerializedNodeCommands,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
+    """A workflow whose requests go to the executor's engine."""
+    return WorkflowRuntime("wf", executor.engine)
 
 
 def _make_executor() -> NodeExecutor:
@@ -129,7 +135,7 @@ class TestGetIterationControlAction:
 
         # _find_sources_for_control_param returns the direct source for each connection
         # _check_control_source_fired is keyed on the source_node_name returned
-        def fake_find_sources(incoming: list, param_name: str) -> list[tuple[str, str]]:
+        def fake_find_sources(_workflow: WorkflowRuntime, incoming: list, param_name: str) -> list[tuple[str, str]]:
             return [
                 (c.source_node_name, c.source_parameter_name) for c in incoming if c.target_parameter_name == param_name
             ]
@@ -142,6 +148,7 @@ class TestGetIterationControlAction:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
         with (
             patch.object(NodeExecutor, "_find_sources_for_control_param", side_effect=fake_find_sources),
             patch.object(NodeExecutor, "_get_control_source_that_reached_end", return_value=None),
@@ -240,38 +247,49 @@ class TestGetControlSourceThatReachedEnd:
 
     def test_returns_none_when_end_node_not_in_mappings(self) -> None:
         mapping = _make_end_node_mapping()
-        assert _make_executor()._get_control_source_that_reached_end(mapping, {}) is None
+        assert (
+            _make_executor()._get_control_source_that_reached_end(WorkflowRuntime("wf", MagicMock()), mapping, {})
+            is None
+        )
 
     def test_returns_none_when_node_manager_raises_value_error(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.side_effect = ValueError("not found")
-        result = executor._get_control_source_that_reached_end(_make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"})
+        mock_engine.node_manager.get_node_by_name_in.side_effect = ValueError("not found")
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
         assert result is None
 
     def test_returns_none_when_control_never_entered_end(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = _make_end_node(entered_on=None)
-        result = executor._get_control_source_that_reached_end(_make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"})
+        mock_engine.node_manager.get_node_by_name_in.return_value = _make_end_node(entered_on=None)
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
         assert result is None
 
     def test_returns_none_when_end_entered_on_an_input_with_no_body_source(self) -> None:
         # The while path wires the Start node straight to End's exec_in, which maps to no body exit.
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = _make_end_node(entered_on="exec_in")
-        result = executor._get_control_source_that_reached_end(_make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"})
+        mock_engine.node_manager.get_node_by_name_in.return_value = _make_end_node(entered_on="exec_in")
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
         assert result is None
 
     def test_returns_the_body_exit_the_entry_input_maps_to(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = _make_end_node(entered_on="Cond_True")
+        mock_engine.node_manager.get_node_by_name_in.return_value = _make_end_node(entered_on="Cond_True")
         mapping = _make_end_node_mapping({"Cond_True": OriginalNodeParameter(node_name="Cond", parameter_name="True")})
-        result = executor._get_control_source_that_reached_end(mapping, {"EndPkg": "EndPkg_inst1"})
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), mapping, {"EndPkg": "EndPkg_inst1"}
+        )
         assert result == OriginalNodeParameter(node_name="Cond", parameter_name="True")
-        mock_engine.node_manager.get_node_by_name.assert_called_once_with("EndPkg_inst1")
+        mock_engine.node_manager.get_node_by_name_in.assert_called_once_with(ANY, "EndPkg_inst1")
 
 
 class TestForgetControlSourceThatReachedEnd:
@@ -281,15 +299,17 @@ class TestForgetControlSourceThatReachedEnd:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         end_node = _make_end_node(entered_on="Cond_True")
-        mock_engine.node_manager.get_node_by_name.return_value = end_node
-        executor._forget_control_source_that_reached_end(_make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"})
+        mock_engine.node_manager.get_node_by_name_in.return_value = end_node
+        executor._forget_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
         end_node.set_entry_control_parameter.assert_called_once_with(None)
 
     def test_does_nothing_when_end_node_not_in_mappings(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        executor._forget_control_source_that_reached_end(_make_end_node_mapping(), {})
-        mock_engine.node_manager.get_node_by_name.assert_not_called()
+        executor._forget_control_source_that_reached_end(_workflow_of(executor), _make_end_node_mapping(), {})
+        mock_engine.node_manager.get_node_by_name_in.assert_not_called()
 
 
 class TestGetIterationControlActionEndToEnd:
@@ -332,11 +352,12 @@ class TestGetIterationControlActionEndToEnd:
         deserialized_nodes = {"EndPkg_inst1": _make_end_node(entered_on=entered_on)}
 
         # Canvas lookups of the body's source nodes get a plain node; only End's entry matters.
-        def fake_get_node(name: str) -> Any:
+        def fake_get_node(_workflow: WorkflowRuntime, name: str) -> Any:
             return deserialized_nodes.get(name, MagicMock())
 
         mock_engine.handle_request.return_value = connections_result
-        mock_engine.node_manager.get_node_by_name.side_effect = fake_get_node
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        mock_engine.node_manager.get_node_by_name_in.side_effect = fake_get_node
         end_node_mapping = _make_end_node_mapping(
             {"CondNode_orig_exec_out": OriginalNodeParameter(node_name="CondNode_orig", parameter_name="exec_out")}
         )
