@@ -461,16 +461,8 @@ class WorkflowRunner(EngineScoped):
         self.engine.enter_opened_workflow(opened)
 
     async def _close_replaced_workflow(self, replaces_workflow_id: str | None) -> bool:
-        """Close the open workflow a clean-slate open replaces, returning False if closing it failed.
-
-        That is the workflow `replaces_workflow_id` names, else the one that keeps another from
-        opening while only one may be open. A named workflow that is no longer open leaves nothing
-        to close, and with several allowed open, naming none closes none.
-        """
-        if replaces_workflow_id is not None:
-            replaced = self.engine.open_workflows.find(replaces_workflow_id)
-        else:
-            replaced = self.engine.open_workflows.workflow_blocking_open()
+        """Close the open workflow a clean-slate open replaces, if any, returning False if closing it failed."""
+        replaced = self.engine.open_workflows.workflow_replaced_by_open(replaces_workflow_id)
         if replaced is None:
             return True
         result = await replaced.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

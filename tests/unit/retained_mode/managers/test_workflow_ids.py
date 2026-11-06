@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
+    SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
@@ -867,6 +868,55 @@ class TestIdsOnResults:
         assert context.workflow_id == workflow_id
         assert isinstance(heartbeat, EngineHeartbeatResultSuccess)
         assert heartbeat.current_workflow_id == workflow_id
+
+
+class TestSetWorkflowContextReplacesTheOpenWorkflow:
+    """With only one workflow open at a time, setting the context opens a workflow in place of the open one."""
+
+    def test_it_closes_the_open_workflow_and_opens_the_requested_one(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        replaced_id = _open_new_workflow(project_engine, "replaced")
+
+        result = project_engine.handle_request(SetWorkflowContextRequest(workflow_name=saved.workflow_name))
+
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [saved.workflow_id]
+        assert not project_engine.open_workflows.is_open(replaced_id)
+
+    def test_it_creates_the_top_level_flow_when_asked(self, project_engine: Engine) -> None:
+        _open_new_workflow(project_engine, "replaced")
+
+        result = project_engine.handle_request(SetWorkflowContextRequest(display_name="fresh", create_flow=True))
+
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert result.open_workflow is not None
+        assert result.open_workflow.has_active_flow
+        assert project_engine.open_workflows.get(result.open_workflow.workflow_id).context.has_current_flow()
+
+    def test_it_refuses_the_workflow_that_is_already_open_and_keeps_it(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        reopened = _run(project_engine, RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name))
+        assert reopened.succeeded(), reopened.result_details
+        assert saved.workflow_id is not None
+        workflow = project_engine.open_workflows.get(saved.workflow_id)
+        objects_before = len(workflow.objects)
+
+        result = project_engine.handle_request(SetWorkflowContextRequest(workflow_name=saved.workflow_name))
+
+        assert isinstance(result, SetWorkflowContextFailure)
+        assert "already open" in str(result.result_details)
+        assert project_engine.open_workflows.all_open() == [workflow]
+        assert len(workflow.objects) == objects_before
+
+    def test_naming_a_workflow_that_is_no_longer_open_closes_nothing_and_fails(self, project_engine: Engine) -> None:
+        open_id = _open_new_workflow(project_engine, "open")
+
+        result = project_engine.handle_request(
+            SetWorkflowContextRequest(display_name="fresh", replaces_workflow_id=uuid.uuid4().hex)
+        )
+
+        assert isinstance(result, SetWorkflowContextFailure)
+        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [open_id]
 
 
 class TestOpenAndSaveResultsReportTheOpenWorkflow:

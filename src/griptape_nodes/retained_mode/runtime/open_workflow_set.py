@@ -113,6 +113,17 @@ class OpenWorkflowSet:
             return None
         return next(iter(self._by_id.values()))
 
+    def workflow_replaced_by_open(self, replaces_workflow_id: str | None) -> WorkflowRuntime | None:
+        """The open workflow an open closes first, or None.
+
+        That is the workflow `replaces_workflow_id` names, else the one that keeps another from
+        opening while only one may be open. A named workflow that is no longer open leaves nothing
+        to close, and with several allowed open, naming none closes none.
+        """
+        if replaces_workflow_id is not None:
+            return self.find(replaces_workflow_id)
+        return self.workflow_blocking_open()
+
     def is_open(self, workflow_id: str) -> bool:
         return workflow_id in self._by_id
 

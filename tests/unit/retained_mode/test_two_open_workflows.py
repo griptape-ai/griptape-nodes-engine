@@ -758,6 +758,17 @@ class TestRequestsWithNoEnvelopeId:
         assert result.workflow_id is not None
         assert engine.open_workflows.all_open() == [a, b, engine.open_workflows.get(result.workflow_id)]
 
+    def test_opening_a_workflow_in_place_of_b_leaves_a_open(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+
+        result = _send(engine, SetWorkflowContextRequest(display_name="C", replaces_workflow_id=b.workflow_id), None)
+
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert result.workflow_id is not None
+        assert engine.open_workflows.all_open() == [a, engine.open_workflows.get(result.workflow_id)]
+
     def test_clear_all_with_no_id_closes_every_open_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:

@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.context_events import (
 from griptape_nodes.retained_mode.managers.event_manager import current_request_type
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -158,13 +159,7 @@ class ContextManager(EngineScoped):
         event_manager.register_request_handlers(self)
 
     @handles(SetWorkflowContextRequest)
-    def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if blocking is not None:
-            blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{blocking_name}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
-            return SetWorkflowContextFailure(result_details=msg)
-
+    def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:  # noqa: C901, PLR0911
         # Normalized here rather than at read time so `workflow_dir` never has to care whether
         # the caller sent an absolute path, a workspace-relative one, or one with a `~` in it.
         working_directory = None
@@ -219,8 +214,34 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
-        opened = self.open_workflow(workflow_name, working_directory=working_directory)
-        resolved_name = self.engine.workflow_registry.get(opened.workflow_id).name
+        # Closing an open workflow to reopen it would empty its canvas, since nothing reloads its file.
+        target = registry.get_workflow_by_name(workflow_name)
+        if self.engine.open_workflows.is_open(target.workflow_id):
+            msg = f"Attempted to open workflow '{workflow_name}'. Failed because it is already open."
+            return SetWorkflowContextFailure(result_details=msg)
+
+        replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
+        if replaced is not None:
+            replaced_name = registry.get(replaced.workflow_id).name
+            try:
+                self.engine.close_workflow(replaced)
+            except OpenWorkflowError as err:
+                msg = f"Attempted to open workflow '{workflow_name}' in place of '{replaced_name}'. Failed to close '{replaced_name}': {err}"
+                return SetWorkflowContextFailure(result_details=msg)
+
+        try:
+            opened = self.open_workflow(workflow_name, working_directory=working_directory)
+        except self.WorkflowAlreadyOpenError as err:
+            return SetWorkflowContextFailure(result_details=str(err))
+        resolved_name = registry.get(opened.workflow_id).name
+
+        if request.create_flow:
+            create_flow_result = self._create_top_level_flow(opened)
+            if not create_flow_result.succeeded():
+                self.engine.close_workflow(opened)
+                msg = f"Attempted to open workflow '{resolved_name}' with a flow. Failed to create the flow: {create_flow_result.result_details}"
+                return SetWorkflowContextFailure(result_details=msg)
+
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(
             workflow_name=resolved_name,
@@ -454,6 +475,13 @@ class ContextManager(EngineScoped):
 
         self._register_orchestrator_workflow(workflow_id, name, file_path, working_directory)
         return self.engine.worker_workflows.runtime_for(workflow_id)
+
+    def _create_top_level_flow(self, workflow: WorkflowRuntime) -> ResultPayload:
+        """Create `workflow`'s top-level flow and make it the current flow."""
+        # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
+        from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
+
+        return workflow.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
 
     def _register_orchestrator_workflow(
         self,

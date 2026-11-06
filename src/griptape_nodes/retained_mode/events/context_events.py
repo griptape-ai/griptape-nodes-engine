@@ -43,15 +43,27 @@ class SetWorkflowContextRequest(RequestPayload):
                       (not the project base directory, which may sit one level above). Optional:
                       when None, `{workflow_dir}` answers the folder this workflow's first save
                       would land in, read from the project's `save_workflow` situation.
+        replaces_workflow_id: Id of the open workflow to close first. Left out, the request closes
+                      the open workflow while only one may be open, and closes none otherwise. An
+                      id that names no open workflow closes nothing, so the open fails if another
+                      is open and only one may be.
+        create_flow: Whether to create the workflow's top-level flow, which a workflow needs
+                      before it can be saved. Leave it False to build a saved file into the
+                      workflow with RunWorkflowWithCurrentStateRequest.
+
+    Opening a workflow doesn't depend on which workflow the caller has open, so the request
+    ignores the envelope's `open_workflow_id`.
 
     Results: SetWorkflowContextSuccess (carries the resolved workflow_name and workflow_id) |
-             SetWorkflowContextFailure (workflow not found, working_directory names an
-             existing non-directory)
+             SetWorkflowContextFailure (workflow not found or already open, working_directory
+             names an existing non-directory)
     """
 
     workflow_name: str | None = None
     display_name: str | None = None
     working_directory: str | None = None
+    replaces_workflow_id: str | None = None
+    create_flow: bool = False
 
 
 @dataclass
