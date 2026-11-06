@@ -120,12 +120,6 @@ class LibraryWorkers(EngineScoped):
         listener, so the GUI hears about a worker's library from the orchestrator accepting the
         report rather than from a relayed event.
         """
-        return await self.note_library_loaded_in_worker(request, worker_id=None)
-
-    async def note_library_loaded_in_worker(
-        self, request: ReportLibraryLoadedRequest, *, worker_id: str | None
-    ) -> ResultPayload:
-        """Note a worker's report that it loaded a library. `worker_id` names that worker, when known."""
         library_info = self.engine.library_manager.get_library_info_by_library_name(request.library_name)
         if library_info is None:
             details = f"Received a library load report for unknown library '{request.library_name}'."
@@ -144,7 +138,6 @@ class LibraryWorkers(EngineScoped):
                 library_name=request.library_name,
                 fitness=request.fitness,
                 problem_details=request.problem_details,
-                worker_id=worker_id,
             )
         )
         return ReportLibraryLoadedResultSuccess(

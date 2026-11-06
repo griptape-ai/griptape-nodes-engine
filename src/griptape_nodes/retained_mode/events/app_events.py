@@ -250,14 +250,11 @@ class LibraryLoadedNotification(AppPayload):
         library_name: Name of the library that was loaded.
         fitness: Final fitness value (LibraryManager.LibraryFitness string).
         problem_details: Human-readable summary of problems, or None if there are none.
-        worker_id: The engine ID of the worker process that loaded it, or None when the library loaded
-            in the engine itself or the worker that loaded it is not one this engine started.
     """
 
     library_name: str
     fitness: str
     problem_details: str | None = None
-    worker_id: str | None = None
 
 
 @dataclass

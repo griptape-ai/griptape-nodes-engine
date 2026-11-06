@@ -846,13 +846,12 @@ class WorkerManager(EngineScoped):
                 "details": f"Attempted to start {_worker_described(worker_key)}. Failed because {refusal}",
             }
         for library in hello.libraries:
-            report = await self.engine.library_manager.workers.note_library_loaded_in_worker(
+            report = await self.engine.library_manager.workers.on_report_library_loaded_request(
                 ReportLibraryLoadedRequest(
                     library_name=library.library_name,
                     fitness=library.fitness,
                     problem_details=library.problem_details,
-                ),
-                worker_id=worker_id,
+                )
             )
             if report.failed():
                 logger.warning(

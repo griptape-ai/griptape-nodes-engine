@@ -75,7 +75,7 @@ def _worker_manager() -> WorkerManager:
         default if cast_type is None else cast_type(default)
     )
     engine.project_manager.committed_project.return_value = ("project-1", _GENERATION)
-    engine.library_manager.workers.note_library_loaded_in_worker = AsyncMock(
+    engine.library_manager.workers.on_report_library_loaded_request = AsyncMock(
         return_value=ReportLibraryLoadedResultSuccess(result_details="noted")
     )
     return WorkerManager(engine=engine, event_manager=MagicMock())
@@ -146,12 +146,10 @@ class TestHello:
         reply = await manager._accept_hello(worker_id, _hello())
 
         assert reply["accepted"] is True
-        noted = _engine(manager).library_manager.workers.note_library_loaded_in_worker
+        noted = _engine(manager).library_manager.workers.on_report_library_loaded_request
         assert [call.args[0].library_name for call in noted.await_args_list] == [_DEPENDENCY, _LIBRARY]
         assert noted.await_args_list[1].args[0].fitness == "FLAWED"
         assert noted.await_args_list[1].args[0].problem_details == "one warning"
-        # The notification each one raises names the worker that loaded it.
-        assert {call.kwargs["worker_id"] for call in noted.await_args_list} == {_WORKER_ID}
 
     @pytest.mark.asyncio
     async def test_a_worker_on_another_engine_version_is_refused_naming_both(self, pair: _Pair) -> None:
@@ -169,7 +167,7 @@ class TestHello:
         assert "0.0.1" in reason
         assert engine_version in reason
         assert manager.has_settled(_LIBRARY)
-        _engine(manager).library_manager.workers.note_library_loaded_in_worker.assert_not_awaited()
+        _engine(manager).library_manager.workers.on_report_library_loaded_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_worker_that_could_not_load_its_library_is_refused_with_why(self, pair: _Pair) -> None:
