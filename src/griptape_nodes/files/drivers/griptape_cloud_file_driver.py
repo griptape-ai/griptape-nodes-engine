@@ -1,6 +1,9 @@
 """File driver for Griptape Cloud asset locations."""
 
+from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx2
@@ -13,6 +16,9 @@ from griptape_nodes.drivers.cloud_credentials import (
 )
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.base_file_driver import BaseFileDriver
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 # HTTP status code threshold for success
 _HTTP_SUCCESS_THRESHOLD = 400
@@ -48,18 +54,22 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         self.headers = {"Authorization": f"Bearer {api_key}"}
 
     @classmethod
-    def create_from_env(cls) -> "GriptapeCloudFileDriver | None":
+    def create_from_env(cls, secrets_manager: SecretsManager) -> GriptapeCloudFileDriver | None:
         """Create driver from environment variables if available.
 
         Checks for a GT_CLOUD_BUCKET_ID and a Griptape Cloud credential (the
         license, else GT_CLOUD_API_KEY). If both are present, creates and returns
         a driver instance.
 
+        Args:
+            secrets_manager: Resolves the credential. A library's worker process is started without the
+                license and API key, and reads them from the engine it works for.
+
         Returns:
             GriptapeCloudFileDriver instance if credentials available, None otherwise
         """
         bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
-        api_key = resolve_cloud_credential()
+        api_key = resolve_cloud_credential(secrets_manager)
         base_url = resolve_cloud_base_url()
 
         if bucket_id and api_key:
