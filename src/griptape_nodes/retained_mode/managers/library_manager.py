@@ -604,7 +604,7 @@ class LibraryManager(EngineScoped):
                 self._libraries_loading_complete.set()
 
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
-        await self.workers.maybe_start_workers_for_existing_session()
+        await self.workers.start_workers_after_loading()
 
         # Signal readiness again so the app re-renders the library status table against the
         # reloaded set. is_initial_start=False so the app refreshes the table without

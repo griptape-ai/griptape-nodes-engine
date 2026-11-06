@@ -385,22 +385,28 @@ class AppEvents(BaseModel):
 class WorkerSettings(BaseModel):
     heartbeat_interval_s: float = Field(
         default=5.0,
-        description="Interval in seconds between worker heartbeat challenges sent by the orchestrator.",
+        description=(
+            "Interval in seconds between heartbeat challenges sent to a worker that runs on another "
+            "computer's engine. A worker this engine starts for itself is not challenged: the engine "
+            "knows the moment it stops."
+        ),
     )
     heartbeat_timeout_s: float = Field(
         default=15.0,
         description=(
-            "Seconds without a heartbeat response before a worker is evicted. A worker also shuts "
-            "itself down after this much orchestrator silence, but never sooner than 30 seconds, so "
-            "that an orchestrator too busy to challenge is not mistaken for one that exited."
+            "Seconds without a heartbeat response before a worker that runs on another computer's "
+            "engine is evicted. Such a worker also shuts itself down after this much orchestrator "
+            "silence, but never sooner than 30 seconds, so that an orchestrator too busy to challenge "
+            "is not mistaken for one that exited. Does not apply to a worker this engine starts for "
+            "itself."
         ),
     )
     library_load_timeout_s: float = Field(
         default=600.0,
         description=(
-            "Seconds a worker may take to load its library. Bounds how long running a node waits "
-            "for its library's worker to finish loading, and how long a project switch waits for "
-            "each worker to adopt it. "
+            "Seconds a worker may take to load its library. Bounds how long a worker this engine "
+            "starts may take to connect to it, how long running a node waits for its library's "
+            "worker to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
             "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
         ),

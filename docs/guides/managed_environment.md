@@ -117,9 +117,11 @@ waits for the first to finish. When the sandbox is off, the request fails with a
 ### `worker.command_prefix`
 
 Libraries that run in their own worker process are started with the engine's own Python
-interpreter, by its full path: `/path/to/python -m griptape_nodes_app engine --library-name "Foo Library" ...`.
+interpreter, by its full path: `/path/to/python -m griptape_nodes.worker --library-name "Foo Library"`.
 `worker.command_prefix` is a list of words placed in front of that command, so your tool can
-prepare the environment first and then run the worker inside it:
+prepare the environment first and then run the worker inside it. The environment needs only the
+`griptape-nodes-engine` package, at the engine's own version, and the library's dependencies. It
+does not need the Griptape Nodes app.
 
 ```bash
 export GTN_CONFIG_WORKER__COMMAND_PREFIX='["env-tool", "run", "engine=={engine_version}", "python-{python_version}", "{library_request}", "--"]'
@@ -169,9 +171,10 @@ JSON list of words, is reported in the engine log. With `library.provisioned_by`
 prefix.
 
 The worker receives the engine's environment as it was when the engine started, plus a few
-variables the engine sets by name (`GTN_ENGINE_ID`, `GTN_ORCHESTRATOR_ENGINE_ID`,
-`PYTHONUNBUFFERED`, and the static file server address). The engine copies no other variables and
-changes none of your tool's, so your tool decides what the worker's environment contains.
+variables the engine sets by name (`PYTHONUNBUFFERED`, the static file server address, and the two
+`GTN_WORKER_CHANNEL_` variables it uses to reach the engine). It leaves out `GRIPTAPE_NODES_LICENSE`
+and `GT_CLOUD_API_KEY`: a worker asks the engine for every secret instead. The engine copies no other
+variables and changes none of your tool's, so your tool decides what the worker's environment contains.
 
 Keep the prefix free of quoted arguments if Windows machines use it: some shells on Windows drop
 double quotes inside arguments.
