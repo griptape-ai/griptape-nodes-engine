@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -84,7 +84,11 @@ from griptape_nodes.retained_mode.events.node_events import (
     ListParametersOnNodeRequest,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest, RenameObjectRequest
-from griptape_nodes.retained_mode.events.os_events import ResolveMacroPathRequest, ResolveMacroPathResultSuccess
+from griptape_nodes.retained_mode.events.os_events import (
+    ResolveMacroPathRequest,
+    ResolveMacroPathResultSuccess,
+    WriteFileRequest,
+)
 from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     GetParameterValueResultSuccess,
@@ -1377,6 +1381,19 @@ class TestOtherSharedState:
         assert isinstance(heartbeat, EngineHeartbeatResultSuccess), heartbeat.result_details
         assert [info.workflow_id for info in heartbeat.open_workflows] == [a.workflow_id, b.workflow_id]
         assert heartbeat.current_workflow_id == b.workflow_id
+
+    def test_an_image_written_for_b_collects_bs_metadata(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime], tmp_path: Path
+    ) -> None:
+        _, b = two_open
+        provider = MagicMock()
+        provider.collect_metadata_for_write.return_value = {}
+
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
+            result = _send(engine, WriteFileRequest(file_path=str(tmp_path / "out.png"), content=b"png"), b)
+
+        assert result.succeeded(), result.result_details
+        provider.collect_metadata_for_write.assert_called_once_with("out.png", b)
 
     @pytest.mark.asyncio
     async def test_a_post_dispatch_hook_sees_the_workflow_its_request_was_addressed_to(

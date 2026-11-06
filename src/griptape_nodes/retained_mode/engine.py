@@ -879,7 +879,7 @@ class Engine:
             # would look idle and the cancel would be skipped.
             self.handle_request(CancelAllRunsRequest())
             self._flow_manager.reset_global_execution_state()
-            self._delete_workflow_flows()
+            self._delete_workflow_flows(workflow)
         if len(workflow.objects) > 0:
             msg = (
                 f"Attempted to close workflow '{workflow.workflow_id}'. Failed because {len(workflow.objects)} "
@@ -895,8 +895,8 @@ class Engine:
         if dropped:
             logger.debug("Released %d held object(s) while closing the workflow.", dropped)
 
-    def _delete_workflow_flows(self) -> None:
-        """Delete the current workflow's flows, which deletes their nodes.
+    def _delete_workflow_flows(self, workflow: WorkflowRuntime) -> None:
+        """Delete `workflow`'s flows, which deletes their nodes.
 
         Deletes a flow with no parent until none is left; `on_delete_flow_request` cascades into
         its children and nodes. `ListFlowsInCurrentContextRequest` can't be used: the workflow may
@@ -908,15 +908,15 @@ class Engine:
         flow_manager = self._flow_manager
         deleted: set[str] = set()
         while True:
-            flows = self._object_manager.get_filtered_subset(type=ControlFlow)
-            orphan = next((name for name in flows if not flow_manager.get_parent_flow(name)), None)
+            flows = workflow.objects.get_filtered_subset(type=ControlFlow)
+            orphan = next((name for name in flows if not flow_manager.get_parent_flow_in(workflow, name)), None)
             if orphan is None:
                 return
             failure = None
             if orphan in deleted:
                 failure = "it was still there after it was deleted"
             else:
-                result = self.handle_request(DeleteFlowRequest(flow_name=orphan))
+                result = workflow.handle_request(DeleteFlowRequest(flow_name=orphan))
                 if result.failed():
                     failure = str(result.result_details)
             if failure is not None:

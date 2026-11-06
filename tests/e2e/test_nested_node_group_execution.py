@@ -190,9 +190,9 @@ def _check_nesting_rebuilt() -> None:
     flow_manager = _E2EGriptapeNodes.FlowManager()
     inner_subflow = inner.metadata.get("subflow_name")
     outer_subflow = outer.metadata.get("subflow_name")
-    if flow_manager.get_parent_flow(inner_subflow) != outer_subflow:
+    if flow_manager.get_parent_flow_in(flow_manager.engine.current_workflow(), inner_subflow) != outer_subflow:
         raise RuntimeError(
-            f"E2E_FAIL: {{inner_subflow}} parent is {{flow_manager.get_parent_flow(inner_subflow)!r}}, "
+            f"E2E_FAIL: {{inner_subflow}} parent is {{flow_manager.get_parent_flow_in(flow_manager.engine.current_workflow(), inner_subflow)!r}}, "
             f"expected {{outer_subflow!r}}"
         )
 

@@ -92,7 +92,7 @@ async def _run_legacy_loop_with_outside_dependency(
 
     ``StartFlowRequest.flow_node_name`` is deliberately never set: a Start/End loop's control
     graph is cyclic (End's iteration signal loops back to Start), and
-    ``FlowManager.get_start_node_from_node``/``get_prev_node`` walk incoming control connections
+    ``FlowManager.get_start_node_from_node_in``/``get_prev_node_in`` walk incoming control connections
     with no visited set -- supplying an explicit target hangs forever (see
     [[transient-iteration-flow]] "Related bug: FlowManager cycle-guard hang"). Omitting it lets
     the normal queue discover the real control entry (``Loop Start``) and avoids the hang.

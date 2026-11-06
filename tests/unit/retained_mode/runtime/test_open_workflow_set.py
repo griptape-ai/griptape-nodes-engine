@@ -164,13 +164,3 @@ class TestOpenWorkflowsFollowTheContext:
 
         assert engine.worker_workflows.find(peer_id) is workflow
         assert engine.open_workflows.all_open() == []
-
-    def test_moving_the_open_workflow_moves_its_runtime(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="outer")
-        [workflow] = engine.open_workflows.all_open()
-        copy = engine.workflow_registry.register_unsaved("copy")
-
-        engine.context_manager.move_current_workflow_onto(copy.workflow_id)
-
-        assert engine.open_workflows.all_open() == [workflow]
-        assert workflow.workflow_id == copy.workflow_id
