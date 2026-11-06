@@ -242,18 +242,7 @@ class WorkflowRunner(EngineScoped):
     async def on_run_workflow_from_registry_request(  # noqa: PLR0911
         self, request: RunWorkflowFromRegistryRequest
     ) -> ResultPayload:
-        """Open the registered workflow and run its file into it.
-
-        With a clean slate, closes the workflow the open replaces first, if any.
-        """
-        if request.replaces_workflow_id is not None and not request.run_with_clean_slate:
-            details = (
-                f"Attempted to run workflow '{request.workflow_name}' in place of workflow "
-                f"'{request.replaces_workflow_id}'. Failed because replacing a workflow needs a clean slate. "
-                "Send run_with_clean_slate=True, or leave out replaces_workflow_id."
-            )
-            return RunWorkflowFromRegistryResultFailure(result_details=details)
-
+        """Close the workflow the open replaces, if any, then open the registered workflow and run its file into it."""
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
         # get workflow from registry
@@ -275,29 +264,15 @@ class WorkflowRunner(EngineScoped):
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-        # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
-        # Refused before anything is registered or run.
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if not request.run_with_clean_slate and blocking is not None:
-            details = (
-                f"Attempted to run workflow '{request.workflow_name}'. Failed because workflow "
-                f"'{self.engine.workflow_registry.get(blocking.workflow_id).name}' is open. Clear the open workflow first, "
-                "or run it with a clean slate (run_with_clean_slate=True)."
-            )
-            return RunWorkflowFromRegistryResultFailure(result_details=details)
-
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            replaced = None
-            if request.run_with_clean_slate:
-                replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
+            replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
             if not await self._close_replaced_workflow(replaced):
                 details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
                 return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Open the workflow before running its file, so the file builds into it. A failed run closes it below.
-            # The open refuses when this workflow is already open, or another is and only one may be,
-            # cases the checks above can't see once several workflows may be open.
+            # The open refuses when this workflow is already open, or another is and only one may be.
             try:
                 opened = self.engine.context_manager.open_workflow(request.workflow_name)
             except ContextManager.WorkflowAlreadyOpenError as err:
@@ -305,7 +280,7 @@ class WorkflowRunner(EngineScoped):
             except OpenWorkflowError:
                 details = (
                     f"Attempted to run workflow '{request.workflow_name}'. Failed because it is already open. "
-                    "Close it first, or run it with a clean slate from its own tab."
+                    "Close it first, or run it again from its own tab."
                 )
                 return RunWorkflowFromRegistryResultFailure(result_details=details)
             # run file

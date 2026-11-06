@@ -1246,7 +1246,7 @@ def saved_workflow_name(engine: Engine, spike_library: None, tmp_path: Path) -> 
 class TestLoadingASavedFileWhileAnotherIsOpen:
     """Scenario (i)."""
 
-    def test_a_clean_slate_load_in_place_of_b_leaves_a_open(self, engine: Engine, saved_workflow_name: str) -> None:
+    def test_a_load_in_place_of_b_leaves_a_open(self, engine: Engine, saved_workflow_name: str) -> None:
         _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
@@ -1256,9 +1256,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         result = asyncio.run(
             _send_async(
                 engine,
-                RunWorkflowFromRegistryRequest(
-                    workflow_name=saved_workflow_name, run_with_clean_slate=True, replaces_workflow_id=b.workflow_id
-                ),
+                RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, replaces_workflow_id=b.workflow_id),
                 None,
             )
         )
@@ -1271,16 +1269,14 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert a.objects.has("survivor")
 
     @pytest.mark.parametrize("request_type", ["registry", "scratch"])
-    def test_a_clean_slate_load_that_replaces_nothing_opens_beside_the_others(
+    def test_a_load_that_replaces_nothing_opens_beside_the_others(
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
         """A load that names no workflow to replace must not close any tab's workflow."""
         _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
-        request: RequestPayload = RunWorkflowFromRegistryRequest(
-            workflow_name=saved_workflow_name, run_with_clean_slate=True
-        )
+        request: RequestPayload = RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)
         if request_type == "scratch":
             file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
             assert file_path is not None
@@ -1317,7 +1313,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert len(open_now) == 2  # noqa: PLR2004
 
     @pytest.mark.parametrize("request_type", ["registry", "scratch"])
-    def test_a_clean_slate_load_in_place_of_a_closed_workflow_closes_nothing(
+    def test_a_load_in_place_of_a_closed_workflow_closes_nothing(
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
         _allow_several_open(engine)
@@ -1339,27 +1335,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert open_now[0] is a
         assert len(open_now) == 2  # noqa: PLR2004
 
-    def test_replacing_a_workflow_without_a_clean_slate_fails_with_a_registry_failure(
-        self, engine: Engine, saved_workflow_name: str
-    ) -> None:
-        _allow_several_open(engine)
-        a = _open(engine, "A")
-        b = _open(engine, "B")
-
-        result = asyncio.run(
-            _send_async(
-                engine,
-                RunWorkflowFromRegistryRequest(
-                    workflow_name=saved_workflow_name, run_with_clean_slate=False, replaces_workflow_id=b.workflow_id
-                ),
-                None,
-            )
-        )
-
-        assert isinstance(result, RunWorkflowFromRegistryResultFailure), result.result_details
-        assert "clean slate" in str(result.result_details)
-        assert engine.open_workflows.all_open() == [a, b]
-
     def test_loading_a_workflow_that_is_already_open_fails_with_a_registry_failure(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
@@ -1368,9 +1343,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         async def load_unbound() -> ResultPayload:
             with engine.bind_workflow(NO_WORKFLOW):
-                return await engine.ahandle_request(
-                    RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=False)
-                )
+                return await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name))
 
         loaded = asyncio.run(load_unbound())
         assert loaded.succeeded(), loaded.result_details
@@ -1390,9 +1363,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         async def load_unbound() -> ResultPayload:
             with engine.bind_workflow(NO_WORKFLOW):
-                return await engine.ahandle_request(
-                    RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=False)
-                )
+                return await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name))
 
         result = asyncio.run(load_unbound())
 
@@ -1430,7 +1401,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
     def test_a_load_from_scratch_stays_bound_to_the_workflow_it_opened_after_the_run(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
-        """Post-dispatch hooks act on the workflow the file opened, not the one the clean slate closed."""
+        """Post-dispatch hooks act on the workflow the file opened, not the one the load closed."""
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
         assert file_path is not None
         _allow_several_open(engine)

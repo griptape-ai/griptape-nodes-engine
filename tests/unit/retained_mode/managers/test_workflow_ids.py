@@ -18,10 +18,12 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
 )
+from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
@@ -1046,20 +1048,43 @@ class TestWorkflowsDoNotNest:
         assert project_engine.context_manager.get_current_workflow_id() == open_id
         assert not project_engine.workflow_registry.is_open(other.workflow_id or "")
 
-    def test_a_run_without_a_clean_slate_while_one_is_open_is_refused(self, project_engine: Engine) -> None:
+    def test_a_run_in_place_of_a_workflow_that_is_not_open_is_refused_while_one_is_open(
+        self, project_engine: Engine
+    ) -> None:
         other = _saved_workflow(project_engine, "other")
         open_id = _open_new_workflow(project_engine, "open")
         registered_before = set(project_engine.workflow_registry._by_id)
 
         refused = _run(
             project_engine,
-            RunWorkflowFromRegistryRequest(workflow_name=other.workflow_name, run_with_clean_slate=False),
+            RunWorkflowFromRegistryRequest(workflow_name=other.workflow_name, replaces_workflow_id=other.workflow_id),
         )
 
         assert isinstance(refused, RunWorkflowFromRegistryResultFailure)
-        assert "Clear the open workflow first" in str(refused.result_details)
+        assert "is already open" in str(refused.result_details)
         assert project_engine.context_manager.get_current_workflow_id() == open_id
         assert set(project_engine.workflow_registry._by_id) == registered_before
+
+    def test_a_run_from_a_client_that_still_sends_run_with_clean_slate_closes_the_open_workflow(
+        self, project_engine: Engine
+    ) -> None:
+        """Reading a request drops fields it doesn't have, so the open closes the workflow it replaces."""
+        other = _saved_workflow(project_engine, "other")
+        open_id = _open_new_workflow(project_engine, "open")
+        event = converters.client.structure(
+            {
+                "request_type": RunWorkflowFromRegistryRequest.__name__,
+                "request": {"workflow_name": other.workflow_name, "run_with_clean_slate": False},
+            },
+            EventRequest,
+        )
+
+        result = _run(project_engine, event.request)
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result.result_details
+        assert result.replaced_workflow_id == open_id
+        assert not project_engine.open_workflows.is_open(open_id)
+        assert project_engine.context_manager.get_current_workflow_id() == other.workflow_id
 
 
 class TestASavedFileOpensTheWorkflowItLoads:

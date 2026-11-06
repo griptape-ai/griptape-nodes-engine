@@ -281,13 +281,13 @@ class TestRunWorkflowFromRegistry:
         assert engine.open_workflows.all_open() == []
         assert _lifecycle_events(_drain(queue)) == []
 
-    def test_a_clean_slate_load_closes_the_replaced_workflow_before_announcing_its_own(
+    def test_a_load_closes_the_replaced_workflow_before_announcing_its_own(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
         replaced = _open_with_set_context(engine, "replaced")
         _drain(queue)
         request = RunWorkflowFromRegistryRequest(
-            workflow_name=saved_workflow_name, run_with_clean_slate=True, replaces_workflow_id=replaced.workflow_id
+            workflow_name=saved_workflow_name, replaces_workflow_id=replaced.workflow_id
         )
 
         result_event = asyncio.run(_send_async(engine, request, replaced.workflow_id))
