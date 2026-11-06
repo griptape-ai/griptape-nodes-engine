@@ -546,10 +546,13 @@ nav:
           - OCIO Color Parameters: libraries/opencolorio/ocio_color_parameters.md
       - OpenEXR:
           - Overview: libraries/openexr/index.md
+          - Read EXR: libraries/openexr/read_exr.md
           - Load EXR: libraries/openexr/load_exr.md
+          - Load EXR Sequence: libraries/openexr/load_exr_sequence.md
           - Display EXR Part: libraries/openexr/display_exr_part.md
           - Display EXR Channel: libraries/openexr/display_exr_channel.md
           - Save EXR: libraries/openexr/save_exr.md
+          - EXR Sequence to Preview: libraries/openexr/exr_sequence_to_preview.md
       - Nuke:
           - Overview: libraries/nuke/index.md
           - Nuke Start Flow: libraries/nuke/nuke_start_flow.md
