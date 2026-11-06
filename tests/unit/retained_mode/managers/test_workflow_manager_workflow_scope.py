@@ -56,8 +56,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowResultSuccess,
     RenameWorkflowRequest,
     RenameWorkflowResultSuccess,
-    RunWorkflowFromRegistryRequest,
-    RunWorkflowFromScratchRequest,
     RunWorkflowWithCurrentStateRequest,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
@@ -120,8 +118,6 @@ _OPTIONAL_WORKFLOW_REQUESTS = {
     GetWorkflowRunCommandRequest,
     GetWorkflowContextRequest,
     RunWorkflowWithCurrentStateRequest,
-    RunWorkflowFromScratchRequest,
-    RunWorkflowFromRegistryRequest,
 }
 
 
