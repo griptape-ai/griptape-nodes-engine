@@ -40,7 +40,6 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 from griptape_nodes.retained_mode.events.base_events import (
     GriptapeNodeEvent,
-    ResultPayloadFailure,
     TypedRequestsMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -49,6 +48,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
@@ -551,7 +551,7 @@ class Engine(TypedRequestsMixin):
                 type(request).__name__,
                 request.request_id,
             )
-            return ResultPayloadFailure(
+            return GenericResultFailure(
                 exception=e, result_details=f"Unhandled exception while processing {type(request).__name__}: {e}"
             )
         else:
@@ -578,7 +578,7 @@ class Engine(TypedRequestsMixin):
                 type(request).__name__,
                 request.request_id,
             )
-            return ResultPayloadFailure(
+            return GenericResultFailure(
                 exception=e, result_details=f"Unhandled exception while processing async {type(request).__name__}: {e}"
             )
         else:

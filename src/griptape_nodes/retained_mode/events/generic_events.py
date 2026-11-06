@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
-    ResultPayloadFailure,
+    DispatchFailure,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
@@ -9,7 +9,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class GenericResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+class GenericResultFailure(WorkflowNotAlteredMixin, DispatchFailure):
     """Failure result not tied to a specific request type.
 
     Returned when the dispatcher must fail a request before (or instead of) its
@@ -23,7 +23,7 @@ class GenericResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, DispatchFailure):
     """The request's envelope named a workflow the engine doesn't have open, so it was not handled.
 
     The one failure for every request whose envelope `open_workflow_id` names no open workflow,
@@ -34,7 +34,7 @@ class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class WorkflowNotNamedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+class WorkflowNotNamedResultFailure(WorkflowNotAlteredMixin, DispatchFailure):
     """The request names no workflow it can act on, so it was not handled.
 
     The one failure for every request that acts on a workflow (`RequestScope.WORKFLOW`) but names

@@ -391,7 +391,9 @@ class GetArtifactSchemasResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class CheckArtifactReadPermissionRequest(RequestPayload["CheckArtifactReadPermissionResultSuccess"]):
+class CheckArtifactReadPermissionRequest(
+    RequestPayload["CheckArtifactReadPermissionResultSuccess", "CheckArtifactReadPermissionResultFailure"]
+):
     """Ask whether a file may be read under the current authorization policy.
 
     Routed to the artifact provider that claims the source's extension; that

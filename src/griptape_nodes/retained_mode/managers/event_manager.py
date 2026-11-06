@@ -23,6 +23,7 @@ from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     BaseEvent,
+    DispatchFailure,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
@@ -360,7 +361,7 @@ class EventManager(EngineScoped):
         # hook returns None (fall through) or a ResultPayload (short-circuit the
         # dispatcher). Lets PermissionManager enforce policy without instrumenting
         # every manager.
-        self._pre_dispatch_hooks: list[Callable[[RequestPayload, ResultContext], ResultPayload | None]] = []
+        self._pre_dispatch_hooks: list[Callable[[RequestPayload, ResultContext], DispatchFailure | None]] = []
         # handle_request runs on arbitrary threads, so guard the list and snapshot
         # it before iteration.
         self._pre_dispatch_hooks_lock = threading.Lock()
@@ -541,12 +542,12 @@ class EventManager(EngineScoped):
 
     def add_pre_dispatch_hook(
         self,
-        hook: Callable[[RequestPayload, ResultContext], ResultPayload | None],
+        hook: Callable[[RequestPayload, ResultContext], DispatchFailure | None],
     ) -> None:
         """Register a pre-dispatch hook.
 
         Hooks run in registration order before the request's manager callback.
-        Returning a ResultPayload short-circuits the dispatcher with that result;
+        Returning a `DispatchFailure` refuses the request with that result;
         returning None lets dispatch continue.
 
         Hooks should be cheap and sync. A hook that re-enters `handle_request`
@@ -560,7 +561,7 @@ class EventManager(EngineScoped):
 
     def remove_pre_dispatch_hook(
         self,
-        hook: Callable[[RequestPayload, ResultContext], ResultPayload | None],
+        hook: Callable[[RequestPayload, ResultContext], DispatchFailure | None],
     ) -> None:
         with self._pre_dispatch_hooks_lock:
             try:
@@ -572,7 +573,7 @@ class EventManager(EngineScoped):
         self,
         request: RequestPayload,
         context: ResultContext,
-    ) -> ResultPayload | None:
+    ) -> DispatchFailure | None:
         # Bypass the chain when a hook is already running on this thread. A hook
         # that re-enters handle_request would otherwise re-trigger itself and
         # recurse without bound.

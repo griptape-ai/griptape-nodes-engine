@@ -5,7 +5,7 @@ import logging
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ForwardRef, Generic, NoReturn, get_args, get_origin
+from typing import Any, ForwardRef, Generic, NamedTuple, NoReturn, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypeVar
@@ -97,18 +97,21 @@ class Payload(ABC):  # noqa: B024
     """Base class for all payload types. Customers will derive from this."""
 
 
-# The success result a request declares. Quote it in the subscript, since results are defined after their requests:
-# `class FooRequest(RequestPayload["FooResultSuccess"])`. A request that declares none returns `ResultPayloadSuccess`.
+# The results a request declares. Quote them in the subscript, since results are defined after their requests:
+# `class FooRequest(RequestPayload["FooResultSuccess", "FooResultFailure"])`. A request that declares none
+# returns `ResultPayloadSuccess` and `ResultPayloadFailure`.
 SuccessT_co = TypeVar("SuccessT_co", bound="ResultPayloadSuccess", default="ResultPayloadSuccess", covariant=True)
+FailureT_co = TypeVar("FailureT_co", bound="ResultPayloadFailure", default="ResultPayloadFailure", covariant=True)
 
 
 # Request payload base class with optional request ID
 @dataclass(kw_only=True)
-class RequestPayload(Payload, ABC, Generic[SuccessT_co]):
+class RequestPayload(Payload, ABC, Generic[SuccessT_co, FailureT_co]):
     """Base class for all request payloads.
 
-    Declare the success result the handler returns as the type argument, so `Engine.request` and
-    `Engine.try_request` return that type instead of `ResultPayload`.
+    Declare the success and failure results the handler returns as the type arguments, so
+    `Engine.request` and `Engine.try_request` return those types instead of `ResultPayload`.
+    A request can also fail with a `DispatchFailure`, which the dispatcher returns for any request.
 
     Args:
         request_id: Optional request ID for tracking.
@@ -153,7 +156,12 @@ class RequestPayload(Payload, ABC, Generic[SuccessT_co]):
     @classmethod
     def success_type(cls) -> type[ResultPayloadSuccess]:
         """The success result this request declares, or `ResultPayloadSuccess` when it declares none."""
-        return _declared_success_type(cls)
+        return _declared_results(cls).success
+
+    @classmethod
+    def failure_type(cls) -> type[ResultPayloadFailure]:
+        """The failure result this request declares, or `ResultPayloadFailure` when it declares none."""
+        return _declared_results(cls).failure
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -298,6 +306,15 @@ class ResultPayloadFailure(ResultPayload, ABC):
         return False
 
 
+@dataclass(kw_only=True)
+class DispatchFailure(ResultPayloadFailure, ABC):
+    """A failure the dispatcher returns instead of the request's own, for any request.
+
+    The handler raised, the request was refused before reaching it (a pre-dispatch hook, an
+    unknown sender), or the envelope named no workflow it can act on.
+    """
+
+
 class RequestFailedError(Exception):
     """A request sent with `Engine.request` failed.
 
@@ -315,7 +332,8 @@ class TypedRequestsMixin(ABC):
     """Typed request methods for anything that dispatches requests.
 
     `request` returns the success result a request declares and raises on failure. `try_request`
-    returns the success or the failure, for callers that handle a failure themselves.
+    returns the success, the declared failure, or a `DispatchFailure`, for callers that handle a
+    failure themselves.
     """
 
     @abstractmethod
@@ -324,7 +342,7 @@ class TypedRequestsMixin(ABC):
     @abstractmethod
     async def ahandle_request(self, request: RequestPayload) -> ResultPayload: ...
 
-    def request[T: ResultPayloadSuccess](self, request: RequestPayload[T]) -> T:
+    def request[S: ResultPayloadSuccess, F: ResultPayloadFailure](self, request: RequestPayload[S, F]) -> S:
         """Handle `request` and return the success result it declares.
 
         Raises:
@@ -333,59 +351,71 @@ class TypedRequestsMixin(ABC):
         """
         return expect_success(request, self.handle_request(request))
 
-    async def arequest[T: ResultPayloadSuccess](self, request: RequestPayload[T]) -> T:
+    async def arequest[S: ResultPayloadSuccess, F: ResultPayloadFailure](self, request: RequestPayload[S, F]) -> S:
         """Async `request`."""
         return expect_success(request, await self.ahandle_request(request))
 
-    def try_request[T: ResultPayloadSuccess](self, request: RequestPayload[T]) -> T | ResultPayloadFailure:
-        """Handle `request` and return the success result it declares, or the failure."""
-        return success_or_failure(request, self.handle_request(request))
+    def try_request[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+        self, request: RequestPayload[S, F]
+    ) -> S | F | DispatchFailure:
+        """Handle `request` and return the result it declares, or the `DispatchFailure` it failed with."""
+        return declared_result(request, self.handle_request(request))
 
-    async def atry_request[T: ResultPayloadSuccess](self, request: RequestPayload[T]) -> T | ResultPayloadFailure:
+    async def atry_request[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+        self, request: RequestPayload[S, F]
+    ) -> S | F | DispatchFailure:
         """Async `try_request`."""
-        return success_or_failure(request, await self.ahandle_request(request))
+        return declared_result(request, await self.ahandle_request(request))
 
 
-def expect_success[T: ResultPayloadSuccess](request: RequestPayload[T], result: ResultPayload) -> T:
+def expect_success[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+    request: RequestPayload[S, F], result: ResultPayload
+) -> S:
     """Return `result` as the success `request` declares, or raise the failure's exception."""
-    if isinstance(result, ResultPayloadFailure):
-        raise result.as_exception(request) from result.exception
-    return _as_declared_success(request, result)
+    narrowed = declared_result(request, result)
+    if isinstance(narrowed, ResultPayloadFailure):
+        raise narrowed.as_exception(request) from narrowed.exception
+    return narrowed
 
 
-def success_or_failure[T: ResultPayloadSuccess](
-    request: RequestPayload[T], result: ResultPayload
-) -> T | ResultPayloadFailure:
-    """Return `result` as the success `request` declares, or as a failure."""
-    if isinstance(result, ResultPayloadFailure):
+def declared_result[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+    request: RequestPayload[S, F], result: ResultPayload
+) -> S | F | DispatchFailure:
+    """Check `result` against the results `request` declares, and return it typed as one of them."""
+    if isinstance(result, DispatchFailure):
         return result
-    return _as_declared_success(request, result)
-
-
-def _as_declared_success[T: ResultPayloadSuccess](request: RequestPayload[T], result: ResultPayload) -> T:
-    declared = type(request).success_type()
-    if not isinstance(result, declared):
+    declared = _declared_results(type(request))
+    expected = declared.failure if isinstance(result, ResultPayloadFailure) else declared.success
+    if not isinstance(result, expected):
         msg = (
-            f"{type(request).__name__} declares {declared.__name__} as its success result, "
-            f"but its handler returned {type(result).__name__}."
+            f"{type(request).__name__} declares {expected.__name__}, but its handler returned {type(result).__name__}."
         )
         raise TypeError(msg)
     return result  # pyright: ignore[reportReturnType] -- checked against the declared type above
 
 
+class DeclaredResults(NamedTuple):
+    success: type[ResultPayloadSuccess]
+    failure: type[ResultPayloadFailure]
+
+
 @functools.cache
-def _declared_success_type(request_type: type[RequestPayload]) -> type[ResultPayloadSuccess]:
-    """Find the `RequestPayload[...]` argument in `request_type`'s bases and resolve it to a class."""
+def _declared_results(request_type: type[RequestPayload]) -> DeclaredResults:
+    """Find the `RequestPayload[...]` arguments in `request_type`'s bases and resolve them to classes."""
     for klass in request_type.__mro__:
         for base in klass.__dict__.get("__orig_bases__", ()):
             if get_origin(base) is not RequestPayload:
                 continue
-            (argument,) = get_args(base)
-            return _resolve_success_type(argument, klass)
-    return ResultPayloadSuccess
+            arguments = get_args(base)
+            success = _resolve_result_type(arguments[0], klass, ResultPayloadSuccess)
+            failure = ResultPayloadFailure
+            if len(arguments) > 1:
+                failure = _resolve_result_type(arguments[1], klass, ResultPayloadFailure)
+            return DeclaredResults(success=success, failure=failure)
+    return DeclaredResults(success=ResultPayloadSuccess, failure=ResultPayloadFailure)
 
 
-def _resolve_success_type(argument: Any, declaring_class: type) -> type[ResultPayloadSuccess]:
+def _resolve_result_type[T: ResultPayload](argument: Any, declaring_class: type, base: type[T]) -> type[T]:
     if isinstance(argument, str):
         argument = ForwardRef(argument)
     if isinstance(argument, ForwardRef):
@@ -393,14 +423,14 @@ def _resolve_success_type(argument: Any, declaring_class: type) -> type[ResultPa
         resolved = getattr(module, argument.__forward_arg__, None)
         if resolved is None:
             msg = (
-                f"{declaring_class.__name__} declares '{argument.__forward_arg__}' as its success result, "
+                f"{declaring_class.__name__} declares '{argument.__forward_arg__}' as a result, "
                 f"but {module.__name__} defines no class by that name."
             )
             raise TypeError(msg)
         argument = resolved
-    if not (isinstance(argument, type) and issubclass(argument, ResultPayloadSuccess)):
+    if not (isinstance(argument, type) and issubclass(argument, base)):
         # A type variable, from a generic intermediate class, declares nothing yet.
-        return ResultPayloadSuccess
+        return base
     return argument
 
 

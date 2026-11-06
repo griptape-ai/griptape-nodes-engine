@@ -113,7 +113,9 @@ class DeleteConnectionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ListConnectionsForNodeRequest(RequestPayload["ListConnectionsForNodeResultSuccess"], GraphAccessMixin):
+class ListConnectionsForNodeRequest(
+    RequestPayload["ListConnectionsForNodeResultSuccess", "ListConnectionsForNodeResultFailure"], GraphAccessMixin
+):
     """List all connections for a specific node.
 
     Use when: Inspecting node connectivity, building connection visualizations,
