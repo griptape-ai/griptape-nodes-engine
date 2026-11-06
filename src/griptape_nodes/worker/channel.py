@@ -318,7 +318,15 @@ class Channel:
             if frame is None:
                 self._finish_closing()
                 return
-            self._dispatch_frame(frame)
+            try:
+                self._dispatch_frame(frame)
+            # gate/on_notification are caller-supplied; a failure there must close the channel, not kill this thread.
+            except Exception as exc:
+                logger.error("Worker channel dispatch raised %s: %s; closing the channel.", type(exc).__name__, exc)
+                with contextlib.suppress(OSError):
+                    self._connection.close()
+                self._finish_closing()
+                return
 
     def _dispatch_frame(self, frame: dict) -> None:
         frame_type = frame["frame"]

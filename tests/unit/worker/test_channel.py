@@ -204,6 +204,103 @@ def test_gate_denies_without_calling_on_request() -> None:
         pair.child.close()
 
 
+def test_gate_that_raises_closes_the_channel_instead_of_killing_the_dispatch_thread() -> None:
+    """A gate exception is fail-closed: the channel closes, on_request never runs, on_closed fires once."""
+    pair = _connected_pair()
+    rec_parent = _Recorder()
+    on_request_calls: list[dict] = []
+
+    def gate(_body: dict) -> GateDecision:
+        msg = "gate exploded"
+        raise RuntimeError(msg)
+
+    def parent_on_request(body: dict) -> dict:
+        on_request_calls.append(body)
+        return {}
+
+    pair.parent.set_request_gate(gate)
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=rec_parent.on_closed)
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        # The pending future for this very request lives on the child's side, so the channel
+        # closing (triggered by the gate raising on the parent) is what fails it.
+        with pytest.raises(ChannelClosedError):
+            pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        assert on_request_calls == []
+        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        assert rec_parent.closed_count == 1
+        assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
+        assert rec_child.closed_count == 1
+    finally:
+        pair.parent.close()
+        pair.child.close()
+
+
+def test_on_notification_that_raises_closes_the_channel() -> None:
+    """An on_notification exception is fail-closed: the channel closes and on_closed fires once."""
+    pair = _connected_pair()
+    rec_parent = _Recorder()
+
+    def parent_on_notification(_body: dict) -> None:
+        msg = "on_notification exploded"
+        raise RuntimeError(msg)
+
+    pair.parent.start(
+        on_request=lambda _body: {}, on_notification=parent_on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        pair.child.notify({"hello": True})
+        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        assert rec_parent.closed_count == 1
+        assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
+        assert rec_child.closed_count == 1
+        # The channel is closed now: a fresh request from the peer fails rather than hanging.
+        with pytest.raises(ChannelClosedError):
+            pair.child.request({}, timeout_s=SHORT_TIMEOUT_S)
+    finally:
+        pair.parent.close()
+        pair.child.close()
+
+
+def test_gate_denial_with_no_reply_closes_the_channel() -> None:
+    """A gate that denies without a reply is a contract violation: fail-closed, not a bad frame."""
+    pair = _connected_pair()
+    rec_parent = _Recorder()
+    on_request_calls: list[dict] = []
+
+    def gate(_body: dict) -> GateDecision:
+        return GateDecision(dispatch=None, reply=None)
+
+    def parent_on_request(body: dict) -> dict:
+        on_request_calls.append(body)
+        return {}
+
+    pair.parent.set_request_gate(gate)
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=rec_parent.on_closed)
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        with pytest.raises(ChannelClosedError):
+            pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        assert on_request_calls == []
+        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        assert rec_parent.closed_count == 1
+        assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
+        assert rec_child.closed_count == 1
+    finally:
+        pair.parent.close()
+        pair.child.close()
+
+
 def test_wrong_authkey_is_rejected_without_crashing_the_listener() -> None:
     """A bad authkey attempt is rejected; the listener keeps waiting for a valid connection."""
     listener = ChannelListener()
