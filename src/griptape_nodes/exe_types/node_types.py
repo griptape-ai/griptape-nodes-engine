@@ -1844,7 +1844,10 @@ class BaseNode(ABC):
         # Publish the event up!
         self.engine.event_manager.put_event(
             ProgressEvent(
-                value=value, node_name=self.name, parameter_name=parameter_name, workflow_id=self._event_workflow_id()
+                value=value,
+                node_name=self.name,
+                parameter_name=parameter_name,
+                open_workflow_id=self._event_workflow_id(),
             )
         )
 

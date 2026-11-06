@@ -18,7 +18,7 @@ _SRC = Path(griptape_nodes.__file__).parent
 _EVENT_TYPES = {"ExecutionEvent", "ProgressEvent"}
 
 # (path under src/griptape_nodes, enclosing function) for each site allowed to build one directly,
-# mapped to whether every event built there must pass `workflow_id`.
+# mapped to whether every event built there must pass `open_workflow_id`.
 _ALLOWED_SITES = {
     # The one builder `WorkflowRuntime`, `WorkflowFlows` and `BaseNode.execution_event` share.
     ("retained_mode/events/base_events.py", "build_execution_event"): True,
@@ -71,8 +71,8 @@ class _SiteFinder(ast.NodeVisitor):
 
 
 def _names_a_workflow(keyword: ast.keyword) -> bool:
-    """Whether `keyword` passes a `workflow_id` that isn't a literal None."""
-    if keyword.arg != "workflow_id":
+    """Whether `keyword` passes an `open_workflow_id` that isn't a literal None."""
+    if keyword.arg != "open_workflow_id":
         return False
     return not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None)
 
