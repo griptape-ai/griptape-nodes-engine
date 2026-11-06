@@ -42,13 +42,20 @@ class RunWorkflowFromScratchRequest(RequestPayload):
     Use when: Loading and executing saved workflows, testing workflows from files,
     running workflows in clean environments, batch processing workflows.
 
+    Opening a workflow doesn't depend on which workflow the caller has open, so the request
+    ignores the envelope's `open_workflow_id`.
+
     Args:
         file_path: Path to the workflow file to load and execute
+        replaces_workflow_id: Id of the open workflow to close first. Left out, the request closes the
+            open workflow while only one may be open, and closes none otherwise. An id that names no
+            open workflow leaves nothing to close.
 
     Results: RunWorkflowFromScratchResultSuccess | RunWorkflowFromScratchResultFailure (file not found, load error)
     """
 
     file_path: str
+    replaces_workflow_id: str | None = None
 
 
 @dataclass
@@ -133,16 +140,23 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     Use when: Executing registered workflows, running workflows by name,
     using workflow templates, automated workflow execution.
 
+    Opening a workflow doesn't depend on which workflow the caller has open, so the request
+    ignores the envelope's `open_workflow_id`.
+
     Args:
         workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to clear the open workflow first (default: True). With False, the
-            request fails while a workflow is open.
+        run_with_clean_slate: Whether to close an open workflow first (default: True). With False, the
+            request fails while a workflow is open and only one may be.
+        replaces_workflow_id: Id of the open workflow a clean slate closes. Left out, a clean slate
+            closes the open workflow while only one may be open, and closes none otherwise. An id
+            that names no open workflow leaves nothing to close. Needs run_with_clean_slate=True.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
 
     workflow_name: str
     run_with_clean_slate: bool = True
+    replaces_workflow_id: str | None = None
 
 
 @dataclass
