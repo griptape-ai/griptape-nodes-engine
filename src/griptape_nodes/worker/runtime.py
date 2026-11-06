@@ -415,7 +415,6 @@ async def _serve(side: WorkerSide, library_name: str | None, worker_engine_id: s
     await engine.abroadcast_app_event(
         AppInitializationComplete(
             is_worker=True,
-            is_general_purpose_worker=library_name is None,
             libraries_to_register=[library_name] if library_name else [],
         )
     )

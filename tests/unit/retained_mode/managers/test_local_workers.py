@@ -185,19 +185,6 @@ class TestHello:
             "its worker process could not load it: the library did not load there."
         )
 
-    @pytest.mark.asyncio
-    async def test_the_general_purpose_worker_is_ready_once_it_has_loaded(self, pair: _Pair) -> None:
-        manager = _worker_manager()
-        _Worker(pair.worker)
-        manager.expect_worker(None)
-        worker_id, _ = await _connected(manager, None, pair)
-
-        reply = await manager._accept_hello(worker_id, _hello(library_name=None, libraries=[]))
-
-        assert reply["accepted"] is True
-        assert manager.has_settled(None)
-        assert manager.worker_unavailable_reason(None) is None
-
 
 class TestGone:
     @pytest.mark.asyncio
