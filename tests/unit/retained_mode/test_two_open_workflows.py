@@ -25,7 +25,11 @@ from griptape_nodes.exe_types.node_types import ControlNode, DataNode
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.file import File
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
-from griptape_nodes.retained_mode.events.app_events import EngineHeartbeatRequest, GetEngineVersionRequest
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineHeartbeatRequest,
+    EngineHeartbeatResultSuccess,
+    GetEngineVersionRequest,
+)
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionGriptapeNodeEvent,
     GriptapeNodeEvent,
@@ -1363,22 +1367,16 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 class TestOtherSharedState:
     """Scenario (j): state shared across workflows that a run or request reads."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "FINDING j1: the heartbeat reports one current workflow (Engine._get_current_workflow_info), "
-            "read from the engine's one open workflow. With two open it reports none."
-        ),
-    )
-    def test_the_heartbeat_reports_an_open_workflow_while_two_are_open(
-        self,
-        engine: Engine,
-        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    def test_the_heartbeat_reports_every_open_workflow_and_the_one_opened_last_as_current(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
+        a, b = two_open
 
-        info = engine._get_current_workflow_info()
+        heartbeat = _send(engine, EngineHeartbeatRequest(heartbeat_id="h"), None)
 
-        assert info["current_workflow_id"] is not None
+        assert isinstance(heartbeat, EngineHeartbeatResultSuccess), heartbeat.result_details
+        assert [info.workflow_id for info in heartbeat.open_workflows] == [a.workflow_id, b.workflow_id]
+        assert heartbeat.current_workflow_id == b.workflow_id
 
     @pytest.mark.asyncio
     async def test_a_post_dispatch_hook_sees_the_workflow_its_request_was_addressed_to(
