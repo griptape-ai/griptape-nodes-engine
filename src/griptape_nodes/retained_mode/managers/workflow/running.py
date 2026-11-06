@@ -178,7 +178,6 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # Start with a clean slate in the workflow the open replaces. Other open workflows stay.
             if not await self._close_replaced_workflow(request.replaces_workflow_id):
                 details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
@@ -280,7 +279,6 @@ class WorkflowRunner(EngineScoped):
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            # Start with a clean slate in the workflow the open replaces. Other open workflows stay.
             if request.run_with_clean_slate and not await self._close_replaced_workflow(request.replaces_workflow_id):
                 details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
                 return RunWorkflowFromRegistryResultFailure(result_details=details)
