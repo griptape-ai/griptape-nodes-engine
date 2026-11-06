@@ -17,6 +17,7 @@ import pytest
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.context_events import (
+    CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
@@ -102,6 +103,7 @@ _HANDLER_CLASSES = (
 )
 # They act on the tab's open workflow: they read or change its graph.
 _WORKFLOW_REQUESTS = {
+    CloseWorkflowRequest,
     SaveWorkflowRequest,
     SaveSubflowToWorkflowRequest,
     ImportWorkflowAsReferencedSubFlowRequest,

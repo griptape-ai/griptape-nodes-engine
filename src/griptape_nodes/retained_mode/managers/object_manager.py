@@ -108,24 +108,14 @@ class ObjectManager(EngineScoped):
         return RenameObjectResultSuccess(final_name=final_name, result_details=result_details)
 
     @handles(ClearAllObjectStateRequest)
-    async def on_clear_all_object_state_request(
-        self, request: ClearAllObjectStateRequest, workflow: WorkflowRuntime | None = None
-    ) -> ResultPayload:
-        """Close `workflow`, the one the request names, or every open workflow when it names none.
-
-        Closing a workflow releases the held objects kept for it. Clearing everything also releases
-        the ones kept for no workflow, here and in every worker.
-        """
+    async def on_clear_all_object_state_request(self, request: ClearAllObjectStateRequest) -> ResultPayload:
+        """Close every open workflow, and release the held objects kept for any workflow or none, here and in every worker."""
         if not request.i_know_what_im_doing:
             details = "Attempted to clear all object state and delete everything. Failed because they didn't know what they were doing."
             return ClearAllObjectStateResultFailure(result_details=details)
 
-        # Closing tells the workers which workflow closed, or, closing every one, to release everything.
         try:
-            if workflow is None:
-                await self.engine.aclose_all_workflows()
-            elif self.engine.open_workflows.is_open(workflow.workflow_id):
-                await self.engine.aclose_workflow(workflow)
+            await self.engine.aclose_all_workflows()
         except Exception as e:
             details = f"Attempted to clear all object state and delete everything. Failed with exception: {e}"
             return ClearAllObjectStateResultFailure(result_details=details)

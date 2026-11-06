@@ -18,6 +18,7 @@ from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, DropLo
 from griptape_nodes.exe_types.core_types import ParameterType
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest
 from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultSuccess,
@@ -542,7 +543,7 @@ class TestWorkflowStateClearReleasesObjects:
         workflow = engine.current_workflow()
 
         result = engine.event_manager.handle_request(
-            ClearAllObjectStateRequest(i_know_what_im_doing=True),
+            CloseWorkflowRequest(),
             result_context=ResultContext(open_workflow_id=workflow.workflow_id),
         )
 

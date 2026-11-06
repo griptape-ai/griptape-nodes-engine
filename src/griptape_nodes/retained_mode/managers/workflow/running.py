@@ -19,7 +19,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
@@ -304,11 +303,7 @@ class WorkflowRunner(EngineScoped):
             if not execution_result.execution_successful:
                 result_messages = execution_result_details(execution_result, level=logging.ERROR)
 
-                # Close the workflow the run opened, as we modified the engine state getting here. The
-                # file may have closed it itself before failing, leaving nothing to close.
-                still_open = self.engine.open_workflows.find(registered.workflow_id)
-                if still_open is not None:
-                    await still_open.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+                await self._close_failed_load(registered.workflow_id)
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
 
         # Success!
@@ -460,13 +455,26 @@ class WorkflowRunner(EngineScoped):
             return
         self.engine.enter_opened_workflow(opened)
 
+    async def _close_failed_load(self, workflow_id: str) -> None:
+        """Close the workflow a failed run opened. The file may have closed it itself before failing."""
+        still_open = self.engine.open_workflows.find(workflow_id)
+        if still_open is None:
+            return
+        try:
+            await self.engine.aclose_workflow(still_open)
+        except OpenWorkflowError as err:
+            logger.warning("Failed to close workflow '%s' after its file failed to run: %s", workflow_id, err)
+
     async def _close_replaced_workflow(self, replaces_workflow_id: str | None) -> bool:
         """Close the open workflow a clean-slate open replaces, if any, returning False if closing it failed."""
         replaced = self.engine.open_workflows.workflow_replaced_by_open(replaces_workflow_id)
         if replaced is None:
             return True
-        result = await replaced.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        return result.succeeded()
+        try:
+            await self.engine.aclose_workflow(replaced)
+        except OpenWorkflowError:
+            return False
+        return True
 
     async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
         """Ensure `workflow`, which a file just built into, has a current flow."""
