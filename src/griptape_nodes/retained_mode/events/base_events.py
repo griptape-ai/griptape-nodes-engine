@@ -332,6 +332,8 @@ class EventRequest[P: Payload](BaseEvent):
             Left out, the request acts on the engine's only open workflow, unless another engine
             sent it: then it acts on no workflow. A payload field named `workflow_id` is something
             else: the workflow the request is about.
+        worker_engine_id: Set by an engine that runs a library's worker for the receiving engine, on a
+            request that worker sent. The receiving engine answers it as its own worker's request.
     """
 
     request: P
@@ -341,6 +343,7 @@ class EventRequest[P: Payload](BaseEvent):
     # `require_request_sender()`.
     sender: RequestSender | None = None
     open_workflow_id: str | None = None
+    worker_engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
