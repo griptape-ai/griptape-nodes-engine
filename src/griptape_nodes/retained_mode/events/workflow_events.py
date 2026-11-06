@@ -49,7 +49,7 @@ class RunWorkflowFromScratchRequest(RequestPayload):
         file_path: Path to the workflow file to load and execute
         replaces_workflow_id: Id of the open workflow to close first. Left out, the request closes the
             open workflow while only one may be open, and closes none otherwise. An id that names no
-            open workflow leaves nothing to close.
+            open workflow closes nothing, so the open fails if another is open and only one may be.
 
     Results: RunWorkflowFromScratchResultSuccess | RunWorkflowFromScratchResultFailure (file not found, load error)
     """
@@ -149,7 +149,8 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
             request fails while a workflow is open and only one may be.
         replaces_workflow_id: Id of the open workflow a clean slate closes. Left out, a clean slate
             closes the open workflow while only one may be open, and closes none otherwise. An id
-            that names no open workflow leaves nothing to close. Needs run_with_clean_slate=True.
+            that names no open workflow closes nothing, so the open fails if another is open and
+            only one may be. Needs run_with_clean_slate=True.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
