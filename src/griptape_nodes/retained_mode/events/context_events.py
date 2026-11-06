@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
 from griptape_nodes.retained_mode.events.base_events import (
     GraphAccessMixin,
     RequestPayload,
@@ -65,10 +66,12 @@ class SetWorkflowContextSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
                        this is the new unsaved workflow's key. Otherwise it echoes the
                        requested key.
         workflow_id: Id of the workflow now in context.
+        open_workflow: The workflow now in context, as the heartbeat lists it.
     """
 
     workflow_name: str = ""
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
