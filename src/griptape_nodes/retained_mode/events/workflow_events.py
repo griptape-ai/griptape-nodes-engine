@@ -71,11 +71,13 @@ class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
         open_workflow: The workflow now open, as the heartbeat lists it. None when the file opened none.
+        replaced_workflow_id: Id of the workflow closed to open this one, or None.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
     open_workflow: OpenWorkflowInfo | None = None
+    replaced_workflow_id: str | None = None
 
 
 @dataclass
@@ -121,11 +123,13 @@ class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPaylo
         workflow_id: Id of the workflow now open.
         open_workflow: The workflow the file opened, as the heartbeat lists it. None when the file
             built into the open workflow the envelope named.
+        replaced_workflow_id: Always None: this request closes no workflow.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
     open_workflow: OpenWorkflowInfo | None = None
+    replaced_workflow_id: str | None = None
 
 
 @dataclass
@@ -178,11 +182,13 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
         open_workflow: The workflow now open, as the heartbeat lists it. None when the file opened none.
+        replaced_workflow_id: Id of the workflow closed to open this one, or None.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
     open_workflow: OpenWorkflowInfo | None = None
+    replaced_workflow_id: str | None = None
 
 
 @dataclass

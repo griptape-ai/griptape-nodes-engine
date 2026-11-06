@@ -79,11 +79,13 @@ class SetWorkflowContextSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
                        requested key.
         workflow_id: Id of the workflow now in context.
         open_workflow: The workflow now in context, as the heartbeat lists it.
+        replaced_workflow_id: Id of the workflow closed to open this one, or None.
     """
 
     workflow_name: str = ""
     workflow_id: str | None = None
     open_workflow: OpenWorkflowInfo | None = None
+    replaced_workflow_id: str | None = None
 
 
 @dataclass

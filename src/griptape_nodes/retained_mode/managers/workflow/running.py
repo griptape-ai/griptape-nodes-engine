@@ -174,7 +174,8 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            if not await self._close_replaced_workflow(request.replaces_workflow_id):
+            replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
+            if not await self._close_replaced_workflow(replaced):
                 details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
@@ -185,6 +186,7 @@ class WorkflowRunner(EngineScoped):
                     status=execution_result.status,
                     workflow_id=execution_result.workflow_id,
                     open_workflow=self._open_workflow_info(execution_result.workflow_id),
+                    replaced_workflow_id=self._workflow_id_of(replaced),
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
@@ -281,7 +283,10 @@ class WorkflowRunner(EngineScoped):
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate and not await self._close_replaced_workflow(request.replaces_workflow_id):
+            replaced = None
+            if request.run_with_clean_slate:
+                replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
+            if not await self._close_replaced_workflow(replaced):
                 details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
                 return RunWorkflowFromRegistryResultFailure(result_details=details)
 
@@ -313,6 +318,7 @@ class WorkflowRunner(EngineScoped):
             status=execution_result.status,
             workflow_id=execution_result.workflow_id,
             open_workflow=self._open_workflow_info(execution_result.workflow_id),
+            replaced_workflow_id=self._workflow_id_of(replaced),
             result_details=ResultDetails(*result_messages),
         )
 
@@ -453,9 +459,8 @@ class WorkflowRunner(EngineScoped):
         except OpenWorkflowError as err:
             logger.warning("Failed to close workflow '%s' after its file failed to run: %s", workflow_id, err)
 
-    async def _close_replaced_workflow(self, replaces_workflow_id: str | None) -> bool:
-        """Close the open workflow a clean-slate open replaces, if any, returning False if closing it failed."""
-        replaced = self.engine.open_workflows.workflow_replaced_by_open(replaces_workflow_id)
+    async def _close_replaced_workflow(self, replaced: WorkflowRuntime | None) -> bool:
+        """Close the open workflow an open replaces, if any, returning False if closing it failed."""
         if replaced is None:
             return True
         try:

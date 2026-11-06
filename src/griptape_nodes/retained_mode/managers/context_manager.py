@@ -222,7 +222,9 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
+        replaced_workflow_id = None
         if replaced is not None:
+            replaced_workflow_id = replaced.workflow_id
             replaced_name = registry.get(replaced.workflow_id).name
             try:
                 self.engine.close_workflow(replaced)
@@ -248,6 +250,7 @@ class ContextManager(EngineScoped):
             workflow_name=resolved_name,
             workflow_id=opened.workflow_id,
             open_workflow=self.engine.open_workflow_info(opened),
+            replaced_workflow_id=replaced_workflow_id,
             result_details=msg,
         )
 
