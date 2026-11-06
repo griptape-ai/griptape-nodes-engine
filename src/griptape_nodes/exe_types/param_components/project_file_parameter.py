@@ -91,6 +91,9 @@ class ProjectFileParameter(ProjectOutputParameter):
         Otherwise the parameter's string value is combined with this component's
         situation to build a ``FileDestination``.
 
+        Either way the destination writes in the node's workflow, so it can be built and
+        written from any thread.
+
         Args:
             **extra_vars: Additional variables for the macro (e.g., sub_dirs="renders")
 
@@ -113,7 +116,8 @@ class ProjectFileParameter(ProjectOutputParameter):
         if "node_name" not in extra_vars:
             extra_vars["node_name"] = self._node.name
 
-        return ProjectFileDestination.from_situation(
+        return ProjectFileDestination.from_situation_in_workflow(
+            self._node.workflow,
             filename,
             self._situation_name,
             **extra_vars,
