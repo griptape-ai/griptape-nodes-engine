@@ -142,6 +142,39 @@ class CloseWorkflowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class ListOpenWorkflowsRequest(RequestPayload):
+    """List the workflows the engine has open.
+
+    Use when: A client starts or reconnects and needs to know which workflows are open, for
+    example to find the one it had open before. The request ignores the envelope's `open_workflow_id`.
+
+    Results: ListOpenWorkflowsResultSuccess | ListOpenWorkflowsResultFailure (engine error)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListOpenWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The workflows the engine has open.
+
+    Args:
+        open_workflows: Every open workflow, in the order they were opened.
+        engine_run_id: Changes each time the engine restarts. Workflow ids last only until a
+            restart, so drop the ids you kept when it changes.
+    """
+
+    open_workflows: list[OpenWorkflowInfo]
+    engine_run_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ListOpenWorkflowsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Listing the open workflows failed."""
+
+
+@dataclass
+@PayloadRegistry.register
 class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
     """Ensure a workflow + flow context exists, creating scratch ones if needed.
 

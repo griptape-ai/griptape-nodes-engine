@@ -22,6 +22,8 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
+    ListOpenWorkflowsRequest,
+    ListOpenWorkflowsResultSuccess,
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
@@ -266,6 +268,17 @@ class ContextManager(EngineScoped):
             msg = f"Attempted to close workflow '{workflow_name}'. Failed because {err}"
             return CloseWorkflowResultFailure(result_details=msg)
         return CloseWorkflowResultSuccess(result_details=f"Closed workflow '{workflow_name}'.")
+
+    @handles(ListOpenWorkflowsRequest)
+    def on_list_open_workflows_request(self, request: ListOpenWorkflowsRequest) -> ResultPayload:  # noqa: ARG002
+        open_workflows = [
+            self.engine.open_workflow_info(workflow) for workflow in self.engine.open_workflows.all_open()
+        ]
+        return ListOpenWorkflowsResultSuccess(
+            open_workflows=open_workflows,
+            engine_run_id=self.engine.engine_run_id,
+            result_details=f"Listed {len(open_workflows)} open workflow(s).",
+        )
 
     @handles(GetWorkflowContextRequest)
     def on_get_workflow_context_request(
