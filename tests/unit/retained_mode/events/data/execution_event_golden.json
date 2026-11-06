@@ -1,0 +1,19 @@
+{
+  "ProgressEvent": {
+    "value": "partial text",
+    "node_name": "Agent",
+    "parameter_name": "output",
+    "open_workflow_id": "5b0f6c3e8d1a4f7e9c2b6a4d3e1f0b97"
+  },
+  "ExecutionEvent": {
+    "open_workflow_id": "5b0f6c3e8d1a4f7e9c2b6a4d3e1f0b97",
+    "event_type": "ExecutionEvent",
+    "payload_type": "GriptapeEvent",
+    "payload": {
+      "node_name": "Agent",
+      "parameter_name": "output",
+      "type": "ProgressEvent",
+      "value": "partial text"
+    }
+  }
+}
