@@ -166,8 +166,7 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
-        open_workflow: The workflow now open, as the heartbeat lists it. A library workflow opens as
-            an unsaved copy, under a name of its own. None when the file opened none.
+        open_workflow: The workflow now open, as the heartbeat lists it. None when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
