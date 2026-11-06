@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         WorkflowShape,
     )
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
@@ -188,6 +189,7 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromScratchResultSuccess(
                     status=execution_result.status,
                     workflow_id=execution_result.workflow_id,
+                    open_workflow=self._open_workflow_info(execution_result.workflow_id),
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
@@ -306,6 +308,7 @@ class WorkflowRunner(EngineScoped):
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
             workflow_id=execution_result.workflow_id,
+            open_workflow=self._open_workflow_info(execution_result.workflow_id),
             result_details=ResultDetails(*result_messages),
         )
 
@@ -426,6 +429,15 @@ class WorkflowRunner(EngineScoped):
             engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
+
+    def _open_workflow_info(self, workflow_id: str | None) -> OpenWorkflowInfo | None:
+        """What clients are told of the workflow a load opened, or None when it opened none or it closed since."""
+        if workflow_id is None:
+            return None
+        opened = self.engine.open_workflows.find(workflow_id)
+        if opened is None:
+            return None
+        return self.engine.open_workflow_info(opened)
 
     def _enter_workflow_the_file_opened(self, result: WorkflowExecutionResult) -> None:
         """Bind the current request to the workflow its file opened, once the load's own binding has ended.
