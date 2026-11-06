@@ -1007,3 +1007,188 @@ class DeleteAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class DeleteAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Agent provider deletion failed. Common causes: provider not found, protected provider, last remaining provider."""
+
+
+@dataclass
+class AgentSkill:
+    """One skill found in the agent's skills folders.
+
+    Args:
+        name: The skill's name, which is also its folder name.
+        description: When the agent should use the skill. Empty when the skill cannot load.
+        directory: The skills folder it was found in, one of ``ListAgentSkillsResultSuccess.directories``.
+        path: The skill's own folder, holding its ``SKILL.md``.
+        enabled: Whether the user has the skill turned on. A skill with a ``problem`` is never loaded.
+        problem: Why the agent cannot use the skill, or ``None`` when it can.
+        model_invocable: False when the skill's ``SKILL.md`` sets ``disable-model-invocation: true``,
+            which keeps it from the agent whatever ``enabled`` says.
+    """
+
+    name: str
+    description: str
+    directory: str
+    path: str
+    enabled: bool
+    problem: str | None = None
+    model_invocable: bool = True
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentSkillsRequest(RequestPayload):
+    """List the skills in the agent's skills folders, whether each is on, and why any cannot load.
+
+    The folders come from the ``agent.skills_directories`` setting.
+
+    Use when: Showing the user which skills the agent has.
+
+    Results: ListAgentSkillsResultSuccess | ListAgentSkillsResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentSkillsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Skills listed.
+
+    Args:
+        skills: Every skill found, in folder order then by name.
+        directories: The skills folders, as absolute paths in setting order. New skills go in the first.
+    """
+
+    skills: list[AgentSkill] = field(default_factory=list)
+    directories: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentSkillsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Skills could not be listed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetAgentSkillEnabledRequest(RequestPayload):
+    """Turn a skill on or off for the agent.
+
+    Stored in the ``agent.disabled_skills`` setting, so it applies to the agent's next message.
+
+    Args:
+        name: The skill's name.
+        enabled: True to let the agent use the skill, False to hide it from the agent.
+
+    Results: SetAgentSkillEnabledResultSuccess | SetAgentSkillEnabledResultFailure
+    """
+
+    name: str = ""
+    enabled: bool = True
+
+
+@dataclass
+@PayloadRegistry.register
+class SetAgentSkillEnabledResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Skill turned on or off."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetAgentSkillEnabledResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Skill could not be turned on or off. Common causes: no skill has that name."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentSkillRequest(RequestPayload):
+    """Write a skill into the first skills folder.
+
+    Args:
+        name: The skill's name: lowercase letters, numbers, and single hyphens.
+        description: When the agent should use the skill.
+        instructions: The skill's body, in markdown.
+
+    Results: CreateAgentSkillResultSuccess | CreateAgentSkillResultFailure
+    """
+
+    name: str = ""
+    description: str = ""
+    instructions: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentSkillResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Skill written.
+
+    Args:
+        skill: The skill as the agent now sees it.
+    """
+
+    skill: AgentSkill | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentSkillResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Skill not written. Common causes: invalid name, missing description, name already taken."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportAgentSkillRequest(RequestPayload):
+    """Add a skill to the first skills folder from the text of its ``SKILL.md``.
+
+    The skill is named by the ``name`` in its frontmatter.
+
+    Args:
+        content: The full text of a ``SKILL.md``, frontmatter included.
+
+    Results: ImportAgentSkillResultSuccess | ImportAgentSkillResultFailure
+    """
+
+    content: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportAgentSkillResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Skill imported.
+
+    Args:
+        skill: The skill as the agent now sees it.
+    """
+
+    skill: AgentSkill | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportAgentSkillResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Skill not imported. Common causes: no frontmatter, no name, name already taken."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentSkillRequest(RequestPayload):
+    """Delete a skill from the first skills folder, with everything it bundles.
+
+    Skills in the other folders are shared and are left alone.
+
+    Args:
+        name: The skill's name.
+
+    Results: DeleteAgentSkillResultSuccess | DeleteAgentSkillResultFailure
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentSkillResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Skill deleted."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentSkillResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Skill not deleted. Common causes: no skill has that name, or it is in a shared folder."""

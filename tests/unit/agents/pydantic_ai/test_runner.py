@@ -41,6 +41,7 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     _run_messages,
 )
 from griptape_nodes.agents.pydantic_ai.tool_approval import pending_tool_calls
+from griptape_nodes.agents.skills import discover_skills, select_skills
 from griptape_nodes.drivers.cloud_models import MODEL_SETTINGS
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 
@@ -427,8 +428,8 @@ async def test_tool_call_round_trips_through_runner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_workspace_skill_reaches_the_model_on_a_run(tmp_path: Path) -> None:
-    """A skill in the workspace is offered to the model, so the run wiring is not silently dropped."""
+async def test_selected_skill_reaches_the_model_on_a_run(tmp_path: Path) -> None:
+    """A selected skill is offered to the model, so the run wiring is not silently dropped."""
     workspace = tmp_path / "ws"
     skill_dir = workspace / ".agents/skills/demo-skill"
     skill_dir.mkdir(parents=True)
@@ -444,7 +445,13 @@ async def test_workspace_skill_reaches_the_model_on_a_run(tmp_path: Path) -> Non
         yield "Done."
 
     runner = _runner_with_function_model(workspace, threads_dir, stream)
-    await runner.run("Use the demo skill.")
+    await runner.run(
+        "Use the demo skill.",
+        skill_folders=[
+            skill.folder
+            for skill in select_skills(await discover_skills([workspace / ".agents/skills"]), disabled=set())
+        ],
+    )
 
     assert len(offered) == 1
     # Each skill is a deferred capability: the model sees it in the catalog instructions
