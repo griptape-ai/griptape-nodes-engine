@@ -25,6 +25,8 @@ if TYPE_CHECKING:
         AppPayload,
         RequestPayload,
         ResultPayload,
+        ResultPayloadFailure,
+        ResultPayloadSuccess,
     )
     from griptape_nodes.retained_mode.managers.access_manager import AccessManager
     from griptape_nodes.retained_mode.managers.agent_manager import AgentManager
@@ -150,6 +152,22 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
     @classmethod
     async def ahandle_request(cls, request: RequestPayload) -> ResultPayload:
         return await current_engine().ahandle_request(request)
+
+    @classmethod
+    def request[T: ResultPayloadSuccess](cls, request: RequestPayload[T]) -> T:
+        return current_engine().request(request)
+
+    @classmethod
+    async def arequest[T: ResultPayloadSuccess](cls, request: RequestPayload[T]) -> T:
+        return await current_engine().arequest(request)
+
+    @classmethod
+    def try_request[T: ResultPayloadSuccess](cls, request: RequestPayload[T]) -> T | ResultPayloadFailure:
+        return current_engine().try_request(request)
+
+    @classmethod
+    async def atry_request[T: ResultPayloadSuccess](cls, request: RequestPayload[T]) -> T | ResultPayloadFailure:
+        return await current_engine().atry_request(request)
 
     @classmethod
     def broadcast_app_event(cls, app_event: AppPayload) -> None:

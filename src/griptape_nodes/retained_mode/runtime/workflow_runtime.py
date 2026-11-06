@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from griptape_nodes.retained_mode.events.base_events import build_execution_event
+from griptape_nodes.retained_mode.events.base_events import TypedRequestsMixin, build_execution_event
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     )
 
 
-class WorkflowRuntime:
+class WorkflowRuntime(TypedRequestsMixin):
     """The state of one open workflow, made when it opens and dropped when it closes.
 
     Holds the workflow's context stack (the flows, nodes and elements entered in it), its objects

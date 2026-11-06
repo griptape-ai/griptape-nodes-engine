@@ -650,7 +650,7 @@ class RenameParameterResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConnectionsForParameterRequest(RequestPayload, GraphAccessMixin):
+class GetConnectionsForParameterRequest(RequestPayload["GetConnectionsForParameterResultSuccess"], GraphAccessMixin):
     """Get connections for a specific parameter on a node.
 
     Use when: Checking if a parameter is connected, getting connection details for a parameter,

@@ -356,7 +356,7 @@ class TestRequestingAnotherEngine:
         engine = Engine()
 
         with pytest.raises(EngineNotFoundError, match="no connections to other engines"):
-            await engine.request("gpu-01", SetSecretValueRequest(key="k", value="v"), timeout_s=1.0)
+            await engine.request_engine("gpu-01", SetSecretValueRequest(key="k", value="v"), timeout_s=1.0)
 
         assert not engine.can_reach_other_engines
 
@@ -367,7 +367,7 @@ class TestRequestingAnotherEngine:
         engine.attach_engine_transports(links)  # type: ignore[arg-type]
         request = SetSecretValueRequest(key="k", value="v")
 
-        result = await engine.request("gpu-01", request, timeout_s=1.0)
+        result = await engine.request_engine("gpu-01", request, timeout_s=1.0)
 
         assert isinstance(result, ResultPayloadFailure)
         assert links.asked == [("gpu-01", request, 1.0)]

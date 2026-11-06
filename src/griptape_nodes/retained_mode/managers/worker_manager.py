@@ -1067,7 +1067,7 @@ class WorkerManager(EngineScoped):
         lease = EngineLease(lease_id=str(uuid.uuid4()), host_engine_id=host_engine_id, run_id=run_id)
         self._leases[lease.lease_id] = lease
         request = worker_events.AcquireLeaseRequest(lease_id=lease.lease_id, run_id=run_id)
-        lease.request_task = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
+        lease.request_task = asyncio.ensure_future(self.engine.request_engine(host_engine_id, request, timeout_s=None))
         # However the acquire is answered, the run no longer waits, even if that engine's last report was lost.
         lease.request_task.add_done_callback(lambda _task: self._stop_reporting_wait(lease))
         if run is not None:
@@ -1455,7 +1455,7 @@ class WorkerManager(EngineScoped):
             library_name=library_name, worker_engine_id=worker_engine_id
         )
         try:
-            result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+            result = await self.engine.request_engine(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
             # That engine may still get the start, such as once a connection that was down comes back.
             self._schedule_remote_stop(worker_engine_id, host_engine_id)
@@ -1482,7 +1482,7 @@ class WorkerManager(EngineScoped):
     async def _stop_remote_worker(self, worker_engine_id: str, host_engine_id: str) -> None:
         request = worker_events.StopWorkerForEngineRequest(worker_engine_id=worker_engine_id)
         try:
-            result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+            result = await self.engine.request_engine(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
             logger.warning(
                 "Could not tell %s to stop worker %s, whose start was withdrawn: %s",
@@ -1517,7 +1517,7 @@ class WorkerManager(EngineScoped):
 
     async def _withdraw_session_offer(self, host_engine_id: str) -> None:
         try:
-            result = await self.engine.request(
+            result = await self.engine.request_engine(
                 host_engine_id, worker_events.WithdrawSessionOfferRequest(), timeout_s=_ENGINE_REQUEST_TIMEOUT_S
             )
         except EngineNotFoundError as e:
@@ -1578,7 +1578,7 @@ class WorkerManager(EngineScoped):
             library_versions=library_versions,
             static_server_base_url=await self._orchestrator_static_server_base_url(),
         )
-        result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        result = await self.engine.request_engine(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         # Catches a registry record or address that leads to the wrong engine. It cannot catch one
         # that claims to be `host_engine_id`, since the answer is that engine's own word.
         if isinstance(result, worker_events.OfferSessionForWorkersResultSuccess) and result.engine_id != host_engine_id:
@@ -1844,7 +1844,7 @@ class WorkerManager(EngineScoped):
             worker_engine_id=worker_engine_id, exit_code=exit_code, reason=reason
         )
         try:
-            result = await self.engine.request(hosted.engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+            result = await self.engine.request_engine(hosted.engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
             logger.warning("Could not tell engine %s that worker %s exited: %s", hosted.engine_id, worker_engine_id, e)
             return
@@ -2137,7 +2137,7 @@ class WorkerManager(EngineScoped):
     async def _send_place_in_line(self, engine_id: str, lease_id: str, position: int) -> None:
         request = worker_events.ReportPlaceInLineRequest(lease_id=lease_id, position=position)
         try:
-            result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+            result = await self.engine.request_engine(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
         except EngineNotFoundError as e:
             logger.warning("Could not tell engine %s its run's place in line: %s", engine_id, e)
             return
@@ -2157,7 +2157,7 @@ class WorkerManager(EngineScoped):
                 logger.info("Not telling engine %s that %s: this engine no longer uses it.", engine_id, what)
                 return
             try:
-                result = await self.engine.request(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+                result = await self.engine.request_engine(engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
             except EngineNotFoundError as e:
                 logger.warning(
                     "Could not tell engine %s that %s (attempt %d of %d): %s",
