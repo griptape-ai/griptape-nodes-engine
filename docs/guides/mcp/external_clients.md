@@ -104,6 +104,24 @@ Create `.vscode/mcp.json` in your workspace, or open the user file via **MCP: Op
 
 Note that VS Code uses `servers` (not `mcpServers`) and `"type": "http"`.
 
+### Name a workflow in the configuration
+
+To point a client at one workflow, add its id as an `X-Griptape-Workflow-Id` header. See [Choose the workflow](#choose-the-workflow). In Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "griptape-nodes": {
+      "type": "streamable-http",
+      "url": "http://localhost:8125/mcp/",
+      "headers": { "X-Griptape-Workflow-Id": "<workflow id>" }
+    }
+  }
+}
+```
+
+Cursor and VS Code take the same `headers` object beside `url`.
+
 ### Claude Desktop
 
 Claude Desktop's `claude_desktop_config.json` only supports `stdio` servers. To connect to a remote/HTTP MCP server, either:
@@ -140,6 +158,15 @@ npx -y @modelcontextprotocol/inspector
 ```
 
 Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP** as the transport. If the connection fails with `TypeError: NetworkError when attempting to fetch resource`, it's almost always CORS: the engine's MCP server does not currently emit `Access-Control-Allow-Origin` headers, so cross-origin browser fetches are blocked. Use the CLI command above instead, or run the inspector with browser security relaxed.
+
+## Choose the workflow
+
+Tool calls that build or change a workflow act on one open workflow. A client names it in one of two ways:
+
+- **A header.** Send the workflow's id in an `X-Griptape-Workflow-Id` header. Every tool call acts on that workflow, including each request inside `EventRequestBatch`. If that workflow isn't open, the call fails. Saving a Griptape-provided template continues in a copy with a new id, and the old id keeps reaching it. `GetWorkflowContextRequest` and `EnsureWorkflowAndFlowRequest` return the `workflow_id` of the workflow they report.
+- **The session's own workflow.** A client that sends no header can start with `EnsureWorkflowAndFlowRequest` or `SetWorkflowContextRequest`. Later calls in the same MCP session act on the workflow that call opened or selected, until that workflow closes.
+
+A call with neither acts on the workflow that's open in the engine.
 
 ## Parameter values
 

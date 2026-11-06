@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     require_request_sender,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
@@ -2360,6 +2361,58 @@ class TestNodeProcessEventTranslation:
             )
 
         assert received == [finish, finish]
+
+    def test_translation_keeps_the_events_workflow(self) -> None:
+        """A loop body's translated events still name the workflow they belong to."""
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+        finish = NodeFinishProcessEvent(
+            node_name="Body_1",
+            node_type="LoopBodyControlNode",
+            specific_library_name="Library",
+            flow_name="Canvas Flow",
+            execution_id="run-1",
+            parent_execution_id=None,
+            outcome=NodeProcessOutcome.SUCCEEDED,
+        )
+
+        with EventTranslationContext(manager, {"Body_1": "Body"}):
+            manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish, workflow_id="wf-1"))
+            )
+
+        translated = queue.get_nowait()
+        assert translated.wrapped_event.payload.node_name == "Body"
+        assert translated.wrapped_event.workflow_id == "wf-1"
+
+
+class TestResultWorkflowId:
+    """A result names the envelope's workflow, else the workflow the request was bound to."""
+
+    def test_the_envelopes_workflow_wins_over_the_binding(self) -> None:
+        bound = MagicMock(spec=WorkflowRuntime, workflow_id="bound")
+        token = bound_workflow.set(bound)
+        try:
+            assert EventManager._result_workflow_id(ResultContext(open_workflow_id="named")) == "named"
+        finally:
+            bound_workflow.reset(token)
+
+    def test_with_no_envelope_id_the_bound_workflow_is_named(self) -> None:
+        bound = MagicMock(spec=WorkflowRuntime, workflow_id="bound")
+        token = bound_workflow.set(bound)
+        try:
+            assert EventManager._result_workflow_id(ResultContext()) == "bound"
+        finally:
+            bound_workflow.reset(token)
+
+    @pytest.mark.parametrize("binding", [None, NO_WORKFLOW])
+    def test_a_request_bound_to_no_workflow_names_none(self, binding: object) -> None:
+        token = bound_workflow.set(binding)  # pyright: ignore[reportArgumentType]
+        try:
+            assert EventManager._result_workflow_id(ResultContext()) is None
+        finally:
+            bound_workflow.reset(token)
 
 
 class _RecordingWorkerRequestClient:

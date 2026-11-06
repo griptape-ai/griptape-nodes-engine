@@ -13,7 +13,7 @@ from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, DagNodeCate
 class TestDagNodeCategories:
     """Test cases for the DagNodeCategories seeding contract.
 
-    The classifier (FlowManager.classify_nodes_for_dag) and the queue drainer
+    The classifier (FlowManager.classify_nodes_for_dag_in) and the queue drainer
     (ControlFlowMachine._drain_global_flow_queue) both produce this tuple, and the DAG-seeding
     routine consumes it positionally, so the field order/names are part of the shared contract.
     """

@@ -290,7 +290,6 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
             ("get_parent_flow", "get_parent_flow_in", ("canvas",)),
             ("flow_state", "flow_state_in", ("flow",)),
             ("get_start_node_queue", "get_start_node_queue_in", ()),
-            ("classify_nodes_for_dag", "classify_nodes_for_dag_in", (["node"],)),
             ("get_connected_output_parameters", "get_connected_output_parameters_in", ("node", "param")),
             ("has_connection", "has_connection_in", ("source", "source_param", "target", "target_param")),
             ("get_start_node_from_node", "get_start_node_from_node_in", ("flow", "node")),
@@ -309,6 +308,15 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         explicit.assert_called_once_with(engine.current_workflow(), *args)
         assert returned is explicit.return_value
 
+    def test_unresolving_a_flow_hands_the_open_workflow_to_its_explicit_twin(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        flow_manager = engine.flow_manager
+
+        with patch.object(flow_manager, "unresolve_all_nodes_in_flow_in") as explicit:
+            flow_manager.unresolve_all_nodes_in_flow("canvas")
+
+        explicit.assert_called_once_with(engine.current_workflow(), "canvas")
+
     @pytest.mark.asyncio
     async def test_edge_methods_report_failure_with_no_workflow_open(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager
@@ -325,7 +333,6 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
             lambda c: c.fm.has_connection(c.node, c.param, c.node, c.param),
             lambda c: c.fm.get_start_node_from_node(c.flow, c.node),
             lambda c: c.fm.get_prev_node(c.flow, c.node),
-            lambda c: c.fm.classify_nodes_for_dag([c.node]),
             lambda c: c.fm.get_connected_input_from_node(c.flow, c.node),
             lambda c: c.fm.get_connected_output_from_node(c.flow, c.node),
             lambda c: c.fm.get_connected_input_parameters(c.flow, c.node, c.param),

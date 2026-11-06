@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import threading
-from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -14,6 +15,7 @@ from starlette.requests import Request
 
 from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
@@ -21,6 +23,7 @@ from griptape_nodes.servers.mcp import (
     ENGINE_TOOLS,
     EVENT_REQUEST_BATCH_TOOL_NAME,
     SUPPORTED_REQUEST_EVENTS,
+    ToolCallSender,
     _build_batch_requests,
     _dispatch_to_engine,
     _event_request_batch_input_schema,
@@ -35,7 +38,12 @@ from griptape_nodes.servers.mcp import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
     from mcp.server.context import ServerRequestContext
+
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # A context with no HTTP request, which the handlers serve the engine tools to.
 _NO_CONTEXT = cast("ServerRequestContext[Any]", SimpleNamespace(request=None))
@@ -318,7 +326,7 @@ class TestCallTool:
 
     @pytest.mark.asyncio
     async def test_returns_trimmed_payload_as_text_content(self) -> None:
-        async def fake_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def fake_dispatch(_payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
             return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {"libraries": ["demo"]}}
 
         with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
@@ -333,7 +341,7 @@ class TestCallTool:
     async def test_treats_missing_arguments_as_empty(self) -> None:
         seen: dict[str, object] = {}
 
-        async def fake_dispatch(payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def fake_dispatch(payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
             seen["payload"] = payload
             return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {}}
 
@@ -361,7 +369,11 @@ class TestCallTool:
 
     @pytest.mark.asyncio
     async def test_reports_dispatch_timeout_as_error_result(self) -> None:
-        async def timing_out_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def timing_out_dispatch(
+            _payload: object,
+            _sender: object,
+            timeout_ms: int | None = None,  # noqa: ARG001
+        ) -> dict[str, Any]:
             raise TimeoutError
 
         with patch.object(mcp_module, "_dispatch_to_engine", timing_out_dispatch):
@@ -373,7 +385,7 @@ class TestCallTool:
 
     @pytest.mark.asyncio
     async def test_dispatches_the_batch_envelope(self) -> None:
-        async def fake_batch_dispatch(requests: list[RequestPayload], timeout_ms: int) -> list[Any]:  # noqa: ARG001
+        async def fake_batch_dispatch(requests: list[RequestPayload], _sender: object, timeout_ms: int) -> list[Any]:  # noqa: ARG001
             return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}} for _ in requests]
 
         with patch.object(mcp_module, "_dispatch_batch_to_engine", fake_batch_dispatch):
@@ -432,7 +444,7 @@ class TestDispatchToEngineShield:
         completed = threading.Event()
         cancelled = threading.Event()
 
-        async def slow_engine_handler(_payload: object) -> dict[str, bool]:
+        async def slow_engine_handler(_payload: object, _sender: object) -> dict[str, bool]:
             try:
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
@@ -449,7 +461,7 @@ class TestDispatchToEngineShield:
                 patch.object(mcp_module, "_handle_request_on_engine_loop", slow_engine_handler),
             ):
                 with pytest.raises(TimeoutError):
-                    await _dispatch_to_engine(self._a_request_payload(), timeout_ms=50)
+                    await _dispatch_to_engine(self._a_request_payload(), ToolCallSender(), timeout_ms=50)
 
                 # The shielded engine coroutine keeps running on its own loop after the
                 # wait times out; wait long enough for its 0.5s body to finish.
@@ -464,7 +476,7 @@ class TestDispatchToEngineShield:
     async def test_returns_result_when_engine_finishes_before_timeout(self) -> None:
         engine_loop, thread = self._run_engine_loop_in_thread()
 
-        async def fast_engine_handler(_payload: object) -> dict[str, bool]:
+        async def fast_engine_handler(_payload: object, _sender: object) -> dict[str, bool]:
             return {"ok": True}
 
         event_manager = MagicMock()
@@ -474,7 +486,7 @@ class TestDispatchToEngineShield:
                 patch.object(mcp_module.GriptapeNodes, "EventManager", return_value=event_manager),
                 patch.object(mcp_module, "_handle_request_on_engine_loop", fast_engine_handler),
             ):
-                result = await _dispatch_to_engine(self._a_request_payload(), timeout_ms=5000)
+                result = await _dispatch_to_engine(self._a_request_payload(), ToolCallSender(), timeout_ms=5000)
 
             assert result == {"ok": True}
         finally:
@@ -498,7 +510,7 @@ _PROBE_LIBRARY_SLUG = "probe_render_library"
 _PROBE_TOOLS = [MCPTool(ProbeListRendersRequest, read_only=True), MCPTool(ProbeStartRenderRequest)]
 
 
-def _context_for(url_path: str, query_string: bytes = b"") -> "ServerRequestContext[Any]":
+def _context_for(url_path: str, query_string: bytes = b"") -> ServerRequestContext[Any]:
     """A context whose HTTP request arrived at url_path on the server's /mcp mount."""
     request = Request(
         {"type": "http", "path": url_path, "root_path": "/mcp", "query_string": query_string, "headers": []}
@@ -608,7 +620,7 @@ class TestLibraryTools:
     async def test_calls_a_library_tool(self) -> None:
         seen: dict[str, object] = {}
 
-        async def fake_dispatch(payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def fake_dispatch(payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
             seen["payload"] = payload
             return {"result_type": "ProbeStartRenderResultSuccess", "result": {}}
 
@@ -651,3 +663,210 @@ class TestLibraryTools:
             served = await _tools_for_request(_context_for("/mcp/", b"libraries=first,second"))
 
         assert served["ProbeStartRenderRequest"] is first
+
+
+def _http_context(headers: dict[str, str]) -> ServerRequestContext[Any]:
+    """A tool call that came over an HTTP request carrying `headers`, on the engine's own endpoint."""
+    raw_headers = [(name.lower().encode(), value.encode()) for name, value in headers.items()]
+    request = Request({"type": "http", "path": "/mcp/", "query_string": b"", "headers": raw_headers})
+    return cast("ServerRequestContext[Any]", SimpleNamespace(request=request))
+
+
+def _create_flow_call(flow_name: str) -> CallToolRequestParams:
+    return CallToolRequestParams(
+        name="CreateFlowRequest",
+        arguments={"parent_flow_name": None, "flow_name": flow_name, "set_as_new_context": False},
+    )
+
+
+def _payload(result: Any) -> Any:
+    return json.loads(result.content[0].text)
+
+
+class TestToolCallWorkflow:
+    """A tool call acts on the workflow its header names, else the one its MCP session opened."""
+
+    @pytest.fixture(autouse=True)
+    def dispatch_on_this_loop(self) -> Iterator[None]:
+        """Run tool calls on the test's loop, which stands in for the engine loop, with no sessions."""
+
+        async def dispatch_inline(
+            payload: RequestPayload,
+            sender: ToolCallSender,
+            timeout_ms: int | None = None,  # noqa: ARG001
+        ) -> dict[str, Any]:
+            return await mcp_module._handle_request_on_engine_loop(payload, sender)
+
+        with (
+            patch.object(mcp_module, "_dispatch_to_engine", dispatch_inline),
+            patch.dict(mcp_module._session_workflow_ids, {}, clear=True),
+        ):
+            yield
+
+    @pytest.fixture
+    def two_open(self, engine: Engine) -> tuple[WorkflowRuntime, WorkflowRuntime]:
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+        opened = []
+        for name in ("first", "second"):
+            entry = engine.workflow_registry.register_unsaved(name, listed=False)
+            opened.append(engine.open_workflow(entry.workflow_id))
+        return opened[0], opened[1]
+
+    @pytest.mark.asyncio
+    async def test_a_call_naming_no_workflow_acts_on_the_open_one(self, engine: Engine) -> None:
+        entry = engine.workflow_registry.register_unsaved("only", listed=False)
+        only = engine.open_workflow(entry.workflow_id)
+
+        result = await call_tool(_NO_CONTEXT, _create_flow_call("canvas"))
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in only.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_the_header_names_the_workflow(self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]) -> None:
+        first, second = two_open
+
+        result = await call_tool(
+            _http_context({"X-Griptape-Workflow-Id": second.workflow_id}), _create_flow_call("canvas")
+        )
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in second.flows.name_to_parent_name
+        assert "canvas" not in first.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_a_header_naming_a_workflow_that_is_not_open_fails(
+        self,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": "0" * 32}), _create_flow_call("canvas"))
+
+        assert not _payload(result)["ok"]
+        assert "isn't open" in result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_the_header_names_the_workflow_of_every_request_in_a_batch(
+        self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        first, second = two_open
+        batch = CallToolRequestParams(
+            name=EVENT_REQUEST_BATCH_TOOL_NAME,
+            arguments={
+                "requests": [
+                    {"request_type": "CreateFlowRequest", "request": {"parent_flow_name": None, "flow_name": name}}
+                    for name in ("one", "two")
+                ]
+            },
+        )
+
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": second.workflow_id}), batch)
+
+        assert [entry["ok"] for entry in _payload(result)] == [True, True]
+        assert {"one", "two"} <= set(second.flows.name_to_parent_name)
+        assert not {"one", "two"} & set(first.flows.name_to_parent_name)
+
+    @pytest.mark.asyncio
+    async def test_a_session_acts_on_the_workflow_it_opened(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+
+        opened = await call_tool(
+            session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={"display_name": "third"})
+        )
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        assert _payload(opened)["ok"], opened
+        third = engine.open_workflows.all_open()[-1]
+        assert third not in two_open
+        assert _payload(result)["ok"], result
+        assert "canvas" in third.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_sessions_that_opened_different_workflows_do_not_cross(
+        self,
+        engine: Engine,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        session_a = _http_context({"mcp-session-id": "session-a"})
+        session_b = _http_context({"mcp-session-id": "session-b"})
+
+        await call_tool(session_a, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        workflow_a = engine.open_workflows.all_open()[-1]
+        await call_tool(session_b, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        workflow_b = engine.open_workflows.all_open()[-1]
+        await call_tool(session_a, _create_flow_call("canvas_a"))
+        await call_tool(session_b, _create_flow_call("canvas_b"))
+
+        assert set(workflow_a.flows.name_to_parent_name) == {"canvas_a"}
+        assert set(workflow_b.flows.name_to_parent_name) == {"canvas_b"}
+
+    @pytest.mark.asyncio
+    async def test_a_session_forgets_its_workflow_once_it_closes(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        third = engine.open_workflows.all_open()[-1]
+        engine.close_workflow(third)
+
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        # With the session's workflow gone the call names none, and two are still open.
+        assert not _payload(result)["ok"]
+        assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
+
+    @pytest.mark.asyncio
+    async def test_a_header_follows_its_workflow_when_a_save_moves_it(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """Saving a template continues in a copy under another id, and the header still reaches it."""
+        _, second = two_open
+        held_id = second.workflow_id
+        copy = engine.workflow_registry.register_unsaved("copy", listed=False)
+        engine.open_workflows.move(second, copy.workflow_id)
+
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": held_id}), _create_flow_call("canvas"))
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in second.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_the_header_wins_over_the_sessions_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        first, _ = two_open
+        await call_tool(
+            _http_context({"mcp-session-id": "session-a"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+        third = engine.open_workflows.all_open()[-1]
+
+        result = await call_tool(
+            _http_context({"mcp-session-id": "session-a", "X-Griptape-Workflow-Id": first.workflow_id}),
+            _create_flow_call("canvas"),
+        )
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in first.flows.name_to_parent_name
+        assert "canvas" not in third.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_remembering_a_session_forgets_sessions_whose_workflow_closed(
+        self,
+        engine: Engine,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        """Sessions end without telling the server, so their entries go once their workflow closes."""
+        await call_tool(
+            _http_context({"mcp-session-id": "ended"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+        engine.close_workflow(engine.open_workflows.all_open()[-1])
+
+        await call_tool(
+            _http_context({"mcp-session-id": "live"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+
+        assert set(mcp_module._session_workflow_ids) == {"live"}

@@ -1,7 +1,8 @@
-"""Tests for how InspectLibraryRepoRequest picks the git ref to inspect."""
+"""Tests for InspectLibraryRepoRequest: which git ref it inspects, and where the checkout runs."""
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -52,3 +53,27 @@ class TestInspectLibraryRepoRef:
         assert isinstance(result, InspectLibraryRepoResultSuccess)
         assert result.git_url == REPO_URL
         assert result.ref == expected_ref
+
+
+class TestInspectLibraryRepoEventLoop:
+    @pytest.mark.asyncio
+    async def test_sparse_checkout_runs_off_the_event_loop_thread(self, engine: Engine) -> None:
+        """The checkout's git subprocesses must not block the loop serving the editor connection."""
+        loop_thread = threading.current_thread()
+        checkout_threads: list[threading.Thread] = []
+
+        def fake_checkout(_url: str, _ref: str) -> MagicMock:
+            checkout_threads.append(threading.current_thread())
+            return _checkout()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.sparse_checkout_library_json", side_effect=fake_checkout),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibrarySchema", return_value=MagicMock()),
+        ):
+            result = await engine.library_manager.git_operations.inspect_library_repo_request(
+                InspectLibraryRepoRequest(git_url="griptape-ai/griptape-nodes-library-nuke")
+            )
+
+        assert isinstance(result, InspectLibraryRepoResultSuccess)
+        assert len(checkout_threads) == 1
+        assert checkout_threads[0] is not loop_thread

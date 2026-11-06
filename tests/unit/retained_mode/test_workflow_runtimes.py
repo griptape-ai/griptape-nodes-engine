@@ -599,7 +599,7 @@ class TestNodesAndFlowsOnTheRuntime:
         graph.add_node("other")
         first.flows.global_dag_builder.graphs["network"] = graph
         context = ParallelResolutionContext(
-            "canvas", dag_builder=first.flows.global_dag_builder, flows=first.flows, engine=engine
+            "canvas", dag_builder=first.flows.global_dag_builder, workflow=first, engine=engine
         )
         engine.context_manager.pop_workflow()
         if next_workflow_opens:

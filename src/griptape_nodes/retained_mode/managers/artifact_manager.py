@@ -351,7 +351,7 @@ class ArtifactManager(EngineScoped):
         ``provider_for_write`` don't drift on it.
         Currently just "first registered class wins" per the provider
         registry order; ambiguity handling is tracked at
-        https://github.com/griptape-ai/griptape-nodes/issues/4027.
+        https://github.com/griptape-ai/griptape-nodes-engine/issues/4027.
         """
         if not fmt:
             return None
@@ -1467,7 +1467,7 @@ class ArtifactManager(EngineScoped):
         else:
             # Valid config - check if all fields are present
 
-            # TODO: Remove this manual check after https://github.com/griptape-ai/griptape-nodes/issues/3980
+            # TODO: Remove this manual check after https://github.com/griptape-ai/griptape-nodes-engine/issues/3980
             # Once we normalize config on write, typos will be fixed automatically
 
             # Check if all model fields are present in user's config

@@ -462,7 +462,7 @@ class LibraryManager(EngineScoped):
     async def load_libraries_for_startup(self, payload: AppInitializationComplete) -> None:
         """Run the library half of engine startup. See `EngineLifecycle` for the rest."""
         # Automatically migrate old XDG library paths from config
-        # TODO: Remove https://github.com/griptape-ai/griptape-nodes/issues/3348
+        # TODO: Remove https://github.com/griptape-ai/griptape-nodes-engine/issues/3348
         self.discovery.migrate_old_xdg_library_paths()
 
         # App just got init'd. First download any missing libraries from git URLs.

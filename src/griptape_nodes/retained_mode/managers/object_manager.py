@@ -83,7 +83,7 @@ class ObjectManager(EngineScoped):
             # We'll use the next available name.
             final_name = next_name
 
-            # Let the object's manager know. TODO: https://github.com/griptape-ai/griptape-nodes/issues/869
+            # Let the object's manager know. TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/869
         match source_obj:
             case ControlFlow():
                 self.engine.flow_manager.handle_flow_rename(workflow, old_name=request.object_name, new_name=final_name)
@@ -162,7 +162,11 @@ class ObjectManager(EngineScoped):
     def add_object_by_name_in(self, workflow: WorkflowRuntime, name: str, obj: object) -> None:
         objects = workflow.objects
         objects.add(name, obj)
+        if isinstance(obj, ControlFlow):
+            obj._set_workflow(workflow)
         if isinstance(obj, BaseNode):
+            # The one place a node joins a workflow, so every node in `workflow.objects` knows it.
+            obj._set_workflow(workflow)
             # The workflow holding the node queues its changes, so they go when it closes.
             obj.set_change_listener(objects.note_queued_changes)
 

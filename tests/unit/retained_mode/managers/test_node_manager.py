@@ -503,7 +503,7 @@ class TestGetParameterValueOutputPriority:
 
 
 class TestNodeManagerCancelExecuteNode:
-    """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution dispatch."""
+    """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution_in dispatch."""
 
     @pytest.mark.asyncio
     async def test_handler_no_inflight_returns_success(self, engine: Engine) -> None:
@@ -568,12 +568,13 @@ class TestNodeManagerCancelExecuteNode:
 
     @pytest.mark.asyncio
     async def test_cancel_worker_execution_noop_when_not_tracked(self, engine: Engine) -> None:
-        """cancel_worker_execution is a no-op when the node isn't routed to a worker."""
-        node_manager = engine.node_manager
+        """cancel_worker_execution_in is a no-op when the node isn't routed to a worker."""
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
 
         # Should not raise; there is no entry for "ghost_node" and
         # WorkerManager.forward_event_to_worker should not be invoked.
-        await node_manager.cancel_worker_execution("ghost_node")
+        await engine.node_manager.cancel_worker_execution_in(workflow, "ghost_node")
 
 
 class TestDeserializeNodeFromCommandsRetargetsElementCommands:

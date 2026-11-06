@@ -32,8 +32,6 @@ from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachi
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories, NodeState
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
     ResultDetails,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -452,6 +450,13 @@ class FlowManager(EngineScoped):
         raise ValueError(msg)
 
     def reparent_flow(self, flow_name: str, new_parent_flow_name: str) -> None:
+        """Move a Flow of the open workflow under a different parent Flow; see `reparent_flow_in`.
+
+        Edge method for code not handed a workflow.
+        """
+        self.reparent_flow_in(self.engine.current_workflow(), flow_name, new_parent_flow_name)
+
+    def reparent_flow_in(self, workflow: WorkflowRuntime, flow_name: str, new_parent_flow_name: str) -> None:
         """Move a Flow under a different parent Flow.
 
         Used when a node group is nested inside another: the inner group's subflow has to become a
@@ -470,19 +475,18 @@ class FlowManager(EngineScoped):
         rather than from flow parentage. An editor feature that reads flow parentage directly would
         need this promoted to a request first.
 
-        Edge method for code not handed a workflow.
-
         Args:
+            workflow: The workflow both Flows are in
             flow_name: The Flow to move
             new_parent_flow_name: The Flow that should become its parent
 
         Raises:
             ValueError: If either Flow is unknown, or the move would create a cycle
         """
-        if flow_name not in self._name_to_parent_name:
+        if flow_name not in workflow.flows.name_to_parent_name:
             msg = f"Flow with name {flow_name} doesn't exist"
             raise ValueError(msg)
-        if new_parent_flow_name not in self._name_to_parent_name:
+        if new_parent_flow_name not in workflow.flows.name_to_parent_name:
             msg = f"Flow with name {new_parent_flow_name} doesn't exist"
             raise ValueError(msg)
         if flow_name == new_parent_flow_name:
@@ -491,16 +495,16 @@ class FlowManager(EngineScoped):
 
         # Walk up from the proposed parent: if we meet the flow being moved, the move would
         # detach that branch from the tree and make the ancestor walk loop forever.
-        ancestor = self._name_to_parent_name[new_parent_flow_name]
+        ancestor = workflow.flows.name_to_parent_name[new_parent_flow_name]
         while ancestor is not None:
             if ancestor == flow_name:
                 msg = (
                     f"Attempted to move Flow '{flow_name}' under '{new_parent_flow_name}', which is already inside it."
                 )
                 raise ValueError(msg)
-            ancestor = self._name_to_parent_name.get(ancestor)
+            ancestor = workflow.flows.name_to_parent_name.get(ancestor)
 
-        self._name_to_parent_name[flow_name] = new_parent_flow_name
+        workflow.flows.name_to_parent_name[flow_name] = new_parent_flow_name
 
     def is_referenced_workflow(self, workflow: WorkflowRuntime, flow: ControlFlow) -> bool:
         """Check if this flow was created by importing a referenced workflow.
@@ -663,7 +667,7 @@ class FlowManager(EngineScoped):
             parent = workflow.context.get_current_flow()
             parent_name = parent.name
 
-        # TODO: FIX THIS LOGIC MESS https://github.com/griptape-ai/griptape-nodes/issues/616
+        # TODO: FIX THIS LOGIC MESS https://github.com/griptape-ai/griptape-nodes-engine/issues/616
 
         if parent_name is not None and parent is None:
             parent = workflow.objects.get_as_type(parent_name, ControlFlow)
@@ -688,7 +692,7 @@ class FlowManager(EngineScoped):
         # when serializing it. It may inform the editor to render it differently.
         workflow_manager = self.engine.workflow_manager
         flow = ControlFlow(name=final_flow_name, engine=self.engine, metadata=request.metadata)
-        workflow.objects.add(final_flow_name, flow)
+        self.engine.object_manager.add_object_by_name_in(workflow, final_flow_name, flow)
         flows = workflow.flows
         flows.name_to_parent_name[final_flow_name] = parent_name
 
@@ -857,8 +861,8 @@ class FlowManager(EngineScoped):
     def on_list_nodes_in_flow_request(self, request: ListNodesInFlowRequest) -> ResultPayload:
         """Answer `request` for the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_list_nodes_in_flow_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_list_nodes_in_flow_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -960,12 +964,24 @@ class FlowManager(EngineScoped):
     def unresolve_all_nodes_in_flow(self, flow_name: str) -> None:
         """Reset all nodes in a flow to UNRESOLVED state.
 
-        Edge method for code not handed a workflow.
+        Edge method for code not handed a workflow; engine and `exe_types` code calls
+        `unresolve_all_nodes_in_flow_in`.
 
         Args:
             flow_name: Name of the flow whose nodes should be unresolved
+
+        Raises:
+            KeyError: No flow of that name is in the open workflow, or no workflow is open.
         """
-        flow = self.get_flow_by_name(flow_name)
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            msg = f"Flow with name {flow_name} doesn't exist"
+            raise KeyError(msg)
+        self.unresolve_all_nodes_in_flow_in(workflow, flow_name)
+
+    def unresolve_all_nodes_in_flow_in(self, workflow: WorkflowRuntime, flow_name: str) -> None:
+        """Reset all nodes in `workflow`'s flow `flow_name` to UNRESOLVED state."""
+        flow = self.get_flow_by_name_in(workflow, flow_name)
         for node in flow.nodes.values():
             node.state = NodeResolutionState.UNRESOLVED
 
@@ -987,8 +1003,8 @@ class FlowManager(EngineScoped):
     def on_create_connection_request(self, request: CreateConnectionRequest) -> ResultPayload:
         """Connect two parameters in the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_create_connection_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_create_connection_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -1078,7 +1094,7 @@ class FlowManager(EngineScoped):
 
         target_param = target_node.get_parameter_by_name(request.target_parameter_name)
         if target_param is None:
-            # TODO: https://github.com/griptape-ai/griptape-nodes/issues/860
+            # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/860
             details = f'Connection failed: "{target_node_name}.{request.target_parameter_name}" not found'
             return CreateConnectionResultFailure(result_details=details)
         # Validate parameter modes accept this type of connection.
@@ -1326,7 +1342,7 @@ class FlowManager(EngineScoped):
 
         # Mark all downstream nodes as dirty when connection is created
         # This ensures dependency graph changes propagate even if values don't change
-        # Matches the pattern used in connection deletion (https://github.com/griptape-ai/griptape-nodes/blob/9f299338193edc4a10f60728172c1ad214d1eb46/src/griptape_nodes/retained_mode/managers/flow_manager.py#L1227)
+        # Matches the pattern used in connection deletion (https://github.com/griptape-ai/griptape-nodes-engine/blob/9f299338193edc4a10f60728172c1ad214d1eb46/src/griptape_nodes/retained_mode/managers/flow_manager.py#L1227)
         if not is_control_parameter and not request.initial_setup:
             target_node.make_node_unresolved(
                 current_states_to_trigger_change_event=set(
@@ -1349,8 +1365,8 @@ class FlowManager(EngineScoped):
     def on_delete_connection_request(self, request: DeleteConnectionRequest) -> ResultPayload:
         """Disconnect two parameters in the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_delete_connection_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_delete_connection_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -1866,8 +1882,8 @@ class FlowManager(EngineScoped):
     async def on_start_local_subflow_request(self, request: StartLocalSubflowRequest) -> ResultPayload:
         """Run a subflow of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_start_local_subflow_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_start_local_subflow_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -1927,6 +1943,7 @@ class FlowManager(EngineScoped):
         subflow_machine = ControlFlowMachine(
             flow.name,
             dag_builder=DagBuilder(workflow.flows.connections),
+            workflow=workflow,
             is_isolated=True,
             engine=self.engine,
         )
@@ -2360,7 +2377,7 @@ class FlowManager(EngineScoped):
             flows.global_flow_queue.task_done()
 
         # Initialize global control flow machine and DAG builder
-        machine = self._make_control_flow_machine(flows, flow.name)
+        machine = self._make_control_flow_machine(workflow, flow.name)
         flows.global_control_flow_machine = machine
         # Set off the request here.
         try:
@@ -2368,9 +2385,7 @@ class FlowManager(EngineScoped):
         except Exception:
             await self._abandon_running_flow(flows)
             raise
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
+        self.engine.event_manager.put_event(workflow.execution_event(InvolvedNodesEvent(involved_nodes=[])))
 
     async def start_run(self, spec: RunSpec) -> ResultPayload:
         """Run `spec` once the current workflow's runs ahead of it end, returning what its request returns.
@@ -2649,14 +2664,12 @@ class FlowManager(EngineScoped):
 
     def _put_run_queued_event(self, run: Run, position: int) -> None:
         self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(
-                    payload=RunQueuedEvent(
-                        run_id=run.run_id,
-                        flow_name=run.flow_name,
-                        position=position,
-                        request_id=run.request_id,
-                    )
+            run.flows.execution_event(
+                RunQueuedEvent(
+                    run_id=run.run_id,
+                    flow_name=run.flow_name,
+                    position=position,
+                    request_id=run.request_id,
                 )
             )
         )
@@ -2732,14 +2745,8 @@ class FlowManager(EngineScoped):
         flows.global_dag_builder.clear()
         logger.debug("Cancelling flow run")
 
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
-            )
-        )
+        self.engine.event_manager.put_event(flows.execution_event(InvolvedNodesEvent(involved_nodes=[])))
+        self.engine.event_manager.put_event(flows.execution_event(ControlFlowCancelledEvent(run_seconds=run_seconds)))
         self._finish_run_if_over(flows)
 
     async def _abandon_running_flow(self, flows: WorkflowFlows) -> None:
@@ -2774,22 +2781,16 @@ class FlowManager(EngineScoped):
             flows.global_control_flow_machine.reset_machine(cancel=True)
         flows.global_single_node_resolution = False
         flows.global_dag_builder.clear()
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent(run_seconds=run_seconds))
-            )
-        )
+        self.engine.event_manager.put_event(flows.execution_event(InvolvedNodesEvent(involved_nodes=[])))
+        self.engine.event_manager.put_event(flows.execution_event(ControlFlowCancelledEvent(run_seconds=run_seconds)))
         self._finish_run_if_over(flows)
 
-    def _make_control_flow_machine(self, flows: WorkflowFlows, flow_name: str) -> ControlFlowMachine:
-        """A machine for a top-level run of `flow_name` over the run state in `flows`."""
+    def _make_control_flow_machine(self, workflow: WorkflowRuntime, flow_name: str) -> ControlFlowMachine:
+        """A machine for a top-level run of `flow_name` in `workflow`."""
         return ControlFlowMachine(
             flow_name,
-            dag_builder=flows.global_dag_builder,
-            flows=flows,
+            dag_builder=workflow.flows.global_dag_builder,
+            workflow=workflow,
             engine=self.engine,
         )
 
@@ -2862,13 +2863,14 @@ class FlowManager(EngineScoped):
     # Internal execution queue helper methods to consolidate redundant operations
     async def _handle_flow_start_if_not_running(
         self,
-        flows: WorkflowFlows,
+        workflow: WorkflowRuntime,
         flow: ControlFlow,
         *,
         debug_mode: bool,
         error_message: str,
     ) -> None:
         """Common logic for starting flow execution if not already running."""
+        flows = workflow.flows
         if not self._flow_is_running(flows):
             if flows.global_flow_queue.empty():
                 raise RuntimeError(error_message)
@@ -2877,7 +2879,7 @@ class FlowManager(EngineScoped):
             flows.global_flow_queue.task_done()
             # Get or create machine
             if flows.global_control_flow_machine is None:
-                flows.global_control_flow_machine = self._make_control_flow_machine(flows, flow.name)
+                flows.global_control_flow_machine = self._make_control_flow_machine(workflow, flow.name)
             await flows.global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
 
     async def _handle_post_execution_queue_processing(self, flows: WorkflowFlows, *, debug_mode: bool) -> None:
@@ -2913,16 +2915,14 @@ class FlowManager(EngineScoped):
             # Emit involved nodes update after adding node to DAG
             involved_nodes = list(flows.global_dag_builder.node_to_reference.keys())
             self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
         else:
             self._raise_if_run_cancelled(flows)
             # Set that we are only working on one node right now!
             flows.global_single_node_resolution = True
             # Get or create machine
-            machine = self._make_control_flow_machine(flows, flow.name)
+            machine = self._make_control_flow_machine(workflow, flow.name)
             flows.global_control_flow_machine = machine
             machine.context.current_nodes = [node]
             resolution_machine = machine.resolution_machine
@@ -2943,9 +2943,7 @@ class FlowManager(EngineScoped):
             # Send a InvolvedNodesRequest
 
             self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
             try:
                 await machine.start_flow(start_node=node, end_node=node, debug_mode=debug_mode)
@@ -2960,20 +2958,14 @@ class FlowManager(EngineScoped):
                 error_message = resolution_machine.get_error_message()
                 flows.global_single_node_resolution = False
                 machine.context.current_nodes = []
-                self.engine.event_manager.put_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[]))
-                    )
-                )
+                self.engine.event_manager.put_event(workflow.execution_event(InvolvedNodesEvent(involved_nodes=[])))
                 # Re-raise with the original error message
                 raise RuntimeError(error_message or "Node resolution failed")
 
             if resolution_machine.is_complete():
                 flows.global_single_node_resolution = False
                 machine.context.current_nodes = []
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-            )
+            self.engine.event_manager.put_event(workflow.execution_event(InvolvedNodesEvent(involved_nodes=[])))
 
     async def single_execution_step(
         self,
@@ -2984,7 +2976,7 @@ class FlowManager(EngineScoped):
         flows = workflow.flows
         # do a granular step
         await self._handle_flow_start_if_not_running(
-            flows,
+            workflow,
             flow,
             debug_mode=True,
             error_message="Flow has not yet been started. Cannot step while no flow has begun.",
@@ -3008,7 +3000,7 @@ class FlowManager(EngineScoped):
         flows = workflow.flows
         # It won't call single_node_step without an existing flow running from US.
         await self._handle_flow_start_if_not_running(
-            flows,
+            workflow,
             flow,
             debug_mode=True,
             error_message="Flow has not yet been started. Cannot step while no flow has begun.",
@@ -3034,7 +3026,7 @@ class FlowManager(EngineScoped):
     async def continue_executing(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
         flows = workflow.flows
         await self._handle_flow_start_if_not_running(
-            flows,
+            workflow,
             flow,
             debug_mode=False,
             error_message="Flow has not yet been started. Cannot step while no flow has begun.",
@@ -3234,7 +3226,7 @@ class FlowManager(EngineScoped):
     def exclude_subflow_group_children(nodes: list[BaseNode]) -> list[BaseNode]:
         """Drop nodes owned by a SubflowNodeGroup; they run inside their group's own subflow.
 
-        This is a scope/ownership decision kept out of classify_nodes_for_dag so the classifier
+        This is a scope/ownership decision kept out of classify_nodes_for_dag_in so the classifier
         stays scope-agnostic. Only the top-level run (get_start_node_queue) applies it, to keep a
         group's members from being seeded into the cross-flow DAG (they run when the group's proxy
         node executes its subflow). The isolated-subflow path must NOT apply it: inside a group's
@@ -3242,17 +3234,6 @@ class FlowManager(EngineScoped):
         strand the members and seed only the start node.
         """
         return [node for node in nodes if not isinstance(node.parent_group, SubflowNodeGroup)]
-
-    def classify_nodes_for_dag(self, nodes: list[BaseNode]) -> DagNodeCategories:
-        """Bucket nodes of the open workflow into start / control-entry / data-sink roles for DAG seeding.
-
-        Edge method for code not handed a workflow; engine code calls `classify_nodes_for_dag_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        workflow = self.engine.current_workflow()
-        return self.classify_nodes_for_dag_in(workflow, nodes)
 
     def classify_nodes_for_dag_in(self, workflow: WorkflowRuntime, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
         """Bucket a scope of nodes into start / control-entry / data-sink roles for DAG seeding.
@@ -3357,9 +3338,18 @@ class FlowManager(EngineScoped):
 
         return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes)
 
-    def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
+    def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:
         """Edge method for code not handed a workflow."""
-        global_connections = self.get_connections()
+        return self.get_connected_input_from_node_in(self.engine.current_workflow(), flow, node)
+
+    def get_connected_input_from_node_in(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,  # noqa: ARG002
+        node: BaseNode,
+    ) -> list[tuple[BaseNode, Parameter]]:
+        """See `get_connected_input_from_node`, for `workflow`'s connections."""
+        global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.incoming_index:
             connection_ids = [
@@ -3370,9 +3360,18 @@ class FlowManager(EngineScoped):
                 connections.append((connection.source_node, connection.source_parameter))
         return connections
 
-    def get_connected_output_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
+    def get_connected_output_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:
         """Edge method for code not handed a workflow."""
-        global_connections = self.get_connections()
+        return self.get_connected_output_from_node_in(self.engine.current_workflow(), flow, node)
+
+    def get_connected_output_from_node_in(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,  # noqa: ARG002
+        node: BaseNode,
+    ) -> list[tuple[BaseNode, Parameter]]:
+        """See `get_connected_output_from_node`, for `workflow`'s connections."""
+        global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.outgoing_index:
             connection_ids = [
@@ -3385,12 +3384,22 @@ class FlowManager(EngineScoped):
 
     def get_connected_input_parameters(
         self,
-        flow: ControlFlow,  # noqa: ARG002
+        flow: ControlFlow,
         node: BaseNode,
         param: Parameter,
     ) -> list[tuple[BaseNode, Parameter]]:
         """Edge method for code not handed a workflow."""
-        global_connections = self.get_connections()
+        return self.get_connected_input_parameters_in(self.engine.current_workflow(), flow, node, param)
+
+    def get_connected_input_parameters_in(
+        self,
+        workflow: WorkflowRuntime,
+        flow: ControlFlow,  # noqa: ARG002
+        node: BaseNode,
+        param: Parameter,
+    ) -> list[tuple[BaseNode, Parameter]]:
+        """See `get_connected_input_parameters`, for `workflow`'s connections."""
+        global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.incoming_index:
             incoming_params = global_connections.incoming_index[node.name]
@@ -3402,7 +3411,11 @@ class FlowManager(EngineScoped):
 
     def get_connections_on_node(self, node: BaseNode) -> list[BaseNode] | None:
         """Edge method for code not handed a workflow."""
-        return self._connected_nodes(self.get_connections(), node)
+        return self.get_connections_on_node_in(self.engine.current_workflow(), node)
+
+    def get_connections_on_node_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode] | None:
+        """See `get_connections_on_node`, for `workflow`'s connections."""
+        return self._connected_nodes(workflow.flows.connections, node)
 
     def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:
         """Edge method for code not handed a workflow; engine code calls `get_all_connected_nodes_in`."""

@@ -107,7 +107,7 @@ class ExecutionStatusComponent:
         self._update_parameter_value(self._result_details, result_details)
         # Update display label: show warning emoji only on actual failure (not placeholder/initialization messages)
         # While string matching is not the best practice, it's currently the only way to check for placeholder messages.
-        # TODO: use a better approach to check for placeholder messages. https://github.com/griptape-ai/griptape-nodes/issues/3686
+        # TODO: use a better approach to check for placeholder messages. https://github.com/griptape-ai/griptape-nodes-engine/issues/3686
         is_placeholder = result_details in (
             "<Results will appear when the node executes>",
             "Beginning execution...",

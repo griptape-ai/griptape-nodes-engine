@@ -79,6 +79,48 @@ class TestOpenWorkflowSet:
         assert workflows.get("def") is workflow
         assert not workflows.is_open("abc")
 
+    def test_a_moved_workflow_is_still_found_by_its_old_id_when_following_moves(self) -> None:
+        workflows = OpenWorkflowSet(MagicMock())
+        workflow = workflows.open("abc")
+
+        workflows.move(workflow, "def")
+        workflows.move(workflow, "ghi")
+
+        assert workflows.find("abc") is None
+        assert workflows.find_following_moves("abc") is workflow
+        assert workflows.find_following_moves("def") is workflow
+
+    def test_closing_a_moved_workflow_forgets_its_old_ids(self) -> None:
+        workflows = OpenWorkflowSet(MagicMock())
+        workflow = workflows.open("abc")
+        workflows.move(workflow, "def")
+
+        workflows.close(workflow)
+
+        assert workflows.find_following_moves("abc") is None
+
+    def test_an_old_id_opened_again_names_the_workflow_opened_under_it(self) -> None:
+        workflows = OpenWorkflowSet(MagicMock(), allow_several_open=True)
+        moved = workflows.open("abc")
+        workflows.move(moved, "def")
+
+        reopened = workflows.open("abc")
+
+        assert workflows.find_following_moves("abc") is reopened
+        assert workflows.find_following_moves("def") is moved
+
+    def test_moving_onto_an_old_id_takes_it_back(self) -> None:
+        workflows = OpenWorkflowSet(MagicMock(), allow_several_open=True)
+        first = workflows.open("abc")
+        workflows.move(first, "def")
+        second = workflows.open("xyz")
+
+        workflows.move(second, "abc")
+        workflows.close(second)
+
+        assert workflows.find_following_moves("abc") is None
+        assert workflows.find_following_moves("def") is first
+
     def test_move_refuses_an_id_already_open(self) -> None:
         workflows = OpenWorkflowSet(MagicMock())
         workflow = workflows.open("abc")

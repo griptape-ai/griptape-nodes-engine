@@ -176,7 +176,7 @@ class Connections:
         connections_from_node = connections.get(node.name, {})
 
         connection_id = connections_from_node.get(parameter.name, [])
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/859
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/859
         if not len(connection_id):
             return None
         # Right now, our special case is that it is ok to have multiple inputs to a CONTROL_TYPE parameter, so if we're going upstream, it's ok. And it's ok to have multiple downstream outputs from a data type parameter.
