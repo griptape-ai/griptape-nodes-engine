@@ -2371,7 +2371,7 @@ class EventTranslationContext:
         wrapped_class = type(wrapped_event)
         try:
             new_wrapped = wrapped_class(
-                payload=translated_payload, workflow_id=getattr(wrapped_event, "workflow_id", None)
+                payload=translated_payload, open_workflow_id=getattr(wrapped_event, "open_workflow_id", None)
             )
         except Exception:
             return None
