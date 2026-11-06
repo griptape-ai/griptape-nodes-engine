@@ -227,6 +227,8 @@ default.extend-ignore-re = [
 [tool.typos.default.extend-words]
 # HALD CLUT is a Color Lookup Table technique named after its inventor
 HALD = "HALD"
+# The editor's name for its 3D file type, reused as a `FileFormat` kind
+threed = "threed"
 
 [tool.pyright]
 venvPath = "."
