@@ -113,8 +113,8 @@ def test_round_trip_request_result_both_directions() -> None:
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
-        assert pair.parent.request({"x": 1, "y": 2}, timeout_s=REQUEST_TIMEOUT_S) == {"sum": 3}
-        assert pair.child.request({"ping": True}, timeout_s=REQUEST_TIMEOUT_S) == {"echo": {"ping": True}}
+        assert pair.parent.request({"ping": True}, timeout_s=REQUEST_TIMEOUT_S) == {"echo": {"ping": True}}
+        assert pair.child.request({"x": 1, "y": 2}, timeout_s=REQUEST_TIMEOUT_S) == {"sum": 3}
     finally:
         pair.parent.close()
         pair.child.close()
