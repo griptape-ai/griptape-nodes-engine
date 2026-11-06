@@ -5,14 +5,11 @@ import contextlib
 import functools
 import json
 import logging
-import math
 import os
-import re
 import sys
-import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anyio
 
@@ -23,18 +20,23 @@ from griptape_nodes.retained_mode.engine_transports import (
     DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
     EngineNotFoundError,
 )
-from griptape_nodes.retained_mode.events import converters, worker_events
+from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import (
     ConfigChanged,
     CurrentProjectChanged,
-    ReportGeneralPurposeWorkerReadyRequest,
-    ReportGeneralPurposeWorkerReadyResultSuccess,
     ReportLibraryLoadedRequest,
     SecretChanged,
 )
 from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
 from griptape_nodes.retained_mode.events.converters import EventSerializationError
-from griptape_nodes.retained_mode.managers.event_manager import require_request_sender
+from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetSecretValueRequest,
+    GetSecretValueResultFailure,
+    GetSecretValueResultSuccess,
+)
+from griptape_nodes.retained_mode.managers.event_manager import HostedWorkerRequest, require_request_sender
 from griptape_nodes.retained_mode.managers.external_environment import (
     WorkerCommand,
     WorkerCommandRefusal,
@@ -45,13 +47,12 @@ from griptape_nodes.retained_mode.managers.external_environment import (
 )
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
+from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.managers.settings import (
     DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY,
     DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY,
     DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY,
     DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY,
-    WORKER_HEARTBEAT_INTERVAL_KEY,
-    WORKER_HEARTBEAT_TIMEOUT_KEY,
     WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
     ReleaseSettings,
 )
@@ -60,10 +61,19 @@ from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.serialization.values import untag
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
+from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.version_utils import engine_version
 from griptape_nodes.worker.channel import ChannelClosedError, ChannelListener
-from griptape_nodes.worker.parent import ParentEnd
-from griptape_nodes.worker.wire import EVENT_RESULT, WORKER_ENGINE_ID_ENV, event_request_envelope
+from griptape_nodes.worker.hosted import HostedWorkerEnd
+from griptape_nodes.worker.parent import ParentEnd, apply_worker_notifications, decide_worker_checkpoint
+from griptape_nodes.worker.wire import (
+    AUTHORIZATION_CHECKPOINT,
+    EVENT_RESULT,
+    WORKER_ENGINE_ID_ENV,
+    WireFormatError,
+    event_request_envelope,
+    read_event_request,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine
@@ -71,7 +81,8 @@ if TYPE_CHECKING:
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayload
-    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.events.worker_events import LibraryLoadReport
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
     from griptape_nodes.retained_mode.managers.run_queue import Run
     from griptape_nodes.worker.channel import Channel
     from griptape_nodes.worker.wire import WorkerHello
@@ -93,14 +104,18 @@ _ENGINE_REQUEST_TIMEOUT_S = 60.0
 _REPORT_ATTEMPTS = 5
 _REPORT_RETRY_PAUSE_S = 10.0
 
-# Set on a worker this engine runs for another engine, to this engine's ID. The worker asks this engine,
-# before each node, whether the lease the node was sent under holds it.
-HOST_ENGINE_ID_ENV = "GTN_HOST_ENGINE_ID"
-
 # Never in the environment of a worker this engine starts for itself: the worker reads its secrets
 # from this engine, so a credential its environment carried would be one this engine did not give it.
 # Nor this engine's own identity: the worker is given one of its own.
 _LOCAL_WORKER_WITHHELD_ENV = (LICENSE_SECRET_NAME, API_KEY_SECRET_NAME, "GTN_ORCHESTRATOR_ENGINE_ID")
+
+# The broadcasts a worker another engine runs for this one is sent, by request type name, since the
+# requests are defined in a module that imports this one. It reads its configuration on the machine it
+# runs on, and asks this engine for each secret as it needs it, so neither reload is sent.
+_SENT_TO_HOSTED_WORKERS = frozenset({"ActivateProjectRequest", "DropLocalObjectsRequest", "DropAllLocalObjectsRequest"})
+
+# The secrets a worker another engine runs for this one is answered with this engine's license session for.
+_CLOUD_CREDENTIAL_SECRET_NAMES = frozenset({LICENSE_SECRET_NAME, API_KEY_SECRET_NAME})
 
 # Why a node's local worker went away, when nothing that stopped it said otherwise.
 _LOCAL_WORKER_STOPPED = "the worker process running it stopped."
@@ -141,6 +156,7 @@ class _HostedWorker:
     worker_key: str
     engine_id: str
     session_id: str
+    library_name: str
     # None until the process exists. Stopping compares it to the managed process for the key, which a
     # newer start for the same library may already have replaced.
     process: asyncio.subprocess.Process | None = None
@@ -148,6 +164,11 @@ class _HostedWorker:
     started: asyncio.Event = field(default_factory=asyncio.Event)
     # Reports the process's exit to the artist's engine, done once that engine has answered.
     exit_watcher: asyncio.Task | None = None
+    # The channel to the worker and the end that carries it to the artist's engine, once it connects.
+    channel: Channel | None = None
+    end: HostedWorkerEnd | None = None
+    # Whether it ended on its own, as when its channel closed or it never connected, rather than being stopped.
+    ended_on_its_own: bool = False
 
 
 @dataclass
@@ -216,22 +237,20 @@ class WorkerRegistration:
     general-purpose workers.
     """
 
-    # Empty for a worker this engine started for itself, which is reached through `channel`.
+    # Empty: every worker is reached through `channel`, or through the engine that runs it.
     request_topic: str
     worker_key: str | None
-    # Challenges sent since this worker last answered one. Eviction counts these rather than
-    # measuring elapsed time, because the sweep shares a loop with library load: a wall-clock
-    # timeout charges the orchestrator's own latency to the worker and evicts one that was
-    # never asked.
-    unanswered_challenges: int = 0
     # Engine ID of the engine that runs this worker, or None for a local worker.
     host_engine_id: str | None = None
     # The private channel to a worker this engine started for itself, and its process. None for a
-    # worker that reached this engine over the transport.
+    # worker another engine runs for this one.
     channel: Channel | None = None
     process: asyncio.subprocess.Process | None = None
     # Why this engine is done with the worker, once it has decided. What was waiting on it fails with this.
     gone_reason: str | None = None
+    # Set with `gone_reason`. A request to a worker another engine runs waits on that engine's answer,
+    # which nothing here ends, so it watches this instead.
+    gone: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -250,29 +269,18 @@ class _WorkerTransport:
 
 
 class WorkerManager(EngineScoped):
-    """Manages worker registration, heartbeating, eviction, and event routing.
+    """Manages the worker processes an engine runs, for itself and for other engines, and routing to them.
 
-    Encapsulates all state and logic related to worker engines on both the
-    orchestrator side (registry, heartbeat challenges, eviction, result relay)
-    and the worker side (heartbeat response, self-termination monitor).
+    Each worker is this engine's child process on a private channel. A worker another engine runs for
+    this one is reached through that engine, and one this engine runs for another engine has its
+    traffic carried to that engine.
 
     Transport operations (subscribe, unsubscribe, send message) are injected
     as callables so this class has no direct dependency on WebSocket plumbing.
     """
 
-    DEFAULT_HEARTBEAT_INTERVAL_S: float = 5.0
-    DEFAULT_HEARTBEAT_TIMEOUT_S: float = 15.0
-    # Floor on the configured interval. Zero or negative is a configuration a human can write and
-    # the code cannot run: the interval divides the timeout to size the challenge allowance, and it
-    # is the sleep in both heartbeat loops, so a non-positive value is a ZeroDivisionError on one
-    # path and a hot loop on the other. Low enough that any interval meant seriously survives it.
-    MINIMUM_HEARTBEAT_INTERVAL_S: float = 0.1
-    # Floor on the silence a worker tolerates before shutting itself down. Deliberately above the
-    # heartbeat timeout; see `orchestrator_silence_allowed_s` for why the two sides differ.
-    MINIMUM_ORCHESTRATOR_SILENCE_S: float = 30.0
     # How long a worker may take to load its library (venv creation, installs, imports): the ceiling
-    # on `wait_until_executable` and on each worker's reply to a project-switch fan-out. Not a
-    # heartbeat bound on either side: a worker keeps answering challenges while it loads.
+    # on `wait_until_executable` and on each worker's reply to a project-switch fan-out.
     DEFAULT_LIBRARY_LOAD_TIMEOUT_S: float = 600.0
     # How long to wait for a worker to exit after SIGTERM before escalating to
     # SIGKILL. Workers convert SIGTERM into a cooperative shutdown on their event
@@ -287,8 +295,6 @@ class WorkerManager(EngineScoped):
     # that will never resolve.
     DEFAULT_TERMINATE_HOP_TIMEOUT_S: float = 15.0
 
-    _WORKER_RESPONSE_TOPIC_RE: re.Pattern = re.compile(r"sessions/[^/]+/workers/(?P<worker_engine_id>[^/]+)/response$")
-
     def __init__(
         self,
         *,
@@ -300,8 +306,8 @@ class WorkerManager(EngineScoped):
         self._transport: _WorkerTransport | None = None
 
         # Workers another engine was asked to start, by the engine ID this engine chose for them,
-        # from sending the start until the worker registers, the start fails, or it is withdrawn.
-        # Their worker registers here like a local one.
+        # from sending the start until that engine reports the worker ready, the start fails, or it
+        # is withdrawn.
         self._remote_starts: dict[str, _RemoteStart] = {}
 
         # This engine's registration with each engine it sends work to, by (host_engine_id, session).
@@ -335,10 +341,6 @@ class WorkerManager(EngineScoped):
         # Reports and lease releases sent to other engines from synchronous callbacks, held until answered.
         self._engine_notices: set[asyncio.Task] = set()
 
-        # The engine that runs this worker for another engine, which decides when it may run each node,
-        # or None for any other engine.
-        self._host_engine_id: str | None = os.environ.get(HOST_ENGINE_ID_ENV)
-
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
 
@@ -366,9 +368,6 @@ class WorkerManager(EngineScoped):
         # tasks does not GC a watcher before its process ends.
         self._exit_watchers: set[asyncio.Task] = set()
 
-        # Worker-side: monotonic timestamp of last heartbeat received from the orchestrator
-        self._worker_heartbeat_last_received_at: float = 0.0
-
         # Fire-and-forget broadcast tasks scheduled from sync callers; held here so
         # the event loop's weak-ref to tasks does not GC them before completion.
         self._inflight_broadcast_tasks: set[asyncio.Task] = set()
@@ -384,21 +383,6 @@ class WorkerManager(EngineScoped):
         self._worker_unavailable: dict[str | None, _WorkerUnavailable] = {}
 
         config = engine.config_manager
-        configured_interval_s: float = config.get_config_value(
-            WORKER_HEARTBEAT_INTERVAL_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_INTERVAL_S, cast_type=float
-        )
-        self.heartbeat_interval_s: float = max(WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S, configured_interval_s)
-        if self.heartbeat_interval_s != configured_interval_s:
-            logger.warning(
-                "Worker heartbeat interval of %.3gs cannot be used; running at the %.3gs minimum instead. "
-                "Set '%s' to a positive number of seconds.",
-                configured_interval_s,
-                self.heartbeat_interval_s,
-                WORKER_HEARTBEAT_INTERVAL_KEY,
-            )
-        self.heartbeat_timeout_s: float = config.get_config_value(
-            WORKER_HEARTBEAT_TIMEOUT_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_TIMEOUT_S, cast_type=float
-        )
         self.library_load_timeout_s: float = config.get_config_value(
             WORKER_LIBRARY_LOAD_TIMEOUT_KEY,
             default=WorkerManager.DEFAULT_LIBRARY_LOAD_TIMEOUT_S,
@@ -407,6 +391,7 @@ class WorkerManager(EngineScoped):
 
         event_manager.register_request_handlers(self)
         event_manager.recognize_sessions(self.has_registered_session)
+        event_manager.admit_hosted_worker_requests(self.admit_hosted_worker_request)
 
         # Subscribe to domain events from ConfigManager / SecretsManager so
         # those managers don't have to know workers exist. The listeners are
@@ -415,35 +400,6 @@ class WorkerManager(EngineScoped):
         event_manager.add_listener_to_app_event(ConfigChanged, self._on_config_changed)
         event_manager.add_listener_to_app_event(SecretChanged, self._on_secret_changed)
         event_manager.add_listener_to_app_event(CurrentProjectChanged, self._on_current_project_changed)
-
-    @property
-    def unanswered_challenges_allowed(self) -> int:
-        """How many challenges a worker may leave unanswered before it is evicted.
-
-        Derived from the two configured values rather than stored, so tuning either takes effect
-        without a restart. Rounded up, not nearest: with a 12s timeout and a 5s interval, nearest
-        gives 2 challenges and evicts after about 10s, tolerating less silence than the timeout
-        asks for. At least one, so no configuration evicts a worker the first time it is asked.
-
-        Note that the timeout is read two ways. Here it sizes an allowance in challenges, which is
-        why a slow sweep cannot evict a worker that was never asked. On the worker,
-        `orchestrator_silence_allowed_s` turns it into elapsed time, because a worker can only
-        measure silence from a peer it cannot poll.
-        """
-        return max(1, math.ceil(self.heartbeat_timeout_s / self.heartbeat_interval_s))
-
-    @property
-    def orchestrator_silence_allowed_s(self) -> float:
-        """How much orchestrator silence a worker tolerates before shutting itself down.
-
-        Above `heartbeat_timeout_s`, because the two sides do not measure the same thing. The
-        orchestrator counts unanswered challenges, so its sweep running late costs a worker nothing.
-        The worker has only wall-clock time, and a late sweep is indistinguishable there from an
-        orchestrator that is gone. That sweep shares an event loop with library loading and has been
-        measured 18 seconds late during boot, so a worker held to the eviction timeout would kill
-        itself over the orchestrator's own latency.
-        """
-        return max(self.heartbeat_timeout_s, WorkerManager.MINIMUM_ORCHESTRATOR_SILENCE_S)
 
     @property
     def _tx(self) -> _WorkerTransport:
@@ -476,65 +432,7 @@ class WorkerManager(EngineScoped):
             request_client=request_client,
         )
 
-    @handles(worker_events.RegisterWorkerRequest)
-    async def handle_register_worker_request(
-        self,
-        request: worker_events.RegisterWorkerRequest,
-    ) -> worker_events.RegisterWorkerResultSuccess | worker_events.RegisterWorkerResultFailure:
-        """Handle a worker registration request from a worker engine."""
-        wid = request.worker_engine_id
-        if request.engine_version != engine_version:
-            details = (
-                f"Worker {wid} reported engine_version '{request.engine_version}' "
-                f"but orchestrator is running engine_version '{engine_version}'. "
-                "Workers and orchestrators must share an engine version because the "
-                "wire shape of every event is tied to the engine build."
-            )
-            return worker_events.RegisterWorkerResultFailure(result_details=details)
-        remote = self._remote_starts.get(wid)
-        assigned_engine = self._engine_for_library(request.library_name) if request.library_name else None
-        if remote is not None and remote.library_name != request.library_name:
-            details = (
-                f"Attempted to register worker {wid} for library '{request.library_name}'. Failed because "
-                f"this engine asked {remote.host_engine_id} to start that worker for library '{remote.library_name}'."
-            )
-            return worker_events.RegisterWorkerResultFailure(result_details=details)
-        if remote is None and assigned_engine is not None:
-            details = (
-                f"Attempted to register worker {wid} for library '{request.library_name}'. Failed because "
-                f"this engine did not ask {assigned_engine} to start a worker with that ID."
-            )
-            return worker_events.RegisterWorkerResultFailure(result_details=details)
-        host_engine_id = None
-        if remote is not None:
-            del self._remote_starts[wid]
-            host_engine_id = remote.host_engine_id
-
-        session_id = self.engine.get_session_id()
-        request_topic = f"sessions/{session_id}/workers/{wid}/request"
-        self._workers[wid] = WorkerRegistration(
-            request_topic=request_topic, worker_key=request.library_name, host_engine_id=host_engine_id
-        )
-
-        if request.library_name:
-            logger.debug("Worker registered: %s → library '%s'", wid, request.library_name)
-        else:
-            logger.debug("Worker registered: %s (general-purpose)", wid)
-        if host_engine_id is not None:
-            logger.debug("Worker %s runs on engine %s", wid, host_engine_id)
-
-        response_topic = f"sessions/{session_id}/workers/{wid}/response"
-        await self._tx.subscribe_to_topic(response_topic)
-        # Put the worker on this orchestrator's project rather than answering with it. One sender
-        # and one adoption path, so a switch landing mid-registration is a second message on the
-        # same channel instead of a reply racing a fan-out.
-        await self._activate_project_on_worker(wid, request_topic)
-        return worker_events.RegisterWorkerResultSuccess(
-            worker_engine_id=wid,
-            result_details="Worker registered successfully.",
-        )
-
-    async def _activate_project_on_worker(self, worker_engine_id: str, worker_request_topic: str) -> None:
+    async def _activate_project_on_worker(self, worker_engine_id: str) -> None:
         """Tell one worker which project to be on, as of the last activation that committed.
 
         Sent without awaiting a reply: registration must not depend on a round trip back into the
@@ -554,118 +452,7 @@ class WorkerManager(EngineScoped):
         await self.forward_event_to_worker(
             EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation)),
             worker_engine_id=worker_engine_id,
-            worker_request_topic=worker_request_topic,
         )
-
-    @handles(worker_events.WorkerHeartbeatRequest)
-    def handle_worker_heartbeat_request(
-        self,
-        request: worker_events.WorkerHeartbeatRequest,
-    ) -> worker_events.WorkerHeartbeatResultSuccess:
-        """Respond to an orchestrator heartbeat challenge."""
-        self._worker_heartbeat_last_received_at = time.monotonic()
-        return worker_events.WorkerHeartbeatResultSuccess(
-            heartbeat_id=request.heartbeat_id,
-            result_details="Worker alive.",
-        )
-
-    @handles(worker_events.UnregisterWorkerRequest)
-    async def handle_unregister_worker_request(
-        self,
-        request: worker_events.UnregisterWorkerRequest,
-    ) -> worker_events.UnregisterWorkerResultSuccess | worker_events.UnregisterWorkerResultFailure:
-        """Handle a worker unregister request from a worker engine."""
-        wid = request.worker_engine_id
-        session_id = self.engine.get_session_id()
-        registration = self._workers.pop(wid, None)
-        worker_key = registration.worker_key if registration else None
-        response_topic = f"sessions/{session_id}/workers/{wid}/response"
-        await self._tx.unsubscribe_from_topic(response_topic)
-        # Remove the managed process entry so a new worker can be spawned for this key.
-        if registration is not None:
-            removed = self._managed_worker_processes.pop(worker_key, None)
-            if removed is not None:
-                logger.debug(
-                    "Worker unregistered: removed managed process for key '%s' (pid %s)", worker_key, removed.pid
-                )
-            # A worker leaving before its library settled releases nothing otherwise: the registry pop
-            # above also removes the entry eviction would have released it through. A clean shutdown
-            # unregisters too, but with its gate already set, so has_settled keeps it out.
-            if not self.has_settled(worker_key):
-                self.note_worker_unavailable(worker_key, "the worker process that runs it shut down before loading it.")
-        logger.debug("Worker unregistered: %s", wid)
-        return worker_events.UnregisterWorkerResultSuccess(worker_engine_id=wid, result_details="Worker unregistered.")
-
-    async def orchestrator_heartbeat_loop(self) -> None:
-        """Challenge each registered worker on an interval; evict those that stop answering."""
-        while True:
-            await asyncio.sleep(self.heartbeat_interval_s)
-            if not self._workers:
-                continue
-
-            for wid in [
-                wid
-                for wid, registration in self._workers.items()
-                if registration.unanswered_challenges >= self.unanswered_challenges_allowed
-            ]:
-                await self.evict_worker(wid)
-
-            session_id = self.engine.get_session_id()
-            for wid, registration in list(self._workers.items()):
-                # A local worker's channel ending is its liveness signal; it is never challenged.
-                if registration.channel is not None:
-                    continue
-                hb = EventRequest(
-                    request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
-                    response_topic=f"sessions/{session_id}/workers/{wid}/response",
-                )
-                # Only a challenge that went out counts against the worker, and a send that fails
-                # must not end the loop: the transport raises while a connection is re-establishing,
-                # and both charging that to the worker and leaving nothing to evict it are the
-                # orchestrator's problem becoming the worker's.
-                try:
-                    await self._tx.send_message("EventRequest", converters.engine.dumps(hb), registration.request_topic)
-                except Exception:
-                    logger.warning(
-                        "Could not challenge worker %s on '%s'; not counting it against the worker.",
-                        wid,
-                        registration.request_topic,
-                        exc_info=True,
-                    )
-                    continue
-                registration.unanswered_challenges += 1
-                logger.debug(
-                    "Challenged worker %s on '%s'; %d unanswered of %d allowed.",
-                    wid,
-                    registration.request_topic,
-                    registration.unanswered_challenges,
-                    self.unanswered_challenges_allowed,
-                )
-
-    async def worker_heartbeat_monitor(self) -> None:
-        """Shut down the worker if orchestrator heartbeats stop arriving.
-
-        Enforced from the start, as the orchestrator's side is: it challenges a worker from the
-        moment the worker registers, with no grace period. A worker loading its library keeps
-        answering, because the host answers heartbeats on a different event loop from the one that
-        loads libraries. Silence is measured from the later of the last heartbeat and this monitor
-        starting, so a first challenge still in flight is not counted as silence.
-
-        Tolerates `orchestrator_silence_allowed_s` rather than the eviction timeout, which is longer
-        by the margin the orchestrator's sweep needs to run late without being mistaken for a dead one.
-
-        Does not mutate `_worker_heartbeat_last_received_at`; that attribute is owned by
-        `handle_worker_heartbeat_request`.
-        """
-        started_at = time.monotonic()
-        while True:
-            await asyncio.sleep(self.heartbeat_interval_s)
-            last_heard_at = max(self._worker_heartbeat_last_received_at, started_at)
-            elapsed = time.monotonic() - last_heard_at
-            if elapsed > self.orchestrator_silence_allowed_s:
-                msg = f"Orchestrator heartbeat lost ({elapsed:.1f}s since last heartbeat); worker is shutting down."
-                logger.warning(msg)
-                raise RuntimeError(msg)
 
     def is_worker_running_or_starting(self, worker_key: str | None) -> bool:
         """Whether a worker for worker_key has been requested, is a process this orchestrator spawned, or is registered.
@@ -695,47 +482,6 @@ class WorkerManager(EngineScoped):
             if registration.worker_key == key:
                 return wid, registration.request_topic
         return None
-
-    async def spawn_worker(
-        self,
-        args: list[str],
-        worker_key: str | None,
-        *,
-        library_name: str | None = None,
-        worker_engine_id: str | None = None,
-        environ_overrides: dict[str, str] | None = None,
-    ) -> None:
-        """Spawn a worker subprocess for another engine's session using the given command args.
-
-        worker_key is an opaque identifier used to track the process and prevent
-        duplicate spawns. Callers are responsible for constructing the args list.
-        library_name is the library whose execution environment the worker imports from, when the
-        key is not that name. worker_engine_id is the id the worker takes, when the caller needs it
-        before the worker starts. environ_overrides are set in the worker's environment last.
-        """
-
-        async def environ() -> dict[str, str]:
-            worker_environ = await self._base_worker_environ(worker_key, library_name)
-            worker_environ["GTN_ENGINE_ID"] = worker_engine_id or str(uuid.uuid4())
-            # Stamp the spawning orchestrator's id so the worker can report it in its discovery
-            # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
-            # The orchestrator always has an id by the time it spawns a worker; guard the None
-            # case anyway so a subprocess env value is never None.
-            orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
-            if orchestrator_engine_id is not None:
-                worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
-            worker_environ.update(environ_overrides or {})
-            return worker_environ
-
-        proc = await self._start_worker_process(args, worker_key, environ)
-        if proc is None:
-            return
-        # Started on this loop, the only one that may await proc.wait().
-        watcher = create_task_bound_to_no_workflow(
-            asyncio.get_running_loop(), self._settle_when_worker_exits_early(worker_key, proc)
-        )
-        self._exit_watchers.add(watcher)
-        watcher.add_done_callback(self._exit_watchers.discard)
 
     async def _spawn_local_worker(self, args: list[str], worker_key: str | None) -> None:
         """Start a worker this engine runs for itself, as its child on a private channel, and take it on.
@@ -769,8 +515,37 @@ class WorkerManager(EngineScoped):
         self, worker_key: str | None, proc: asyncio.subprocess.Process, listener: ChannelListener
     ) -> Channel | None:
         """Wait for a just-started local worker to connect, or settle why it never will. None when it did not."""
-        timeout_s = self.library_load_timeout_s
-        accepting = asyncio.ensure_future(asyncio.to_thread(listener.accept, timeout_s))
+        try:
+            channel = await self._await_worker_connection(proc, listener)
+        except TimeoutError:
+            logger.error(
+                "Worker for key '%s' (pid %s) did not connect within %.0fs; stopping it.",
+                worker_key,
+                proc.pid,
+                self.library_load_timeout_s,
+            )
+            if self._managed_worker_processes.get(worker_key) is proc:
+                del self._managed_worker_processes[worker_key]
+                await self._terminate_managed_process(worker_key, proc)
+                self.note_worker_unavailable(
+                    worker_key,
+                    f"its worker process did not connect to this engine within {self.library_load_timeout_s:.0f} seconds.",
+                )
+            return None
+        if channel is None:
+            self._note_early_exit(worker_key, proc, proc.returncode)
+            return None
+        return channel
+
+    async def _await_worker_connection(
+        self, proc: asyncio.subprocess.Process, listener: ChannelListener
+    ) -> Channel | None:
+        """Wait for a just-started worker to connect. None when its process exited first.
+
+        Raises:
+            TimeoutError: It did not connect within the library load timeout.
+        """
+        accepting = asyncio.ensure_future(asyncio.to_thread(listener.accept, self.library_load_timeout_s))
         exiting = asyncio.ensure_future(proc.wait())
         try:
             done, _ = await asyncio.wait({accepting, exiting}, return_when=asyncio.FIRST_COMPLETED)
@@ -785,24 +560,8 @@ class WorkerManager(EngineScoped):
             with contextlib.suppress(TimeoutError):
                 late = await accepting
                 late.close()
-            self._note_early_exit(worker_key, proc, proc.returncode)
             return None
-        try:
-            return accepting.result()
-        except TimeoutError:
-            logger.error(
-                "Worker for key '%s' (pid %s) did not connect within %.0fs; stopping it.",
-                worker_key,
-                proc.pid,
-                timeout_s,
-            )
-            if self._managed_worker_processes.get(worker_key) is proc:
-                del self._managed_worker_processes[worker_key]
-                await self._terminate_managed_process(worker_key, proc)
-                self.note_worker_unavailable(
-                    worker_key, f"its worker process did not connect to this engine within {timeout_s:.0f} seconds."
-                )
-            return None
+        return accepting.result()
 
     async def _take_on_local_worker(
         self, worker_id: str, worker_key: str | None, proc: asyncio.subprocess.Process, channel: Channel
@@ -820,11 +579,11 @@ class WorkerManager(EngineScoped):
             self.engine,
             on_hello=functools.partial(self._accept_hello, worker_id),
             on_closed=functools.partial(self._schedule_forget_local_worker, worker_id, loop),
-            relay_to_editor=self._relay_local_worker_event,
+            relay_to_editor=self._relay_worker_event,
         )
         parent_end.attach(channel, loop)
         logger.debug("Worker for key '%s' (pid %s) connected as %s", worker_key, proc.pid, worker_id)
-        await self._activate_project_on_worker(worker_id, "")
+        await self._activate_project_on_worker(worker_id)
 
     async def _accept_hello(self, worker_id: str, hello: WorkerHello) -> dict[str, Any]:
         """Take a local worker into service once it has loaded what it serves, or refuse it with why.
@@ -845,7 +604,14 @@ class WorkerManager(EngineScoped):
                 "accepted": False,
                 "details": f"Attempted to start {_worker_described(worker_key)}. Failed because {refusal}",
             }
-        for library in hello.libraries:
+        await self._note_libraries_loaded(worker_key, hello.libraries)
+        if worker_key is None:
+            self.note_library_loaded(None)
+        return {"accepted": True, "details": f"Started {_worker_described(worker_key)}."}
+
+    async def _note_libraries_loaded(self, worker_key: str | None, libraries: list[LibraryLoadReport]) -> None:
+        """Note each library a worker reports loading, as a per-library load report would be."""
+        for library in libraries:
             report = await self.engine.library_manager.workers.on_report_library_loaded_request(
                 ReportLibraryLoadedRequest(
                     library_name=library.library_name,
@@ -860,9 +626,6 @@ class WorkerManager(EngineScoped):
                     library.library_name,
                     report.result_details,
                 )
-        if worker_key is None:
-            self.note_library_loaded(None)
-        return {"accepted": True, "details": f"Started {_worker_described(worker_key)}."}
 
     @staticmethod
     def _hello_refusal(worker_key: str | None, hello: WorkerHello) -> str | None:
@@ -910,8 +673,8 @@ class WorkerManager(EngineScoped):
             )
         self.note_worker_unavailable(worker_key, reason)
 
-    async def _relay_local_worker_event(self, event_type: str, payload: dict[str, Any]) -> None:
-        """Send on, unacted on, what a local worker would have sent the editor, when there is an editor to send it to."""
+    async def _relay_worker_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Send on, unacted on, what a worker would have sent the editor, when there is an editor to send it to."""
         if self._transport is None:
             return
         if event_type == EVENT_RESULT:
@@ -1021,18 +784,6 @@ class WorkerManager(EngineScoped):
             worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
         return worker_environ
 
-    async def _settle_when_worker_exits_early(self, worker_key: str | None, proc: asyncio.subprocess.Process) -> None:
-        """Release the runs waiting on `worker_key` if its process exits before it has loaded.
-
-        Every other way a worker ends is noticed through the registry: it unregisters, or it stops
-        answering heartbeats and is evicted. A worker that dies while starting up -- refused a
-        license session, a crash on import -- never registered, so neither happens, and the runs
-        waiting on it would wait out the whole load timeout before blaming a load that never began.
-        The process exiting is the fact itself, so it is read from the process.
-        """
-        returncode = await proc.wait()
-        self._note_early_exit(worker_key, proc, returncode)
-
     def _note_early_exit(
         self, worker_key: str | None, proc: asyncio.subprocess.Process, returncode: int | None
     ) -> None:
@@ -1041,7 +792,7 @@ class WorkerManager(EngineScoped):
         # stopped it records the reason.
         if self._managed_worker_processes.get(worker_key) is not proc:
             return
-        # Loaded, then exited: the heartbeat loop evicts it and says so.
+        # Loaded, then exited: its channel ending forgets it and says so.
         if self.has_settled(worker_key):
             return
         del self._managed_worker_processes[worker_key]
@@ -1104,8 +855,7 @@ class WorkerManager(EngineScoped):
     async def _stop_workers(self, *, library_names: set[str | None] | None, action: str) -> None:
         """Terminate the named libraries' workers (every worker when None) and forget them.
 
-        Anything awaiting one of them is failed with the reason, and its response topic is
-        unsubscribed.
+        Anything awaiting one of them is failed with the reason.
         """
         self._withdraw_spawn_requests(library_names=library_names, action=action)
         processes = [
@@ -1117,67 +867,39 @@ class WorkerManager(EngineScoped):
         # manager's doing and not as a worker dying on its own.
         for library_name, _proc in processes:
             self._managed_worker_processes.pop(library_name, None)
-        self._release_local_workers(library_names=library_names, action=action)
+        self._release_workers(library_names=library_names, action=action)
         await asyncio.gather(*(self._terminate_via_spawn_loop(library_name, proc) for library_name, proc in processes))
-        # Read after the termination, not before: a worker can register while its process is being
-        # stopped, and an id missed here stays routable to a dead process.
-        worker_ids = [
-            wid
-            for wid, registration in self._workers.items()
-            if library_names is None or registration.worker_key in library_names
-        ]
-        # Settle anything still awaiting one of these workers, BEFORE the registry is cleared.
-        # Clearing it is what makes this the last chance: the heartbeat loop can only evict ids it
-        # can still see, so after this nothing reaches these requests at all. route_to_worker has no
-        # wall-clock ceiling, so a node dispatched into a worker this call terminates would await a
-        # future that never settles.
-        if self._transport is not None:
-            for wid in worker_ids:
-                registration = self._workers[wid]
-                await self._tx.request_client.fail_requests_by_tag(
-                    wid,
-                    worker_events.WorkerGoneError(
-                        f"worker '{wid}' was shut down to {action} library '{registration.worker_key}'"
-                        if registration.worker_key
-                        else f"worker '{wid}' was shut down to {action} libraries"
-                    ),
-                )
-        session_id = self.engine.get_session_id()
-        if session_id and self._transport is not None:
-            for wid in worker_ids:
-                response_topic = f"sessions/{session_id}/workers/{wid}/response"
-                try:
-                    await self._tx.unsubscribe_from_topic(response_topic)
-                except Exception as e:
-                    logger.debug("Failed to unsubscribe from '%s' while stopping workers: %s", response_topic, e)
         self._forget_remote_starts(library_names=library_names)
         if library_names is None:
             self._managed_worker_processes.clear()
-            self._workers.clear()
             self._withdraw_session_offers()
-            return
-        for wid in worker_ids:
-            self._workers.pop(wid, None)
 
-    def _release_local_workers(self, *, library_names: set[str | None] | None, action: str) -> None:
-        """Forget the named libraries' local workers (every one when None) and close their channels.
+    def _release_workers(self, *, library_names: set[str | None] | None, action: str) -> None:
+        """Forget the named libraries' workers (every one when None), closing the channels to this engine's own.
 
         Before their processes are stopped, so what was waiting on one fails at once with why, and the
-        channel ending reads as this manager's doing rather than as a worker that died.
+        channel ending reads as this manager's doing rather than as a worker that died. A worker another
+        engine runs for this one is left running there, which replaces it at this engine's next start.
         """
         for wid, registration in list(self._workers.items()):
-            if registration.channel is None:
-                continue
             if library_names is not None and registration.worker_key not in library_names:
                 continue
             if registration.worker_key is None:
-                registration.gone_reason = f"the worker process running it was shut down to {action} libraries."
+                reason = f"the worker process running it was shut down to {action} libraries."
             else:
-                registration.gone_reason = (
-                    f"the worker process running it was shut down to {action} library '{registration.worker_key}'."
-                )
-            del self._workers[wid]
+                reason = f"the worker process running it was shut down to {action} library '{registration.worker_key}'."
+            self._release_worker(wid, reason)
+
+    def _release_worker(self, worker_engine_id: str, reason: str) -> WorkerRegistration | None:
+        """Forget one worker, failing what waits on it with `reason`. Returns its registration, or None if it was unknown."""
+        registration = self._workers.pop(worker_engine_id, None)
+        if registration is None:
+            return None
+        registration.gone_reason = reason
+        registration.gone.set()
+        if registration.channel is not None:
             registration.channel.close()
+        return registration
 
     def _stops_with(self, worker_key: str | None, library_names: set[str | None] | None) -> bool:
         """Whether stopping `library_names` (every library when None) stops the worker process under `worker_key`.
@@ -1220,70 +942,76 @@ class WorkerManager(EngineScoped):
             self.note_worker_unavailable(library_name, f"its worker was stopped to {action} it before it started.")
 
     async def route_to_worker(
-        self,
-        event_request: EventRequest,
-        worker_engine_id: str,
-        worker_request_topic: str,
-        *,
-        response_topic: str | None = None,
+        self, event_request: EventRequest, worker_engine_id: str, *, lease_id: str | None = None
     ) -> dict:
-        """Forward event_request to the named worker and await the raw result payload.
+        """Send `event_request` to the named worker and await its raw result payload.
 
-        Registers a Future via RequestClient keyed by request_id and resolves it when
-        the worker response arrives. The caller is responsible for deserializing the
-        returned dict into the appropriate result type. `response_topic` is where the worker
-        answers, by default the worker's response topic in this engine's session.
+        The caller deserializes the returned dict into the appropriate result type. A node for a worker
+        another engine runs is sent under `lease_id`, that engine's lease for it.
+
+        No timeout: long-running AI workloads exceed any sensible default. The worker going away is what
+        fails a request to it, at once, with `WorkerGoneError`.
         """
         registration = self._workers.get(worker_engine_id)
-        if registration is not None and registration.channel is not None:
+        if registration is None:
+            msg = f"the worker process '{worker_engine_id}' is not running."
+            raise worker_events.WorkerGoneError(msg)
+        if registration.channel is not None:
             return await self._route_over_channel(event_request, registration, registration.channel)
-        request_id = event_request.request_id or str(uuid.uuid4())
-        # Opt into structured-failure delivery so a worker-side
-        # ResultPayloadFailure arrives as the raw payload dict rather
-        # than being collapsed to a bare ``Exception(error_msg)`` by
-        # ``_try_match``. ``_execute_node_via_worker`` then runs the
-        # dict through ``converter.structure(...)``, which rebuilds
-        # ``self.exception`` into a ForwardedException carrying the
-        # worker-side type name and traceback string.
-        future = await self._tx.request_client.track_request(
-            request_id, tag=worker_engine_id, resolve_failures_as_payload=True
-        )
-
-        # Both awaits belong inside the `try`: either can unwind and leave the entry tracked with
-        # nobody to settle it. No wall-clock timeout on the response, because long-running AI
-        # workloads exceed any sensible default and the heartbeat loop already fails a silent
-        # worker's requests with WorkerGoneError. That is also why a CancelledError here means only
-        # that the caller was cancelled. wrap_future adapts a future the transport loop settles.
-        try:
-            await self.forward_event_to_worker(
-                event_request.model_copy(update={"request_id": request_id}),
-                worker_engine_id=worker_engine_id,
-                worker_request_topic=worker_request_topic,
-                response_topic=response_topic,
-            )
-            return await asyncio.wrap_future(future)
-        except BaseException:
-            # BaseException, not Exception: cancellation is the common case and it is not an
-            # Exception. The other ways out remove the request themselves -- a response pops it in
-            # _try_match, eviction in fail_requests_by_tag -- so this is the one exit that has to
-            # clean up after itself. Without it the entry outlives the run, one per cancelled node
-            # execution, each still carrying its worker's tag for fail_requests_by_tag to walk.
-            self._tx.request_client.discard_request(request_id)
-            raise
+        return await self._route_to_hosted_worker(event_request, worker_engine_id, registration, lease_id)
 
     @staticmethod
     async def _route_over_channel(
         event_request: EventRequest, registration: WorkerRegistration, channel: Channel
     ) -> dict:
-        """Send `event_request` to a local worker and await its raw result.
-
-        No timeout, for the reason `route_to_worker` gives: the channel ending is what fails a
-        request to a worker that is gone, at once.
-        """
+        """Send `event_request` to a local worker and await its raw result."""
         try:
             return await channel.request_async(event_request_envelope(event_request), timeout_s=None)
         except ChannelClosedError:
             raise worker_events.WorkerGoneError(registration.gone_reason or _LOCAL_WORKER_STOPPED) from None
+
+    async def _route_to_hosted_worker(
+        self,
+        event_request: EventRequest,
+        worker_engine_id: str,
+        registration: WorkerRegistration,
+        lease_id: str | None,
+    ) -> dict:
+        """Send `event_request` to a worker another engine runs for this one, through that engine, and await its raw result."""
+        host_engine_id = cast("str", registration.host_engine_id)
+        envelope = event_request_envelope(event_request)
+        request: RequestPayload
+        if isinstance(event_request.request, ExecuteNodeRequest):
+            if lease_id is None:
+                msg = f"Attempted to run a node on engine {host_engine_id}. Failed because it was sent without a lease there."
+                raise RuntimeError(msg)
+            request = worker_events.ExecuteNodeOnHostedWorkerRequest(
+                worker_engine_id=worker_engine_id, lease_id=lease_id, execute_node=envelope
+            )
+        else:
+            request = worker_events.SendToHostedWorkerRequest(
+                worker_engine_id=worker_engine_id, request=envelope, await_reply=True
+            )
+        sending = asyncio.ensure_future(self.engine.request(host_engine_id, request, timeout_s=None))
+        gone = asyncio.ensure_future(registration.gone.wait())
+        try:
+            done, _ = await asyncio.wait({sending, gone}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            gone.cancel()
+            if not sending.done():
+                sending.cancel()
+        if sending not in done:
+            raise worker_events.WorkerGoneError(registration.gone_reason or _LOCAL_WORKER_STOPPED)
+        try:
+            result = sending.result()
+        except EngineNotFoundError as e:
+            raise worker_events.WorkerGoneError(str(e)) from e
+        if isinstance(result, worker_events.ExecuteNodeOnHostedWorkerResultSuccess):
+            return result.result
+        if isinstance(result, worker_events.SendToHostedWorkerResultSuccess) and result.result is not None:
+            return result.result
+        msg = f"{host_engine_id}, which runs the worker process, did not pass it on: {result.result_details}"
+        raise worker_events.WorkerGoneError(msg)
 
     async def acquire_lease(self, library_name: str, node_name: str) -> EngineLease | None:
         """Wait until the engine that runs `library_name`'s worker holds a lease for the node, or None if it runs here.
@@ -1369,34 +1097,6 @@ class WorkerManager(EngineScoped):
             self._report_until_answered(lease.host_engine_id, request, f"lease {lease.lease_id} was released")
         )
 
-    async def lease_refusal(self, node_name: str, lease_id: str | None) -> str | None:
-        """Why this worker must not run the node now, or None if it may.
-
-        A worker another engine runs asks that engine whether the lease the node was sent under holds it
-        now. Any other worker runs each node it is sent.
-        """
-        host_engine_id = self._host_engine_id
-        if host_engine_id is None:
-            return None
-        if lease_id is None:
-            return (
-                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because it was sent "
-                "without a lease on that engine, so that engine had not agreed to run it."
-            )
-        request = worker_events.CheckLeaseRequest(
-            lease_id=lease_id, worker_engine_id=cast("str", self.engine.get_engine_id())
-        )
-        try:
-            result = await self._event_manager.request_engine_from_worker(host_engine_id, request)
-        except TimeoutError:
-            return (
-                f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because that engine "
-                "did not answer whether it may run the node."
-            )
-        if not result.succeeded():
-            return f"Attempted to run node '{node_name}' on engine {host_engine_id}. Failed because {result.result_details}"
-        return None
-
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL the workspace is served on, awaited until initialization decides it.
 
@@ -1444,36 +1144,6 @@ class WorkerManager(EngineScoped):
                     _STATIC_URL_SETTLE_TIMEOUT_S,
                 )
         return None
-
-    async def evict_worker(self, worker_engine_id: str) -> None:
-        """Remove a worker from the registry and unsubscribe from its response topic."""
-        session_id = self.engine.get_session_id()
-        registration = self._workers.pop(worker_engine_id, None)
-        lib_name = registration.worker_key if registration else None
-        topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
-        await self._tx.unsubscribe_from_topic(topic)
-        # A hung worker cannot shut itself down, so the engine that runs it is told to stop it.
-        if registration is not None and registration.host_engine_id is not None:
-            self._schedule_remote_stop(worker_engine_id, registration.host_engine_id)
-        logger.warning("Worker evicted: %s", worker_engine_id)
-        # Terminate the managed subprocess for this worker, if any.
-        if registration is not None:
-            proc = self._managed_worker_processes.pop(lib_name, None)
-            if proc is not None:
-                await self._terminate_via_spawn_loop(lib_name, proc)
-        # Fail anything awaiting this worker, with the reason, so the awaiter reports why rather
-        # than inferring it from a bare cancellation.
-        await self._tx.request_client.fail_requests_by_tag(
-            worker_engine_id,
-            worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
-        )
-        # Eviction is terminal -- nothing respawns the worker -- so anything still waiting on this
-        # library would wait forever, and the next run would report a worker that "may still be
-        # starting up" for the rest of the session.
-        if registration is not None:
-            self.note_worker_unavailable(
-                lib_name, "the worker process that runs it stopped responding and was shut down."
-            )
 
     async def _terminate_via_spawn_loop(self, library_name: str | None, proc: asyncio.subprocess.Process) -> None:
         """Terminate a managed worker on the loop that owns its subprocess.
@@ -1646,23 +1316,12 @@ class WorkerManager(EngineScoped):
         sender = require_request_sender()
         # EventManager refuses this request from an engine that names no session.
         session_id = cast("str", sender.session_id)
-        return await self._start_worker_for_session(
-            request.library_name, session_id, sender.engine_id, request.worker_engine_id
-        )
+        return await self._start_worker_for_session(request, session_id, sender.engine_id)
 
     def _release_spawn_request(self, task: asyncio.Task, library_name: str | None) -> None:
         """Forget a finished spawn request, unless stopping the library's workers already withdrew it."""
         if self._requested_spawns.get(library_name) is task:
             del self._requested_spawns[library_name]
-
-    @handles(ReportGeneralPurposeWorkerReadyRequest)
-    def handle_report_general_purpose_worker_ready_request(
-        self,
-        request: ReportGeneralPurposeWorkerReadyRequest,  # noqa: ARG002
-    ) -> ReportGeneralPurposeWorkerReadyResultSuccess:
-        """Release anything waiting to route to the general-purpose worker, now that it has loaded."""
-        self.note_library_loaded(None)
-        return ReportGeneralPurposeWorkerReadyResultSuccess(result_details="General-purpose worker is ready.")
 
     async def _spawn_library_worker(self, library_name: str) -> None:
         """Spawn the worker subprocess that runs the given library's nodes for this engine."""
@@ -1725,8 +1384,12 @@ class WorkerManager(EngineScoped):
         worker_engine_id = str(uuid.uuid4())
         self._remote_starts[worker_engine_id] = _RemoteStart(host_engine_id=host_engine_id, library_name=library_name)
         logger.info("Asking %s to start worker %s for library '%s'.", host_engine_id, worker_engine_id, library_name)
+        project_id, generation = self.engine.project_manager.committed_project()
         request = worker_events.StartWorkerForEngineRequest(
-            library_name=library_name, worker_engine_id=worker_engine_id
+            library_name=library_name,
+            worker_engine_id=worker_engine_id,
+            project_id=project_id,
+            project_generation=generation,
         )
         try:
             result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
@@ -1873,8 +1536,8 @@ class WorkerManager(EngineScoped):
     ) -> worker_events.ReportWorkerExitedResultSuccess | worker_events.ReportWorkerExitedResultFailure:
         """Settle a worker another engine ran for this engine, now that that engine reports it exited.
 
-        Handled like a local worker's exit: a start that never registered settles the library with the
-        reason, and a registered worker is removed at once. "exited" leaves the library unavailable
+        Handled like a local worker's exit: a start whose worker never loaded settles the library with
+        the reason, and a worker in service is removed at once. "exited" leaves the library unavailable
         with the reason; "stopped" leaves it free to be started again.
         """
         wid = request.worker_engine_id
@@ -1908,16 +1571,145 @@ class WorkerManager(EngineScoped):
             )
         logger.warning("Worker %s for library '%s' on %s %s.", wid, library_name, host_engine_id, request.reason)
         if registered:
-            del self._workers[wid]
-            await self._tx.unsubscribe_from_topic(f"sessions/{self.engine.get_session_id()}/workers/{wid}/response")
-            await self._tx.request_client.fail_requests_by_tag(
-                wid, worker_events.WorkerGoneError(f"worker '{wid}' on {host_engine_id} {request.reason}")
-            )
+            self._release_worker(wid, reason)
         # The local rules: a worker that ended on its own leaves its library unavailable, and one that
         # was stopped does so only if it never loaded, so whatever waits on it hears why.
         if request.reason == "exited" or not self.has_settled(library_name):
             self.note_worker_unavailable(library_name, reason)
         return worker_events.ReportWorkerExitedResultSuccess(result_details=f"Recorded that worker {wid} exited.")
+
+    @handles(
+        worker_events.ReportHostedWorkerReadyRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager.worker_host(request.worker_engine_id),
+    )
+    async def handle_report_hosted_worker_ready_request(
+        self, request: worker_events.ReportHostedWorkerReadyRequest
+    ) -> worker_events.ReportHostedWorkerReadyResultSuccess | worker_events.ReportHostedWorkerReadyResultFailure:
+        """Take into service a worker another engine started for this one, now that it has loaded its library."""
+        wid = request.worker_engine_id
+        start = self._remote_starts.get(wid)
+        if start is None:
+            return worker_events.ReportHostedWorkerReadyResultFailure(
+                result_details=f"This engine is not waiting on worker {wid}, so it does not need it."
+            )
+        del self._remote_starts[wid]
+        self._workers[wid] = WorkerRegistration(
+            request_topic="", worker_key=start.library_name, host_engine_id=start.host_engine_id
+        )
+        logger.debug("Worker %s for library '%s' runs on engine %s", wid, start.library_name, start.host_engine_id)
+        await self._note_libraries_loaded(start.library_name, request.libraries)
+        # It started on the project the start named; a switch since then reaches it only this way.
+        self._send_notice(self._activate_project_on_worker(wid))
+        return worker_events.ReportHostedWorkerReadyResultSuccess(result_details=f"Took worker {wid} into service.")
+
+    @handles(
+        worker_events.DeliverWorkerEventsRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager.worker_host(request.worker_engine_id),
+    )
+    async def handle_deliver_worker_events_request(
+        self, request: worker_events.DeliverWorkerEventsRequest
+    ) -> worker_events.DeliverWorkerEventsResultSuccess | worker_events.DeliverWorkerEventsResultFailure:
+        """Act on a batch of what a worker another engine runs for this one sent the editor, as for a worker of this engine's."""
+        if self.worker_host(request.worker_engine_id) is None:
+            return worker_events.DeliverWorkerEventsResultFailure(
+                result_details=f"This engine runs no worker {request.worker_engine_id} on another engine."
+            )
+        await apply_worker_notifications(self.engine, request.events, self._relay_worker_event)
+        return worker_events.DeliverWorkerEventsResultSuccess(result_details=f"Took {len(request.events)} event(s).")
+
+    @handles(
+        worker_events.DecideWorkerCheckpointRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager.worker_host(request.worker_engine_id),
+    )
+    async def handle_decide_worker_checkpoint_request(
+        self, request: worker_events.DecideWorkerCheckpointRequest
+    ) -> worker_events.DecideWorkerCheckpointResultSuccess | worker_events.DecideWorkerCheckpointResultFailure:
+        """Decide a checkpoint a worker another engine runs for this one reached, with this engine's authorization hooks."""
+        if self.worker_host(request.worker_engine_id) is None:
+            return worker_events.DecideWorkerCheckpointResultFailure(
+                result_details=f"This engine runs no worker {request.worker_engine_id} on another engine."
+            )
+        body = {"type": AUTHORIZATION_CHECKPOINT, "payload": request.checkpoint}
+        # Off the loop, as a local worker's checkpoint is decided on a channel thread: a hook may block.
+        reply = await to_thread(decide_worker_checkpoint, self.engine, body)
+        return worker_events.DecideWorkerCheckpointResultSuccess(
+            denial=reply["denial"], result_details=f"Decided a checkpoint for worker {request.worker_engine_id}."
+        )
+
+    async def admit_hosted_worker_request(
+        self, request: RequestPayload, result_context: ResultContext
+    ) -> HostedWorkerRequest | ResultPayload:
+        """Admit a request another engine relays from a worker it runs for this one, as this engine's own worker's.
+
+        It passes the same worker request gates a local worker's request does, so the license wire
+        policy sees the request's own type. A Griptape Cloud credential it asks for is this engine's
+        license session credential, never the license or API key itself.
+        """
+        worker_engine_id = cast("str", result_context.get("worker_engine_id"))
+        sender = result_context.get("sender")
+        request_type = type(request).__name__
+        host_engine_id = self.worker_host(worker_engine_id)
+        if sender is None or host_engine_id is None or host_engine_id != sender.engine_id:
+            details = (
+                f"Attempted to handle a {request_type} from worker {worker_engine_id}. Failed because this "
+                "engine did not ask the engine that sent it to run that worker."
+            )
+            return GenericResultFailure(result_details=details)
+        event_request = EventRequest(
+            request=request,
+            request_id=result_context.get("request_id"),
+            open_workflow_id=result_context.get("open_workflow_id"),
+        )
+        decision = self._event_manager.evaluate_worker_request_gate(event_request_envelope(event_request))
+        if decision.forward is None:
+            logger.warning(
+                "The license policy refused a %s from a library's worker process on %s: %s",
+                request_type,
+                host_engine_id,
+                decision.denials,
+            )
+            details = (
+                f"Attempted to run '{request_type}' from a library's worker process on {host_engine_id}. "
+                "Failed because the license policy refused it."
+            )
+            return GenericResultFailure(result_details=details)
+        try:
+            admitted = read_event_request(decision.forward)
+        except WireFormatError as e:
+            details = f"Attempted to handle a request from a library's worker process on {host_engine_id}. Failed because {e}."
+            return GenericResultFailure(result_details=details)
+        credential_answer = self._cloud_credential_answer(admitted.request)
+        if credential_answer is not None:
+            return credential_answer
+        context: ResultContext = {
+            "request_id": result_context.get("request_id"),
+            "response_topic": result_context.get("response_topic"),
+            "sender": None,
+            "open_workflow_id": admitted.open_workflow_id,
+        }
+        return HostedWorkerRequest(request=admitted.request, result_context=context)
+
+    def _cloud_credential_answer(self, request: RequestPayload) -> ResultPayload | None:
+        """This engine's answer to a hosted worker asking for its Griptape Cloud credential, or None for any other request."""
+        if not isinstance(request, GetSecretValueRequest):
+            return None
+        secret_name = SecretsManager._apply_secret_name_compliance(request.key)
+        if secret_name not in _CLOUD_CREDENTIAL_SECRET_NAMES:
+            return None
+        credential = self._event_manager.session_credential()
+        if credential is None and request.should_error_on_not_found:
+            return GetSecretValueResultFailure(
+                result_details=f"Secret '{secret_name}' not found: this engine has no license session to share."
+            )
+        value = None
+        if credential is not None:
+            value = credential.token
+        return GetSecretValueResultSuccess(
+            value=value, result_details=f"Answered secret '{secret_name}' with this engine's license session."
+        )
 
     @handles(
         worker_events.OfferSessionForWorkersRequest,
@@ -1962,9 +1754,15 @@ class WorkerManager(EngineScoped):
         )
 
     async def _start_worker_for_session(
-        self, library_name: str, session_id: str, engine_id: str, worker_engine_id: str
+        self, request: worker_events.StartWorkerForEngineRequest, session_id: str, engine_id: str
     ) -> worker_events.StartWorkerForEngineResultSuccess | worker_events.StartWorkerForEngineResultFailure:
-        """Start a worker for an artist's session on another engine, in that session, under the ID it chose."""
+        """Start a worker, as this engine's child process, for an artist's session on another engine, under the ID it chose.
+
+        Answers once the process exists. The worker connects, loads its library on the artist's project,
+        and is reported ready to the artist's engine after.
+        """
+        library_name = request.library_name
+        worker_engine_id = request.worker_engine_id
         worker_key = f"{session_id}/{library_name}"
         starting = any(
             hosted.worker_key == worker_key and not hosted.started.is_set() for hosted in self._hosted_workers.values()
@@ -1976,47 +1774,47 @@ class WorkerManager(EngineScoped):
         refusal = self._start_refusal(library_name, session_id, worker_key)
         if refusal is not None:
             return refusal
-        resolved = self._worker_command(library_name, session_id)
+        resolved = self._prefixed_worker_command(
+            library_name, [sys.executable, "-m", "griptape_nodes.worker", "--library-name", library_name]
+        )
         if isinstance(resolved, WorkerCommandRefusal):
             return worker_events.StartWorkerForEngineResultFailure(result_details=resolved.reason)
-        # `_start_refusal` refuses a start while this engine has none.
-        own_engine_id = cast("str", self.engine.get_engine_id())
         # Read before anything awaits, since a lost connection can forget the session meanwhile.
         session = self._sessions[session_id]
-        # The worker runs on this machine's license or API key, which it inherits like a local worker. It
-        # runs a node only while this engine holds itself for the lease the node was sent under.
-        environ_overrides: dict[str, str] = {HOST_ENGINE_ID_ENV: own_engine_id}
-        # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
-        if session.static_server_base_url is not None:
-            environ_overrides[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = session.static_server_base_url
-        # It reaches the artist's engine the way that engine reached this engine.
-        try:
-            environ_overrides.update(self.engine.hosted_worker_environment(engine_id))
-        except EngineNotFoundError as e:
-            return worker_events.StartWorkerForEngineResultFailure(result_details=str(e))
         # Recorded before anything awaits, so a stop or another start sent meanwhile sees this one.
-        hosted = _HostedWorker(worker_key=worker_key, engine_id=engine_id, session_id=session_id)
+        hosted = _HostedWorker(
+            worker_key=worker_key, engine_id=engine_id, session_id=session_id, library_name=library_name
+        )
         self._hosted_workers[worker_engine_id] = hosted
+        listener = ChannelListener()
+
+        async def environ() -> dict[str, str]:
+            worker_environ = await self._base_worker_environ(worker_key, library_name)
+            # It runs on the artist's license session, which it asks the artist's engine for, never on this engine's.
+            for withheld in _LOCAL_WORKER_WITHHELD_ENV:
+                worker_environ.pop(withheld, None)
+            # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
+            if session.static_server_base_url is not None:
+                worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = session.static_server_base_url
+            worker_environ[WORKER_ENGINE_ID_ENV] = worker_engine_id
+            worker_environ.update(listener.child_environment())
+            return worker_environ
+
         try:
             # The artist's engine asks only once it has no worker for the library, so a running one is a
-            # worker it already stopped using, such as after a library reset, and would never register.
+            # worker it already stopped using, such as after a library reset.
             stale = self._managed_worker_processes.pop(worker_key, None)
             if stale is not None:
                 logger.info("Replacing the worker for key '%s' that its session stopped using.", worker_key)
                 await self._terminate_via_spawn_loop(worker_key, stale)
-            await self.spawn_worker(
-                resolved.args,
-                worker_key,
-                library_name=library_name,
-                worker_engine_id=worker_engine_id,
-                environ_overrides=environ_overrides,
-            )
+            proc = await self._start_worker_process(resolved.args, worker_key, environ)
         except BaseException:
+            listener.close()
             self._hosted_workers.pop(worker_engine_id, None)
             hosted.started.set()
             raise
-        proc = self._managed_worker_processes.get(worker_key)
         if proc is None:
+            listener.close()
             self._hosted_workers.pop(worker_engine_id, None)
             hosted.started.set()
             return worker_events.StartWorkerForEngineResultFailure(
@@ -2024,17 +1822,131 @@ class WorkerManager(EngineScoped):
             )
         hosted.process = proc
         hosted.started.set()
-        # It registers with the artist's engine, not here, so its unregistration never reaches this
-        # engine. Watching the process is what reports its exit and lets another start for the session.
-        watcher = create_task_bound_to_no_workflow(
-            asyncio.get_running_loop(), self._report_when_exited(worker_engine_id, hosted, proc)
-        )
+        loop = asyncio.get_running_loop()
+        # Watching the process is what reports its exit to the artist's engine and lets another start for the session.
+        watcher = create_task_bound_to_no_workflow(loop, self._report_when_exited(worker_engine_id, hosted, proc))
         hosted.exit_watcher = watcher
         self._exit_watchers.add(watcher)
         watcher.add_done_callback(self._exit_watchers.discard)
+        connecting = create_task_bound_to_no_workflow(
+            loop,
+            self._connect_hosted_worker(
+                worker_engine_id,
+                hosted,
+                proc,
+                listener,
+                project_id=request.project_id,
+                project_generation=request.project_generation,
+            ),
+        )
+        self._exit_watchers.add(connecting)
+        connecting.add_done_callback(self._exit_watchers.discard)
         return worker_events.StartWorkerForEngineResultSuccess(
             result_details=f"Started worker {worker_engine_id} for library '{library_name}' for another engine."
         )
+
+    async def _connect_hosted_worker(  # noqa: PLR0913 (each is a separate fact about this start)
+        self,
+        worker_engine_id: str,
+        hosted: _HostedWorker,
+        proc: asyncio.subprocess.Process,
+        listener: ChannelListener,
+        *,
+        project_id: str,
+        project_generation: int,
+    ) -> None:
+        """Wait for a worker this engine runs for another engine to connect, then carry it, on that engine's project."""
+        # Lazy import: worker_routing imports this module.
+        from griptape_nodes.app.worker_routing import ActivateProjectRequest
+
+        try:
+            channel = await self._await_worker_connection(proc, listener)
+        except TimeoutError:
+            logger.error(
+                "Worker %s for key '%s' did not connect within %.0fs; stopping it.",
+                worker_engine_id,
+                hosted.worker_key,
+                self.library_load_timeout_s,
+            )
+            await self._end_hosted_worker(hosted)
+            return
+        finally:
+            listener.close()
+        # Exited before connecting, which its exit watcher reports.
+        if channel is None:
+            return
+        # Stopped while it was connecting.
+        if (
+            self._hosted_workers.get(worker_engine_id) is not hosted
+            or self._managed_worker_processes.get(hosted.worker_key) is not proc
+        ):
+            channel.close()
+            return
+        loop = asyncio.get_running_loop()
+        end = HostedWorkerEnd(
+            self.engine,
+            worker_engine_id=worker_engine_id,
+            artist_engine_id=hosted.engine_id,
+            request_timeout_s=_ENGINE_REQUEST_TIMEOUT_S,
+            on_hello=functools.partial(self._accept_hosted_hello, worker_engine_id),
+            on_closed=functools.partial(self._schedule_end_hosted_worker, hosted, loop),
+        )
+        hosted.channel = channel
+        hosted.end = end
+        end.attach(channel, loop)
+        logger.debug("Worker %s for key '%s' (pid %s) connected", worker_engine_id, hosted.worker_key, proc.pid)
+        activation = EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=project_generation))
+        with contextlib.suppress(ChannelClosedError):
+            channel.notify(event_request_envelope(activation))
+
+    async def _accept_hosted_hello(self, worker_engine_id: str, hello: WorkerHello) -> dict[str, Any]:
+        """Report a worker this engine runs for another engine ready to that engine, or refuse it with why."""
+        hosted = self._hosted_workers.get(worker_engine_id)
+        if hosted is None:
+            return {"accepted": False, "details": "This engine has already stopped this worker."}
+        refusal = self._hello_refusal(hosted.library_name, hello)
+        if refusal is not None:
+            logger.error("Refused worker %s for key '%s': %s", worker_engine_id, hosted.worker_key, refusal)
+            return {
+                "accepted": False,
+                "details": f"Attempted to start worker {worker_engine_id}. Failed because {refusal}",
+            }
+        ready = worker_events.ReportHostedWorkerReadyRequest(
+            worker_engine_id=worker_engine_id, libraries=hello.libraries
+        )
+        try:
+            result = await self.engine.request(hosted.engine_id, ready, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        except EngineNotFoundError as e:
+            return {
+                "accepted": False,
+                "details": f"Attempted to report worker {worker_engine_id} ready. Failed because {e}",
+            }
+        if not isinstance(result, worker_events.ReportHostedWorkerReadyResultSuccess):
+            return {
+                "accepted": False,
+                "details": f"Engine {hosted.engine_id} did not take worker {worker_engine_id}: {result.result_details}",
+            }
+        return {"accepted": True, "details": f"Started worker {worker_engine_id} for engine {hosted.engine_id}."}
+
+    def _schedule_end_hosted_worker(self, hosted: _HostedWorker, loop: asyncio.AbstractEventLoop) -> None:
+        """From the channel's thread, as its channel ends: end the worker on the loop that owns it."""
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(self._start_end_hosted_worker, hosted)
+
+    def _start_end_hosted_worker(self, hosted: _HostedWorker) -> None:
+        task = create_task_bound_to_no_workflow(asyncio.get_running_loop(), self._end_hosted_worker(hosted))
+        self._exit_watchers.add(task)
+        task.add_done_callback(self._exit_watchers.discard)
+
+    async def _end_hosted_worker(self, hosted: _HostedWorker) -> None:
+        """Stop a worker this engine runs for another engine that ended on its own. Its exit watcher reports it exited."""
+        proc = hosted.process
+        # Stopped by this engine, which reports it stopped.
+        if proc is None or self._managed_worker_processes.get(hosted.worker_key) is not proc:
+            return
+        hosted.ended_on_its_own = True
+        del self._managed_worker_processes[hosted.worker_key]
+        await self._terminate_via_spawn_loop(hosted.worker_key, proc)
 
     def _start_refusal(
         self, library_name: str, session_id: str, worker_key: str
@@ -2103,17 +2015,19 @@ class WorkerManager(EngineScoped):
     ) -> None:
         """Tell the artist's engine that a worker this engine ran for it exited, and why."""
         exit_code = await proc.wait()
-        reason = "stopped"
+        reason: Literal["stopped", "exited"] = "stopped"
         # A process this manager stopped itself was dropped from the records first.
         if self._managed_worker_processes.get(hosted.worker_key) is proc:
             del self._managed_worker_processes[hosted.worker_key]
             reason = "exited"
+        if hosted.ended_on_its_own:
+            reason = "exited"
         logger.debug("Worker %s for key '%s' %s (exit code %s)", worker_engine_id, hosted.worker_key, reason, exit_code)
-        self._hosted_workers.pop(worker_engine_id, None)
-        # A request this engine sent it, such as freeing its models at a handoff, will never be answered.
-        await self._tx.request_client.fail_requests_by_tag(
-            worker_engine_id, worker_events.WorkerGoneError(f"worker '{worker_engine_id}' {reason}")
-        )
+        if self._hosted_workers.get(worker_engine_id) is hosted:
+            del self._hosted_workers[worker_engine_id]
+        # Fails what this engine was waiting on it for, such as a node or freeing its models at a handoff.
+        if hosted.channel is not None:
+            hosted.channel.close()
         request = worker_events.ReportWorkerExitedRequest(
             worker_engine_id=worker_engine_id, exit_code=exit_code, reason=reason
         )
@@ -2147,6 +2061,77 @@ class WorkerManager(EngineScoped):
             )
         await self._stop_hosted_worker(hosted)
         return worker_events.StopWorkerForEngineResultSuccess(result_details=f"Stopped worker {wid}.")
+
+    @handles(
+        worker_events.ExecuteNodeOnHostedWorkerRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager.hosted_for(request.worker_engine_id),
+    )
+    async def handle_execute_node_on_hosted_worker_request(
+        self, request: worker_events.ExecuteNodeOnHostedWorkerRequest
+    ) -> worker_events.ExecuteNodeOnHostedWorkerResultSuccess | worker_events.ExecuteNodeOnHostedWorkerResultFailure:
+        """Run a node on a worker this engine runs for the engine that asked, while that engine's lease holds this one.
+
+        Answered once every event the worker sent while running it has reached that engine, so its
+        progress lands there ahead of its result.
+        """
+        engine_id = require_request_sender().engine_id
+        wid = request.worker_engine_id
+        hosted = self._hosted_workers.get(wid)
+        if hosted is None or hosted.channel is None or hosted.end is None:
+            return worker_events.ExecuteNodeOnHostedWorkerResultFailure(
+                result_details=f"this engine is not running worker {wid} for engine {engine_id}.", worker_gone=True
+            )
+        engine_run = self._engine_runs.get((engine_id, request.lease_id))
+        if engine_run is None or not engine_run.holds_engine:
+            return worker_events.ExecuteNodeOnHostedWorkerResultFailure(
+                result_details=(
+                    f"that engine is not holding itself for engine {engine_id}'s run now. The run may have "
+                    "ended, or another run has that engine."
+                )
+            )
+        try:
+            raw = await hosted.channel.request_async(request.execute_node, timeout_s=None)
+        except ChannelClosedError:
+            return worker_events.ExecuteNodeOnHostedWorkerResultFailure(
+                result_details=f"the worker process running it on {self.engine.get_engine_id()} stopped.",
+                worker_gone=True,
+            )
+        await hosted.end.flush_events()
+        return worker_events.ExecuteNodeOnHostedWorkerResultSuccess(
+            result=raw, result_details=f"Worker {wid} answered the node."
+        )
+
+    @handles(
+        worker_events.SendToHostedWorkerRequest,
+        sender=RequiredSender.ENGINE,
+        owner=lambda manager, request, _sender: manager.hosted_for(request.worker_engine_id),
+    )
+    async def handle_send_to_hosted_worker_request(
+        self, request: worker_events.SendToHostedWorkerRequest
+    ) -> worker_events.SendToHostedWorkerResultSuccess | worker_events.SendToHostedWorkerResultFailure:
+        """Pass a request from the engine that asked to a worker this engine runs for it."""
+        engine_id = require_request_sender().engine_id
+        wid = request.worker_engine_id
+        hosted = self._hosted_workers.get(wid)
+        if hosted is None or hosted.channel is None:
+            return worker_events.SendToHostedWorkerResultFailure(
+                result_details=f"this engine is not running worker {wid} for engine {engine_id}.", worker_gone=True
+            )
+        gone = worker_events.SendToHostedWorkerResultFailure(
+            result_details=f"the worker process {wid} on {self.engine.get_engine_id()} stopped.", worker_gone=True
+        )
+        if not request.await_reply:
+            try:
+                hosted.channel.notify(request.request)
+            except ChannelClosedError:
+                return gone
+            return worker_events.SendToHostedWorkerResultSuccess(result_details=f"Sent it to worker {wid}.")
+        try:
+            raw = await hosted.channel.request_async(request.request, timeout_s=None)
+        except ChannelClosedError:
+            return gone
+        return worker_events.SendToHostedWorkerResultSuccess(result=raw, result_details=f"Worker {wid} answered it.")
 
     @handles(worker_events.WithdrawSessionOfferRequest, sender=RequiredSender.ENGINE)
     async def handle_withdraw_session_offer_request(
@@ -2200,32 +2185,6 @@ class WorkerManager(EngineScoped):
         await self._end_engine_run(engine_run, "its lease was released.")
         return worker_events.ReleaseLeaseResultSuccess(
             result_details=f"Released lease {request.lease_id} of engine {engine_id}."
-        )
-
-    @handles(worker_events.CheckLeaseRequest)
-    def handle_check_lease_request(
-        self, request: worker_events.CheckLeaseRequest
-    ) -> worker_events.CheckLeaseResultSuccess | worker_events.CheckLeaseResultFailure:
-        """Answer a worker this engine runs whether the lease its node was sent under holds this engine now.
-
-        Takes no sender rule, so it is answered only for this engine's own clients, which is how the
-        workers it runs reach it. Answered for the engine the worker serves, whatever lease it names.
-        """
-        engine_id = self.hosted_for(request.worker_engine_id)
-        if engine_id is None:
-            return worker_events.CheckLeaseResultFailure(
-                result_details=f"this engine runs no worker {request.worker_engine_id} for another engine."
-            )
-        engine_run = self._engine_runs.get((engine_id, request.lease_id))
-        if engine_run is None or not engine_run.holds_engine:
-            return worker_events.CheckLeaseResultFailure(
-                result_details=(
-                    f"that engine is not holding itself for engine {engine_id}'s run now. The run may have "
-                    "ended, or another run has that engine."
-                )
-            )
-        return worker_events.CheckLeaseResultSuccess(
-            result_details=f"Lease {request.lease_id} of engine {engine_id} holds this engine."
         )
 
     @handles(
@@ -2318,22 +2277,28 @@ class WorkerManager(EngineScoped):
         if proc is None or self._managed_worker_processes.get(hosted.worker_key) is not proc:
             return
         del self._managed_worker_processes[hosted.worker_key]
+        if hosted.channel is not None:
+            hosted.channel.close()
         await self._terminate_via_spawn_loop(hosted.worker_key, proc)
 
     async def on_engine_lost(self, engine_id: str) -> None:
-        """Settle the starts sent to an engine whose connection was lost, or forget an artist's engine whose connection was.
+        """Settle the workers on an engine whose connection was lost, or forget an artist's engine whose connection was.
 
-        On the artist's side, a start the other engine accepted but whose worker never registered would
-        otherwise wait out the library load timeout. On the other engine's side, that artist's sessions are
-        forgotten and the workers run for them stopped.
+        On the artist's side, the workers that engine runs for this one are gone, whether started or still
+        starting, and a node waiting on one fails with why. On the other engine's side, that artist's
+        sessions are forgotten and the workers run for them stopped.
         """
+        lost = f"the connection to {engine_id}, which runs its worker, was lost."
         for wid, start in list(self._remote_starts.items()):
             if start.host_engine_id != engine_id:
                 continue
             del self._remote_starts[wid]
-            self.note_worker_unavailable(
-                start.library_name, f"the connection to {engine_id}, which runs its worker, was lost."
-            )
+            self.note_worker_unavailable(start.library_name, lost)
+        for wid, registration in list(self._workers.items()):
+            if registration.host_engine_id != engine_id:
+                continue
+            self._release_worker(wid, lost)
+            self.note_worker_unavailable(registration.worker_key, lost)
         # That engine forgets this engine's session once it loses the connection, so the offer is gone too.
         for key in [key for key in self._engine_registrations if key[0] == engine_id]:
             del self._engine_registrations[key]
@@ -2489,21 +2454,20 @@ class WorkerManager(EngineScoped):
 
     async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
         """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
+        if hosted.channel is None:
+            logger.info("Worker %s has not connected, so it holds nothing to free.", worker_engine_id)
+            return
         event = EventRequest(request=worker_events.DropLibraryNamedLocalObjectsRequest())
-        request_topic = f"sessions/{hosted.session_id}/workers/{worker_engine_id}/request"
-        # The worker is in the session of the engine it serves, not this engine's, so it answers on this engine's own topic.
-        response_topic = f"engines/{self.engine.get_engine_id()}/response"
         try:
-            result = await asyncio.wait_for(
-                self.route_to_worker(event, worker_engine_id, request_topic, response_topic=response_topic),
-                timeout=_ENGINE_REQUEST_TIMEOUT_S,
+            result = await hosted.channel.request_async(
+                event_request_envelope(event), timeout_s=_ENGINE_REQUEST_TIMEOUT_S
             )
         except TimeoutError:
             logger.warning(
                 "Worker %s did not free its models within %.0f seconds.", worker_engine_id, _ENGINE_REQUEST_TIMEOUT_S
             )
             return
-        except worker_events.WorkerGoneError:
+        except ChannelClosedError:
             # Gone, so nothing of it is left to free.
             logger.info("Worker %s exited before it freed its models.", worker_engine_id)
             return
@@ -2526,20 +2490,6 @@ class WorkerManager(EngineScoped):
             self.note_worker_unavailable(library_name, "no session was available to start its worker process.")
             return None
         return session_id
-
-    def _worker_command(self, library_name: str, session_id: str) -> WorkerCommand | WorkerCommandRefusal:
-        """The command that starts `library_name`'s worker for another engine's session `session_id`."""
-        command = [
-            sys.executable,
-            "-m",
-            "griptape_nodes_app",
-            "engine",
-            "--session-id",
-            session_id,
-            "--library-name",
-            library_name,
-        ]
-        return self._prefixed_worker_command(library_name, command)
 
     def _prefixed_worker_command(self, library_name: str, command: list[str]) -> WorkerCommand | WorkerCommandRefusal:
         """`command`, which starts `library_name`'s worker, behind the configured `worker.command_prefix`."""
@@ -2810,35 +2760,38 @@ class WorkerManager(EngineScoped):
         )
         return True
 
-    async def forward_event_to_worker(
-        self,
-        event: EventRequest,
-        *,
-        worker_engine_id: str,
-        worker_request_topic: str,
-        response_topic: str | None = None,
-    ) -> None:
-        """Route an event to the appropriate worker's dedicated request topic.
-
-        MVP: routes to the single registered worker.
-        Future: consult a WorkerRegistry to select the correct worker based on event type
-        or target library.
-        """
+    async def forward_event_to_worker(self, event: EventRequest, *, worker_engine_id: str) -> None:
+        """Send `event` to one worker without waiting for it to be handled."""
         registration = self._workers.get(worker_engine_id)
-        if registration is not None and registration.channel is not None:
-            logger.debug("Sending %s to worker %s", type(event.request).__name__, worker_engine_id)
+        if registration is None:
+            logger.debug(
+                "Not sending %s to worker %s: it is not running.", type(event.request).__name__, worker_engine_id
+            )
+            return
+        logger.debug("Sending %s to worker %s", type(event.request).__name__, worker_engine_id)
+        if registration.channel is not None:
             try:
                 registration.channel.notify(event_request_envelope(event))
             except ChannelClosedError:
                 logger.debug("Not sending %s to worker %s: it is gone.", type(event.request).__name__, worker_engine_id)
             return
-        worker_response_topic = response_topic
-        if worker_response_topic is None:
-            session_id = self.engine.get_session_id()
-            worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
-        forwarded = event.model_copy(update={"response_topic": worker_response_topic})
-        logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
-        await self._tx.send_message("EventRequest", converters.engine.dumps(forwarded), worker_request_topic)
+        host_engine_id = cast("str", registration.host_engine_id)
+        request = worker_events.SendToHostedWorkerRequest(
+            worker_engine_id=worker_engine_id, request=event_request_envelope(event), await_reply=False
+        )
+        try:
+            result = await self.engine.request(host_engine_id, request, timeout_s=_ENGINE_REQUEST_TIMEOUT_S)
+        except EngineNotFoundError as e:
+            logger.warning("Could not send %s to worker %s: %s", type(event.request).__name__, worker_engine_id, e)
+            return
+        if not result.succeeded():
+            logger.warning(
+                "%s did not pass %s on to worker %s: %s",
+                host_engine_id,
+                type(event.request).__name__,
+                worker_engine_id,
+                result.result_details,
+            )
 
     async def _on_config_changed(self, _event: ConfigChanged) -> None:
         """Fan out a ReloadConfigRequest after the orchestrator's config mutation succeeded.
@@ -3069,22 +3022,23 @@ class WorkerManager(EngineScoped):
         Concurrent, and bounded per worker. Serially, a worker that is merely SLOW -- adoption runs a
         full library reload, which can include installs -- kept every worker behind it from even
         receiving the request, so the caller waited out the sum rather than the slowest. And
-        `route_to_worker` has no ceiling of its own: it argues liveness from the heartbeat, which
-        evicts a SILENT worker and says nothing about a busy one, so a user-facing switch could wait
-        forever. The bound is the startup grace, the same budget a worker's own slow startup gets.
+        `route_to_worker` has no ceiling of its own: a worker going away fails it, and a busy one
+        does not, so a user-facing switch could wait forever. The bound is the startup grace, the
+        same budget a worker's own slow startup gets.
 
         Each worker gets its own request id so replies cannot be confused. One worker's failure does
         not affect the others; the caller decides what a failure means.
         """
-        if not self._workers:
+        recipients = self._broadcast_recipients(event)
+        if not recipients:
             return []
 
-        async def ask(worker_engine_id: str, request_topic: str) -> str | None:
+        async def ask(worker_engine_id: str) -> str | None:
             per_worker = EventRequest(request=event.request)
             per_worker.request_id = str(uuid.uuid4())
             try:
                 raw = await asyncio.wait_for(
-                    self.route_to_worker(per_worker, worker_engine_id, request_topic),
+                    self.route_to_worker(per_worker, worker_engine_id),
                     timeout=self.library_load_timeout_s,
                 )
             except TimeoutError:
@@ -3098,9 +3052,7 @@ class WorkerManager(EngineScoped):
                 return f"{worker_engine_id}: {details}"
             return None
 
-        outcomes = await asyncio.gather(
-            *(ask(wid, registration.request_topic) for wid, registration in list(self._workers.items()))
-        )
+        outcomes = await asyncio.gather(*(ask(wid) for wid in recipients))
         return [failure for failure in outcomes if failure is not None]
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
@@ -3127,8 +3079,7 @@ class WorkerManager(EngineScoped):
         """Fire-and-forget fan out of an EventRequest to every registered worker.
 
         Used for orchestrator-originated notifications that every worker must
-        act on locally (e.g. reload config, refresh secrets). The request is
-        sent to each worker's dedicated request topic; no response is awaited.
+        act on locally (e.g. reload config, refresh secrets). No response is awaited.
 
         Safe to call with zero registered workers -- it is a no-op. An event that cannot be
         serialized is logged and sent to no worker.
@@ -3136,41 +3087,25 @@ class WorkerManager(EngineScoped):
         if not self._workers:
             return
         try:
-            for wid, registration in list(self._workers.items()):
-                await self.forward_event_to_worker(
-                    event,
-                    worker_engine_id=wid,
-                    worker_request_topic=registration.request_topic,
-                )
+            for wid in self._broadcast_recipients(event):
+                await self.forward_event_to_worker(event, worker_engine_id=wid)
         except EventSerializationError:
             logger.exception("Could not broadcast %s to workers", type(event.request).__name__)
+
+    def _broadcast_recipients(self, event: EventRequest) -> list[str]:
+        """The workers a broadcast of `event` goes to: every one of this engine's, and the ones other engines run for it if they need it."""
+        sent_to_hosted = type(event.request).__name__ in _SENT_TO_HOSTED_WORKERS
+        return [
+            wid for wid, registration in self._workers.items() if registration.host_engine_id is None or sent_to_hosted
+        ]
 
     async def relay_worker_result(self, payload: dict) -> None:
         """Relay an unmatched worker result to the GUI session response topic.
 
-        Called for worker result messages not claimed by RequestClient
-        (heartbeats and any results without a pending request).
+        Called for worker results without a pending request.
         The orchestrator always mediates between workers and the GUI; workers never
         publish directly to the session response topic.
         """
-        # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
-        result_event_type = payload.get("result_type", "")
-        if result_event_type == worker_events.WorkerHeartbeatResultSuccess.__name__:
-            response_topic = payload.get("response_topic", "")
-            m = self._WORKER_RESPONSE_TOPIC_RE.match(response_topic)
-            if m is None:
-                logger.warning(
-                    "Heartbeat reply arrived on '%s', which names no worker, so no worker was marked alive.",
-                    response_topic,
-                )
-                return
-            worker_engine_id = m.group("worker_engine_id")
-            registration = self._workers.get(worker_engine_id)
-            if registration is not None:
-                registration.unanswered_challenges = 0
-            logger.debug("Heartbeat received from worker %s", worker_engine_id)
-            return  # Internal health check — do not forward to GUI
-
         # 1 engine = 1 session — the orchestrator's session response topic is always the right target.
         session_response_topic = self._determine_response_topic()
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"

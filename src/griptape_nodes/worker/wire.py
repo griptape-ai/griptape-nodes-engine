@@ -20,6 +20,9 @@ from griptape_nodes.retained_mode.events.base_events import EventRequest, Reques
 from griptape_nodes.retained_mode.events.execution_events import GriptapeEvent, ParameterValueUpdateEvent
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.logger_events import LogHandlerEvent
+from griptape_nodes.retained_mode.events.worker_events import (
+    LibraryLoadReport,  # noqa: TC001 (WorkerHello is structured at runtime)
+)
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -55,15 +58,6 @@ QUEUED_APP_PAYLOADS = (LogHandlerEvent, EngineInitializationProgress)
 
 class WireFormatError(ValueError):
     """A channel body that does not have the shape its type promises."""
-
-
-@dataclass
-class LibraryLoadReport:
-    """How one library loaded in a worker, as the worker saw it."""
-
-    library_name: str
-    fitness: str
-    problem_details: str | None = None
 
 
 @dataclass

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -164,17 +164,22 @@ class StartWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 class StartWorkerForEngineRequest(RequestPayload):
     """Sent by the artist's engine to the engine its distribution settings assign a library to.
 
-    That engine starts the library's worker under `worker_engine_id` in the session of the engine
-    that sent the request, so the worker registers with the artist's engine and serves it.
+    That engine starts the library's worker as its own child process, under `worker_engine_id`, on
+    the artist's engine's project. It carries the worker's traffic to the artist's engine, and
+    reports with `ReportHostedWorkerReadyRequest` once the worker has loaded the library.
 
     Args:
         library_name: The library the worker will serve.
-        worker_engine_id: The engine ID the worker takes, chosen by the artist's engine so it can
-            recognize the worker's registration, and stop it, before this request is answered.
+        worker_engine_id: Names the worker, chosen by the artist's engine so it can recognize the
+            worker's reports, and stop it, before this request is answered.
+        project_id: The project the artist's engine is on, which the worker starts on.
+        project_generation: The generation of that project's activation on the artist's engine.
     """
 
     library_name: str
     worker_engine_id: str
+    project_id: str
+    project_generation: int
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
@@ -427,34 +432,189 @@ class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 
 @dataclass
-@PayloadRegistry.register
-class CheckLeaseRequest(RequestPayload):
-    """Sent by a worker that another engine runs, to that engine, before it runs a node.
+class LibraryLoadReport:
+    """How one library loaded in a worker, as the worker saw it."""
 
-    The engine answers whether the lease the node was sent under holds it now, for the engine the
-    worker serves. A node sent under no lease, or one that does not hold it, does not run, so only the
-    engine that runs the worker decides when its workers run another engine's nodes.
+    library_name: str
+    fitness: str
+    problem_details: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ReportHostedWorkerReadyRequest(RequestPayload):
+    """Sent by an engine to the artist's engine once a worker it runs for that artist has loaded its library.
 
     Args:
-        lease_id: The `lease_id` the `ExecuteNodeRequest` carried.
-        worker_engine_id: The worker asking, which names the engine it serves.
+        worker_engine_id: The worker, as named in the `StartWorkerForEngineRequest`.
+        libraries: Every library that loaded in the worker, including the ones its library depends on.
     """
 
-    lease_id: str
     worker_engine_id: str
+    libraries: list[LibraryLoadReport] = field(default_factory=list)
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
 @dataclass
 @PayloadRegistry.register
-class CheckLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """The lease holds the engine for the engine the worker serves, so the node may run."""
+class ReportHostedWorkerReadyResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The artist's engine took the worker into service."""
 
 
 @dataclass
 @PayloadRegistry.register
-class CheckLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The lease does not hold the engine, so the node may not run, with why."""
+class ReportHostedWorkerReadyResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The artist's engine did not ask for that worker, so the engine running it should stop it."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecuteNodeOnHostedWorkerRequest(RequestPayload):
+    """Sent by the artist's engine to the engine that runs a library's worker for it, to run one node there.
+
+    That engine runs the node only while the lease it was sent under holds that engine, and answers once
+    every event the worker sent while running it has reached the artist's engine.
+
+    Args:
+        worker_engine_id: The worker to run it on, as named in the `StartWorkerForEngineRequest`.
+        lease_id: The lease, on the engine that runs the worker, the node is sent under.
+        execute_node: The `ExecuteNodeRequest`, as the wire envelope a worker's channel carries.
+    """
+
+    worker_engine_id: str
+    lease_id: str
+    execute_node: dict[str, Any]
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecuteNodeOnHostedWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The worker answered the node, successfully or not.
+
+    Args:
+        result: The worker's result for the `ExecuteNodeRequest`, as the wire carries it.
+    """
+
+    result: dict[str, Any]
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecuteNodeOnHostedWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The node did not reach the worker, or the worker went away before answering it.
+
+    Args:
+        worker_gone: The worker is gone, so nothing more sent to it will be answered.
+    """
+
+    worker_gone: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class SendToHostedWorkerRequest(RequestPayload):
+    """Sent by the artist's engine to the engine that runs a library's worker for it, to pass it a request.
+
+    Args:
+        worker_engine_id: The worker, as named in the `StartWorkerForEngineRequest`.
+        request: The request, as the wire envelope a worker's channel carries.
+        await_reply: Whether to answer with the worker's result, rather than once the request is sent.
+    """
+
+    worker_engine_id: str
+    request: dict[str, Any]
+    await_reply: bool = False
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class SendToHostedWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The request reached the worker.
+
+    Args:
+        result: The worker's result, as the wire carries it, when the reply was awaited.
+    """
+
+    result: dict[str, Any] | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class SendToHostedWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The request did not reach the worker, or the worker went away before answering it.
+
+    Args:
+        worker_gone: The worker is gone, so nothing more sent to it will be answered.
+    """
+
+    worker_gone: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class DeliverWorkerEventsRequest(RequestPayload):
+    """Sent by an engine to the artist's engine with what a worker it runs for that artist sent the editor.
+
+    The events go in the order the worker sent them, one batch at a time per worker. The artist's engine
+    acts on them as it does on its own worker's.
+
+    Args:
+        worker_engine_id: The worker, as named in the `StartWorkerForEngineRequest`.
+        events: The worker's one-way channel bodies, as it sent them.
+    """
+
+    worker_engine_id: str
+    events: list[dict[str, Any]] = field(default_factory=list)
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class DeliverWorkerEventsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The artist's engine took the events."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeliverWorkerEventsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The events came from an engine that does not run that worker for this one."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DecideWorkerCheckpointRequest(RequestPayload):
+    """Sent by an engine to the artist's engine to decide an authorization checkpoint a worker it runs for that artist reached.
+
+    The artist's engine decides it with its own authorization hooks, as for its own worker.
+
+    Args:
+        worker_engine_id: The worker, as named in the `StartWorkerForEngineRequest`.
+        checkpoint: The `AuthorizationCheckpoint`, as the worker sent it.
+    """
+
+    worker_engine_id: str
+    checkpoint: dict[str, Any]
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class DecideWorkerCheckpointResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The artist's engine decided the checkpoint.
+
+    Args:
+        denial: The `CheckpointDenial`, as the wire carries it, or None when the checkpoint is allowed.
+    """
+
+    denial: dict[str, Any] | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class DecideWorkerCheckpointResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The checkpoint came from an engine that does not run that worker for this one, so it is denied."""
 
 
 @dataclass
