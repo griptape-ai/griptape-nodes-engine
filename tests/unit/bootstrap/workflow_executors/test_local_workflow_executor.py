@@ -1,4 +1,4 @@
-"""Unit tests for LocalWorkflowExecutor._load_project."""
+"""Unit tests for LocalWorkflowExecutor project activation, CLI arguments, and flow input."""
 
 from argparse import ArgumentParser
 from pathlib import Path, PureWindowsPath
@@ -12,7 +12,12 @@ from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import 
 )
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import StartNode
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.project_events import (
+    ActivateWorkspaceProjectRequest,
+    ActivateWorkspaceProjectResultFailure,
+    ActivateWorkspaceProjectResultSuccess,
+    LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
 )
@@ -125,6 +130,96 @@ class TestLoadProject:
 
         set_request = mock_gn.ahandle_request.call_args_list[1].args[0]
         assert set_request.project_id == opaque_id
+
+
+class TestEnterActivatesProject:
+    """`__aenter__` activates a project before broadcasting AppInitializationComplete (#6214)."""
+
+    @staticmethod
+    def _executor(project_file_path: Path | None = None) -> LocalWorkflowExecutor:
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._project_file_path = project_file_path
+        executor._skip_library_loading = True
+        executor._workflows_to_register = []
+        return executor
+
+    @staticmethod
+    def _broadcasts(mock_gn: MagicMock) -> list[object]:
+        return [call.args[0] for call in mock_gn.EventManager.return_value.abroadcast_app_event.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_activates_configured_project_before_app_initialization(self) -> None:
+        """Without --project-file-path, the configured project is activated before boot completes."""
+        order: list[str] = []
+        activated = ActivateWorkspaceProjectResultSuccess(result_details="Activated workspace project: p")
+
+        async def handle_request(request: object) -> object:
+            order.append(type(request).__name__)
+            return activated
+
+        async def broadcast(event: object) -> None:
+            order.append(type(event).__name__)
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(side_effect=handle_request)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock(side_effect=broadcast)
+
+            await self._executor().__aenter__()
+
+        assert order == [ActivateWorkspaceProjectRequest.__name__, AppInitializationComplete.__name__]
+
+    @pytest.mark.asyncio
+    async def test_configured_project_that_fails_to_activate_fails_the_run(self) -> None:
+        """A configured project that is denied or broken raises instead of falling back to system defaults."""
+        denied = ActivateWorkspaceProjectResultFailure(
+            result_details="Attempted to activate workspace project at '/p/griptape-nodes-project.yml'. "
+            "Failed because Denied by the license policy."
+        )
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(return_value=denied)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            with pytest.raises(LocalExecutorError, match="Denied by the license policy"):
+                await self._executor().__aenter__()
+
+            assert self._broadcasts(mock_gn) == []
+
+    @pytest.mark.asyncio
+    async def test_no_configured_project_stays_on_system_defaults(self) -> None:
+        """With nothing configured the activation is a no-op success and the run proceeds."""
+        no_project = ActivateWorkspaceProjectResultSuccess(
+            result_details="No workspace project found; system defaults remain active"
+        )
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(return_value=no_project)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            executor = self._executor()
+            assert await executor.__aenter__() is executor
+
+            broadcasts = self._broadcasts(mock_gn)
+            assert len(broadcasts) == 1
+            assert isinstance(broadcasts[0], AppInitializationComplete)
+
+    @pytest.mark.asyncio
+    async def test_explicit_project_file_path_skips_workspace_activation(self) -> None:
+        """--project-file-path is loaded directly; the configured project is not consulted."""
+        mock_load_result = MagicMock(spec=LoadProjectTemplateResultSuccess)
+        mock_load_result.project_id = "proj-123"
+        mock_set_result = MagicMock(spec=SetCurrentProjectResultSuccess)
+        mock_set_result.failed.return_value = False
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(side_effect=[mock_load_result, mock_set_result])
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            await self._executor(Path("/some/project.yaml")).__aenter__()
+
+        requests = [call.args[0] for call in mock_gn.ahandle_request.call_args_list]
+        assert isinstance(requests[0], LoadProjectTemplateRequest)
+        assert not any(isinstance(request, ActivateWorkspaceProjectRequest) for request in requests)
 
 
 class TestPrepareWorkflowForRunStorageBackend:
