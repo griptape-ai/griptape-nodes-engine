@@ -96,6 +96,7 @@ class EventConverter(JsonConverter):
             "request_id": event.request_id,
             "response_topic": event.response_topic,
             "open_workflow_id": event.open_workflow_id,
+            "engine_id": event.engine_id,
         }
         if event.retained_mode:
             failure["retained_mode"] = event.retained_mode

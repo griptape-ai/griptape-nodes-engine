@@ -50,6 +50,10 @@ class DirectedGraph:
                 count += 1
         return count
 
+    def get_successors(self, node: str) -> set[str]:
+        """Return the names of nodes with an edge coming directly from `node`."""
+        return {other for other, predecessors in self._predecessors.items() if node in predecessors}
+
     def remove_node(self, node: str) -> None:
         """Remove a node and all its edges from the graph."""
         if node not in self._nodes:

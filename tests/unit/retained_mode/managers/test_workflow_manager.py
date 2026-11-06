@@ -3,6 +3,7 @@ import asyncio
 import contextvars
 import logging
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -90,14 +91,11 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
-from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidTomlFormatProblem,
     LibraryNotRegisteredProblem,
     MissingTomlSectionProblem,
 )
-from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
-from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 from griptape_nodes.retained_mode.managers.workflow.codegen import WorkflowCodeGenerator
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, execution_result_details
 from griptape_nodes.retained_mode.managers.workflow.saving import (
@@ -115,6 +113,7 @@ from griptape_nodes.retained_mode.managers.workflow.shape import (
 from griptape_nodes.retained_mode.managers.workflow_manager import (
     WorkflowManager,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.workflow_context import empty_workflow_registry
 
 
@@ -915,12 +914,14 @@ class TestWorkflowManager:
                     ),
                     patch.object(
                         workflow_manager,
-                        "extract_workflow_shape",
+                        "extract_workflow_shape_in",
                         side_effect=ValueError("no shape"),
                     ),
                 ):
                     result = asyncio.run(
-                        workflow_manager.saver.on_save_workflow_request(SaveWorkflowRequest(file_name=saved_key))
+                        workflow_manager.saver.on_save_workflow_request(
+                            SaveWorkflowRequest(file_name=saved_key), engine.current_workflow()
+                        )
                     )
 
                 assert isinstance(result, SaveWorkflowResultSuccess)
@@ -1063,7 +1064,7 @@ class TestWorkflowManager:
                     ),
                     patch.object(
                         workflow_manager,
-                        "extract_workflow_shape",
+                        "extract_workflow_shape_in",
                         side_effect=ValueError("no shape"),
                     ),
                     patch(
@@ -1075,7 +1076,9 @@ class TestWorkflowManager:
                     # frontend saveWorkflowWithoutModal behavior). Backend should strip it
                     # and use metadata.name as the filename stem.
                     result = asyncio.run(
-                        workflow_manager.saver.on_save_workflow_request(SaveWorkflowRequest(file_name=unsaved_key))
+                        workflow_manager.saver.on_save_workflow_request(
+                            SaveWorkflowRequest(file_name=unsaved_key), engine.current_workflow()
+                        )
                     )
 
                 assert isinstance(result, SaveWorkflowResultSuccess)
@@ -1150,7 +1153,8 @@ class TestWorkflowManager:
                         workflow_name=scenario.workflow_name,
                         requested_name=scenario.requested_name,
                         **(request_kwargs or {}),
-                    )
+                    ),
+                    WorkflowRuntime("renamed", workflow_manager.engine),
                 )
             )
 
@@ -1340,7 +1344,8 @@ class TestWorkflowManager:
                         requested_name="my_workflow_renamed",
                         display_name_behavior=RenameDisplayNameBehavior[non_override_behavior],
                         display_name="Silently Ignored",
-                    )
+                    ),
+                    WorkflowRuntime("renamed", workflow_manager.engine),
                 )
             )
 
@@ -1374,7 +1379,8 @@ class TestWorkflowManager:
                         requested_name="my_workflow_renamed",
                         display_name_behavior=RenameDisplayNameBehavior.OVERRIDE,
                         display_name=empty_display_name,
-                    )
+                    ),
+                    WorkflowRuntime("renamed", workflow_manager.engine),
                 )
             )
 
@@ -1449,7 +1455,8 @@ class TestWorkflowManager:
                         workflow_name="never_registered",
                         requested_name="never_registered_renamed",
                         display_name_behavior=RenameDisplayNameBehavior.PRESERVE_EXISTING,
-                    )
+                    ),
+                    WorkflowRuntime("renamed", workflow_manager.engine),
                 )
             )
 
@@ -1497,7 +1504,8 @@ class TestWorkflowManager:
         ):
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
-                    RenameWorkflowRequest(workflow_name="old", requested_name="new")
+                    RenameWorkflowRequest(workflow_name="old", requested_name="new"),
+                    WorkflowRuntime("renamed", workflow_manager.engine),
                 )
             )
 
@@ -2526,7 +2534,7 @@ class TestWorkflowManager:
     ) -> None:
         """build_workflow() must register every library named in node_libraries_referenced.
 
-        Regression test for https://github.com/griptape-ai/griptape-nodes/issues/4584:
+        Regression test for https://github.com/griptape-ai/griptape-nodes-engine/issues/4584:
         when a generated workflow is run as a standalone script via LocalWorkflowExecutor,
         no engine-side library bootstrap runs before build_workflow(), so the file itself
         must register its declared libraries to avoid every CreateNodeRequest collapsing
@@ -2846,6 +2854,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="declared_var", scope=VariableScope.CURRENT_FLOW_ONLY)},
@@ -2875,6 +2884,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references=set(),
@@ -2893,6 +2903,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="ghost", scope=VariableScope.CURRENT_FLOW_ONLY)},
@@ -2925,6 +2936,7 @@ class TestWorkflowVariablePersistence:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={VariableReference(name="shared_name", scope=VariableScope.GLOBAL_ONLY)},
@@ -2973,6 +2985,7 @@ class TestWorkflowVariablePersistence:
         # Child flow should not claim the parent-owned variable.
         child_unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         child_commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=child_flow_name,
             unique_parameter_uuid_to_values=child_unique_values,
             variable_references={ref},
@@ -2982,6 +2995,7 @@ class TestWorkflowVariablePersistence:
         # Parent flow should claim it.
         parent_unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         parent_commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=parent_flow_name,
             unique_parameter_uuid_to_values=parent_unique_values,
             variable_references={ref},
@@ -3179,6 +3193,7 @@ class TestVariableReferenceAccess:
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager.serialization._serialize_variables_for_flow(
+            engine.current_workflow(),
             flow_name=flow_name,
             unique_parameter_uuid_to_values=unique_values,
             variable_references={
@@ -3467,11 +3482,13 @@ class TestRunWorkflowWithCurrentStateRequest:
     _OPEN_FLOW_NAME = "ControlFlow_1"
 
     @pytest.fixture
-    def context_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
-        """The engine's ContextManager, so each test states the flow stack it is loading into."""
-        context_manager = Mock(spec=ContextManager)
-        monkeypatch.setattr(engine, "_context_manager", context_manager)
-        return context_manager
+    def open_workflow(self, engine: Engine) -> Iterator[WorkflowRuntime]:
+        """An open workflow, so each test states the flow stack it is loading into."""
+        engine.context_manager.push_workflow(workflow_name="loading_into")
+        try:
+            yield engine.current_workflow()
+        finally:
+            engine.context_manager.pop_workflow()
 
     @pytest.fixture
     def run_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
@@ -3506,18 +3523,17 @@ class TestRunWorkflowWithCurrentStateRequest:
     async def test_refuses_while_a_flow_is_open(
         self,
         engine: Engine,
-        context_manager: Mock,
+        open_workflow: WorkflowRuntime,
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
         open_flow = Mock(spec=ControlFlow)
         open_flow.name = self._OPEN_FLOW_NAME
-        context_manager.has_current_flow.return_value = True
-        context_manager.get_current_flow.return_value = open_flow
+        open_workflow.context.push_flow(open_flow)
 
         result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
-            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
         )
 
         assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
@@ -3529,38 +3545,31 @@ class TestRunWorkflowWithCurrentStateRequest:
     async def test_allows_a_workflow_context_with_no_open_flow(
         self,
         engine: Engine,
-        context_manager: Mock,
+        open_workflow: WorkflowRuntime,
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
-        context_manager.has_current_flow.return_value = False
-        context_manager.has_current_workflow.return_value = True
-
         await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
-            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
         )
 
-        # It builds into the open workflow rather than opening the file as another.
-        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, opens_workflow=False)
+        # It builds into the workflow it is handed rather than opening the file as another.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, workflow=open_workflow)
 
     @pytest.mark.asyncio
     async def test_opens_the_file_when_no_workflow_is_open(
         self,
         engine: Engine,
-        context_manager: Mock,
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
-        context_manager.has_current_flow.return_value = False
-        context_manager.has_current_workflow.return_value = False
-
         await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
             RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
         )
 
-        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, opens_workflow=True)
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, workflow=None)
 
 
 class TestWorkflowsLoadingGate:
@@ -5181,11 +5190,12 @@ class TestSaveWorkflowDisplayNameFallback:
             with (
                 patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
                 patch.object(workflow_manager.saver, "_save_workflow_file_inline", side_effect=capture_inline),
-                patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
+                patch.object(workflow_manager, "extract_workflow_shape_in", side_effect=ValueError("no shape")),
             ):
                 asyncio.run(
                     workflow_manager.saver.on_save_workflow_request(
-                        SaveWorkflowRequest(file_name=request_file_name, display_name=request_display_name)
+                        SaveWorkflowRequest(file_name=request_file_name, display_name=request_display_name),
+                        engine.current_workflow(),
                     )
                 )
         finally:
@@ -5499,22 +5509,24 @@ class TestScrubForAstConstant:
 class TestSelectTopLevelImportedFlow:
     """ReferencedWorkflowImport._select_top_level_imported_flow picks the top-level imported flow."""
 
-    def _flow_manager_with_parents(self, parents: dict[str, str]) -> Engine:
-        """Build a mock engine whose flow_manager.get_parent_flow resolves via the given name->parent mapping."""
-        flow_manager = Mock(spec=FlowManager)
-        flow_manager.get_parent_flow.side_effect = lambda flow: parents[flow]
-        engine = Mock(spec=Engine)
-        engine.flow_manager = flow_manager
-        return engine
+    _WORKFLOW = WorkflowRuntime("importing", MagicMock())
+
+    def _parents(self, engine: Engine, parents: dict[str, str]) -> Any:
+        """Patch the flow manager so each flow of `_WORKFLOW` has the parent the mapping gives it."""
+
+        def get_parent_flow_in(workflow: WorkflowRuntime, flow: str) -> str:
+            assert workflow is self._WORKFLOW
+            return parents[flow]
+
+        return patch.object(engine.flow_manager, "get_parent_flow_in", side_effect=get_parent_flow_in)
 
     def test_selects_flow_parented_to_import_target(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         # Top-level flow is parented to the target; the group's body flow is parented to the top-level.
-        mock_engine = self._flow_manager_with_parents({"ControlFlow_2": "ParentFlow", "Group_subflow": "ControlFlow_2"})
-
-        selected = workflow_manager.referenced_import._select_top_level_imported_flow(
-            {"ControlFlow_2", "Group_subflow"}, "ParentFlow", "grouped_inner_workflow", mock_engine
-        )
+        with self._parents(engine, {"ControlFlow_2": "ParentFlow", "Group_subflow": "ControlFlow_2"}):
+            selected = workflow_manager.referenced_import._select_top_level_imported_flow(
+                self._WORKFLOW, {"ControlFlow_2", "Group_subflow"}, "ParentFlow", "grouped_inner_workflow"
+            )
 
         assert selected == "ControlFlow_2"
 
@@ -5522,11 +5534,13 @@ class TestSelectTopLevelImportedFlow:
         self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
         workflow_manager = engine.workflow_manager
-        mock_engine = self._flow_manager_with_parents({"Zeta_flow": "Other", "Alpha_flow": "Other"})
 
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+        with (
+            self._parents(engine, {"Zeta_flow": "Other", "Alpha_flow": "Other"}),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
             selected = workflow_manager.referenced_import._select_top_level_imported_flow(
-                {"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf", mock_engine
+                self._WORKFLOW, {"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf"
             )
 
         # No flow parented to the target: deterministic sorted fallback, never hash-ordered.
@@ -5540,11 +5554,13 @@ class TestSelectTopLevelImportedFlow:
         self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
         workflow_manager = engine.workflow_manager
-        mock_engine = self._flow_manager_with_parents({"Zeta_flow": "ParentFlow", "Alpha_flow": "ParentFlow"})
 
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+        with (
+            self._parents(engine, {"Zeta_flow": "ParentFlow", "Alpha_flow": "ParentFlow"}),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
             selected = workflow_manager.referenced_import._select_top_level_imported_flow(
-                {"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf", mock_engine
+                self._WORKFLOW, {"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf"
             )
 
         # More than one candidate parented to the target: deterministic sorted fallback.
@@ -5624,21 +5640,27 @@ class TestExecuteWorkflowImport:
         request = ImportWorkflowAsReferencedSubFlowRequest(
             workflow_name="wf", flow_name="ParentFlow", imported_flow_metadata=None, track_as_referenced=False
         )
-        workflow = Mock(spec=Workflow)
-        workflow.file_path = "workflows/wf.py"
+        imported = Mock(spec=Workflow)
+        imported.name = "wf"
+        imported.file_path = "workflows/wf.py"
 
         # The import creates two new flows (a top-level flow + a group's body flow). The dict
         # values are never inspected -- only the keys form the new-flows set.
-        object_manager = Mock(spec=ObjectManager)
-        object_manager.get_filtered_subset.side_effect = [
-            {"ParentFlow": object()},
-            {"ParentFlow": object(), "ControlFlow_2": object(), "Group_subflow": object()},
-        ]
-        monkeypatch.setattr(engine, "_object_manager", object_manager)
-
-        # ContextManager().flow(...) is used purely as a context manager wrapping the import.
-        context_manager = MagicMock(spec=ContextManager)
-        monkeypatch.setattr(engine, "_context_manager", context_manager)
+        workflow = WorkflowRuntime("importing", engine)
+        monkeypatch.setattr(
+            workflow.objects,
+            "get_filtered_subset",
+            Mock(
+                side_effect=[
+                    {"ParentFlow": object()},
+                    {"ParentFlow": object(), "ControlFlow_2": object(), "Group_subflow": object()},
+                ]
+            ),
+        )
+        # The target flow is entered purely as a context manager wrapping the import.
+        monkeypatch.setattr(
+            engine.flow_manager, "get_flow_by_name_in", Mock(return_value=ControlFlow("ParentFlow", engine))
+        )
 
         monkeypatch.setattr(
             workflow_manager.runner,
@@ -5652,10 +5674,12 @@ class TestExecuteWorkflowImport:
         )
         monkeypatch.setattr(workflow_manager.referenced_import, "_select_top_level_imported_flow", select_mock)
 
-        result = await workflow_manager.referenced_import._execute_workflow_import(request, workflow, "ParentFlow")
+        result = await workflow_manager.referenced_import._execute_workflow_import(
+            workflow, request, imported, "ParentFlow"
+        )
 
-        # It selects via the helper (passing the new-flows set, target flow, workflow name, and engine)...
-        select_mock.assert_called_once_with({"ControlFlow_2", "Group_subflow"}, "ParentFlow", "wf", engine)
+        # It selects via the helper (passing the workflow, the new-flows set, target flow and workflow name)...
+        select_mock.assert_called_once_with(workflow, {"ControlFlow_2", "Group_subflow"}, "ParentFlow", "wf")
         # ...and returns exactly what the helper chose.
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
         assert result.created_flow_name == "ControlFlow_2"
@@ -5708,8 +5732,8 @@ class TestReferencedWorkflowTagging:
 
         flow_x = flow_manager.get_flow_by_name(flow_x_name)
         flow_y = flow_manager.get_flow_by_name(flow_y_name)
-        assert flow_manager.get_referenced_workflow_name(flow_x) == "workflow_x"
-        assert flow_manager.get_referenced_workflow_name(flow_y) == "workflow_y"
+        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_x) == "workflow_x"
+        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_y) == "workflow_y"
 
     def test_imports_in_one_engine_do_not_leak_into_another(self, engine: Engine) -> None:
         """An import running in one engine does not tag flows created in another engine."""
@@ -5726,7 +5750,10 @@ class TestReferencedWorkflowTagging:
             )
             assert isinstance(result, CreateFlowResultSuccess)
             other_flow = other_engine.flow_manager.get_flow_by_name(result.flow_name)
-            assert other_engine.flow_manager.get_referenced_workflow_name(other_flow) is None
+            assert (
+                other_engine.flow_manager.get_referenced_workflow_name(other_engine.current_workflow(), other_flow)
+                is None
+            )
 
     def test_leaving_an_import_removes_the_variable_from_the_context(self, engine: Engine) -> None:
         """Leaving an import clears the stack and drops the variable from the Context."""
@@ -5868,11 +5895,12 @@ class TestSaveWorkflowOverwriteProtection:
         try:
             with (
                 patch.object(workflow_manager.engine, "ahandle_request", side_effect=fake_ahandle_request),
-                patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
+                patch.object(workflow_manager, "extract_workflow_shape_in", side_effect=ValueError("no shape")),
             ):
                 return asyncio.run(
                     workflow_manager.saver.on_save_workflow_request(
-                        SaveWorkflowRequest(file_name=file_name, overwrite_existing=overwrite_existing)
+                        SaveWorkflowRequest(file_name=file_name, overwrite_existing=overwrite_existing),
+                        engine.current_workflow(),
                     )
                 )
         finally:
@@ -6296,15 +6324,15 @@ class TestNodeLibraryDelegates:
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
-        run_mock.assert_awaited_once_with("flow.py", opens_workflow=True)
+        run_mock.assert_awaited_once_with("flow.py", None)
 
     def test_run_workflow_builds_into_the_open_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        engine.context_manager.push_workflow(workflow_name="open")
+        opened = engine.context_manager.open_workflow(workflow_name="open")
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
-        run_mock.assert_awaited_once_with("flow.py", opens_workflow=False)
+        run_mock.assert_awaited_once_with("flow.py", opened)
 
     def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
@@ -6313,19 +6341,40 @@ class TestNodeLibraryDelegates:
             workflow_manager._walk_object_tree("obj", visit)
         walk_mock.assert_called_once_with("obj", visit, None)
 
-    def test_extract_workflow_shape_reads_the_flow_manager(self, engine: Engine) -> None:
+    def test_extract_workflow_shape_reads_the_open_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        with patch(
-            "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape", return_value={"x": 1}
-        ) as extract_mock:
-            assert workflow_manager.extract_workflow_shape("wf", flow_name="f") == {"x": 1}
-        extract_mock.assert_called_once_with(engine.flow_manager, "wf", "f")
+        engine.context_manager.push_workflow(workflow_name="shaped")
+        try:
+            with patch(
+                "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape", return_value={"x": 1}
+            ) as extract_mock:
+                assert workflow_manager.extract_workflow_shape("wf", flow_name="f") == {"x": 1}
+            open_workflow = engine.current_workflow()
+            extract_mock.assert_called_once_with(engine.flow_manager, open_workflow, "wf", "f")
+        finally:
+            engine.context_manager.pop_workflow()
+
+    def test_extract_workflow_shape_with_nothing_open_fails_as_it_did(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
+
+        with pytest.raises(ValueError, match="does not have a top-level flow"):
+            workflow_manager.extract_workflow_shape("wf")
+        with pytest.raises(KeyError, match="doesn't exist"):
+            workflow_manager.extract_workflow_shape("wf", flow_name="f")
 
 
 class TestGetWorkflowShapeRequest:
     """`GetWorkflowShapeRequest` answers with the shape `extract_workflow_shape` reads, so a node can ask for it."""
 
-    def test_returns_the_shape_of_the_named_flow(self, engine: Engine) -> None:
+    @pytest.fixture(autouse=True)
+    def open_workflow(self, engine: Engine) -> Iterator[WorkflowRuntime]:
+        engine.context_manager.push_workflow(workflow_name="parent")
+        try:
+            yield engine.current_workflow()
+        finally:
+            engine.context_manager.pop_workflow()
+
+    def test_returns_the_shape_of_the_named_flow(self, engine: Engine, open_workflow: WorkflowRuntime) -> None:
         param = {"type": "str"}
         with patch(
             "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape",
@@ -6336,7 +6385,7 @@ class TestGetWorkflowShapeRequest:
         assert isinstance(result, GetWorkflowShapeResultSuccess)
         assert result.workflow_shape.inputs == {"Start Flow_1": {"text": param}}
         assert result.workflow_shape.outputs == {"End Flow_1": {"text": param}}
-        extract_mock.assert_called_once_with(engine.flow_manager, "child", "sub")
+        extract_mock.assert_called_once_with(engine.flow_manager, open_workflow, "child", "sub")
 
     def test_fails_naming_the_workflow_when_the_flow_has_no_start_node(self, engine: Engine) -> None:
         with patch(

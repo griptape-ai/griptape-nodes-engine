@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import PackagedNodeParameterMapping
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 def _make_package_result() -> MagicMock:
@@ -103,16 +104,19 @@ async def test_while_iteration_subflow_runs_inside_the_loop_body_scope() -> None
         return StartLocalSubflowResultSuccess(result_details="ran")
 
     engine.ahandle_request = AsyncMock(side_effect=handle_request)
+    while_node = _make_while_node()
+    while_node._require_workflow.return_value = WorkflowRuntime("wf", engine)
 
     with (
         patch.object(NodeExecutor, "_set_while_iteration_parameters", new_callable=AsyncMock),
         patch.object(NodeExecutor, "_evaluate_while_iteration_result", return_value=True),
     ):
         await executor._run_while_loop_iterations(
-            node=cast("BaseWhileNodeGroup", _make_while_node()),
+            node=cast("BaseWhileNodeGroup", while_node),
             flow_name="BodyFlow_1",
             node_name_mappings={"Body": "Body_1"},
             packaged_start_node_name="S_1",
+            end_node_mapping=PackagedNodeParameterMapping(node_name="E", parameter_mappings={}),
             resolved_upstream_values={},
             iteration_startflow_params=[],
             reverse_node_mapping={"Body_1": "Body"},

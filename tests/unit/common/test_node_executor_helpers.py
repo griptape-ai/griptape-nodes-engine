@@ -24,6 +24,18 @@ from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LOCAL_EXECUT
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+def _in_workflow_of(executor: NodeExecutor, node: Any) -> Any:
+    """`node`, joined to a workflow whose requests go to the executor's engine."""
+    node._require_workflow.return_value = WorkflowRuntime("wf", executor.engine)
+    return node
+
+
+async def _execute(node: Any) -> None:
+    executor = _make_executor()
+    await executor.execute(_in_workflow_of(executor, node))
 
 
 def _make_executor() -> NodeExecutor:
@@ -99,7 +111,7 @@ class TestExecuteSubflowNodeGroupBranches:
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_private.assert_awaited_once_with(node)
         mock_library.assert_not_awaited()
@@ -118,7 +130,7 @@ class TestExecuteSubflowNodeGroupBranches:
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_library.assert_awaited_once_with(node, "some_library_name")
         mock_private.assert_not_awaited()
@@ -132,7 +144,7 @@ class TestExecuteSubflowNodeGroupBranches:
 
         executor = _make_executor()
         with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock):
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         node.subflow_execution_component.clear_execution_state.assert_called_once()
 
@@ -141,7 +153,7 @@ class TestExecuteSubflowNodeGroupBranches:
         """LOCAL_EXECUTION runs aprocess directly; clearing subprocess state is unnecessary."""
         node = _make_subflow_node(LOCAL_EXECUTION)
 
-        await _make_executor().execute(node)
+        await _execute(node)
 
         node.subflow_execution_component.clear_execution_state.assert_not_called()
 
@@ -162,7 +174,7 @@ class TestPrivateExecutionInWorker:
             patch(_IS_BETA_ENABLED_PATH, return_value=True),
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
         ):
-            await _make_executor().execute(node)
+            await _execute(node)
 
         assert seen == [IsolatedExecutionScope(owner_name="Subflow")]
         mock_private.assert_not_awaited()
@@ -174,7 +186,7 @@ class TestPrivateExecutionInWorker:
         node = _make_subflow_node(ISOLATED_EXECUTION)
 
         with patch(_IS_BETA_ENABLED_PATH, return_value=True):
-            await _make_executor().execute(node)
+            await _execute(node)
 
         assert current_isolated_execution_scope.get() is None
 
@@ -186,7 +198,7 @@ class TestPrivateExecutionInWorker:
             patch(_IS_BETA_ENABLED_PATH, return_value=False),
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
         ):
-            await _make_executor().execute(node)
+            await _execute(node)
 
         mock_private.assert_awaited_once_with(node)
         node.aprocess.assert_not_awaited()
@@ -202,7 +214,7 @@ class TestPrivateExecutionInWorker:
             patch(_IS_BETA_ENABLED_PATH, return_value=True),
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock),
         ):
-            await _make_executor().execute(node)
+            await _execute(node)
 
         assert all(scope is None for scope in seen)
 
@@ -309,7 +321,7 @@ class TestExecuteUnexpectedResultType:
         mock_engine.ahandle_request = AsyncMock(return_value=not_a_payload)
 
         with pytest.raises(RuntimeError, match="Weird"):
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
 
 class TestExecuteSuccessReturnsNone:
@@ -328,7 +340,7 @@ class TestExecuteSuccessReturnsNone:
         mock_engine.ahandle_request = AsyncMock(
             return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"x": 1}),
         )
-        result = await executor.execute(node)
+        result = await executor.execute(_in_workflow_of(executor, node))
 
         assert result is None
 
@@ -396,3 +408,59 @@ class TestControlFlowResolvedEventWireForm:
         assert received.parameter_output_values == values
         assert type(received.parameter_output_values["flag"]) is bool
         assert type(received.parameter_output_values["count"]) is int
+
+
+class TestRedirectPackagedEdgesAndRemove:
+    """Drop packaged nodes from one network without losing their outside consumers.
+
+    An outside consumer is left waiting on the node that stands in for the package (the loop End
+    or the group node), where the package's real values land once a pass finishes.
+    """
+
+    def test_outside_consumer_now_waits_on_replacement(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("Outside", "Body")  # Outside feeds a body node; both get packaged
+        network.add_edge("Outside", "Sink")  # ...and a loose sink that stays in the outer DAG
+        network.add_edge("Body", "End")
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"Outside", "Body"}, "End")
+
+        assert network.nodes() == {"End", "Sink"}
+        assert network.get_successors("End") == {"Sink"}
+        assert network.in_degree("Sink") == 1
+
+    def test_edges_between_packaged_nodes_are_dropped_not_redirected(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("A", "B")
+        network.add_edge("B", "End")
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"A", "B"}, "End")
+
+        assert network.nodes() == {"End"}
+        assert network.in_degree("End") == 0
+
+    def test_replacement_node_never_gains_a_self_loop(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("Body", "End")  # Body's only successor is the replacement itself
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"Body"}, "End")
+
+        assert network.nodes() == {"End"}
+        assert network.get_successors("End") == set()
+        assert network.in_degree("End") == 0
+
+    def test_nodes_absent_from_this_network_are_ignored(self) -> None:
+        from griptape_nodes.common.directed_graph import DirectedGraph
+
+        network = DirectedGraph()
+        network.add_edge("X", "Y")
+
+        NodeExecutor._redirect_packaged_edges_and_remove(network, {"NotHere"}, "End")
+
+        assert network.nodes() == {"X", "Y"}

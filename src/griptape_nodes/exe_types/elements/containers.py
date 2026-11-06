@@ -87,7 +87,7 @@ class ParameterContainer(Parameter, ABC):
         parameter structure/definitions rather than just data, so they remain
         meaningful even when empty.
 
-        See: https://github.com/griptape-ai/griptape-nodes/issues/1799
+        See: https://github.com/griptape-ai/griptape-nodes-engine/issues/1799
         """
         return True
 
@@ -178,7 +178,14 @@ class ParameterList(ParameterContainer):
     @property
     def row_input_types(self) -> list[str]:
         """What a row, or a drop on the list's header, accepts: each item type, a list of it, and a bare `list`."""
-        return self._with_list_variants(super()._custom_getter_for_property_input_types())
+        return self.input_types_for_child(self._own_input_types())
+
+    def input_types_for_child(self, input_types: list[str]) -> list[str]:
+        """A row accepts its own item types, a list of each, and a bare `list`.
+
+        Bare `list` because runtime-built lists cannot always declare one item type.
+        """
+        return list(dict.fromkeys([*input_types, *(f"list[{item_type}]" for item_type in input_types), "list"]))
 
     @property
     def _rows_add_list_items(self) -> bool:
@@ -187,7 +194,7 @@ class ParameterList(ParameterContainer):
         False when the list's items may themselves be lists (`any`, `all` or `list`), where it is one item.
         """
         whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value, "list"}
-        item_types = super()._custom_getter_for_property_input_types()
+        item_types = self._own_input_types()
         return all(
             ParameterType._extract_base_type(item_type.lower()) not in whole_item_bases for item_type in item_types
         )
@@ -293,6 +300,16 @@ class ParameterList(ParameterContainer):
         data["row_input_types"] = self.row_input_types
         return data
 
+    def save_dict(self) -> dict[str, Any]:
+        """Save the item types, which the setters take, rather than the list-shaped types the getters return.
+
+        Replaying `list[Thing]` through the setters would make the list a `list[list[Thing]]`.
+        """
+        data = super().save_dict()
+        data["type"] = super()._custom_getter_for_property_type()
+        data["output_type"] = super()._custom_getter_for_property_output_type()
+        return data
+
     def _custom_getter_for_property_type(self) -> str:
         base_type = super()._custom_getter_for_property_type()
         result = f"list[{base_type}]"
@@ -304,28 +321,16 @@ class ParameterList(ParameterContainer):
             if isinstance(child, Parameter):
                 child.type = value
         super()._custom_setter_for_property_type(value)
-        # Without explicit input types, the item types fall back to the type.
-        self._widen_all_row_input_types()
 
     def _custom_setter_for_property_input_types(self, value: list[str] | None) -> None:
+        for child in self._children:
+            if isinstance(child, Parameter):
+                child.input_types = value
         super()._custom_setter_for_property_input_types(value)
-        self._widen_all_row_input_types()
 
     def row_value_is_items(self, value: Any) -> bool:
         """Return whether a row's `value` contributes its items rather than one item."""
         return isinstance(value, list) and self._rows_add_list_items
-
-    def _widen_all_row_input_types(self) -> None:
-        rows = [child for child in self._children if isinstance(child, Parameter)]
-        if not rows:
-            # During construction there are no rows, and the other item types may not be set yet.
-            return
-        for row in rows:
-            self._widen_row_input_types(row)
-
-    def _widen_row_input_types(self, row: Parameter) -> None:
-        # `self.input_types` is the container's list-shaped set, not its item types.
-        row.input_types = self.row_input_types
 
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         # If we are setting a type, we need to propagate this to our children as well.
@@ -333,11 +338,9 @@ class ParameterList(ParameterContainer):
             if isinstance(child, Parameter):
                 child.output_type = value
         super()._custom_setter_for_property_output_type(value)
-        # Without explicit input types or a type, the item types fall back to the output type.
-        self._widen_all_row_input_types()
 
     def _custom_getter_for_property_input_types(self) -> list[str]:
-        base_input_types = super()._custom_getter_for_property_input_types()
+        base_input_types = self._own_input_types()
         result = []
         for base_input_type in base_input_types:
             container_variant = f"list[{base_input_type}]"
@@ -501,10 +504,12 @@ class ParameterList(ParameterContainer):
                 raise ValueError(msg)
 
         if isinstance(child, Parameter):
-            # Saved rows also need the container's item converters and input types.
+            # Saved rows also need the container's item converters.
             missing = [converter for converter in self._item_converters if converter not in child._converters]
             child._converters = [*missing, *child._converters]
-            self._widen_row_input_types(child)
+            if child._input_types:
+                # Engine 0.105.0 and 0.106.0 saved rows with the list variants, which would otherwise repeat.
+                child._input_types = _without_list_variants(child._input_types)
         super().add_child(child)
 
         # Mark the parent node as unresolved since the parameter structure changed
@@ -543,10 +548,15 @@ class ParameterList(ParameterContainer):
                 current_states_to_trigger_change_event={NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
             )
 
-    @staticmethod
-    def _with_list_variants(item_types: list[str]) -> list[str]:
-        """Accept bare `list` because runtime-built lists cannot always declare one item type."""
-        return [*item_types, *(f"list[{item_type}]" for item_type in item_types), "list"]
+
+def _without_list_variants(input_types: list[str]) -> list[str]:
+    """Drop the types `ParameterList.input_types_for_child` adds back, keeping at least one."""
+    item_types = [
+        input_type
+        for input_type in input_types
+        if input_type != "list" and not (input_type.startswith("list[") and input_type[5:-1] in input_types)
+    ]
+    return item_types or input_types
 
 
 class ParameterKeyValuePair(Parameter):

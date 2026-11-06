@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
     from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 T = TypeVar("T")
@@ -155,7 +156,7 @@ class WorkflowCandidate(NamedTuple):
 class WorkflowManager(EngineScoped):
     WORKFLOW_METADATA_HEADER: ClassVar[str] = WORKFLOW_METADATA_HEADER
     MAX_MINOR_VERSION_DEVIATION: ClassVar[int] = (
-        100  # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1219 <- make the versioning enforcement softer after we get a release going
+        100  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/1219 <- make the versioning enforcement softer after we get a release going
     )
 
     WorkflowStatus = WorkflowStatus
@@ -625,7 +626,7 @@ class WorkflowManager(EngineScoped):
             registered_libraries: Registered library names, or None to fetch them here.
         """
         # We have valid dependencies, etc.
-        # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes/issues/617
+        # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes-engine/issues/617
         problems = []
         had_critical_error = False
 
@@ -913,17 +914,39 @@ class WorkflowManager(EngineScoped):
 
         Builds into the current workflow, else opens the file as one.
         """
-        opens_workflow = not self.engine.context_manager.has_current_workflow()
-        return await self.runner.run_workflow(relative_file_path, opens_workflow=opens_workflow)
+        return await self.runner.run_workflow(relative_file_path, self.engine.current_workflow_or_none())
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
-        """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""
-        return extract_workflow_shape(self.engine.flow_manager, workflow_name, flow_name)
+        """Extracts the input and output shape of the open workflow. See `shape.extract_workflow_shape`.
+
+        Edge method for code not handed a workflow (node library publishers); engine code calls
+        `extract_workflow_shape_in`.
+
+        Raises:
+            KeyError: No workflow is open and `flow_name` names a flow, or no flow has that name.
+            ValueError: No workflow is open and no flow is named, or the flow has no Start or End node.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None and flow_name is not None:
+            details = f"Flow with name {flow_name} doesn't exist"
+            raise KeyError(details)
+        if workflow is None:
+            details = f"Workflow '{workflow_name}' does not have a top-level flow."
+            raise ValueError(details)
+        return self.extract_workflow_shape_in(workflow, workflow_name, flow_name)
+
+    def extract_workflow_shape_in(
+        self, workflow: WorkflowRuntime, workflow_name: str, flow_name: str | None = None
+    ) -> dict[str, Any]:
+        """Extracts the input and output shape of `workflow`. See `shape.extract_workflow_shape`."""
+        return extract_workflow_shape(self.engine.flow_manager, workflow, workflow_name, flow_name)
 
     @handles(GetWorkflowShapeRequest)
-    def on_get_workflow_shape_request(self, request: GetWorkflowShapeRequest) -> ResultPayload:
+    def on_get_workflow_shape_request(
+        self, request: GetWorkflowShapeRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         try:
-            shape = self.extract_workflow_shape(request.workflow_name, flow_name=request.flow_name)
+            shape = self.extract_workflow_shape_in(workflow, request.workflow_name, flow_name=request.flow_name)
         except (ValueError, KeyError) as err:
             details = (
                 f"Attempted to read the inputs and outputs of workflow '{request.workflow_name}'. "

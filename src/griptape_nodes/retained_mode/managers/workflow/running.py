@@ -42,13 +42,16 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowWithCurrentStateResultSuccess,
     WorkflowStatus,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext, current_request_type
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     LibraryNotRegisteredProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -60,6 +63,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -83,6 +87,8 @@ class WorkflowExecutionResult(NamedTuple):
     execution_details: str
     status: WorkflowStatus = WorkflowStatus.GOOD
     problems: tuple[WorkflowProblem, ...] = ()
+    # The workflow the file built into, which may have closed since, or None when it opened none.
+    workflow_id: str | None = None
 
 
 def execution_result_details(
@@ -133,28 +139,36 @@ class WorkflowRunner(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    async def run_workflow(self, relative_file_path: str, *, opens_workflow: bool) -> WorkflowExecutionResult:
-        """Run a saved workflow file's `build_workflow()`.
+    async def run_workflow(self, relative_file_path: str, workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
+        """Run a saved workflow file's `build_workflow()` into the open `workflow`, or with None, into the file opened as one.
 
-        A saved file never decides whether to open a workflow; its caller does. With
-        `opens_workflow`, the file is opened as a workflow and builds into it. Without, it builds
-        into the workflow the current work acts on, as a referenced import does.
+        A saved file never decides whether to open a workflow; its caller does. The file's requests
+        name no workflow, so the run binds the workflow it builds into, and the binding ends with
+        the run. The result names that workflow. A request that runs a file opening itself acts on
+        the workflow it opened for the rest of the request, as any load does.
         """
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
         # Problems found anywhere under this load land in the frame, including those of a
         # referenced subflow imported from inside exec() -- see LoadProblemFrame.
-        with LoadProblemFrame() as frame:
-            return await self._run_workflow_in_frame(
+        # Bound to no workflow until the file's own is known, so opening it never sees the caller's.
+        with LoadProblemFrame() as frame, self.engine.bind_workflow(NO_WORKFLOW):
+            result = await self._run_workflow_in_frame(
                 relative_file_path=relative_file_path,
                 complete_file_path=complete_file_path,
                 frame=frame,
-                opens_workflow=opens_workflow,
+                workflow=workflow,
             )
+        if workflow is None:
+            self._enter_workflow_the_file_opened(result)
+        return result
 
     @handles(RunWorkflowFromScratchRequest)
-    async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
+    async def on_run_workflow_from_scratch_request(
+        self, request: RunWorkflowFromScratchRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Close `workflow`, if the request acts on one, then open the file as a workflow."""
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with self.engine.workflow_manager.squelch_workflow_altered():
             # Check if file path exists
@@ -166,19 +180,19 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # Start with a clean slate.
-            clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-            clear_all_result = await self.engine.ahandle_request(clear_all_request)
-            if not clear_all_result.succeeded():
-                details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+            # Start with a clean slate in the workflow the request acts on. Other open workflows stay.
+            if workflow is not None:
+                clear_all_result = await self._clear_for_clean_slate(workflow)
+                if not clear_all_result.succeeded():
+                    details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
+                    return RunWorkflowFromScratchResultFailure(result_details=details)
 
             # Run the file, goddamn it
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path, opens_workflow=True)
+            execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=None)
             if execution_result.execution_successful:
                 return RunWorkflowFromScratchResultSuccess(
                     status=execution_result.status,
-                    workflow_id=self._current_workflow_id(),
+                    workflow_id=execution_result.workflow_id,
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
                 )
 
@@ -188,15 +202,16 @@ class WorkflowRunner(EngineScoped):
 
     @handles(RunWorkflowWithCurrentStateRequest)
     async def on_run_workflow_with_current_state_request(
-        self, request: RunWorkflowWithCurrentStateRequest
+        self, request: RunWorkflowWithCurrentStateRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
+        """Build the file into `workflow`, or with None, open the file as a workflow."""
         relative_file_path = request.file_path
-        if self.engine.context_manager.has_current_flow():
+        if workflow is not None and workflow.context.has_current_flow():
             # Disallow opening a workflow inside another workflow this way. It would
             # become an invisible child flow (no way to reach it in the UI), persisted
             # with the parent workflow on save, and executed invisibly whenever the
             # parent workflow was executed.
-            open_flow_name = self.engine.context_manager.get_current_flow().name
+            open_flow_name = workflow.context.get_current_flow().name
             details = (
                 f"Attempted to open workflow '{relative_file_path}' while the flow '{open_flow_name}' is still open. "
                 "Close the current workflow first, before opening this one."
@@ -207,14 +222,12 @@ class WorkflowRunner(EngineScoped):
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
             return RunWorkflowWithCurrentStateResultFailure(result_details=details)
-        # Builds into the open workflow, else opens the file as one.
-        opens_workflow = not self.engine.context_manager.has_current_workflow()
-        execution_result = await self.run_workflow(relative_file_path=relative_file_path, opens_workflow=opens_workflow)
+        execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=workflow)
 
         if execution_result.execution_successful:
             return RunWorkflowWithCurrentStateResultSuccess(
                 status=execution_result.status,
-                workflow_id=self._current_workflow_id(),
+                workflow_id=execution_result.workflow_id,
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
         return RunWorkflowWithCurrentStateResultFailure(
@@ -222,12 +235,18 @@ class WorkflowRunner(EngineScoped):
         )
 
     @handles(RunWorkflowFromRegistryRequest)
-    async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
+    async def on_run_workflow_from_registry_request(  # noqa: PLR0911
+        self, request: RunWorkflowFromRegistryRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Open the registered workflow and run its file into it.
+
+        With a clean slate, closes `workflow` first, if the request acts on one.
+        """
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
         # get workflow from registry
         try:
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
+            registered = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
         except KeyError:
             details = f"Failed to get workflow '{request.workflow_name}' from registry."
             return RunWorkflowFromRegistryResultFailure(result_details=details)
@@ -236,7 +255,7 @@ class WorkflowRunner(EngineScoped):
         # Unsaved workflows have no file; callers should use StartFlowRequest against the
         # live flow for in-memory execution. Keep this reject explicit so the UI can
         # distinguish "run this unsaved edit" (StartFlow) from "run the last saved version".
-        relative_file_path = workflow.file_path
+        relative_file_path = registered.file_path
         if relative_file_path is None:
             details = (
                 f"Cannot run unsaved workflow '{request.workflow_name}' from the registry because it has no file on disk. "
@@ -246,65 +265,77 @@ class WorkflowRunner(EngineScoped):
 
         # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
         # Refused before anything is registered or run.
-        context_manager = self.engine.context_manager
-        if not request.run_with_clean_slate and context_manager.has_current_workflow():
+        blocking = self.engine.open_workflows.workflow_blocking_open()
+        if not request.run_with_clean_slate and blocking is not None:
             details = (
                 f"Attempted to run workflow '{request.workflow_name}'. Failed because workflow "
-                f"'{context_manager.get_current_workflow_name()}' is open. Clear the open workflow first, "
+                f"'{self.engine.workflow_registry.get(blocking.workflow_id).name}' is open. Clear the open workflow first, "
                 "or run it with a clean slate (run_with_clean_slate=True)."
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate:
-                # Start with a clean slate.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
+            if request.run_with_clean_slate and workflow is not None:
+                # Start with a clean slate in the workflow the request acts on. Other open workflows stay.
+                clear_all_result = await self._clear_for_clean_slate(workflow)
                 if not clear_all_result.succeeded():
                     details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-            # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
-            self.engine.context_manager.push_workflow(request.workflow_name)
+            # Open the workflow before running its file, so the file builds into it. A failed run closes it below.
+            # The open refuses when the request is bound to another open workflow or this one is already
+            # open, cases the check above can't see once several workflows may be open.
+            try:
+                opened = self.engine.context_manager.open_workflow(request.workflow_name)
+            except ContextManager.WorkflowAlreadyOpenError as err:
+                return RunWorkflowFromRegistryResultFailure(result_details=str(err))
+            except OpenWorkflowError:
+                details = (
+                    f"Attempted to run workflow '{request.workflow_name}'. Failed because it is already open. "
+                    "Close it first, or run it with a clean slate from its own tab."
+                )
+                return RunWorkflowFromRegistryResultFailure(result_details=details)
             # run file
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path, opens_workflow=False)
+            execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=opened)
 
             if not execution_result.execution_successful:
                 result_messages = execution_result_details(execution_result, level=logging.ERROR)
 
-                # Attempt to clear everything out, as we modified the engine state getting here.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
-
-                # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
+                # Close the workflow the run opened, as we modified the engine state getting here. The
+                # file may have closed it itself before failing, leaving nothing to close.
+                still_open = self.engine.open_workflows.find(registered.workflow_id)
+                if still_open is not None:
+                    await still_open.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
 
         # Success!
         result_messages = execution_result_details(execution_result, level=logging.DEBUG)
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
-            workflow_id=workflow.workflow_id,
+            workflow_id=execution_result.workflow_id,
             result_details=ResultDetails(*result_messages),
         )
 
     @handles(GetWorkflowRunCommandRequest)
-    async def on_get_workflow_run_command_request(self, request: GetWorkflowRunCommandRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912
+    async def on_get_workflow_run_command_request(  # noqa: C901, PLR0911, PLR0912
+        self, request: GetWorkflowRunCommandRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """The command line that runs the saved workflow or file the request names, else the open `workflow`."""
         workflow_name = request.workflow_name
         file_path = request.file_path
 
         # Failure: no identifier and no current context
         if workflow_name is None and file_path is None:
-            context_manager = self.engine.context_manager
-            if not context_manager.has_current_workflow():
+            if workflow is None:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(
                         "Attempted to get workflow run command. Failed with workflow_name=None, file_path=None "
                         "because no workflow is loaded in the current context. Provide workflow_name or file_path, or load a workflow."
                     )
                 )
-            # When neither workflow_name nor file_path is provided, use the workflow in the current context as a fallback.
-            workflow_name = context_manager.get_current_workflow_name()
+            # When neither workflow_name nor file_path is provided, use the open workflow as a fallback.
+            workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
 
         # Failure: both workflow_name and file_path provided
         if workflow_name is not None and file_path is not None:
@@ -319,7 +350,7 @@ class WorkflowRunner(EngineScoped):
         workflow_shape: WorkflowShape | None = None
         if workflow_name is not None:
             try:
-                workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
+                saved = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
             except KeyError:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(
@@ -327,8 +358,8 @@ class WorkflowRunner(EngineScoped):
                         "because the workflow was not found in the registry. Save the workflow first, or provide file_path."
                     )
                 )
-            relative_file_path = workflow.file_path
-            workflow_shape = workflow.metadata.workflow_shape
+            relative_file_path = saved.file_path
+            workflow_shape = saved.metadata.workflow_shape
         else:
             relative_file_path = file_path
 
@@ -404,24 +435,26 @@ class WorkflowRunner(EngineScoped):
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
 
-    def _current_workflow_id(self) -> str | None:
-        """The id of the workflow a load left in context, or None if it left none."""
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_workflow():
-            return None
-        return context_manager.get_current_workflow_id()
+    def _enter_workflow_the_file_opened(self, result: WorkflowExecutionResult) -> None:
+        """Bind the current request to the workflow its file opened, once the load's own binding has ended.
 
-    async def _ensure_workflow_context_established(self) -> None:
-        """Ensure there's a current workflow and flow context after workflow execution."""
-        context_manager = self.engine.context_manager
+        `open_workflow` binds it inside `run_workflow`'s NO_WORKFLOW block, whose exit undoes that,
+        so without this the request's post-dispatch hooks would act on no workflow.
+        """
+        if current_request_type() is None or result.workflow_id is None:
+            return
+        opened = self.engine.open_workflows.find(result.workflow_id)
+        if opened is None:
+            return
+        self.engine.enter_opened_workflow(opened)
 
-        # First check: Do we have a current workflow? If not, that's a critical failure.
-        if not context_manager.has_current_workflow():
-            error_message = "Workflow execution completed but no current workflow is established in context"
-            raise RuntimeError(error_message)
+    async def _clear_for_clean_slate(self, workflow: WorkflowRuntime) -> ResultPayload:
+        """Close `workflow` before a file opens as a new one."""
+        return await workflow.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-        # Second check: Do we have a current flow? If not, try to establish one.
-        if not context_manager.has_current_flow():
+    async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
+        """Ensure `workflow`, which a file just built into, has a current flow."""
+        if not workflow.context.has_current_flow():
             # Use the proper request to get the top-level flow
             from griptape_nodes.retained_mode.events.flow_events import (
                 GetTopLevelFlowRequest,
@@ -429,7 +462,7 @@ class WorkflowRunner(EngineScoped):
             )
 
             top_level_flow_request = GetTopLevelFlowRequest()
-            top_level_flow_result = await self.engine.ahandle_request(top_level_flow_request)
+            top_level_flow_result = await workflow.ahandle_request(top_level_flow_request)
 
             if (
                 isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess)
@@ -437,20 +470,28 @@ class WorkflowRunner(EngineScoped):
             ):
                 # Push the flow to the context stack permanently using FlowManager
                 flow_manager = self.engine.flow_manager
-                flow_obj = flow_manager.get_flow_by_name(top_level_flow_result.flow_name)
-                context_manager.push_flow(flow_obj)
+                flow_obj = flow_manager.get_flow_by_name_in(workflow, top_level_flow_result.flow_name)
+                workflow.context.push_flow(flow_obj)
                 details = f"Workflow execution completed. Set '{top_level_flow_result.flow_name}' as current context."
                 logger.debug(details)
 
             # If we still don't have a flow, that's a critical error
-            if not context_manager.has_current_flow():
+            if not workflow.context.has_current_flow():
                 error_message = "Workflow execution completed but no current flow context could be established"
                 raise RuntimeError(error_message)
 
     async def _run_workflow_in_frame(
-        self, *, relative_file_path: str, complete_file_path: Path, frame: LoadProblemFrame, opens_workflow: bool
+        self,
+        *,
+        relative_file_path: str,
+        complete_file_path: Path,
+        frame: LoadProblemFrame,
+        workflow: WorkflowRuntime | None,
     ) -> WorkflowExecutionResult:
-        """Read, resolve libraries for, and exec one workflow file, recording problems in `frame`."""
+        """Read, resolve libraries for, and exec one workflow file into `workflow`, recording problems in `frame`.
+
+        With no `workflow`, the file is opened as one first.
+        """
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -463,8 +504,8 @@ class WorkflowRunner(EngineScoped):
 
             # By the path a standalone run opens it with (`push_workflow(file_path=__file__)`), so
             # both find the same registry entry.
-            if opens_workflow:
-                self.engine.context_manager.push_workflow(file_path=str(complete_file_path))
+            if workflow is None:
+                workflow = self.engine.context_manager.open_workflow(file_path=str(complete_file_path))
 
             # _generate_workflow_run_prerequisite_code emits one registration per header entry,
             # so each library we just failed to register is about to fail again on a request the
@@ -476,7 +517,7 @@ class WorkflowRunner(EngineScoped):
                 if any(isinstance(problem, LibraryNotRegisteredProblem) for problem in frame.problems)
                 else nullcontext()
             )
-            with duplicate_library_failures:
+            with duplicate_library_failures, self.engine.bind_workflow(workflow):
                 # Execute the workflow module with a dedicated namespace so `__file__` resolves
                 # to the workflow path and the `if __name__ == "__main__"` guard does not fire
                 # (which would try to spin up a second event loop via asyncio.run).
@@ -496,7 +537,7 @@ class WorkflowRunner(EngineScoped):
                 # After workflow execution, ensure there's always a current context by pushing
                 # the top-level flow if the context is empty. This fixes regressions where
                 # with Workflow Schema version 0.6.0+ workflows expect context to be established.
-                await self._ensure_workflow_context_established()
+                await self._ensure_workflow_context_established(workflow)
 
         except Exception as e:
             return WorkflowExecutionResult(
@@ -504,6 +545,7 @@ class WorkflowRunner(EngineScoped):
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
                 status=WorkflowStatus.UNUSABLE,
                 problems=tuple(frame.problems),
+                workflow_id=self._workflow_id_of(workflow),
             )
         return WorkflowExecutionResult(
             execution_successful=True,
@@ -512,6 +554,7 @@ class WorkflowRunner(EngineScoped):
             # canvas, with placeholders where the missing library's nodes belong.
             status=WorkflowStatus.FLAWED if frame.problems else WorkflowStatus.GOOD,
             problems=tuple(frame.problems),
+            workflow_id=workflow.workflow_id,
         )
 
     async def _ensure_libraries_for_workflow(self, *, relative_file_path: str) -> list[WorkflowProblem]:
@@ -580,3 +623,9 @@ class WorkflowRunner(EngineScoped):
                     )
                 )
         return problems
+
+    @staticmethod
+    def _workflow_id_of(workflow: WorkflowRuntime | None) -> str | None:
+        if workflow is None:
+            return None
+        return workflow.workflow_id

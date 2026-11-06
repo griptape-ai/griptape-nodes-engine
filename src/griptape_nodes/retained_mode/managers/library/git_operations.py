@@ -709,16 +709,15 @@ class LibraryGitOperations(EngineScoped):
     @handles(InspectLibraryRepoRequest)
     async def inspect_library_repo_request(self, request: InspectLibraryRepoRequest) -> ResultPayload:
         """Inspect a library's metadata from a git repository without downloading the full repository."""
-        git_url = request.git_url
-        ref = request.ref
-
-        # Normalize GitHub shorthand to full URL
-        normalized_url = normalize_github_url(git_url)
+        parsed_url = parse_git_url_with_ref(normalize_github_url(request.git_url))
+        normalized_url = parsed_url.url
+        # Explicit ref wins over a url@ref suffix, matching DownloadLibraryRequest.
+        ref = request.ref or parsed_url.ref or "HEAD"
         logger.info("Inspecting library metadata from '%s' (ref: %s)", normalized_url, ref)
 
         # Perform sparse checkout to get library JSON
         try:
-            checkout = sparse_checkout_library_json(normalized_url, ref)
+            checkout = await asyncio.to_thread(sparse_checkout_library_json, normalized_url, ref)
         except GitError as e:
             details = f"Failed to inspect library from {normalized_url}: {e}"
             return InspectLibraryRepoResultFailure(result_details=details)

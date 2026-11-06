@@ -6,7 +6,7 @@ there. This module provides:
 
 - ``LOCAL_ONLY_REQUEST_TYPES``: the request classes a worker answers ITSELF. Every other
   registered type gets a ``RemoteHandler`` that forwards to the orchestrator.
-- ``RemoteHandler``: an async callable that replaces the original manager
+- ``RemoteHandler``: a ``ForwardingHandler`` that replaces the original manager
   handler for those request types on the worker. While the worker is actively
   executing a node it forwards; outside that scope it delegates back to the
   original local handler (which preserves bootstrap / library-load behavior).
@@ -77,6 +77,7 @@ from griptape_nodes.retained_mode.events.worker_events import (
     WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
@@ -421,7 +422,7 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
 
 
 @dataclass
-class RemoteHandler:
+class RemoteHandler(ForwardingHandler):
     """Worker-side dispatch shim.
 
     Registered in place of the original manager handler for every registered type except
@@ -440,11 +441,16 @@ class RemoteHandler:
     original: Any  # HandlerCallback; typed loosely to avoid a runtime import cycle
     event_manager: EventManager
 
-    async def __call__(self, request: RequestPayload) -> ResultPayload:
-        if self.event_manager.in_node_execution():
-            event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
-            return cast("ResultPayload", event_result.result)
-        return await call_function(self.original, request)
+    def forwards_now(self) -> bool:
+        """Whether a call made now goes to the orchestrator: only while this worker runs a node."""
+        return self.event_manager.in_node_execution()
+
+    async def forward(self, request: RequestPayload) -> ResultPayload:
+        event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
+        return cast("ResultPayload", event_result.result)
+
+    async def handle_locally(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:
+        return await call_function(self.original, request, **kwargs)
 
 
 def schedule_broadcast(broadcast_type: type[RequestPayload]) -> None:
@@ -479,9 +485,8 @@ def register_remote_handlers(event_manager: EventManager) -> None:
     constructed) AND after ``configure_worker_forwarding`` has supplied the RequestClient,
     topic, and loop references. See ``_run_worker`` in app.py.
 
-    A swapped type keeps no declared scope (``RequestScope``): ``RemoteHandler`` passes the
-    original the request alone, so an OPTIONAL_WORKFLOW handler gets None here, and a WORKFLOW
-    handler, which has no default, must be local-only.
+    A swapped type keeps its scope (``RequestScope``): dispatch hands the workflow that scope passes
+    to ``RemoteHandler.handle_locally``, which hands it to the original.
     """
     for request_type in event_manager.registered_request_types():
         if request_type in LOCAL_ONLY_REQUEST_TYPES:
@@ -490,8 +495,7 @@ def register_remote_handlers(event_manager: EventManager) -> None:
         if original is None:
             continue
         remote = RemoteHandler(original=original, event_manager=event_manager)
-        event_manager.remove_manager_from_request_type(request_type)
-        event_manager.assign_manager_to_request_type(request_type, remote)
+        event_manager.replace_manager_for_request_type(request_type, remote)
 
 
 async def _handle_drop_all_local_objects(

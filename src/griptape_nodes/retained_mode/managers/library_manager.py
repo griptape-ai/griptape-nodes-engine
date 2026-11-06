@@ -73,7 +73,7 @@ from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
 )
-from griptape_nodes.retained_mode.request_handlers import RequestScope, handles
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -339,7 +339,7 @@ class LibraryManager(EngineScoped):
         finally:
             self._libraries_loading_complete.set()
 
-    @handles(ReloadAllLibrariesRequest, scope=RequestScope.HOST)
+    @handles(ReloadAllLibrariesRequest)
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
         # The heartbeat reports is_initializing during a mid-session reload too.
         with self.engine.lifecycle.reloading():
@@ -462,7 +462,7 @@ class LibraryManager(EngineScoped):
     async def load_libraries_for_startup(self, payload: AppInitializationComplete) -> None:
         """Run the library half of engine startup. See `EngineLifecycle` for the rest."""
         # Automatically migrate old XDG library paths from config
-        # TODO: Remove https://github.com/griptape-ai/griptape-nodes/issues/3348
+        # TODO: Remove https://github.com/griptape-ai/griptape-nodes-engine/issues/3348
         self.discovery.migrate_old_xdg_library_paths()
 
         # App just got init'd. First download any missing libraries from git URLs.

@@ -1,8 +1,8 @@
 """Who opens the workflow a saved workflow file builds into.
 
 `build_workflow()` opens nothing: it builds into the workflow its caller opened or bound. The
-engine's load paths decide through `WorkflowRunner.run_workflow(opens_workflow=...)`, and a file
-run on its own opens itself in `aexecute_workflow()`.
+engine's load paths decide through `WorkflowRunner.run_workflow(path, workflow)`, where a None
+workflow opens the file as one, and a file run on its own opens itself in `aexecute_workflow()`.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # The guard files saved before carry in build_workflow().
 _SAVED_BEFORE_GUARD = """    context_manager = GriptapeNodes.ContextManager()
@@ -54,8 +55,8 @@ def _generate(engine: Engine, *, workflow_shape: WorkflowShape | None = None) ->
     )
 
 
-def _run(engine: Engine, path: Path, *, opens_workflow: bool) -> None:
-    result = asyncio.run(engine.workflow_manager.runner.run_workflow(str(path), opens_workflow=opens_workflow))
+def _run(engine: Engine, path: Path, workflow: WorkflowRuntime | None) -> None:
+    result = asyncio.run(engine.workflow_manager.runner.run_workflow(str(path), workflow))
     assert result.execution_successful, result.execution_details
 
 
@@ -74,25 +75,24 @@ class TestSavedWorkflowOpen:
         path = tmp_path / "saved.py"
         path.write_text(_generate(engine), encoding="utf-8")
 
-        _run(engine, path, opens_workflow=True)
+        _run(engine, path, None)
 
         [opened] = engine.open_workflows.all_open()
         assert engine.workflow_registry.get(opened.workflow_id).absolute_path == path.resolve()
         assert opened.objects.has("canvas")
 
-    def test_the_runner_builds_into_the_bound_workflow_however_many_are_open(
+    def test_the_runner_builds_into_the_workflow_it_is_handed_however_many_are_open(
         self, engine: Engine, tmp_path: Path
     ) -> None:
         path = tmp_path / "saved.py"
         path.write_text(_generate(engine), encoding="utf-8")
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
         loading = engine.open_workflows.open(
             engine.workflow_registry.register_unsaved("loading", listed=False).workflow_id
         )
 
-        with engine.bind_workflow(loading):
-            _run(engine, path, opens_workflow=False)
+        _run(engine, path, loading)
 
         assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
         assert loading.objects.has("canvas")
@@ -105,7 +105,7 @@ class TestSavedWorkflowOpen:
         signature = "async def build_workflow() -> None:\n"
         path.write_text(generated.replace(signature, signature + _SAVED_BEFORE_GUARD), encoding="utf-8")
 
-        _run(engine, path, opens_workflow=True)
+        _run(engine, path, None)
 
         [opened] = engine.open_workflows.all_open()
         assert opened.objects.has("canvas")
@@ -113,7 +113,7 @@ class TestSavedWorkflowOpen:
 
 class TestWorkflowsDoNotNest:
     def test_unbound_work_may_push_while_several_are_open(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="first")
         engine.context_manager.push_workflow(workflow_name="second")
 
@@ -122,7 +122,7 @@ class TestWorkflowsDoNotNest:
         assert len(engine.open_workflows.all_open()) == 3  # noqa: PLR2004
 
     def test_a_push_while_bound_to_a_live_workflow_is_refused_however_many_may_be_open(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(allow_several_open=True)
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="bound")
         bound = engine.current_workflow()
 

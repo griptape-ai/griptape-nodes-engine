@@ -159,9 +159,10 @@ class ContextManager(EngineScoped):
 
     @handles(SetWorkflowContextRequest)
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
-        # As of today, we only allow a single Workflow context at a time. This may change in the future.
-        if self.has_current_workflow():
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{self.get_current_workflow_name()}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
+        blocking = self.engine.open_workflows.workflow_blocking_open()
+        if blocking is not None:
+            blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
+            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{blocking_name}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
             return SetWorkflowContextFailure(result_details=msg)
 
         # Normalized here rather than at read time so `workflow_dir` never has to care whether
@@ -218,22 +219,27 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
-        resolved_name = self.push_workflow(workflow_name, working_directory=working_directory)
+        opened = self.open_workflow(workflow_name, working_directory=working_directory)
+        resolved_name = self.engine.workflow_registry.get(opened.workflow_id).name
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(
-            workflow_name=resolved_name, workflow_id=self.get_current_workflow_id(), result_details=msg
+            workflow_name=resolved_name, workflow_id=opened.workflow_id, result_details=msg
         )
 
     @handles(GetWorkflowContextRequest)
-    def on_get_workflow_context_request(self, request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG002
+    def on_get_workflow_context_request(
+        self,
+        request: GetWorkflowContextRequest,  # noqa: ARG002
+        workflow: WorkflowRuntime | None = None,
+    ) -> ResultPayload:
         workflow_name = None
         workflow_id = None
         is_saved = None
-        if self.has_current_workflow():
-            workflow = self.get_current_workflow()
-            workflow_name = workflow.name
-            workflow_id = workflow.workflow_id
-            is_saved = workflow.is_saved
+        if workflow is not None:
+            entry = self.engine.workflow_registry.get(workflow.workflow_id)
+            workflow_name = entry.name
+            workflow_id = entry.workflow_id
+            is_saved = entry.is_saved
         return GetWorkflowContextSuccess(
             workflow_name=workflow_name,
             workflow_id=workflow_id,
@@ -242,13 +248,16 @@ class ContextManager(EngineScoped):
         )
 
     @handles(EnsureWorkflowAndFlowRequest)
-    def on_ensure_workflow_and_flow_request(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
+    def on_ensure_workflow_and_flow_request(
+        self, request: EnsureWorkflowAndFlowRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 
-        Delegates the workflow side to SetWorkflowContextRequest so the unsaved-registry-key
-        scheme ("unsaved:<workflow id>") stays the single source of truth for scratch workflows;
-        composes that with CreateFlowRequest so callers can go from a blank engine to
-        CreateNode in a single round trip.
+        Uses the open `workflow`, and otherwise opens one. Delegates opening to
+        SetWorkflowContextRequest so the unsaved-registry-key scheme ("unsaved:<workflow id>")
+        stays the single source of truth for scratch workflows; composes that with
+        CreateFlowRequest so callers can go from a blank engine to CreateNode in a single round
+        trip.
         """
         # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
         from griptape_nodes.retained_mode.events.flow_events import (
@@ -257,9 +266,9 @@ class ContextManager(EngineScoped):
         )
 
         created_workflow = False
-        if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
-            workflow_id = self.get_current_workflow_id()
+        if workflow is not None:
+            workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+            workflow_id = workflow.workflow_id
         else:
             set_workflow_result = self.engine.handle_request(
                 SetWorkflowContextRequest(
@@ -268,7 +277,11 @@ class ContextManager(EngineScoped):
                     working_directory=request.working_directory,
                 )
             )
-            if not isinstance(set_workflow_result, SetWorkflowContextSuccess):
+            # The success names the workflow it opened; its id field is optional only for older engines.
+            if (
+                not isinstance(set_workflow_result, SetWorkflowContextSuccess)
+                or set_workflow_result.workflow_id is None
+            ):
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while setting the workflow: "
@@ -277,13 +290,14 @@ class ContextManager(EngineScoped):
                 )
             workflow_name = set_workflow_result.workflow_name
             workflow_id = set_workflow_result.workflow_id
+            workflow = self.engine.open_workflows.get(workflow_id)
             created_workflow = True
 
         created_flow = False
-        if self.has_current_flow():
-            flow_name = self.get_current_flow().name
+        if workflow.context.has_current_flow():
+            flow_name = workflow.context.get_current_flow().name
         else:
-            create_flow_result = self.engine.handle_request(
+            create_flow_result = workflow.handle_request(
                 CreateFlowRequest(
                     parent_flow_name=None,
                     flow_name=request.flow_name,
@@ -291,9 +305,9 @@ class ContextManager(EngineScoped):
                 )
             )
             if not isinstance(create_flow_result, CreateFlowResultSuccess):
-                # Roll the workflow push back so a partial failure does not leave hanging state.
+                # Close the workflow this request opened so a partial failure does not leave hanging state.
                 if created_workflow:
-                    self.pop_workflow()
+                    self.engine.close_workflow(workflow)
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while creating the flow: "
@@ -729,7 +743,18 @@ class ContextManager(EngineScoped):
         file_path: str | None = None,
         working_directory: str | None = None,
     ) -> str:
-        """Open a workflow as the Workflow context, through `Engine.open_workflow`.
+        """Open a workflow as the Workflow context, and return its name. See `open_workflow`."""
+        opened = self.open_workflow(workflow_name, file_path=file_path, working_directory=working_directory)
+        return self.engine.workflow_registry.get(opened.workflow_id).name
+
+    def open_workflow(
+        self,
+        workflow_name: str | None = None,
+        *,
+        file_path: str | None = None,
+        working_directory: str | None = None,
+    ) -> WorkflowRuntime:
+        """Open a workflow as the Workflow context, through `Engine.open_workflow`, and return its runtime.
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
@@ -751,7 +776,7 @@ class ContextManager(EngineScoped):
                 reaches here.
 
         Returns:
-            The name of the Workflow that was entered.
+            The runtime of the Workflow that was entered.
 
         Raises:
             ValueError: If neither or both of workflow_name and file_path are provided.
@@ -789,7 +814,7 @@ class ContextManager(EngineScoped):
             # Outside a request nothing is bound: the work acts on the only open workflow, so no
             # binding is left behind in a context a later close does not reach.
             self.engine.enter_opened_workflow(opened)
-        return workflow.name
+        return opened
 
     def _find_or_register_open_file(self, file_path: str) -> Workflow:
         """The registry entry for a workflow file being opened, registered unlisted when there is none.

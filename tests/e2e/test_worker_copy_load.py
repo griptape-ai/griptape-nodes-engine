@@ -149,7 +149,7 @@ async def _run(node: BaseNode) -> ResultPayload:
     """Run `node` on the orchestrator, which sends it to the worker. The executor sends no values of its own."""
     engine = current_engine()
     request = ExecuteNodeRequest(node_name=node.name, node_metadata=dict(node.metadata))  # type: ignore[arg-type]
-    return await engine.ahandle_request(sent_from_open_workflow(request, engine))
+    return await engine.current_workflow().ahandle_request(sent_from_open_workflow(request, engine))
 
 
 async def _run_successfully(node: BaseNode) -> ExecuteNodeResultSuccess:
@@ -196,7 +196,7 @@ def _what_the_worker_still_holds(worker: SimulatedWorker) -> dict[str, list[str]
             held["objects"] += [
                 name for name in engine.object_manager.get_filtered_subset() if name != _WORKER_COPIES_FLOW_NAME
             ]
-            held["node parents"] += list(engine.node_manager._name_to_parent_flow_name)
+            held["node parents"] += list(workflow.nodes.name_to_parent_flow_name)
             held["flow parents"] += [
                 name for name in engine.flow_manager._name_to_parent_name if name != _WORKER_COPIES_FLOW_NAME
             ]

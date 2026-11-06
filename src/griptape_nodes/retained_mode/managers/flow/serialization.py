@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 logger = logging.getLogger("griptape_nodes")
@@ -237,6 +238,7 @@ class FlowSerialization(EngineScoped):
 
     def _serialize_variables_for_flow(
         self,
+        workflow: WorkflowRuntime,
         flow_name: str,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         variable_references: set[VariableReference],
@@ -253,6 +255,7 @@ class FlowSerialization(EngineScoped):
         generated workflow script references both kinds through the same ``top_level_unique_values_dict``.
 
         Args:
+            workflow: The workflow the flow belongs to.
             flow_name: The flow whose flow-scoped variables are being serialized.
             unique_parameter_uuid_to_values: Shared unique-value pool; variable values are added in place.
             variable_references: Aggregated set of references declared by nodes in this flow and its subtree.
@@ -261,12 +264,12 @@ class FlowSerialization(EngineScoped):
             A list of ``SerializedVariableCommand``s for this flow's declared flow-scoped variables.
         """
         declared_names_for_this_flow = self._resolve_declared_variable_names_for_flow(
-            flow_name=flow_name, variable_references=variable_references
+            workflow, flow_name=flow_name, variable_references=variable_references
         )
         if not declared_names_for_this_flow:
             return []
 
-        flow_list_result = self.engine.handle_request(
+        flow_list_result = workflow.handle_request(
             ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY)
         )
         if not isinstance(flow_list_result, ListVariablesResultSuccess):
@@ -288,6 +291,7 @@ class FlowSerialization(EngineScoped):
 
     def _resolve_declared_variable_names_for_flow(
         self,
+        workflow: WorkflowRuntime,
         flow_name: str,
         variable_references: set[VariableReference],
     ) -> set[str]:
@@ -311,10 +315,10 @@ class FlowSerialization(EngineScoped):
         for ref in variable_references:
             match ref.scope:
                 case VariableScope.CURRENT_FLOW_ONLY:
-                    if self._variable_is_owned_by(name=ref.name, flow_name=flow_name):
+                    if self._variable_is_owned_by(workflow, name=ref.name, flow_name=flow_name):
                         claimed_names.add(ref.name)
                 case VariableScope.HIERARCHICAL:
-                    owning_flow = self._hierarchical_owning_flow_for(name=ref.name, starting_flow=flow_name)
+                    owning_flow = self._hierarchical_owning_flow_for(workflow, name=ref.name, starting_flow=flow_name)
                     if owning_flow == flow_name:
                         claimed_names.add(ref.name)
                 case (
@@ -337,9 +341,9 @@ class FlowSerialization(EngineScoped):
 
         return claimed_names
 
-    def _variable_is_owned_by(self, name: str, flow_name: str) -> bool:
+    def _variable_is_owned_by(self, workflow: WorkflowRuntime, name: str, flow_name: str) -> bool:
         """Return True if a flow-scoped variable with ``name`` exists directly in ``flow_name``."""
-        list_result = self.engine.handle_request(
+        list_result = workflow.handle_request(
             ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY)
         )
         if not isinstance(list_result, ListVariablesResultSuccess):
@@ -352,9 +356,9 @@ class FlowSerialization(EngineScoped):
             return False
         return any(variable.name == name for variable in list_result.variables)
 
-    def _hierarchical_owning_flow_for(self, name: str, starting_flow: str) -> str | None:
+    def _hierarchical_owning_flow_for(self, workflow: WorkflowRuntime, name: str, starting_flow: str) -> str | None:
         """Return the owning flow name of a variable found by hierarchical lookup, or None if not found."""
-        result = self.engine.handle_request(
+        result = workflow.handle_request(
             GetVariableRequest(name=name, lookup_scope=VariableScope.HIERARCHICAL, starting_flow=starting_flow)
         )
         if not isinstance(result, GetVariableResultSuccess):
@@ -428,22 +432,22 @@ class FlowSerialization(EngineScoped):
 
         return aggregated_commands
 
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/861
-    # similar manager refactors: https://github.com/griptape-ai/griptape-nodes/issues/806
     @handles(SerializeFlowToCommandsRequest)
-    def on_serialize_flow_to_commands(self, request: SerializeFlowToCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_serialize_flow_to_commands(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self, request: SerializeFlowToCommandsRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         flow_name = request.flow_name
         flow = None
         if flow_name is None:
-            if self.engine.context_manager.has_current_flow():
-                flow = self.engine.context_manager.get_current_flow()
+            if workflow.context.has_current_flow():
+                flow = workflow.context.get_current_flow()
                 flow_name = flow.name
             else:
                 details = "Attempted to serialize a Flow to commands from the Current Context. Failed because the Current Context was empty."
                 return SerializeFlowToCommandsResultFailure(result_details=details)
         if flow is None:
             # Does this flow exist?
-            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
             if flow is None:
                 details = (
                     f"Attempted to serialize Flow '{flow_name}' to commands, but no Flow with that name could be found."
@@ -455,12 +459,12 @@ class FlowSerialization(EngineScoped):
         # And track how values map into that map.
         serialized_parameter_value_tracker = SerializedParameterValueTracker()
 
-        with self.engine.context_manager.flow(flow):
+        with workflow.context.flow(flow):
             # The base flow creation, if desired.
             if request.include_create_flow_command:
                 # Check if this flow is a referenced workflow
-                if self.engine.flow_manager.is_referenced_workflow(flow):
-                    referenced_workflow_name = self.engine.flow_manager.get_referenced_workflow_name(flow)
+                if self.engine.flow_manager.is_referenced_workflow(workflow, flow):
+                    referenced_workflow_name = self.engine.flow_manager.get_referenced_workflow_name(workflow, flow)
                     create_flow_request = ImportWorkflowAsReferencedSubFlowRequest(
                         workflow_name=referenced_workflow_name,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
                         imported_flow_metadata=flow.metadata,
@@ -469,7 +473,7 @@ class FlowSerialization(EngineScoped):
                     # Always set set_as_new_context=False during serialization - let the workflow manager
                     # that loads this serialized flow decide whether to push it to context or not
                     # Get parent flow name from the flow manager's tracking
-                    parent_name = self.engine.flow_manager.get_parent_flow(flow_name)
+                    parent_name = self.engine.flow_manager.get_parent_flow_in(workflow, flow_name)
                     create_flow_request = CreateFlowRequest(
                         flow_name=flow_name,
                         parent_flow_name=parent_name,
@@ -487,7 +491,7 @@ class FlowSerialization(EngineScoped):
             # Now each of the child nodes in the flow.
             node_name_to_uuid = {}
             nodes_in_flow_request = ListNodesInFlowRequest()
-            nodes_in_flow_result = self.engine.handle_request(nodes_in_flow_request)
+            nodes_in_flow_result = workflow.handle_request(nodes_in_flow_request)
             if not isinstance(nodes_in_flow_result, ListNodesInFlowResultSuccess):
                 details = (
                     f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to list Nodes in the Flow."
@@ -496,12 +500,12 @@ class FlowSerialization(EngineScoped):
 
             # Serialize each node
             for node_name in nodes_in_flow_result.node_names:
-                node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
+                node = workflow.objects.get_as_type(node_name, BaseNode)
                 if node is None:
                     details = f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to serialize Node '{node_name}' within the Flow."
                     return SerializeFlowToCommandsResultFailure(result_details=details)
 
-                with self.engine.context_manager.node(node):
+                with workflow.context.node(node):
                     # Note: the parameter value stuff is pass-by-reference, and we expect the values to be modified in place.
                     # This might be dangerous if done over the wire.
 
@@ -511,7 +515,7 @@ class FlowSerialization(EngineScoped):
                         serialized_parameter_value_tracker=serialized_parameter_value_tracker,  # Mapping values to UUIDs,
                         include_existing_subflow_in_group=True,
                     )
-                    serialize_node_result = self.engine.handle_request(serialize_node_request)
+                    serialize_node_result = workflow.handle_request(serialize_node_request)
                     if not isinstance(serialize_node_result, SerializeNodeToCommandsResultSuccess):
                         details = f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to serialize Node '{node_name}' within the Flow."
                         return SerializeFlowToCommandsResultFailure(result_details=details)
@@ -538,17 +542,17 @@ class FlowSerialization(EngineScoped):
 
             # Serialize sub-flows first, before creating connections.
             # We need the complete UUID map from all flows to handle cross-flow connections.
-            parent_flow = self.engine.context_manager.get_current_flow()
+            parent_flow = workflow.context.get_current_flow()
             parent_flow_name = parent_flow.name
             flows_in_flow_request = ListFlowsInFlowRequest(parent_flow_name=parent_flow_name)
-            flows_in_flow_result = self.engine.handle_request(flows_in_flow_request)
+            flows_in_flow_result = workflow.handle_request(flows_in_flow_request)
             if not isinstance(flows_in_flow_result, ListFlowsInFlowResultSuccess):
                 details = f"Attempted to serialize Flow '{flow_name}'. Failed while attempting to list child Flows in the Flow."
                 return SerializeFlowToCommandsResultFailure(result_details=details)
 
             sub_flow_commands = []
             for child_flow in flows_in_flow_result.flow_names:
-                child_flow_obj = self.engine.object_manager.attempt_get_object_by_name_as_type(child_flow, ControlFlow)
+                child_flow_obj = workflow.objects.get_as_type(child_flow, ControlFlow)
                 if child_flow_obj is None:
                     details = f"Attempted to serialize Flow '{flow_name}', but no Flow with that name could be found."
                     return SerializeFlowToCommandsResultFailure(result_details=details)
@@ -560,9 +564,11 @@ class FlowSerialization(EngineScoped):
                     continue
 
                 # Check if this is a referenced workflow
-                if self.engine.flow_manager.is_referenced_workflow(child_flow_obj):
+                if self.engine.flow_manager.is_referenced_workflow(workflow, child_flow_obj):
                     # For referenced workflows, create a minimal SerializedFlowCommands with just the import command
-                    referenced_workflow_name = self.engine.flow_manager.get_referenced_workflow_name(child_flow_obj)
+                    referenced_workflow_name = self.engine.flow_manager.get_referenced_workflow_name(
+                        workflow, child_flow_obj
+                    )
                     import_command = ImportWorkflowAsReferencedSubFlowRequest(
                         workflow_name=referenced_workflow_name,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
                         imported_flow_metadata=child_flow_obj.metadata,
@@ -587,9 +593,9 @@ class FlowSerialization(EngineScoped):
                     sub_flow_commands.append(serialized_flow)
                 else:
                     # For standalone sub-flows, use the existing recursive serialization.
-                    with self.engine.context_manager.flow(flow=child_flow_obj):
+                    with workflow.context.flow(child_flow_obj):
                         child_flow_request = SerializeFlowToCommandsRequest()
-                        child_flow_result = self.engine.handle_request(child_flow_request)
+                        child_flow_result = workflow.handle_request(child_flow_request)
                         if not isinstance(child_flow_result, SerializeFlowToCommandsResultSuccess):
                             details = f"Attempted to serialize parent flow '{flow_name}'. Failed while serializing child flow '{child_flow}'."
                             return SerializeFlowToCommandsResultFailure(result_details=details)
@@ -635,7 +641,7 @@ class FlowSerialization(EngineScoped):
         # Now create the connections using the complete UUID map (includes all flows).
         # This must happen after subflows are serialized so we have all UUIDs available.
         create_connection_commands = []
-        for connection in self.engine.flow_manager._get_connections_for_flow(flow):
+        for connection in self.engine.flow_manager._get_connections_for_flow(workflow, flow):
             source_node_name = connection.source_node.name
             target_node_name = connection.target_node.name
 
@@ -677,6 +683,7 @@ class FlowSerialization(EngineScoped):
 
         # Serialize flow-scoped variables owned by this flow that are declared by a node.
         serialized_variable_commands = self._serialize_variables_for_flow(
+            workflow,
             flow_name=flow_name,
             unique_parameter_uuid_to_values=aggregated_unique_values,
             variable_references=aggregated_dependencies.variable_references,
@@ -705,11 +712,13 @@ class FlowSerialization(EngineScoped):
         return result
 
     @handles(DeserializeFlowFromCommandsRequest)
-    def on_deserialize_flow_from_commands(self, request: DeserializeFlowFromCommandsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912 (I am big and complicated and have a lot of negative edge-cases)
+    def on_deserialize_flow_from_commands(  # noqa: C901, PLR0911, PLR0912 (I am big and complicated and have a lot of negative edge-cases)
+        self, request: DeserializeFlowFromCommandsRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
         # Do we want to create a NEW Flow to deserialize into, or use the one in the Current Context?
         if request.serialized_flow_commands.flow_initialization_command is None:
-            if self.engine.context_manager.has_current_flow():
-                flow = self.engine.context_manager.get_current_flow()
+            if workflow.context.has_current_flow():
+                flow = workflow.context.get_current_flow()
                 flow_name = flow.name
                 pushed_flow_context = False
                 created_new_flow = False
@@ -719,7 +728,7 @@ class FlowSerialization(EngineScoped):
         else:
             # Issue the creation command first.
             flow_initialization_command = request.serialized_flow_commands.flow_initialization_command
-            flow_initialization_result = self.engine.handle_request(flow_initialization_command)
+            flow_initialization_result = workflow.handle_request(flow_initialization_command)
 
             # Handle different types of creation commands
             match flow_initialization_command:
@@ -738,11 +747,11 @@ class FlowSerialization(EngineScoped):
                     return DeserializeFlowFromCommandsResultFailure(result_details=details)
 
             # Adopt the newly-created flow as our current context.
-            flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+            flow = workflow.objects.get_as_type(flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to deserialize a serialized set of Flow Creation commands. Failed to find created flow '{flow_name}'."
                 return DeserializeFlowFromCommandsResultFailure(result_details=details)
-            self.engine.context_manager.push_flow(flow=flow)
+            workflow.context.push_flow(flow)
             pushed_flow_context = True  # Mark that we pushed this flow
             created_new_flow = True  # Mark that we created this flow
 
@@ -754,7 +763,7 @@ class FlowSerialization(EngineScoped):
         # did not exist within the flow" and fails the whole load.
         try:
             deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands
+                workflow, serialized_flow_commands=request.serialized_flow_commands
             )
 
             # Now apply the connections, for this Flow and every Flow beneath it.
@@ -769,6 +778,7 @@ class FlowSerialization(EngineScoped):
             # every node in the subtree exists before any edge is made, so there is no such
             # constraint and claiming at the top is the simpler of the two.
             self._deserialize_connections_for_flow_and_subflows(
+                workflow,
                 serialized_flow_commands=request.serialized_flow_commands,
                 deserialized_nodes=deserialized_nodes,
                 created_connection_keys=set(),
@@ -778,13 +788,15 @@ class FlowSerialization(EngineScoped):
             # This is the same issue that we handle for Connections:
             # we don't know the exact node name that would be used, but we do know the UUIDs.
             self._deserialize_values_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands, deserialized_nodes=deserialized_nodes
+                workflow,
+                serialized_flow_commands=request.serialized_flow_commands,
+                deserialized_nodes=deserialized_nodes,
             )
         except FlowDeserializationError as err:
             details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
             if created_new_flow:
                 self.engine.flow_manager._cleanup_flow_on_failed_deserialization(
-                    flow_name, pushed_flow_context=pushed_flow_context
+                    workflow, flow_name, pushed_flow_context=pushed_flow_context
                 )
             return DeserializeFlowFromCommandsResultFailure(result_details=details)
 
@@ -792,7 +804,7 @@ class FlowSerialization(EngineScoped):
 
         # Pop flow context if requested and we pushed it
         if request.pop_flow_context_after and pushed_flow_context:
-            self.engine.context_manager.pop_flow()
+            workflow.context.pop_flow()
 
         details = f"Successfully deserialized Flow '{flow_name}'."
         return DeserializeFlowFromCommandsResultSuccess(
@@ -800,7 +812,7 @@ class FlowSerialization(EngineScoped):
         )
 
     def _deserialize_nodes_for_flow_and_subflows(
-        self, serialized_flow_commands: SerializedFlowCommands
+        self, workflow: WorkflowRuntime, serialized_flow_commands: SerializedFlowCommands
     ) -> DeserializedFlowNodes:
         """Rebuild every node in a Flow and, recursively, in each of its subflows.
 
@@ -813,6 +825,7 @@ class FlowSerialization(EngineScoped):
         group first silently dropped members that did not exist yet, leaving an empty group.
 
         Args:
+            workflow: The workflow the Flow is rebuilt in
             serialized_flow_commands: The commands for the Flow being rebuilt
 
         Returns:
@@ -835,30 +848,40 @@ class FlowSerialization(EngineScoped):
         ]
 
         for serialized_node in regular_node_commands:
-            self._deserialize_and_record_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
+            self._deserialize_and_record_node(
+                workflow, serialized_node=serialized_node, deserialized_nodes=deserialized_nodes
+            )
 
         for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
-            sub_flow_nodes = self._deserialize_subflow_nodes(sub_flow_commands=sub_flow_commands)
+            sub_flow_nodes = self._deserialize_subflow_nodes(workflow, sub_flow_commands=sub_flow_commands)
             deserialized_nodes.merge(sub_flow_nodes)
 
         for serialized_node in node_group_commands:
-            self._deserialize_and_record_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
+            self._deserialize_and_record_node(
+                workflow, serialized_node=serialized_node, deserialized_nodes=deserialized_nodes
+            )
 
         return deserialized_nodes
 
     def _deserialize_and_record_node(
-        self, serialized_node: SerializedNodeCommands, deserialized_nodes: DeserializedFlowNodes
+        self,
+        workflow: WorkflowRuntime,
+        serialized_node: SerializedNodeCommands,
+        deserialized_nodes: DeserializedFlowNodes,
     ) -> None:
         """Rebuild one node and record the name it was given under both keys callers look it up by.
 
         Args:
+            workflow: The workflow the node is rebuilt in
             serialized_node: The commands for the node being rebuilt
             deserialized_nodes: The collection to record the rebuilt node in
 
         Raises:
             FlowDeserializationError: If the node could not be rebuilt
         """
-        node_name = self._deserialize_one_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
+        node_name = self._deserialize_one_node(
+            workflow, serialized_node=serialized_node, deserialized_nodes=deserialized_nodes
+        )
         deserialized_nodes.node_uuid_to_node_name[serialized_node.node_uuid] = node_name
         original_node_name = serialized_node.create_node_command.node_name
         if original_node_name is not None:
@@ -866,11 +889,15 @@ class FlowSerialization(EngineScoped):
             deserialized_nodes.original_name_to_node_name[original_node_name] = node_name
 
     def _deserialize_one_node(
-        self, serialized_node: SerializedNodeCommands, deserialized_nodes: DeserializedFlowNodes
+        self,
+        workflow: WorkflowRuntime,
+        serialized_node: SerializedNodeCommands,
+        deserialized_nodes: DeserializedFlowNodes,
     ) -> str:
         """Rebuild a single node, resolving any group membership it declares.
 
         Args:
+            workflow: The workflow the node is rebuilt in
             serialized_node: The commands for the node being rebuilt
             deserialized_nodes: Nodes rebuilt so far, used to resolve group membership UUIDs
 
@@ -899,7 +926,7 @@ class FlowSerialization(EngineScoped):
         deserialize_node_request = DeserializeNodeFromCommandsRequest(
             serialized_node_commands=serialized_node_for_deserialization
         )
-        deserialized_node_result = self.engine.handle_request(deserialize_node_request)
+        deserialized_node_result = workflow.handle_request(deserialize_node_request)
         if not isinstance(deserialized_node_result, DeserializeNodeFromCommandsResultSuccess):
             msg = f"Failed while rebuilding the node '{create_cmd.node_name}'."
             raise FlowDeserializationError(msg)
@@ -984,10 +1011,13 @@ class FlowSerialization(EngineScoped):
         remapped_metadata["subflow_name"] = created_subflow_name
         return remapped_metadata
 
-    def _deserialize_subflow_nodes(self, sub_flow_commands: SerializedFlowCommands) -> DeserializedFlowNodes:
+    def _deserialize_subflow_nodes(
+        self, workflow: WorkflowRuntime, sub_flow_commands: SerializedFlowCommands
+    ) -> DeserializedFlowNodes:
         """Create one subflow and rebuild the nodes inside it, and inside its own subflows.
 
         Args:
+            workflow: The workflow the subflow is rebuilt in
             sub_flow_commands: The commands for the subflow being rebuilt
 
         Returns:
@@ -1000,18 +1030,22 @@ class FlowSerialization(EngineScoped):
         if flow_initialization_command is None:
             # No creation command means "deserialize into the Flow already in context", which is
             # this Flow: the nodes belong here rather than in a child.
-            return self._deserialize_nodes_for_flow_and_subflows(serialized_flow_commands=sub_flow_commands)
+            return self._deserialize_nodes_for_flow_and_subflows(workflow, serialized_flow_commands=sub_flow_commands)
 
-        sub_flow_name = self._create_flow_for_deserialization(flow_initialization_command=flow_initialization_command)
-        sub_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(sub_flow_name, ControlFlow)
+        sub_flow_name = self._create_flow_for_deserialization(
+            workflow, flow_initialization_command=flow_initialization_command
+        )
+        sub_flow = workflow.objects.get_as_type(sub_flow_name, ControlFlow)
         if sub_flow is None:
             msg = f"Failed to find the sub-flow '{sub_flow_name}' just created for it."
             raise FlowDeserializationError(msg)
 
         # Nodes are created into the Flow at the top of the context stack, so enter the subflow
         # while rebuilding its contents and leave it afterwards.
-        with self.engine.context_manager.flow(flow=sub_flow):
-            sub_flow_nodes = self._deserialize_nodes_for_flow_and_subflows(serialized_flow_commands=sub_flow_commands)
+        with workflow.context.flow(sub_flow):
+            sub_flow_nodes = self._deserialize_nodes_for_flow_and_subflows(
+                workflow, serialized_flow_commands=sub_flow_commands
+            )
 
         # Record what this flow was saved as against what it came back as. A group node saved a
         # reference to its subflow by name, and the name is deduped on the way in, so the group has
@@ -1042,11 +1076,14 @@ class FlowSerialization(EngineScoped):
         return None
 
     def _create_flow_for_deserialization(
-        self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
+        self,
+        workflow: WorkflowRuntime,
+        flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest,
     ) -> str:
         """Issue a Flow's initialization command and return the name it was created under.
 
         Args:
+            workflow: The workflow the Flow is created in
             flow_initialization_command: The command that brings the Flow into existence
 
         Returns:
@@ -1055,7 +1092,7 @@ class FlowSerialization(EngineScoped):
         Raises:
             FlowDeserializationError: If the Flow could not be created
         """
-        flow_initialization_result = self.engine.handle_request(flow_initialization_command)
+        flow_initialization_result = workflow.handle_request(flow_initialization_command)
 
         match flow_initialization_command:
             case CreateFlowRequest():
@@ -1077,6 +1114,7 @@ class FlowSerialization(EngineScoped):
 
     def _deserialize_connections_for_flow_and_subflows(
         self,
+        workflow: WorkflowRuntime,
         serialized_flow_commands: SerializedFlowCommands,
         deserialized_nodes: DeserializedFlowNodes,
         created_connection_keys: set[SerializedConnectionKey],
@@ -1092,6 +1130,7 @@ class FlowSerialization(EngineScoped):
         from undoing the wiring it just restored.
 
         Args:
+            workflow: The workflow the Flow is rebuilt in
             serialized_flow_commands: The commands for the Flow being rebuilt
             deserialized_nodes: Every node rebuilt for this Flow's whole subtree
             created_connection_keys: Edges already created for this Flow's subtree, added to here
@@ -1120,24 +1159,29 @@ class FlowSerialization(EngineScoped):
                 target_node_name=target_node_name,
                 target_parameter_name=indirect_connection.target_parameter_name,
             )
-            create_connection_result = self.engine.handle_request(create_connection_request)
+            create_connection_result = workflow.handle_request(create_connection_request)
             if create_connection_result.failed():
                 msg = f"Failed while reconnecting '{source_node_name}.{indirect_connection.source_parameter_name}' to '{target_node_name}.{indirect_connection.target_parameter_name}'."
                 raise FlowDeserializationError(msg)
 
         for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
             self._deserialize_connections_for_flow_and_subflows(
+                workflow,
                 serialized_flow_commands=sub_flow_commands,
                 deserialized_nodes=deserialized_nodes,
                 created_connection_keys=created_connection_keys,
             )
 
     def _deserialize_values_for_flow_and_subflows(
-        self, serialized_flow_commands: SerializedFlowCommands, deserialized_nodes: DeserializedFlowNodes
+        self,
+        workflow: WorkflowRuntime,
+        serialized_flow_commands: SerializedFlowCommands,
+        deserialized_nodes: DeserializedFlowNodes,
     ) -> None:
         """Reapply the parameter values of a Flow and every Flow beneath it.
 
         Args:
+            workflow: The workflow the Flow is rebuilt in
             serialized_flow_commands: The commands for the Flow being rebuilt
             deserialized_nodes: Every node rebuilt for this Flow's whole subtree
 
@@ -1149,14 +1193,15 @@ class FlowSerialization(EngineScoped):
             if node_name is None:
                 msg = "Failed while restoring saved values because the node they belong to was not rebuilt."
                 raise FlowDeserializationError(msg)
-            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = workflow.objects.get_as_type(node_name, BaseNode)
             if node is None:
                 msg = f"Failed while restoring the saved values of '{node_name}'."
                 raise FlowDeserializationError(msg)
 
-            with self.engine.context_manager.node(node=node):
+            with workflow.context.node(node):
                 for indirect_set_value_command in set_value_command_list:
                     self._apply_deserialized_parameter_value(
+                        workflow,
                         indirect_set_value_command=indirect_set_value_command,
                         node=node,
                         unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
@@ -1164,11 +1209,12 @@ class FlowSerialization(EngineScoped):
 
         for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
             self._deserialize_values_for_flow_and_subflows(
-                serialized_flow_commands=sub_flow_commands, deserialized_nodes=deserialized_nodes
+                workflow, serialized_flow_commands=sub_flow_commands, deserialized_nodes=deserialized_nodes
             )
 
     def _apply_deserialized_parameter_value(
         self,
+        workflow: WorkflowRuntime,
         indirect_set_value_command: SerializedNodeCommands.IndirectSetParameterValueCommand,
         node: BaseNode,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
@@ -1176,6 +1222,7 @@ class FlowSerialization(EngineScoped):
         """Set one saved parameter value on a rebuilt node.
 
         Args:
+            workflow: The workflow the node is rebuilt in
             indirect_set_value_command: The saved assignment, referencing its value by UUID
             node: The node the value belongs to
             unique_parameter_uuid_to_values: The pool the value UUID resolves against
@@ -1195,7 +1242,7 @@ class FlowSerialization(EngineScoped):
         )
         # Update the parameter value command to have the correct name.
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
-        set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
+        set_parameter_value_result = workflow.handle_request(indirect_set_value_command.set_parameter_value_command)
         if set_parameter_value_result.failed():
             msg = (
                 f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
@@ -1205,12 +1252,14 @@ class FlowSerialization(EngineScoped):
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
-        self, request: ExtractFlowCommandsFromImageMetadataRequest
+        self, request: ExtractFlowCommandsFromImageMetadataRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
 
         Args:
             request: ExtractFlowCommandsFromImageMetadataRequest with file path or URL
+            workflow: The open workflow a `deserialize` request builds the flow in. Only `deserialize`
+                needs one.
 
         Returns:
             ExtractFlowCommandsFromImageMetadataResultSuccess if successful
@@ -1289,7 +1338,12 @@ class FlowSerialization(EngineScoped):
         if request.deserialize:
             # Deserialize the flow
             deserialize_request = DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized_flow_commands)
-            deserialize_result = self.engine.handle_request(deserialize_request)
+            if workflow is None:
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details="Failed to deserialize flow from image metadata: no workflow is open to load it into.",
+                    file_path=file_url_or_path,
+                )
+            deserialize_result = workflow.handle_request(deserialize_request)
 
             # Validation: Check if deserialization succeeded
             if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):

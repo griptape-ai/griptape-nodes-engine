@@ -271,6 +271,8 @@ class TestResolveLiveRoutes:
         )
         node = node_class(name="Shout It")
         subflow_name = _build_live_subflow()
+        # The node is in the workflow that holds its imported subflow.
+        node._set_workflow(current_engine().current_workflow())
 
         live_routes = node._resolve_live_routes(subflow_name)
 

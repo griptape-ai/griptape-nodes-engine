@@ -38,7 +38,7 @@ def _doomed_run(monkeypatch: pytest.MonkeyPatch, *, cancel_also_fails: bool = Fa
     tests can assert on the check itself rather than on the call that is supposed to satisfy it.
     """
     engine = MagicMock()
-    runtime = WorkflowRuntime("workflow")
+    runtime = WorkflowRuntime("workflow", MagicMock())
     engine.current_workflow.return_value = runtime
     engine.current_workflow_or_none.return_value = runtime
     flow_manager = FlowManager(MagicMock(spec=EventManager), engine=engine)
@@ -82,7 +82,7 @@ class TestStartFlowCleansUpAfterAFailedRun:
         flow_manager, _ = _doomed_run(monkeypatch)
 
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.start_flow(MagicMock(), MagicMock())
+            await flow_manager.start_flow(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         _assert_engine_is_restartable(flow_manager)
 
@@ -95,7 +95,7 @@ class TestStartFlowCleansUpAfterAFailedRun:
         # The error worth reporting is the one that ended the run, not the one raised while
         # clearing up after it.
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.start_flow(MagicMock(), MagicMock())
+            await flow_manager.start_flow(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         machine.cancel_flow.assert_awaited_once()
         _assert_engine_is_restartable(flow_manager)
@@ -109,7 +109,7 @@ class TestResolveSingularNodeCleansUpAfterAFailedRun:
         flow_manager, _ = _doomed_run(monkeypatch)
 
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.resolve_singular_node(MagicMock(), MagicMock())
+            await flow_manager.resolve_singular_node(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         _assert_engine_is_restartable(flow_manager)
 
@@ -120,7 +120,7 @@ class TestResolveSingularNodeCleansUpAfterAFailedRun:
         flow_manager, machine = _doomed_run(monkeypatch, cancel_also_fails=True)
 
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.resolve_singular_node(MagicMock(), MagicMock())
+            await flow_manager.resolve_singular_node(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         machine.cancel_flow.assert_awaited_once()
         _assert_engine_is_restartable(flow_manager)
@@ -140,7 +140,7 @@ class TestResolveSingularNodeCleansUpAfterAFailedRun:
         machine.resolution_machine.is_started.return_value = False
 
         with pytest.raises(RuntimeError, match=_RUN_FAILURE):
-            await flow_manager.resolve_singular_node(MagicMock(), MagicMock())
+            await flow_manager.resolve_singular_node(flow_manager.engine.current_workflow(), MagicMock(), MagicMock())
 
         machine.cancel_flow.assert_not_awaited()
         _assert_engine_is_restartable(flow_manager)

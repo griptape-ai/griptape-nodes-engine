@@ -6,7 +6,7 @@ becomes run_in_order=False (run in parallel means NOT run in order).
 
 TODO: Remove this compatibility check once all workflows have been migrated and we no
 longer need to support loading old workflows with the run_in_parallel parameter.
-Link: https://github.com/griptape-ai/griptape-nodes/issues/XXXX
+Link: https://github.com/griptape-ai/griptape-nodes-engine/issues/XXXX
 """
 
 from __future__ import annotations

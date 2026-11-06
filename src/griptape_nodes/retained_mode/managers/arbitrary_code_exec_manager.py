@@ -11,10 +11,12 @@ from griptape_nodes.retained_mode.events.arbitrary_python_events import (
     RunArbitraryPythonStringResultSuccess,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -36,8 +38,20 @@ class ArbitraryCodeExecManager:
         event_manager.register_request_handlers(self)
 
     @handles(RunArbitraryPythonStringRequest)
-    def on_run_arbitrary_python_string_request(self, request: RunArbitraryPythonStringRequest) -> ResultPayload:
+    def on_run_arbitrary_python_string_request(
+        self, request: RunArbitraryPythonStringRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Run the request's Python, bound to `workflow` so the requests it sends act on it.
 
+        With no workflow handed it runs unbound, so its requests act as an unaddressed client's do.
+        """
+        token = bound_workflow.set(workflow)
+        try:
+            return self._run_python_string(request)
+        finally:
+            bound_workflow.reset(token)
+
+    def _run_python_string(self, request: RunArbitraryPythonStringRequest) -> ResultPayload:
         try:
             string_buffer = io.StringIO()
             with redirect_stdout(string_buffer):
@@ -54,7 +68,7 @@ class ArbitraryCodeExecManager:
                 #
                 # 2. ISOLATION: An isolated namespace prevents exec'd code from accessing or modifying
                 #    variables in the outer program scope, protecting read/write access to sensitive engine data.
-                # For the PR that implements this behavior alongside an Execute Python and List Files node, see https://github.com/griptape-ai/griptape-nodes/pull/2087
+                # For the PR that implements this behavior alongside an Execute Python and List Files node, see https://github.com/griptape-ai/griptape-nodes-engine/pull/2087
 
                 namespace = {"__builtins__": __builtins__}
                 exec(  # noqa: S102

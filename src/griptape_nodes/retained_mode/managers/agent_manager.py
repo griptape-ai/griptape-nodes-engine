@@ -38,7 +38,11 @@ from pydantic_ai.tools import DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import UsageLimits
 
 from griptape_nodes.agents.pydantic_ai.image_tools import ImageGenerationToolsetConfig
-from griptape_nodes.agents.pydantic_ai.mcp_servers import grant_keys_for_call, streamable_http_local
+from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    grant_keys_for_call,
+    streamable_http_library,
+    streamable_http_local,
+)
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
     MCPToolsetCache,
     MCPToolsetLease,
@@ -168,12 +172,21 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
+    LibraryMCPServer,
+    ListLibraryMCPServersRequest,
+    ListLibraryMCPServersResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers import bind_free_socket
-from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
+from griptape_nodes.servers.mcp import (
+    GTN_MCP_SERVER_HOST,
+    GTN_MCP_SERVER_PORT,
+    LIBRARIES_PATH_SEGMENT,
+    list_library_mcp_tools,
+    start_mcp_server,
+)
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, refusal_from_exception
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import halt_message as budget_halt_message
@@ -190,6 +203,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -700,16 +714,22 @@ class AgentManager(EngineScoped):
             self._runner_cache.clear()
 
     @handles(RunAgentRequest)
-    async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
+    async def on_handle_run_agent_request(
+        self, request: RunAgentRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Run a chat turn whose instructions describe `workflow`'s current flow, when there is one."""
         try:
-            return await self._run_agent(request)
+            return await self._run_agent(request, workflow)
         except Exception as e:
             return self._agent_run_failure(e, request.provider_name)
 
     @handles(ResolveToolApprovalsRequest)
-    async def on_handle_resolve_tool_approvals_request(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
+    async def on_handle_resolve_tool_approvals_request(
+        self, request: ResolveToolApprovalsRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
+        """Resume a chat turn whose instructions describe `workflow`'s current flow, when there is one."""
         try:
-            return await self._resolve_tool_approvals(request)
+            return await self._resolve_tool_approvals(request, workflow)
         except Exception as e:
             return self._agent_run_failure(e, request.provider_name)
 
@@ -752,18 +772,18 @@ class AgentManager(EngineScoped):
             return str(exc)
         return f"Griptape Cloud refused the request because {POLICY_DENIED_HINT} ({exc})"
 
-    async def _run_agent(self, request: RunAgentRequest) -> ResultPayload:
+    async def _run_agent(self, request: RunAgentRequest, workflow: WorkflowRuntime | None) -> ResultPayload:
         thread_id = self._validate_thread_for_run(request.thread_id)
         active = self._claim_thread(thread_id)
         if active is None:
             return _reply_in_progress_failure(f"send a message in conversation {thread_id}")
         try:
-            return await self._run_agent_on_claimed_thread(request, thread_id, active)
+            return await self._run_agent_on_claimed_thread(request, thread_id, active, workflow)
         finally:
             self._release_thread(thread_id, active)
 
     async def _run_agent_on_claimed_thread(
-        self, request: RunAgentRequest, thread_id: str, active: _ActiveRun
+        self, request: RunAgentRequest, thread_id: str, active: _ActiveRun, workflow: WorkflowRuntime | None
     ) -> ResultPayload:
         history = self._thread_storage.load_history(thread_id)
         is_first_run = len(history) == 0
@@ -786,10 +806,12 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
             prompt=composed.live,
             persist_prompt=composed.persist,
             approval=ToolApprovalDeps(granted=granted),
             deferred_tool_results=deferred_tool_results,
+            workflow=workflow,
         )
 
         # A first run creates the thread; title it from the input even when the
@@ -804,9 +826,12 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
         )
 
-    async def _resolve_tool_approvals(self, request: ResolveToolApprovalsRequest) -> ResultPayload:
+    async def _resolve_tool_approvals(
+        self, request: ResolveToolApprovalsRequest, workflow: WorkflowRuntime | None
+    ) -> ResultPayload:
         thread_id = request.thread_id
         if not self._thread_storage.thread_exists(thread_id):
             details = f"Attempted to answer the approval request in conversation {thread_id}. Failed because the conversation does not exist."
@@ -821,12 +846,16 @@ class AgentManager(EngineScoped):
         if active is None:
             return _reply_in_progress_failure(f"answer the approval request in conversation {thread_id}")
         try:
-            return await self._resolve_tool_approvals_on_claimed_thread(request, thread_id, active)
+            return await self._resolve_tool_approvals_on_claimed_thread(request, thread_id, active, workflow)
         finally:
             self._release_thread(thread_id, active)
 
     async def _resolve_tool_approvals_on_claimed_thread(
-        self, request: ResolveToolApprovalsRequest, thread_id: str, active: _ActiveRun
+        self,
+        request: ResolveToolApprovalsRequest,
+        thread_id: str,
+        active: _ActiveRun,
+        workflow: WorkflowRuntime | None,
     ) -> ResultPayload:
         # Read from the saved conversation rather than anything held in memory, so
         # an approval card still works after the engine restarts.
@@ -851,16 +880,19 @@ class AgentManager(EngineScoped):
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
             prompt=None,
             persist_prompt=None,
             approval=ToolApprovalDeps(granted=plan.granted),
             deferred_tool_results=plan.results,
+            workflow=workflow,
         )
         return self._finish_turn(
             result,
             provider_name=request.provider_name,
             model_name=request.model_name,
             mcp_server_names=request.additional_mcp_servers,
+            library_mcp_server_names=request.library_mcp_servers,
         )
 
     async def _run_turn(  # noqa: PLR0913
@@ -871,22 +903,24 @@ class AgentManager(EngineScoped):
         provider_name: str | None,
         model_name: str | None,
         mcp_server_names: list[str],
+        library_mcp_server_names: list[str],
         prompt: str | list[UserContent] | None,
         persist_prompt: str | list[UserContent] | None,
         approval: ToolApprovalDeps,
         deferred_tool_results: DeferredToolResults | None,
+        workflow: WorkflowRuntime | None,
     ) -> AgentRunResult:
         """Run one agent turn on ``thread_id``, streaming its events.
 
         ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
-        is what ``CancelAgentRequest`` sets.
+        is what ``CancelAgentRequest`` sets. The instructions describe ``workflow``'s current flow.
         """
         runner = self._build_runner(
             provider_name=provider_name,
             model_name=model_name,
         )
         attribution_headers = await self._attribution_headers(provider_name)
-        workflow_context = await self._workflow_context()
+        workflow_context = await self._workflow_context(workflow)
 
         event_manager = self.engine.event_manager
 
@@ -894,12 +928,13 @@ class AgentManager(EngineScoped):
             payload = _run_event_to_payload(event, thread_id)
             if payload is None:
                 return
-            event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=payload),
-                ),
-            )
+            # A chat about a workflow belongs to it, so its events name that workflow.
+            if workflow is not None:
+                event_manager.put_event(workflow.execution_event(payload))
+                return
+            event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
 
+        library_toolsets = self._library_toolsets(library_mcp_server_names, workflow)
         # Nothing may sit between this and the `async with` that releases
         # it: a server left with a stray use count is never shut down.
         mcp = await self._acquire_mcp_toolsets(mcp_server_names)
@@ -911,14 +946,14 @@ class AgentManager(EngineScoped):
                 cancel_event=active.cancel_event,
                 persist_prompt=persist_prompt,
                 history_rehydrator=_rehydrate_history,
-                extra_toolsets=mcp.lease.toolsets,
+                extra_toolsets=[self._engine_mcp_toolset(workflow), *mcp.lease.toolsets, *library_toolsets],
                 extra_instructions=_compose_run_instructions(workflow_context, mcp.instructions),
                 extra_headers=attribution_headers,
                 approval=approval,
                 deferred_tool_results=deferred_tool_results,
             )
 
-    async def _workflow_context(self) -> _WorkflowContext:
+    async def _workflow_context(self, workflow: WorkflowRuntime | None) -> _WorkflowContext:
         """The available node types and the current flow, rendered for one run's instructions.
 
         Read fresh every run rather than cached, so a library loaded or a node added
@@ -926,7 +961,7 @@ class AgentManager(EngineScoped):
         are not broadcast, and a failure costs the run some context rather than
         showing the user an error.
         """
-        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context())
+        node_types, flow = await asyncio.gather(self._node_types_context(), self._flow_context(workflow))
         return _WorkflowContext(node_types=node_types, flow=flow)
 
     async def _node_types_context(self) -> str:
@@ -964,10 +999,10 @@ class AgentManager(EngineScoped):
             libraries[library_name] = result.node_metadata
         return _render_node_types(libraries)
 
-    async def _flow_context(self) -> str:
-        if not self.engine.context_manager.has_current_flow():
+    async def _flow_context(self, workflow: WorkflowRuntime | None) -> str:
+        if workflow is None or not workflow.context.has_current_flow():
             return _NO_FLOW_INSTRUCTION
-        summary = await self.engine.ahandle_request(
+        summary = await workflow.ahandle_request(
             GetFlowSummaryRequest(broadcast_result=False, failure_log_level=logging.DEBUG)
         )
         if not isinstance(summary, GetFlowSummaryResultSuccess):
@@ -1006,6 +1041,7 @@ class AgentManager(EngineScoped):
         provider_name: str | None,
         model_name: str | None,
         mcp_server_names: list[str],
+        library_mcp_server_names: list[str],
     ) -> RunAgentResultSuccess:
         """Record a finished turn and build the result the editor renders it from."""
         # A cancelled run saves no model response, so there is no response to record.
@@ -1018,6 +1054,7 @@ class AgentManager(EngineScoped):
                     provider_name=resolved_provider.name,
                     model=model_name or resolved_provider.model,
                     mcp_servers=mcp_server_names or [],
+                    library_mcp_servers=library_mcp_server_names or [],
                 ),
             )
 
@@ -1073,6 +1110,21 @@ class AgentManager(EngineScoped):
             },
             thread_id=result.thread_id,
             result_details=result_details,
+        )
+
+    @handles(ListLibraryMCPServersRequest)
+    def on_handle_list_library_mcp_servers_request(self, _: ListLibraryMCPServersRequest) -> ResultPayload:
+        servers = [
+            LibraryMCPServer(
+                name=library.slug,
+                library_name=library.library_name,
+                url=self._library_mcp_url(library.slug),
+                tool_names=[tool.request_type.__name__ for tool in library.tools],
+            )
+            for library in list_library_mcp_tools()
+        ]
+        return ListLibraryMCPServersResultSuccess(
+            servers=servers, result_details=f"Listed {len(servers)} library MCP server(s)."
         )
 
     @handles(ClearToolGrantsRequest)
@@ -1390,10 +1442,11 @@ class AgentManager(EngineScoped):
         """Return the cached agent for this provider/model, building it if needed.
 
         The runner carries only what is fixed for the life of an agent: the
-        model, the engine's own MCP server, and the base instructions. Anything
-        the user can edit mid-session - their MCP servers and the rules attached
-        to them - is passed to :meth:`PydanticAgentRunner.run` instead, so an
-        edit takes effect on the next run rather than the next engine restart.
+        model and the base instructions. Anything that can change between runs -
+        the user's MCP servers and the rules attached to them, and the workflow
+        the engine's own MCP server acts on - is passed to
+        :meth:`PydanticAgentRunner.run` instead, so it takes effect on the next run
+        rather than the next engine restart.
         """
         provider = self._get_provider(provider_name)
         provider_type = provider.type
@@ -1431,12 +1484,6 @@ class AgentManager(EngineScoped):
 
         workspace_root = Path(config_manager.workspace_path)
         self._ensure_skills_directory(workspace_root)
-        # The engine's own MCP server is the only one baked into the agent: the
-        # engine owns its lifetime and its address cannot change mid-session.
-        mcp_servers: list[AbstractToolset[Any]] = [
-            streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/"),
-        ]
-
         runner = PydanticAgentRunner(
             model_name=model_name,
             provider=provider_type,
@@ -1446,13 +1493,22 @@ class AgentManager(EngineScoped):
             storage=self._thread_storage,
             instructions=_build_agent_instructions(include_image_tool=image_config is not None),
             system_prompt=self._system_prompt_extra or None,
-            mcp_servers=mcp_servers,
             image_config=image_config,
             static_files_manager=self.static_files_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def _engine_mcp_toolset(self, workflow: WorkflowRuntime | None) -> AbstractToolset[Any]:
+        """The engine's own MCP server, addressed to `workflow`, for one run.
+
+        Built per run because the cached runner is shared by chats about different workflows.
+        """
+        workflow_id = None
+        if workflow is not None:
+            workflow_id = workflow.workflow_id
+        return streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/", workflow_id=workflow_id)
 
     def _ensure_skills_directory(self, workspace_root: Path) -> None:
         """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
@@ -1676,6 +1732,35 @@ class AgentManager(EngineScoped):
             ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
         )
         return _MCPAttachment(lease=lease, instructions=instructions)
+
+    def _library_toolsets(self, names: list[str], workflow: WorkflowRuntime | None) -> list[AbstractToolset[Any]]:
+        """Build a toolset for each named library MCP server, addressed to `workflow`, skipping names no loaded library serves."""
+        read_only_by_slug: dict[str, set[str]] = {}
+        for library in list_library_mcp_tools():
+            read_only = read_only_by_slug.setdefault(library.slug, set())
+            read_only.update(tool.request_type.__name__ for tool in library.tools if tool.read_only)
+        unavailable = [name for name in names if name not in read_only_by_slug]
+        if unavailable:
+            logger.warning(
+                "Attempted to give the agent the tools of library %s. No loaded library with that name exposes "
+                "MCP tools, so the agent will run without them. Check the library is loaded.",
+                ", ".join(sorted(unavailable)),
+            )
+        workflow_id = None
+        if workflow is not None:
+            workflow_id = workflow.workflow_id
+        toolsets: list[AbstractToolset[Any]] = []
+        for name in dict.fromkeys(names):
+            if name not in read_only_by_slug:
+                continue
+            read_only = frozenset(read_only_by_slug[name])
+            toolsets.append(
+                streamable_http_library(name, self._library_mcp_url(name), read_only, workflow_id=workflow_id)
+            )
+        return toolsets
+
+    def _library_mcp_url(self, slug: str) -> str:
+        return f"http://localhost:{self._mcp_server_port}/mcp/{LIBRARIES_PATH_SEGMENT}/{slug}/"
 
     def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
         """Current config of every enabled MCP server, or ``None`` if unreadable.

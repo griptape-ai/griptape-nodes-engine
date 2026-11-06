@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class OpenWorkflowError(Exception):
@@ -20,14 +25,18 @@ class OpenWorkflowSet:
     `Engine.open_workflow` and `Engine.close_workflow` are the operations that open and close one.
     """
 
-    def __init__(self, *, allow_several_open: bool = False) -> None:
+    def __init__(self, engine: Engine, *, allow_several_open: bool = False) -> None:
         """Make an empty set.
 
         Args:
+            engine: The engine holding the runtimes, handed to each one.
             allow_several_open: Test seam that lets a workflow open beside another. The engine never
                 sets it: it opens one workflow at a time.
         """
+        self._engine = engine
         self._by_id: dict[str, WorkflowRuntime] = {}
+        # Each id an open workflow moved off of, to the id it is open under now.
+        self._moved_to: dict[str, str] = {}
         self._allow_several_open = allow_several_open
 
     def open(self, workflow_id: str) -> WorkflowRuntime:
@@ -47,8 +56,10 @@ class OpenWorkflowSet:
             )
             raise OpenWorkflowError(msg)
 
-        workflow = WorkflowRuntime(workflow_id)
+        workflow = WorkflowRuntime(workflow_id, self._engine)
         self._by_id[workflow_id] = workflow
+        # The id names this workflow now, not one that moved off of it.
+        self._moved_to.pop(workflow_id, None)
         return workflow
 
     def close(self, workflow: WorkflowRuntime) -> None:
@@ -61,12 +72,15 @@ class OpenWorkflowSet:
             msg = f"Attempted to close workflow '{workflow.workflow_id}'. Failed because it is not open."
             raise OpenWorkflowError(msg)
         del self._by_id[workflow.workflow_id]
+        self._moved_to = {old: new for old, new in self._moved_to.items() if new != workflow.workflow_id}
         workflow.closed = True
 
     def move(self, workflow: WorkflowRuntime, workflow_id: str) -> None:
         """Keep an open workflow open under another id, as when saving it writes a copy it continues in.
 
-        The old id stops naming it: an open workflow has exactly one id.
+        The old id stops naming it: an open workflow has exactly one id. The editor learns the new id
+        from the workflow context. An MCP client, whose header can't change mid-run, reaches it
+        through `find_following_moves`.
 
         Raises:
             OpenWorkflowError: That runtime is not open, or another workflow is open under the new id.
@@ -84,9 +98,14 @@ class OpenWorkflowSet:
             )
             raise OpenWorkflowError(msg)
 
-        del self._by_id[workflow.workflow_id]
+        old_id = workflow.workflow_id
+        del self._by_id[old_id]
         workflow.workflow_id = workflow_id
         self._by_id[workflow_id] = workflow
+        self._moved_to = {old: workflow_id if new == old_id else new for old, new in self._moved_to.items()}
+        # The new id names this workflow now, not one that moved off of it.
+        self._moved_to.pop(workflow_id, None)
+        self._moved_to[old_id] = workflow_id
 
     def workflow_blocking_open(self) -> WorkflowRuntime | None:
         """The open workflow that keeps another from opening: the one open, when only one may be."""
@@ -100,6 +119,22 @@ class OpenWorkflowSet:
     def find(self, workflow_id: str) -> WorkflowRuntime | None:
         """The runtime of the open workflow with this id, or None."""
         return self._by_id.get(workflow_id)
+
+    def find_following_moves(self, workflow_id: str) -> WorkflowRuntime | None:
+        """The open workflow an MCP client's id addresses, or None, following the workflow if it moved since.
+
+        For an id fixed in an MCP header or remembered for a session, so a save that moves the open
+        workflow onto a copy doesn't strand the client. Code asking whether a registry entry is open
+        uses `find`: the entry a workflow moved off of is not open. A request envelope's id doesn't
+        follow moves either, since the editor learns the copy's id from the workflow context.
+        """
+        workflow = self._by_id.get(workflow_id)
+        if workflow is not None:
+            return workflow
+        moved_to = self._moved_to.get(workflow_id)
+        if moved_to is None:
+            return None
+        return self._by_id.get(moved_to)
 
     def get(self, workflow_id: str) -> WorkflowRuntime:
         """The runtime of the open workflow with this id.

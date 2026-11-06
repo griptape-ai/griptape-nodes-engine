@@ -7,6 +7,8 @@ Minimal shapes, deliberately dependency-free so the library registers in a bare 
 - ``SinkNode`` - a data-only node with a single input and no outputs, for the "loose
   sink hanging off the middle of a chain" shape.
 - ``ListSinkNode`` - the same, taking a list, for hanging off a loop's collected results.
+- ``ControlListSinkNode`` - a control node (control in/out) with a single list input, for the
+  shape where a downstream sink is reached by both a data edge and a control edge.
 - ``BranchNode`` - two control outputs, one chosen at runtime, for the branching shape.
 """
 
@@ -66,6 +68,23 @@ class SinkNode(DataNode):
 
 
 class ListSinkNode(DataNode):
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="items",
+                tooltip="List to consume",
+                type="list",
+                input_types=["list"],
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        pass
+
+
+class ControlListSinkNode(ControlNode):
     def __init__(self, name: str, metadata: dict | None = None) -> None:
         super().__init__(name, metadata=metadata)
         self.add_parameter(

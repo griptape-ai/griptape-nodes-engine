@@ -16,6 +16,7 @@ from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class RunningMachine(NamedTuple):
@@ -62,7 +63,11 @@ def machine_running_one_node(max_nodes_in_parallel: int) -> RunningMachine:
     dag_builder.node_to_reference["running"] = DagNode(node_reference=running_node, node_state=NodeState.PROCESSING)
 
     machine = ParallelResolutionMachine(
-        "flow", max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder, engine=engine
+        "flow",
+        workflow=WorkflowRuntime("wf", MagicMock()),
+        max_nodes_in_parallel=max_nodes_in_parallel,
+        dag_builder=dag_builder,
+        engine=engine,
     )
 
     release = asyncio.Event()

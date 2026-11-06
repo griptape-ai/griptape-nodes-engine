@@ -83,7 +83,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -1045,7 +1045,7 @@ class ModelManager(EngineScoped):
 
     @staticmethod
     def _model_checkpoint_attributes(
-        request: DeclareModelInvocationRequest, *, object_manager: ObjectManager
+        request: DeclareModelInvocationRequest, *, workflow: WorkflowRuntime | None
     ) -> dict[str, Any]:
         """Resolve the facts a hook may gate a model invocation on.
 
@@ -1056,11 +1056,11 @@ class ModelManager(EngineScoped):
         `InstantiateNode` checkpoints already carry, so a provider- or
         family-scoped rule gates an invocation exactly as it gates the picker that
         offered the model -- not only a bare-id rule. Resolution is best-effort: a
-        declaration with no node, an unregistered node, or a key absent from the
-        node's declared models falls back to the bare id.
+        declaration with no node or no workflow, a node not in `workflow`, or a key
+        absent from the node's declared models falls back to the bare id.
         """
         attributes: dict[str, Any] = {CheckpointAttribute.ID: request.model_id}
-        resolved = ModelManager._resolve_invocation_model(request, object_manager=object_manager)
+        resolved = ModelManager._resolve_invocation_model(request, workflow=workflow)
         if resolved is not None:
             attributes[CheckpointAttribute.PROVIDER_ID] = resolved.provider_id
             if resolved.model.family:
@@ -1069,20 +1069,20 @@ class ModelManager(EngineScoped):
 
     @staticmethod
     def _resolve_invocation_model(
-        request: DeclareModelInvocationRequest, *, object_manager: ObjectManager
+        request: DeclareModelInvocationRequest, *, workflow: WorkflowRuntime | None
     ) -> ResolvedModel | None:
         """Resolve a declared invocation's stable catalog key to its catalog entry.
 
         The declaring node names itself, so the key resolves against that node's
         declared catalog models -- the same set the node's model dropdown is built
         from -- keeping the invocation gate consistent with the picker that offered
-        the model. Returns None when the declaration carries no node, the node is
-        not registered, or the key is not one of the node's declared models,
-        leaving the invocation gated on the bare id.
+        the model. Returns None when the declaration carries no node or no workflow,
+        the node is not in `workflow`, or the key is not one of the node's declared
+        models, leaving the invocation gated on the bare id.
         """
-        if request.node_name is None:
+        if request.node_name is None or workflow is None:
             return None
-        node = object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        node = workflow.objects.get_as_type(request.node_name, BaseNode)
         if node is None:
             return None
         return next(
@@ -1091,7 +1091,9 @@ class ModelManager(EngineScoped):
         )
 
     @handles(DeclareModelInvocationRequest)
-    def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
+    def on_handle_declare_model_invocation_request(
+        self, request: DeclareModelInvocationRequest, workflow: WorkflowRuntime | None = None
+    ) -> ResultPayload:
         """Acknowledge a node's declaration that it is about to invoke a model.
 
         This request is how a well-intentioned node opts into the permission
@@ -1103,10 +1105,19 @@ class ModelManager(EngineScoped):
 
         Args:
             request: The declared invocation, identifying the catalog model
+            workflow: The workflow the declaring node is in, or None
 
         Returns:
             ResultPayload: Success, meaning the node is cleared to proceed
         """
+        if request.node_name is not None and workflow is None:
+            # Without the node, provider- and family-scoped rules can't gate the invocation, so refuse it.
+            return DeclareModelInvocationResultFailure(
+                result_details=(
+                    f"Model invocation denied for '{request.model_id}'. Node '{request.node_name}' could not be "
+                    "found because the request names no open workflow."
+                )
+            )
         # License-policy checkpoint: gate the declared invocation on the stable
         # catalog key, enriched with the provider and family the key resolves to
         # (see _model_checkpoint_attributes) so a provider- or family-scoped rule
@@ -1118,7 +1129,7 @@ class ModelManager(EngineScoped):
                 action=CheckpointAction.INVOKE_MODEL,
                 subject_type=CheckpointSubjectType.MODEL,
                 subject_id=request.model_id,
-                attributes=self._model_checkpoint_attributes(request, object_manager=self.engine.object_manager),
+                attributes=self._model_checkpoint_attributes(request, workflow=workflow),
             )
         )
         if denial is not None:
@@ -1670,6 +1681,6 @@ class ModelManager(EngineScoped):
             msg = f"Download status file not found for model '{model_id}'"
             raise FileNotFoundError(msg)
 
-        # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
+        # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes-engine/issues/3765
         status_file.unlink()
         return str(status_file)

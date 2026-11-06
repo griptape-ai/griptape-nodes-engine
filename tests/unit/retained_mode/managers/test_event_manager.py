@@ -6,7 +6,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     require_request_sender,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
@@ -322,6 +323,36 @@ class TestHandleRequestLoopSafety:
 
 
 @dataclass(kw_only=True)
+class _ProbeFailure(ResultPayloadFailure):
+    """Minimal failure payload paired with _ProbeRequest."""
+
+
+class TestResultEngineId:
+    """Every result dispatch builds names the engine that sent it."""
+
+    @pytest.mark.asyncio
+    async def test_a_success_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeResult(result_details="ok"))
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+
+        assert event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+    def test_a_failure_names_the_engine(self) -> None:
+        event_manager = EventManager()
+        event_manager.assign_manager_to_request_type(_ProbeRequest, lambda _: _ProbeFailure(result_details="no"))
+
+        event = event_manager.handle_request(_ProbeRequest())
+
+        assert not event.succeeded()
+        assert event.engine_id is not None
+        assert event.engine_id == current_engine().get_engine_id()
+
+
+@dataclass(kw_only=True)
 class _ForwardableProbeRequest(RequestPayload):
     """Minimal request used to drive the worker-forwarding path in tests."""
 
@@ -365,13 +396,14 @@ class TestHandleRequestForwardingFromRunningLoop:
                 result=_ForwardableProbeResult(result_details="forwarded"),
             )
 
-        # Register a RemoteHandler shape: dispatch table entry points at it directly.
-        # ``handle_request`` detects RemoteHandler via isinstance and routes onto the WS loop.
+        # Install a RemoteHandler as a worker does. ``handle_request`` sees a ForwardingHandler and
+        # routes onto the WS loop.
         async def original(_request: _ForwardableProbeRequest) -> _ForwardableProbeResult:
             return _ForwardableProbeResult(result_details="local")
 
+        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, original)
         remote = RemoteHandler(original=original, event_manager=event_manager)
-        event_manager.assign_manager_to_request_type(_ForwardableProbeRequest, remote)
+        event_manager.replace_manager_for_request_type(_ForwardableProbeRequest, remote)
         event_manager._websocket_event_loop = ws_loop
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
@@ -1627,12 +1659,12 @@ class TestPostDispatchHooks:
         engine = Engine()
         event_manager = engine.event_manager
         event_manager.initialize_queue(asyncio.Queue())
-        workflow = WorkflowRuntime("bound")
+        workflow = WorkflowRuntime("bound", MagicMock())
 
         async def handler(_request: _ProbeRequest) -> _ProbeResult:
             return _ProbeResult(result_details="ok")
 
-        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
         seen_workflows: list[WorkflowRuntime | None] = []
 
@@ -2329,6 +2361,58 @@ class TestNodeProcessEventTranslation:
             )
 
         assert received == [finish, finish]
+
+    def test_translation_keeps_the_events_workflow(self) -> None:
+        """A loop body's translated events still name the workflow they belong to."""
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+        finish = NodeFinishProcessEvent(
+            node_name="Body_1",
+            node_type="LoopBodyControlNode",
+            specific_library_name="Library",
+            flow_name="Canvas Flow",
+            execution_id="run-1",
+            parent_execution_id=None,
+            outcome=NodeProcessOutcome.SUCCEEDED,
+        )
+
+        with EventTranslationContext(manager, {"Body_1": "Body"}):
+            manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish, workflow_id="wf-1"))
+            )
+
+        translated = queue.get_nowait()
+        assert translated.wrapped_event.payload.node_name == "Body"
+        assert translated.wrapped_event.workflow_id == "wf-1"
+
+
+class TestResultWorkflowId:
+    """A result names the envelope's workflow, else the workflow the request was bound to."""
+
+    def test_the_envelopes_workflow_wins_over_the_binding(self) -> None:
+        bound = MagicMock(spec=WorkflowRuntime, workflow_id="bound")
+        token = bound_workflow.set(bound)
+        try:
+            assert EventManager._result_workflow_id(ResultContext(open_workflow_id="named")) == "named"
+        finally:
+            bound_workflow.reset(token)
+
+    def test_with_no_envelope_id_the_bound_workflow_is_named(self) -> None:
+        bound = MagicMock(spec=WorkflowRuntime, workflow_id="bound")
+        token = bound_workflow.set(bound)
+        try:
+            assert EventManager._result_workflow_id(ResultContext()) == "bound"
+        finally:
+            bound_workflow.reset(token)
+
+    @pytest.mark.parametrize("binding", [None, NO_WORKFLOW])
+    def test_a_request_bound_to_no_workflow_names_none(self, binding: object) -> None:
+        token = bound_workflow.set(binding)  # pyright: ignore[reportArgumentType]
+        try:
+            assert EventManager._result_workflow_id(ResultContext()) is None
+        finally:
+            bound_workflow.reset(token)
 
 
 class _RecordingWorkerRequestClient:

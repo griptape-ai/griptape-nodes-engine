@@ -9,6 +9,8 @@ The agent asks before it:
 - runs your workflow, a flow, or a single node
 - generates an image
 - uses any tool from an MCP server you attached to the conversation (see [MCP Servers](./mcp_servers.md))
+- uses a tool from a library you picked under **Libraries**, unless the library marks the tool as
+    only reading information
 
 Everything else runs without asking. That includes reading your canvas, listing libraries and nodes, creating and connecting nodes, setting parameter values, and saving the workflow.
 

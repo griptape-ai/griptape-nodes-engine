@@ -91,6 +91,8 @@ class RunAgentRequest(RequestPayload):
         url_artifacts: List of URL artifacts to include with the request
         thread_id: Thread ID to use for conversation.
         additional_mcp_servers: List of additional MCP server names to include
+        library_mcp_servers: Names of library MCP servers whose tools to include, from
+            ``ListLibraryMCPServersRequest``.
 
     Results: RunAgentResultStarted -> RunAgentResultSuccess (with output) | RunAgentResultFailure (execution error)
     """
@@ -99,6 +101,7 @@ class RunAgentRequest(RequestPayload):
     url_artifacts: list[RunAgentRequestArtifact]
     thread_id: str
     additional_mcp_servers: list[str] = field(default_factory=list)
+    library_mcp_servers: list[str] = field(default_factory=list)
     provider_name: str | None = None
     model_name: str | None = None
 
@@ -190,6 +193,8 @@ class ResolveToolApprovalsRequest(RequestPayload):
             when an "Approve for conversation" decision in the same request
             already covers its ``grant_keys``.
         additional_mcp_servers: List of additional MCP server names to include
+        library_mcp_servers: Names of library MCP servers whose tools to include, as in
+            ``RunAgentRequest``.
         provider_name: Chat provider to continue with, as in ``RunAgentRequest``.
         model_name: Model to continue with, as in ``RunAgentRequest``.
 
@@ -200,6 +205,7 @@ class ResolveToolApprovalsRequest(RequestPayload):
     thread_id: str
     decisions: list[ToolApprovalDecision]
     additional_mcp_servers: list[str] = field(default_factory=list)
+    library_mcp_servers: list[str] = field(default_factory=list)
     provider_name: str | None = None
     model_name: str | None = None
 
@@ -424,6 +430,7 @@ class RunRecord:
     provider_name: str
     model: str | None
     mcp_servers: list[str] = field(default_factory=list)
+    library_mcp_servers: list[str] = field(default_factory=list)
 
 
 @dataclass

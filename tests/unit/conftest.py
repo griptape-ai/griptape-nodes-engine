@@ -22,7 +22,9 @@ from griptape_nodes.retained_mode.managers.external_environment import (  # noqa
     LIBRARY_PATHS_ENV_VAR,
     LIBRARY_WORKER_REQUESTS_ENV_VAR,
 )
+from griptape_nodes.retained_mode.runtime.read_observer import install_workflow_read_observer  # noqa: E402
 from griptape_nodes.utils import engine_dirs  # noqa: E402
+from tests.unit.host_workflow_reads import HostWorkflowRead, HostWorkflowReadRecorder  # noqa: E402
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
@@ -174,6 +176,24 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
             # Detach the sinks while the directory still exists: they live on the process-global
             # logger, so one left behind holds an open file in a directory about to be deleted.
             log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
+
+
+@pytest.fixture(autouse=True)
+def fail_on_host_workflow_reads() -> Generator[list[HostWorkflowRead], None, None]:
+    """Fail a test whose HOST request read the current workflow while one was open.
+
+    A HOST request acts on no workflow, so such a read finds none: its handler depends on a workflow it
+    should take. See `RequestScope`.
+    """
+    recorder = HostWorkflowReadRecorder()
+    previous = install_workflow_read_observer(recorder)
+    try:
+        yield recorder.reads
+    finally:
+        install_workflow_read_observer(previous)
+    assert recorder.reads == [], "HOST requests read the current workflow while one was open: " + "; ".join(
+        f"{read.request_type_name} {read.read}" for read in recorder.reads
+    )
 
 
 @pytest.fixture

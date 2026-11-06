@@ -41,6 +41,7 @@
     "response_topic": null,
     "retained_mode": "m",
     "open_workflow_id": null,
+    "engine_id": "e1",
     "event_type": "EventResultSuccess",
     "request_type": "GetParameterValueRequest",
     "result_type": "GetParameterValueResultSuccess",
@@ -83,6 +84,7 @@
     "response_topic": null,
     "retained_mode": null,
     "open_workflow_id": null,
+    "engine_id": null,
     "event_type": "EventResultFailure",
     "request_type": "GetParameterValueRequest",
     "result_type": "GetParameterValueResultFailure",
@@ -108,6 +110,7 @@
     }
   },
   "ExecutionEvent": {
+    "workflow_id": "wf",
     "event_type": "ExecutionEvent",
     "payload_type": "CurrentControlNodeEvent",
     "payload": {

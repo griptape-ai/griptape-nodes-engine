@@ -382,10 +382,15 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events.
 
     Args:
-        open_workflow_id: The request envelope's `open_workflow_id`, echoed back: the open workflow
-            the request ran in. A result payload's own `workflow_id` is something else. For
+        open_workflow_id: The open workflow the request acted on: the envelope's `open_workflow_id`
+            when it named one, else the workflow dispatch bound the request to, such as the only
+            open workflow, a run's own workflow, or the workflow a load opened. None when it acted
+            on no workflow. A result payload's own `workflow_id` is something else. For
             example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
             Save As is a copy that is not open.
+        engine_id: The engine that sent the result. A client that reached it through a session
+            topic learns from this which engine holds the session. None when the result was built
+            outside the engine's dispatch, such as by the MCP server or a bootstrap script.
     """
 
     request: P
@@ -394,6 +399,7 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     response_topic: str | None = None
     retained_mode: str | None = None
     open_workflow_id: str | None = None
+    engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventResult, inferring the generic types if needed."""
@@ -457,7 +463,15 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
+    """An event from running a flow. `workflow_id` names the open workflow it belongs to, None for a host event.
+
+    Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
+    for an event a node reports about itself, naming the workflow it joined. Both go through
+    `build_execution_event`.
+    """
+
     payload: E
+    workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an ExecutionEvent, inferring the generic type if needed."""
@@ -507,8 +521,15 @@ class ExecutionGriptapeNodeEvent(BaseEvent):
         return self.wrapped_event.get_request()
 
 
+def build_execution_event(payload: ExecutionPayload, workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
+    """An execution event naming the open workflow `workflow_id` it belongs to, or None for no workflow."""
+    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=workflow_id))
+
+
 @dataclass
 class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
+    # The workflow of the node that streamed this. See ExecutionEvent.workflow_id.
+    workflow_id: str | None = field(default=None)
