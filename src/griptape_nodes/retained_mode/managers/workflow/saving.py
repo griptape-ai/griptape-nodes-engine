@@ -505,7 +505,7 @@ class WorkflowSaver(EngineScoped):
         # Saving an open library workflow wrote a copy instead of the library's file. Move the open
         # workflow onto the copy, so the next save lands in it rather than in yet another copy.
         if scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE and current_workflow.metadata.is_griptape_provided:
-            self.engine.open_workflows.move(workflow, saved_workflow.workflow_id)
+            self.engine.move_open_workflow(workflow, saved_workflow.workflow_id)
         return saved_workflow
 
     def generate_unique_filename(self, base_name: str) -> str:

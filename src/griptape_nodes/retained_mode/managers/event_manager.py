@@ -692,7 +692,8 @@ class EventManager(EngineScoped):
         """Schedule every hook registered for this request's exact type.
 
         Hooks run bound as the request ran, except after a request that opened a workflow: they
-        run bound to the workflow it opened, which its result names.
+        run bound to the workflow it opened, which its result names. A workflow the request closed
+        leaves them bound to no workflow, so a hook never acts on a closed one.
         """
         request_type = type(request)
 
@@ -711,6 +712,8 @@ class EventManager(EngineScoped):
             opened = self.engine.open_workflows.find(result.open_workflow.workflow_id)
             if opened is not None:
                 workflow = opened
+        if workflow is not None and workflow is not NO_WORKFLOW and workflow.closed:
+            workflow = NO_WORKFLOW
         for callback in hooks:
             # Identity, not `(request_type, callback) in active`: membership compares with
             # `__eq__`, and a callable `@dataclass` compares by field value, so a hook

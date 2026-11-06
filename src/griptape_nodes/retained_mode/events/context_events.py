@@ -185,6 +185,8 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
         created_workflow: True if this call created the workflow; False if an existing one was reused.
         created_flow: True if this call created the flow; False if an existing one was reused.
         workflow_id: Id of the workflow in the current context.
+        open_workflow: The workflow this call opened, as the heartbeat lists it, or None when it
+            reused an open one.
     """
 
     workflow_name: str
@@ -192,6 +194,7 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
     created_workflow: bool
     created_flow: bool
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
