@@ -17,7 +17,7 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin, Trait
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
 from griptape_nodes.files.path_utils import (
@@ -40,6 +40,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.workflow.shape import SHAPE_FILE_FORMAT_KEY
+from griptape_nodes.traits.file_format import FileFormat, FileFormatKind
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -606,6 +608,12 @@ def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeS
     if surface_parameter.output_route is not None:
         allowed_modes.add(ParameterMode.OUTPUT)
 
+    # A host reads the kind back off this node's own shape, so it has to survive one level of nesting.
+    traits: set[type[Trait] | Trait] = set()
+    file_format = definition.get(SHAPE_FILE_FORMAT_KEY)
+    if file_format in [kind.value for kind in FileFormatKind]:
+        traits.add(FileFormat(kind=file_format))
+
     return Parameter(
         name=surface_name,
         tooltip=definition.get("tooltip", ""),
@@ -615,6 +623,7 @@ def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeS
         default_value=definition.get("default_value"),
         allowed_modes=allowed_modes,
         ui_options=definition.get("ui_options"),
+        traits=traits,
     )
 
 
