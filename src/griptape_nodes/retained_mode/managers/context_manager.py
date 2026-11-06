@@ -179,6 +179,12 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
+        # Refused before anything is registered or closed.
+        refusal = self._refuse_set_workflow_context(request)
+        if refusal is not None:
+            return refusal
+        replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
+
         # When no workflow_name is supplied, register a new unsaved workflow here so the engine
         # owns the namespace. Callers doing "create a new workflow" should omit the name and
         # read the resolved key off the success result.
@@ -214,13 +220,6 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
-        # Closing an open workflow to reopen it would empty its canvas, since nothing reloads its file.
-        target = registry.get_workflow_by_name(workflow_name)
-        if self.engine.open_workflows.is_open(target.workflow_id):
-            msg = f"Attempted to open workflow '{workflow_name}'. Failed because it is already open."
-            return SetWorkflowContextFailure(result_details=msg)
-
-        replaced = self.engine.open_workflows.workflow_replaced_by_open(request.replaces_workflow_id)
         if replaced is not None:
             replaced_name = registry.get(replaced.workflow_id).name
             try:
@@ -229,17 +228,17 @@ class ContextManager(EngineScoped):
                 msg = f"Attempted to open workflow '{workflow_name}' in place of '{replaced_name}'. Failed to close '{replaced_name}': {err}"
                 return SetWorkflowContextFailure(result_details=msg)
 
-        try:
-            opened = self.open_workflow(workflow_name, working_directory=working_directory)
-        except self.WorkflowAlreadyOpenError as err:
-            return SetWorkflowContextFailure(result_details=str(err))
+        opened = self.open_workflow(workflow_name, working_directory=working_directory)
         resolved_name = registry.get(opened.workflow_id).name
 
         if request.create_flow:
             create_flow_result = self._create_top_level_flow(opened)
             if not create_flow_result.succeeded():
-                self.engine.close_workflow(opened)
                 msg = f"Attempted to open workflow '{resolved_name}' with a flow. Failed to create the flow: {create_flow_result.result_details}"
+                try:
+                    self.engine.close_workflow(opened)
+                except OpenWorkflowError as err:
+                    msg = f"{msg} The workflow stays open, because closing it failed: {err}"
                 return SetWorkflowContextFailure(result_details=msg)
 
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
@@ -475,6 +474,28 @@ class ContextManager(EngineScoped):
 
         self._register_orchestrator_workflow(workflow_id, name, file_path, working_directory)
         return self.engine.worker_workflows.runtime_for(workflow_id)
+
+    def _refuse_set_workflow_context(self, request: SetWorkflowContextRequest) -> SetWorkflowContextFailure | None:
+        """The failure for a set-context request that can't open its workflow, or None when it can."""
+        open_workflows = self.engine.open_workflows
+        requested = None
+        if request.workflow_name is not None:
+            requested = self.engine.workflow_registry.find_by_name(request.workflow_name)
+        # Closing an open workflow to reopen it would empty its canvas, since nothing reloads its file.
+        if requested is not None and open_workflows.is_open(requested.workflow_id):
+            msg = f"Attempted to open workflow '{request.workflow_name}'. Failed because it is already open."
+            return SetWorkflowContextFailure(result_details=msg)
+
+        blocking = open_workflows.workflow_blocking_open()
+        if blocking is None or blocking is open_workflows.workflow_replaced_by_open(request.replaces_workflow_id):
+            return None
+        blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
+        msg = (
+            f"Attempted to open workflow '{request.workflow_name or request.display_name}' in place of workflow "
+            f"'{request.replaces_workflow_id}'. Failed because workflow '{blocking_name}' is open and only one "
+            f"workflow can be open at a time. Leave out replaces_workflow_id to replace '{blocking_name}'."
+        )
+        return SetWorkflowContextFailure(result_details=msg)
 
     def _create_top_level_flow(self, workflow: WorkflowRuntime) -> ResultPayload:
         """Create `workflow`'s top-level flow and make it the current flow."""

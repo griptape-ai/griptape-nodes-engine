@@ -917,6 +917,9 @@ class TestSetWorkflowContextReplacesTheOpenWorkflow:
 
         assert isinstance(result, SetWorkflowContextFailure)
         assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [open_id]
+        # Refused before it registered the new workflow, so the list doesn't gain an entry.
+        assert project_engine.workflow_registry.find_by_name("fresh") is None
+        assert all(workflow["name"] != "fresh" for workflow in _listed(project_engine).values())
 
 
 class TestOpenAndSaveResultsReportTheOpenWorkflow:

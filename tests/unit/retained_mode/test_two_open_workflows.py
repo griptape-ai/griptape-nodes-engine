@@ -612,6 +612,27 @@ class TestCloseOneWhileTheOtherRuns:
         assert isinstance(result, StartFlowResultSuccess), result.result_details
         assert _get(engine, b, "park", "result") == "done:b"
 
+    @pytest.mark.asyncio
+    async def test_opening_a_workflow_in_place_of_a_running_one_ends_its_run(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        _make_node(engine, a, "_ParkNode", "park")
+        _set(engine, a, "park", "a")
+        gate = _park("park")
+        run = await _start_parked_run(engine, a, "park")
+
+        opened = await asyncio.wait_for(
+            _send_async(engine, SetWorkflowContextRequest(display_name="C", replaces_workflow_id=a.workflow_id), None),
+            5,
+        )
+        gate.set()
+        await asyncio.wait_for(run, 5)
+
+        assert isinstance(opened, SetWorkflowContextSuccess), opened.result_details
+        assert opened.workflow_id is not None
+        assert engine.open_workflows.all_open() == [b, engine.open_workflows.get(opened.workflow_id)]
+
     def test_clear_all_addressed_to_b_closes_only_b(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
