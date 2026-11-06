@@ -571,8 +571,6 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
         use_pickling: Deprecated and ignored. The value pool always holds encoded values.
-        values_supplied_by_connections: Names of parameters whose set values are left out, because a
-            connection in the flow the commands are replayed into supplies them. Output values are kept.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
@@ -589,7 +587,6 @@ class SerializeNodeToCommandsRequest(RequestPayload):
     serialize_all_parameter_values: bool = False
     # If True, keep subflow_name in group metadata for workflow file generation (defaults to False for copy/paste)
     include_existing_subflow_in_group: bool = False
-    values_supplied_by_connections: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -739,13 +736,30 @@ class DeserializeNodeFromCommandsRequest(RequestPayload):
     Use when: Restoring individual nodes from backups/templates, implementing node-level copy/paste,
     loading configurations, creating from templates. Creates new node with unique name and restores parameters.
 
+    The node is rebuilt the way a saved workflow reopens it: created, given its structure commands, then
+    its saved values with `initial_setup`. A saved value that could not be read is logged and the parameter
+    keeps its default. A saved value the rebuilt node refuses is logged and skipped when a connection will
+    replace it before the node runs, and fails the rebuild otherwise.
+
     Args:
         serialized_node_commands: Serialized node commands containing complete node state
+        set_parameter_value_commands: The node's saved values, each naming its value in the pool by UUID
+        unique_parameter_uuid_to_values: The pool of encoded values the commands refer to
+        connected_parameter_names: Parameters a connection made after this node is rebuilt will feed. A
+            saved value one of them refuses is skipped, since the connection replaces it; a refused value
+            on any other parameter fails the rebuild, so a wrong result cannot pass as a successful run.
 
     Results: DeserializeNodeFromCommandsResultSuccess (with node name) | DeserializeNodeFromCommandsResultFailure (deserialization error)
     """
 
     serialized_node_commands: SerializedNodeCommands
+    set_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand] = field(
+        default_factory=list
+    )
+    unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any] = field(
+        default_factory=dict
+    )
+    connected_parameter_names: set[str] = field(default_factory=set)
 
 
 @dataclass

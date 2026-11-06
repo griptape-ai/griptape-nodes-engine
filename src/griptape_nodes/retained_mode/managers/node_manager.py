@@ -4588,7 +4588,6 @@ class NodeManager(EngineScoped):
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
-                    value_supplied_by_connection=parameter.name in request.values_supplied_by_connections,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -4902,7 +4901,10 @@ class NodeManager(EngineScoped):
         create_node_result = workflow.handle_request(create_node_request)
         if not isinstance(create_node_result, CreateNodeResultSuccess):
             req_node_name = create_node_request.node_name
-            details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to create node '{req_node_name}'."
+            details = (
+                f"Attempted to deserialize a serialized set of Node Creation commands. Failed to create node "
+                f"'{req_node_name}': {create_node_result.result_details}"
+            )
             return DeserializeNodeFromCommandsResultFailure(result_details=details)
 
         # Adopt the newly-created node as our current context.
@@ -4933,8 +4935,63 @@ class NodeManager(EngineScoped):
                     details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to execute an element command for node '{node_name}'."
                     self._cleanup_node_on_failed_deserialization(workflow, node_name)
                     return DeserializeNodeFromCommandsResultFailure(result_details=details)
+            refusal = self._restore_saved_values(
+                workflow,
+                node,
+                request.set_parameter_value_commands,
+                request.unique_parameter_uuid_to_values,
+                request.connected_parameter_names,
+            )
+            if refusal is not None:
+                self._cleanup_node_on_failed_deserialization(workflow, node_name)
+                return DeserializeNodeFromCommandsResultFailure(result_details=refusal)
         details = f"Successfully deserialized a serialized set of Node Creation commands for node '{node_name}'."
         return DeserializeNodeFromCommandsResultSuccess(node_name=node_name, result_details=details)
+
+    def _restore_saved_values(
+        self,
+        workflow: WorkflowRuntime,
+        node: BaseNode,
+        set_parameter_value_commands: list[SerializedNodeCommands.IndirectSetParameterValueCommand],
+        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
+        connected_parameter_names: set[str],
+    ) -> str | None:
+        """Set a rebuilt node's saved values, as a saved workflow sets them. Returns the reason the rebuild fails, or None.
+
+        A value the node refuses on a parameter a connection will feed is logged and skipped: the
+        connection replaces it before the node runs. A refused value anywhere else fails the rebuild,
+        since the node would otherwise run on a default and report success.
+        """
+        for indirect_command in set_parameter_value_commands:
+            set_value_request = indirect_command.set_parameter_value_command
+            parameter_name = set_value_request.parameter_name
+            if indirect_command.unique_value_uuid not in unique_parameter_uuid_to_values:
+                logger.warning(
+                    "Attempted to restore the value of parameter '%s' on node '%s'. Skipped because the saved value "
+                    "could not be read, so the parameter uses its default.",
+                    parameter_name,
+                    node.name,
+                )
+                continue
+            # Decoding builds a fresh object each time, so repeated rebuilds share nothing.
+            set_value_request.value = decode_value(unique_parameter_uuid_to_values[indirect_command.unique_value_uuid])
+            set_value_request.node_name = node.name
+            set_value_result = workflow.handle_request(set_value_request)
+            if not set_value_result.failed():
+                continue
+            if parameter_name not in connected_parameter_names:
+                return (
+                    f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
+                    f"{set_value_result.result_details}"
+                )
+            logger.warning(
+                "Attempted to restore the value of parameter '%s' on node '%s'. Skipped, its connection supplies "
+                "the value before the node runs: %s",
+                parameter_name,
+                node.name,
+                set_value_result.result_details,
+            )
+        return None
 
     @handles(SerializeSelectedNodesToCommandsRequest)
     def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
@@ -5168,7 +5225,17 @@ class NodeManager(EngineScoped):
                 del metadata["_parent_group_uuid"]
 
             result = self.on_deserialize_node_from_commands(
-                DeserializeNodeFromCommandsRequest(serialized_node_commands=node_command), workflow
+                DeserializeNodeFromCommandsRequest(
+                    serialized_node_commands=node_command,
+                    set_parameter_value_commands=commands.set_parameter_value_commands[node_command.node_uuid],
+                    unique_parameter_uuid_to_values=copied_values,
+                    connected_parameter_names={
+                        connection.target_parameter_name
+                        for connection in connections
+                        if connection.target_node_uuid == node_command.node_uuid
+                    },
+                ),
+                workflow,
             )
             if not isinstance(result, DeserializeNodeFromCommandsResultSuccess):
                 details = "Attempted to deserialize node but ran into an error on node serialization."
@@ -5183,25 +5250,6 @@ class NodeManager(EngineScoped):
                 self._cleanup_created_nodes(workflow, created_node_names)
                 return DeserializeSelectedNodesFromCommandsResultFailure(result_details=details)
             with workflow.context.node(node):
-                parameter_commands = commands.set_parameter_value_commands[node_command.node_uuid]
-                for parameter_command in parameter_commands:
-                    param_request = parameter_command.set_parameter_value_command
-                    # Set the Node name
-                    param_request.node_name = result.node_name
-                    if parameter_command.unique_value_uuid in copied_values:
-                        # Decoding builds a fresh object each time, so repeated pastes share nothing.
-                        param_request.value = decode_value(copied_values[parameter_command.unique_value_uuid])
-                        set_parameter_result = workflow.handle_request(parameter_command.set_parameter_value_command)
-                        if not set_parameter_result.succeeded():
-                            details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
-                            logger.warning(details)
-                    else:
-                        logger.warning(
-                            "Attempted to paste the value of parameter '%s' on node '%s'. Failed because the "
-                            "copied value could not be read, so the parameter uses its default.",
-                            param_request.parameter_name,
-                            param_request.node_name,
-                        )
                 lock_command = commands.set_lock_commands_per_node[node_command.node_uuid]
                 if lock_command is not None:
                     lock_node_result = workflow.handle_request(lock_command)
@@ -5216,6 +5264,8 @@ class NodeManager(EngineScoped):
                 source_parameter_name=connection_command.source_parameter_name,
                 target_node_name=node_uuid_to_name[connection_command.target_node_uuid],
                 target_parameter_name=connection_command.target_parameter_name,
+                # The rebuilt nodes already hold their saved values; wiring must not push anything.
+                initial_setup=True,
             )
             result = workflow.handle_request(connection_request)
             if result.failed():
@@ -5250,14 +5300,17 @@ class NodeManager(EngineScoped):
         except CommandsFormatError as error:
             raise CopiedNodesError(str(error)) from error
 
-    def _read_copied_values(self, texts: dict[str, str]) -> dict[str, JsonValue]:
+    def _read_copied_values(
+        self, texts: dict[str, str]
+    ) -> dict[SerializedNodeCommands.UniqueParameterValueUUID, JsonValue]:
         """Read copied parameter values, keeping them encoded until each use decodes its own copy.
 
         A value that cannot be read is left out, so its parameter pastes with its default.
         """
-        values: dict[str, JsonValue] = {}
+        values: dict[SerializedNodeCommands.UniqueParameterValueUUID, JsonValue] = {}
         library_modules = self.engine.library_manager.module_loading.stable_module_names()
-        for uuid, text in texts.items():
+        for uuid_text, text in texts.items():
+            uuid = SerializedNodeCommands.UniqueParameterValueUUID(uuid_text)
             try:
                 values[uuid] = json.loads(text)
             except json.JSONDecodeError:
@@ -5503,7 +5556,6 @@ class NodeManager(EngineScoped):
         create_node_request: CreateNodeRequest,
         *,
         serialize_all_parameter_values: bool = False,
-        value_supplied_by_connection: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -5522,7 +5574,6 @@ class NodeManager(EngineScoped):
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
-            value_supplied_by_connection (bool): If True, leave out the set value: a connection in the destination flow supplies it. The output value is still saved.
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
@@ -5546,11 +5597,7 @@ class NodeManager(EngineScoped):
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
         # If serialize_all_parameter_values is True, save all parameter values regardless.
-        # A value a connection will supply is not saved at all: replaying it would only have it
-        # validated against the parameter's current rules, and then overwritten by the connection.
-        if value_supplied_by_connection:
-            internal_value = None
-        elif (
+        if (
             serialize_all_parameter_values
             or parameter.name in node.parameter_values
             or (parameter.default_value is not None and effective_value == parameter.default_value)
