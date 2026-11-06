@@ -23,9 +23,13 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 from griptape_nodes.utils.version_utils import engine_version
+from griptape_nodes.worker.channel import CHANNEL_ADDRESS_ENV, CHANNEL_AUTHKEY_ENV
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+# Each test runs the real spawn path, with process creation captured.
+pytestmark = pytest.mark.worker_processes
 
 _SESSION = "sess-abc"
 _ORCHESTRATOR_ID = "orchestrator-id"
@@ -44,9 +48,9 @@ with open(output_path, "w", encoding="utf-8") as output:
     json.dump({"argv": sys.argv[2:], "env": dict(os.environ)}, output)
 """
 
-# The variables spawn_worker sets by name on top of the baseline. The static server URL is absent
-# because the test has no static server.
-_ENGINE_SET_VARIABLES = {"GTN_ENGINE_ID", "GTN_ORCHESTRATOR_ENGINE_ID", "PYTHONUNBUFFERED"}
+# The variables a local worker's spawn sets by name on top of the baseline. The static server URL is
+# absent because the test has no static server.
+_ENGINE_SET_VARIABLES = {"GTN_ENGINE_ID", "PYTHONUNBUFFERED", CHANNEL_ADDRESS_ENV, CHANNEL_AUTHKEY_ENV}
 
 
 def _worker_manager(config_values: dict[str, Any], baseline: dict[str, str]) -> WorkerManager:
@@ -65,13 +69,15 @@ def _worker_manager(config_values: dict[str, Any], baseline: dict[str, str]) -> 
     engine.library_manager.environment.execution_site_packages.return_value = None
     manager = WorkerManager(engine=engine, event_manager=MagicMock())
     manager._orchestrator_static_server_base_url = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    # The probe never connects back, so the spawn stops before waiting for it to.
+    manager._connect_local_worker = AsyncMock(return_value=None)  # type: ignore[method-assign]
     return manager
 
 
 async def _spawn(manager: WorkerManager) -> MagicMock:
     """Run the spawn path with process creation captured instead of performed."""
     with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as create:
-        await manager._spawn_when_session_ready(_LIBRARY)
+        await manager._spawn_library_worker(_LIBRARY)
     return create
 
 
@@ -131,10 +137,7 @@ class TestPrefixedWorkerCommand:
             "--",
             sys.executable,
             "-m",
-            "griptape_nodes_app",
-            "engine",
-            "--session-id",
-            _SESSION,
+            "griptape_nodes.worker",
             "--library-name",
             _LIBRARY,
         ]
@@ -224,10 +227,7 @@ class TestPrefixedWorkerCommand:
         assert list(create.call_args.args) == [
             sys.executable,
             "-m",
-            "griptape_nodes_app",
-            "engine",
-            "--session-id",
-            _SESSION,
+            "griptape_nodes.worker",
             "--library-name",
             _LIBRARY,
         ]
@@ -235,6 +235,29 @@ class TestPrefixedWorkerCommand:
 
 class TestWorkerEnvironment:
     """The worker's environment is the baseline plus variables the engine sets by name, nothing else."""
+
+    @pytest.mark.asyncio
+    async def test_a_worker_is_started_without_credentials_and_with_an_engine_id_of_its_own(
+        self, probe: Path, tmp_path: Path
+    ) -> None:
+        """The worker reads its secrets from this engine, prefix or not, and is named by an ID minted for it."""
+        withheld = {
+            "GRIPTAPE_NODES_LICENSE": "license-jwt",
+            "GT_CLOUD_API_KEY": "api-key",
+            "GTN_ORCHESTRATOR_ENGINE_ID": "this-engines-id",
+        }
+        manager = _worker_manager(
+            {WORKER_COMMAND_PREFIX_KEY: _probe_prefix(probe, tmp_path)},
+            baseline={"PATH": "/usr/bin:/bin", "GTN_ENGINE_ID": "this-engines-id", **withheld},
+        )
+
+        create = await _spawn(manager)
+        env = create.call_args.kwargs["env"]
+        recorded = _run_captured(create)
+
+        assert set(withheld).isdisjoint(env)
+        assert set(withheld).isdisjoint(recorded["env"])
+        assert recorded["env"]["GTN_ENGINE_ID"] not in ("", "this-engines-id")
 
     @pytest.mark.asyncio
     async def test_only_named_variables_are_added_to_the_baseline(

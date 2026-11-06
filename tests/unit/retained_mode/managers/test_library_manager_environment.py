@@ -1108,7 +1108,7 @@ class TestSandboxReloadAndFullReload:
         library_manager = engine.library_manager
         await library_manager.load_all_libraries_from_config()
         monkeypatch.setattr(library_manager, "_pre_reload_callbacks", [])
-        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock())
+        monkeypatch.setattr(library_manager.workers, "start_workers_after_loading", AsyncMock())
         registration = library_manager.registration
         register = registration.register_library_from_file_request
         full_reload: list[asyncio.Task] = []

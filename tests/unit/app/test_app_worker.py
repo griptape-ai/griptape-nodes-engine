@@ -1576,7 +1576,7 @@ class TestHandleStartWorkerRequest:
     async def test_returns_success_immediately(self, worker_manager: WorkerManager) -> None:
         request = worker_events.StartWorkerRequest(library_name="My Library")
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", new=AsyncMock()):
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()):
             result = await worker_manager.handle_start_worker_request(request)
 
         assert isinstance(result, worker_events.StartWorkerResultSuccess)
@@ -1591,7 +1591,7 @@ class TestHandleStartWorkerRequest:
         """
         request = worker_events.StartWorkerRequest(library_name="Lib")
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await worker_manager.handle_start_worker_request(request)
             gate = worker_manager._execution_ready["Lib"]
             await worker_manager.handle_start_worker_request(request)
@@ -1606,7 +1606,7 @@ class TestHandleStartWorkerRequest:
     ) -> None:
         request = worker_events.StartWorkerRequest(library_name="Lib")
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await worker_manager.handle_start_worker_request(request)
             await worker_manager._requested_spawns["Lib"]
             # Done-callbacks, which release the request, run on the next turn of the loop.
@@ -1625,7 +1625,7 @@ class TestHandleStartWorkerRequest:
         worker_manager.note_library_loaded("Lib")
         worker_manager._managed_worker_processes["Lib"] = _managed_proc_mock()
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Lib"))
             await asyncio.sleep(0)
 
@@ -1638,7 +1638,7 @@ class TestHandleStartWorkerRequest:
             request_topic=f"sessions/{_SESSION}/workers/eng-1/request", worker_key="Lib"
         )
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Lib"))
             await asyncio.sleep(0)
 
@@ -1653,7 +1653,7 @@ class TestHandleStartWorkerRequest:
         async def wait_for_a_session(_library_name: str) -> None:
             await never.wait()
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", side_effect=wait_for_a_session):
+        with patch.object(worker_manager, "_spawn_library_worker", side_effect=wait_for_a_session):
             await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Lib"))
             await asyncio.sleep(0)
             pending = worker_manager._requested_spawns["Lib"]
@@ -1682,7 +1682,7 @@ class TestHandleStartWorkerRequest:
             worker_manager._spawns_in_flight[library_name] = asyncio.Event()
             await released.wait()
 
-        with patch.object(worker_manager, "_spawn_when_session_ready", side_effect=claim_then_park):
+        with patch.object(worker_manager, "_spawn_library_worker", side_effect=claim_then_park):
             await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Lib"))
             await asyncio.sleep(0)
             under_way = worker_manager._requested_spawns["Lib"]
@@ -1729,42 +1729,18 @@ class TestLogSpawnError:
         mock_refuse.assert_called_once()
 
 
-class TestSpawnWhenSessionReady:
+class TestSpawnLibraryWorker:
     @pytest.mark.asyncio
-    async def test_skips_wait_when_session_already_active(self, worker_manager: WorkerManager) -> None:
-        """If a session is already active, spawn proceeds without waiting for the event."""
-        worker_manager.engine.get_session_id.return_value = _SESSION  # type: ignore[union-attr]
+    async def test_spawns_without_waiting_for_a_session(self, worker_manager: WorkerManager) -> None:
+        """A worker this engine runs for itself joins no session, so none has to exist first."""
+        worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as mock_spawn:
-            await worker_manager._spawn_when_session_ready("My Library")
+        with patch.object(worker_manager, "_spawn_local_worker", new=AsyncMock()) as spawn:
+            await worker_manager._spawn_library_worker("My Library")
 
-        mock_spawn.assert_called_once()
+        spawn.assert_awaited_once()
+        assert spawn.await_args_list[0].args[0][1:] == ["-m", "griptape_nodes.worker", "--library-name", "My Library"]
         assert not worker_manager._session_ready_event.is_set()
-
-    @pytest.mark.asyncio
-    async def test_waits_then_spawns_after_session_ready(self, worker_manager: WorkerManager) -> None:
-        """If no session yet, waits for the event and spawns once the session is available."""
-        # First call (pre-check) returns None; second call (post-wait) returns session ID.
-        worker_manager.engine.get_session_id.side_effect = [None, _SESSION]  # type: ignore[union-attr]
-
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as mock_spawn:
-            task = asyncio.create_task(worker_manager._spawn_when_session_ready("My Library"))
-            await asyncio.sleep(0)  # let the task start and reach the event wait
-            worker_manager._session_ready_event.set()
-            await task
-
-        mock_spawn.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_logs_error_when_no_session_after_event(self, worker_manager: WorkerManager) -> None:
-        """If the session event fires but get_session_id still returns None, spawn is not attempted."""
-        worker_manager.engine.get_session_id.side_effect = [None, None]  # type: ignore[union-attr]
-        worker_manager._session_ready_event.set()
-
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as mock_spawn:
-            await worker_manager._spawn_when_session_ready("My Library")
-
-        mock_spawn.assert_not_called()
 
 
 class TestRouteToWorker:
