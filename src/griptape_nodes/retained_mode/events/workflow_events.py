@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
 from griptape_nodes.retained_mode.events.base_events import (
     GraphAccessMixin,
     RequestPayload,
@@ -66,10 +67,12 @@ class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
+        open_workflow: The workflow now open, as the heartbeat lists it. None when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
@@ -163,10 +166,13 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
+        open_workflow: The workflow now open, as the heartbeat lists it. A library workflow opens as
+            an unsaved copy, under a name of its own. None when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
@@ -510,11 +516,15 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
         workflow_id: Id of the saved workflow. A Save As or versioned save
             writes a copy, with a new id.
+        open_workflow: The workflow open after the save, as the heartbeat lists it. When its id is
+            `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
+            workflow moves onto its copy. Otherwise the save wrote a copy and the original stays open.
     """
 
     file_path: str
     workflow_name: str
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass

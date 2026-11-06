@@ -27,6 +27,8 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
+    SetWorkflowContextRequest,
+    SetWorkflowContextSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -69,6 +71,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryResultFailure,
     RunWorkflowFromRegistryResultSuccess,
     RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultSuccess,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
     SaveWorkflowRequest,
@@ -864,6 +867,71 @@ class TestIdsOnResults:
         assert context.workflow_id == workflow_id
         assert isinstance(heartbeat, EngineHeartbeatResultSuccess)
         assert heartbeat.current_workflow_id == workflow_id
+
+
+class TestOpenAndSaveResultsReportTheOpenWorkflow:
+    """Open, save and set-context results say which workflow is open afterwards, so clients need no follow-up reads."""
+
+    def test_set_context_reports_the_unsaved_workflow_it_opened(self, project_engine: Engine) -> None:
+        result = project_engine.handle_request(SetWorkflowContextRequest(display_name="fresh"))
+
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert result.open_workflow is not None
+        assert result.open_workflow.workflow_id == result.workflow_id
+        assert result.open_workflow.name == result.workflow_name
+        assert result.open_workflow.workflow_file_path is None
+
+    def test_a_first_save_reports_the_open_workflow_as_the_one_saved(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "first")
+
+        saved = _save(project_engine)
+
+        assert saved.open_workflow is not None
+        assert saved.open_workflow.workflow_id == workflow_id == saved.workflow_id
+        assert saved.open_workflow.name == saved.workflow_name
+        assert saved.open_workflow.workflow_file_path == str(Path(saved.file_path).resolve())
+
+    def test_a_save_as_reports_the_original_still_open(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "original")
+        original = _save(project_engine)
+
+        copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy"))
+
+        assert copy.open_workflow is not None
+        assert copy.open_workflow.workflow_id == workflow_id != copy.workflow_id
+        assert copy.open_workflow.name == original.workflow_name
+
+    def test_saving_a_library_workflow_reports_the_open_workflow_moved_onto_the_copy(
+        self, project_engine: Engine
+    ) -> None:
+        library_id = _open_new_workflow(project_engine, "library_workflow")
+        library_saved = _save(project_engine)
+        project_engine.workflow_registry.get(library_id).metadata.is_griptape_provided = True
+
+        copy = _save(project_engine, SaveWorkflowRequest(file_name=library_saved.workflow_name))
+
+        assert copy.open_workflow is not None
+        assert copy.open_workflow.workflow_id == copy.workflow_id != library_id
+        assert copy.open_workflow.name == copy.workflow_name
+
+    @pytest.mark.parametrize("load", ["from_registry", "from_scratch"])
+    def test_a_load_reports_the_workflow_it_opened(self, project_engine: Engine, load: str) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        if load == "from_registry":
+            request: object = RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name)
+        else:
+            request = RunWorkflowFromScratchRequest(file_path=saved.file_path)
+
+        loaded = _run(project_engine, request)
+
+        assert isinstance(loaded, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess)), (
+            loaded.result_details
+        )
+        assert loaded.open_workflow is not None
+        assert loaded.open_workflow.workflow_id == loaded.workflow_id == saved.workflow_id
+        assert loaded.open_workflow.name == saved.workflow_name
+        assert loaded.open_workflow.workflow_file_path is not None
+        assert loaded.open_workflow.has_active_flow
 
 
 class TestIdentityAcrossTheWorkflowLifecycle:
