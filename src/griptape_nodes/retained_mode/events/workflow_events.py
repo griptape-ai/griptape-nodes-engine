@@ -42,8 +42,11 @@ class RunWorkflowFromScratchRequest(RequestPayload):
     Use when: Loading and executing saved workflows, testing workflows from files,
     running workflows in clean environments, batch processing workflows.
 
+    Ignores the envelope's `open_workflow_id`.
+
     Args:
-        file_path: Path to the workflow file to load and execute
+        file_path: Path to the workflow file to load and execute. The request closes the open
+            workflow first while only one may be open.
 
     Results: RunWorkflowFromScratchResultSuccess | RunWorkflowFromScratchResultFailure (file not found, load error)
     """
@@ -133,10 +136,12 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     Use when: Executing registered workflows, running workflows by name,
     using workflow templates, automated workflow execution.
 
+    Ignores the envelope's `open_workflow_id`.
+
     Args:
         workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to clear the open workflow first (default: True). With False, the
-            request fails while a workflow is open.
+        run_with_clean_slate: Whether to close the open workflow first, while only one may be open
+            (default: True). With False, the request fails while a workflow is open and only one may be.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
