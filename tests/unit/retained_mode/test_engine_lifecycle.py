@@ -126,7 +126,7 @@ class TestStartupHandler:
             calls.append(f"ready:{is_initial_start}")
 
         monkeypatch.setattr(library_manager, "load_libraries_for_startup", record_load)
-        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", record_workers)
+        monkeypatch.setattr(library_manager.workers, "start_workers_after_loading", record_workers)
         monkeypatch.setattr(engine.secrets_manager, "register_all_secrets", record_secrets)
         monkeypatch.setattr(engine.workflow_manager, "refresh_workflow_registry", record_workflows)
         monkeypatch.setattr(lifecycle, "announce_ready", record_ready)
@@ -147,7 +147,7 @@ class TestStartupHandler:
         refresh_workflows = AsyncMock()
         announce_ready = MagicMock()
         monkeypatch.setattr(library_manager, "load_libraries_for_startup", load)
-        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", start_workers)
+        monkeypatch.setattr(library_manager.workers, "start_workers_after_loading", start_workers)
         monkeypatch.setattr(engine.secrets_manager, "register_all_secrets", register_secrets)
         monkeypatch.setattr(engine.workflow_manager, "refresh_workflow_registry", refresh_workflows)
         monkeypatch.setattr(lifecycle, "announce_ready", announce_ready)
@@ -239,7 +239,7 @@ class TestLibraryManagerDelegation:
         library_manager = engine.library_manager
         announce_ready = MagicMock()
         monkeypatch.setattr(library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[]))
-        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock())
+        monkeypatch.setattr(library_manager.workers, "start_workers_after_loading", AsyncMock())
         monkeypatch.setattr(engine.lifecycle, "announce_ready", announce_ready)
 
         result = await library_manager._run_reload_libraries(ReloadAllLibrariesRequest())

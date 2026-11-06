@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal, overload
 
@@ -46,9 +46,25 @@ def merge_env_file_values(*, global_values: Mapping[str, str], workspace_values:
 
 
 class SecretsManager:
-    def __init__(self, config_manager: ConfigManager, event_manager: EventManager | None = None) -> None:
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        event_manager: EventManager | None = None,
+        *,
+        read_secret: Callable[[str], str | None] | None = None,
+    ) -> None:
+        """Build the secrets manager.
+
+        Args:
+            config_manager: Locates the workspace `.env` file.
+            event_manager: Receives the secret request handlers and change notifications.
+            read_secret: Set in a library's worker process, which reads every secret from the engine
+                it works for instead. The worker's own environment and `.env` files are never read,
+                so a credential that process was not given cannot be found there.
+        """
         self.config_manager = config_manager
         self._event_manager = event_manager
+        self._read_secret = read_secret
 
         # Track keys this manager itself has installed into os.environ from a
         # .env file -- distinct from "keys seen in a file." The single
@@ -62,7 +78,8 @@ class SecretsManager:
         # ``_install_managed`` / ``_uninstall_managed``.
         self._managed_env_keys: set[str] = set()
 
-        self._load_env_files_into_environ()
+        if read_secret is None:
+            self._load_env_files_into_environ()
 
         if event_manager is not None:
             event_manager.register_request_handlers(self)
@@ -90,6 +107,9 @@ class SecretsManager:
         no pop happens at all: a transient missing file must not wipe
         state.
         """
+        if self._read_secret is not None:
+            logger.debug("Secrets are read from the engine this worker works for; nothing to refresh.")
+            return
         if not ENV_VAR_PATH.exists() and not self.workspace_env_path.exists():
             logger.debug("No .env files to refresh from; leaving os.environ untouched.")
             return
@@ -240,8 +260,16 @@ class SecretsManager:
         1. OS environment variables (highest priority)
         2. Workspace .env file (<workspace>/.env)
         3. Global .env file (~/.config/griptape_nodes/.env) (lowest priority)
+
+        In a library's worker process the engine it works for answers instead, by the same precedence.
         """
         secret_name = SecretsManager._apply_secret_name_compliance(secret_name)
+
+        if self._read_secret is not None:
+            secret_value = self._read_secret(secret_name)
+            if secret_value is None and should_error_on_not_found:
+                logger.error("Secret '%s' not found", secret_name)
+            return secret_value
 
         search_order = [
             ("environment variables", lambda: os.getenv(secret_name)),

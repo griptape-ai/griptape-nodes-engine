@@ -10,7 +10,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 from asyncio_thread_runner import ThreadRunner
 from typing_extensions import TypedDict, TypeVar
@@ -68,13 +68,35 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
     from collections.abc import Set as AbstractSet
 
-    from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
     # A post-dispatch hook observes a completed request. It may be sync or async;
     # its return value is ignored because nothing awaits the notification.
     PostDispatchHook = Callable[[Any, ResultPayload], None] | Callable[[Any, ResultPayload], Awaitable[None]]
+
+
+class WorkerRequestGateDecision(NamedTuple):
+    """What a worker request gate decides about one request a library's worker process sent this engine.
+
+    `forward` is the envelope to dispatch, possibly rewritten, or None to refuse the request. `denials`
+    says why, one entry per refusal.
+    """
+
+    forward: dict | None
+    denials: list[str]
+
+
+class WorkerRequestSender(Protocol):
+    """How a worker sends a request to the engine it works for and awaits the raw result payload."""
+
+    async def request_from_worker(
+        self,
+        event_request: EventRequest,
+        request_topic: str,
+        worker_response_topic: str,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]: ...
 
 
 RP = TypeVar("RP", bound=RequestPayload, default=RequestPayload)
@@ -343,7 +365,7 @@ class EventManager(EngineScoped):
         # Worker-to-orchestrator forwarding state. Inert until
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
-        self._worker_request_client: RequestClient | None = None
+        self._worker_request_client: WorkerRequestSender | None = None
         self._orchestrator_request_topic: str | None = None
         self._worker_response_topic: str | None = None
         self._websocket_event_loop: asyncio.AbstractEventLoop | None = None
@@ -386,6 +408,9 @@ class EventManager(EngineScoped):
         # The engine itself registers nothing here; the app installs the policy.
         self._authorization_hooks: list[Callable[[AuthorizationCheckpoint], CheckpointDenial | None]] = []
         self._authorization_hooks_lock = threading.Lock()
+        # Screens each request a library's worker process sends this engine. See add_worker_request_gate.
+        self._worker_request_gates: list[Callable[[dict], WorkerRequestGateDecision]] = []
+        self._worker_request_gates_lock = threading.Lock()
 
     @property
     def event_queue(self) -> asyncio.Queue:
@@ -924,6 +949,58 @@ class EventManager(EngineScoped):
             except ValueError:
                 return
 
+    def has_authorization_hook(
+        self,
+        hook: Callable[[AuthorizationCheckpoint], CheckpointDenial | None],
+    ) -> bool:
+        """Whether `hook` is registered with `add_authorization_hook`."""
+        with self._authorization_hooks_lock:
+            return hook in self._authorization_hooks
+
+    def add_worker_request_gate(self, hook: Callable[[dict], WorkerRequestGateDecision]) -> None:
+        """Register a hook that screens each request a library's worker process sends this engine.
+
+        `hook` is given the request's wire envelope (`{"type", "topic", "payload"}`, the shape a
+        client's request arrives in) and returns the envelope to dispatch, or None with the denials.
+        Hooks run in registration order, each on the envelope the one before it forwarded, and the
+        first denial wins. The engine registers none, so with no hook every request is allowed, as a
+        checkpoint is: this is how the app applies its license wire policy to worker traffic.
+        Registering the same hook twice is a no-op.
+        """
+        with self._worker_request_gates_lock:
+            if hook not in self._worker_request_gates:
+                self._worker_request_gates.append(hook)
+
+    def remove_worker_request_gate(self, hook: Callable[[dict], WorkerRequestGateDecision]) -> None:
+        with self._worker_request_gates_lock:
+            try:
+                self._worker_request_gates.remove(hook)
+            except ValueError:
+                return
+
+    def evaluate_worker_request_gate(self, envelope: dict) -> WorkerRequestGateDecision:
+        """Run the registered worker request gates over `envelope`. Fails closed: a hook that raises denies."""
+        with self._worker_request_gates_lock:
+            hooks = list(self._worker_request_gates)
+
+        forward = envelope
+        denials: list[str] = []
+        for hook in hooks:
+            try:
+                decision = hook(forward)
+            except Exception as exc:
+                logging.getLogger("griptape_nodes").exception(
+                    "Worker request gate '%s' raised; refusing the request.", getattr(hook, "__name__", hook)
+                )
+                return WorkerRequestGateDecision(
+                    forward=None, denials=[f"The license policy could not be evaluated: {type(exc).__name__}: {exc}"]
+                )
+            denials.extend(decision.denials)
+            if decision.forward is None:
+                return WorkerRequestGateDecision(forward=None, denials=denials)
+            forward = decision.forward
+        return WorkerRequestGateDecision(forward=forward, denials=denials)
+
     def evaluate_authorization_checkpoint(self, checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
         """Ask registered hooks whether a resolved operation is permitted.
 
@@ -1101,7 +1178,7 @@ class EventManager(EngineScoped):
     def configure_worker_forwarding(
         self,
         *,
-        request_client: RequestClient,
+        request_client: WorkerRequestSender,
         orchestrator_request_topic: str,
         worker_response_topic: str,
         websocket_event_loop: asyncio.AbstractEventLoop,
@@ -1224,7 +1301,7 @@ class EventManager(EngineScoped):
             response_topic=self._worker_response_topic,
             open_workflow_id=self._bound_worker_workflow_id(),
         )
-        result_payload = _read_forwarded_result(request, response_payload)
+        result_payload = read_forwarded_result(request, response_payload)
 
         event_cls: type[EventResultSuccess | EventResultFailure]
         event_cls = (
@@ -1258,7 +1335,7 @@ class EventManager(EngineScoped):
             request_topic=f"engines/{engine_id}/request",
             response_topic=f"engines/{own_engine_id}/response",
         )
-        return _read_forwarded_result(request, response_payload)
+        return read_forwarded_result(request, response_payload)
 
     async def _send_from_worker(
         self, request: RequestPayload, *, request_topic: str, response_topic: str, open_workflow_id: str | None = None
@@ -2419,7 +2496,7 @@ class EventTranslationContext:
             return event
 
 
-def _read_forwarded_result(request: RequestPayload, response_payload: dict) -> ResultPayload:
+def read_forwarded_result(request: RequestPayload, response_payload: dict) -> ResultPayload:
     """The result payload a forwarded request's raw reply carries."""
     result_type_name = response_payload.get("result_type")
     result_data = response_payload.get("result", {})

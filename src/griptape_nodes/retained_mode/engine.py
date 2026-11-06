@@ -19,6 +19,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -66,7 +67,7 @@ from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkf
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from griptape_nodes.retained_mode.engine_transports import EngineTransports
     from griptape_nodes.retained_mode.events.base_events import (
@@ -137,6 +138,21 @@ _root_engine_lock = threading.RLock()
 _root_engine_building = False
 
 
+@dataclass(frozen=True)
+class WorkerProcess:
+    """What makes an engine a library's worker process. Set only by the worker's entry point.
+
+    Attributes:
+        engine_id: The ID the engine that started this worker minted for the spawn. Held in memory
+            only, and not an address: nothing reaches the worker by it.
+        read_secret: Reads a secret from that engine, which answers every secret the worker asks for.
+            The worker's own environment and `.env` files are never read.
+    """
+
+    engine_id: str
+    read_secret: Callable[[str], str | None]
+
+
 class EngineScoped:
     """Base for objects that belong to a single `Engine`.
 
@@ -202,7 +218,12 @@ class Engine:
     _open_workflows: OpenWorkflowSet
     _worker_workflows: WorkerWorkflowSet
 
-    def __init__(self) -> None:  # noqa: PLR0915
+    def __init__(self, *, worker: WorkerProcess | None = None) -> None:  # noqa: PLR0915
+        """Build an engine and its managers.
+
+        Args:
+            worker: Set only by a library's worker process. See `WorkerProcess`.
+        """
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
         from griptape_nodes.retained_mode.managers.agent_manager import AgentManager
         from griptape_nodes.retained_mode.managers.arbitrary_code_exec_manager import (
@@ -255,9 +276,12 @@ class Engine:
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
+        # Before OSManager, which resolves the Griptape Cloud credential through it as it builds.
+        self._secrets_manager = SecretsManager(
+            self._config_manager, self._event_manager, read_secret=worker.read_secret if worker else None
+        )
         self._os_manager = OSManager(self._event_manager, engine=self)
         self._workflow_registry = _WorkflowRegistry(self._config_manager, is_workflow_open=self._holds_workflow)
-        self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
@@ -275,8 +299,12 @@ class Engine:
         )
         self._agent_manager = AgentManager(self._static_files_manager, self._event_manager, engine=self)
         self._version_compatibility_manager = VersionCompatibilityManager(self._event_manager, engine=self)
-        self._engine_identity_manager = EngineIdentityManager(self._event_manager)
-        self._session_manager = SessionManager(self._engine_identity_manager, self._event_manager)
+        self._engine_identity_manager = EngineIdentityManager(
+            self._event_manager, worker_engine_id=worker.engine_id if worker else None
+        )
+        self._session_manager = SessionManager(
+            self._engine_identity_manager, self._event_manager, worker=worker is not None
+        )
         self._mcp_manager = MCPManager(self._event_manager, self._config_manager)
         self._sync_manager = SyncManager(self._event_manager, self._config_manager, engine=self)
         self._user_manager = UserManager(self._secrets_manager)
@@ -1081,8 +1109,6 @@ def current_engine() -> Engine:
     threaded through -- the `GriptapeNodes` facade, saved workflow files, and node
     libraries.
     """
-    global _root_engine, _root_engine_building  # noqa: PLW0603
-
     scoped = _scoped_engine.get()
     if scoped is not None:
         return scoped
@@ -1100,12 +1126,33 @@ def current_engine() -> Engine:
                 "passed to it."
             )
             raise RuntimeError(msg)
-        _root_engine_building = True
-        try:
-            _root_engine = Engine()
-        finally:
-            _root_engine_building = False
-        return _root_engine
+        return _build_root_engine(Engine)
+
+
+def build_root_engine(*, worker: WorkerProcess) -> Engine:
+    """Build the process root engine with options a lazily built one cannot take.
+
+    For a process entry point that must configure its engine before anything uses it, such as a
+    library's worker process. Raises if the root engine already exists.
+    """
+    with _root_engine_lock:
+        if _root_engine is not None or _root_engine_building:
+            msg = "Attempted to build the process root engine. Failed because it was already built."
+            raise RuntimeError(msg)
+        return _build_root_engine(lambda: Engine(worker=worker))
+
+
+def _build_root_engine(build: Callable[[], Engine]) -> Engine:
+    """Build and store the root engine with `build`. Caller holds `_root_engine_lock`."""
+    global _root_engine, _root_engine_building  # noqa: PLW0603
+
+    _root_engine_building = True
+    try:
+        engine = build()
+    finally:
+        _root_engine_building = False
+    _root_engine = engine
+    return engine
 
 
 def has_current_engine() -> bool:

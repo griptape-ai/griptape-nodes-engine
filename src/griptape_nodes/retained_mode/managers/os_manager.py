@@ -427,7 +427,7 @@ class OSManager(EngineScoped):
         FileDriverRegistry.register(HttpFileDriver())
         FileDriverRegistry.register(DataUriFileDriver())
 
-        cloud_driver = GriptapeCloudFileDriver.create_from_env()
+        cloud_driver = GriptapeCloudFileDriver.create_from_env(self.engine.secrets_manager)
         if cloud_driver:
             FileDriverRegistry.register(cloud_driver)
 
