@@ -24,7 +24,6 @@ from griptape_nodes.exe_types.workflow_node import (
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.managers.workflow.shape import file_format_kind
 
 CONTROL_TYPE = "parametercontroltype"
 
@@ -323,34 +322,6 @@ class TestBuildWorkflowNodeClass:
         # The node brings its own control flow rather than surfacing the workflow's.
         assert node.get_parameter_by_name("exec_in") is node.control_parameter_in
         assert node.get_parameter_by_name("exec_out") is node.control_parameter_out
-
-    def test_file_format_from_the_shape_becomes_a_trait(self) -> None:
-        shape = WorkflowShape(
-            inputs={
-                "Start Flow": {
-                    "fmt": _param("fmt", file_format="three_d"),
-                    "text": _param("text"),
-                    "bogus": _param("bogus", file_format="spreadsheet"),
-                }
-            },
-            outputs={"End Flow": {"result": _param("result")}},
-        )
-
-        node_class = build_workflow_node_class(
-            node_type="ShoutWorkflow",
-            workflow_file_path=Path("/library/shout_workflow.py"),
-            workflow_metadata=_metadata(shape),
-        )
-        node = node_class(name="Shout It")
-
-        def kind(name: str) -> str | None:
-            param = node.get_parameter_by_name(name)
-            assert param is not None
-            return file_format_kind(param)
-
-        assert kind("fmt") == "three_d"
-        assert kind("text") is None
-        assert kind("bogus") is None
 
     def test_property_mode_withheld_when_shape_forbids_it(self) -> None:
         shape = WorkflowShape(

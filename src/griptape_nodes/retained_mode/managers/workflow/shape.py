@@ -7,12 +7,10 @@ from typing import TYPE_CHECKING, Any, cast
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
 from griptape_nodes.retained_mode.events.workflow_events import WorkflowShape
-from griptape_nodes.traits.file_format import FileFormat
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -23,7 +21,6 @@ NodeParameterMap = dict[str, ParameterShapeInfo]  # {param_name: param_info}
 WorkflowShapeNodes = dict[str, NodeParameterMap]  # {node_name: {param_name: param_info}}
 
 SHAPE_DEFAULT_VALUE_KEY = "default_value"  # Key in ParameterShapeInfo holding the parameter's default
-SHAPE_FILE_FORMAT_KEY = "file_format"  # Key in ParameterShapeInfo holding a `FileFormat` trait's kind
 
 
 class WorkflowShapeType(StrEnum):
@@ -81,7 +78,6 @@ def extract_workflow_shape(
         nodes=start_nodes,
         workflow_shape=workflow_shape,
         workflow_shape_type=WorkflowShapeType.INPUT,
-        connections=workflow.flows.connections,
     )
     return create_workflow_shape_from_nodes(
         nodes=end_nodes,
@@ -94,15 +90,12 @@ def create_workflow_shape_from_nodes(
     nodes: Sequence[BaseNode],
     workflow_shape: dict[str, Any],
     workflow_shape_type: WorkflowShapeType,
-    connections: Connections | None = None,
 ) -> dict[str, Any]:
     """Creates a workflow shape from the nodes.
 
     This method iterates over a sequence of a certain Node type (input or output)
     and creates a dictionary representation of the workflow shape. This informs which
     Parameters can be set for input, and which Parameters are expected as output.
-
-    `connections` lets an input parameter report the file format of the parameters it feeds.
     """
     for node in nodes:
         for param in node.parameters:
@@ -111,8 +104,6 @@ def create_workflow_shape_from_nodes(
             if param_info is not None:
                 if workflow_shape_type == WorkflowShapeType.INPUT:
                     apply_set_value_as_default(node, param, param_info)
-                    if connections is not None:
-                        apply_connected_file_format(node, param, param_info, connections)
                 if node.name in workflow_shape[workflow_shape_type]:
                     cast("dict", workflow_shape[workflow_shape_type][node.name])[param.name] = param_info
                 else:
@@ -136,35 +127,6 @@ def apply_set_value_as_default(node: BaseNode, param: Parameter, param_info: Par
     except (TypeError, ValueError):
         return
     param_info[SHAPE_DEFAULT_VALUE_KEY] = value
-
-
-def apply_connected_file_format(
-    node: BaseNode, param: Parameter, param_info: ParameterShapeInfo, connections: Connections
-) -> None:
-    """Record the file format of the parameters a Start Flow parameter feeds.
-
-    The editor builds a Start Flow parameter from the one it connects to by copying its type and
-    UI options, not its traits, so the `FileFormat` trait stays on the downstream parameter. The
-    kind is recorded only when every connected parameter that declares one agrees.
-    """
-    if SHAPE_FILE_FORMAT_KEY in param_info:
-        return
-    kinds = set()
-    for connection_id in connections.outgoing_index.get(node.name, {}).get(param.name, []):
-        kind = file_format_kind(connections.connections[connection_id].target_parameter)
-        if kind is not None:
-            kinds.add(kind)
-    if len(kinds) != 1:
-        return
-    param_info[SHAPE_FILE_FORMAT_KEY] = kinds.pop()
-
-
-def file_format_kind(parameter: Parameter) -> str | None:
-    """The kind of the parameter's `FileFormat` trait, or None if it has none."""
-    traits = parameter.find_elements_by_type(FileFormat)
-    if not traits:
-        return None
-    return traits[0].kind.value
 
 
 def extract_parameter_shape_info(parameter: Parameter, *, include_control_params: bool) -> ParameterShapeInfo | None:
@@ -230,8 +192,5 @@ def convert_parameter_to_minimal_dict(parameter: Parameter) -> dict[str, Any]:
     minimal_dict = {key: param_dict[key] for key in fields_to_include if key in param_dict}
     minimal_dict["settable"] = bool(getattr(parameter, "settable", True))
     minimal_dict["is_user_defined"] = bool(getattr(param_dict, "is_user_defined", True))
-    kind = file_format_kind(parameter)
-    if kind is not None:
-        minimal_dict[SHAPE_FILE_FORMAT_KEY] = kind
 
     return minimal_dict
