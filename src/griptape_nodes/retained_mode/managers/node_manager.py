@@ -382,8 +382,14 @@ class _NodeInstantiationDeniedError(Exception):
     Caught by the same handler path that substitutes an Error Proxy for a node
     whose library failed to load, so a denied node surfaces identically: a proxy
     carrying the missing-permission detail, or a failure result when the caller
-    opted out of proxy substitution.
+    opted out of proxy substitution. It keeps the structured `denial` and the resolved
+    library name so the proxy can show every violated rule and name the real library.
     """
+
+    def __init__(self, denial: CheckpointDenial, library_name: str) -> None:
+        super().__init__(denial.reason())
+        self.denial = denial
+        self.library_name = library_name
 
 
 @dataclass(frozen=True)
@@ -661,19 +667,6 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
-    def _evaluate_instantiation_checkpoint(
-        *, node_type: str, specific_library_name: str | None, event_manager: EventManager
-    ) -> CheckpointDenial | None:
-        """Ask any registered authorization hook whether this node type may be instantiated."""
-        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
-        return NodeManager._evaluate_node_instantiation_checkpoint(
-            node_type=node_type,
-            node_declarations=library.get_node_metadata(node_type).declarations,
-            library_declarations=library.get_metadata().declarations,
-            event_manager=event_manager,
-        )
-
-    @staticmethod
     def _enforce_instantiation_checkpoint(
         *, node_type: str, specific_library_name: str | None, event_manager: EventManager
     ) -> None:
@@ -681,14 +674,18 @@ class NodeManager(EngineScoped):
 
         Raised rather than returned so a denial joins the Error Proxy substitution
         path in `on_create_node_request`, identical to a node whose library failed
-        to load. The message lists every missing permission.
+        to load. The error carries the whole denial, so every missing permission
+        survives, along with the name of the library the node type resolved to.
         """
-        denial = NodeManager._evaluate_instantiation_checkpoint(
-            node_type=node_type, specific_library_name=specific_library_name, event_manager=event_manager
+        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        denial = NodeManager._evaluate_node_instantiation_checkpoint(
+            node_type=node_type,
+            node_declarations=library.get_node_metadata(node_type).declarations,
+            library_declarations=library.get_metadata().declarations,
+            event_manager=event_manager,
         )
         if denial is not None:
-            message = denial.reason(separator="\n")
-            raise _NodeInstantiationDeniedError(message)
+            raise _NodeInstantiationDeniedError(denial, library.get_library_data().name)
 
     @staticmethod
     def evaluate_schema_node_instantiation_denials(
@@ -852,23 +849,27 @@ class NodeManager(EngineScoped):
                     # A policy denial is a recoverable restriction rather than a broken
                     # node, so the proxy carries the denial reason and renders as a warning
                     # instead of surfacing library-load diagnostics as a hard error.
-                    denied_by_policy = isinstance(err, _NodeInstantiationDeniedError)
-                    if denied_by_policy:
-                        failure_reason = str(err)
+                    if isinstance(err, _NodeInstantiationDeniedError):
+                        node = ErrorProxyNode(
+                            name=final_node_name,
+                            original_node_type=request.node_type,
+                            original_library_name=err.library_name,
+                            failure_reason=str(err),
+                            metadata=request.metadata,
+                            denial=err.denial,
+                        )
                     else:
                         failure_reason = self._describe_node_creation_failure(
                             err, node_type=request.node_type, library_name=request.specific_library_name
                         )
-
-                    # Create ErrorProxyNode directly since it needs special initialization
-                    node = ErrorProxyNode(
-                        name=final_node_name,
-                        original_node_type=request.node_type,
-                        original_library_name=request.specific_library_name or "Unknown",
-                        failure_reason=failure_reason,
-                        metadata=request.metadata,
-                        denied_by_policy=denied_by_policy,
-                    )
+                        # Create ErrorProxyNode directly since it needs special initialization
+                        node = ErrorProxyNode(
+                            name=final_node_name,
+                            original_node_type=request.node_type,
+                            original_library_name=request.specific_library_name or "Unknown",
+                            failure_reason=failure_reason,
+                            metadata=request.metadata,
+                        )
 
                     logger.warning(
                         "Created Error Proxy (placeholder) node '%s' to substitute for failed '%s'",

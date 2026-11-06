@@ -9,14 +9,14 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 class TestCheckpointDenialReason:
     """`reason` renders the denial as one display string with a safe fallback."""
 
-    def test_joins_failure_details_with_default_separator(self) -> None:
+    def test_joins_failure_details_with_a_space_by_default(self) -> None:
         denial = CheckpointDenial(
             failures=(
                 CheckpointFailure(detail="Labs libraries are disabled."),
                 CheckpointFailure(detail="Ask your admin to enable them."),
             )
         )
-        assert denial.reason() == "Labs libraries are disabled.; Ask your admin to enable them."
+        assert denial.reason() == "Labs libraries are disabled. Ask your admin to enable them."
 
     def test_honors_custom_separator(self) -> None:
         denial = CheckpointDenial(
@@ -34,3 +34,18 @@ class TestCheckpointDenialReason:
 
     def test_empty_failures_honors_custom_default(self) -> None:
         assert CheckpointDenial(failures=()).reason(default="nope") == "nope"
+
+
+class TestCheckpointFailureSource:
+    """`source` is optional supplementary attribution that never changes `detail`."""
+
+    def test_source_defaults_to_none(self) -> None:
+        assert CheckpointFailure(detail="Denied.").source is None
+
+    def test_source_is_carried_alongside_the_detail(self) -> None:
+        failure = CheckpointFailure(
+            detail="Inverting images is not allowed.",
+            source="policy 'Image Edits' (rule 'no-invert-image')",
+        )
+        assert failure.detail == "Inverting images is not allowed."
+        assert failure.source == "policy 'Image Edits' (rule 'no-invert-image')"

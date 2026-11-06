@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ExecutionPayload, ResultPayload
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -2843,8 +2844,12 @@ class ErrorProxyNode(BaseNode):
     A node denied by an authorization policy is a recoverable restriction rather than a broken node,
     so `denied_by_policy` substitutes a warning treatment for the hard-error one and explains the
     cause as a permission gate instead of a load failure. The engine stays policy-agnostic: the
-    specific reason text arrives in `failure_reason` from whatever hook denied the node.
+    reasons arrive in `denial` from whatever hook denied the node. They render as one bullet per
+    distinct reason and travel to the editor, in full, as the `permission_denial` UI option of the
+    message element. `failure_reason` is the plain-text fallback when no structured `denial` is given.
     """
+
+    PERMISSION_DENIAL_UI_OPTION = "permission_denial"
 
     def __init__(  # noqa: PLR0913
         self,
@@ -2855,13 +2860,15 @@ class ErrorProxyNode(BaseNode):
         metadata: dict[Any, Any] | None = None,
         *,
         denied_by_policy: bool = False,
+        denial: CheckpointDenial | None = None,
     ) -> None:
         super().__init__(name, metadata)
 
         self.original_node_type = original_node_type
         self.original_library_name = original_library_name
         self.failure_reason = failure_reason
-        self.denied_by_policy = denied_by_policy
+        self.denial = denial
+        self.denied_by_policy = denied_by_policy or denial is not None
 
         # The owning library/node type are normally injected into metadata by
         # LibraryRegistry.create_node, but a proxy is created precisely because that
@@ -2881,10 +2888,14 @@ class ErrorProxyNode(BaseNode):
         # message emphasize that distinction; the editor renders both the variant and the markdown.
         self._error_message = ParameterMessage(
             name="error_proxy_message",
-            variant="warning" if denied_by_policy else "error",
+            variant="warning" if self.denied_by_policy else "error",
             value="",  # Will be set by _update_error_message
-            markdown=denied_by_policy,
+            markdown=self.denied_by_policy,
         )
+        if self.denial is not None:
+            self._error_message.update_ui_options_key(
+                self.PERMISSION_DENIAL_UI_OPTION, self._permission_denial_payload()
+            )
         self.add_node_element(self._error_message)
         self._update_error_message()
 
@@ -2895,7 +2906,7 @@ class ErrorProxyNode(BaseNode):
                 f"**Permission denied**\n\n"
                 f"You don't have permission to use the **{self.original_node_type}** node from the "
                 f"**{self.original_library_name}** library, so this placeholder is holding its spot.\n\n"
-                f"{self.failure_reason}\n\n"
+                f"{self._denial_reasons_markdown()}\n\n"
                 f"Your original node will be restored automatically once permission is granted. "
                 f"Contact your administrator if you need this capability enabled."
             )
@@ -3015,6 +3026,15 @@ class ErrorProxyNode(BaseNode):
 
     def validate_before_node_run(self) -> list[Exception] | None:
         """Prevent ErrorProxy nodes from running - validate at node level only."""
+        if self.denied_by_policy:
+            denied_msg = (
+                f"Cannot run node '{self.name}': You don't have permission to use the '{self.original_node_type}' "
+                f"node from the '{self.original_library_name}' library, so this placeholder is holding its spot.\n\n"
+                f"{self._denial_reasons_markdown()}\n\n"
+                f"Once permission is granted, reload this workflow and the placeholder will be automatically "
+                f"replaced with the original node. Contact your administrator if you need this capability enabled."
+            )
+            return [RuntimeError(denied_msg)]
         error_msg = (
             f"Cannot run node '{self.name}': This is a placeholder node put in place to preserve your workflow until the breaking issue is fixed.\n\n"
             f"The original '{self.original_node_type}' from library '{self.original_library_name}' failed to load due to this technical issue:\n\n"
@@ -3022,6 +3042,37 @@ class ErrorProxyNode(BaseNode):
             f"Once you resolve the issue above, reload this workflow and the placeholder will be automatically replaced with the original node."
         )
         return [RuntimeError(error_msg)]
+
+    def _denial_reasons_markdown(self) -> str:
+        """One bullet per distinct denial detail, in order, falling back to `failure_reason`."""
+        if self.denial is None:
+            return self.failure_reason
+        details: list[str] = []
+        for failure in self.denial.failures:
+            if failure.detail not in details:
+                details.append(failure.detail)
+        if not details:
+            return self.failure_reason
+        return "\n".join(f"- {detail}" for detail in details)
+
+    def _permission_denial_payload(self) -> dict[str, Any]:
+        """The structured denial the editor renders in place of the markdown fallback."""
+        failures: list[dict[str, str | None]] = []
+        if self.denial is not None:
+            for failure in self.denial.failures:
+                entry = {
+                    "detail": failure.detail,
+                    "capability": failure.capability,
+                    "advice": failure.advice,
+                    "source": failure.source,
+                }
+                if entry not in failures:
+                    failures.append(entry)
+        return {
+            "node_type": self.original_node_type,
+            "library_name": self.original_library_name,
+            "failures": failures,
+        }
 
     def record_initialization_request(self, request: RequestPayload) -> None:
         """Record an initialization request for replay during serialization.
