@@ -1447,6 +1447,7 @@ class EventManager(EngineScoped):
             # Some requests have fields marked as "omit_from_result" which should be removed from the request
             self._scrub_omitted_request_fields(request)
             result_workflow_id = self._result_workflow_id(callback_result, request_workflow, context)
+            self._announce_opened_workflow(callback_result)
             if callback_result.succeeded():
                 result_event = EventResultSuccess(
                     request=request,
@@ -2155,6 +2156,12 @@ class EventManager(EngineScoped):
         if request_workflow is None:
             return context.get("open_workflow_id")
         return request_workflow.acted_on_workflow_id
+
+    def _announce_opened_workflow(self, result: ResultPayload) -> None:
+        """Announce the workflow `result`'s request opened, once its handler returned it built (see `Engine.announce_opened_workflow`)."""
+        if not result.succeeded() or not isinstance(result, OpenedWorkflowResult) or result.open_workflow is None:
+            return
+        self.engine.announce_opened_workflow(result.open_workflow.workflow_id)
 
 
 class EventSuppressionContext:

@@ -115,6 +115,11 @@ Results then arrive as messages whose `type` is `success_result` or `failure_res
 
 While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each one has an `open_workflow_id` naming the open workflow it belongs to, like a result's, so you can tell which tab it is for when node names repeat across workflows. It is `null` for events that belong to no workflow, such as publishing progress.
 
+The engine also tells every connection when a workflow opens or closes, whichever connection sent the request:
+
+- `WorkflowOpenedEvent` arrives once the opened workflow is built, so you can read its graph right away. Its `open_workflow` describes the workflow in the form the heartbeat's `open_workflows` lists it.
+- `WorkflowClosedEvent` names the closed workflow in `open_workflow_id`. A close, a clear, a library reload and a project switch all send it, one for each workflow they close. When a request closes the open workflow before opening another, the closed event comes first.
+
 If your organization uses license keys, the engine checks each request against your license. A request your license doesn't permit is refused rather than run.
 
 ## Examples
