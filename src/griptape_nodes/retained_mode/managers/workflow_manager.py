@@ -34,13 +34,11 @@ from griptape_nodes.node_library.workflow_registry import (
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
-    EngineInitializationProgress,
-    InitializationPhase,
     InitializationStatus,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
-from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetails
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
     GetLibraryMetadataRequest,
     GetLibraryMetadataResultSuccess,
@@ -94,6 +92,7 @@ from griptape_nodes.retained_mode.managers.workflow.file_operations import Workf
 from griptape_nodes.retained_mode.managers.workflow.loading import EPOCH_START
 from griptape_nodes.retained_mode.managers.workflow.publishing import WorkflowPublishing
 from griptape_nodes.retained_mode.managers.workflow.referenced_import import ReferencedWorkflowImport
+from griptape_nodes.retained_mode.managers.workflow.registration_progress import WorkflowRegistrationProgressReporter
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowRunner, collate_problems_by_type
 from griptape_nodes.retained_mode.managers.workflow.saving import (
     WorkflowSaver,
@@ -1090,21 +1089,11 @@ class WorkflowManager(EngineScoped):
             registered_libraries = []
 
         # Second pass: process each workflow file with progress events
+        progress = WorkflowRegistrationProgressReporter(self.engine.event_manager.put_event, total_workflows)
         for current_index, workflow_file in enumerate(all_workflow_files, start=1):
             workflow_name = str(workflow_file.name)
 
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
-                )
-            )
+            progress.report(item_name=workflow_name, status=InitializationStatus.LOADING, current=current_index)
 
             # Process the workflow
             workflow = await self._process_single_workflow_file(
@@ -1115,32 +1104,14 @@ class WorkflowManager(EngineScoped):
             if workflow is not None:
                 succeeded.append(workflow.name)
                 workflow_ids.append(workflow.workflow_id)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
+                progress.report(item_name=workflow_name, status=InitializationStatus.COMPLETE, current=current_index)
             else:
                 failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
+                progress.report(
+                    item_name=workflow_name,
+                    status=InitializationStatus.FAILED,
+                    current=current_index,
+                    error="Failed to process workflow file",
                 )
 
         return WorkflowRegistrationResult(succeeded=succeeded, failed=failed, workflow_ids=workflow_ids)
