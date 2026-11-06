@@ -785,7 +785,6 @@ class Engine:
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
         """What clients are told of an open workflow: its id, name, file and whether it has a flow."""
         entry = self.workflow_registry.get(workflow.workflow_id)
-        # None for unsaved workflows.
         file_path = None
         if entry.absolute_path is not None:
             file_path = str(entry.absolute_path)
