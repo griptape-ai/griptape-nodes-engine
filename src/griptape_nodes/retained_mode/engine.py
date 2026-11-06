@@ -782,6 +782,20 @@ class Engine:
         """
         return self._open_workflows.open(workflow_id)
 
+    def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
+        """What clients are told of an open workflow: its id, name, file and whether it has a flow."""
+        entry = self.workflow_registry.get(workflow.workflow_id)
+        # None for unsaved workflows.
+        file_path = None
+        if entry.absolute_path is not None:
+            file_path = str(entry.absolute_path)
+        return OpenWorkflowInfo(
+            workflow_id=workflow.workflow_id,
+            name=entry.name,
+            workflow_file_path=file_path,
+            has_active_flow=workflow.context.has_current_flow(),
+        )
+
     def close_workflow(self, workflow: WorkflowRuntime) -> None:
         """Close an open workflow, tearing down everything it holds, here and in the workers.
 
@@ -1035,7 +1049,7 @@ class Engine:
         }
 
         try:
-            open_workflows = self._open_workflows_info()
+            open_workflows = [self.open_workflow_info(workflow) for workflow in self._open_workflows.all_open()]
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
             return workflow_info
@@ -1049,29 +1063,6 @@ class Engine:
         workflow_info["has_active_flow"] = current.has_active_flow
         workflow_info["open_workflows"] = open_workflows
         return workflow_info
-
-    def _open_workflows_info(self) -> list[OpenWorkflowInfo]:
-        """What the heartbeat reports of each open workflow, in the order they were opened."""
-        context_manager = self._context_manager
-        infos: list[OpenWorkflowInfo] = []
-        for open_workflow in self._open_workflows.all_open():
-            with self.bind_workflow(open_workflow):
-                if not context_manager.has_current_workflow():
-                    continue
-                workflow = context_manager.get_current_workflow()
-                # None for unsaved workflows.
-                file_path = None
-                if workflow.absolute_path is not None:
-                    file_path = str(workflow.absolute_path)
-                infos.append(
-                    OpenWorkflowInfo(
-                        workflow_id=workflow.workflow_id,
-                        name=workflow.name,
-                        workflow_file_path=file_path,
-                        has_active_flow=context_manager.has_current_flow(),
-                    )
-                )
-        return infos
 
 
 def current_engine() -> Engine:

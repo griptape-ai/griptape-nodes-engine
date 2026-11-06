@@ -427,6 +427,7 @@ class WorkflowSaver(EngineScoped):
             file_path=save_file_result.file_path,
             workflow_name=saved_workflow.name,
             workflow_id=saved_workflow.workflow_id,
+            open_workflow=self.engine.open_workflow_info(workflow),
             result_details=details,
         )
 

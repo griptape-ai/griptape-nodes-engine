@@ -223,7 +223,10 @@ class ContextManager(EngineScoped):
         resolved_name = self.engine.workflow_registry.get(opened.workflow_id).name
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(
-            workflow_name=resolved_name, workflow_id=opened.workflow_id, result_details=msg
+            workflow_name=resolved_name,
+            workflow_id=opened.workflow_id,
+            open_workflow=self.engine.open_workflow_info(opened),
+            result_details=msg,
         )
 
     @handles(GetWorkflowContextRequest)
