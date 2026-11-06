@@ -463,7 +463,9 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
-    """An event from running a flow. `workflow_id` names the open workflow it belongs to, None for a host event.
+    """An event from running a flow. `open_workflow_id` names the open workflow it belongs to, None for a host event.
+
+    It matches a result envelope's `open_workflow_id`, so a client routes both by one field.
 
     Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
     for an event a node reports about itself, naming the workflow it joined. Both go through
@@ -471,7 +473,7 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """
 
     payload: E
-    workflow_id: str | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an ExecutionEvent, inferring the generic type if needed."""
@@ -521,9 +523,9 @@ class ExecutionGriptapeNodeEvent(BaseEvent):
         return self.wrapped_event.get_request()
 
 
-def build_execution_event(payload: ExecutionPayload, workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
-    """An execution event naming the open workflow `workflow_id` it belongs to, or None for no workflow."""
-    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=workflow_id))
+def build_execution_event(payload: ExecutionPayload, open_workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
+    """An execution event naming the open workflow `open_workflow_id` it belongs to, or None for no workflow."""
+    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=open_workflow_id))
 
 
 @dataclass
@@ -531,5 +533,5 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
-    # The workflow of the node that streamed this. See ExecutionEvent.workflow_id.
-    workflow_id: str | None = field(default=None)
+    # The workflow of the node that streamed this. See ExecutionEvent.open_workflow_id.
+    open_workflow_id: str | None = field(default=None)

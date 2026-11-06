@@ -58,7 +58,7 @@ def _events() -> dict[str, BaseEvent]:
             result=GetParameterValueResultFailure(result_details="nope"),
             request_id="r2",
         ),
-        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n"), workflow_id="wf"),
+        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n"), open_workflow_id="wf"),
         "AppEvent": AppEvent(payload=AppInitializationComplete()),
     }
 
@@ -142,7 +142,7 @@ def test_an_execution_events_workflow_survives_json() -> None:
     restored = converters.engine.structure(
         json.loads(json.dumps(converters.engine.unstructure(original), default=str)), ExecutionEvent
     )
-    assert restored.workflow_id == original.workflow_id == "wf"
+    assert restored.open_workflow_id == original.open_workflow_id == "wf"
 
 
 def test_payload_fields_hold_unstructured_output() -> None:
@@ -192,7 +192,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "result",
     ]
     assert list(converters.engine.unstructure(_events()["ExecutionEvent"])) == [
-        "workflow_id",
+        "open_workflow_id",
         "event_type",
         "payload_type",
         "payload",

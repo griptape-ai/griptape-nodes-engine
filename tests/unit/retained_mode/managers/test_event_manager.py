@@ -2379,12 +2379,12 @@ class TestNodeProcessEventTranslation:
 
         with EventTranslationContext(manager, {"Body_1": "Body"}):
             manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish, workflow_id="wf-1"))
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish, open_workflow_id="wf-1"))
             )
 
         translated = queue.get_nowait()
         assert translated.wrapped_event.payload.node_name == "Body"
-        assert translated.wrapped_event.workflow_id == "wf-1"
+        assert translated.wrapped_event.open_workflow_id == "wf-1"
 
 
 class TestResultWorkflowId:
