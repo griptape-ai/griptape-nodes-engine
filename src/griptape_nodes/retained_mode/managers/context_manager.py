@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -9,7 +10,6 @@ from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
     WorkflowMetadataError,
-    WorkflowRegistryError,
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -75,6 +75,19 @@ class ContextManager(EngineScoped):
 
     class WorkerWorkflowNotClosableError(WorkflowContextError):
         """Work on a worker tried to close the runtime the worker keeps for an orchestrator workflow."""
+
+    class OpenRefusedError(WorkflowContextError):
+        """An open was refused, having changed nothing. See `open_requested_workflow`."""
+
+    class RequestedWorkflowNotFoundError(OpenRefusedError):
+        """An open named an id or name that no registered workflow has."""
+
+    class AnotherWorkflowOpenError(OpenRefusedError):
+        """An open was refused because another workflow is open and only one may be."""
+
+        def __init__(self, message: str, open_workflow: WorkflowRuntime) -> None:
+            super().__init__(message)
+            self.open_workflow = open_workflow
 
     class WorkflowContext:
         """A context manager for a Workflow."""
@@ -164,96 +177,118 @@ class ContextManager(EngineScoped):
 
     @handles(SetWorkflowContextRequest)
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
-        return self._set_workflow_context(request, create_flow=False, flow_name=None)
-
-    def _set_workflow_context(  # noqa: C901
-        self, request: SetWorkflowContextRequest, *, create_flow: bool, flow_name: str | None
-    ) -> SetWorkflowContextSuccess | SetWorkflowContextFailure:
-        """Open the workflow `request` names, with its top-level flow named `flow_name` when `create_flow` is set.
-
-        Called directly rather than dispatched by a handler that opens a workflow for its own
-        result, so the workflow is announced once, with that result (see `OpenedWorkflowResult`).
-        """
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if blocking is not None:
-            blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{blocking_name}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
-            return SetWorkflowContextFailure(result_details=msg)
-
-        # Normalized here rather than at read time so `workflow_dir` never has to care whether
-        # the caller sent an absolute path, a workspace-relative one, or one with a `~` in it.
-        working_directory = None
-        if request.working_directory is not None:
-            working_directory = str(
-                canonicalize_for_identity(request.working_directory, base=self.engine.config_manager.workspace_path)
+        try:
+            opened = self.open_requested_workflow(
+                workflow_name=request.workflow_name,
+                display_name=request.display_name,
+                working_directory=request.working_directory,
             )
-            # A file where a folder was meant is the one mistake worth rejecting: the value
-            # becomes the parent of every path the workflow writes, so accepting it would put
-            # outputs beside the file rather than in the folder the caller named -- a plausible
-            # location, which is what makes it hard to notice.
-            existing = Path(working_directory)
-            if existing.exists() and not existing.is_dir():
-                msg = (
-                    f"Attempted to set the folder for a new Workflow to '{request.working_directory}'. "
-                    f"Failed because that path is a file, not a folder."
-                )
-                return SetWorkflowContextFailure(result_details=msg)
-
-        # When no workflow_name is supplied, register a new unsaved workflow here so the engine
-        # owns the namespace. Callers doing "create a new workflow" should omit the name and
-        # read the resolved key off the success result.
-        registry = self.engine.workflow_registry
-        display_name = request.display_name or "Untitled"
-        workflow_name = request.workflow_name
-        if workflow_name is None:
-            workflow_name = registry.register_unsaved(display_name).name
-        elif registry.find_by_name(workflow_name) is None:
-            # A name no workflow has fails, rather than opening a blank workflow under it: a typo,
-            # a name another client just renamed, or a file the workspace scan has not registered
-            # yet would otherwise show an empty canvas whose next save writes a new file. The
-            # handler does not wait for the scan: it is synchronous, and the scan's completion
-            # event is already set before the first scan starts, so waiting would not cover an
-            # editor that reconnects that early. It fails instead, and the editor can ask again.
-            # Only an "unsaved:<id>" name, which an editor sends back to restore an unsaved
-            # workflow, registers a new unsaved entry under that id. This makes every workflow
-            # (saved or not) a first-class registry entry, so list/metadata/etc. calls don't
-            # need special-casing for pre-save state.
-            workflow_id = registry.unsaved_name_workflow_id(workflow_name)
-            if workflow_id is None:
-                msg = (
-                    f"Attempted to open workflow '{workflow_name}'. Failed because no workflow with that name "
-                    f"is registered. Open a workflow from the workflow list, or start a new one."
-                )
-                return SetWorkflowContextFailure(result_details=msg)
-            try:
-                workflow_name = registry.register_unsaved(display_name, workflow_id=workflow_id).name
-            except WorkflowRegistryError as err:
-                msg = (
-                    f"Attempted to auto-register unsaved workflow '{workflow_name}' "
-                    f"before setting it as the Current Context. Failed because of '{err}'."
-                )
-                return SetWorkflowContextFailure(result_details=msg)
-
-        opened = self.open_workflow(workflow_name, working_directory=working_directory)
-        resolved_name = registry.get(opened.workflow_id).name
-
-        if create_flow:
-            create_flow_result = self._create_top_level_flow(opened, flow_name)
-            if not create_flow_result.succeeded():
-                msg = f"Attempted to open workflow '{resolved_name}' with a flow. Failed to create the flow: {create_flow_result.result_details}"
-                try:
-                    self.engine.close_workflow(opened)
-                except OpenWorkflowError as err:
-                    msg = f"{msg} The workflow stays open, because closing it failed: {err}"
-                return SetWorkflowContextFailure(result_details=msg)
+        except self.OpenRefusedError as err:
+            return SetWorkflowContextFailure(result_details=str(err))
+        resolved_name = self.engine.workflow_registry.get(opened.workflow.workflow_id).name
+        if opened.already_open:
+            msg = f"Attempted to open workflow '{resolved_name}'. Failed because it is already open."
+            return SetWorkflowContextFailure(result_details=msg)
 
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(
             workflow_name=resolved_name,
-            workflow_id=opened.workflow_id,
-            open_workflow=self.engine.open_workflow_info(opened),
+            workflow_id=opened.workflow.workflow_id,
+            open_workflow=self.engine.open_workflow_info(opened.workflow),
             result_details=msg,
         )
+
+    def open_requested_workflow(  # noqa: PLR0913
+        self,
+        *,
+        workflow_id: str | None = None,
+        workflow_name: str | None = None,
+        file_path: str | None = None,
+        display_name: str | None = None,
+        working_directory: str | None = None,
+        create_flow: bool = False,
+        flow_name: str | None = None,
+    ) -> OpenedWorkflow:
+        """Open the workflow a request names, or return it as it is when it is already open. Never closes one.
+
+        `OpenWorkflowRequest`, `SetWorkflowContextRequest`, `EnsureWorkflowAndFlowRequest`,
+        `RunWorkflowFromRegistryRequest` and `RunWorkflowFromScratchRequest` open here. Name the
+        workflow by at most one of `workflow_id`, `workflow_name` and `file_path`; naming none
+        opens a new unsaved workflow. A workflow already open comes back unchanged, whatever the
+        other arguments ask. Every refusal comes before anything is registered or opened, except a
+        flow that can't be created, which closes the workflow again.
+
+        A saved workflow opens empty: `WorkflowRunner.open_and_build_workflow` builds its file into
+        it. Clients hear of the workflow from the result of the request that opened it (see
+        `OpenedWorkflowResult`).
+
+        Args:
+            workflow_id: Id of a registered workflow.
+            workflow_name: Legacy registry name of a registered workflow.
+            file_path: A workflow file. One the registry does not know is registered unlisted.
+            display_name: Display name of a new unsaved workflow, "Untitled" when None.
+            working_directory: Folder the workflow belongs to until it has a file, as
+                SetWorkflowContextRequest describes.
+            create_flow: Whether to create the workflow's top-level flow.
+            flow_name: Name of that flow, or None to let the engine name it.
+
+        Raises:
+            OpenRefusedError: The workflow was named more than one way, `working_directory` names
+                a file, `file_path` could not be registered, or the flow could not be created.
+            RequestedWorkflowNotFoundError: No registered workflow has `workflow_id` or `workflow_name`.
+            AnotherWorkflowOpenError: Another workflow is open and only one may be.
+        """
+        named = [name for name in (workflow_id, workflow_name, file_path) if name is not None]
+        if len(named) > 1:
+            msg = "Attempted to open a workflow. Failed because the request named it more than one way. Give its id or its name, not both."
+            raise self.OpenRefusedError(msg)
+        normalized_directory = self._normalize_working_directory(working_directory)
+        registry = self.engine.workflow_registry
+        entry = self._find_requested_workflow(workflow_id, workflow_name, file_path)
+        if entry is not None:
+            already_open = self.engine.open_workflows.find(entry.workflow_id)
+            if already_open is not None:
+                return OpenedWorkflow(workflow=already_open, already_open=True)
+
+        blocking = self.engine.open_workflows.workflow_blocking_open()
+        if blocking is not None:
+            label = file_path or display_name or "Untitled"
+            if entry is not None:
+                label = entry.name
+            msg = (
+                f"Attempted to open workflow '{label}'. Failed because workflow "
+                f"'{registry.get(blocking.workflow_id).name}' is open and only one workflow can be open at a time. "
+                "Close it first."
+            )
+            raise self.AnotherWorkflowOpenError(msg, blocking)
+
+        if entry is None:
+            entry = self._register_requested_workflow(file_path, display_name)
+        try:
+            opened = self.open_workflow(entry.name, working_directory=normalized_directory)
+        except self.WorkflowAlreadyOpenError as err:
+            raise self.OpenRefusedError(str(err)) from err
+
+        if create_flow:
+            self.create_top_level_flow_or_close(opened, flow_name)
+        return OpenedWorkflow(workflow=opened, already_open=False)
+
+    def create_top_level_flow_or_close(self, workflow: WorkflowRuntime, flow_name: str | None) -> None:
+        """Create the top-level flow of `workflow`, which was just opened, and close it again if that fails.
+
+        Raises:
+            OpenRefusedError: The flow could not be created.
+        """
+        create_flow_result = self._create_top_level_flow(workflow, flow_name)
+        if create_flow_result.succeeded():
+            return
+        workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+        msg = f"Attempted to open workflow '{workflow_name}' with a flow. Failed to create the flow: {create_flow_result.result_details}"
+        try:
+            self.engine.close_workflow(workflow)
+        except OpenWorkflowError as err:
+            msg = f"{msg} The workflow stays open, because closing it failed: {err}"
+        raise self.OpenRefusedError(msg)
 
     @handles(CloseWorkflowRequest)
     async def on_close_workflow_request(
@@ -312,33 +347,61 @@ class ContextManager(EngineScoped):
         """
         if workflow is None:
             return self._open_workflow_with_flow(request)
+        return self._ensure_flow(request, workflow)
 
-        # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
-        from griptape_nodes.retained_mode.events.flow_events import (
-            CreateFlowRequest,
-            CreateFlowResultSuccess,
+    def _open_workflow_with_flow(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
+        """Open the workflow an Ensure request names, or a new one, with its top-level flow.
+
+        A flow that can't be created closes the workflow again, so it is never announced. A
+        workflow already open is used as it is, with a flow created if it has none.
+        """
+        try:
+            opened = self.open_requested_workflow(
+                workflow_name=request.workflow_name,
+                display_name=request.display_name,
+                working_directory=request.working_directory,
+                create_flow=True,
+                flow_name=request.flow_name,
+            )
+        except self.OpenRefusedError as err:
+            return EnsureWorkflowAndFlowResultFailure(
+                result_details=f"Attempted to ensure a workflow + flow context. Failed while opening the workflow: {err}"
+            )
+        if opened.already_open:
+            return self._ensure_flow(request, opened.workflow)
+
+        workflow = opened.workflow
+        workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+        flow_name = workflow.context.get_current_flow().name
+        return EnsureWorkflowAndFlowResultSuccess(
+            workflow_name=workflow_name,
+            workflow_id=workflow.workflow_id,
+            flow_name=flow_name,
+            created_workflow=True,
+            created_flow=True,
+            open_workflow=self.engine.open_workflow_info(workflow),
+            result_details=(
+                f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
+                "(created_workflow=True, created_flow=True)."
+            ),
         )
 
+    def _ensure_flow(self, request: EnsureWorkflowAndFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
+        """Give the open `workflow` a top-level flow if it has none, for an Ensure request."""
         workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
         created_flow = False
         if workflow.context.has_current_flow():
             flow_name = workflow.context.get_current_flow().name
         else:
-            create_flow_result = workflow.handle_request(
-                CreateFlowRequest(
-                    parent_flow_name=None,
-                    flow_name=request.flow_name,
-                    set_as_new_context=True,
-                )
-            )
-            if not isinstance(create_flow_result, CreateFlowResultSuccess):
+            create_flow_result = self._create_top_level_flow(workflow, request.flow_name)
+            if create_flow_result.failed():
                 return EnsureWorkflowAndFlowResultFailure(
                     result_details=(
                         f"Attempted to ensure a workflow + flow context. Failed while creating the flow: "
                         f"{create_flow_result.result_details}"
                     )
                 )
-            flow_name = create_flow_result.flow_name
+            flow_name = workflow.context.get_current_flow().name
             created_flow = True
 
         return EnsureWorkflowAndFlowResultSuccess(
@@ -350,44 +413,6 @@ class ContextManager(EngineScoped):
             result_details=(
                 f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
                 f"(created_workflow=False, created_flow={created_flow})."
-            ),
-        )
-
-    def _open_workflow_with_flow(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
-        """Open the workflow an Ensure request names, or a new one, with its top-level flow.
-
-        A flow that can't be created closes the workflow again, so it is never announced.
-        """
-        set_workflow_result = self._set_workflow_context(
-            SetWorkflowContextRequest(
-                workflow_name=request.workflow_name,
-                display_name=request.display_name,
-                working_directory=request.working_directory,
-            ),
-            create_flow=True,
-            flow_name=request.flow_name,
-        )
-        if not isinstance(set_workflow_result, SetWorkflowContextSuccess) or set_workflow_result.workflow_id is None:
-            return EnsureWorkflowAndFlowResultFailure(
-                result_details=(
-                    f"Attempted to ensure a workflow + flow context. Failed while opening the workflow: "
-                    f"{set_workflow_result.result_details}"
-                )
-            )
-
-        workflow_name = set_workflow_result.workflow_name
-        workflow = self.engine.open_workflows.get(set_workflow_result.workflow_id)
-        flow_name = workflow.context.get_current_flow().name
-        return EnsureWorkflowAndFlowResultSuccess(
-            workflow_name=workflow_name,
-            workflow_id=workflow.workflow_id,
-            flow_name=flow_name,
-            created_workflow=True,
-            created_flow=True,
-            open_workflow=set_workflow_result.open_workflow,
-            result_details=(
-                f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
-                "(created_workflow=True, created_flow=True)."
             ),
         )
 
@@ -513,6 +538,79 @@ class ContextManager(EngineScoped):
 
         self._register_orchestrator_workflow(workflow_id, name, file_path, working_directory)
         return self.engine.worker_workflows.runtime_for(workflow_id)
+
+    def _normalize_working_directory(self, working_directory: str | None) -> str | None:
+        """`working_directory` made absolute against the workspace, or None.
+
+        Raises:
+            OpenRefusedError: It names an existing file.
+        """
+        if working_directory is None:
+            return None
+        # Normalized here rather than at read time so `workflow_dir` never has to care whether
+        # the caller sent an absolute path, a workspace-relative one, or one with a `~` in it.
+        normalized = str(canonicalize_for_identity(working_directory, base=self.engine.config_manager.workspace_path))
+        # A file where a folder was meant is the one mistake worth rejecting: the value
+        # becomes the parent of every path the workflow writes, so accepting it would put
+        # outputs beside the file rather than in the folder the caller named -- a plausible
+        # location, which is what makes it hard to notice.
+        existing = Path(normalized)
+        if existing.exists() and not existing.is_dir():
+            msg = (
+                f"Attempted to set the folder for a new Workflow to '{working_directory}'. "
+                f"Failed because that path is a file, not a folder."
+            )
+            raise self.OpenRefusedError(msg)
+        return normalized
+
+    def _register_requested_workflow(self, file_path: str | None, display_name: str | None) -> Workflow:
+        """Register the workflow an open names that the registry does not hold: the file at `file_path`, or a new unsaved one.
+
+        Raises:
+            OpenRefusedError: The file could not be registered.
+        """
+        if file_path is None:
+            return self.engine.workflow_registry.register_unsaved(display_name or "Untitled")
+        try:
+            return self._find_or_register_open_file(file_path)
+        except ValueError as err:
+            msg = f"Attempted to open workflow file '{file_path}'. Failed because {err}"
+            raise self.OpenRefusedError(msg) from err
+
+    def _find_requested_workflow(
+        self, workflow_id: str | None, workflow_name: str | None, file_path: str | None
+    ) -> Workflow | None:
+        """The registry entry an open names, or None for a new workflow or a file the registry does not know.
+
+        Raises:
+            RequestedWorkflowNotFoundError: No registered workflow has `workflow_id` or `workflow_name`.
+        """
+        registry = self.engine.workflow_registry
+        if workflow_id is not None:
+            entry = registry.find_by_id(workflow_id)
+            if entry is None:
+                msg = (
+                    f"Attempted to open workflow '{workflow_id}'. Failed because no workflow has that id. "
+                    "Workflow ids last only until the engine restarts, and an unsaved workflow is lost with it."
+                )
+                raise self.RequestedWorkflowNotFoundError(msg)
+            return entry
+        if workflow_name is not None:
+            entry = registry.find_by_name(workflow_name)
+            if entry is None:
+                # A name no workflow has fails, rather than opening a blank workflow under it: a
+                # typo, a name another client just renamed, or a file the workspace scan has not
+                # registered yet would otherwise show an empty canvas whose next save writes a new
+                # file.
+                msg = (
+                    f"Attempted to open workflow '{workflow_name}'. Failed because no workflow with that name "
+                    f"is registered. Open a workflow from the workflow list, or start a new one."
+                )
+                raise self.RequestedWorkflowNotFoundError(msg)
+            return entry
+        if file_path is not None:
+            return registry.find_by_path(file_path)
+        return None
 
     def _create_top_level_flow(self, workflow: WorkflowRuntime, flow_name: str | None) -> ResultPayload:
         """Create `workflow`'s top-level flow, named `flow_name` or by the engine, and make it the current flow."""
@@ -1018,6 +1116,19 @@ class ContextManager(EngineScoped):
     def _current_or_none(self) -> WorkflowRuntime | None:
         """The current workflow (`Engine.current_workflow_or_none`), or None when there is none."""
         return self.engine.current_workflow_or_none()
+
+
+@dataclass(frozen=True)
+class OpenedWorkflow:
+    """The workflow `ContextManager.open_requested_workflow` returned.
+
+    Args:
+        workflow: Its runtime.
+        already_open: Whether it was open before, and so was returned unchanged.
+    """
+
+    workflow: WorkflowRuntime
+    already_open: bool
 
 
 class OpenedFileMetadata(NamedTuple):

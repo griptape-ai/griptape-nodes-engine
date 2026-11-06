@@ -568,23 +568,10 @@ class TestWorkflowWorkingDirectory:
 
 
 class TestUnsavedWorkflowNames:
-    """An "unsaved:" name only opens a new workflow when it carries a workflow id the engine could mint."""
+    """An "unsaved:" name the registry does not hold fails like any other name, whatever follows the prefix."""
 
-    def test_an_unsaved_name_with_a_hex_id_registers_the_workflow(self, engine: Engine) -> None:
-        name = f"unsaved:{uuid.uuid4().hex}"
-
-        with empty_workflow_registry(engine):
-            try:
-                result = engine.handle_request(SetWorkflowContextRequest(workflow_name=name))
-
-                assert isinstance(result, SetWorkflowContextSuccess)
-                assert engine.workflow_registry.has_workflow_with_name(name)
-            finally:
-                while engine.context_manager.has_current_workflow():
-                    engine.context_manager.pop_workflow()
-
-    @pytest.mark.parametrize("suffix", [str(uuid.UUID(int=1)), "abc-123", ""])
-    def test_an_unsaved_name_without_a_hex_id_is_refused(self, engine: Engine, suffix: str) -> None:
+    @pytest.mark.parametrize("suffix", ["0123456789abcdef0123456789abcdef", str(uuid.UUID(int=1)), "abc-123", ""])
+    def test_an_unregistered_unsaved_name_is_refused(self, engine: Engine, suffix: str) -> None:
         name = f"unsaved:{suffix}"
 
         with empty_workflow_registry(engine):
@@ -596,18 +583,7 @@ class TestUnsavedWorkflowNames:
 
 
 class TestSetWorkflowContextUnsavedNames:
-    """An unregistered "unsaved:<id>" name registers an unsaved workflow under that id; any other unregistered name fails."""
-
-    def test_an_unsaved_name_registers_a_workflow_with_its_id(self, engine: Engine) -> None:
-        workflow_id = "0123456789abcdef0123456789abcdef"
-        try:
-            result = engine.handle_request(SetWorkflowContextRequest(workflow_name=f"unsaved:{workflow_id}"))
-
-            assert isinstance(result, SetWorkflowContextSuccess)
-            assert result.workflow_id == workflow_id
-            assert result.workflow_name == f"unsaved:{workflow_id}"
-        finally:
-            engine.context_manager.pop_workflow()
+    """A name the registry does not hold fails."""
 
     def test_a_name_no_workflow_has_fails(self, engine: Engine) -> None:
         result = engine.handle_request(SetWorkflowContextRequest(workflow_name="shots/sh010_typo"))

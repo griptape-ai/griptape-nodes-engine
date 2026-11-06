@@ -10,6 +10,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
 
 
 @dataclass
@@ -22,14 +23,9 @@ class SetWorkflowContextRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow to set as current context. When None,
-                       the handler mints a fresh "unsaved:<uuid>" registry key and
-                       auto-registers an unsaved entry under it. When provided and
-                       starting with the unsaved-registry-key prefix ("unsaved:"),
-                       the handler auto-registers a fresh unsaved entry keyed by
-                       that exact value if one does not already exist. The prefix
-                       must be followed by a workflow id (32 lowercase hex digits);
-                       any other "unsaved:" name fails. Any other name the registry
-                       does not hold fails.
+                       the handler registers a new unsaved workflow, named
+                       "unsaved:<workflow id>". A name the registry does not hold fails,
+                       "unsaved:" names included.
         display_name: Human-readable name used when auto-registering an unsaved entry.
                       Ignored when the workflow is already in the registry. Defaults to
                       None; in that case the auto-registered entry gets a placeholder
@@ -44,9 +40,12 @@ class SetWorkflowContextRequest(RequestPayload):
                       when None, `{workflow_dir}` answers the folder this workflow's first save
                       would land in, read from the project's `save_workflow` situation.
 
+    Fails while a workflow is open and only one may be. Opening a workflow doesn't depend on which
+    workflow the caller has open, so the request ignores the envelope's `open_workflow_id`.
+
     Results: SetWorkflowContextSuccess (carries the resolved workflow_name and workflow_id) |
-             SetWorkflowContextFailure (workflow not found, working_directory names an
-             existing non-directory)
+             SetWorkflowContextFailure (workflow not found or already open, another workflow
+             open, working_directory names an existing non-directory)
     """
 
     workflow_name: str | None = None
@@ -61,10 +60,8 @@ class SetWorkflowContextSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 
     Args:
         workflow_name: Resolved registry key for the workflow now in context. When the
-                       request omitted `workflow_name`, this is the freshly minted
-                       "unsaved:<uuid>" key. When the request named no registered workflow,
-                       this is the new unsaved workflow's key. Otherwise it echoes the
-                       requested key.
+                       request omitted `workflow_name`, this is the new unsaved workflow's
+                       "unsaved:<workflow id>" key. Otherwise it echoes the requested key.
         workflow_id: Id of the workflow now in context.
         open_workflow: The workflow now in context, as the heartbeat lists it.
     """
@@ -142,6 +139,95 @@ class CloseWorkflowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class OpenWorkflowRequest(RequestPayload):
+    """Open a workflow, or get it back if it is already open. Never closes a workflow.
+
+    Use when: A client opens a workflow in a tab, reopens the one it had after reconnecting, or
+    starts a new one. Name the workflow by `workflow_id` or by `workflow_name`, not both; name
+    neither to start a new unsaved workflow. To switch the workflow in a tab, close the open one
+    with CloseWorkflowRequest first.
+
+    Opening doesn't depend on which workflow the caller has open, so the request ignores the
+    envelope's `open_workflow_id`.
+
+    Args:
+        workflow_id: Id of the workflow to open, as ListAllWorkflowsRequest or
+            ListOpenWorkflowsRequest report it.
+        workflow_name: Registry name of the workflow to open.
+        display_name: Name of a new unsaved workflow. Ignored when a workflow is named.
+        working_directory: Folder the workflow belongs to until it is saved, as
+            SetWorkflowContextRequest describes. Ignored when the workflow is already open.
+        create_flow: Whether to give the workflow its top-level flow when it has none once opened,
+            which a new workflow needs before it can be saved. A saved workflow's file builds its own.
+
+    A workflow already open comes back as it is, with `already_open` set, and nothing changes. A
+    saved workflow opens and its file builds its graph into it. A new or unsaved workflow opens empty.
+
+    Results: OpenWorkflowResultSuccess | WorkflowNotFoundResultFailure (no workflow has that id or
+        name, such as an unsaved workflow lost to an engine restart) |
+        AnotherWorkflowOpenResultFailure (another workflow is open and only one may be) |
+        OpenWorkflowResultFailure (both an id and a name, working_directory names a file, the file
+        failed to build)
+    """
+
+    workflow_id: str | None = None
+    workflow_name: str | None = None
+    display_name: str | None = None
+    working_directory: str | None = None
+    create_flow: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class OpenWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The workflow is open.
+
+    Clients get `WorkflowOpenedEvent` for it only when this request opened it, not when it was
+    already open.
+
+    Args:
+        open_workflow: The workflow, as ListOpenWorkflowsRequest lists it.
+        already_open: Whether it was open before the request, which then changed nothing.
+        status: Fitness of the load of a saved workflow's file. FLAWED means the graph is on the
+            canvas with placeholders standing in for nodes whose library could not be registered.
+            GOOD for a workflow with no file, or one already open.
+    """
+
+    open_workflow: OpenWorkflowInfo
+    already_open: bool
+    status: WorkflowStatus = WorkflowStatus.GOOD
+
+
+@dataclass
+@PayloadRegistry.register
+class OpenWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The workflow did not open, and no workflow opened or closed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowNotFoundResultFailure(OpenWorkflowResultFailure):
+    """No workflow has the id or name OpenWorkflowRequest named.
+
+    Workflow ids last only until the engine restarts, so a client that gets this for an unsaved
+    workflow's id has lost that workflow.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class AnotherWorkflowOpenResultFailure(OpenWorkflowResultFailure):
+    """OpenWorkflowRequest was refused because another workflow is open and only one may be.
+
+    Args:
+        blocking_workflow: The open workflow. Close it with CloseWorkflowRequest to open another.
+    """
+
+    blocking_workflow: OpenWorkflowInfo
+
+
+@dataclass
+@PayloadRegistry.register
 class ListOpenWorkflowsRequest(RequestPayload):
     """List the workflows the engine has open.
 
@@ -185,10 +271,9 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
 
     Args:
         workflow_name: Registered workflow to enter if no workflow is in context. Ignored
-            when a workflow is already in context. When None or an unregistered
-            "unsaved:<workflow id>" name, the engine auto-registers an unsaved entry and the
-            resolved key is returned in the success result. Any other name the registry does
-            not hold fails; pass display_name to name a new workflow.
+            when a workflow is already in context. When None, the engine registers a new
+            unsaved workflow and returns its key in the success result. A name the registry
+            does not hold fails; pass display_name to name a new workflow.
         display_name: Human-readable name attached to the auto-registered unsaved
             entry. Ignored when the workflow is already in context or when a saved
             workflow_name is supplied.

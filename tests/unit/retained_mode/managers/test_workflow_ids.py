@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
+    SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
@@ -867,6 +868,41 @@ class TestIdsOnResults:
         assert context.workflow_id == workflow_id
         assert isinstance(heartbeat, EngineHeartbeatResultSuccess)
         assert heartbeat.current_workflow_id == workflow_id
+
+
+class TestSetWorkflowContextWhileAWorkflowIsOpen:
+    """With only one workflow open at a time, setting the context fails while one is open."""
+
+    def test_it_refuses_another_workflow_and_keeps_the_open_one(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        open_id = _open_new_workflow(project_engine, "open")
+
+        result = project_engine.handle_request(SetWorkflowContextRequest(workflow_name=saved.workflow_name))
+
+        assert isinstance(result, SetWorkflowContextFailure)
+        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [open_id]
+
+    def test_it_refuses_the_workflow_that_is_already_open_and_keeps_it(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        reopened = _run(project_engine, RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name))
+        assert reopened.succeeded(), reopened.result_details
+        assert saved.workflow_id is not None
+        workflow = project_engine.open_workflows.get(saved.workflow_id)
+        objects_before = len(workflow.objects)
+
+        result = project_engine.handle_request(SetWorkflowContextRequest(workflow_name=saved.workflow_name))
+
+        assert isinstance(result, SetWorkflowContextFailure)
+        assert project_engine.open_workflows.all_open() == [workflow]
+        assert len(workflow.objects) == objects_before
+
+    def test_a_refused_new_workflow_is_not_registered(self, project_engine: Engine) -> None:
+        _open_new_workflow(project_engine, "open")
+
+        result = project_engine.handle_request(SetWorkflowContextRequest(display_name="fresh"))
+
+        assert isinstance(result, SetWorkflowContextFailure)
+        assert all(workflow["name"] != "fresh" for workflow in _listed(project_engine).values())
 
 
 class TestOpenAndSaveResultsReportTheOpenWorkflow:
