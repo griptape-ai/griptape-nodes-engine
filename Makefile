@@ -96,13 +96,18 @@ install/test: ## Install test dependencies.
 # The published app pins an exact engine version. Overriding that pin with this checkout stops uv
 # from falling back to an older app whose pin happens to accept the local engine version. The
 # override must be editable: a plain path install is built once and cached, so it goes stale when
-# the checkout changes.
-RUN_OVERRIDES := build/run-overrides.txt
+# the checkout changes. The file sits in the checkout root and make 4 writes it itself, so the
+# recipe needs no shell: on Windows make may run recipes through cmd.exe. Make 3 (stock on macOS)
+# has no file function, so it falls back to printf.
+RUN_OVERRIDES := .run-overrides.txt
 
 .PHONY: run/overrides
 run/overrides:
-	@mkdir -p $(dir $(RUN_OVERRIDES))
+ifneq ($(filter 3.%,$(MAKE_VERSION)),)
 	@printf -- '-e %s\n' "$(CURDIR)" > $(RUN_OVERRIDES)
+else
+	$(file >$(RUN_OVERRIDES),-e $(CURDIR))
+endif
 
 .PHONY: run
 run: run/overrides ## Run the engine from this checkout (published app + local editable engine).
