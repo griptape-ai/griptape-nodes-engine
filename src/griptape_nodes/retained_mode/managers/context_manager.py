@@ -87,6 +87,9 @@ class ContextManager(EngineScoped):
     class RequestedWorkflowNotFoundError(OpenRefusedError):
         """An open named an id or name that no registered workflow has."""
 
+    class InvalidWorkingDirectoryError(OpenRefusedError):
+        """An open's `working_directory` can't be the folder of a new workflow, because it names a file."""
+
     class AnotherWorkflowOpenError(OpenRefusedError):
         """An open was refused because another workflow is open and only one may be."""
 
@@ -247,8 +250,9 @@ class ContextManager(EngineScoped):
             flow_name: Name of that flow, or None to let the engine name it.
 
         Raises:
-            OpenRefusedError: The workflow was named more than one way, `working_directory` names
-                a file, `file_path` could not be registered, or the flow could not be created.
+            OpenRefusedError: The workflow was named more than one way, `file_path` could not be
+                registered, or the flow could not be created.
+            InvalidWorkingDirectoryError: `working_directory` names a file.
             RequestedWorkflowNotFoundError: No registered workflow has `workflow_id` or `workflow_name`.
             AnotherWorkflowOpenError: Another workflow is open and only one may be.
         """
@@ -586,7 +590,7 @@ class ContextManager(EngineScoped):
         """`working_directory` made absolute against the workspace, or None.
 
         Raises:
-            OpenRefusedError: It names an existing file.
+            InvalidWorkingDirectoryError: It names an existing file.
         """
         if working_directory is None:
             return None
@@ -603,7 +607,7 @@ class ContextManager(EngineScoped):
                 f"Attempted to set the folder for a new Workflow to '{working_directory}'. "
                 f"Failed because that path is a file, not a folder."
             )
-            raise self.OpenRefusedError(msg)
+            raise self.InvalidWorkingDirectoryError(msg)
         return normalized
 
     def _register_requested_workflow(self, file_path: str | None, display_name: str | None) -> Workflow:

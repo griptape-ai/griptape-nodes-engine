@@ -293,6 +293,8 @@ async def test_library_listeners_watch_every_node_and_stop_when_it_unloads(
     assert isinstance(unload_result, UnloadLibraryFromRegistryResultSuccess), unload_result
     heard_before_unload = len(heard)
     engine.event_manager.put_event(
-        ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="After")))
+        ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="After"), open_workflow_id=None)
+        )
     )
     assert len(heard) == heard_before_unload, "a listener kept firing after its library unloaded"

@@ -169,8 +169,8 @@ class OpenWorkflowRequest(RequestPayload):
     Results: OpenWorkflowResultSuccess | WorkflowNotFoundResultFailure (no workflow has that id or
         name, such as an unsaved workflow that was closed or lost to an engine restart) |
         AnotherWorkflowOpenResultFailure (another workflow is open and only one may be) |
-        OpenWorkflowResultFailure (both an id and a name, working_directory names a file, the file
-        failed to build)
+        InvalidWorkingDirectoryResultFailure (working_directory names a file) |
+        OpenWorkflowResultFailure (both an id and a name, the file failed to build)
     """
 
     workflow_id: str | None = None
@@ -214,6 +214,16 @@ class WorkflowNotFoundResultFailure(OpenWorkflowResultFailure):
 
     Workflow ids last only until the engine restarts, so a client that gets this for an unsaved
     workflow's id has lost that workflow.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class InvalidWorkingDirectoryResultFailure(OpenWorkflowResultFailure):
+    """OpenWorkflowRequest was refused because its `working_directory` names a file, not a folder.
+
+    Only a new workflow takes a `working_directory`, so a client can send the request again without
+    one to open the workflow with the default folder.
     """
 
 
