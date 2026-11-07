@@ -60,7 +60,7 @@ class TestBuildDirectoryDestinationFromSituation:
             )
 
         handle_request.assert_not_called()
-        assert dest._directory._dir_path == str(tmp_path / "extracted")
+        assert pathlib.Path(str(dest._directory._dir_path)) == tmp_path / "extracted"
 
     def test_unresolvable_home_folder_raises(self) -> None:
         with (
