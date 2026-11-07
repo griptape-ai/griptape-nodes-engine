@@ -46,7 +46,9 @@ class DiscoveredLibrary(NamedTuple):
 
 @dataclass
 @PayloadRegistry.register
-class ListRegisteredLibrariesRequest(RequestPayload):
+class ListRegisteredLibrariesRequest(
+    RequestPayload["ListRegisteredLibrariesResultSuccess", "ListRegisteredLibrariesResultFailure"]
+):
     """List all currently registered libraries.
 
     Use when: Displaying available libraries, checking library availability,
@@ -76,7 +78,9 @@ class ListRegisteredLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class ListCapableLibraryEventHandlersRequest(RequestPayload):
+class ListCapableLibraryEventHandlersRequest(
+    RequestPayload["ListCapableLibraryEventHandlersResultSuccess", "ListCapableLibraryEventHandlersResultFailure"]
+):
     """List libraries capable of handling a specific event type.
 
     Use when: Finding libraries that can process specific events, implementing event routing,
@@ -142,7 +146,9 @@ class ListCapableLibraryEventHandlersResultFailure(WorkflowNotAlteredMixin, Resu
 
 @dataclass
 @PayloadRegistry.register
-class ListNodeTypesInLibraryRequest(RequestPayload):
+class ListNodeTypesInLibraryRequest(
+    RequestPayload["ListNodeTypesInLibraryResultSuccess", "ListNodeTypesInLibraryResultFailure"]
+):
     """List all node types available in a specific library.
 
     Use when: Discovering available nodes, building node creation UIs,
@@ -187,7 +193,9 @@ class ListNodeTypesInLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayload
 
 @dataclass
 @PayloadRegistry.register
-class GetNodeMetadataFromLibraryRequest(RequestPayload):
+class GetNodeMetadataFromLibraryRequest(
+    RequestPayload["GetNodeMetadataFromLibraryResultSuccess", "GetNodeMetadataFromLibraryResultFailure"]
+):
     """Get metadata for a specific node type from a library.
 
     Use when: Inspecting node capabilities, validating node types, building node creation UIs,
@@ -294,7 +302,7 @@ class ParameterDescription:
 
 @dataclass
 @PayloadRegistry.register
-class DescribeNodeTypeRequest(RequestPayload):
+class DescribeNodeTypeRequest(RequestPayload["DescribeNodeTypeResultSuccess", "DescribeNodeTypeResultFailure"]):
     """Describe a node type's metadata and parameter schema without adding a node to a flow.
 
     Use when: choosing between similar node types, building a node-creation UI, or inspecting
@@ -347,7 +355,9 @@ class DescribeNodeTypeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 
 @dataclass
 @PayloadRegistry.register
-class RegisterSandboxNodeFromSourceRequest(RequestPayload):
+class RegisterSandboxNodeFromSourceRequest(
+    RequestPayload["RegisterSandboxNodeFromSourceResultSuccess", "RegisterSandboxNodeFromSourceResultFailure"]
+):
     """Register a node type from a `.py` file already on disk inside the sandbox library directory.
 
     Use when: An agent has just written a `.py` file into the configured sandbox directory
@@ -426,7 +436,9 @@ class RegisterSandboxNodeFromSourceResultFailure(WorkflowNotAlteredMixin, Result
 
 @dataclass
 @PayloadRegistry.register
-class LoadLibraryMetadataFromFileRequest(RequestPayload):
+class LoadLibraryMetadataFromFileRequest(
+    RequestPayload["LoadLibraryMetadataFromFileResultSuccess", "LoadLibraryMetadataFromFileResultFailure"]
+):
     """Request to load library metadata from a JSON file without loading node modules.
 
     This provides a lightweight way to get library schema information without the overhead
@@ -537,7 +549,9 @@ class LoadLibraryMetadataFromFileResultFailure(WorkflowNotAlteredMixin, ResultPa
 
 @dataclass
 @PayloadRegistry.register
-class LoadMetadataForAllLibrariesRequest(RequestPayload):
+class LoadMetadataForAllLibrariesRequest(
+    RequestPayload["LoadMetadataForAllLibrariesResultSuccess", "LoadMetadataForAllLibrariesResultFailure"]
+):
     """Request to load metadata for all libraries from configuration without loading node modules.
 
     This loads metadata from both:
@@ -588,7 +602,9 @@ class LoadMetadataForAllLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPa
 
 @dataclass
 @PayloadRegistry.register
-class ScanSandboxDirectoryRequest(RequestPayload):
+class ScanSandboxDirectoryRequest(
+    RequestPayload["ScanSandboxDirectoryResultSuccess", "ScanSandboxDirectoryResultFailure"]
+):
     """Scan sandbox directory and generate/update library metadata.
 
     This request triggers a scan of a sandbox directory,
@@ -630,7 +646,9 @@ class ScanSandboxDirectoryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class RegisterLibraryFromFileRequest(RequestPayload):
+class RegisterLibraryFromFileRequest(
+    RequestPayload["RegisterLibraryFromFileResultSuccess", "RegisterLibraryFromFileResultFailure"]
+):
     """Register a library by name or path, progressing through all lifecycle phases.
 
     This request handles the complete library loading lifecycle:
@@ -679,7 +697,11 @@ class RegisterLibraryFromFileResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RegisterLibraryFromRequirementSpecifierRequest(RequestPayload):
+class RegisterLibraryFromRequirementSpecifierRequest(
+    RequestPayload[
+        "RegisterLibraryFromRequirementSpecifierResultSuccess", "RegisterLibraryFromRequirementSpecifierResultFailure"
+    ]
+):
     """Register a library from a requirement specifier (e.g., package name).
 
     Use when: Installing libraries from package managers, adding dependencies,
@@ -712,7 +734,9 @@ class RegisterLibraryFromRequirementSpecifierResultFailure(ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class ListCategoriesInLibraryRequest(RequestPayload):
+class ListCategoriesInLibraryRequest(
+    RequestPayload["ListCategoriesInLibraryResultSuccess", "ListCategoriesInLibraryResultFailure"]
+):
     """List all categories available in a library.
 
     Use when: Building category-based UIs, organizing node selection,
@@ -744,7 +768,7 @@ class ListCategoriesInLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class GetLibraryMetadataRequest(RequestPayload):
+class GetLibraryMetadataRequest(RequestPayload["GetLibraryMetadataResultSuccess", "GetLibraryMetadataResultFailure"]):
     """Get metadata for a specific library.
 
     Use when: Inspecting library properties, displaying library information,
@@ -796,7 +820,9 @@ class WidgetInfo:
 # "Jumbo" event for getting all things say, a GUI might want w/r/t a Library.
 @dataclass
 @PayloadRegistry.register
-class GetAllInfoForLibraryRequest(RequestPayload):
+class GetAllInfoForLibraryRequest(
+    RequestPayload["GetAllInfoForLibraryResultSuccess", "GetAllInfoForLibraryResultFailure"]
+):
     """Get comprehensive information for a library in a single call.
 
     Use when: Populating library UIs, implementing library inspection,
@@ -835,7 +861,9 @@ class GetAllInfoForLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 # The "Jumbo-est" of them all. Grabs all info for all libraries in one fell swoop.
 @dataclass
 @PayloadRegistry.register
-class GetAllInfoForAllLibrariesRequest(RequestPayload):
+class GetAllInfoForAllLibrariesRequest(
+    RequestPayload["GetAllInfoForAllLibrariesResultSuccess", "GetAllInfoForAllLibrariesResultFailure"]
+):
     """Get comprehensive information for all libraries in a single call.
 
     Use when: Populating complete library catalogs, implementing library browsers,
@@ -865,7 +893,9 @@ class GetAllInfoForAllLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayl
 
 @dataclass
 @PayloadRegistry.register
-class UnloadLibraryFromRegistryRequest(RequestPayload):
+class UnloadLibraryFromRegistryRequest(
+    RequestPayload["UnloadLibraryFromRegistryResultSuccess", "UnloadLibraryFromRegistryResultFailure"]
+):
     """Unload a library from the registry.
 
     Use when: Removing unused libraries, cleaning up library registry,
@@ -894,7 +924,7 @@ class UnloadLibraryFromRegistryResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ReloadAllLibrariesRequest(RequestPayload):
+class ReloadAllLibrariesRequest(RequestPayload["ReloadAllLibrariesResultSuccess", "ReloadAllLibrariesResultFailure"]):
     """WARNING: This request will CLEAR ALL CURRENT WORKFLOW STATE!
 
     Reloading all libraries requires clearing all existing workflows, nodes, and execution state
@@ -920,7 +950,9 @@ class ReloadAllLibrariesResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ReloadSandboxLibraryRequest(RequestPayload):
+class ReloadSandboxLibraryRequest(
+    RequestPayload["ReloadSandboxLibraryResultSuccess", "ReloadSandboxLibraryResultFailure"]
+):
     """Reload only the sandbox library, picking up node files added or changed in the sandbox directory.
 
     Unregisters the sandbox library, rescans `sandbox_library_directory`, and registers it again.
@@ -954,7 +986,7 @@ class ReloadSandboxLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class DiscoverLibrariesRequest(RequestPayload):
+class DiscoverLibrariesRequest(RequestPayload["DiscoverLibrariesResultSuccess", "DiscoverLibrariesResultFailure"]):
     """Discover all libraries from configuration.
 
     Scans configured library paths and creates LibraryInfo entries in 'discovered' state.
@@ -985,7 +1017,9 @@ class DiscoverLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 @PayloadRegistry.register
-class EvaluateLibraryFitnessRequest(RequestPayload):
+class EvaluateLibraryFitnessRequest(
+    RequestPayload["EvaluateLibraryFitnessResultSuccess", "EvaluateLibraryFitnessResultFailure"]
+):
     """Evaluate a library's fitness (compatibility with current engine).
 
     Checks version compatibility and determines if the library can be loaded.
@@ -1027,7 +1061,7 @@ class EvaluateLibraryFitnessResultFailure(WorkflowNotAlteredMixin, ResultPayload
 
 @dataclass
 @PayloadRegistry.register
-class LoadLibrariesRequest(RequestPayload):
+class LoadLibrariesRequest(RequestPayload["LoadLibrariesResultSuccess", "LoadLibrariesResultFailure"]):
     """Load all libraries from configuration if they are not already loaded.
 
     This is a non-destructive operation that checks if libraries are already loaded
@@ -1055,7 +1089,7 @@ class LoadLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CheckLibraryUpdateRequest(RequestPayload):
+class CheckLibraryUpdateRequest(RequestPayload["CheckLibraryUpdateResultSuccess", "CheckLibraryUpdateResultFailure"]):
     """Check if a library has updates available via git.
 
     Use when: Checking for library updates, displaying update status,
@@ -1117,7 +1151,7 @@ class CheckLibraryUpdateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class UpdateLibraryRequest(RequestPayload):
+class UpdateLibraryRequest(RequestPayload["UpdateLibraryResultSuccess"]):
     """Update a library to the latest version using the appropriate git strategy.
 
     Automatically detects whether the library uses branch-based or tag-based workflow:
@@ -1180,7 +1214,7 @@ class UpdateLibraryResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SwitchLibraryRefRequest(RequestPayload):
+class SwitchLibraryRefRequest(RequestPayload["SwitchLibraryRefResultSuccess"]):
     """Switch a library to a different git branch or tag.
 
     Supports switching to both branches and tags (e.g., 'main', 'develop', 'latest', 'v1.0.0').
@@ -1229,7 +1263,7 @@ class SwitchLibraryRefResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DownloadLibraryRequest(RequestPayload):
+class DownloadLibraryRequest(RequestPayload["DownloadLibraryResultSuccess", "DownloadLibraryResultFailure"]):
     """Download a library from a git repository.
 
     Use when: Installing new libraries from git repositories, downloading third-party libraries,
@@ -1289,7 +1323,9 @@ class DownloadLibraryResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class InstallLibraryDependenciesRequest(RequestPayload):
+class InstallLibraryDependenciesRequest(
+    RequestPayload["InstallLibraryDependenciesResultSuccess", "InstallLibraryDependenciesResultFailure"]
+):
     """Install dependencies for a library.
 
     Use when: Installing or reinstalling dependencies for a library,
@@ -1333,7 +1369,7 @@ class InstallLibraryDependenciesResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ResetLibraryRequest(RequestPayload):
+class ResetLibraryRequest(RequestPayload["ResetLibraryResultSuccess", "ResetLibraryResultFailure"]):
     """Delete a library's Python environments and build them again from its manifest.
 
     Removes the library's edit-time environment (`.venv`) and execution environment
@@ -1383,7 +1419,7 @@ class ResetLibraryResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SyncLibrariesRequest(RequestPayload):
+class SyncLibrariesRequest(RequestPayload["SyncLibrariesResultSuccess", "SyncLibrariesResultFailure"]):
     """Sync all libraries to latest versions and ensure dependencies are installed.
 
     Similar to `uv sync` - ensures workspace is in a consistent, up-to-date state.
@@ -1436,7 +1472,7 @@ class SyncLibrariesResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class InspectLibraryRepoRequest(RequestPayload):
+class InspectLibraryRepoRequest(RequestPayload["InspectLibraryRepoResultSuccess", "InspectLibraryRepoResultFailure"]):
     """Inspect a library's metadata from a git repository without downloading the full repository.
 
     Performs a sparse checkout to fetch only the library JSON file, which is efficient for
@@ -1485,7 +1521,9 @@ class InspectLibraryRepoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class GetLibrarySourceInfoRequest(RequestPayload):
+class GetLibrarySourceInfoRequest(
+    RequestPayload["GetLibrarySourceInfoResultSuccess", "GetLibrarySourceInfoResultFailure"]
+):
     """Get filesystem paths for a registered library's source code.
 
     Use when: Locating library source files on disk, reading node source code.
@@ -1523,7 +1561,9 @@ class GetLibrarySourceInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class GetEngineSourceInfoRequest(RequestPayload):
+class GetEngineSourceInfoRequest(
+    RequestPayload["GetEngineSourceInfoResultSuccess", "GetEngineSourceInfoResultFailure"]
+):
     """Get the filesystem path of the griptape_nodes engine source tree.
 
     Use when: Reading engine base class definitions (e.g. exe_types/node_types.py),
@@ -1591,7 +1631,9 @@ class LibraryProvisioningAction:
 
 @dataclass
 @PayloadRegistry.register
-class PreviewProjectProvisioningRequest(RequestPayload):
+class PreviewProjectProvisioningRequest(
+    RequestPayload["PreviewProjectProvisioningResultSuccess", "PreviewProjectProvisioningResultFailure"]
+):
     """Compute, without touching disk, what activating a project would provision.
 
     Use when: the UI wants to show the user which libraries_to_download entries

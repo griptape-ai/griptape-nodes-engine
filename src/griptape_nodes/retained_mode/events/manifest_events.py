@@ -16,7 +16,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class GenerateManifestRequest(RequestPayload):
+class GenerateManifestRequest(RequestPayload["GenerateManifestResultSuccess", "GenerateManifestResultFailure"]):
     """Generate a manifest of the engine's currently registered resources.
 
     Use when: A UI needs a single descriptive snapshot of the libraries and

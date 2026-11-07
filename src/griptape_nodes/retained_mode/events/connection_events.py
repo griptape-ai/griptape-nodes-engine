@@ -13,7 +13,9 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class CreateConnectionRequest(RequestPayload, GraphAccessMixin):
+class CreateConnectionRequest(
+    RequestPayload["CreateConnectionResultSuccess", "CreateConnectionResultFailure"], GraphAccessMixin
+):
     """Create a connection between two node parameters.
 
     Use when: Connecting node outputs to inputs, building data flow between nodes,
@@ -77,7 +79,9 @@ class CreateConnectionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DeleteConnectionRequest(RequestPayload, GraphAccessMixin):
+class DeleteConnectionRequest(
+    RequestPayload["DeleteConnectionResultSuccess", "DeleteConnectionResultFailure"], GraphAccessMixin
+):
     """Delete a connection between two node parameters.
 
     Use when: Removing unwanted connections, restructuring workflows, disconnecting nodes,

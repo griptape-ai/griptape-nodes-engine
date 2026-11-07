@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from dataclasses import dataclass
 
 import pytest
 
+import griptape_nodes.retained_mode.events as events_package
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import (
     DispatchFailure,
@@ -15,6 +18,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 
 @dataclass(kw_only=True)
@@ -238,3 +242,23 @@ class TestTryRequest:
                 outcome = "not handled"
 
         assert outcome == "failed"
+
+
+def _registered_request_types() -> list[type[RequestPayload]]:
+    # Importing every event module registers its requests with `PayloadRegistry`. The schema
+    # generator is a script that runs on import, not an event module.
+    for module in pkgutil.iter_modules(events_package.__path__, f"{events_package.__name__}."):
+        if module.name.endswith(".generate_request_payload_schemas"):
+            continue
+        importlib.import_module(module.name)
+    importlib.import_module("griptape_nodes.app.worker_routing")
+
+    registry = PayloadRegistry.get_registry().values()
+    return [t for t in registry if isinstance(t, type) and issubclass(t, RequestPayload)]
+
+
+@pytest.mark.parametrize("request_type", _registered_request_types(), ids=lambda t: t.__name__)
+def test_every_registered_request_declaration_resolves(request_type: type[RequestPayload]) -> None:
+    """A declared name must exist at runtime in the request's module, not only for the type checker."""
+    assert issubclass(request_type.success_type(), ResultPayloadSuccess)
+    assert issubclass(request_type.failure_type(), ResultPayloadFailure)

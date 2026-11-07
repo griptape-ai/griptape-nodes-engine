@@ -114,7 +114,7 @@ class StartFlowResultFailure(RunIdMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartLocalSubflowRequest(RequestPayload, GraphAccessMixin):
+class StartLocalSubflowRequest(RequestPayload["StartLocalSubflowResultSuccess"], GraphAccessMixin):
     """Start an independent local subflow that runs concurrently with the main flow.
 
     Use when: Running loop iterations or other independent subflows that need their own
@@ -190,7 +190,7 @@ class StartFlowFromNodeResultFailure(RunIdMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelFlowRequest(RequestPayload, GraphAccessMixin):
+class CancelFlowRequest(RequestPayload["CancelFlowResultSuccess", "CancelFlowResultFailure"], GraphAccessMixin):
     """Cancel a running flow execution.
 
     Use when: Stopping long-running workflows, handling user cancellation,
@@ -221,7 +221,7 @@ class CancelFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelRunRequest(RequestPayload, GraphAccessMixin):
+class CancelRunRequest(RequestPayload["CancelRunResultSuccess", "CancelRunResultFailure"], GraphAccessMixin):
     """Cancel one run: a waiting run leaves the line without starting, and the run in progress stops.
 
     Use when: withdrawing a run queued behind another, or stopping a particular run. Run ids come
@@ -250,7 +250,9 @@ class CancelRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelAllRunsRequest(RequestPayload, GraphAccessMixin):
+class CancelAllRunsRequest(
+    RequestPayload["CancelAllRunsResultSuccess", "CancelAllRunsResultFailure"], GraphAccessMixin
+):
     """Cancel every waiting run, then the run in progress, without starting another.
 
     Use when: closing a workflow, or stopping everything a script queued.
@@ -293,7 +295,7 @@ class RunInfo:
 
 @dataclass
 @PayloadRegistry.register
-class ListRunsRequest(RequestPayload, GraphAccessMixin):
+class ListRunsRequest(RequestPayload["ListRunsResultSuccess", "ListRunsResultFailure"], GraphAccessMixin):
     """List the run in progress and the runs waiting behind it.
 
     Use when: finding a queued run to cancel, or showing what is waiting.
@@ -322,7 +324,9 @@ class ListRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveFlowRequest(RequestPayload, GraphAccessMixin):
+class UnresolveFlowRequest(
+    RequestPayload["UnresolveFlowResultSuccess", "UnresolveFlowResultFailure"], GraphAccessMixin
+):
     """Reset every node in a flow back to unresolved.
 
     Use when: Clearing cached results so the next run re-executes every node.
@@ -357,7 +361,7 @@ class UnresolveFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 # Step In: Execute one resolving step at a time (per parameter)
 @dataclass
 @PayloadRegistry.register
-class SingleExecutionStepRequest(RequestPayload, GraphAccessMixin):
+class SingleExecutionStepRequest(RequestPayload["SingleExecutionStepResultSuccess"], GraphAccessMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
@@ -376,7 +380,9 @@ class SingleExecutionStepResultFailure(ResultPayloadFailure):
 # Step Over: Execute one node at a time (execute whole node and move on) IS THIS CONTROL NODE OR ANY NODE?
 @dataclass
 @PayloadRegistry.register
-class SingleNodeStepRequest(RequestPayload, GraphAccessMixin):
+class SingleNodeStepRequest(
+    RequestPayload["SingleNodeStepResultSuccess", "SingleNodeStepResultFailure"], GraphAccessMixin
+):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
@@ -396,7 +402,9 @@ class SingleNodeStepResultFailure(ResolveNodeResultFailure):
 # Continue
 @dataclass
 @PayloadRegistry.register
-class ContinueExecutionStepRequest(RequestPayload, GraphAccessMixin):
+class ContinueExecutionStepRequest(
+    RequestPayload["ContinueExecutionStepResultSuccess", "ContinueExecutionStepResultFailure"], GraphAccessMixin
+):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
@@ -415,7 +423,7 @@ class ContinueExecutionStepResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowStateRequest(RequestPayload, GraphAccessMixin):
+class GetFlowStateRequest(RequestPayload["GetFlowStateResultSuccess", "GetFlowStateResultFailure"], GraphAccessMixin):
     """Get the current execution state of a flow.
 
     Use when: Monitoring execution progress, debugging workflow state,
@@ -451,7 +459,9 @@ class GetFlowStateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetIsFlowRunningRequest(RequestPayload, GraphAccessMixin):
+class GetIsFlowRunningRequest(
+    RequestPayload["GetIsFlowRunningResultSuccess", "GetIsFlowRunningResultFailure"], GraphAccessMixin
+):
     """Check if a flow is currently running.
 
     Use when: Monitoring execution status, preventing concurrent execution,
@@ -842,7 +852,9 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelExecuteNodeRequest(RequestPayload, SkipTheLineMixin):
+class CancelExecuteNodeRequest(
+    RequestPayload["CancelExecuteNodeResultSuccess", "CancelExecuteNodeResultFailure"], SkipTheLineMixin
+):
     """Cancel an in-flight ExecuteNodeRequest on this engine.
 
     Dispatched by the orchestrator to a worker when a user cancels a flow and a

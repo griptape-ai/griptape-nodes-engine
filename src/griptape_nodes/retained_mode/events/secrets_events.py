@@ -12,7 +12,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class GetSecretValueRequest(RequestPayload):
+class GetSecretValueRequest(RequestPayload["GetSecretValueResultSuccess", "GetSecretValueResultFailure"]):
     """Get a secret value by key.
 
     Use when: Retrieving API keys, database credentials, authentication tokens,
@@ -49,7 +49,7 @@ class GetSecretValueResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class SetSecretValueRequest(RequestPayload):
+class SetSecretValueRequest(RequestPayload["SetSecretValueResultSuccess", "SetSecretValueResultFailure"]):
     """Set a secret value by key.
 
     Use when: Storing API keys, database credentials, authentication tokens,
@@ -80,7 +80,7 @@ class SetSecretValueResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class GetAllSecretValuesRequest(RequestPayload):
+class GetAllSecretValuesRequest(RequestPayload["GetAllSecretValuesResultSuccess", "GetAllSecretValuesResultFailure"]):
     """Get all secret values.
 
     Use when: Backing up secrets, migrating configurations, implementing secret management UIs,
@@ -110,7 +110,7 @@ class GetAllSecretValuesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class DeleteSecretValueRequest(RequestPayload):
+class DeleteSecretValueRequest(RequestPayload["DeleteSecretValueResultSuccess", "DeleteSecretValueResultFailure"]):
     """Delete a secret value by key.
 
     Use when: Removing obsolete secrets, cleaning up configurations, implementing secret rotation,

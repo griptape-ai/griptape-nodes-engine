@@ -97,7 +97,7 @@ HandlerCallback = "Callable[[RequestPayload], ResultPayload | Awaitable[ResultPa
 
 @dataclass
 @PayloadRegistry.register
-class ReloadConfigRequest(RequestPayload, SkipTheLineMixin):
+class ReloadConfigRequest(RequestPayload["ReloadConfigResultSuccess", "ReloadConfigResultFailure"], SkipTheLineMixin):
     """Sent by the orchestrator to each registered worker after a config mutation succeeds.
 
     On the same machine orchestrator and workers share
@@ -125,7 +125,9 @@ class ReloadConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+class DropAllLocalObjectsRequest(
+    RequestPayload["DropAllLocalObjectsResultSuccess", "DropAllLocalObjectsResultFailure"], SkipTheLineMixin
+):
     """Sent by the orchestrator to each registered worker when workflow object state is cleared.
 
     Clearing workflow state deletes every node and so every key referring to a held object, leaving
@@ -146,7 +148,9 @@ class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
 
 @dataclass
 @PayloadRegistry.register
-class DropLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+class DropLocalObjectsRequest(
+    RequestPayload["DropLocalObjectsResultSuccess", "DropLocalObjectsResultFailure"], SkipTheLineMixin
+):
     """Sent by the orchestrator when named held objects stop being referenced.
 
     A handle parameter's value is a key. When that value is replaced or the node carrying it is deleted,
@@ -186,7 +190,9 @@ class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class RefreshSecretsRequest(RequestPayload, SkipTheLineMixin):
+class RefreshSecretsRequest(
+    RequestPayload["RefreshSecretsResultSuccess", "RefreshSecretsResultFailure"], SkipTheLineMixin
+):
     """Sent by the orchestrator to each registered worker after a secret mutation succeeds.
 
     The global .env at ~/.config/griptape_nodes/.env is shared across
@@ -214,7 +220,9 @@ class RefreshSecretsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
+class ActivateProjectRequest(
+    RequestPayload["ActivateProjectResultSuccess", "ActivateProjectResultFailure"], SkipTheLineMixin
+):
     """Sent by the orchestrator to each registered worker after it switches projects.
 
     The orchestrator is the single source of truth for the current project, but a

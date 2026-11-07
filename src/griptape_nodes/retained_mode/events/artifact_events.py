@@ -51,7 +51,7 @@ class PreviewGenerationPolicy(StrEnum):
 
 @dataclass
 @PayloadRegistry.register
-class GeneratePreviewRequest(RequestPayload):
+class GeneratePreviewRequest(RequestPayload["GeneratePreviewResultSuccess", "GeneratePreviewResultFailure"]):
     """Generate a preview for an artifact.
 
     Args:
@@ -96,7 +96,9 @@ class GeneratePreviewResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class GeneratePreviewFromDefaultsRequest(RequestPayload):
+class GeneratePreviewFromDefaultsRequest(
+    RequestPayload["GeneratePreviewFromDefaultsResultSuccess", "GeneratePreviewFromDefaultsResultFailure"]
+):
     """Generate a preview for an artifact using ALL defaults from config.
 
     This is a high-level convenience request that reads all settings from config
@@ -139,7 +141,9 @@ class GeneratePreviewFromDefaultsResultFailure(WorkflowNotAlteredMixin, ResultPa
 
 @dataclass
 @PayloadRegistry.register
-class GetPreviewForArtifactRequest(RequestPayload):
+class GetPreviewForArtifactRequest(
+    RequestPayload["GetPreviewForArtifactResultSuccess", "GetPreviewForArtifactResultFailure"]
+):
     """Get preview for an artifact, optionally generating/regenerating if needed.
 
     Args:
@@ -190,7 +194,9 @@ class GetPreviewForArtifactResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 
 @dataclass
 @PayloadRegistry.register
-class RegisterArtifactProviderRequest(RequestPayload):
+class RegisterArtifactProviderRequest(
+    RequestPayload["RegisterArtifactProviderResultSuccess", "RegisterArtifactProviderResultFailure"]
+):
     """Register an artifact provider.
 
     Args:
@@ -216,7 +222,9 @@ class RegisterArtifactProviderResultFailure(WorkflowNotAlteredMixin, ResultPaylo
 
 @dataclass
 @PayloadRegistry.register
-class ListArtifactProvidersRequest(RequestPayload):
+class ListArtifactProvidersRequest(
+    RequestPayload["ListArtifactProvidersResultSuccess", "ListArtifactProvidersResultFailure"]
+):
     """List all registered artifact providers.
 
     Results: ListArtifactProvidersResultSuccess | ListArtifactProvidersResultFailure
@@ -239,7 +247,9 @@ class ListArtifactProvidersResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 
 @dataclass
 @PayloadRegistry.register
-class GetArtifactProviderDetailsRequest(RequestPayload):
+class GetArtifactProviderDetailsRequest(
+    RequestPayload["GetArtifactProviderDetailsResultSuccess", "GetArtifactProviderDetailsResultFailure"]
+):
     """Get details for a specific artifact provider by friendly name.
 
     Args:
@@ -270,7 +280,9 @@ class GetArtifactProviderDetailsResultFailure(WorkflowNotAlteredMixin, ResultPay
 
 @dataclass
 @PayloadRegistry.register
-class RegisterPreviewGeneratorRequest(RequestPayload):
+class RegisterPreviewGeneratorRequest(
+    RequestPayload["RegisterPreviewGeneratorResultSuccess", "RegisterPreviewGeneratorResultFailure"]
+):
     """Register a preview generator with a provider.
 
     Args:
@@ -298,7 +310,9 @@ class RegisterPreviewGeneratorResultFailure(WorkflowNotAlteredMixin, ResultPaylo
 
 @dataclass
 @PayloadRegistry.register
-class ListPreviewGeneratorsRequest(RequestPayload):
+class ListPreviewGeneratorsRequest(
+    RequestPayload["ListPreviewGeneratorsResultSuccess", "ListPreviewGeneratorsResultFailure"]
+):
     """List all registered preview generators for a provider.
 
     Args:
@@ -326,7 +340,9 @@ class ListPreviewGeneratorsResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 
 @dataclass
 @PayloadRegistry.register
-class GetPreviewGeneratorDetailsRequest(RequestPayload):
+class GetPreviewGeneratorDetailsRequest(
+    RequestPayload["GetPreviewGeneratorDetailsResultSuccess", "GetPreviewGeneratorDetailsResultFailure"]
+):
     """Get details for a specific preview generator by friendly name.
 
     Args:
@@ -359,7 +375,7 @@ class GetPreviewGeneratorDetailsResultFailure(WorkflowNotAlteredMixin, ResultPay
 
 @dataclass
 @PayloadRegistry.register
-class GetArtifactSchemasRequest(RequestPayload):
+class GetArtifactSchemasRequest(RequestPayload["GetArtifactSchemasResultSuccess", "GetArtifactSchemasResultFailure"]):
     """Request artifact configuration schemas for all registered providers.
 
     This retrieves the complete schema structure including providers, formats,

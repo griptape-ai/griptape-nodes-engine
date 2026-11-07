@@ -23,7 +23,9 @@ ATTRIBUTION_SCHEMA_VERSION = 1
 
 @dataclass
 @PayloadRegistry.register
-class GetAttributionContextRequest(RequestPayload):
+class GetAttributionContextRequest(
+    RequestPayload["GetAttributionContextResultSuccess", "GetAttributionContextResultFailure"]
+):
     """Describe the current project so an outbound call can be attributed to it.
 
     The result carries project ids and no credential. Ids are user-influenced -- usually a slug
@@ -93,7 +95,7 @@ class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 
 @dataclass
 @PayloadRegistry.register
-class BudgetAccessRequest(RequestPayload):
+class BudgetAccessRequest(RequestPayload["BudgetAccessResultSuccess", "BudgetAccessResultFailure"]):
     """Ask Griptape Cloud whether a direct provider call fits the budgets it is attributed to.
 
     Fails open: if Cloud cannot be reached or gives no usable answer, the call is cleared with
@@ -158,7 +160,7 @@ class BudgetAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ReportUsageRequest(RequestPayload):
+class ReportUsageRequest(RequestPayload["ReportUsageResultSuccess", "ReportUsageResultFailure"]):
     """Report what a direct provider call used, so it counts against budgets and shows in usage.
 
     Send the provider's token counts and Griptape Cloud prices them, so no client holds prices.
