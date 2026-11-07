@@ -62,6 +62,12 @@ class TestBuildDirectoryDestinationFromSituation:
         handle_request.assert_not_called()
         assert dest._directory._dir_path == str(tmp_path / "extracted")
 
+    def test_unknown_home_folder_raises(self) -> None:
+        with pytest.raises(ValueError, match="home folder"):
+            project_directory_parameter._build_directory_destination_from_situation(
+                "~no_such_user_xyz/out", "save_output_directory"
+            )
+
     def test_web_address_raises(self) -> None:
         with pytest.raises(ValueError, match="cannot save to"):
             project_directory_parameter._build_directory_destination_from_situation(

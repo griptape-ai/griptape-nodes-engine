@@ -149,7 +149,8 @@ def _build_directory_destination_from_situation(
         DirectoryDestination with a MacroPath and baked-in creation policy.
 
     Raises:
-        ValueError: If ``dirname`` is a web address or another address that cannot be saved to.
+        ValueError: If ``dirname`` is a web address, another address that cannot be saved to,
+            or a ``~`` path whose home folder cannot be found.
     """
     explicit_path = _explicit_directory_path(dirname)
     if explicit_path is not None:
@@ -183,7 +184,8 @@ def _explicit_directory_path(dirname: str) -> str | None:
     a drive path from another operating system, cannot be saved to and raise.
 
     Raises:
-        ValueError: If `dirname` is an address or drive path that names no location on this computer.
+        ValueError: If `dirname` is an address, drive path, or `~` path that names no location on
+            this computer.
     """
     local_path_from_uri = path_utils.parse_file_uri(dirname)
     if local_path_from_uri is not None:
@@ -207,7 +209,14 @@ def _explicit_directory_path(dirname: str) -> str | None:
         )
         raise ValueError(msg)
 
-    expanded = pathlib.Path(dirname).expanduser()
+    try:
+        expanded = pathlib.Path(dirname).expanduser()
+    except RuntimeError as e:
+        msg = (
+            f"Attempted to save to directory '{dirname}'. Failed because the home folder it starts with "
+            f"could not be found on this computer. Use a full folder path instead."
+        )
+        raise ValueError(msg) from e
     if expanded.is_absolute():
         return str(expanded)
     return None
