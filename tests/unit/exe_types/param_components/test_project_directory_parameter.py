@@ -3,6 +3,8 @@
 import pathlib
 from unittest import mock
 
+import pytest
+
 from griptape_nodes.common.project_templates import situation
 from griptape_nodes.exe_types.param_components import project_directory_parameter
 from griptape_nodes.files import directory as directory_mod
@@ -50,6 +52,21 @@ class TestBuildDirectoryDestinationFromSituation:
             )
 
         assert dest._directory._dir_path == str(pathlib.Path("~/extracted").expanduser())
+
+    def test_file_uri_bypasses_situation(self, tmp_path: pathlib.Path) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH) as handle_request:
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                (tmp_path / "extracted").as_uri(), "save_output_directory"
+            )
+
+        handle_request.assert_not_called()
+        assert dest._directory._dir_path == str(tmp_path / "extracted")
+
+    def test_web_address_raises(self) -> None:
+        with pytest.raises(ValueError, match="cannot save to"):
+            project_directory_parameter._build_directory_destination_from_situation(
+                "https://example.com/out", "save_output_directory"
+            )
 
     def test_uses_situation_macro(self) -> None:
         sit = _make_situation("{outputs}/{node_name}/{dir_name}_v{_index:03}")
