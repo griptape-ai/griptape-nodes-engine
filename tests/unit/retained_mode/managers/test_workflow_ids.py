@@ -29,10 +29,12 @@ from griptape_nodes.retained_mode.events.context_events import (
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
     OpenWorkflowRequest,
+    OpenWorkflowResultFailure,
     OpenWorkflowResultSuccess,
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
+    WorkflowNotFoundResultFailure,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -1202,6 +1204,38 @@ class TestLibraryWorkflowsOpenAsCopies:
         assert copy.open_workflow is not None
         assert copy.open_workflow.name == mine.workflow_name
 
+    def test_closing_an_unsaved_copy_forgets_it(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.find_by_id(copy_id) is None
+        assert _copies_of(project_engine, library.workflow_id) == []
+        assert project_engine.workflow_registry.get(library.workflow_id).metadata.is_griptape_provided  # type: ignore[arg-type]
+
+    def test_closing_a_saved_copy_keeps_it(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+        _save(project_engine)
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.get(copy_id).is_saved
+
+    def test_a_copy_whose_build_fails_is_forgotten(self, project_engine: Engine, workspace: Path) -> None:
+        broken_file = _write_workflow_file(workspace / "broken_library.py", name="broken")
+        with broken_file.open("a", encoding="utf-8") as file:
+            file.write("raise RuntimeError('broken library workflow')\n")
+        library = project_engine.workflow_registry.register_file(broken_file, read_workflow_metadata(broken_file))
+        library.metadata.is_griptape_provided = True
+
+        opened = _run(project_engine, OpenWorkflowRequest(workflow_id=library.workflow_id))
+
+        assert isinstance(opened, OpenWorkflowResultFailure)
+        assert project_engine.open_workflows.all_open() == []
+        assert _copies_of(project_engine, library.workflow_id) == []
+
 
 class TestSaveAsContinuingInTheCopy:
     """`continue_in_copy` keeps the open workflow, its id and its graph, on the file a Save As writes."""
@@ -1270,3 +1304,35 @@ class TestSaveAsContinuingInTheCopy:
 
         assert saved.workflow_id == workflow_id
         assert [workflow["workflow_id"] for workflow in _listed(project_engine).values()].count(workflow_id) == 1
+
+
+class TestClosingAnUnsavedWorkflow:
+    """An unsaved workflow's graph lives only while it is open, so closing it forgets its entry."""
+
+    def test_closing_forgets_it(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "scratch")
+        name = project_engine.workflow_registry.get(workflow_id).name
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.find_by_id(workflow_id) is None
+        assert name not in _listed(project_engine)
+        reopened = _run(project_engine, OpenWorkflowRequest(workflow_id=workflow_id))
+        assert isinstance(reopened, WorkflowNotFoundResultFailure)
+
+    def test_closing_a_saved_workflow_keeps_it(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "kept")
+
+        assert saved.workflow_id is not None
+        assert project_engine.workflow_registry.get(saved.workflow_id).is_saved
+        assert saved.workflow_name in _listed(project_engine)
+
+    def test_deleting_it_while_open_succeeds(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "scratch")
+        name = project_engine.workflow_registry.get(workflow_id).name
+
+        deleted = _run(project_engine, DeleteWorkflowRequest(name=name))
+
+        assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
+        assert project_engine.open_workflows.all_open() == []
+        assert project_engine.workflow_registry.find_by_id(workflow_id) is None

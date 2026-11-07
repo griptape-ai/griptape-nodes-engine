@@ -595,7 +595,7 @@ class ContextManager(EngineScoped):
             if entry is None:
                 msg = (
                     f"Attempted to open workflow '{workflow_id}'. Failed because no workflow has that id. "
-                    "Workflow ids last only until the engine restarts, and an unsaved workflow is lost with it."
+                    "Workflow ids last only until the engine restarts, and an unsaved workflow is lost when it closes."
                 )
                 raise self.RequestedWorkflowNotFoundError(msg)
             return entry

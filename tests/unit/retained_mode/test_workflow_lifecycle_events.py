@@ -377,6 +377,8 @@ class TestClosing:
         assert result_event.succeeded(), result_event.result.result_details
         assert _lifecycle_events(_drain(queue)) == [WorkflowClosedEvent(open_workflow_id=workflow.workflow_id)]
         assert result_event.open_workflow_id == workflow.workflow_id
+        # An unsaved workflow's entry goes with it, after the result and event above were built.
+        assert engine.workflow_registry.find_by_id(workflow.workflow_id) is None
 
     def test_an_mcp_close_with_no_envelope_names_the_workflow_it_closed(
         self, engine: Engine, queue: asyncio.Queue

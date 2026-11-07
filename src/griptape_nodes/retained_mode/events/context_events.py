@@ -167,7 +167,7 @@ class OpenWorkflowRequest(RequestPayload):
     into it. A new or unsaved workflow opens empty.
 
     Results: OpenWorkflowResultSuccess | WorkflowNotFoundResultFailure (no workflow has that id or
-        name, such as an unsaved workflow lost to an engine restart) |
+        name, such as an unsaved workflow that was closed or lost to an engine restart) |
         AnotherWorkflowOpenResultFailure (another workflow is open and only one may be) |
         OpenWorkflowResultFailure (both an id and a name, working_directory names a file, the file
         failed to build)
