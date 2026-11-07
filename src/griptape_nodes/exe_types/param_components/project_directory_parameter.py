@@ -6,6 +6,7 @@ DirectoryDestination. Falls back to a sensible default when no situation is conf
 
 from __future__ import annotations
 
+import pathlib
 import typing
 
 from griptape_nodes.common import macro_parser
@@ -13,7 +14,7 @@ from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import situation_resolver
-from griptape_nodes.retained_mode.events import project_events
+from griptape_nodes.retained_mode.events import os_events, project_events
 from griptape_nodes.traits import file_system_picker
 
 if typing.TYPE_CHECKING:
@@ -135,7 +136,8 @@ def _build_directory_destination_from_situation(
     """Build a DirectoryDestination from a project situation template.
 
     Args:
-        dirname: Directory name to use as the ``dir_name`` macro variable.
+        dirname: Directory name to use as the ``dir_name`` macro variable. An absolute or ``~``
+            path is used as the destination directly, bypassing the situation.
         situation: Situation name to look up in the current project.
         workflow: The workflow to look the situation up and create the directory in, or None
             for the caller's. Positional-only so a macro variable named `workflow` stays in
@@ -145,6 +147,17 @@ def _build_directory_destination_from_situation(
     Returns:
         DirectoryDestination with a MacroPath and baked-in creation policy.
     """
+    # An absolute or `~` path names the destination, so use it as given rather than nesting it
+    # inside the situation's directory. It is not versioned: the user chose this exact location.
+    explicit_path = pathlib.Path(dirname).expanduser()
+    if explicit_path.is_absolute():
+        return directory_mod.DirectoryDestination(
+            str(explicit_path),
+            existing_dir_policy=os_events.ExistingFilePolicy.OVERWRITE,
+            create_parents=True,
+            workflow=workflow,
+        )
+
     resolved = situation_resolver.resolve_situation(situation, _FALLBACK_DIRECTORY_MACRO, workflow=workflow)
     variables: dict[str, str | int] = {
         "dir_name": dirname,

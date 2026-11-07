@@ -1,5 +1,6 @@
 """Unit tests for _build_directory_destination_from_situation."""
 
+import pathlib
 from unittest import mock
 
 from griptape_nodes.common.project_templates import situation
@@ -31,6 +32,24 @@ def _make_situation(
 
 class TestBuildDirectoryDestinationFromSituation:
     """Tests for _build_directory_destination_from_situation helper."""
+
+    def test_absolute_path_bypasses_situation(self, tmp_path: pathlib.Path) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH) as handle_request:
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                str(tmp_path / "extracted"), "save_output_directory"
+            )
+
+        handle_request.assert_not_called()
+        assert dest._directory._dir_path == str(tmp_path / "extracted")
+        assert dest._existing_dir_policy == os_events.ExistingFilePolicy.OVERWRITE
+
+    def test_home_relative_path_bypasses_situation(self) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH):
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                "~/extracted", "save_output_directory"
+            )
+
+        assert dest._directory._dir_path == str(pathlib.Path("~/extracted").expanduser())
 
     def test_uses_situation_macro(self) -> None:
         sit = _make_situation("{outputs}/{node_name}/{dir_name}_v{_index:03}")
