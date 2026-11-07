@@ -329,9 +329,12 @@ class EventRequest[P: Payload](BaseEvent):
             handler, and every task it starts, acts on that workflow. An id that names no open
             workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
             handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
-            Left out, the request acts on the engine's only open workflow, unless another engine
-            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
-            else: the workflow the request is about.
+            Left out, the request acts on the workflow the code sending it is bound to, else on no
+            workflow. Two exceptions fall back to the only open workflow: a local transport client's
+            request (`GriptapeNodes.only_open_workflow_for_unbound_caller`, applied where the app
+            receives it), and `EnsureWorkflowAndFlowRequest`, whose handler adopts it. Neither
+            applies to a request another engine sent. A payload field named `workflow_id` is
+            something else: the workflow the request is about.
     """
 
     request: P
