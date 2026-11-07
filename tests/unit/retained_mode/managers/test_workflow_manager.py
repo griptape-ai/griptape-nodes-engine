@@ -4308,8 +4308,21 @@ class TestWorkflowCreationOnTheDefaultProject:
         assert copy_metadata.is_griptape_provided is False
         assert copy_metadata.is_template is False
 
+    def _open_library_workflow_copy(self, engine: Engine, library_key: str) -> str:
+        """Close what is open, open the library workflow `library_key`, and return the id of the copy that opens."""
+        from griptape_nodes.retained_mode.events.context_events import (
+            OpenWorkflowRequest,
+            OpenWorkflowResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        opened = asyncio.run(engine.ahandle_request(OpenWorkflowRequest(workflow_name=library_key)))
+        assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
+        return opened.open_workflow.workflow_id
+
     def test_saving_a_library_workflow_writes_a_copy(self, engine: Engine, temp_dir: Path) -> None:
-        """Saving an open library-provided workflow never writes over the library's file."""
+        """A library-provided workflow opens as a copy, so saving it never writes over the library's file."""
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowRequest,
             SaveWorkflowResultSuccess,
@@ -4318,17 +4331,17 @@ class TestWorkflowCreationOnTheDefaultProject:
         library_key = self._make_library_workflow(engine, "library_workflow")
         library_file = temp_dir / "library_workflow.py"
         library_content = library_file.read_text(encoding="utf-8")
+        copy_id = self._open_library_workflow_copy(engine, library_key)
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=library_key)))
+        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        assert saved.workflow_id == copy_id
         assert Path(saved.file_path) != library_file
         assert Path(saved.file_path).exists()
         assert library_file.read_text(encoding="utf-8") == library_content
 
-        # The copy is now the open workflow, so the next save lands in it instead of another copy.
-        assert engine.context_manager.get_current_workflow_name() == saved.workflow_name
-        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
 
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
         assert Path(saved_again.file_path) == Path(saved.file_path)
@@ -4338,7 +4351,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         ]
 
     def test_saving_a_library_workflow_keeps_substitution_disabled(self, engine: Engine) -> None:
-        """A library workflow with variable substitution off stays off in its copy across saves."""
+        """A library workflow's copy with variable substitution off stays off across saves."""
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowRequest,
             SaveWorkflowResultSuccess,
@@ -4346,11 +4359,12 @@ class TestWorkflowCreationOnTheDefaultProject:
         )
 
         library_key = self._make_library_workflow(engine, "library_workflow")
+        self._open_library_workflow_copy(engine, library_key)
         engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=library_key)))
+        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
-        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
 
         assert engine.workflow_manager.variable_substitution.is_enabled() is False

@@ -23,13 +23,18 @@ from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatResultSuccess,
 )
 from griptape_nodes.retained_mode.events.context_events import (
+    AnotherWorkflowOpenResultFailure,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
+    OpenWorkflowRequest,
+    OpenWorkflowResultFailure,
+    OpenWorkflowResultSuccess,
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
+    WorkflowNotFoundResultFailure,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -37,7 +42,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
@@ -52,6 +56,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     CreateWorkflowFromTemplateResultSuccess,
     DeleteWorkflowRequest,
     DeleteWorkflowResultSuccess,
+    GetWorkflowRunCommandRequest,
+    GetWorkflowRunCommandResultFailure,
     ImportWorkflowRequest,
     ImportWorkflowResultSuccess,
     ListAllWorkflowsRequest,
@@ -73,6 +79,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryResultSuccess,
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultSuccess,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
     SaveWorkflowRequest,
@@ -83,6 +91,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -256,42 +265,6 @@ class TestWritePathsKeepOrMintAnId:
         assert _id_at(project_engine, other.file_path) == written.workflow_id
         assert all(workflow["workflow_id"] != other.workflow_id for workflow in _listed(project_engine).values())
         assert project_engine.context_manager.get_current_workflow_id() == workflow_id
-
-    def test_saving_a_library_workflow_writes_a_copy_with_a_new_id(self, project_engine: Engine) -> None:
-        library_id = _open_new_workflow(project_engine, "library_workflow")
-        library_saved = _save(project_engine)
-        project_engine.workflow_registry.get(library_id).metadata.is_griptape_provided = True
-
-        copy = _save(project_engine, SaveWorkflowRequest(file_name=library_saved.workflow_name))
-
-        assert copy.workflow_id != library_id
-        assert _id_at(project_engine, copy.file_path) == copy.workflow_id
-        assert _id_at(project_engine, library_saved.file_path) == library_id
-        # As on main, the open workflow moves onto the copy so the next save lands in it.
-        assert project_engine.context_manager.get_current_workflow_id() == copy.workflow_id
-
-    def test_after_saving_a_library_workflow_requests_reach_it_by_the_id_of_the_copy(
-        self, project_engine: Engine
-    ) -> None:
-        """The editor learns the copy's id from the context, so the open workflow's runtime answers to it."""
-        library_id = _open_new_workflow(project_engine, "library_workflow")
-        library_saved = _save(project_engine)
-        project_engine.workflow_registry.get(library_id).metadata.is_griptape_provided = True
-        workflow = project_engine.open_workflows.get(library_id)
-
-        copy = _save(project_engine, SaveWorkflowRequest(file_name=library_saved.workflow_name))
-
-        assert copy.workflow_id is not None
-        assert project_engine.open_workflows.get(copy.workflow_id) is workflow
-        by_copy = project_engine.event_manager.handle_request(
-            GetWorkflowContextRequest(), result_context=ResultContext(open_workflow_id=copy.workflow_id)
-        )
-        assert isinstance(by_copy.result, GetWorkflowContextSuccess)
-        assert by_copy.result.workflow_id == copy.workflow_id
-        by_library = project_engine.event_manager.handle_request(
-            GetWorkflowContextRequest(), result_context=ResultContext(open_workflow_id=library_id)
-        )
-        assert isinstance(by_library.result, WorkflowNotOpenResultFailure)
 
     def test_branch_merge_and_reset(self, project_engine: Engine) -> None:
         source = _saved_workflow(project_engine, "source")
@@ -937,19 +910,6 @@ class TestOpenAndSaveResultsReportTheOpenWorkflow:
         assert copy.open_workflow.workflow_id == workflow_id != copy.workflow_id
         assert copy.open_workflow.name == original.workflow_name
 
-    def test_saving_a_library_workflow_reports_the_open_workflow_moved_onto_the_copy(
-        self, project_engine: Engine
-    ) -> None:
-        library_id = _open_new_workflow(project_engine, "library_workflow")
-        library_saved = _save(project_engine)
-        project_engine.workflow_registry.get(library_id).metadata.is_griptape_provided = True
-
-        copy = _save(project_engine, SaveWorkflowRequest(file_name=library_saved.workflow_name))
-
-        assert copy.open_workflow is not None
-        assert copy.open_workflow.workflow_id == copy.workflow_id != library_id
-        assert copy.open_workflow.name == copy.workflow_name
-
     @pytest.mark.parametrize("load", ["from_registry", "from_scratch"])
     def test_a_load_reports_the_workflow_it_opened(self, project_engine: Engine, load: str) -> None:
         saved = _saved_workflow(project_engine, "saved")
@@ -1073,3 +1033,317 @@ class TestASavedFileOpensTheWorkflowItLoads:
         assert project_engine.context_manager.has_current_flow()
         assert len(opened.objects) > 0
         assert len(replaced.objects) == 0
+
+
+def _library_workflow(engine: Engine, display_name: str) -> SaveWorkflowResultSuccess:
+    """A saved, closed workflow marked as one a library provides, with a description and an image."""
+    saved = _saved_workflow(engine, display_name)
+    assert saved.workflow_id is not None
+    entry = engine.workflow_registry.get(saved.workflow_id)
+    entry.metadata.is_griptape_provided = True
+    entry.metadata.is_template = True
+    entry.metadata.description = "From the library"
+    entry.metadata.image = "library.png"
+    return saved
+
+
+def _copies_of(engine: Engine, library_id: str | None) -> list[str]:
+    """The ids of the registered workflows seeded from the library workflow `library_id`."""
+    return [
+        workflow.workflow_id
+        for workflow in engine.workflow_registry._by_id.values()
+        if workflow.seeded_from_workflow_id == library_id
+    ]
+
+
+# Each way of opening a workflow, and whether it builds the workflow's file into it.
+_LIBRARY_OPENS = {
+    "open_by_id": True,
+    "open_by_name": True,
+    "run_from_registry": True,
+    "run_from_scratch": True,
+    "run_with_current_state": True,
+    "script": False,
+    "set_workflow_context": False,
+    "ensure_workflow_and_flow": False,
+}
+
+
+def _open_library_workflow(engine: Engine, how: str, library: SaveWorkflowResultSuccess) -> str:
+    """Open `library` the way `how` names, and return the id the open reports."""
+    if how == "script":
+        # A saved file run on its own opens itself, then builds into what it opened.
+        engine.context_manager.push_workflow(file_path=library.file_path)
+        return engine.open_workflows.all_open()[0].workflow_id
+    requests: dict[str, object] = {
+        "open_by_id": OpenWorkflowRequest(workflow_id=library.workflow_id),
+        "open_by_name": OpenWorkflowRequest(workflow_name=library.workflow_name),
+        "run_from_registry": RunWorkflowFromRegistryRequest(workflow_name=library.workflow_name),
+        "run_from_scratch": RunWorkflowFromScratchRequest(file_path=library.file_path),
+        "run_with_current_state": RunWorkflowWithCurrentStateRequest(file_path=library.file_path),
+        "set_workflow_context": SetWorkflowContextRequest(workflow_name=library.workflow_name),
+        "ensure_workflow_and_flow": EnsureWorkflowAndFlowRequest(workflow_name=library.workflow_name),
+    }
+    result = _run(engine, requests[how])
+    assert result.succeeded(), result.result_details
+    if isinstance(result, OpenWorkflowResultSuccess):
+        return result.open_workflow.workflow_id
+    assert isinstance(
+        result,
+        (
+            RunWorkflowFromRegistryResultSuccess,
+            RunWorkflowFromScratchResultSuccess,
+            RunWorkflowWithCurrentStateResultSuccess,
+            SetWorkflowContextSuccess,
+            EnsureWorkflowAndFlowResultSuccess,
+        ),
+    )
+    assert result.workflow_id is not None
+    return result.workflow_id
+
+
+class TestLibraryWorkflowsOpenAsCopies:
+    """A workflow a library provides never opens itself: each open makes a new unsaved copy of it."""
+
+    @pytest.mark.parametrize("how", list(_LIBRARY_OPENS))
+    def test_every_open_makes_an_unsaved_copy_seeded_from_it(self, project_engine: Engine, how: str) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        library_entry = project_engine.workflow_registry.get(library.workflow_id)  # type: ignore[arg-type]
+
+        copy_id = _open_library_workflow(project_engine, how, library)
+
+        assert copy_id != library.workflow_id
+        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [copy_id]
+        copy = project_engine.workflow_registry.get(copy_id)
+        assert not copy.is_saved
+        assert copy.seeded_from_workflow_id == library.workflow_id
+        assert copy.metadata.name == library_entry.metadata.name
+        assert copy.metadata.description == "From the library"
+        assert copy.metadata.image == "library.png"
+        assert copy.metadata.is_griptape_provided is False
+        assert copy.metadata.is_template is False
+        # The library's entry is unchanged, and the workflow list doesn't show the copy beside it.
+        assert library_entry.metadata.is_griptape_provided is True
+        assert copy.name not in _listed(project_engine)
+
+    @pytest.mark.parametrize("how", [how for how, builds in _LIBRARY_OPENS.items() if builds])
+    def test_an_open_that_builds_builds_the_library_file_into_the_copy(self, project_engine: Engine, how: str) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        library_content = Path(library.file_path).read_text(encoding="utf-8")
+
+        copy_id = _open_library_workflow(project_engine, how, library)
+
+        copy = project_engine.open_workflows.get(copy_id)
+        assert copy.context.has_current_flow()
+        assert len(copy.objects) > 0
+        assert Path(library.file_path).read_text(encoding="utf-8") == library_content
+
+    def test_a_second_open_while_the_first_copy_is_open_is_refused(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        first_copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+
+        second = _run(project_engine, OpenWorkflowRequest(workflow_id=library.workflow_id))
+
+        assert isinstance(second, AnotherWorkflowOpenResultFailure)
+        assert second.blocking_workflow.workflow_id == first_copy_id
+        assert _copies_of(project_engine, library.workflow_id) == [first_copy_id]
+
+    def test_opening_it_twice_beside_each_other_makes_two_copies(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        project_engine._open_workflows = OpenWorkflowSet(project_engine, allow_several_open=True)
+
+        first_copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+        second_copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+
+        assert first_copy_id != second_copy_id
+        assert sorted(_copies_of(project_engine, library.workflow_id)) == sorted([first_copy_id, second_copy_id])
+        assert not project_engine.open_workflows.is_open(library.workflow_id)  # type: ignore[arg-type]
+
+    def test_the_first_save_keeps_the_id_of_the_copy_and_is_named_after_the_library_file(
+        self, project_engine: Engine
+    ) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        library_content = Path(library.file_path).read_text(encoding="utf-8")
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+
+        saved = _save(project_engine)
+
+        assert saved.workflow_id == copy_id
+        assert Path(saved.file_path).stem == "library_flow_1"
+        assert saved.open_workflow is not None
+        assert saved.open_workflow.workflow_id == copy_id
+        assert saved.open_workflow.is_saved
+        header = read_workflow_metadata(Path(saved.file_path))
+        assert header.is_griptape_provided is False
+        assert header.description == "From the library"
+        assert header.image == "library.png"
+        assert Path(library.file_path).read_text(encoding="utf-8") == library_content
+        assert _id_at(project_engine, library.file_path) == library.workflow_id
+
+    def test_the_next_save_lands_in_the_same_file(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+        first = _save(project_engine)
+
+        second = _save(project_engine, SaveWorkflowRequest(file_name=first.workflow_name))
+
+        assert second.file_path == first.file_path
+        assert second.workflow_id == copy_id
+
+    def test_saving_onto_a_library_workflows_name_writes_a_copy_and_stays_open_on_its_own_file(
+        self, project_engine: Engine
+    ) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        workflow_id = _open_new_workflow(project_engine, "mine")
+        mine = _save(project_engine)
+
+        copy = _save(project_engine, SaveWorkflowRequest(file_name=library.workflow_name))
+
+        assert copy.workflow_id not in (workflow_id, library.workflow_id)
+        assert Path(copy.file_path) != Path(library.file_path)
+        assert _id_at(project_engine, library.file_path) == library.workflow_id
+        assert project_engine.context_manager.get_current_workflow_id() == workflow_id
+        assert copy.open_workflow is not None
+        assert copy.open_workflow.name == mine.workflow_name
+
+    def test_closing_an_unsaved_copy_forgets_it(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.find_by_id(copy_id) is None
+        assert _copies_of(project_engine, library.workflow_id) == []
+        assert project_engine.workflow_registry.get(library.workflow_id).metadata.is_griptape_provided  # type: ignore[arg-type]
+
+    def test_closing_a_saved_copy_keeps_it(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
+        _save(project_engine)
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.get(copy_id).is_saved
+
+    def test_a_copy_whose_build_fails_is_forgotten(self, project_engine: Engine, workspace: Path) -> None:
+        broken_file = _write_workflow_file(workspace / "broken_library.py", name="broken")
+        with broken_file.open("a", encoding="utf-8") as file:
+            file.write("raise RuntimeError('broken library workflow')\n")
+        library = project_engine.workflow_registry.register_file(broken_file, read_workflow_metadata(broken_file))
+        library.metadata.is_griptape_provided = True
+
+        opened = _run(project_engine, OpenWorkflowRequest(workflow_id=library.workflow_id))
+
+        assert isinstance(opened, OpenWorkflowResultFailure)
+        assert project_engine.open_workflows.all_open() == []
+        assert _copies_of(project_engine, library.workflow_id) == []
+
+    def test_asking_for_the_run_command_of_an_open_copy_asks_to_save_it_first(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        _open_library_workflow(project_engine, "open_by_id", library)
+
+        result = _run(project_engine, GetWorkflowRunCommandRequest())
+
+        assert isinstance(result, GetWorkflowRunCommandResultFailure)
+        assert "isn't saved" in str(result.result_details)
+
+
+class TestSaveAsContinuingInTheCopy:
+    """`continue_in_copy` keeps the open workflow, its id and its graph, on the file a Save As writes."""
+
+    def _open_saved_workflow_with_an_unsaved_edit(self, engine: Engine) -> str:
+        """Open a workflow, save it, then add a flow the save doesn't hold, and return its id."""
+        workflow_id = _open_new_workflow(engine, "original")
+        _save(engine)
+        top_level = engine.handle_request(GetTopLevelFlowRequest())
+        assert isinstance(top_level, GetTopLevelFlowResultSuccess)
+        created = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top_level.flow_name, flow_name="unsaved_edit", set_as_new_context=False)
+        )
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+        return workflow_id
+
+    def test_the_open_workflow_keeps_its_id_and_graph_and_names_the_new_file(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        workflow = project_engine.open_workflows.get(workflow_id)
+        original_path = project_engine.workflow_registry.get(workflow_id).absolute_path
+
+        copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
+
+        assert copy.workflow_id == workflow_id
+        assert copy.workflow_name == "the_copy"
+        assert copy.open_workflow is not None
+        assert copy.open_workflow.workflow_id == workflow_id
+        assert copy.open_workflow.name == "the_copy"
+        assert copy.open_workflow.workflow_file_path == str(Path(copy.file_path).resolve())
+        assert _id_at(project_engine, copy.file_path) == workflow_id
+        # The same runtime, with the edit made after the last save.
+        assert project_engine.open_workflows.get(workflow_id) is workflow
+        assert "unsaved_edit" in workflow.flows.name_to_parent_name
+        assert project_engine.context_manager.get_current_workflow_id() == workflow_id
+        # The original file is a separate, closed workflow under a new id.
+        assert original_path is not None
+        left_behind_id = _id_at(project_engine, original_path)
+        assert left_behind_id not in (None, workflow_id)
+        assert not project_engine.open_workflows.is_open(left_behind_id)  # type: ignore[arg-type]
+        assert any(listed["workflow_id"] == left_behind_id for listed in _listed(project_engine).values())
+
+    def test_the_next_save_lands_in_the_copy(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
+
+        again = _save(project_engine, SaveWorkflowRequest(file_name=copy.workflow_name))
+
+        assert again.file_path == copy.file_path
+        assert again.workflow_id == workflow_id
+
+    def test_a_versioned_save_can_continue_in_the_version(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        original_path = project_engine.workflow_registry.get(workflow_id).absolute_path
+
+        version = _save(project_engine, SaveWorkflowRequest(create_versioned=True, continue_in_copy=True))
+
+        assert version.workflow_id == workflow_id
+        assert _id_at(project_engine, version.file_path) == workflow_id
+        assert original_path is not None
+        assert _id_at(project_engine, original_path) not in (None, workflow_id)
+
+    def test_it_changes_nothing_for_a_first_save(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "first")
+
+        saved = _save(project_engine, SaveWorkflowRequest(file_name="first_file", continue_in_copy=True))
+
+        assert saved.workflow_id == workflow_id
+        assert [workflow["workflow_id"] for workflow in _listed(project_engine).values()].count(workflow_id) == 1
+
+
+class TestClosingAnUnsavedWorkflow:
+    """An unsaved workflow's graph lives only while it is open, so closing it forgets its entry."""
+
+    def test_closing_forgets_it(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "scratch")
+        name = project_engine.workflow_registry.get(workflow_id).name
+
+        _close(project_engine)
+
+        assert project_engine.workflow_registry.find_by_id(workflow_id) is None
+        assert name not in _listed(project_engine)
+        reopened = _run(project_engine, OpenWorkflowRequest(workflow_id=workflow_id))
+        assert isinstance(reopened, WorkflowNotFoundResultFailure)
+
+    def test_closing_a_saved_workflow_keeps_it(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "kept")
+
+        assert saved.workflow_id is not None
+        assert project_engine.workflow_registry.get(saved.workflow_id).is_saved
+        assert saved.workflow_name in _listed(project_engine)
+
+    def test_deleting_it_while_open_succeeds(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "scratch")
+        name = project_engine.workflow_registry.get(workflow_id).name
+
+        deleted = _run(project_engine, DeleteWorkflowRequest(name=name))
+
+        assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
+        assert project_engine.open_workflows.all_open() == []
+        assert project_engine.workflow_registry.find_by_id(workflow_id) is None

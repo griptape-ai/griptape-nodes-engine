@@ -791,23 +791,6 @@ class Engine:
         opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
         self._event_manager.put_event(AppEvent(payload=opened_event))
 
-    def move_open_workflow(self, workflow: WorkflowRuntime, workflow_id: str) -> None:
-        """Keep an open workflow open under another id (`OpenWorkflowSet.move`), telling clients if it was announced.
-
-        Clients hear of it as a close of the old id followed by an open of the new one, so none keeps
-        an id that names nothing.
-
-        Raises:
-            OpenWorkflowError: That runtime is not open, or another workflow is open under the new id.
-        """
-        old_workflow_id = workflow.workflow_id
-        self._open_workflows.move(workflow, workflow_id)
-        if workflow not in self._announced_workflows:
-            return
-        self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(open_workflow_id=old_workflow_id)))
-        opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
-        self._event_manager.put_event(AppEvent(payload=opened_event))
-
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
         """What clients are told of an open workflow: its id, name, file, whether it is saved and whether it has a flow."""
         entry = self.workflow_registry.get(workflow.workflow_id)
@@ -827,8 +810,9 @@ class Engine:
 
         Cancels its run and resets its run state, deletes its flows (and with them their nodes)
         through the normal delete path, then forgets its runtime, which takes its context stack and
-        queued UI changes with it, and releases the held objects this process kept for it. The
-        workers hold their own: this is sync, so telling them is scheduled on the engine loop
+        queued UI changes with it, forgets an unsaved workflow's registry entry, and releases the
+        held objects this process kept for it. The workers hold their own: this is sync, so telling
+        them is scheduled on the engine loop
         (`WorkerManager.schedule_local_object_teardown`). `aclose_workflow` awaits it instead.
 
         The flows are deleted while the workflow is still open, because deleting one enters its
@@ -928,6 +912,11 @@ class Engine:
             raise OpenWorkflowError(msg)
         self._open_workflows.close(workflow)
         self._announce_closed_workflow(workflow)
+
+        # An unsaved workflow's graph lived only in the runtime just closed, so there is nothing left to reopen.
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.is_saved:
+            self._workflow_registry.remove(workflow.workflow_id)
 
         # Every key referring to a held object kept for it lived on a node just deleted, so each entry
         # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.

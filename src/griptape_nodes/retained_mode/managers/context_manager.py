@@ -220,7 +220,9 @@ class ContextManager(EngineScoped):
         registered or opened, except a flow that can't be created, which closes the workflow again.
 
         A saved workflow opens empty: `WorkflowRunner.open_and_build_workflow` builds its file into
-        it. Clients hear of the workflow from the result of the request that opened it (see
+        it. A library-provided workflow is never open, so naming one always opens a new unsaved copy
+        of it (see `open_workflow`), into which `open_and_build_workflow` builds the library's file.
+        Clients hear of the workflow from the result of the request that opened it (see
         `OpenedWorkflowResult`).
 
         Args:
@@ -593,7 +595,7 @@ class ContextManager(EngineScoped):
             if entry is None:
                 msg = (
                     f"Attempted to open workflow '{workflow_id}'. Failed because no workflow has that id. "
-                    "Workflow ids last only until the engine restarts, and an unsaved workflow is lost with it."
+                    "Workflow ids last only until the engine restarts, and an unsaved workflow is lost when it closes."
                 )
                 raise self.RequestedWorkflowNotFoundError(msg)
             return entry
@@ -880,6 +882,10 @@ class ContextManager(EngineScoped):
         workflow is refused, and so is a push the open workflows have no room for. Opening binds
         nothing: work that builds into the opened workflow binds it (`Engine.bind_workflow`).
 
+        A library-provided workflow opens as a new unsaved copy of itself
+        (`register_unsaved_copy`), so every open, a script's own included, leaves the library's
+        entry closed. The caller builds the library's file into the copy.
+
         Args:
             workflow_name: The legacy registry name of the Workflow to enter. A name the registry
                 does not hold registers a new unsaved Workflow with that display name, unlisted.
@@ -895,7 +901,7 @@ class ContextManager(EngineScoped):
                 reaches here.
 
         Returns:
-            The runtime of the Workflow that was entered.
+            The runtime of the Workflow that was entered: the copy's, for a library workflow.
 
         Raises:
             ValueError: If neither or both of workflow_name and file_path are provided.
@@ -926,6 +932,9 @@ class ContextManager(EngineScoped):
             msg = "Either workflow_name or file_path must be provided."
             raise ValueError(msg)
 
+        # A library workflow never opens itself, so its file is never saved over.
+        if workflow.metadata.is_griptape_provided:
+            workflow = self.engine.workflow_registry.register_unsaved_copy(workflow)
         if working_directory is not None:
             workflow.working_directory = working_directory
         return self.engine.open_workflow(workflow.workflow_id)
