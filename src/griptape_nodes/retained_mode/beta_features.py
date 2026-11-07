@@ -354,3 +354,16 @@ ISOLATED_EXECUTION_IN_WORKER = register_beta_feature(
         remove_by=date(2027, 4, 1),
     )
 )
+
+MULTIPLE_OPEN_WORKFLOWS = register_beta_feature(
+    BetaFeature(
+        id="multiple_open_workflows",
+        name="Multiple open workflows",
+        description=(
+            "Lets the engine keep several workflows open at once, one per editor tab, instead of closing or "
+            "refusing to open a workflow while another is open."
+        ),
+        owner="@collindutter",
+        remove_by=date(2027, 5, 1),
+    )
+)

@@ -10,6 +10,11 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.retained_mode.beta_features import (
+    BETA_FEATURES_ENABLED_KEY,
+    MULTIPLE_OPEN_WORKFLOWS,
+    is_beta_enabled,
+)
 from griptape_nodes.retained_mode.events.app_events import WorkflowClosedEvent, WorkflowOpenedEvent
 from griptape_nodes.retained_mode.events.base_events import (
     AppEvent,
@@ -17,8 +22,10 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
 )
+from griptape_nodes.retained_mode.events.config_events import SetConfigValueRequest, SetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.context_events import (
     AnotherWorkflowOpenResultFailure,
+    CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     ListOpenWorkflowsRequest,
@@ -36,7 +43,10 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryRequest,
+    RunWorkflowFromRegistryResultFailure,
     RunWorkflowFromRegistryResultSuccess,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
     RunWorkflowWithCurrentStateResultSuccess,
     SaveWorkflowRequest,
@@ -45,7 +55,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers.mcp import SUPPORTED_REQUEST_EVENTS
 
 ORIGINAL_RUN_WORKFLOW = WorkflowRunner.run_workflow
@@ -85,15 +94,17 @@ def _send(
     )
 
 
-def _allow_several_open(engine: Engine) -> None:
-    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
-
-
 def _open_new(engine: Engine, display_name: str) -> WorkflowRuntime:
     """Open a new unsaved workflow with its flow, as an editor tab would."""
     result = _send(engine, OpenWorkflowRequest(display_name=display_name, create_flow=True)).result
     assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
     return engine.open_workflows.get(result.open_workflow.workflow_id)
+
+
+def _set_config_value(engine: Engine, key: str, *, value: bool) -> None:
+    """Set a config value as the editor's Beta Features page does."""
+    result = engine.handle_request(SetConfigValueRequest(category_and_key=key, value=value))
+    assert isinstance(result, SetConfigValueResultSuccess), result.result_details
 
 
 def _use_default_project(engine: Engine, workspace: Path) -> None:
@@ -141,8 +152,8 @@ class TestListOpenWorkflows:
         assert result.open_workflows == [engine.open_workflow_info(workflow)]
         assert result.open_workflows[0].has_active_flow
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_lists_every_open_workflow_in_the_order_they_opened(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         first = _open_new(engine, "first")
         second = _open_new(engine, "second")
 
@@ -182,8 +193,8 @@ class TestOpenWorkflowNew:
         assert result.open_workflow.has_active_flow
         assert engine.open_workflows.get(result.open_workflow.workflow_id).context.has_current_flow()
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_opens_beside_the_others_when_several_may_be_open(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         first = _open_new(engine, "first")
 
         result = _send(engine, OpenWorkflowRequest(display_name="second")).result
@@ -277,8 +288,8 @@ class TestOpenWorkflowAlreadyOpen:
         assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
         assert result.already_open
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_closes_none_of_the_others_when_several_are_open(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         first = _open_new(engine, "first")
         second = _open_new(engine, "second")
 
@@ -344,8 +355,8 @@ class TestOpenWorkflowRefused:
 
 
 class TestOlderOpenRequestsShareTheCode:
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_ensure_naming_a_workflow_already_open_uses_it_and_creates_its_flow(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         opened = _send(engine, OpenWorkflowRequest(display_name="draft")).result
         assert isinstance(opened, OpenWorkflowResultSuccess)
         workflow_name = opened.open_workflow.name
@@ -358,20 +369,155 @@ class TestOlderOpenRequestsShareTheCode:
         assert result.open_workflow is None
         assert result.workflow_id == opened.open_workflow.workflow_id
 
-    def test_a_clean_slate_registry_run_of_the_open_workflow_reloads_it_from_its_file(
-        self, engine: Engine, saved_workflow_name: str
+
+@pytest.fixture(params=[False, True], ids=["one_may_be_open", "several_may_be_open"])
+def several_may_be_open(request: pytest.FixtureRequest, engine: Engine) -> bool:
+    """The `multiple_open_workflows` beta feature, set off and then on. Request it before `saved_workflow_name`."""
+    engine.config_manager.set_config_value(MULTIPLE_OPEN_WORKFLOWS.config_key, value=request.param)
+    return request.param
+
+
+def _clean_slate_run(
+    engine: Engine, saved_workflow_name: str, request_type: str
+) -> EventResultSuccess | EventResultFailure:
+    """Run the saved workflow with a clean slate, from the registry or from scratch."""
+    request: RequestPayload = RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)
+    if request_type == "scratch":
+        file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+        assert file_path is not None
+        request = RunWorkflowFromScratchRequest(file_path=file_path)
+    return _send(engine, request)
+
+
+@pytest.mark.parametrize("request_type", ["registry", "scratch"])
+class TestACleanSlateStartsTheWorkflowOver:
+    """A clean slate run of an open workflow reloads it from its file, whether or not several may be open."""
+
+    def test_a_clean_slate_run_of_the_open_workflow_reloads_it_from_its_file(
+        self, engine: Engine, request_type: str, *, several_may_be_open: bool, saved_workflow_name: str
     ) -> None:
-        first = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
-        assert isinstance(first, RunWorkflowFromRegistryResultSuccess), first.result_details
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert first.succeeded(), first.result_details
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
         assert first.workflow_id is not None
         before = engine.open_workflows.get(first.workflow_id)
 
-        again = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
 
-        assert isinstance(again, RunWorkflowFromRegistryResultSuccess), again.result_details
+        assert again.succeeded(), again.result_details
+        assert isinstance(again, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
         assert again.workflow_id == first.workflow_id
         assert before.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [first.workflow_id]
         assert engine.open_workflows.get(first.workflow_id) is not before
+        assert is_beta_enabled(MULTIPLE_OPEN_WORKFLOWS, engine.config_manager) is several_may_be_open
+
+    @pytest.mark.usefixtures("multiple_open_workflows")
+    def test_with_several_allowed_it_leaves_the_other_workflows_open(
+        self, engine: Engine, saved_workflow_name: str, request_type: str
+    ) -> None:
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
+        assert first.workflow_id is not None
+        before = engine.open_workflows.get(first.workflow_id)
+        other = _open_new(engine, "other")
+
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
+
+        assert again.succeeded(), again.result_details
+        assert before.closed
+        assert not other.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [
+            other.workflow_id,
+            first.workflow_id,
+        ]
+
+
+class TestMultipleOpenWorkflowsBetaFeature:
+    """Whether a workflow opens beside the others follows the `multiple_open_workflows` beta feature."""
+
+    @pytest.mark.usefixtures("multiple_open_workflows_off")
+    def test_off_a_clean_slate_registry_run_closes_the_open_workflow(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        open_workflow = _open_new(engine, "open")
+
+        result = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result.result_details
+        assert open_workflow.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [result.workflow_id]
+
+    @pytest.mark.usefixtures("multiple_open_workflows")
+    def test_on_a_clean_slate_registry_run_opens_beside_the_open_workflow(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        open_workflow = _open_new(engine, "open")
+
+        result = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result.result_details
+        assert not open_workflow.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [
+            open_workflow.workflow_id,
+            result.workflow_id,
+        ]
+
+    @pytest.mark.usefixtures("multiple_open_workflows_off")
+    def test_turning_it_on_applies_to_the_next_open(self, engine: Engine) -> None:
+        first = _open_new(engine, "first")
+
+        _set_config_value(engine, MULTIPLE_OPEN_WORKFLOWS.config_key, value=True)
+        second = _open_new(engine, "second")
+
+        assert engine.open_workflows.all_open() == [first, second]
+
+    def test_turning_it_off_closes_nothing_and_refuses_the_next_open(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        _set_config_value(engine, MULTIPLE_OPEN_WORKFLOWS.config_key, value=True)
+        first = _open_new(engine, "first")
+        second = _open_new(engine, "second")
+
+        _set_config_value(engine, MULTIPLE_OPEN_WORKFLOWS.config_key, value=False)
+        refused_open = _send(engine, OpenWorkflowRequest(display_name="third")).result
+        refused_run = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
+
+        assert isinstance(refused_open, AnotherWorkflowOpenResultFailure)
+        assert refused_open.blocking_workflow == engine.open_workflow_info(first)
+        assert "2 workflows are open and only one can be" in str(refused_open.result_details)
+        # Closing one of the two would not make room, so the clean slate closes neither.
+        assert isinstance(refused_run, RunWorkflowFromRegistryResultFailure)
+        assert "2 workflows are open and only one can be" in str(refused_run.result_details)
+        assert engine.open_workflows.all_open() == [first, second]
+
+    def test_once_one_is_left_after_turning_it_off_a_run_from_scratch_closes_it(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        # Absolute, because setting a config value reloads the config, which drops the test's workspace.
+        saved_file = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).absolute_path
+        assert saved_file is not None
+        _set_config_value(engine, MULTIPLE_OPEN_WORKFLOWS.config_key, value=True)
+        first = _open_new(engine, "first")
+        second = _open_new(engine, "second")
+        _set_config_value(engine, MULTIPLE_OPEN_WORKFLOWS.config_key, value=False)
+        _send(engine, CloseWorkflowRequest(), second.workflow_id)
+
+        result = _send(engine, RunWorkflowFromScratchRequest(file_path=str(saved_file))).result
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
+        assert first.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [result.workflow_id]
+
+    def test_the_switch_that_turns_every_beta_feature_off_wins(self, engine: Engine) -> None:
+        _set_config_value(engine, MULTIPLE_OPEN_WORKFLOWS.config_key, value=True)
+        _set_config_value(engine, BETA_FEATURES_ENABLED_KEY, value=False)
+        first = _open_new(engine, "first")
+
+        refused = _send(engine, OpenWorkflowRequest(display_name="second")).result
+
+        assert isinstance(refused, AnotherWorkflowOpenResultFailure)
+        assert engine.open_workflows.all_open() == [first]
 
 
 class TestOpenWorkflowWhileAnotherRequestOpensIt:

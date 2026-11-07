@@ -116,7 +116,6 @@ from griptape_nodes.retained_mode.managers.workflow.variable_substitution import
 from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -157,10 +156,6 @@ _OPTIONAL_WORKFLOW_REQUESTS = {
     GetWorkflowContextRequest,
     RunWorkflowWithCurrentStateRequest,
 }
-
-
-def _allow_several_open(engine: Engine) -> None:
-    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
 
 
 def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
@@ -468,8 +463,8 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert "a library provides it" in str(renamed.result_details)
         assert closed.file_path.is_file()
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_renaming_an_open_workflow_by_id_from_another_tab_saves_its_own_graph(self, project_engine: Engine) -> None:
-        _allow_several_open(project_engine)
         target = _open_with_flow(project_engine, "target")
         saved = _send_async(project_engine, SaveWorkflowRequest(), target)
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
@@ -518,8 +513,8 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert project_engine.workflow_registry.find_by_id(closed.workflow_id) is None
         assert project_engine.open_workflows.is_open(tab.workflow_id)
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_renaming_an_open_workflow_from_another_tab_saves_that_workflow(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         tab = _open(engine, "tab")
         target = _open(engine, "target")
         saved_runtimes: list[WorkflowRuntime] = []
@@ -552,8 +547,8 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert "no workflow has that name" in str(renamed.result_details)
         save.assert_not_called()
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_publishing_saves_and_publishes_the_workflow_it_is_handed(self, engine: Engine, tmp_path: Path) -> None:
-        _allow_several_open(engine)
         _open(engine, "beside")
         target = engine.open_workflow(_write_saved_workflow(engine, tmp_path.resolve() / "target.py").workflow_id)
         saved_in: list[WorkflowRuntime] = []
@@ -584,8 +579,8 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert saved_in == [target]
         assert published_in == [target]
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_publishing_another_open_workflow_by_name_is_refused(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         tab = _open(engine, "tab")
         other = _open(engine, "other")
         publish = MagicMock()
@@ -857,8 +852,8 @@ class TestPublishOptions:
 
 
 class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_save_serializes_and_records_the_workflow_it_is_handed(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         _open(engine, "tab")
         target = _open(engine, "target")
         recorded = _RecordedRequests(flow_name="target_canvas")
@@ -886,10 +881,10 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert [call.args[0] for call in extract_calls] == [target]
         assert record_saved_file.call_args.args == (target,)
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_save_subflow_serializes_the_handed_workflow_into_the_named_workflows_file(
         self, engine: Engine, tmp_path: Path
     ) -> None:
-        _allow_several_open(engine)
         _open(engine, "tab")
         source = _open(engine, "subflow source")
         saved_target = _write_saved_workflow(engine, tmp_path.resolve() / "target.py")
@@ -921,10 +916,10 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert recorded.bound == [(SerializeFlowToCommandsRequest, source)]
         assert written_paths == [str(saved_target.absolute_path)]
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_referenced_import_creates_its_flow_in_the_workflow_it_is_handed(
         self, engine: Engine, tmp_path: Path
     ) -> None:
-        _allow_several_open(engine)
         tab = _open(engine, "tab")
         _create_flow(engine, tab, "tab_canvas")
         importing = _open(engine, "importing")
@@ -958,8 +953,8 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert isinstance(into_tab_flow, ImportWorkflowAsReferencedSubFlowResultFailure)
         assert "target flow does not exist" in str(into_tab_flow.result_details)
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_ensure_creates_its_flow_in_the_workflow_it_is_handed(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         tab = _open(engine, "tab")
         target = _open(engine, "target")
 
@@ -981,8 +976,8 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert result.workflow_id == tab.workflow_id
         assert result.created_workflow is False
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_ensure_naming_no_workflow_while_several_are_open_fails(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         tab = _open(engine, "tab")
         beside = _open(engine, "beside")
 
@@ -992,12 +987,12 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert "did not name one" in str(result.result_details)
         assert engine.open_workflows.all_open() == [tab, beside]
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_run_command_naming_nothing_answers_for_the_workflow_it_is_handed(
         self, engine: Engine, tmp_path: Path
     ) -> None:
         workspace = tmp_path.resolve()
         engine.config_manager.workspace_path = workspace
-        _allow_several_open(engine)
         saved = _write_saved_workflow(engine, workspace / "tab.py", workflow_shape=WorkflowShape(inputs={}, outputs={}))
         tab = engine.open_workflow(saved.workflow_id)
         _open(engine, "beside")
@@ -1019,10 +1014,10 @@ class TestSavingOntoAnotherOpenWorkflowsFile:
 
     @pytest.mark.parametrize("tab_saved", [False, True])
     @pytest.mark.parametrize("continue_in_copy", [False, True])
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_it_is_refused_and_writes_nothing(
         self, project_engine: Engine, *, tab_saved: bool, continue_in_copy: bool
     ) -> None:
-        _allow_several_open(project_engine)
         other = _open_with_flow(project_engine, "other")
         other_saved = _send_async(project_engine, SaveWorkflowRequest(), other)
         assert isinstance(other_saved, SaveWorkflowResultSuccess), other_saved.result_details

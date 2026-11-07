@@ -16,6 +16,7 @@ for _engine_dir_env_var in ("GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN
     os.environ.pop(_engine_dir_env_var, None)
 
 from griptape_nodes.common import log_capture  # noqa: E402
+from griptape_nodes.retained_mode.beta_features import MULTIPLE_OPEN_WORKFLOWS  # noqa: E402
 from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine  # noqa: E402
 from griptape_nodes.retained_mode.managers import settings as settings_module  # noqa: E402
 from griptape_nodes.retained_mode.managers.external_environment import (  # noqa: E402
@@ -126,6 +127,9 @@ _EXTERNAL_ENVIRONMENT_VARS = (
 )
 
 
+_BETA_FEATURES_ENV_PREFIX = "GTN_CONFIG_BETA_FEATURES__"
+
+
 @pytest.fixture(autouse=True)
 def isolate_external_environment() -> Generator[None, None, None]:
     """Clear the variables an externally managed environment sets for the engine.
@@ -144,6 +148,20 @@ def isolate_external_environment() -> Generator[None, None, None]:
     yield
     for name in _EXTERNAL_ENVIRONMENT_VARS:
         os.environ.pop(name, None)
+    os.environ.update(saved)
+
+
+@pytest.fixture(autouse=True)
+def isolate_beta_feature_environment() -> Generator[None, None, None]:
+    """Clear the `GTN_CONFIG_BETA_FEATURES__` variables a developer sets to try engine beta features.
+
+    The user config is already isolated, so this leaves each test on the features' defaults unless
+    it sets them. Saved and restored by hand for the reason `isolate_external_environment` gives.
+    """
+    saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(_BETA_FEATURES_ENV_PREFIX)}
+    yield
+    for name in [name for name in os.environ if name.startswith(_BETA_FEATURES_ENV_PREFIX)]:
+        os.environ.pop(name)
     os.environ.update(saved)
 
 
@@ -200,3 +218,26 @@ def fail_on_host_workflow_reads() -> Generator[list[HostWorkflowRead], None, Non
 def engine() -> Engine:
     """Provide the engine for this test, building it on first use."""
     return current_engine()
+
+
+@pytest.fixture
+def multiple_open_workflows(engine: Engine) -> Engine:
+    """The engine with the `multiple_open_workflows` beta feature on, so a workflow opens beside the others.
+
+    Set in the user config as the editor's Beta Features page sets it. Setting a config value reloads
+    the config, which drops a `workspace_path` set directly, so request this fixture before one that
+    sets it (`@pytest.mark.usefixtures` runs before the test's own arguments).
+    """
+    engine.config_manager.set_config_value(MULTIPLE_OPEN_WORKFLOWS.config_key, value=True)
+    return engine
+
+
+@pytest.fixture
+def multiple_open_workflows_off(engine: Engine) -> Engine:
+    """The engine with the `multiple_open_workflows` beta feature off, so only one workflow may be open.
+
+    Off by default; this sets it, for tests about the difference. Request it before a fixture that
+    sets `workspace_path`, as with `multiple_open_workflows`.
+    """
+    engine.config_manager.set_config_value(MULTIPLE_OPEN_WORKFLOWS.config_key, value=False)
+    return engine

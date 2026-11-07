@@ -259,11 +259,13 @@ class ContextManager(EngineScoped):
             label = file_path or display_name or "Untitled"
             if entry is not None:
                 label = entry.name
-            msg = (
-                f"Attempted to open workflow '{label}'. Failed because workflow "
-                f"'{registry.get(blocking.workflow_id).name}' is open and only one workflow can be open at a time. "
-                "Close it first."
-            )
+            reason = self.engine.open_workflows.several_open_refusal()
+            if reason is None:
+                reason = (
+                    f"workflow '{registry.get(blocking.workflow_id).name}' is open and only one workflow can be open "
+                    "at a time. Close it first."
+                )
+            msg = f"Attempted to open workflow '{label}'. Failed because {reason}"
             raise self.AnotherWorkflowOpenError(msg, blocking)
 
         if entry is None:
@@ -912,14 +914,17 @@ class ContextManager(EngineScoped):
             msg = "Provide either workflow_name or file_path, not both."
             raise ValueError(msg)
         blocking = self.engine.bound_live_workflow_or_none()
+        reason = None
         if blocking is None:
             blocking = self.engine.open_workflows.workflow_blocking_open()
+            reason = self.engine.open_workflows.several_open_refusal()
         if blocking is not None:
-            msg = (
-                f"Attempted to open workflow '{workflow_name or file_path}'. Failed because workflow "
-                f"'{self.engine.workflow_registry.get(blocking.workflow_id).name}' is already open. "
-                "Close or clear the open workflow first."
-            )
+            if reason is None:
+                reason = (
+                    f"workflow '{self.engine.workflow_registry.get(blocking.workflow_id).name}' is already open. "
+                    "Close or clear the open workflow first."
+                )
+            msg = f"Attempted to open workflow '{workflow_name or file_path}'. Failed because {reason}"
             raise self.WorkflowAlreadyOpenError(msg)
         if workflow_name is not None:
             workflow = self.engine.workflow_registry.find_by_name(workflow_name)

@@ -69,7 +69,6 @@ from griptape_nodes.retained_mode.managers import event_manager as event_manager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from tests.unit.host_workflow_reads import HostWorkflowRead
 
@@ -155,8 +154,7 @@ def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntim
 
 
 def _open_two(engine: Engine) -> list[WorkflowRuntime]:
-    """Two workflows open at once, through the test seam that allows it."""
-    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+    """Two workflows open at once. Needs the `multiple_open_workflows` fixture."""
     opened = []
     for display_name in ("A", "B"):
         workflow = engine.workflow_registry.register_unsaved(display_name, listed=False)
@@ -214,6 +212,7 @@ class TestScopesThatTakeAWorkflow:
         assert [record.levelno for record in records] == [logging.DEBUG]
 
     @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_no_envelope_id_takes_the_callers_binding(self, engine: Engine, calls: _Calls, scope: RequestScope) -> None:
         _a, b = _open_two(engine)
         _register(engine, calls, scope, _ScopeProbeRequest)
@@ -265,6 +264,7 @@ class TestWorkflowScope:
         assert "names no workflow and none is open" in str(result.result_details)
         assert calls.workflows == []
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_no_envelope_id_and_several_open_fails(self, engine: Engine, calls: _Calls) -> None:
         _open_two(engine)
         _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
@@ -351,6 +351,7 @@ class TestOnlyOpenUntilClientsName:
         assert result.succeeded()
         assert calls.workflows == [None]
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_no_envelope_id_while_several_are_open_fails(self, engine: Engine, calls: _Calls) -> None:
         """Its client means the open one, and which that is can't be told."""
         _open_two(engine)
@@ -362,6 +363,7 @@ class TestOnlyOpenUntilClientsName:
         assert "2 workflows are open" in str(result.result_details)
         assert calls.workflows == []
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_the_envelope_id_wins_over_the_only_open_workflow(self, engine: Engine, calls: _Calls) -> None:
         a, b = _open_two(engine)
         _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
@@ -505,6 +507,7 @@ class TestRequestsARuntimeSends:
     """A runtime's requests act on that runtime's workflow, whatever its caller has bound."""
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("multiple_open_workflows")
     async def test_they_act_on_the_runtimes_workflow(self, engine: Engine, calls: _Calls) -> None:
         a, b = _open_two(engine)
         _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
@@ -561,6 +564,7 @@ class TestObjectAndVariableRequests:
     def test_is_registered_with_workflow_scope(self, engine: Engine, request_type: type[RequestPayload]) -> None:
         assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.WORKFLOW
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_variable_is_created_in_the_workflow_the_envelope_names(self, engine: Engine) -> None:
         a, b = _open_two(engine)
 
@@ -584,6 +588,7 @@ class TestObjectAndVariableRequests:
         assert isinstance(result, WorkflowNotOpenResultFailure)
         assert not workflow.variables.global_layer.has("greeting")
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_naming_no_workflow_while_several_are_open_reaches_the_requests_own_failure_subscribers(
         self, engine: Engine
     ) -> None:
@@ -711,6 +716,7 @@ class TestResultLabels:
         assert result_event.open_workflow_id is None
 
     @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.OPTIONAL_WORKFLOW])
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_scoped_result_names_the_workflow_its_handler_was_handed(
         self, engine: Engine, calls: _Calls, scope: RequestScope
     ) -> None:
@@ -734,6 +740,7 @@ class TestResultLabels:
 
         assert result_event.open_workflow_id == workflow.workflow_id
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_an_unscoped_result_names_the_workflow_its_caller_bound(self, engine: Engine, calls: _Calls) -> None:
         _a, b = _open_two(engine)
         engine.event_manager.assign_manager_to_request_type(
@@ -748,6 +755,7 @@ class TestResultLabels:
         # Unbound with two open, it acts on neither.
         assert unbound_event.open_workflow_id is None
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_request_that_names_no_workflow_while_two_are_open_fails_naming_none(
         self, engine: Engine, calls: _Calls
     ) -> None:
