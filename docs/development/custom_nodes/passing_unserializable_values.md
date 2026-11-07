@@ -1,8 +1,8 @@
 # Passing Values That Cannot Be Serialized
 
 Some values cannot be turned into data. A diffusers pipeline, a latent tensor, an
-open file handle, a live driver — there is no JSON for them. If your library runs
-isolated in a worker subprocess (see
+open file handle, a live driver — there is no JSON for them. If your library's
+nodes execute in a worker subprocess (see
 [Node Isolation with Workers](node_isolation_with_workers.md)), parameter values
 travel between the orchestrator and your worker as JSON, so passing one of these
 from one of your nodes to the next needs help.
@@ -52,7 +52,8 @@ Three consequences worth internalising:
     `parameter_output_values["pipeline"]` and read it straight back and you get the
     pipeline, not a key. Nothing is substituted on a write.
 - **A graph that never leaves the process never does any of this.** If your library
-    runs in Shared mode, values pass by reference exactly as they always have.
+    declares no execution dependencies, values pass by reference exactly as they
+    always have.
 - **Only the producer declares.** The key travels down connections to consumers
     that declare nothing at all, which is why the consuming parameter above is an
     ordinary `Parameter`.
@@ -63,9 +64,9 @@ It has two effects:
 
 - **The value isn't saved.** It's left out of saved workflow files, so its node runs again when the
     workflow reopens.
-- **The value stays in the process that made it.** On an output of a node in an isolated library,
-    the engine holds the value and sends a key in its place. Plain data, such as text, numbers, and
-    lists and dicts of them, is still sent as-is.
+- **The value stays in the process that made it.** On an output of a node that executes in a
+    worker, the engine holds the value and sends a key in its place. Plain data, such as text,
+    numbers, and lists and dicts of them, is still sent as-is.
 
 Only mark an output `serializable=False` when its value can't be serialized, like a pipeline, a
 tensor, or a driver.
@@ -125,8 +126,8 @@ The hook belongs to the cache, so it runs when the cache lets an object go:
 It runs once per object, even when one object sits on two outputs.
 
 What it does *not* cover is an object that never reached the cache. If your library
-runs in Shared mode there is no process boundary, so nothing is ever cached and the
-value simply passes by reference the way it always has — there is nothing for the
+declares no execution dependencies there is no process boundary, so nothing is ever
+cached and the value simply passes by reference the way it always has — nothing for the
 cache to release, and freeing it is yours to do as it was before. The same is true
 of an object you overwrite mid-run: only what the parameter holds when the node
 finishes goes in. Two other cases where the hook will not have run: updating a
@@ -201,6 +202,6 @@ not have to do anything for this; it is the same declaration doing the work.
 - Consuming parameter declares nothing.
 - Producer and consumer run in the same worker, which is automatic within one library.
 - Only outputs whose value can't be serialized are marked `serializable=False`.
-- If your nodes can run in Shared mode, do not rely on the release hook: nothing is
-    cached there, so nothing is released.
+- If your library declares no execution dependencies, do not rely on the release
+    hook: nothing is cached in-process, so nothing is released.
 - Batches go on an ordinary parameter, not a `ParameterList` output.

@@ -163,6 +163,26 @@ def refusal_from_body(body: object) -> BudgetRefusal | None:
     )
 
 
+def refusal_from_check(body: Mapping[str, Any]) -> BudgetRefusal:
+    """Return the refusal a denied ``POST /api/budget-checks`` response describes.
+
+    Unlike :func:`refusal_from_body`, this never returns None: the check already
+    said ``allowed: false``, so a deny naming no budget still refuses.
+
+    Args:
+        body: The parsed response body of a check that answered ``allowed: false``.
+    """
+    entries = body.get("blocked_by")
+    if not isinstance(entries, list):
+        entries = []
+    budgets = tuple(budget for budget in (_budget_from_entry(entry) for entry in entries) if budget is not None)
+    return BudgetRefusal(
+        budgets=budgets,
+        effective_remaining_credits=_optional_int(body.get("effective_remaining_credits")),
+        spend_id=_optional_str(body.get("spend_id")),
+    )
+
+
 def describe(refusal: BudgetRefusal, *, node_name: str | None = None) -> str:
     """Word a refusal for the artist whose run just stopped.
 
@@ -353,6 +373,8 @@ def _budget_from_entry(entry: object) -> BlockedBudget | None:
 
 def _blocked_by(refusal: BudgetRefusal) -> str:
     """Name every budget that refused, as the object of "was blocked by"."""
+    if not refusal.budgets:
+        return "a budget"
     if len(refusal.budgets) == 1:
         return f"the budget {_label(refusal.budgets[0])}"
     return f"the budgets {_joined([_label(budget) for budget in refusal.budgets])}"

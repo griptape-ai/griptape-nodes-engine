@@ -173,8 +173,9 @@ saved shape (no Start Flow and End Flow nodes, or a hand-written file with no he
 a library problem and its node is not registered.
 
 The workflow is also registered as a workflow in its own right, so it shows up in the editor's
-workflow picker. To keep a workflow that only exists to back a node out of that list, set
-`is_internal = true` in its metadata header.
+workflow picker under your library as soon as the library loads, next to the workflows in your
+`workflows` list. To make it a template, set `is_template = true` in its metadata header. To keep a
+workflow that only exists to back a node out of the picker, set `is_internal = true` instead.
 
 ### Library and Node Declarations
 

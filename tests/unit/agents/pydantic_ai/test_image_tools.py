@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx2
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.exceptions import ApprovalRequired, ModelRetry
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -19,6 +19,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
     ImageGenerationToolsetConfig,
     register_image_tools,
 )
+from griptape_nodes.agents.pydantic_ai.tool_approval import ToolApprovalDeps
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError
 from tests.unit.utils.test_budget_refusal import a_refusal_body
 
@@ -53,9 +54,25 @@ def _make_toolset(
     return ImageGenerationToolset(config, cast("StaticFilesManager", static_files))
 
 
-def _ctx(model_settings: dict[str, Any] | None = None) -> RunContext[Any]:
-    """Stand in for the agent run; the tool reads only its model settings."""
-    return cast("RunContext[Any]", SimpleNamespace(model_settings=model_settings))
+def _ctx(
+    model_settings: dict[str, Any] | None = None,
+    *,
+    deps: ToolApprovalDeps | None = None,
+    tool_call_approved: bool = True,
+) -> RunContext[Any]:
+    """Stand in for the agent run; the tool reads its model settings and approval state.
+
+    Defaults to a call the user already approved, so tests about generating the
+    image are not stopped by the approval gate.
+    """
+    return cast(
+        "RunContext[Any]",
+        SimpleNamespace(
+            model_settings=model_settings,
+            deps=deps or ToolApprovalDeps(),
+            tool_call_approved=tool_call_approved,
+        ),
+    )
 
 
 def _image_artifact_response(image_bytes: bytes, image_format: str = "png") -> dict[str, Any]:
@@ -157,6 +174,38 @@ class TestGenerateImage:
         body = patch_transport.requests[0].read().decode()
         assert "a red bird" in body
         assert "gpt-image-1-mini" in body
+
+    async def test_asks_before_spending_credits(
+        self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
+    ) -> None:
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        with pytest.raises(ApprovalRequired):
+            await toolset.generate_image(_ctx(deps=ToolApprovalDeps(), tool_call_approved=False), "a red bird")
+
+        assert patch_transport.requests == []
+
+    @pytest.mark.parametrize(
+        ("deps", "tool_call_approved"),
+        [
+            (ToolApprovalDeps(), True),
+            (ToolApprovalDeps(granted=frozenset({"generate_image"})), False),
+        ],
+        ids=["approved-call", "granted-for-conversation"],
+    )
+    async def test_runs_without_asking_once_approved(
+        self,
+        static_files: _FakeStaticFilesManager,
+        patch_transport: _TransportRecorder,
+        deps: ToolApprovalDeps,
+        *,
+        tool_call_approved: bool,
+    ) -> None:
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        await toolset.generate_image(_ctx(deps=deps, tool_call_approved=tool_call_approved), "a red bird")
+
+        assert len(patch_transport.requests) == 1
 
     async def test_sends_the_runs_extra_headers(
         self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder

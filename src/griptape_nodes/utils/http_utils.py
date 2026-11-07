@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
 
@@ -51,6 +52,7 @@ def request_with_retry(
     *,
     max_attempts: int = RETRY_MAX_ATTEMPTS,
     wait: WaitBaseT = DEFAULT_RETRY_WAIT,
+    should_retry: Callable[[BaseException], bool] = is_retryable_httpx_error,
     **kwargs: Any,
 ) -> httpx2.Response:
     """Make an HTTP request with automatic retries on transient errors.
@@ -63,6 +65,7 @@ def request_with_retry(
         url: The URL to request.
         max_attempts: Maximum number of retry attempts.
         wait: Tenacity wait strategy for backoff between retries.
+        should_retry: Decides whether a raised exception is retried.
         **kwargs: Passed through to httpx2.request.
 
     Returns:
@@ -70,7 +73,7 @@ def request_with_retry(
     """
 
     @retry(
-        retry=retry_if_exception(is_retryable_httpx_error),
+        retry=retry_if_exception(should_retry),
         wait=wait,
         stop=stop_after_attempt(max_attempts),
         before_sleep=before_sleep_log(logger, logging.WARNING),

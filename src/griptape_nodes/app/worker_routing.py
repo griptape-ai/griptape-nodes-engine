@@ -6,7 +6,7 @@ there. This module provides:
 
 - ``LOCAL_ONLY_REQUEST_TYPES``: the request classes a worker answers ITSELF. Every other
   registered type gets a ``RemoteHandler`` that forwards to the orchestrator.
-- ``RemoteHandler``: an async callable that replaces the original manager
+- ``RemoteHandler``: a ``ForwardingHandler`` that replaces the original manager
   handler for those request types on the worker. While the worker is actively
   executing a node it forwards; outside that scope it delegates back to the
   original local handler (which preserves bootstrap / library-load behavior).
@@ -46,7 +46,9 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
 )
 from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
-from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    MigrateParameterRequest,
+)
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
@@ -66,18 +68,22 @@ from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileUploadUrlRequest,
 )
 from griptape_nodes.retained_mode.events.worker_events import (
+    DropLibraryNamedLocalObjectsRequest,
+    DropLibraryNamedLocalObjectsResultFailure,
+    DropLibraryNamedLocalObjectsResultSuccess,
     RegisterWorkerRequest,
     StartWorkerRequest,
     UnregisterWorkerRequest,
     WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Coroutine, Iterator
     from types import ModuleType
 
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
@@ -128,7 +134,14 @@ class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
 
     SkipTheLineMixin for the same reason as its siblings: the alternative is a queued ExecuteNodeRequest
     running against objects belonging to a workflow that is already gone.
+
+    A field rather than the envelope's `open_workflow_id`, because the envelope names a workflow open
+    in the receiving engine and a worker opens none.
     """
+
+    # The orchestrator workflow that closed, so only its objects and runtime go. None when every
+    # workflow did.
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -257,10 +270,12 @@ _LOCAL_ONLY_ARTIFACT_REQUESTS: frozenset[type[RequestPayload]] = frozenset(
 )
 
 
-# OpenAssociatedFileRequest is the one filesystem request deliberately NOT local: it hands a path to
-# the OS to open in the user's default application, and that side effect belongs where the user is,
-# not in a headless subprocess.
-_FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os_events.OpenAssociatedFileRequest})
+# The filesystem requests deliberately NOT local: each hands a path to an application on the user's
+# desktop (the OS default one, or the viewer they configured), and that side effect belongs where the
+# user is, not in a headless subprocess.
+_FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset(
+    {os_events.OpenAssociatedFileRequest, os_events.LaunchExternalViewerRequest}
+)
 
 
 # Swept wholesale, minus _FORWARDING_FILESYSTEM_REQUESTS: the workspace is shared on disk, so the
@@ -355,6 +370,7 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # a RemoteHandler forwards.
         DropAllLocalObjectsRequest,
         DropLocalObjectsRequest,
+        DropLibraryNamedLocalObjectsRequest,
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
@@ -406,28 +422,35 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
 
 
 @dataclass
-class RemoteHandler:
+class RemoteHandler(ForwardingHandler):
     """Worker-side dispatch shim.
 
     Registered in place of the original manager handler for every registered type except
     LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
     inside a ``node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
+    A worker rebuilding its copy of a node never reaches this shim: inside
+    ``EventManager.rebuild_scope`` the dispatcher calls ``original`` directly.
 
     ``original`` is the handler this shim replaced and MUST be retained so the
     out-of-scope fallback can still service requests that bootstrap code makes
-    (e.g. ``self.add_parameter(...)`` issuing ``AddParameterToNodeRequest``
-    from a node's ``__init__`` under a LOAD_PROBE scope).
+    (e.g. ``self.add_parameter(...)`` issuing ``AddParameterToNodeRequest`` from
+    a node's ``__init__``, which runs before the execution scope opens).
     """
 
     original: Any  # HandlerCallback; typed loosely to avoid a runtime import cycle
     event_manager: EventManager
 
-    async def __call__(self, request: RequestPayload) -> ResultPayload:
-        if self.event_manager.in_node_execution():
-            event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
-            return cast("ResultPayload", event_result.result)
-        return await call_function(self.original, request)
+    def forwards_now(self) -> bool:
+        """Whether a call made now goes to the orchestrator: only while this worker runs a node."""
+        return self.event_manager.in_node_execution()
+
+    async def forward(self, request: RequestPayload) -> ResultPayload:
+        event_result = await self.event_manager.forward_to_orchestrator(request, ResultContext())
+        return cast("ResultPayload", event_result.result)
+
+    async def handle_locally(self, request: RequestPayload, **kwargs: Any) -> ResultPayload:
+        return await call_function(self.original, request, **kwargs)
 
 
 def schedule_broadcast(broadcast_type: type[RequestPayload]) -> None:
@@ -461,6 +484,9 @@ def register_remote_handlers(event_manager: EventManager) -> None:
     Must be called after every manager has finished registering (i.e. after the engine is
     constructed) AND after ``configure_worker_forwarding`` has supplied the RequestClient,
     topic, and loop references. See ``_run_worker`` in app.py.
+
+    A swapped type keeps its scope (``RequestScope``): dispatch hands the workflow that scope passes
+    to ``RemoteHandler.handle_locally``, which hands it to the original.
     """
     for request_type in event_manager.registered_request_types():
         if request_type in LOCAL_ONLY_REQUEST_TYPES:
@@ -469,36 +495,42 @@ def register_remote_handlers(event_manager: EventManager) -> None:
         if original is None:
             continue
         remote = RemoteHandler(original=original, event_manager=event_manager)
-        event_manager.remove_manager_from_request_type(request_type)
-        event_manager.assign_manager_to_request_type(request_type, remote)
+        event_manager.replace_manager_for_request_type(request_type, remote)
 
 
 async def _handle_drop_all_local_objects(
-    request: DropAllLocalObjectsRequest,  # noqa: ARG001
+    request: DropAllLocalObjectsRequest,
     *,
     event_manager: EventManager,
 ) -> ResultPayload:
-    """Release every object this process is holding for its libraries.
+    """Release the objects this process is holding for its libraries for the workflow that closed, or all of them.
 
     Accepted while a node is executing, like its targeted sibling: the store takes the entries out now and
     holds their release hooks back until nothing is running, so a forward pass mid-flight keeps the object
     it is already holding. The cost is that a node which has not run yet asks for a library-named key and is
     told no, and pays to rebuild -- on a workflow that is being torn down.
 
+    The orchestrator sends this when it tears a workflow down, so the runtime this worker keeps for
+    that workflow goes too, unless a node is still running in it. Naming no workflow, every workflow
+    was torn down: every object goes, and every runtime no node is running in.
+
     Takes the event manager because that is how it reaches this engine; the process-global engine would
     silently no-op for an engine an embedder built directly.
     """
     resource_manager = event_manager.engine.resource_manager
+    event_manager.engine.sweep_worker_workflows(request.workflow_id)
 
     try:
         # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
         # worker's loop past the heartbeat timeout gets it evicted mid-load.
-        dropped = await to_thread(resource_manager.drop_all_local_objects)
+        if request.workflow_id is None:
+            dropped = await to_thread(resource_manager.drop_all_local_objects)
+        else:
+            dropped = await to_thread(resource_manager.drop_objects_for_workflow, request.workflow_id)
     except Exception as e:
         details = (
             f"Attempted to release objects held for this worker's libraries. Failed because of {type(e).__name__}: {e}."
         )
-        logger.error(details)
         return DropAllLocalObjectsResultFailure(result_details=details)
     return DropAllLocalObjectsResultSuccess(result_details=f"Released {dropped} held object(s).")
 
@@ -531,9 +563,60 @@ async def _handle_drop_local_objects(
         dropped = await to_thread(release_all)
     except Exception as e:
         details = f"Attempted to release {len(request.keys)} held object(s). Failed because of {type(e).__name__}: {e}."
-        logger.error(details)
         return DropLocalObjectsResultFailure(result_details=details)
     return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
+
+
+async def _handle_drop_library_named_local_objects(
+    request: DropLibraryNamedLocalObjectsRequest,  # noqa: ARG001
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release the objects this process's libraries named themselves, keeping what the engine parked."""
+    resource_manager = event_manager.engine.resource_manager
+
+    try:
+        # Off the loop for the same reason as its siblings: a release hook is `del model` plus a CUDA
+        # cache flush, and a worker whose loop is blocked past the heartbeat timeout is evicted.
+        dropped = await to_thread(resource_manager.drop_library_named_local_objects)
+    except Exception as e:
+        details = (
+            "Attempted to release what this worker's libraries keep between runs. "
+            f"Failed because of {type(e).__name__}: {e}."
+        )
+        return DropLibraryNamedLocalObjectsResultFailure(result_details=details)
+    return DropLibraryNamedLocalObjectsResultSuccess(result_details=f"Released {dropped} library-named object(s).")
+
+
+async def _adopt_on_engine_loop(
+    request: ActivateProjectRequest,
+    adopt: Callable[[ActivateProjectRequest], Coroutine[Any, Any, ResultPayload]],
+    *,
+    event_manager: EventManager,
+    worker_settled: asyncio.Event,
+) -> ResultPayload:
+    """Run `adopt` on the engine loop, and settle the worker once it succeeds.
+
+    ActivateProjectRequest arrives on the transport loop, which also answers heartbeats. Adoption is a
+    whole project switch, with file I/O and synchronous requests that block the loop they run on, so it
+    runs on the engine loop and is only awaited here.
+    """
+    engine_loop = event_manager.event_loop
+    if engine_loop is None:
+        details = (
+            f"Attempted to adopt orchestrator project '{request.project_id}'. "
+            f"Failed because this worker's engine event loop is not running."
+        )
+        return ActivateProjectResultFailure(result_details=details)
+
+    adoption = asyncio.run_coroutine_threadsafe(adopt(request), engine_loop)
+    result = await asyncio.wrap_future(adoption)
+
+    # Set on this loop, not the engine loop: worker startup waits on it here, and asyncio.Event is not
+    # safe to set from another thread.
+    if result.succeeded():
+        worker_settled.set()
+    return result
 
 
 def register_broadcast_handlers(
@@ -568,7 +651,6 @@ def register_broadcast_handlers(
             config_manager.load_configs()
         except Exception as e:
             details = f"Attempted to reload config from disk. Failed because of {type(e).__name__}: {e}."
-            logger.error(details)
             return ReloadConfigResultFailure(result_details=details)
         return ReloadConfigResultSuccess(result_details="Reloaded config from disk.")
 
@@ -577,7 +659,6 @@ def register_broadcast_handlers(
             secrets_manager.refresh_from_env_file()
         except Exception as e:
             details = f"Attempted to refresh secrets from shared .env file. Failed because of {type(e).__name__}: {e}."
-            logger.error(details)
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
@@ -591,6 +672,11 @@ def register_broadcast_handlers(
     adoption_lock = asyncio.Lock()
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
+        return await _adopt_on_engine_loop(
+            request, _adopt_project, event_manager=event_manager, worker_settled=worker_settled
+        )
+
+    async def _adopt_project(request: ActivateProjectRequest) -> ResultPayload:
         # A concurrent ReloadConfigRequest is safe to interleave with this: _activate_project does
         # clear_project_layers() plus a full re-merge, so a load_configs() landing alongside it only
         # refreshes the user layer idempotently.
@@ -603,7 +689,6 @@ def register_broadcast_handlers(
             if project_manager.is_stale_adoption(request.project_id, request.generation):
                 # Settled, not adopted: a newer activation already landed, so whatever is waiting
                 # on this has the answer it needs.
-                worker_settled.set()
                 return ActivateProjectResultSuccess(
                     result_details=(
                         f"Skipped adopting project '{request.project_id}' (generation "
@@ -616,7 +701,6 @@ def register_broadcast_handlers(
                     f"Failed because the id is absent from the worker's registry even after "
                     f"reloading config and re-running registered-project discovery."
                 )
-                logger.error(details)
                 return ActivateProjectResultFailure(result_details=details)
 
             set_result = await project_manager.on_set_current_project_request(
@@ -627,10 +711,8 @@ def register_broadcast_handlers(
                     f"Attempted to adopt orchestrator project '{request.project_id}'. "
                     f"Failed with result: {set_result.result_details}"
                 )
-                logger.error(details)
                 return ActivateProjectResultFailure(result_details=details)
             project_manager.record_adopted_generation(request.generation)
-            worker_settled.set()
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
@@ -643,7 +725,7 @@ def register_broadcast_handlers(
 
 
 def _register_local_object_handlers(event_manager: EventManager) -> None:
-    """Wire the two teardown requests that free objects this worker is holding."""
+    """Wire the teardown requests that free objects this worker is holding."""
 
     async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
         return await _handle_drop_all_local_objects(request, event_manager=event_manager)
@@ -654,3 +736,10 @@ def _register_local_object_handlers(event_manager: EventManager) -> None:
         return await _handle_drop_local_objects(request, event_manager=event_manager)
 
     event_manager.assign_manager_to_request_type(DropLocalObjectsRequest, handle_drop_local_objects)
+
+    async def handle_drop_library_named_local_objects(request: DropLibraryNamedLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_library_named_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(
+        DropLibraryNamedLocalObjectsRequest, handle_drop_library_named_local_objects
+    )

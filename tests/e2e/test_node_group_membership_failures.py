@@ -38,6 +38,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     RemoveNodeFromNodeGroupResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -107,6 +108,7 @@ def _fail_the_second_move_into(engine: Engine, target_flow_name: str, monkeypatc
     """
     event_manager = engine.event_manager
     real_handler = event_manager._request_type_to_manager[MoveNodeToNewFlowRequest]
+    assert not isinstance(real_handler, ForwardingHandler)
     moves_into_target = 0
 
     def refuse_the_second_move_in(request: MoveNodeToNewFlowRequest) -> object:
@@ -291,7 +293,7 @@ class TestFailedRemove:
             inner = _get_group(engine, inner_name)
             inner_subflow = inner.metadata["subflow_name"]
             outer_subflow = _get_group(engine, outer_name).metadata["subflow_name"]
-            assert engine.flow_manager.get_parent_flow(inner_subflow) == outer_subflow
+            assert engine.flow_manager.get_parent_flow_in(engine.current_workflow(), inner_subflow) == outer_subflow
 
             result = engine.handle_request(
                 RemoveNodeFromNodeGroupRequest(node_names=[inner_name], node_group_name=outer_name)
@@ -300,7 +302,7 @@ class TestFailedRemove:
         assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess), result
 
         # The inner group's subflow follows it out, so its Leaf is still reachable from the top.
-        assert engine.flow_manager.get_parent_flow(inner_subflow) == flow.flow_name
+        assert engine.flow_manager.get_parent_flow_in(engine.current_workflow(), inner_subflow) == flow.flow_name
         assert _flow_of(engine, inner_name) == flow.flow_name
 
 
@@ -330,7 +332,7 @@ class TestDeletedGroup:
 
             inner_subflow = _get_group(engine, inner_name).metadata["subflow_name"]
             outer_subflow = _get_group(engine, outer_name).metadata["subflow_name"]
-            assert engine.flow_manager.get_parent_flow(inner_subflow) == outer_subflow
+            assert engine.flow_manager.get_parent_flow_in(engine.current_workflow(), inner_subflow) == outer_subflow
             assert _flow_of(engine, leaf_name) == inner_subflow
 
             delete_result = engine.handle_request(DeleteNodeRequest(node_name=outer_name))
@@ -348,6 +350,6 @@ class TestDeletedGroup:
 
         # ...and it took its own subflow, and everything in it, along.
         assert engine.object_manager.attempt_get_object_by_name(inner_subflow) is not None
-        assert engine.flow_manager.get_parent_flow(inner_subflow) == flow.flow_name
+        assert engine.flow_manager.get_parent_flow_in(engine.current_workflow(), inner_subflow) == flow.flow_name
         assert leaf_name in inner.nodes
         assert _flow_of(engine, leaf_name) == inner_subflow

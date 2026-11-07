@@ -30,6 +30,10 @@ the app. If the app is already running, quit it first.
 The app reads the policy once at launch. Changes to the file take effect the
 next time the app starts.
 
+To disable updates for one app run, use
+[`GTN_DESKTOP_DISABLE_UPDATES`](../guides/desktop/environment_variables.md).
+It cannot re-enable updates disabled by `policy.json`.
+
 ## What users see
 
 ![The Updates section of App Settings with the message "Updates are disabled by your organization" above the disabled Check for Updates button, Update Behavior menu, and Release Channel menu](../assets/img/enterprise/disabling_app_updates-updates_disabled.png)

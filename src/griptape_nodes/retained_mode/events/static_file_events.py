@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from griptape_nodes.common.macro_parser import MacroVariables
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.retained_mode.events.base_events import (
+    AppPayload,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -205,3 +206,26 @@ class CreateStaticFileDownloadUrlResultFailure(WorkflowNotAlteredMixin, ResultPa
     """
 
     error: str
+
+
+@dataclass
+@PayloadRegistry.register
+class StaticFileChanged(AppPayload):
+    """A local file a client minted a download URL for changed on disk.
+
+    Sent while the `refresh_previews_on_file_change` setting is on, which it is by default. The engine watches
+    each local file passed to CreateStaticFileDownloadUrlFromPathRequest and sends this event when
+    one is saved or replaced, whether by a node or by another app. Clients respond by sending the
+    request again: the new URL carries a new `?v=` version, and a requested preview is regenerated.
+
+    Not sent for Griptape Cloud files, under the Griptape Cloud storage backend, or by workers.
+
+    Args:
+        file_path: Absolute path of the file that changed.
+        requested_file_paths: The `file_path` of every CreateStaticFileDownloadUrlFromPathRequest
+            that resolved to this file, exactly as the client sent it (macro path, file:// URL,
+            absolute or workspace-relative path). Clients match their previews against these.
+    """
+
+    file_path: str
+    requested_file_paths: list[str]

@@ -24,9 +24,10 @@ from urllib.parse import urlsplit
 
 import httpx2
 from pydantic_ai import RunContext  # noqa: TC002 - pydantic-ai reads the annotation at runtime to find `ctx`
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.exceptions import ApprovalRequired, ModelRetry
 
-from griptape_nodes.drivers.cloud_credentials import DEFAULT_CLOUD_BASE_URL
+from griptape_nodes.agents.pydantic_ai.tool_approval import needs_approval
+from griptape_nodes.drivers.cloud_credentials import DEFAULT_CLOUD_BASE_URL, join_cloud_url
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_exception
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
@@ -90,7 +91,7 @@ class ImageGenerationToolset:
     def __init__(self, config: ImageGenerationToolsetConfig, static_files_manager: StaticFilesManager) -> None:
         self._config = config
         self._static_files_manager = static_files_manager
-        self._base_url = config.base_url.rstrip("/")
+        self._base_url = config.base_url
         self._headers = {"Authorization": f"Bearer {config.api_key}"}
 
     @property
@@ -106,7 +107,8 @@ class ImageGenerationToolset:
 
         Args:
             ctx: The agent run. Its ``extra_headers`` go on the Cloud request, so
-                the image is billed to the same project as the reply around it.
+                the image is billed to the same project as the reply around it,
+                and its ``deps`` say whether the user must approve the call.
             prompt: Text description of the image to generate.
             negative_prompt: Optional description of what to avoid. Sent to the
                 model when non-empty.
@@ -119,6 +121,11 @@ class ImageGenerationToolset:
             msg = "generate_image requires a non-empty `prompt`."
             raise ModelRetry(msg)
 
+        # Checked in the body rather than by wrapping a toolset, because the tool
+        # is registered directly on the agent.
+        if not ctx.tool_call_approved and needs_approval(ctx.deps, [IMAGE_TOOL_NAME]):
+            raise ApprovalRequired
+
         payload: dict[str, object] = {
             "prompts": [prompt],
             "driver_configuration": self._driver_configuration(),
@@ -126,7 +133,7 @@ class ImageGenerationToolset:
         if negative_prompt.strip():
             payload["negative_prompts"] = [negative_prompt]
 
-        url = f"{self._base_url}/api/images/generations"
+        url = join_cloud_url(self._base_url, "/api/images/generations")
         # Recoverable Cloud/parse failures are surfaced as ModelRetry so a single
         # bad image request does not abort the whole agent turn (and discard any
         # state already mutated by earlier tool calls); the model can retry or

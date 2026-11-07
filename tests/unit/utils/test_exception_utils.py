@@ -5,6 +5,15 @@ from __future__ import annotations
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
 
+class _MissingSettingError(KeyError):
+    def __str__(self) -> str:
+        return f"Setting {self.args[0]!r} is missing"
+
+
+class _PlainKeySubclassError(KeyError):
+    pass
+
+
 class TestReadableExceptionMessage:
     def test_key_error_message_drops_its_repr_quoting(self) -> None:
         # str() on a KeyError reprs its argument, which would show a quoted sentence.
@@ -20,6 +29,14 @@ class TestReadableExceptionMessage:
 
     def test_key_error_with_several_args_keeps_its_repr(self) -> None:
         assert readable_exception_message(KeyError("library", "node")) == "('library', 'node')"
+
+    def test_key_error_subclass_with_its_own_str_keeps_it(self) -> None:
+        assert readable_exception_message(_MissingSettingError("strength")) == "Setting 'strength' is missing"
+
+    def test_key_error_subclass_without_its_own_str_drops_the_quoting(self) -> None:
+        assert (
+            readable_exception_message(_PlainKeySubclassError("Library L has no node N")) == "Library L has no node N"
+        )
 
     def test_other_exceptions_keep_their_message(self) -> None:
         assert readable_exception_message(ValueError("bad value")) == "bad value"

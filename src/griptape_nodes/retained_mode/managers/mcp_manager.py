@@ -151,7 +151,6 @@ class MCPManager:
         try:
             servers = self._get_mcp_servers()
         except Exception as e:
-            logger.error("Failed to list MCP servers: %s", e)
             return ListMCPServersResultFailure(result_details=f"Failed to list MCP servers: {e}")
 
         if request.include_disabled:
@@ -193,7 +192,6 @@ class MCPManager:
         try:
             servers = self._get_mcp_servers()
         except Exception as e:
-            logger.error("Failed to create MCP server '%s': %s", request.name, e)
             return CreateMCPServerResultFailure(result_details=f"Failed to create MCP server '{request.name}': {e}")
 
         # Check if server already exists
@@ -232,7 +230,6 @@ class MCPManager:
         try:
             self._save_mcp_servers(servers)
         except Exception as e:
-            logger.error("Failed to save MCP server '%s': %s", request.name, e)
             return CreateMCPServerResultFailure(result_details=f"Failed to save MCP server '{request.name}': {e}")
 
         # Success path after exception handling
@@ -267,7 +264,6 @@ class MCPManager:
         try:
             self._save_mcp_servers(updated_servers)
         except Exception as e:
-            logger.error("Failed to save MCP server '%s': %s", request.name, e)
             return UpdateMCPServerResultFailure(result_details=f"Failed to save MCP server '{request.name}': {e}")
 
         # Success path after exception handling
@@ -294,7 +290,6 @@ class MCPManager:
             self._save_mcp_servers(servers)
 
         except Exception as e:
-            logger.error("Failed to delete MCP server '%s': %s", request.name, e)
             return DeleteMCPServerResultFailure(result_details=f"Failed to delete MCP server '{request.name}': {e}")
 
         if not server_found:
@@ -329,7 +324,6 @@ class MCPManager:
         try:
             self._save_mcp_servers(servers)
         except Exception as e:
-            logger.error("Failed to save MCP server '%s': %s", request.name, e)
             return EnableMCPServerResultFailure(result_details=f"Failed to save MCP server '{request.name}': {e}")
 
         # Success path after exception handling
@@ -359,7 +353,6 @@ class MCPManager:
         try:
             self._save_mcp_servers(servers)
         except Exception as e:
-            logger.error("Failed to save MCP server '%s': %s", request.name, e)
             return DisableMCPServerResultFailure(result_details=f"Failed to save MCP server '{request.name}': {e}")
 
         # Success path after exception handling
@@ -385,7 +378,6 @@ class MCPManager:
             servers_dict = {server.name: server.model_dump() for server in enabled_servers}
 
         except Exception as e:
-            logger.error("Failed to get enabled MCP servers: %s", e)
             return GetEnabledMCPServersResultFailure(result_details=f"Failed to get enabled MCP servers: {e}")
 
         # Success path after exception handling

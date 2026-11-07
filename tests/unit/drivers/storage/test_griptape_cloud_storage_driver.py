@@ -209,10 +209,8 @@ class TestGriptapeCloudStorageDriverParseCloudAssetPath:
         assert "https://cloud.griptape.ai" in error_message
         assert "cloud.griptape.ai" in error_message
 
-        # Verify error was also logged
-        assert len(caplog.records) == 1
-        assert caplog.records[0].levelno == logging.ERROR
-        assert "Invalid cloud asset URL" in caplog.records[0].message
+        # The caller reports the raised error, so the driver does not log it too.
+        assert not caplog.records
 
     def test_parse_full_url_with_nested_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
         """Full URL with nested path after assets should extract correctly."""
@@ -526,3 +524,40 @@ class TestGriptapeCloudStorageDriverDeleteFile:
             pytest.raises(RuntimeError, match="Failed to delete file"),
         ):
             cloud_storage_driver.delete_file(TEST_FILE_PATH)
+
+
+class TestGriptapeCloudStorageDriverBaseUrlPath:
+    """Test that requests and asset URLs keep the path on base_url."""
+
+    @pytest.fixture
+    def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
+        return GriptapeCloudStorageDriver(
+            Mock(workspace_path=Path("/workspace")),
+            bucket_id=TEST_BUCKET_ID,
+            api_key=TEST_API_KEY,
+            base_url="https://example.com/prefix",
+        )
+
+    def test_create_signed_download_url_keeps_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        mock_response = Mock()
+        mock_response.json.return_value = {"url": "https://signed.url/file.txt"}
+
+        with patch.object(cloud_storage_driver, "_request", return_value=mock_response) as mock_request:
+            cloud_storage_driver.create_signed_download_url(TEST_FILE_PATH)
+
+        args, _ = mock_request.call_args
+        assert args[1] == f"https://example.com/prefix/api/buckets/{TEST_BUCKET_ID}/asset-urls/{TEST_FILE_PATH}"
+
+    def test_get_asset_url_keeps_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        result = cloud_storage_driver.get_asset_url(TEST_FILE_PATH)
+
+        assert result == f"https://example.com/prefix/buckets/{TEST_BUCKET_ID}/assets/{TEST_FILE_PATH}"
+
+    def test_list_buckets_keeps_path(self) -> None:
+        with patch("griptape_nodes.drivers.storage.griptape_cloud_storage_driver.request_with_retry") as mock_request:
+            mock_request.return_value = Mock(json=Mock(return_value={"buckets": []}))
+
+            GriptapeCloudStorageDriver.list_buckets(base_url="https://example.com/prefix", api_key=TEST_API_KEY)
+
+        args, _ = mock_request.call_args
+        assert args[1] == "https://example.com/prefix/api/buckets"

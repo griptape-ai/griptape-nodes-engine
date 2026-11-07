@@ -1,6 +1,7 @@
 """Unit tests for workflow_metadata.py provenance collection functions."""
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -8,9 +9,8 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
-    _collect_parameter_values,
-    _collect_raw_provenance,
     _collect_workflow_info,
+    _parameter_values_of,
     collect_sidecar_provenance,
     collect_workflow_metadata,
 )
@@ -26,30 +26,6 @@ def _make_param(
     return param, value
 
 
-def _make_engine(
-    *,
-    has_workflow: bool = True,
-    workflow_name: str = "test_workflow",
-    has_flow: bool = True,
-    flow_name: str = "ControlFlow_1",
-    resolving_nodes: list[str] | None = None,
-) -> Mock:
-    """Build a minimal mock engine for provenance tests."""
-    engine = Mock()
-    ctx = engine.context_manager
-    ctx.has_current_workflow.return_value = has_workflow
-    ctx.get_current_workflow_name.return_value = workflow_name
-    ctx.has_current_flow.return_value = has_flow
-
-    flow = Mock()
-    flow.name = flow_name
-    ctx.get_current_flow.return_value = flow
-    engine.flow_manager.flow_state.return_value = (None, resolving_nodes or [], None)
-    engine.workflow_registry.get_workflow_by_name.side_effect = KeyError
-
-    return engine
-
-
 class TestCollectWorkflowInfo:
     def test_returns_name_when_registry_lookup_fails(self) -> None:
         engine = Mock()
@@ -60,8 +36,6 @@ class TestCollectWorkflowInfo:
         assert result == {"name": "my_workflow"}
 
     def test_includes_dates_and_version_when_present(self) -> None:
-        from datetime import UTC, datetime
-
         workflow = Mock()
         workflow.metadata.creation_date = datetime(2026, 1, 1, tzinfo=UTC)
         workflow.metadata.last_modified_date = datetime(2026, 6, 1, tzinfo=UTC)
@@ -94,26 +68,13 @@ class TestCollectWorkflowInfo:
         assert result == {"name": "my_workflow"}
 
 
-class TestCollectParameterValues:
-    def test_returns_none_when_node_not_found(self, caplog: pytest.LogCaptureFixture) -> None:
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = None
-
+class TestParameterValuesOf:
+    def test_returns_none_when_there_is_no_node(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _collect_parameter_values("missing_node", engine)
+            result = _parameter_values_of("missing_node", None)
 
         assert result is None
         assert "missing_node" in caplog.text
-
-    def test_returns_none_when_node_lookup_raises(self, caplog: pytest.LogCaptureFixture) -> None:
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.side_effect = RuntimeError("boom")
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _collect_parameter_values("bad_node", engine)
-
-        assert result is None
-        assert "bad_node" in caplog.text
 
     def test_collects_non_excluded_parameters(self) -> None:
         p1, _ = _make_param("prompt", value=None)
@@ -126,10 +87,7 @@ class TestCollectParameterValues:
         node.parameters = [p1, p2]
         node._get_raw_parameter_value.side_effect = values.get
 
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
-
-        result = _collect_parameter_values("my_node", engine)
+        result = _parameter_values_of("my_node", node)
 
         assert result is not None
         assert result.values == {"prompt": "hello", "model": "gpt-4"}
@@ -146,10 +104,7 @@ class TestCollectParameterValues:
         node.parameters = [pub, priv]
         node._get_raw_parameter_value.side_effect = values.get
 
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
-
-        result = _collect_parameter_values("my_node", engine)
+        result = _parameter_values_of("my_node", node)
 
         assert result is not None
         assert "password" not in result.values
@@ -165,10 +120,7 @@ class TestCollectParameterValues:
         node.parameters = [p]
         node._get_raw_parameter_value.return_value = None
 
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
-
-        result = _collect_parameter_values("my_node", engine)
+        result = _parameter_values_of("my_node", node)
 
         assert result is not None
         assert result.values == {}
@@ -183,10 +135,7 @@ class TestCollectParameterValues:
         node.parameters = [p]
         node._get_raw_parameter_value.return_value = "some_value"
 
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
-
-        result = _collect_parameter_values("my_node", engine)
+        result = _parameter_values_of("my_node", node)
 
         assert result is not None
         assert result.values == {}
@@ -203,82 +152,55 @@ class TestCollectParameterValues:
         node.parameters = [p1, p2, p3]
         node._get_raw_parameter_value.side_effect = values.get
 
-        engine = Mock()
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
-
-        result = _collect_parameter_values("my_node", engine)
+        result = _parameter_values_of("my_node", node)
 
         assert result is not None
         assert set(result.omitted) == {"api_password", "db_password"}
         assert result.values == {"prompt": "hello"}
 
 
-class TestCollectRawProvenance:
-    def test_returns_empty_when_no_workflow_context(self) -> None:
-        engine = _make_engine(has_workflow=False)
-
-        result = _collect_raw_provenance(engine)
-
-        assert result == {}
-
-    def test_returns_workflow_only_when_no_flow(self) -> None:
-        engine = _make_engine(has_flow=False)
-
-        result = _collect_raw_provenance(engine)
-
-        assert "workflow" in result
-        assert "flow" not in result
-
-    def test_includes_flow_and_resolving_nodes(self) -> None:
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = None
-
-        result = _collect_raw_provenance(engine)
-
-        assert result["flow"]["name"] == "ControlFlow_1"
-        assert result["flow"]["resolving_nodes"] == ["MyNode"]
-
-    def test_parameters_omitted_present_for_excluded_params(self) -> None:
-        priv, _ = _make_param("password", exclude_from_metadata=True, value=None)
-        pub, _ = _make_param("prompt", value=None)
-
-        param_values = {"password": "secret", "prompt": "hi"}
-        node = Mock()
-        # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.contains_a_parked_object.return_value = False
-        node.parameters = [priv, pub]
-        node._get_raw_parameter_value.side_effect = param_values.get
-
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
-
-        result = _collect_raw_provenance(engine)
-
-        assert "parameters_omitted" in result
-        assert "password" in result["parameters_omitted"]
-        assert "password" not in result.get("parameters", {})
-
-    def test_no_parameters_key_when_no_resolving_nodes(self) -> None:
-        engine = _make_engine(resolving_nodes=[])
-
-        result = _collect_raw_provenance(engine)
-
-        assert "parameters" not in result
+def _make_workflow(
+    engine: Mock,
+    *,
+    workflow_name: str = "test_workflow",
+    has_flow: bool = True,
+    flow_name: str = "ControlFlow_1",
+    resolving_nodes: list[str] | None = None,
+) -> Mock:
+    """Build a mock workflow runtime, and answer the engine's per-workflow lookups for it."""
+    workflow = Mock()
+    workflow.workflow_id = "wf-1"
+    workflow.context.has_current_flow.return_value = has_flow
+    flow = Mock()
+    flow.name = flow_name
+    workflow.context.get_current_flow.return_value = flow
+    workflow.objects.get_as_type.return_value = None
+    engine.flow_manager.flow_state_in.return_value = (None, resolving_nodes or [], None)
+    engine.workflow_registry.get.return_value.name = workflow_name
+    return workflow
 
 
 class TestCollectSidecarProvenance:
-    def test_empty_when_no_context(self) -> None:
-        engine = _make_engine(has_workflow=False)
+    def test_with_no_workflow_records_nothing(self) -> None:
+        engine = Mock()
 
-        result = collect_sidecar_provenance(engine)
+        assert collect_sidecar_provenance(engine, None) == {}
 
-        assert result == {}
+    def test_reads_the_given_workflow(self) -> None:
+        engine = Mock()
+        workflow = _make_workflow(engine, workflow_name="given", flow_name="GivenFlow")
+
+        result = collect_sidecar_provenance(engine, workflow)
+
+        assert result["workflow"]["name"] == "given"
+        assert result["flow"]["name"] == "GivenFlow"
+        engine.workflow_registry.get.assert_called_with("wf-1")
 
     def test_flow_block_uses_first_resolving_node_as_node_name(self) -> None:
-        engine = _make_engine(resolving_nodes=["NodeA", "NodeB"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = None
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["NodeA", "NodeB"])
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert result["flow"]["node_name"] == "NodeA"
         assert "resolving_nodes" not in result["flow"]
@@ -294,10 +216,11 @@ class TestCollectSidecarProvenance:
         node.parameters = [priv, pub]
         node._get_raw_parameter_value.side_effect = param_values.get
 
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["MyNode"])
+        workflow.objects.get_as_type.return_value = node
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert result["parameters"] == {"prompt": "hi"}
         assert result["parameters_omitted"] == ["password"]
@@ -311,18 +234,20 @@ class TestCollectSidecarProvenance:
         node.parameters = [pub]
         node._get_raw_parameter_value.return_value = "hello"
 
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["MyNode"])
+        workflow.objects.get_as_type.return_value = node
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert "parameters_omitted" not in result
         assert "prompt" in result["parameters"]
 
     def test_no_flow_block_when_no_flow_context(self) -> None:
-        engine = _make_engine(has_flow=False)
+        engine = Mock()
+        workflow = _make_workflow(engine, has_flow=False)
 
-        result = collect_sidecar_provenance(engine)
+        result = collect_sidecar_provenance(engine, workflow)
 
         assert "workflow" in result
         assert "flow" not in result
@@ -330,12 +255,25 @@ class TestCollectSidecarProvenance:
 
 
 class TestCollectWorkflowMetadata:
-    def test_returns_saved_at_with_no_context(self) -> None:
-        engine = _make_engine(has_workflow=False)
+    def test_returns_only_saved_at_with_no_workflow(self) -> None:
+        result = collect_workflow_metadata(Mock(), None)
 
-        result = collect_workflow_metadata(engine)
+        assert list(result) == ["gtn_saved_at"]
 
-        assert "gtn_saved_at" in result
+    def test_reads_the_given_workflow(self) -> None:
+        engine = Mock()
+        workflow = _make_workflow(engine, workflow_name="given", flow_name="GivenFlow", resolving_nodes=["MyNode"])
+
+        with patch(
+            "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
+            return_value=None,
+        ) as serialize:
+            result = collect_workflow_metadata(engine, workflow)
+
+        assert result["gtn_workflow_name"] == "given"
+        assert result["gtn_flow_name"] == "GivenFlow"
+        assert result["gtn_node_name"] == "MyNode"
+        serialize.assert_called_once_with(workflow, "GivenFlow")
 
     def test_excluded_params_excluded_from_png_metadata(self) -> None:
         priv, _ = _make_param("password", exclude_from_metadata=True, value=None)
@@ -348,14 +286,15 @@ class TestCollectWorkflowMetadata:
         node.parameters = [priv, pub]
         node._get_raw_parameter_value.side_effect = param_values.get
 
-        engine = _make_engine(resolving_nodes=["MyNode"])
-        engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
+        engine = Mock()
+        workflow = _make_workflow(engine, resolving_nodes=["MyNode"])
+        workflow.objects.get_as_type.return_value = node
 
         with patch(
             "griptape_nodes.retained_mode.file_metadata.workflow_metadata._serialize_flow",
             return_value=None,
         ):
-            result = collect_workflow_metadata(engine)
+            result = collect_workflow_metadata(engine, workflow)
 
         assert "gtn_param_prompt" in result
         assert "gtn_param_password" not in result

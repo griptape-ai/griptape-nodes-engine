@@ -7,7 +7,7 @@ These tests pin down the two invariants that replaced the old
    inside a ``node_execution_scope``. Outside that scope it delegates
    to the ``original`` handler it displaced, which preserves bootstrap and
    library-load behaviour (e.g. nodes calling ``self.add_parameter(...)``
-   during LOAD_PROBE).
+   from ``__init__``).
 2. ``register_remote_handlers`` swaps the dispatch table entry for every
    registered type outside ``LOCAL_ONLY_REQUEST_TYPES``, preserving the "one handler per
    request type" invariant enforced by ``assign_manager_to_request_type``.
@@ -16,9 +16,10 @@ These tests pin down the two invariants that replaced the old
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -42,6 +43,7 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
+    ResultPayload,
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
@@ -53,13 +55,26 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     GetPathForMacroRequest,
     GetSituationRequest,
+    SetCurrentProjectRequest,
+    SetCurrentProjectResultSuccess,
 )
 from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+
+
+# Workflow ids in the form the registry mints.
+_IDLE_WORKFLOW_ID = "361f2196d4584af88fa4b3600657c25f"
+_BUSY_WORKFLOW_ID = "2287671f711164a037bd38f349ccfd4c"
+_CLOSED_WORKFLOW_ID = "d8aa87c26072342180185408ae0f4c1c"
+_OPEN_WORKFLOW_ID = "a933aec213adcc9ec281ca7604260fa4"
 
 
 @dataclass(kw_only=True)
@@ -76,8 +91,17 @@ class _ProbeResult(ResultPayloadSuccess):
     seen_by: str
 
 
+async def _dispatch(handler: RemoteHandler, request: RequestPayload) -> ResultPayload:
+    """Dispatch `request` through `handler`'s event manager, with `handler` registered as a worker registers it."""
+    event_manager = handler.event_manager
+    event_manager.assign_manager_to_request_type(type(request), handler.original)
+    event_manager.replace_manager_for_request_type(type(request), handler)
+    result_event = await event_manager.ahandle_request(request)
+    return result_event.result
+
+
 class TestRemoteHandlerScopeGate:
-    """RemoteHandler must forward in-scope and delegate out-of-scope."""
+    """Dispatch forwards through a RemoteHandler in-scope and delegates out-of-scope."""
 
     @pytest.mark.asyncio
     async def test_out_of_scope_delegates_to_original(self) -> None:
@@ -91,11 +115,35 @@ class TestRemoteHandlerScopeGate:
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
         assert not event_manager.in_node_execution()
-        result = await handler(_ProbeRequest(marker="m1"))
+        result = await _dispatch(handler, _ProbeRequest(marker="m1"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "local:m1"
         assert call_count["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_passes_the_workflow_through(self) -> None:
+        event_manager = EventManager()
+        workflow = object()
+        seen: dict[str, object] = {}
+
+        async def original(request: _ProbeRequest, workflow: object) -> _ProbeResult:
+            seen["workflow"] = workflow
+            return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
+
+        handler = RemoteHandler(original=original, event_manager=event_manager)
+
+        await handler.handle_locally(_ProbeRequest(marker="m1"), workflow=workflow)
+
+        assert seen["workflow"] is workflow
+
+    def test_forwards_now_only_while_a_node_runs(self) -> None:
+        event_manager = EventManager()
+        handler = RemoteHandler(original=MagicMock(), event_manager=event_manager)
+
+        assert not handler.forwards_now()
+        with event_manager.node_execution_scope():
+            assert handler.forwards_now()
 
     @pytest.mark.asyncio
     async def test_in_scope_forwards_to_orchestrator(self) -> None:
@@ -123,7 +171,7 @@ class TestRemoteHandlerScopeGate:
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
         with event_manager.node_execution_scope():
-            result = await handler(_ProbeRequest(marker="m2"))
+            result = await _dispatch(handler, _ProbeRequest(marker="m2"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "orchestrator"
@@ -140,7 +188,7 @@ class TestRemoteHandlerScopeGate:
 
         handler = RemoteHandler(original=sync_original, event_manager=event_manager)
 
-        result = await handler(_ProbeRequest(marker="s1"))
+        result = await _dispatch(handler, _ProbeRequest(marker="s1"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "sync:s1"
@@ -153,6 +201,20 @@ class _StubResult(ResultPayloadSuccess):
 
 class TestInstallRemoteHandlersSwap:
     """register_remote_handlers forwards everything except the local-only exclusions."""
+
+    def test_swap_keeps_the_registered_scope(self) -> None:
+        """The wrapper takes its original's signature, so dispatch keeps calling it as it called the original."""
+        event_manager = EventManager()
+
+        async def original(_request: RequestPayload, workflow: object) -> _StubResult:  # noqa: ARG001
+            return _StubResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(CreateNodeRequest, original)
+
+        register_remote_handlers(event_manager)
+
+        assert isinstance(event_manager.get_manager_for_request_type(CreateNodeRequest), RemoteHandler)
+        assert event_manager.get_scope_for_request_type(CreateNodeRequest) is RequestScope.WORKFLOW
 
     def test_swap_replaces_every_registered_handler(self) -> None:
         event_manager = EventManager()
@@ -185,8 +247,8 @@ class TestInstallRemoteHandlersSwap:
         event_manager = EventManager()
         locals_registered: dict[type[RequestPayload], Any] = {}
         for request_type in LOCAL_ONLY_REQUEST_TYPES:
-
-            async def original(_request: RequestPayload) -> _StubResult:
+            # Optional, so it registers for any request type, including one that falls back to the only open workflow.
+            async def original(_request: RequestPayload, workflow: object | None = None) -> _StubResult:  # noqa: ARG001
                 return _StubResult(result_details="local")
 
             locals_registered[request_type] = original
@@ -273,12 +335,12 @@ class TestInstallRemoteHandlersSwap:
         assert isinstance(event_manager.get_manager_for_request_type(CreateNodeRequest), RemoteHandler)
 
     def test_post_install_out_of_scope_still_runs_original(self) -> None:
-        """Bootstrap-path regression guard: LOAD_PROBE-style calls must stay local.
+        """Bootstrap-path regression guard: construction-time calls must stay local.
 
-        A node's ``__init__`` running under LOAD_PROBE will issue an
-        ``AddParameterToNodeRequest`` outside ``node_execution_scope``.
-        The RemoteHandler installed for that type must delegate to the
-        original handler rather than trying to forward.
+        A node's ``__init__`` issues an ``AddParameterToNodeRequest`` outside
+        ``node_execution_scope``, including when the worker materializes a transient
+        node for a dispatch. The RemoteHandler installed for that type must delegate
+        to the original handler rather than trying to forward.
         """
         event_manager = EventManager()
 
@@ -347,6 +409,47 @@ class TestDropAllLocalObjectsHandler:
         assert isinstance(result, DropAllLocalObjectsResultSuccess)
         assert release_threads
         assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_closes_the_runtimes_kept_for_the_orchestrators_workflows_except_one_a_node_runs_in(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator tore its workflow down, so a later node of it gets a fresh runtime."""
+        engine.context_manager.adopt_orchestrator_workflow(_IDLE_WORKFLOW_ID, None, None, None)
+        busy = engine.context_manager.adopt_orchestrator_workflow(_BUSY_WORKFLOW_ID, None, None, None)
+
+        with engine.run_in_worker_workflow(busy):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds(_IDLE_WORKFLOW_ID)
+        assert engine.workflow_registry.find_by_id(_IDLE_WORKFLOW_ID) is None
+        assert engine.worker_workflows.find(_BUSY_WORKFLOW_ID) is busy
+
+    @pytest.mark.asyncio
+    async def test_naming_a_workflow_closes_only_its_runtime_and_releases_only_its_objects(
+        self, engine: Engine
+    ) -> None:
+        """The orchestrator closed one workflow while another stays open, so the other's runtime and objects stay."""
+        closed = engine.context_manager.adopt_orchestrator_workflow(_CLOSED_WORKFLOW_ID, None, None, None)
+        still_open = engine.context_manager.adopt_orchestrator_workflow(_OPEN_WORKFLOW_ID, None, None, None)
+        manager = engine.resource_manager
+        with engine.run_in_worker_workflow(closed):
+            closed_key = manager.put_local_object(object(), owner="Lib A", source="N", key="closed")
+        with engine.run_in_worker_workflow(still_open):
+            open_key = manager.put_local_object(object(), owner="Lib A", source="N", key="open")
+
+        result = await _handle_drop_all_local_objects(
+            DropAllLocalObjectsRequest(workflow_id=_CLOSED_WORKFLOW_ID), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert not engine.worker_workflows.holds(_CLOSED_WORKFLOW_ID)
+        assert engine.worker_workflows.find(_OPEN_WORKFLOW_ID) is still_open
+        assert manager.entry_for(closed_key) is None
+        assert manager.entry_for(open_key) is not None
 
     @pytest.mark.asyncio
     async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
@@ -460,3 +563,140 @@ class TestDropLocalObjectsHandler:
         assert isinstance(result, DropLocalObjectsResultSuccess)
         assert released == []
         assert engine.resource_manager.get_local_object(key, owner="Lib A") is not None
+
+
+@pytest.fixture
+def engine_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    """A running loop on its own thread, standing in for the worker's engine loop beside the test's own."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="engine-loop", daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join()
+    loop.close()
+
+
+def _bind_queue_to(event_manager: EventManager, loop: asyncio.AbstractEventLoop) -> None:
+    """Initialize the event queue on `loop`, which is what makes it the engine loop."""
+
+    async def initialize() -> None:
+        event_manager.initialize_queue()
+
+    asyncio.run_coroutine_threadsafe(initialize(), loop).result()
+
+
+def _route_probe_through_a_remote_handler(event_manager: EventManager) -> None:
+    """Install `_ProbeRequest` the way a worker installs every forwarded type: behind a RemoteHandler."""
+
+    async def original(request: _ProbeRequest) -> _ProbeResult:
+        return _ProbeResult(seen_by=f"local:{request.marker}", result_details="ok")
+
+    event_manager.assign_manager_to_request_type(_ProbeRequest, original)
+    event_manager.replace_manager_for_request_type(
+        _ProbeRequest, RemoteHandler(original=original, event_manager=event_manager)
+    )
+
+
+class _ProjectManagerThatRequestsSynchronously:
+    """Adopts by sending a request through sync `handle_request`, as workflow registration does."""
+
+    def __init__(self, event_manager: EventManager) -> None:
+        self._event_manager = event_manager
+        self.adopted_on_thread: str | None = None
+        self.probe_succeeded: bool | None = None
+
+    def is_stale_adoption(self, project_id: str, generation: int) -> bool:  # noqa: ARG002
+        return False
+
+    async def ensure_project_loaded(self, project_id: str) -> bool:  # noqa: ARG002
+        return True
+
+    async def on_set_current_project_request(self, request: SetCurrentProjectRequest) -> SetCurrentProjectResultSuccess:  # noqa: ARG002
+        self.adopted_on_thread = threading.current_thread().name
+        probe_result = self._event_manager.handle_request(_ProbeRequest(marker="sync", broadcast_result=False))
+        self.probe_succeeded = probe_result.succeeded()
+        return SetCurrentProjectResultSuccess(result_details="ok")
+
+    def record_adopted_generation(self, generation: int) -> None:
+        pass
+
+
+def _install_adoption(
+    event_manager: EventManager, project_manager: _ProjectManagerThatRequestsSynchronously
+) -> asyncio.Event:
+    return register_broadcast_handlers(
+        event_manager,
+        config_manager=MagicMock(),
+        secrets_manager=MagicMock(),
+        project_manager=cast("ProjectManager", project_manager),
+    )
+
+
+def _configure_forwarding_on_this_loop(event_manager: EventManager) -> None:
+    """Make the calling loop the worker's websocket loop, the one that receives ActivateProjectRequest."""
+    event_manager.configure_worker_forwarding(
+        request_client=MagicMock(),
+        orchestrator_request_topic="orchestrator",
+        worker_response_topic="worker",
+        websocket_event_loop=asyncio.get_running_loop(),
+    )
+
+
+class TestActivateProjectRunsOnTheEngineLoop:
+    """Adoption arrives on the websocket loop, which answers heartbeats, so it must not run there."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_an_adoption_that_requests_synchronously_completes(
+        self, engine: Engine, engine_loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """Run on the websocket loop, this adoption blocked that loop waiting on itself (#5946)."""
+        event_manager = engine.event_manager
+        _bind_queue_to(event_manager, engine_loop)
+        _configure_forwarding_on_this_loop(event_manager)
+        _route_probe_through_a_remote_handler(event_manager)
+        project_manager = _ProjectManagerThatRequestsSynchronously(event_manager)
+        worker_settled = _install_adoption(event_manager, project_manager)
+        handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
+        assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
+
+        result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
+
+        assert result.succeeded()
+        assert project_manager.adopted_on_thread == "engine-loop"
+        assert project_manager.probe_succeeded is True
+        assert worker_settled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_without_an_engine_loop_adoption_is_refused(self, engine: Engine) -> None:
+        event_manager = engine.event_manager
+        assert event_manager.event_loop is None
+        project_manager = _ProjectManagerThatRequestsSynchronously(event_manager)
+        worker_settled = _install_adoption(event_manager, project_manager)
+        handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
+        assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
+
+        result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
+
+        assert result.failed()
+        assert project_manager.adopted_on_thread is None
+        assert not worker_settled.is_set()
+
+
+class TestSyncDispatchOnTheWebsocketLoop:
+    """Blocking on a RemoteHandler from the loop it is dispatched to can never return."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_it_fails_instead_of_hanging(self, engine: Engine) -> None:
+        event_manager = engine.event_manager
+        _configure_forwarding_on_this_loop(event_manager)
+        _route_probe_through_a_remote_handler(event_manager)
+
+        result_event = event_manager.handle_request(_ProbeRequest(marker="sync", broadcast_result=False))
+
+        assert not result_event.succeeded()
+        assert "synchronously on the websocket event loop" in str(result_event.result.result_details)

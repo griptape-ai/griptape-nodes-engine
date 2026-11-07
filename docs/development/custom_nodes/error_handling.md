@@ -240,6 +240,118 @@ When adding a new node to the core library, also add node reference documentatio
 
 ## Production Error Handling
 
+### Writing Error Messages
+
+When a node fails, the editor shows the node's name and the exception type next to your message.
+Write the message for an artist and leave out what the editor already shows:
+
+- **Don't start with the node's name.** The editor knows which node failed. The engine removes a
+    leading `"{self.name}: "` for you, but new code shouldn't add it.
+- **Say what went wrong and what to do about it.** "Image is required for editing. Connect an
+    image to 'Input Image'." is better than "Invalid input."
+- **Don't paste a provider's response into the message.** A dumped dictionary buries the reason.
+    Attach it with `NodeError` instead (below).
+
+❌ **Bad** - name prefix and a dumped response:
+
+```python
+raise RuntimeError(f"{self.name}: Processing failed.\n\nFull API response:\n{response_json}")
+```
+
+✅ **Good** - `NodeError` with the reason in the message and the rest attached:
+
+```python
+from griptape_nodes.exe_types.core_types import NodeError, NodeErrorLink
+
+raise NodeError(
+    f"Processing failed: {response_json['status_detail']['details']}",
+    fields={"generation_id": response_json["generation_id"]},
+    response=response_json,
+)
+```
+
+`NodeError` takes three optional keyword arguments. The editor shows each one in its own place in
+the error panel:
+
+| Argument   | What it's for                                                                                                          | Limits                                                                                                   |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `fields`   | Labelled values a user may need to quote to support, such as a request ID.                                             | Text or number values.                                                                                   |
+| `response` | The provider's response body, so the details are there if someone needs them.                                          | Body only, never headers. Over 16 KB, long strings are cut down. Dropped if still too large or not JSON. |
+| `links`    | `NodeErrorLink(label=..., url=...)` pages that explain the failure, or places in the editor where the user can fix it. | Up to 3. `http`, `https`, or `#` for a place in the editor. Labels up to 80 characters.                  |
+
+```python
+raise NodeError(
+    "Image format 'image/heic' is not supported.",
+    links=[
+        NodeErrorLink(label="Supported image formats", url="https://docs.griptapenodes.com/nodes/load-image#formats")
+    ],
+)
+```
+
+Anything over a limit is dropped and the rest of the error still reaches the editor. `NodeError`
+works the same way when the node runs in a worker. Other exception types still work, and their
+message and type are shown, but the editor only reads `fields`, `response`, and `links` from a
+`NodeError`.
+
+#### Helpers for provider calls
+
+`NodeError` has a constructor for each failure that every provider call shares. Use them instead of
+writing your own helpers:
+
+| Helper                                                 | Use it when                                                                              |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `NodeError.from_missing_secret(name, key_url=...)`     | The API key is not set. Links to the secret in Settings.                                 |
+| `NodeError.from_http_response(response, provider=...)` | A response came back that the node can't use. Takes a `requests` or `httpx` response.    |
+| `NodeError.from_request_exception(e, provider=...)`    | A call raised. Handles an exception with a response, a timeout, and a failed connection. |
+| `NodeErrorLink.from_secret(name, label)`               | You are writing your own message and want the "open this secret in Settings" link.       |
+
+```python
+def validate_before_node_run(self) -> list[Exception] | None:
+    if not self._api_key():
+        return [NodeError.from_missing_secret("ACME_API_KEY", key_url="https://acme.example/keys")]
+    return None
+
+
+try:
+    response = requests.post(url, json=payload, timeout=60)
+    response.raise_for_status()
+except requests.RequestException as e:
+    raise NodeError.from_request_exception(e, provider="Acme", secret_name="ACME_API_KEY") from e
+```
+
+`from_http_response` takes the status code, the request ID (from a header or the body) and the
+error code into `fields`, and attaches the JSON body as `response`, or the start of the text when
+the body is not JSON. The message is the provider's own explanation when the body has one,
+including a list of validation problems. Otherwise it is a plain sentence for the status. A 401 or
+403 says the key was refused and, with `secret_name`, links to "Update the API key". Pass
+`fields={"job_id": ...}` for anything else a user may need to quote. If a 2xx body is not JSON, call
+`from_http_response` on it too, so it isn't reported as a connection failure.
+
+#### Common failures
+
+- **A call to a service raises.** Catch the SDK's own exception and re-raise it with
+    `raise NodeError(...) from e`. `from e` keeps the original traceback in the logs. Use the
+    provider's explanation as the message, and put the status code and request ID in `fields`.
+- **A required API key is missing.** Check it in `validate_before_node_run`, so the node fails
+    before it starts. Name the exact key and say to add it in **Settings → API Keys & Secrets**.
+    A validation exception can be a `NodeError` too, so it can carry a link. A link that starts
+    with `#` opens a place in the editor, so the user can go straight to the key:
+    `NodeErrorLink(label="Add the API key", url=f"#settings-secrets?filter={quote(API_KEY_NAME)}")`,
+    with `quote` from `urllib.parse`. The editor decides which `#` links it opens, and only
+    follows ones that go somewhere, never ones that change anything.
+- **Polling gives up.** Say how long the node waited and what to do next. Put the job or
+    generation ID in `fields` so the user can check on it later.
+- **The response contains image data.** Attach it as is. A response over 16 KB is shrunk by the
+    engine: base64 data becomes its length and strings over 2000 characters are cut. It is dropped
+    only if it is still too large.
+- **The user clicks "Stop".** That isn't a failure, so don't report it as one. Don't catch
+    `asyncio.CancelledError` or `BaseException`. `except Exception` lets cancellation through.
+
+To see each kind of failure in the editor, copy
+[example_node_error_node.py](example_node_error_node.py) into your sandbox library folder, add the
+node to a flow, pick a "Failure", and run it. It covers a failed provider job, a rejected HTTP
+request, an unsupported input, a missing API key, a plain `KeyError`, and validation problems.
+
 ### Comprehensive Validation
 
 Use `validate_before_node_run()` for complex validation:
@@ -253,7 +365,7 @@ def validate_before_node_run(self) -> list[Exception] | None:
     if model == "advanced":
         images = self.get_parameter_list_value("images") or []
         if len(images) > MAX_IMAGES:
-            exceptions.append(ValueError(f"{self.name}: Maximum {MAX_IMAGES} images allowed, got {len(images)}"))
+            exceptions.append(ValueError(f"Maximum {MAX_IMAGES} images allowed, got {len(images)}"))
 
     return exceptions if exceptions else None
 ```
@@ -272,7 +384,7 @@ def _validate_iterative_connections(self) -> list[Exception]:
     if not _outgoing_connection_exists(self.name, self.exec_out.name):
         errors.append(
             Exception(
-                f"{self.name}: Missing required connection from 'On Each Item'. "
+                "Missing required connection from 'On Each Item'. "
                 f"REQUIRED ACTION: Connect {node_type} Start to interior loop nodes. "
                 "The start node must connect to other nodes to execute the loop body."
             )
@@ -282,7 +394,7 @@ def _validate_iterative_connections(self) -> list[Exception]:
     if self.end_node is None:
         errors.append(
             Exception(
-                f"{self.name}: Missing required tethering connection. "
+                "Missing required tethering connection. "
                 f"REQUIRED ACTION: Connect {node_type} Start 'Loop End Node' to {node_type} End 'Loop Start Node'. "
                 "This establishes the explicit relationship between start and end nodes."
             )
@@ -291,7 +403,7 @@ def _validate_iterative_connections(self) -> list[Exception]:
     return errors
 ```
 
-**Best Practice**: Provide detailed, actionable error messages that tell users exactly what connections are missing and how to fix them.
+**Best Practice**: Provide detailed, actionable error messages that tell users exactly what connections are missing and how to fix them. The editor lists each returned exception on its own line, so return one exception per problem rather than joining them into one message.
 
 ### Safe Defaults Pattern
 

@@ -12,7 +12,11 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
-from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedStaticFilePath, StaticFilesManager
+from griptape_nodes.retained_mode.managers.static_files_manager import (
+    ResolvedStaticFilePath,
+    StaticFilePathFailure,
+    StaticFilesManager,
+)
 
 # pyright: reportAttributeAccessIssue=false
 
@@ -20,6 +24,17 @@ from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedS
 TEST_FILE_DATA = b"test image content"
 TEST_FILE_NAME = "test_image.jpg"
 TEST_ALTERNATIVE_NAME = "test_image_1.jpg"
+
+
+def _route_resolution_through_dispatch(engine: Mock) -> Mock:
+    """Send the stand-in engine's resolve-for-a-workflow helpers through its dispatch, which the tests patch."""
+    engine.project_manager.get_path_for_macro_in.side_effect = lambda _workflow, request: engine.handle_request(request)
+
+    async def get_preview(_workflow: object, request: object) -> object:
+        return await engine.ahandle_request(request)
+
+    engine.artifact_manager.get_preview_for_artifact_in.side_effect = get_preview
+    return engine
 
 
 class TestStaticFilesManagerSaveStaticFile:
@@ -59,10 +74,11 @@ class TestStaticFilesManagerSaveStaticFile:
         self,
         mock_static_files_manager: StaticFilesManager,
     ) -> None:
-        """Raises RuntimeError when the save_static_file situation is not in the project template."""
+        """Raises RuntimeError saying why, when the save_static_file situation's path cannot be resolved."""
+        failure = StaticFilePathFailure(reason="the project template is missing the 'save_static_file' situation")
         with (
-            patch.object(mock_static_files_manager, "_resolve_static_file_path", return_value=None),
-            pytest.raises(RuntimeError, match="save_static_file"),
+            patch.object(mock_static_files_manager, "_resolve_static_file_path", return_value=failure),
+            pytest.raises(RuntimeError, match="Failed because the project template is missing the 'save_static_file'"),
         ):
             mock_static_files_manager.save_static_file(
                 TEST_FILE_DATA,
@@ -374,7 +390,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
                 config_manager=mock_config_manager,
                 secrets_manager=mock_secrets_manager,
                 event_manager=None,
-                engine=Mock(),
+                engine=_route_resolution_through_dispatch(Mock()),
             )
             manager.storage_driver = Mock()
             return manager
@@ -825,7 +841,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         registry = mock_static_files_manager.engine.artifact_manager._registry
         registry.get_provider_classes_by_format.return_value = []
 
-        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file, None)
 
         assert resolution.path_to_serve == source_file
         assert resolution.preview_failure_reason is None
@@ -1049,7 +1065,10 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config.workspace_path = Path("/mock/workspace")
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
-                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=Mock()
+                config_manager=mock_config,
+                secrets_manager=Mock(),
+                event_manager=None,
+                engine=_route_resolution_through_dispatch(Mock()),
             )
         return manager
 
@@ -1097,40 +1116,29 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_static_files_manager.config_manager = mock_config_manager
 
         with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is not None
+        assert isinstance(result, ResolvedStaticFilePath)
         assert result.path == expected_relative_path
         assert result.policy == ExistingFilePolicy.OVERWRITE
 
-    def test_resolve_returns_none_and_warns_when_situation_not_found(
-        self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Returns None and logs a warning when the save_static_file situation is missing."""
-        import logging
-
+    def test_resolve_fails_when_situation_not_found(self, mock_static_files_manager: StaticFilesManager) -> None:
+        """Says the save_static_file situation is missing when the project template has none."""
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultFailure
 
-        with (
-            patch.object(
-                mock_static_files_manager.engine,
-                "handle_request",
-                return_value=GetSituationResultFailure(result_details="situation not found"),
-            ),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        with patch.object(
+            mock_static_files_manager.engine,
+            "handle_request",
+            return_value=GetSituationResultFailure(result_details="situation not found"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is None
-        assert "save_static_file" in caplog.text
-        assert "StaticFilesManager.save_static_file" in caplog.text
+        assert result == StaticFilePathFailure(
+            reason="the project template is missing the 'save_static_file' situation"
+        )
 
-    def test_resolve_returns_none_and_warns_when_macro_parsing_fails(
-        self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Returns None and logs a warning when the situation macro cannot be parsed."""
-        import logging
-
+    def test_resolve_fails_when_macro_parsing_fails(self, mock_static_files_manager: StaticFilesManager) -> None:
+        """Says the situation's path is not valid when its macro cannot be parsed."""
         from griptape_nodes.common.macro_parser import MacroSyntaxError
         from griptape_nodes.common.project_templates.situation import (
             SituationFilePolicy,
@@ -1155,19 +1163,17 @@ class TestStaticFilesManagerResolveStaticFilePath:
                 "griptape_nodes.retained_mode.managers.static_files_manager.ParsedMacro",
                 side_effect=MacroSyntaxError("bad macro"),
             ),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is None
-        assert "save_static_file" in caplog.text
+        assert isinstance(result, StaticFilePathFailure)
+        assert result.reason.startswith("the 'save_static_file' situation's path ")
+        assert result.reason.endswith("is not valid: bad macro")
 
-    def test_resolve_returns_none_and_warns_when_path_resolution_fails(
-        self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
+    def test_resolve_fails_with_the_resolvers_reason_when_path_resolution_fails(
+        self, mock_static_files_manager: StaticFilesManager
     ) -> None:
-        """Returns None and logs a warning when macro path resolution fails."""
-        import logging
-
+        """Passes on the resolver's message, which names the cause, rather than blaming the situation."""
         from griptape_nodes.common.project_templates.situation import (
             SituationFilePolicy,
             SituationPolicy,
@@ -1202,14 +1208,12 @@ class TestStaticFilesManagerResolveStaticFilePath:
             msg = f"Unexpected request: {request}"
             raise AssertionError(msg)
 
-        with (
-            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+        with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is None
-        assert "save_static_file" in caplog.text
+        assert result == StaticFilePathFailure(
+            reason="the 'save_static_file' situation's path could not be resolved. could not resolve"
+        )
 
     def test_resolve_falls_back_to_workspace_staticfiles_when_path_is_outside_workspace(
         self, mock_static_files_manager: StaticFilesManager, caplog: pytest.LogCaptureFixture
@@ -1264,9 +1268,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
             patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = mock_static_files_manager._resolve_static_file_path("output.png")
+            result = mock_static_files_manager._resolve_static_file_path(None, "output.png")
 
-        assert result is not None
+        assert isinstance(result, ResolvedStaticFilePath)
         assert result.path == Path("staticfiles/output.png")
         assert result.policy == ExistingFilePolicy.OVERWRITE
         assert "outside workspace" in caplog.text
@@ -1643,3 +1647,227 @@ class TestStaticServerUrlSettlement:
         started = time.monotonic()
         assert manager.wait_for_static_server_base_url(5.0) is None
         assert time.monotonic() - started < 1.0
+
+
+class TestStaticFilesManagerWatchesMintedFiles:
+    """Local files a client mints a URL for are watched while the refresh_previews_on_file_change setting is on."""
+
+    def _build_manager(
+        self, *, setting_on: bool | None = None, is_worker: bool = False, max_files: object = None
+    ) -> StaticFilesManager:
+        # None leaves a setting out of the config, as for a user who never changed it.
+        config_values: dict[str, object] = {"storage_backend": "local"}
+        if setting_on is not None:
+            config_values["refresh_previews_on_file_change"] = setting_on
+        if max_files is not None:
+            config_values["refresh_previews_max_files"] = max_files
+        mock_config = Mock()
+        mock_config.get_config_value.side_effect = lambda key, default=None, **_kwargs: config_values.get(key, default)
+        mock_config.workspace_path = Path("/mock/workspace")
+        engine = _route_resolution_through_dispatch(Mock())
+        engine.library_manager.is_worker = is_worker
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
+            manager = StaticFilesManager(
+                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=engine
+            )
+        manager.storage_driver = Mock(spec=LocalStorageDriver)
+        manager.storage_driver.create_signed_download_url.return_value = "http://localhost/plate.png?v=a"
+        manager.storage_driver.get_asset_url.return_value = "file:///plate.png"
+        manager.file_watcher = Mock()
+        return manager
+
+    async def _mint(self, manager: StaticFilesManager, file_path: str) -> None:
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        result = await manager.on_handle_create_static_file_download_url_from_path_request(
+            CreateStaticFileDownloadUrlFromPathRequest(file_path=file_path)
+        )
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_watches_the_file_with_the_path_the_client_sent(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager()
+
+        await self._mint(manager, image.as_uri())
+
+        manager.file_watcher.watch_file.assert_called_once()
+        watched_path, requested_file_path = manager.file_watcher.watch_file.call_args.args
+        # Compared as files: the path round-trips through a URI, and Windows may change its spelling.
+        assert watched_path.samefile(image)
+        assert requested_file_path == image.as_uri()
+
+    @pytest.mark.asyncio
+    async def test_watches_the_resolved_file_for_a_macro_path(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.project_events import GetPathForMacroResultSuccess
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager()
+        manager.engine.handle_request = Mock(
+            return_value=GetPathForMacroResultSuccess(resolved_path=image, absolute_path=image, result_details="ok")
+        )
+
+        await self._mint(manager, "{inputs}/plate.png")
+
+        manager.file_watcher.watch_file.assert_called_once()
+        assert manager.file_watcher.watch_file.call_args.args == (image, "{inputs}/plate.png")
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_with_the_setting_off(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(setting_on=False)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_in_a_worker(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(is_worker=True)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_under_cloud_storage(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager()
+        manager.storage_driver = Mock(spec=GriptapeCloudStorageDriver)
+        manager.storage_driver.create_signed_download_url.return_value = "https://signed.example/plate.png"
+        manager.storage_driver.get_asset_url.return_value = "https://cloud.example/plate.png"
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_watch_a_missing_file(self, tmp_path: Path) -> None:
+        manager = self._build_manager()
+
+        await self._mint(manager, str(tmp_path / "missing.png"))
+
+        manager.file_watcher.watch_file.assert_not_called()
+
+    def test_a_change_is_sent_to_clients_as_an_app_event(self) -> None:
+        from griptape_nodes.retained_mode.events.base_events import AppEvent
+        from griptape_nodes.retained_mode.events.static_file_events import StaticFileChanged
+        from griptape_nodes.retained_mode.managers.static_file_watcher import WatchedFileChange
+
+        manager = self._build_manager()
+
+        manager._on_watched_file_changed(
+            WatchedFileChange(path=Path("/work/plate.png"), requested_file_paths=["{inputs}/plate.png"])
+        )
+
+        event = manager.engine.event_manager.put_event.call_args.args[0]
+        assert isinstance(event, AppEvent)
+        assert event.payload == StaticFileChanged(
+            file_path=str(Path("/work/plate.png")), requested_file_paths=["{inputs}/plate.png"]
+        )
+
+    def test_a_change_is_not_sent_after_the_setting_is_turned_off(self) -> None:
+        from griptape_nodes.retained_mode.managers.static_file_watcher import WatchedFileChange
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_watched_file_changed(
+            WatchedFileChange(path=Path("/work/plate.png"), requested_file_paths=["{inputs}/plate.png"])
+        )
+
+        manager.engine.event_manager.put_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_applies_the_configured_file_limit(self, tmp_path: Path) -> None:
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(max_files=250)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.set_max_files.assert_called_with(250)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_files", [None, "abc", 0, -5, True, 12.5])
+    async def test_an_unusable_file_limit_falls_back_to_the_default(self, tmp_path: Path, max_files: object) -> None:
+        from griptape_nodes.retained_mode.managers.settings import DEFAULT_REFRESH_PREVIEWS_MAX_FILES
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        manager = self._build_manager(max_files=max_files)
+
+        await self._mint(manager, str(image))
+
+        manager.file_watcher.set_max_files.assert_called_with(DEFAULT_REFRESH_PREVIEWS_MAX_FILES)
+        manager.file_watcher.watch_file.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reads_the_baseline_before_minting_the_url(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.managers.static_file_watcher import StaticFileWatcher
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        before_mint = StaticFileWatcher.read_fingerprint(image)
+        manager = self._build_manager()
+
+        def mint_while_the_file_is_saved(_path: Path) -> str:
+            image.write_bytes(b"saved during the mint")
+            return "http://localhost/plate.png?v=a"
+
+        manager.storage_driver.create_signed_download_url.side_effect = mint_while_the_file_is_saved
+
+        await self._mint(manager, str(image))
+
+        baseline = manager.file_watcher.watch_file.call_args.kwargs["baseline"]
+        assert baseline == before_mint
+        assert baseline != StaticFileWatcher.read_fingerprint(image)
+
+    def test_turning_the_setting_off_stops_watching(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_config_changed(
+            ConfigChanged(key="refresh_previews_on_file_change", old_value=True, new_value=False)
+        )
+
+        manager.file_watcher.clear.assert_called_once()
+        manager.file_watcher.set_max_files.assert_not_called()
+
+    def test_a_changed_file_limit_applies_at_once(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(max_files=50)
+
+        manager._on_config_changed(ConfigChanged(key="refresh_previews_max_files", old_value=1000, new_value=50))
+
+        manager.file_watcher.set_max_files.assert_called_once_with(50)
+        manager.file_watcher.clear.assert_not_called()
+
+    def test_a_replaced_config_is_applied(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_config_changed(ConfigChanged(key="", old_value=None, new_value={}))
+
+        manager.file_watcher.clear.assert_called_once()
+
+    def test_other_config_changes_are_ignored(self) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        manager = self._build_manager(setting_on=False)
+
+        manager._on_config_changed(ConfigChanged(key="log_level", old_value="INFO", new_value="DEBUG"))
+
+        manager.file_watcher.clear.assert_not_called()
+        manager.file_watcher.set_max_files.assert_not_called()

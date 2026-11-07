@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -47,6 +48,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SetVariableValueRequest,
     SetVariableValueResultFailure,
 )
+from griptape_nodes.retained_mode.managers.project_manager import ProjectVariableResolver
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
     VariableLayer,
@@ -86,7 +88,14 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
     def list_names(_self: object, *, project_id: str | None = None) -> list[str]:  # noqa: ARG001
         return sorted(macros.keys())
 
-    def get_var(_self: object, name: str, *, project_id: str | None = None) -> FlowVariable | None:  # noqa: ARG001
+    def get_var(
+        _self: object,
+        _workflow: object,
+        name: str,
+        *,
+        project_id: str | None = None,  # noqa: ARG001
+        resolver: object = None,  # noqa: ARG001
+    ) -> FlowVariable | None:
         if name not in macros:
             return None
         return _macro(name, macros[name])
@@ -178,17 +187,33 @@ class TestListSubstitutablesRequest:
         assert entries[0].value == "/workspace"
 
     def test_filters_out_non_substitutable_user_vars(self, engine: Engine, flow_name: str) -> None:
-        """User vars with non-str/int values are excluded, matching ResolveSubstitutionRequest behavior."""
+        """User vars that are not str/int/float/bool/dict/list (here None) are excluded."""
         _add_variable(engine, "SHOT", "sc001")
         _add_variable(engine, "META", None)
-        _add_variable(engine, "TAGS", ["a", "b"])
         with project_macros({}):
             result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         names = {s.name for s in result.substitutables}
         assert "SHOT" in names
         assert "META" not in names
-        assert "TAGS" not in names
+
+    def test_lists_list_variables_as_rendered_text(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "TAGS", ["a", "b"])
+        with project_macros({}):
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+        assert isinstance(result, ListSubstitutablesResultSuccess)
+        entries = [s for s in result.substitutables if s.name == "TAGS"]
+        assert len(entries) == 1
+        assert entries[0].value == "a\nb"
+
+    def test_lists_float_and_bool_variables_as_rendered_text(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SCALE", 1.5, type_="float")
+        _add_variable(engine, "PROXY", True, type_="bool")
+        with project_macros({}):
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+        assert isinstance(result, ListSubstitutablesResultSuccess)
+        values = {s.name: s.value for s in result.substitutables}
+        assert values == {"SCALE": "1.5", "PROXY": "true"}
 
     def test_returns_empty_when_no_vars_and_no_macros(self, engine: Engine, flow_name: str) -> None:
         with project_macros({}):
@@ -196,6 +221,7 @@ class TestListSubstitutablesRequest:
         assert isinstance(result, ListSubstitutablesResultSuccess)
         assert result.substitutables == []
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
             result = engine.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
@@ -246,6 +272,7 @@ class TestGetVariablesRequest:
         assert isinstance(result, GetVariablesResultFailure)
         assert "ListVariablesRequest" in str(result.result_details)
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         result = engine.handle_request(GetVariablesRequest(starting_flow="does_not_exist", names=["x"]))
         assert isinstance(result, GetVariablesResultFailure)
@@ -304,6 +331,7 @@ class TestResolveSubstitutionRequest:
         assert result.unresolved == ["MISSING"]
         assert result.resolved == {"SHOT": "sc001", "workspace_dir": "/workspace"}
 
+    @pytest.mark.usefixtures("flow_name")
     def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
             result = engine.handle_request(ResolveSubstitutionRequest(starting_flow="does_not_exist"))
@@ -707,7 +735,7 @@ class TestReservedNames:
         it, a no-op rename of a reserved-named variable would surface a spurious 'that name is
         reserved' failure.
         """
-        engine.variables_manager._global_layer.set(
+        engine.current_workflow().variables.global_layer.set(
             FlowVariable(name="workspace_dir", owning_flow_name=None, type="str", value="/g")
         )
         result = engine.handle_request(
@@ -794,7 +822,7 @@ class TestGetProjectVariableRealBody:
     """
 
     def test_computed_name_resolves_via_real_dispatch(self, engine: Engine, flow_name: str) -> None:
-        """A real builtin resolves through membership check → resolve_project_variable."""
+        """A real builtin resolves through membership check → resolve_computed_variable."""
         result = engine.handle_request(
             GetVariableRequest(name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
         )
@@ -813,8 +841,8 @@ class TestGetProjectVariableRealBody:
         variables_manager.set_project_variables(project_id, stored_layer)
         try:
             with patch.object(
-                type(engine.project_manager),
-                "resolve_project_variable",
+                ProjectVariableResolver,
+                "resolve_computed_variable",
                 side_effect=RuntimeError("context not ready"),
             ):
                 result = engine.handle_request(
@@ -847,6 +875,41 @@ class TestGetProjectVariableRealBody:
             variables_manager.remove_project_variables(project_id)
 
 
+class TestListProjectVariablesRealBody:
+    """Enumerating the project layer shares one resolver across every computed name."""
+
+    def test_listing_resolves_workflow_dir_once(self, engine: Engine, flow_name: str) -> None:
+        """Every default directory references `{workflow_dir}`, which resolves a whole situation macro."""
+        project_manager_type = type(engine.project_manager)
+        real_resolve = project_manager_type._resolve_workflow_dir
+        calls: list[object] = []
+
+        def counting_resolve(pm_self: object, project_info: object, workflow: object) -> str:
+            calls.append(project_info)
+            return real_resolve(pm_self, project_info, workflow)  # type: ignore[arg-type]
+
+        with patch.object(project_manager_type, "_resolve_workflow_dir", counting_resolve):
+            result = engine.handle_request(
+                ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
+            )
+
+        assert isinstance(result, ListVariablesResultSuccess)
+        assert "workflow_dir" in {variable.name for variable in result.variables}
+        assert len(calls) == 1
+
+    def test_listing_skips_a_computed_name_whose_context_is_not_ready(self, engine: Engine, flow_name: str) -> None:
+        project_manager_type = type(engine.project_manager)
+        with patch.object(project_manager_type, "_resolve_workflow_dir", side_effect=RuntimeError("not ready")):
+            result = engine.handle_request(
+                ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
+            )
+
+        assert isinstance(result, ListVariablesResultSuccess)
+        names = {variable.name for variable in result.variables}
+        assert "workflow_dir" not in names
+        assert "workspace_dir" in names
+
+
 class TestProjectVariableSerialization:
     """Regression: project-layer variables must cross the request boundary as plain, serializable FlowVariables."""
 
@@ -861,7 +924,7 @@ class TestProjectVariableSerialization:
 
     def test_get_variable_from_project_serializes(self, engine: Engine, flow_name: str) -> None:
         """The Success payload must survive cattrs unstructure (the broadcast path)."""
-        from griptape_nodes.serialization.converter import converter
+        converter = converters.engine
 
         with project_macros({"workspace_dir": "/proj"}):
             result = engine.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))

@@ -478,3 +478,24 @@ class TestBudgetHaltsTakeTheFailureBranch:
 
         with pytest.raises(BudgetExceededError):
             node._handle_failure_exception(self._a_budget_error())
+
+
+class TestStatusResultDetailsKeepVariables:
+    """A node's status is its own text, so a macro path in it is kept as written.
+
+    Substituting it during a run would expand ``{outputs}`` to the absolute path, which the
+    workflow then saves along with the local username.
+    """
+
+    class _StatusNode(SuccessFailureNode):
+        def __init__(self, name: str) -> None:
+            super().__init__(name=name)
+            self._create_status_parameters()
+
+    def test_macro_path_in_status_is_not_substituted_during_a_run(self) -> None:
+        node = self._StatusNode(name="saver")
+
+        with aprocess_scope(precomputed_variables={"outputs": "/home/user/ws/outputs"}):
+            node._set_status_results(was_successful=True, result_details="Saved to: {outputs}/a.mp4")
+
+        assert node.parameter_output_values["result_details"] == "Saved to: {outputs}/a.mp4"

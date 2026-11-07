@@ -65,7 +65,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         """Test that create_signed_upload_url delegates to OSManager with correct policy."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
-            mock_os_manager.on_write_file_request.return_value = mock_write_success_result
+            mock_os_manager.engine.handle_request.return_value = mock_write_success_result
             mock_post_response = Mock()
             mock_post_response.raise_for_status.return_value = None
             mock_post_response.json.return_value = {"url": "http://test.com/upload"}
@@ -75,8 +75,8 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             local_storage_driver.create_signed_upload_url(TEST_FILE_PATH, ExistingFilePolicy.FAIL)
 
             # Verify OSManager was called with correct WriteFileRequest
-            mock_os_manager.on_write_file_request.assert_called_once()
-            call_args = mock_os_manager.on_write_file_request.call_args[0][0]
+            mock_os_manager.engine.handle_request.assert_called_once()
+            call_args = mock_os_manager.engine.handle_request.call_args[0][0]
             assert isinstance(call_args, WriteFileRequest)
             # LocalStorageDriver converts relative paths to absolute before calling OSManager
             # resolve_workspace_path normalizes the path by calling .resolve()
@@ -94,7 +94,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         """Test that create_signed_upload_url uses resolved filename from OSManager."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
-            mock_os_manager.on_write_file_request.return_value = mock_write_success_result
+            mock_os_manager.engine.handle_request.return_value = mock_write_success_result
             mock_post_response = Mock()
             mock_post_response.raise_for_status.return_value = None
             mock_post_response.json.return_value = {"url": "http://test.com/upload"}
@@ -115,14 +115,14 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_failure_result: Any,
     ) -> None:
         """Test that create_signed_upload_url raises FileExistsError when WriteFileRequest fails."""
-        mock_os_manager.on_write_file_request.return_value = mock_write_failure_result
+        mock_os_manager.engine.handle_request.return_value = mock_write_failure_result
 
         # Call create_signed_upload_url with FAIL policy on existing file
         with pytest.raises(FileExistsError, match="WriteFileRequest failed"):
             local_storage_driver.create_signed_upload_url(TEST_FILE_PATH, ExistingFilePolicy.FAIL)
 
         # Verify OSManager was called but HTTP request was not made
-        mock_os_manager.on_write_file_request.assert_called_once()
+        mock_os_manager.engine.handle_request.assert_called_once()
 
     def test_create_signed_upload_url_default_overwrite_policy(
         self,
@@ -133,7 +133,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         """Test that create_signed_upload_url defaults to OVERWRITE policy."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
-            mock_os_manager.on_write_file_request.return_value = mock_write_success_result
+            mock_os_manager.engine.handle_request.return_value = mock_write_success_result
             mock_post_response = Mock()
             mock_post_response.raise_for_status.return_value = None
             mock_post_response.json.return_value = {"url": "http://test.com/upload"}
@@ -143,8 +143,8 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             local_storage_driver.create_signed_upload_url(TEST_FILE_PATH)
 
             # Verify OSManager was called with default OVERWRITE policy
-            mock_os_manager.on_write_file_request.assert_called_once()
-            call_args = mock_os_manager.on_write_file_request.call_args[0][0]
+            mock_os_manager.engine.handle_request.assert_called_once()
+            call_args = mock_os_manager.engine.handle_request.call_args[0][0]
             assert call_args.existing_file_policy == ExistingFilePolicy.OVERWRITE
 
 
@@ -474,3 +474,26 @@ class TestDeterministicUrlVersioning:
         after = driver.create_signed_download_url(served)
 
         assert before == after
+
+
+class TestFingerprintFile:
+    """fingerprint_file is the identity both download URLs and the preview watcher use."""
+
+    def test_reads_inode_size_and_mtime(self, tmp_path: Path) -> None:
+        from griptape_nodes.drivers.storage.local_storage_driver import fingerprint_file
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        stat_result = image.stat()
+
+        fingerprint = fingerprint_file(image)
+
+        assert fingerprint is not None
+        assert fingerprint.inode == stat_result.st_ino
+        assert fingerprint.size == stat_result.st_size
+        assert fingerprint.mtime_ns == stat_result.st_mtime_ns
+
+    def test_is_none_for_a_missing_file(self, tmp_path: Path) -> None:
+        from griptape_nodes.drivers.storage.local_storage_driver import fingerprint_file
+
+        assert fingerprint_file(tmp_path / "missing.png") is None

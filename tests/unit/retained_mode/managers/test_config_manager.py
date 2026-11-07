@@ -17,6 +17,7 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetConfigLayersRequest,
     GetConfigLayersResultSuccess,
     GetConfigValueRequest,
+    GetConfigValueResultFailure,
     GetConfigValueResultSuccess,
     SetConfigCategoryRequest,
     SetConfigCategoryResultSuccess,
@@ -2629,6 +2630,26 @@ class TestConfigProvenance:
 
         assert editable_result.source.layer == "user"
         assert editable_result.editable is True
+
+    def test_get_config_value_request_returns_a_none_default(self, isolate_user_config: Path) -> None:  # noqa: ARG002
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="library.sandbox_enabled")
+            )
+
+        assert isinstance(result, GetConfigValueResultSuccess)
+        assert result.value is None
+        assert result.source.layer == "default"
+
+    def test_get_config_value_request_fails_for_an_unknown_key(self, isolate_user_config: Path) -> None:  # noqa: ARG002
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="library.no_such_setting")
+            )
+
+        assert isinstance(result, GetConfigValueResultFailure)
 
     def test_get_config_value_request_editable_is_leaf_aware_for_a_category(
         self, tmp_path: Path, isolate_user_config: Path

@@ -129,6 +129,17 @@ def frames_to_video_artifact(frames: list, fps: int = 30, video_format: str = "m
 - The `filename` parameter is the base filename (will be transformed by the situation's macro)
 - The situation (e.g., "save_node_output") determines the final path and collision behavior
 
+### Saving from a Thread or Thread Pool
+
+Macros such as `{outputs}` resolve against the workflow your node is in. A `File`, `FileDestination`, `Directory`, or `FileSequence` keeps the workflow it was built for, so it writes there from any thread. `ProjectFileParameter.build_file()` and the other parameter builders build for the node's workflow wherever you call them, including inside a `threading.Thread` or a `ThreadPoolExecutor` job:
+
+```python
+with ThreadPoolExecutor() as pool:
+    list(pool.map(lambda job: self._output_file.build_file().write_bytes(render(job)), jobs))
+```
+
+Code on a plain thread or in a pool doesn't know which workflow it works for, so a handle built there with `ProjectFileDestination.from_situation()` or `File(...)` has no workflow of its own. Build it in `process()` or `aprocess()` and hand it to the thread, or name the workflow: call `ProjectFileDestination.from_situation_in_workflow(self.workflow, ...)`, or pass `workflow=self.workflow` to the `File`, `FileDestination`, `Directory`, or `FileSequence` constructor.
+
 ## Migration from StaticFilesManager
 
 ### Old Pattern (Deprecated)

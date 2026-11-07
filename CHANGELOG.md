@@ -12,6 +12,829 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.107.0] - 2026-11-06
+
+### Added
+
+- A request envelope (`EventRequest`, and each request in an `EventRequestBatch`) now has an optional
+  `open_workflow_id` beside `request_id`, naming the open workflow the request runs in.
+  `EventManager.handle_request` and `ahandle_request` read it from `result_context`, as they read
+  `request_id`, and echo it on the result envelope, where it stays apart from any `workflow_id` in
+  the result itself. A request that acts on a workflow fails with `WorkflowNotOpenResultFailure`
+  without running when its `open_workflow_id` names no open workflow, and with
+  `WorkflowNotNamedResultFailure` when it leaves the id out while none or several are open; requests
+  about the engine, such as `EngineHeartbeatRequest`, ignore it. See
+  [Transports](docs/guides/transports.md#sending-requests).
+- Execution events, such as the current node, parameter value updates and a run's end, and streamed
+  progress events now have a `workflow_id` naming the open workflow they belong to. A result's
+  `open_workflow_id` now names the workflow the request acted on even when the request left it out,
+  such as the only open workflow, a run's own workflow, or the workflow a load opened. See
+  [Transports](docs/guides/transports.md#getting-results-back).
+- A `FileFormat` trait marks a parameter's value as a file format of a given kind (`image`, `video`,
+  `audio`, `threed`). It renders the kind as the `file_format` UI option, which the editor copies onto
+  a Start Flow parameter and the workflow shape reports, so a host running the workflow can offer only
+  the formats it can open.
+  [#6193](https://github.com/griptape-ai/griptape-nodes-engine/issues/6193)
+- `File`, `FileDestination`, `Directory` and `FileSequence` now keep the workflow they were built in,
+  or take one as `workflow`, so node code that writes from a `threading.Thread` or thread pool
+  resolves `{outputs}` in the node's workflow. `ProjectFileDestination.from_situation_in_workflow`
+  does the same for a situation.
+- `EngineHeartbeatResultSuccess` now reports `engine_run_id`, which changes every time the engine
+  starts. Workflow ids last only until a restart, so a client that sees a new `engine_run_id` drops
+  the workflow ids it kept. Unlike `session_id`, it never survives a restart.
+- `EngineHeartbeatResultSuccess` now lists every open workflow in `open_workflows`. The
+  `current_workflow` fields describe the one opened last.
+- Advanced libraries can offer their own request types as tools on the engine's MCP server by
+  returning them from `get_mcp_tools()`. The chat sidebar lists loaded libraries with tools under
+  "Libraries" in the "MCP servers" dropdown.
+- A list parameter's element details now include `row_input_types`, the types a new entry accepts,
+  even when the list has no entries yet. An editor can use it instead of copying the engine's rules.
+- MCP clients can now name the workflow their tool calls act on with an `X-Griptape-Workflow-Id`
+  header. A client that sends none works, for the rest of its MCP session, on the workflow its own
+  `EnsureWorkflowAndFlowRequest` or `SetWorkflowContextRequest` opened or selected. Either keeps
+  reaching the workflow after saving a Griptape-provided template continues it in a copy. The
+  editor's chat agent, including the tools libraries give it, acts on the workflow its message was
+  sent from. See [Connect External MCP Clients](docs/guides/mcp/external_clients.md#choose-the-workflow).
+- Nodes now have a read-only `workflow` property naming the workflow they were added to, or `None`
+  for a node that was never added to one, such as during its `__init__`.
+- `RefreshProjectTemplatesRequest` re-checks every path in `projects_to_register` and loads the
+  projects that have become reachable since the engine started, such as projects on a network drive
+  that mounted late, without restarting the engine.
+  [#6134](https://github.com/griptape-ai/griptape-nodes-engine/issues/6134)
+- Every request result now carries `engine_id` on its envelope, naming the engine that sent it, so
+  a client that reaches an engine through a session topic knows which engine holds the session.
+- The sidebar agent leaves out a skill whose `SKILL.md` frontmatter sets
+  `disable-model-invocation: true`, so a skill can stay in `.agents/skills` without the agent
+  using it.
+- The engine log now warns when a skill's `description` is longer than 1,024 characters or its
+  frontmatter sets fields that Griptape Nodes ignores, such as `allowed-tools`.
+- The `Widget` trait takes a `synced_parameters` list naming other parameters on the node that a
+  custom widget reads and writes directly, so a node no longer copies them into the widget's own
+  value. See
+  [Custom Widgets](https://docs.griptapenodes.com/en/stable/development/custom_nodes/custom_widgets/).
+  [#4639](https://github.com/griptape-ai/griptape-nodes-engine/issues/4639)
+- Every workflow now has a `workflow_id` that the engine gives it while it runs. It stays the same
+  when the workflow is saved, renamed, or moved, and when the engine rescans the workspace, but it
+  is not saved in the workflow's file, so a restarted engine gives the workflow a new one. Results
+  that name a workflow now also report its id, such as `GetWorkflowContextSuccess.workflow_id` and
+  `EngineHeartbeatResultSuccess.current_workflow_id`.
+
+### Changed
+
+- **Breaking:** A saved workflow file's `build_workflow()` no longer opens a workflow. It builds into
+  the workflow its caller opened, and `aexecute_workflow()` opens the file when it runs on its own.
+  Code that runs a saved file by awaiting `build_workflow()` directly must open the workflow first
+  with `GriptapeNodes.ContextManager().push_workflow(file_path=...)`, or call
+  `GriptapeNodes.WorkflowManager().run_workflow()`, which opens it when none is open. Files saved
+  before keep working unchanged.
+- **Breaking:** `SetWorkflowContextRequest` and `EnsureWorkflowAndFlowRequest` now open a new
+  unsaved workflow only from a `workflow_name` of `unsaved:` followed by 32 lowercase hex digits,
+  the form the engine mints. Any other `unsaved:` name fails. Leave `workflow_name` out to have the
+  engine pick one, and read it from the result.
+- **Breaking:** The `Workflow` class in `griptape_nodes.node_library.workflow_registry` changed for
+  node libraries that use it. `Workflow.file_path` is read-only: move a workflow's file with
+  `MoveWorkflowRequest`. The constructor now takes a `workflow_id`, and `Workflow.from_disk` is
+  gone: register a workflow file with `RegisterWorkflowRequest`. The registry's
+  `clear_all_workflows` is gone: rescan the workspace with `RefreshWorkflowRegistryRequest`.
+- **Breaking:** `SetWorkflowContextRequest` and `EnsureWorkflowAndFlowRequest` now fail for a
+  `workflow_name` that no registered workflow has, instead of opening a blank workflow under that
+  name. To start a new workflow, leave `workflow_name` out and pass `display_name`.
+  `ContextManager.push_workflow(workflow_name=...)` with such a name opens a new unsaved workflow
+  with that display name and returns its `unsaved:<id>` name. `push_workflow(file_path=...)` with a
+  path that has no file opens a new unsaved workflow in that file's folder, whose `absolute_path` on
+  `ContextManager.get_current_workflow()` is `None`.
+- **Breaking:** `RunWorkflowFromRegistryRequest` with `run_with_clean_slate=False` now fails while
+  a workflow is open, instead of loading the second workflow into the open one, since only one
+  workflow is open at a time. Clear the open workflow first with `ClearAllObjectStateRequest`, or
+  send `run_with_clean_slate=True`. Likewise, `GriptapeNodes.ContextManager().push_workflow()` and
+  its `workflow()` block now refuse while a workflow is open.
+- A list parameter connected to a whole list now keeps its own entries. The node reads the
+  connected list's items first, then the entries added by hand, instead of ignoring the entries.
+- "Add Library" now downloads only a library's metadata file when inspecting a Git repository,
+  instead of every file in the latest commit. Repositories with large files inspect much faster,
+  especially on slow connections.
+  [#4836](https://github.com/griptape-ai/griptape-nodes-engine/issues/4836)
+- `MergeWorkflowBranchRequest` now fails while the branch or its source is the open workflow. The
+  merge removes the branch and rewrites the source's file, which the open workflow's next save
+  would write over. Open another workflow first.
+- Creating a global variable with `CreateVariableRequest` now fails when no workflow is open,
+  instead of storing it for the whole engine.
+- The library warning about components older than the ones Griptape Nodes runs on now suggests
+  resetting the library when those versions are left over from an earlier install, and links to a
+  new troubleshooting section in the Libraries guide.
+  [#6098](https://github.com/griptape-ai/griptape-nodes-engine/issues/6098)
+- The sidebar agent now reads a skill's bundled files with read-only file tools, so it can look
+  through the skill's folder and read scripts, images, and PDFs as well as text. It still can't run
+  scripts.
+- A node whose library runs in a separate process now fails with "no workflow was open when it was
+  sent" when its `ExecuteNodeRequest` names no open workflow (`orchestrator_workflow_id`), instead of
+  running outside any workflow. Running a node from an open workflow always names it.
+
+### Deprecated
+
+- The `WorkflowRegistry` classmethods `generate_new_workflow`, `ensure_unsaved`,
+  `delete_workflow_by_name`, `clear_user_workflows`, and `rekey_workflow` are deprecated and log a
+  warning when called. They will be removed in 0.110.0. Use `RegisterWorkflowRequest`,
+  `SetWorkflowContextRequest`, `DeleteWorkflowRequest`, `RefreshWorkflowRegistryRequest`, and
+  `MoveWorkflowRequest` or `RenameWorkflowRequest` instead.
+
+### Removed
+
+- **Breaking:** Manager methods that acted on whichever workflow was open are removed. Call the `_in`
+  variant with the node's workflow, for example `FlowManager.get_parent_flow_in(self.workflow, name)`.
+  `cancel_flow_run` becomes `cancel_all_runs_in(workflow)`, and the `ContextManager` path getters
+  become `absolute_path` and `working_directory` on `get_current_workflow()`.
+  `FlowManager.cancel_run` now requires `flows`; use `cancel_run_in(workflow, run_id)`.
+  Removed: `ObjectManager.add_object_by_name`, `del_obj_by_name`; `FlowManager.get_parent_flow`,
+  `reparent_flow`, `flow_state`, `unresolve_all_nodes_in_flow`, `clear_execution_queue`,
+  `cancel_flow_run`, `has_connection`, `get_connections_on_node`, `get_connected_output_parameters`,
+  `get_connected_input_parameters`, `get_connected_input_from_node`,
+  `get_connected_output_from_node`, `get_start_node_queue`, `get_start_node_from_node`,
+  `get_prev_node`; `ContextManager.get_current_workflow_file_path`,
+  `get_current_workflow_working_directory`.
+
+### Fixed
+
+- The File Browser dialog's file preview no longer sends the entire file as a data URL for images
+  over 10 MB that Pillow can't decode, which could hang the engine base64-encoding a large or
+  multi-part sequence frame (e.g. EXR). Those files now get no preview instead. Images Pillow can
+  decode still get a thumbnail regardless of file size.
+- A data node fed by a ForEach or ForLoop Start's `current_item` or `index` now re-evaluates on every
+  pass of every run, not only the first. On later runs it kept its value from the last pass of the
+  previous run and fed it to every pass.
+  [#5751](https://github.com/griptape-ai/griptape-nodes-engine/issues/5751)
+- `InspectLibraryRepoRequest` now honors a `url@ref` suffix on `git_url` (for example
+  `user/repo@stable`), as `DownloadLibraryRequest` already does, instead of failing to reach the
+  repository. `ref` is now optional and overrides the suffix when set.
+- Inspecting a library from a Git repository in the Add Library modal no longer blocks the engine
+  while the repository is fetched, which could drop the editor's connection on Windows.
+  [#4836](https://github.com/griptape-ai/griptape-nodes-engine/issues/4836)
+- Saving or copying a node keeps the item types of its lists. A list whose type a node set while
+  running, such as Display List's, loads as `list[Thing]` instead of `list[list[Thing]]`, and a row
+  the node typed on its own, such as an `int` row beside `str` rows, keeps its value instead of
+  failing to load. Workflows saved before this fix still load their list types as saved.
+- A data node fed by a node that runs again now recomputes instead of passing on its earlier
+  output. Before, pressing Run a second time, or a later pass of a For Loop or For Each group,
+  could hand the next node the previous run's value: for example, Merge Texts kept its first
+  result while the Agent feeding it wrote new text.
+- While, Retry and For Each groups now end, repeat, skip or break the loop according to the branch
+  the loop body took. Before, a node on a branch that was not taken could still run, and its exit
+  then counted as taken: a group whose body reached "Done" could run again, and a For Each group
+  whose body reached "Loop Complete" could break out of the loop.
+  When several body nodes are wired into the same exit, every wire is now checked, not only the
+  first one drawn, so the result no longer depends on the order the connections were made.
+- A loop no longer counts the entries of a list twice when the list is also connected as a whole
+  list. After the loop ran, the list read, and saved, its own entries a second time.
+- A data node with no control connections that reads, directly or through other data nodes, from a
+  node on the control path now shows this run's value when the workflow is run again. Before, in
+  "parallel" execution mode it could keep the previous run's value, or read a blank value, because
+  it ran at the same time as the node feeding it.
+- Renaming the open workflow no longer closes it and reloads it from its file, so its canvas and
+  node results are no longer reset. It stays open under the new name.
+- Resolving a node downstream of a `ForEach` loop while the loop is still running no longer leaves
+  the workflow stuck as running. The downstream node now runs once the loop finishes, and later
+  runs of it are no longer refused with "already executing".
+  [#5754](https://github.com/griptape-ai/griptape-nodes-engine/issues/5754)
+- Resolving a node that reads a `ForEach` or `ForLoop` End's `results`, after editing an input to
+  the loop body, now runs the loop again and finishes. Before, the loop never started, the body ran
+  once outside the loop with a stale `current_item`, and the resolved node stayed running forever.
+- Running a node placed after a `ForEach` loop no longer fails with a `KeyError` naming a node from
+  outside the loop, once every iteration has finished, when a node in the loop body reads an input
+  from that outside node. The run now completes and the node after the loop gets every iteration's
+  results. Other nodes outside the loop that read the same outside node, such as a `Display Text`,
+  now show this run's value instead of the previous run's.
+  [#5753](https://github.com/griptape-ai/griptape-nodes-engine/issues/5753)
+  [#5747](https://github.com/griptape-ai/griptape-nodes-engine/issues/5747)
+
+## [0.106.0] - 2026-11-02
+
+### Added
+
+- `claude-haiku-5-5` is available in Griptape Cloud model dropdowns and the chat sidebar, with
+  image input. [#5987](https://github.com/griptape-ai/griptape-nodes-engine/issues/5987)
+- `DescribeNodeTypeRequest` now reports each parameter's `element_type` and, for a `ParameterList`, its
+  `max_items`, so clients can tell multi-input parameters from plain list inputs without creating a node.
+  [#5918](https://github.com/griptape-ai/griptape-nodes-engine/issues/5918)
+- A library's nodes can now run on another computer's Griptape Nodes engine while you keep working
+  in your own editor. Several people can share that computer: it runs one person's run at a time,
+  frees the previous person's models when it passes to the next, and the run toolbar shows a run
+  that waits for it as queued. See
+  [Running Nodes on Another Computer](https://docs.griptapenodes.com/en/stable/guides/run_nodes_on_another_computer/).
+- Node libraries can read the inputs and outputs of an imported workflow's flow with
+  `GetWorkflowShapeRequest`, which also works from a node running in a worker.
+  [griptape-nodes-library-standard#883](https://github.com/griptape-ai/griptape-nodes-library-standard/issues/883)
+- `LoadMetadataForAllLibrariesRequest` now takes `include_git_info`. Pass `false` to skip the git
+  lookups behind `git_remote` and `git_ref`, which take several git processes per library, when
+  only the library schemas are needed.
+  [#5943](https://github.com/griptape-ai/griptape-nodes-engine/issues/5943)
+- MCP clients can now call `GetFlowSummaryRequest` to see a flow's nodes, the values set on them,
+  their multi-inputs, and their connections in one compact request, instead of
+  `ListNodesInFlowRequest` and a full `GetAllNodeInfoRequest` per node. Outputs, run results, and UI
+  state are left out. [#5967](https://github.com/griptape-ai/griptape-nodes-engine/issues/5967)
+- Model downloads can be paused with `PauseModelDownloadRequest` and resumed with
+  `ResumeModelDownloadRequest`, and stay paused across engine restarts. Resuming skips files that
+  already finished. Nodes won't run on a paused or failed download.
+  [#4563](https://github.com/griptape-ai/griptape-nodes-engine/issues/4563)
+- Three strict-mode rules flag node code that behaves differently in a separate process than
+  in-process: `graph-access-while-loading` (asking about connections or other nodes while the node
+  loads), `state-read-bypassing-requests` (reading a manager instead of sending a request), and
+  `state-outside-parameters` (keeping state set by `after_value_set` or a connection hook on the
+  node instead of in a parameter). Each warns where the node runs in-process and fails the node's run
+  in a separate process.
+  [#5955](https://github.com/griptape-ai/griptape-nodes-engine/issues/5955)
+- `validate_empty_parameter()` takes a `skip_if_connected` option for use in
+  `validate_before_workflow_run`, which runs before connections deliver their values. With it, a
+  parameter that a connection feeds is not reported as blank.
+  [#5889](https://github.com/griptape-ai/griptape-nodes-engine/issues/5889)
+
+### Changed
+
+- **Breaking:** A node whose library runs in a separate process now runs there on a copy loaded the
+  way a saved workflow reopens, with the same parameters and types as the node in the editor,
+  including parameters added in the editor, by requests, and by its value hooks. `after_value_set`
+  no longer runs in that process, and nothing the node's code sends while the copy loads reaches the
+  workflow. A node whose `process` relied on state its `after_value_set` set needs to keep that
+  state in a parameter; see
+  [Node Isolation with Workers](docs/development/custom_nodes/node_isolation_with_workers.md#the-rules-that-keep-a-worker-identical-to-running-in-process).
+  [#5955](https://github.com/griptape-ai/griptape-nodes-engine/issues/5955)
+- The built-in chat now starts each message with the available node types and the current flow, so
+  it builds a change in one `EventRequestBatch` call instead of first making discovery calls.
+  [#5909](https://github.com/griptape-ai/griptape-nodes-engine/issues/5909)
+- `StartFlowRequest`, `StartFlowFromNodeRequest`, and `ResolveNodeRequest` sent while another run
+  is in progress now wait for that run to finish and then start, instead of failing with "Flow is
+  already running". Waiting runs start in the order they were sent, and a new `RunQueuedEvent` tells
+  the editor each waiting run's place in line, with the `request_id` of the request that submitted
+  it. Their results now carry the run's `run_id`. The new `ListRunsRequest` lists the run in
+  progress and the waiting runs, `CancelRunRequest` withdraws a waiting run or stops the run in
+  progress, and `CancelAllRunsRequest` cancels every run. Running a node while another node is
+  running still adds it to that run, as before.
+- A node's `validate_before_node_run` now runs in a worker thread instead of on the engine's event
+  loop, so a slow check, such as reading a large or remote file, no longer freezes the editor and
+  other flows while it runs. The node still waits for its own checks before it runs, and a failed
+  check stops the run as before.
+  [#5963](https://github.com/griptape-ai/griptape-nodes-engine/issues/5963)
+
+### Fixed
+
+- Workflow nodes that import their workflows at the same time, in parallel branches or in a loop
+  set to "Run Group Items All at Once", no longer mix up which workflow each node's flow came from.
+  Before, a node's flow could be saved as a reference to another node's workflow.
+  [#5665](https://github.com/griptape-ai/griptape-nodes-engine/issues/5665)
+- In a reopened workflow, removing or replacing a connection into a parameter its node rebuilt while
+  loading, such as a ControlNet's provider settings, no longer fails with "Connection does not
+  exist". Deleting that node no longer fails either. A connection into a parameter its node no
+  longer has can also be removed, along with both of its nodes and their flow.
+- A `ForEach Group`, `For Loop Group`, or `Retry Group` no longer fails to start with "Failed while
+  restoring the saved value of '<node>.<parameter>'" when a body node's connected input holds a value
+  that its own range no longer allows, such as a crop coordinate left over from a wider image. The
+  loop body copy now leaves out values that its connections supply, in both execution modes. As a
+  result, a body node's `validate_before_workflow_run` sees a connected input's default rather than
+  the value shown on the canvas, the same as a node at the top level of the workflow.
+  [#5889](https://github.com/griptape-ai/griptape-nodes-engine/issues/5889)
+- A list fed by a connection keeps its items when its node is pasted together with the node feeding
+  it, instead of coming back empty until that node runs again.
+  [#5955](https://github.com/griptape-ai/griptape-nodes-engine/issues/5955)
+- Setting a parameter that has a hard-limited slider or a min/max range to `None` no longer fails
+  with "'>' not supported between instances of 'NoneType' and 'float'". `None` passed over a
+  connection into an optional number parameter now goes through instead of stopping the flow.
+  [#6063](https://github.com/griptape-ai/griptape-nodes-engine/issues/6063)
+- A restarted model download no longer shows progress from 0%. Files finished on an earlier
+  attempt now count as downloaded and toward the total.
+  [#6087](https://github.com/griptape-ai/griptape-nodes-engine/issues/6087)
+- When a saved value cannot be restored while a workflow or loop body is rebuilt, the error now
+  includes the reason, such as "must be between 0 and 50", instead of only naming the parameter.
+  [#5889](https://github.com/griptape-ai/griptape-nodes-engine/issues/5889)
+
+## [0.105.0] - 2026-10-27
+
+### Added
+
+- Engine processes now read `GTN_APPEND_PYTHONPATH`, a list of folders added to the end of the
+  module search path. Modules in those folders can be imported from nodes, but never replace the
+  engine's own packages the way `PYTHONPATH` entries can.
+- `CreateConnectionResultSuccess` now has a `replaced_connection` field, and its message names the
+  connection, when the new connection replaced one on an input or control output that allows only
+  one connection.
+  [#5912](https://github.com/griptape-ai/griptape-nodes-engine/issues/5912)
+- `CreateNodeResultSuccess` now has a `paired_node_name` field naming the End node that creating
+  a For Each or For Loop Start node also creates, so clients don't create a second one.
+  [#5911](https://github.com/griptape-ai/griptape-nodes-engine/issues/5911)
+- A `DatePicker` trait gives a `str` parameter a calendar picker in the editor. The value is an
+  ISO 8601 local date such as `2026-10-14`, or `2026-10-14T09:30` with `include_time=True`, so a
+  node can read it with `date.fromisoformat`. Optional `min` and `max` bound the allowed dates.
+  [#5890](https://github.com/griptape-ai/griptape-nodes-engine/issues/5890)
+- Nodes that call a model provider directly, rather than through Griptape Cloud, can now take part
+  in Griptape Cloud spending budgets. `BudgetAccessRequest` asks Cloud before the call and fails
+  with the same "Budget stopped this run." message when a budget refuses it; if Cloud cannot be
+  reached the call goes ahead. `ReportUsageRequest` sends the call's token counts afterwards, in the
+  background, and Cloud prices them. See [Budgets for Direct Provider Calls](https://docs.griptapenodes.com/en/stable/development/custom_nodes/direct_provider_budgets/).
+  [#5422](https://github.com/griptape-ai/griptape-nodes-engine/issues/5422)
+- An "Isolated Execution in a worker" beta feature runs the nodes of groups and loops set to
+  "Isolated Execution" in one background process that stays open for the session, instead of
+  starting a new process each time the group or loop runs. The group's results no longer travel
+  through Griptape Cloud, so Isolated Execution works on installs that can't reach it. Turn it on
+  from the editor's Beta settings page.
+- Advanced libraries can return execution and app event listeners from
+  `get_execution_event_listeners()` and `get_app_event_listeners()`, for example to log or time
+  every node a workflow runs. The engine registers them when the library loads and removes them
+  when it unloads. See the
+  [timing example](docs/development/custom_nodes/advanced_libraries.md#example-a-library-that-times-every-node-run).
+  [#5779](https://github.com/griptape-ai/griptape-nodes-engine/issues/5779)
+- Each `successful_libraries` entry from `LoadMetadataForAllLibrariesRequest` now reports how the
+  engine's last attempt to load that library went, as `lifecycle_state`, `fitness`, `problems`,
+  and `execution_env_failure`, so a library that failed to load can be told apart from one waiting
+  for a refresh.
+  [#5102](https://github.com/griptape-ai/griptape-nodes-engine/issues/5102)
+- `ListNodeTypesInLibraryRequest` takes `include_metadata` to also return each node type's category,
+  display name, description, and deprecation. MCP clients can survey every library's node types in
+  one `EventRequestBatch` instead of reading library manifests off the engine's disk. It reads library
+  metadata only, so it loads no node code.
+  [#5962](https://github.com/griptape-ai/griptape-nodes-engine/issues/5962)
+- New setting `max_loop_iterations_in_parallel` limits how many iterations of a loop set to
+  "Run Group Items All at Once" run at the same time. Defaults to 0 (no limit).
+  [#5067](https://github.com/griptape-ai/griptape-nodes-engine/issues/5067)
+- MCP clients can now call `CancelFlowRequest` to stop a running flow and `UnresolveFlowRequest` to
+  reset a flow's nodes, so an agent can recover a stuck run without reloading the workflow.
+  [#5754](https://github.com/griptape-ai/griptape-nodes-engine/issues/5754)
+- MCP clients can now call `ValidateFlowDependenciesRequest` to run a flow's pre-run checks without
+  running it, so an agent can find wiring and configuration errors before spending a run on them.
+  [#5917](https://github.com/griptape-ai/griptape-nodes-engine/issues/5917)
+- Node libraries can build a `NodeError` for a failed provider call with `NodeError.from_missing_secret`,
+  `NodeError.from_http_response` and `NodeError.from_request_exception`, instead of each library
+  writing its own helpers. A refused API key links to the secret in Settings, and timeouts and
+  failed connections get a plain message.
+  [#5899](https://github.com/griptape-ai/griptape-nodes-engine/issues/5899)
+- `NodeStartProcessEvent` is sent again before every node runs, and `NodeFinishProcessEvent` after,
+  for every node the engine runs: regular nodes, nodes that run in a worker, group and loop nodes,
+  and the nodes inside them. Both now carry `node_type`, `specific_library_name`, `flow_name`,
+  `execution_id`, and `parent_execution_id`, and `NodeFinishProcessEvent` says how the run ended
+  (`outcome`, `error_message`, `error`). Loop body nodes are named as on the canvas.
+  [#5779](https://github.com/griptape-ai/griptape-nodes-engine/issues/5779)
+- `ParameterList` takes `item_converters`, which convert each item whether it is set in its own row
+  or arrives in a whole list. A whole list a node sets on its own list with `set_parameter_value`
+  now becomes the list's items, as it does when set by request. See
+  [Parameters](docs/development/custom_nodes/parameters.md).
+- The engine now watches each local file the editor previews and sends a `StaticFileChanged` event
+  when the file is saved, including saves from other apps, so the editor can show the new content.
+  Turn it off with the `refresh_previews_on_file_change` setting, and cap how many files are watched
+  with `refresh_previews_max_files` (1000 by default).
+  [griptape-vsl-gui#3273](https://github.com/griptape-ai/griptape-vsl-gui/issues/3273)
+- `ResetLibraryRequest` deletes a library's Python environments (`.venv` and `.venv-exec`) and
+  builds them again, so a library whose packages are broken can be recovered without deleting
+  folders by hand. When the engine has already loaded packages from the library, the reset finishes
+  the next time the engine starts and the result reports `restart_required`.
+  `LoadMetadataForAllLibrariesRequest` reports `reset_requires_restart` so a client can say so
+  before the reset is confirmed.
+  [#5102](https://github.com/griptape-ai/griptape-nodes-engine/issues/5102)
+
+### Changed
+
+- **Breaking:** The chat agent now asks before it runs workflows or nodes, generates images, or uses
+  tools from your own MCP servers, so a question no longer spends credits unprompted. Such a turn
+  ends `RunAgentRequest` with the calls in `output.pending_approvals` instead of running them, and
+  they run only once a client answers with `ResolveToolApprovalsRequest`; see
+  [Approvals](docs/guides/agent/approvals.md).
+  [#5606](https://github.com/griptape-ai/griptape-nodes-engine/issues/5606)
+- **Breaking:** The "Private Execution" option for groups and loops is now called "Isolated
+  Execution": it runs them in a separate process, which keeps them apart but does not make them
+  private. Workflows saved with "Private Execution" open with "Isolated Execution" selected. A
+  workflow saved after this change opens in an older version with "Local Execution" selected. Node
+  libraries that import `PRIVATE_EXECUTION` from `griptape_nodes.exe_types.node_types` need to use
+  `ISOLATED_EXECUTION` instead.
+- Opening, pasting, and editing large workflows spend less time after each request as the workflow
+  grows. The engine used to check every node for pending editor updates after each request; it now
+  checks only the nodes that changed.
+- The editor no longer stalls while the engine saves a large image with its workflow metadata or
+  makes an image preview.
+- Loading libraries, at engine startup and on a library reload or project switch, no longer runs
+  git several times per library or re-reads every package installed in the engine's environment.
+  With three libraries installed, a reload takes about 0.2 seconds instead of 1.9.
+  [#5940](https://github.com/griptape-ai/griptape-nodes-engine/issues/5940)
+- A `NodeError` response over 16 KB now keeps its structure, with base64 data replaced by its length
+  and strings over 2000 characters cut, instead of being dropped. It is dropped only if it is still
+  too large.
+  [#5899](https://github.com/griptape-ai/griptape-nodes-engine/issues/5899)
+- Running a workflow spends less time between nodes. Before each node runs, the engine reads the
+  project's variables, and it now works out `{workflow_dir}` once per read instead of once for
+  every project directory.
+
+### Fixed
+
+- The sidebar agent no longer fails with "Request timed out" behind proxies that hold the TLS
+  handshake for longer than 5 seconds. Model requests now allow 60 seconds to connect.
+  [#5768](https://github.com/griptape-ai/griptape-nodes-engine/issues/5768)
+- A chat message that reaches the agent's limit on steps per message no longer disappears from the
+  conversation with an error. The agent's work up to the limit stays in the conversation, and the
+  reply says it stopped, so sending "continue" picks up where it left off.
+  [#5908](https://github.com/griptape-ai/griptape-nodes-engine/issues/5908)
+- Griptape Cloud storage and file requests now keep the path in `GT_CLOUD_BASE_URL`. A base URL like
+  `https://example.com/prefix` sent requests to `https://example.com/api/...`, dropping `/prefix`.
+  [#5789](https://github.com/griptape-ai/griptape-nodes-engine/issues/5789)
+- A value that reaches a node over a connection is no longer run through variable substitution
+  again when the node copies it onto its own output. A save node's `Saved to: {outputs}/a.mp4`
+  status wired into an End node now stays a macro on the End node too, so the saved workflow
+  holds no absolute path. [#5897](https://github.com/griptape-ai/griptape-nodes-engine/issues/5897)
+- The `execution_events` panel of a group set to Isolated Execution or to a library's environment
+  no longer shows every event twice. It shows a "Starting:" line for each node again, and a
+  "Finished:", "Failed:", or "Cancelled:" line when the node ends.
+  [#5779](https://github.com/griptape-ai/griptape-nodes-engine/issues/5779)
+- The engine reports that it is still initializing from the moment it starts, not only once library
+  loading begins. An editor that connects during startup now waits for the engine instead of
+  showing a connection error.
+  [griptape-nodes-desktop#466](https://github.com/griptape-ai/griptape-nodes-desktop/issues/466)
+- Library templates no longer disappear from the editor's library filters after switching
+  projects. Switching now re-registers each library's templates against the new project.
+  [#5765](https://github.com/griptape-ai/griptape-nodes-engine/issues/5765)
+- **Create** on a workflow a library provides now makes a copy in your workspace even when the
+  library did not mark it `is_template`, and saving an open library workflow writes a copy instead
+  of overwriting the library's file. Before, **Create** opened the library's own file for editing.
+- Removing or moving an item of a list parameter now updates the list that
+  `GetParameterValueRequest` returns, reruns the nodes that read it, and lets the node react, as
+  "Path Join" does when it recomputes its output. A node whose library runs in a separate process
+  now receives its list inputs instead of an empty list.
+- A row of a list parameter (for example `reference_images` on "Kling Omni Video Generation") now
+  accepts a whole list, such as the output of "Create Image List", and adds its items to the list.
+  [#2943](https://github.com/griptape-ai/griptape-vsl-gui/issues/2943)
+- Workflows with a chain of more than about 1,000 connected nodes now run and accept edits. Before,
+  passing a value down the chain failed with "maximum recursion depth exceeded". Passing values
+  down long chains also takes less time.
+- A `ForEach Group`, `For Loop Group`, or `Retry Group` whose body holds a node with a list
+  parameter wired row by row from other nodes, such as `Merge Images`, no longer fails at the end of
+  the run with "Attempted to set list ... some of its items are connected to other nodes".
+  [#6013](https://github.com/griptape-ai/griptape-nodes-engine/issues/6013)
+- Creating a For Each or For Loop Start node with `CreateNodeRequest` and no `position` in its
+  `metadata` now creates and connects its End node, instead of failing with `'position'`.
+  [#5910](https://github.com/griptape-ai/griptape-nodes-engine/issues/5910)
+- Opening a workflow by running a file the registry doesn't know (for example, one outside the
+  workspace) no longer shows a "GetWorkflowMetadata Failed" error. Its metadata is read from the
+  file's header.
+  [#5794](https://github.com/griptape-ai/griptape-nodes-engine/issues/5794)
+- A node failing in a parallel run no longer cancels the other nodes running alongside it. Nodes
+  that already started finish and show their results, nodes still waiting to start are skipped, and
+  the run then reports the failure. Cancelling a run still stops every node.
+  [#5893](https://github.com/griptape-ai/griptape-nodes-engine/issues/5893)
+- A loop set to "Run Group Items All at Once" no longer floods the editor with events about the
+  temporary copies of its body, which could make the editor report the engine as disconnected.
+  [#5067](https://github.com/griptape-ai/griptape-nodes-engine/issues/5067)
+- Switching projects no longer freezes the editor for about 25 seconds and stops a library's nodes
+  from running for the rest of the session, when that library runs its nodes in a separate process
+  and the new project's workspace contains saved workflows.
+  [#5946](https://github.com/griptape-ai/griptape-nodes-engine/issues/5946)
+- Saving a workflow right after updating one of its libraries now keeps parameter values whose
+  type comes from that library, such as a node's mode dropdown. Before, the save dropped those
+  values with a warning, and engines before 0.104.0 failed to save with "Missing stable
+  namespace".
+- A node's status no longer has project variables substituted into it during a run, so a status
+  such as `Saved to: {outputs}/a.mp4` is saved with the workflow as written instead of as the
+  absolute path. [#5897](https://github.com/griptape-ai/griptape-nodes-engine/issues/5897)
+- Closing a workflow that contains node groups, such as a ForEach Group, no longer logs a
+  "subflow doesn't exist" warning for each group.
+  [#5746](https://github.com/griptape-ai/griptape-nodes-engine/issues/5746)
+- Setting a whole list on an unconnected list parameter by request (an MCP client, an agent, a
+  script) now fills the list's items, the same as entering them one by one in the editor. The
+  request used to succeed while the node still read an empty list.
+  [#5758](https://github.com/griptape-ai/griptape-nodes-engine/issues/5758)
+- A node whose library runs in a separate worker process no longer waits up to 10 minutes when
+  that process stops while starting up, for example because no license session was available
+  for it. The run now fails right away and says that the process stopped and where to look.
+- Running a node whose library runs in a separate process no longer deletes connections when the
+  node reacts to a value by changing its wires, such as `Load Pipeline Component` in the Modular
+  Diffusion library dropping every wire it fed after a run.
+- A library whose nodes run in a worker process now starts its worker as soon as the library
+  finishes installing. Its runs no longer fail with a "No module named" error after a first install
+  until the engine restarts, and a library installed from Git while the editor is connected no
+  longer goes without a worker until **Refresh Libraries**.
+- Workflows behind a library's `workflow_nodes`, such as the Modular Diffusion "Preconfigured"
+  nodes, are now listed under their library as soon as the library loads. Before, they appeared
+  only after the node was placed, and a workspace change removed them again.
+
+## [0.104.2] - 2026-10-20
+
+### Fixed
+
+- The agent chat on Windows no longer fails on every message with "`LocalWorkspaceBackend` only
+  supports POSIX platforms" when the workspace has an `.agents/skills` folder. If a platform
+  cannot load skills, the chat now answers without them instead of failing.
+
+## [0.104.1] - 2026-10-13
+
+### Fixed
+
+- Unlocking a node that was locked before it ever ran now lets the next downstream run execute it.
+  A run passing through a locked node marks it resolved without running it, and that state used
+  to outlive the unlock, so the node was skipped until it was run directly.
+  [#5766](https://github.com/griptape-ai/griptape-nodes-engine/issues/5766)
+- The editor no longer shows a "GetConfigValue Failed" popup for `library.sandbox_enabled` at
+  launch or on refresh. `GetConfigValueRequest` now succeeds with an empty value for a setting
+  that is unset by default, and fails only for a key that names no setting.
+
+## [0.104.0] - 2026-10-12
+
+### Added
+
+- The editor's "Enable beta features" switch now turns engine and library beta features off too,
+  not only editor ones. It is saved as `beta_features.enabled`. Each feature keeps its own setting
+  and gets it back when the switch is turned on again. `GTN_CONFIG_BETA_FEATURES__ENABLED=false`
+  turns every beta feature off for one session.
+  [#5710](https://github.com/griptape-ai/griptape-nodes-engine/issues/5710)
+- With Griptape Cloud spending budgets, a node whose call a budget refuses fails with a message
+  naming the node and every budget that refused, and the editor's "Run blocked" bar shows it, for
+  example: "Budget stopped this run. 'Generate Poster' was blocked by the budget "Marketing Q3".
+  Contact your Griptape administrator." A node with its Failure output wired takes that branch, as
+  it does for any other error. Sidebar chat replies and the images they generate count against
+  the open project's budgets, and a refusal there ends the reply instead. See
+  [When a budget stops a run](https://docs.griptapenodes.com/en/stable/guides/editor/running_workflows/#when-a-budget-stops-a-run).
+  [#5422](https://github.com/griptape-ai/griptape-nodes-engine/issues/5422)
+- `GTN_ENGINE_CONFIG_DIR`, `GTN_ENGINE_DATA_DIR` and `GTN_ENGINE_STATE_DIR` move the engine's
+  configuration, data and state directories without changing `XDG_*` for programs the engine
+  starts, such as `uv`. Each names the final directory and must be an absolute path; relative
+  values are ignored.
+- Node libraries can open a file in the viewer application a user picked in the library's settings
+  by sending `LaunchExternalViewerRequest`. The engine starts `<category>.viewer_executable` with
+  the arguments in `<category>.viewer_args` followed by the file, and does not wait for it. When
+  `fallback_to_os_default` is set and no viewer is chosen, it opens the file with the system's
+  default application instead. Requests sent from a worker open the viewer on the user's machine.
+  [#4942](https://github.com/griptape-ai/griptape-nodes-engine/issues/4942)
+- Variables whose value is a list can now be used in `{VAR}` tokens, for example in a `Text` node,
+  and are returned by `ListSubstitutablesRequest`. The list is substituted as text with one item
+  per line.
+  [#5833](https://github.com/griptape-ai/griptape-nodes-engine/issues/5833)
+- Studios can run the engine inside an environment their own tools prepare, listing its libraries in
+  the `GTN_LIBRARY_PATHS` environment variable and starting each library's worker inside that
+  library's own environment with `worker.command_prefix`. Setting `library.provisioned_by` to
+  `environment` makes those the only libraries that load, with nothing downloaded and no virtual
+  environments built; `library.sandbox_enabled` lets the sandbox library load in that mode (or turns
+  it off in any mode), and `ReloadSandboxLibraryRequest` reloads just the sandbox. See
+  [Running in a Managed Environment](https://docs.griptapenodes.com/en/stable/guides/managed_environment/).
+- `NodeErrorEvent` has an optional `error` field that holds a node failure in parts: the node's own
+  message without the engine's "Attempted to execute node" wrapping or a leading node name, the
+  exception type, one message per problem when a node fails validation, and anything the node
+  attached with `NodeError`. When the engine wrote the failure itself, such as a worker that stopped
+  responding, `error.message` is the engine's text. `ExecuteNodeResultFailure.error` carries the
+  same parts back from the process the node ran in. `error_message` is unchanged.
+  [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733)
+- Nodes can raise `NodeError` from `griptape_nodes.exe_types.core_types` to attach labelled values
+  such as a request ID, the provider's response body, and up to three links, instead of putting
+  them in the message text. A link is a web page or, when it starts with `#`, a place in the
+  editor, such as the API key the node needs. They reach the editor in `NodeErrorEvent.error`, also
+  when the node runs in a worker. See
+  [Writing Error Messages](docs/development/custom_nodes/error_handling.md#writing-error-messages).
+  [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733)
+- Execution events carry run times. `NodeResolvedEvent` and `NodeErrorEvent` have an optional
+  `run_seconds` with how long the node ran, and `ControlFlowResolvedEvent` and
+  `ControlFlowCancelledEvent` have one with how long the whole run took, so the editor can show where
+  a run spent its time. An End Loop node's or group node's time includes the nodes inside it.
+  [#5717](https://github.com/griptape-ai/griptape-nodes-engine/issues/5717)
+- `PublicArtifactUrlParameter` has `aget_public_url_for_parameter()` and
+  `adelete_uploaded_artifact()`. Nodes using them can upload multiple reference images concurrently
+  without blocking other nodes or delaying "Stop". Uploads interrupted by "Stop" finish and are
+  deleted in the background.
+  [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
+- The engine installs and runs on Python 3.14 and 3.15.
+  [#5863](https://github.com/griptape-ai/griptape-nodes-engine/issues/5863)
+- A saved workflow placed in the sandbox library folder now appears as a node in the Sandbox
+  Library, with the workflow's Start Flow and End Flow parameters as its inputs and outputs, so it
+  can be reused inside another workflow. `RegisterSandboxNodeFromSourceRequest` accepts a saved
+  workflow too. See "Turning a workflow into a node" in the libraries guide.
+  [#5657](https://github.com/griptape-ai/griptape-nodes-engine/issues/5657)
+
+### Changed
+
+- **Breaking:** `ControlFlowResolvedEvent` sends a parameter value with no plain-data form as `null`
+  instead of as its text, and no longer has `unique_parameter_uuid_to_values`.
+- **Breaking:** In `SerializeFlowToCommandsResultSuccess` and
+  `ExtractFlowCommandsFromImageMetadataResultSuccess`, each node's `element_modification_commands`
+  lists `{"request_type": ..., "request": {...}}` entries, the form `EventRequestBatch` takes,
+  instead of each request's fields alone, so each request reads back as its own type.
+- **Breaking:** A request or event field typed `Any` that holds a griptape object, or a value JSON
+  has no form for, fails to send with an error naming the payload. It used to be sent as the
+  object's `to_dict()` or as its text. A result that fails to send this way answers its request
+  with a generic failure naming the reason, instead of leaving the request without a reply.
+  Annotate a field that carries parameter values `Value` so they send, as described in
+  [`get_request_handlers`](docs/development/custom_nodes/advanced_libraries.md#get_request_handlers).
+  See [MIGRATION.md](MIGRATION.md#parameter-values-keep-their-type).
+- Copied nodes, and the workflow embedded in an exported PNG, are stored as JSON instead of pickle,
+  and the embedded workflow is compressed, so exported PNG files are smaller. Nodes copied and PNG
+  files exported by earlier versions still paste and load. A PNG exported by this version doesn't
+  load its workflow in earlier ones.
+- Serializing an event now walks its payload once instead of twice, cutting serialization cost —
+  most noticeably on events with large parameter values.
+- `ExecuteNodeRequest` results are no longer broadcast to clients by default. The request carries
+  a node's run between its flow and the process it runs in, and no client uses the result.
+- A failed run now reports `Attempted to run flow '<flow>'. Failed due to: ...` instead of
+  `Failed to kick off flow with name <flow>. Exception occurred: ...`, and names the failed node
+  once instead of twice. The old wording read as if the run never started.
+- `GetParameterValueRequest` handled inside the engine, as from node code or
+  `RetainedMode.get_value`, returns the parameter's value itself instead of a plain-data copy, so
+  an artifact comes back as the artifact.
+- Parameter values recorded in an image's workflow provenance name their type when JSON has none.
+- A node in a library running in its own process fails with an error naming the parameter when an
+  input or output has no plain-data form, instead of receiving or sending it as text. See
+  [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
+  that can cross.
+- Image, video, audio, and 3D inputs set from a file path now store a macro path such as
+  `{inputs}/cat.png` for files in a project directory or the workspace, and the absolute path
+  otherwise, instead of copying the file into `staticfiles/` and storing a `localhost` URL.
+  Workflows read those files from disk, so headless and published runs no longer need the
+  desktop app running, and values saved as `localhost` URLs by earlier versions are read from
+  disk too.
+- Each engine now keeps its own workflow registry, reached through `engine.workflow_registry`, so
+  engines in one process no longer share registered workflows. `WorkflowRegistry` classmethods
+  still work and act on the current engine's registry.
+- Nodes that upload media to Griptape Cloud for a public URL now resolve the storage bucket on the
+  first upload and reuse it for later uploads. Adding such a node to a workflow no longer contacts
+  Griptape Cloud.
+  [#5729](https://github.com/griptape-ai/griptape-nodes-engine/issues/5729)
+- The engine console no longer prints routine messages, such as library dependency installs,
+  `Resolving <node>`, `Flow is complete.`, workflow saves, loop iterations, workflow sync, worker
+  and session bookkeeping, and agent prompts and tool calls. A failed node is reported once, by the
+  run that hit it, instead of at every layer with a full traceback. Set `log_level` to `DEBUG` to
+  see the rest.
+- `RunArbitraryPythonStringRequest` failures now start with the exception type, such as
+  `ZeroDivisionError: division by zero`, instead of `ERROR: division by zero`. This is the text a
+  node that runs Python code shows when the code fails.
+  [#5733](https://github.com/griptape-ai/griptape-nodes-engine/issues/5733)
+- The sandbox library now loads nodes from folders linked into it, and `~` and environment
+  variables in `sandbox_library_directory` are expanded. A value that starts with `$` is still read
+  as a secret name.
+- Workflows saved by this version do not open in earlier versions. Saved workflow files store
+  parameter values as readable data instead of pickle, and saving an unchanged workflow writes the
+  same file each time, so saved workflows diff cleanly. Workflows saved by earlier versions still
+  open.
+  [#5441](https://github.com/griptape-ai/griptape-nodes-engine/issues/5441)
+- A class in a request field typed `type`, such as `RegisterArtifactProviderRequest.provider_class`,
+  is sent as `module:Qualname` instead of `module.Qualname`, the form parameter values name
+  classes by.
+- A parameter value with no plain-data form is no longer written to saved workflow files, so its
+  node runs again when the workflow reopens. It is also left out of copied nodes, exported images,
+  and the copy of a loop's or group's nodes that its iterations run, so those copies use the
+  parameter's default. Values flowing into the loop from outside it still arrive. A default value
+  with no plain-data form on a parameter added to a node is left out the same way. See
+  [Parameter values](docs/development/custom_nodes/parameters.md#parameter-values) for the types
+  that are saved, and how to make a class savable.
+- Workflow registration at startup, on `RefreshWorkflowRegistryRequest`, and on project switch now
+  reads and parses each workflow file's metadata header once instead of twice, and fetches the
+  registered library list once per scan instead of once per file. Workspaces holding many workflows
+  finish loading sooner.
+  [#5770](https://github.com/griptape-ai/griptape-nodes-engine/issues/5770)
+
+### Deprecated
+
+- `pickle_control_flow_result` on `StartFlowRequest`, `StartFlowFromNodeRequest`,
+  `StartLocalSubflowRequest`, `SaveWorkflowRequest`, `SaveWorkflowFileFromSerializedFlowRequest`,
+  `PublishWorkflowRequest`, and the workflow executors, and the `--pickle-control-flow-result` CLI
+  flag, have no effect. Flow results always travel as plain data. They will be removed in a later
+  release.
+- Nodes copied, and PNG files exported, by earlier versions still paste and load, with a warning,
+  but a later release will stop reading them. Export the image again to keep its workflow loadable.
+- `safe_unstructure` from `griptape_nodes.retained_mode.events.event_converter` is deprecated and
+  will be removed in a later release. Use `encode_value` from `griptape_nodes.serialization.values`
+  to turn a parameter value into plain data. It no longer uses a griptape object's `to_dict()`, or
+  falls back to a value's text.
+- `use_pickling` on `SerializeNodeToCommandsRequest` has no effect. Parameter values are always
+  stored as plain data. It will be removed in a later release.
+
+### Removed
+
+- **Breaking:** Events' `json()` and `dict()` raise `TypeError`. `strict_json()`, `failure_json()`
+  and `from_dict()` on events, and `to_json()` on payloads, are removed. Use the converters in
+  `griptape_nodes.retained_mode.events.converters`: `engine` keeps parameter values' types for
+  another engine process, `client` sends them as plain JSON.
+  See [MIGRATION.md](MIGRATION.md#events-are-serialized-by-converters).
+- **Breaking:** A library's manifest no longer picks where its nodes run. A library that declared
+  `SuggestedWorkerMode(WORKER)`, or was set to "Isolated" through `worker_mode_override`, now loads
+  into the engine process, and its `pip_dependencies` install into `<library>/.venv` on the engine's
+  own import path, where they can conflict with the engine's packages. Declare
+  `pip_dependencies_exec` to run its `process` in a worker instead. `WorkerModeCompatibility`,
+  `SuggestedWorkerMode`, and `worker_mode_override` still parse but have no effect. See
+  [MIGRATION.md](MIGRATION.md#libraries-no-longer-choose-a-worker) for the other removals.
+  [#5420](https://github.com/griptape-ai/griptape-nodes-engine/issues/5420)
+- **Breaking:** `StartFlowRequest` no longer accepts `wait_for_completion` or `completion_timeout_ms`.
+  The request already answers once the run ends, so neither had any effect. Drop them from calls. To
+  bound a run, wrap the call in `asyncio.wait_for` and send `CancelFlowRequest` on timeout.
+
+### Fixed
+
+- Directory cleanup now counts files in subfolders toward `max_directory_size_gb` instead of
+  failing with a file-not-found error.
+  [#5724](https://github.com/griptape-ai/griptape-nodes-engine/issues/5724)
+- `DownloadLibraryRequest` now honors a `url@ref` suffix on `git_url`, checking out that branch,
+  tag, or commit instead of failing to clone. An explicit `branch_tag_commit` still takes precedence.
+- The engine console no longer prints the same error message more than once when a request, a
+  node run, a workflow publish, or a cloud file upload or download fails.
+- The warning logged when a library's dependencies cannot install under the engine's own versions
+  now includes the installer's explanation, naming the requirement that conflicted.
+  [#5748](https://github.com/griptape-ai/griptape-nodes-engine/issues/5748)
+- Float, bool, and JSON (dict) variables now substitute into `{VAR}` tokens and appear in the
+  variable picker. Before, a `{VAR}` token for one of these stayed in the text as typed. A float
+  renders as `1.5`, a bool as `true` or `false`, and a dict as compact JSON.
+  [#5839](https://github.com/griptape-ai/griptape-nodes-engine/issues/5839)
+- The engine now pins `huggingface-hub<2` to prevent dependency conflicts that mark libraries as
+  `FLAWED` on fresh installs.
+  [#5752](https://github.com/griptape-ai/griptape-nodes-engine/issues/5752)
+- Outputs of a node in a library running in its own process reach downstream nodes as the same
+  types, instead of as plain dicts. Artifact classes a library defines itself, such as
+  `VideoUrlArtifact`, arrive as that class instead of griptape's class of the same name. A value
+  whose class belongs to a library the receiving process does not load still arrives as a dict, and
+  reaches the next process that does load it unchanged.
+  [#4475](https://github.com/griptape-ai/griptape-nodes-engine/issues/4475)
+- A node that reports a result with `set_parameter_value` now shows that result when the node runs
+  in a library's isolated process, instead of leaving the output empty. A parameter that has an
+  output, set while the node is running, now also records the value as a result, and results are what
+  travel back from an isolated process. This covers a parameter that is also kept on display, and one
+  that declares no modes at all, which is most of the parameters a library writes. Nothing the
+  parameter held before is given up: the value is still the parameter's own, so a node that sets one
+  mid-run and reads it on the next run, as a randomized seed does, reads what it set. A parameter
+  with no output has nowhere to publish, so a value set on it during a run stays in the process that
+  set it.
+  [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- Libraries that vendor code as git submodules (such as SAM3 and MiniMax Remover) now get their
+  submodules on install, update, and branch or tag switch. Updating them no longer stops with an
+  "Uncommitted Changes" prompt that "Overwrite" could not clear. A SAM3 install that already shows
+  the prompt needs one "Overwrite".
+  [#5784](https://github.com/griptape-ai/griptape-nodes-engine/issues/5784)
+- Loading library metadata no longer stalls the engine while it reads each library's git details.
+  On Windows, the editor's repeated metadata requests during startup could hold the engine on
+  "Starting your engine" for several minutes.
+  [#5767](https://github.com/griptape-ai/griptape-nodes-engine/issues/5767)
+- A library on a moving tag such as `stable` keeps following that tag when updated, instead of
+  switching to `nightly` whenever both tags point at the same commit. The library checkout records
+  the tag it follows, and Library Management reports it as the current ref.
+  [#5744](https://github.com/griptape-ai/griptape-nodes-engine/issues/5744)
+- Updating a library no longer installs a version that needs a newer engine than the one running.
+  Before, Library Management could still offer an update it had already found incompatible, and
+  installing it left the library unable to load. Checking for updates on an engine too old for
+  the newest version now reports the library as up to date instead of showing an error each time.
+- `DeserializeFlowFromCommandsRequest` and `SaveWorkflowFileFromSerializedFlowRequest` sent as JSON
+  read their nested node, connection, and parameter commands back as commands, instead of as plain
+  dicts the request could not use.
+- When a node fails to be created because a library raised its own kind of missing-key error with a
+  custom message, the error now shows that message instead of only the bare key.
+- `UpdateAgentProviderRequest` sent as JSON with only some provider fields set reads back with just
+  those fields, instead of failing validation on the ones left out.
+  [#5439](https://github.com/griptape-ai/griptape-nodes-engine/issues/5439)
+- A workflow embedded in a PNG loads in a later session even when a node holds a value whose class
+  a node library defines, such as the library's own enum or artifact. PNG files exported by earlier
+  versions with such values load too, instead of failing.
+- Saving an image no longer floods the editor with engine bookkeeping: element events for hidden
+  copies of every node, and results of the engine's own path and project lookups. A 72-node image
+  workflow sent 66 MB over the websocket per run, and now sends 6 MB.
+  [#2823](https://github.com/griptape-ai/griptape-vsl-gui/issues/2823)
+- Renaming a node or flow to a name that is already taken now names the requested name in its
+  warning, instead of printing `{request.requested_name}`.
+- Saved workflows in the sandbox library folder are no longer run when the engine starts. Before,
+  a workflow saved in an older format could make itself the workflow the editor opened on every
+  launch.
+  [#5656](https://github.com/griptape-ai/griptape-nodes-engine/issues/5656)
+- `ScanSequencesResultFailure`, `ListDirectoryResultFailure`, `ListDirectorySequencesResultFailure`,
+  and `DeduceSequencesFromFileListResultFailure` read back from JSON with their `failure_reason`,
+  instead of failing because it may come from either of two enums.
+  [#5438](https://github.com/griptape-ai/griptape-nodes-engine/issues/5438)
+- Saving a workflow with a subflow node group no longer warns about values the group passes
+  through from parameters marked `serializable=False`. `AddParameterToNodeRequest` takes a
+  `serializable` field so a parameter added this way keeps that setting when the workflow reopens.
+  [#5073](https://github.com/griptape-ai/griptape-nodes-engine/issues/5073)
+- Loop iterations that run in a separate process receive artifact and other non-JSON inputs as
+  the same types, instead of as plain dicts.
+- A node group set to "Private Execution" or to a library execution environment now fails right
+  away with a message naming the problem when no `GT_CLOUD_API_KEY` is set, instead of failing
+  after a rejected or timed-out connection.
+  [#5793](https://github.com/griptape-ai/griptape-nodes-engine/issues/5793)
+- A loop or subflow run in a separate process no longer hands back one parameter's value in place
+  of another's when one is `True` and the other is `1`.
+  [#5435](https://github.com/griptape-ai/griptape-nodes-engine/issues/5435)
+- Changing a library's branch or tag in "Library Management" now works on a library that failed to
+  load, so a library built for a newer engine can be switched back to a version this engine can run.
+  Previously the only libraries that could be switched or updated were the ones already loaded.
+- A request with a field typed `type`, such as `RegisterArtifactProviderRequest`, reads back from
+  JSON into the class it names, instead of failing.
+  [#5437](https://github.com/griptape-ai/griptape-nodes-engine/issues/5437)
+- The "Conflicting values" warning for a parameter's `ui_options` now names the node, its type, and
+  the library that defined it, so it is clear which library author to contact.
+  [#5742](https://github.com/griptape-ai/griptape-nodes-engine/issues/5742)
+- A library copied into `libraries_directory` without being registered no longer goes missing
+  silently. Discovery logs the manifest's path and how to register it, and the
+  `libraries_directory` description no longer claims libraries there load on startup: a library
+  loads only from `libraries_to_register` (or Add Library) or a `libraries_to_download` entry.
+  [#5749](https://github.com/griptape-ai/griptape-nodes-engine/issues/5749)
+- Workflows created with `push_workflow(workflow_name=...)` no longer flood the logs with
+  "Optional builtin 'workflow_dir' could not be resolved" warnings before their first save.
+  `workflow_dir` now uses the default save folder when no working directory was provided.
+- A workflow used by a workflow node no longer appears twice in the workflow list when it is inside
+  the workspace.
+
+### Security
+
+- A request that fails outside its handler is now logged by type and request ID only. The engine
+  used to log the whole request, so a failed `SetSecretValueRequest` wrote the secret value to the
+  engine log in plain text.
+  [#5739](https://github.com/griptape-ai/griptape-nodes-engine/issues/5739)
+- Loading a workflow from a PNG, and pasting nodes, no longer unpickle the data unrestricted, no
+  longer run a command in a place serialization never writes that type of command, and no longer
+  import a saved control's module from outside Griptape Nodes and its libraries. Each gap let a
+  crafted image or clipboard payload run any command or module when loaded. Data from earlier
+  versions is read by a reader that builds only saved value types and applies the same checks.
+
 ## [0.103.0] - 2026-09-29
 
 ### Changed
@@ -196,6 +1019,12 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.107.0...HEAD
+[0.107.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...v0.107.0
+[0.106.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.105.0...v0.106.0
+[0.105.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.2...v0.105.0
+[0.104.2]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.1...v0.104.2
+[0.104.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.0...v0.104.1
+[0.104.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.103.0...v0.104.0
 [0.103.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.102.0...v0.103.0
 [0.102.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.101.0...v0.102.0

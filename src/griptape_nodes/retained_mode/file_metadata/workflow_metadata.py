@@ -12,16 +12,12 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_events import (
-    SerializeNodeToCommandsRequest,
-    SerializeNodeToCommandsResultSuccess,
-)
 from griptape_nodes.serialization.commands import encode_commands
-from griptape_nodes.serialization.converter import dump_json
-from griptape_nodes.serialization.values import ValueEncodeError, encode_for_display
+from griptape_nodes.serialization.values import ValueEncodeError, dump_json, encode_for_display
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -37,39 +33,17 @@ class _ParameterCollection(NamedTuple):
     omitted: list[str]
 
 
-def _serialize_node(node_name: str, engine: Engine) -> str | None:
-    """Serialize a specific node to JSON commands.
+def _serialize_flow(workflow: WorkflowRuntime, flow_name: str | None = None) -> str | None:
+    """Serialize a flow of `workflow` to JSON commands for image metadata.
 
     Args:
-        node_name: Name of the node to serialize
-        engine: The engine whose request bus performs the serialization
-
-    Returns:
-        JSON string of serialized node commands, or None if serialization fails
-    """
-    serialize_request = SerializeNodeToCommandsRequest(
-        node_name=node_name,
-    )
-    serialize_result = engine.handle_request(serialize_request)
-
-    if isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
-        # Convert to dict and then to JSON string
-        return serialize_result.to_json()
-
-    return None
-
-
-def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
-    """Serialize a flow's commands to JSON for image metadata.
-
-    Args:
-        engine: The engine whose request bus and context manager perform the serialization
-        flow_name: Name of the flow to serialize (None for current context flow)
+        workflow: The workflow the flow is in
+        flow_name: Name of the flow to serialize (None for the workflow's current flow)
 
     Returns:
         The flow's commands as JSON text, or None if serialization fails
     """
-    if flow_name is None and not engine.context_manager.has_current_flow():
+    if flow_name is None and not workflow.context.has_current_flow():
         logger.warning("Cannot serialize flow: no current flow context available")
         return None
 
@@ -77,7 +51,7 @@ def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
         flow_name=flow_name,
         include_create_flow_command=False,
     )
-    serialize_result = engine.handle_request(serialize_request)
+    serialize_result = workflow.handle_request(serialize_request)
     if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
         logger.warning("Failed to serialize flow '%s' to commands", flow_name or "current")
         return None
@@ -92,28 +66,17 @@ def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
     return text
 
 
-def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterCollection | None:
+def _parameter_values_of(node_name: str, node: BaseNode | None) -> _ParameterCollection | None:
     """Collect current parameter values from a node's INPUT and PROPERTY parameters.
 
     Parameters marked exclude_from_metadata=True are excluded from the returned values and listed
     in the omitted field instead, so callers can surface the omission without revealing
     the value.
 
-    Args:
-        node_name: Name of the node to collect parameters from
-        engine: The engine whose object manager resolves the node
-
     Returns:
         _ParameterCollection with serialized values and omitted exclude_from_metadata parameter names,
-        or None if the node cannot be resolved.
+        or None when there is no node.
     """
-    obj_mgr = engine.object_manager
-    try:
-        node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
-    except Exception as e:
-        logger.warning("Failed to get node '%s' for parameter collection: %s", node_name, e)
-        return None
-
     if node is None:
         logger.warning("Node '%s' not found for parameter collection", node_name)
         return None
@@ -165,70 +128,70 @@ def _collect_workflow_info(engine: Engine, workflow_name: str) -> dict[str, Any]
     return info
 
 
-def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
-    """Collect structured provenance from current execution context without any output formatting.
+def _collect_raw_provenance_in(engine: Engine, workflow: WorkflowRuntime) -> dict[str, Any]:
+    """Collect structured provenance for `workflow` without any output formatting.
 
-    This is the single source of truth for provenance data. Both collect_sidecar_provenance()
-    and collect_workflow_metadata() delegate here and then format the result for their
-    respective targets (JSON sidecar vs. flat PNG text-chunk strings).
-
-    Args:
-        engine: The engine whose context manager and flow manager supply the metadata.
+    collect_workflow_metadata() flattens the result into PNG text-chunk strings, and
+    collect_sidecar_provenance() formats it as JSON.
 
     Returns:
-        Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
+        Dict with 'workflow' and optional 'flow', 'parameters', and 'parameters_omitted' keys.
         'flow' always includes a 'resolving_nodes' list so callers can decide how to present
         multiple nodes. 'parameters_omitted' is present when at least one parameter has
         exclude_from_metadata=True.
     """
-    result: dict[str, Any] = {}
-    context_manager = engine.context_manager
+    result: dict[str, Any] = {
+        "workflow": _collect_workflow_info(engine, engine.workflow_registry.get(workflow.workflow_id).name)
+    }
 
-    if not context_manager.has_current_workflow():
+    if not workflow.context.has_current_flow():
         return result
 
     try:
-        workflow_name = context_manager.get_current_workflow_name()
-        result["workflow"] = _collect_workflow_info(engine, workflow_name)
-    except Exception:
-        logger.warning("Failed to collect workflow name for provenance")
-
-    if not context_manager.has_current_flow():
-        return result
-
-    try:
-        flow = context_manager.get_current_flow()
-        _, resolving_nodes, _ = engine.flow_manager.flow_state(flow)
-        result["flow"] = {"name": flow.name, "resolving_nodes": list(resolving_nodes)}
-
+        flow = workflow.context.get_current_flow()
+        _, resolving_nodes, _ = engine.flow_manager.flow_state_in(workflow, flow)
+        collection = None
         if resolving_nodes:
-            collection = _collect_parameter_values(resolving_nodes[0], engine)
-            if collection is not None:
-                if collection.values:
-                    result["parameters"] = collection.values
-                if collection.omitted:
-                    result["parameters_omitted"] = collection.omitted
+            node_name = resolving_nodes[0]
+            collection = _parameter_values_of(node_name, workflow.objects.get_as_type(node_name, BaseNode))
+        _add_flow_provenance(result, flow.name, resolving_nodes, collection)
     except Exception:
         logger.exception("Failed to collect flow/node metadata for provenance")
 
     return result
 
 
-def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
-    """Collect structured provenance data for the sidecar JSON file.
+def _add_flow_provenance(
+    result: dict[str, Any], flow_name: str, resolving_nodes: list[str], collection: _ParameterCollection | None
+) -> None:
+    """Add the flow block, and the first resolving node's parameters when collected, to `result`."""
+    result["flow"] = {"name": flow_name, "resolving_nodes": list(resolving_nodes)}
+    if collection is None:
+        return
+    if collection.values:
+        result["parameters"] = collection.values
+    if collection.omitted:
+        result["parameters_omitted"] = collection.omitted
 
-    Delegates to _collect_raw_provenance() and reshapes the flow block for the
+
+def collect_sidecar_provenance(engine: Engine, workflow: WorkflowRuntime | None) -> dict[str, Any]:
+    """Collect structured provenance data for the sidecar JSON file of a file written for `workflow`.
+
+    Collects the raw provenance and reshapes the flow block for the
     sidecar's JSON schema. Private parameters are already excluded by
-    _collect_parameter_values(); this function passes 'parameters_omitted' through
+    _parameter_values_of(); this function passes 'parameters_omitted' through
     unchanged. Unlike collect_workflow_metadata(), values stay typed (not stringified).
 
     Args:
-        engine: The engine whose context manager and flow manager supply the metadata.
+        engine: The engine whose flow manager and workflow registry supply the metadata.
+        workflow: The workflow the file was written for, or None, which records no provenance.
 
     Returns:
         Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
     """
-    raw = _collect_raw_provenance(engine)
+    if workflow is None:
+        return {}
+    raw = _collect_raw_provenance_in(engine, workflow)
     result: dict[str, Any] = {}
 
     if "workflow" in raw:
@@ -263,23 +226,26 @@ def _flatten_workflow_info(wf: dict[str, Any], metadata: dict[str, str]) -> None
         metadata[f"{METADATA_NAMESPACE}workflow_description"] = wf["description"]
 
 
-def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
-    """Collect available workflow metadata from current execution context.
+def collect_workflow_metadata(engine: Engine, workflow: WorkflowRuntime | None) -> dict[str, str]:
+    """Collect the metadata to embed in an image written for `workflow`.
 
-    Delegates to _collect_raw_provenance() then flattens the result to a gtn_-prefixed
-    string dict suitable for PNG text-chunk injection. Also appends the serialized flow
-    commands blob, which is only needed for the embedded-metadata path.
+    Flattens _collect_raw_provenance_in() to a gtn_-prefixed string dict suitable for PNG
+    text-chunk injection. Also appends the serialized flow commands blob, which is only needed
+    for the embedded-metadata path.
 
     Args:
-        engine: The engine whose context manager and flow manager supply the metadata.
+        engine: The engine whose flow manager and workflow registry supply the metadata.
+        workflow: The workflow the file was written for, or None, which records only the save time.
 
     Returns:
-        Dictionary of metadata key-value pairs, may be empty if no context available.
+        Dictionary of metadata key-value pairs.
     """
     metadata: dict[str, str] = {}
     metadata[f"{METADATA_NAMESPACE}saved_at"] = datetime.now(UTC).isoformat()
+    if workflow is None:
+        return metadata
 
-    raw = _collect_raw_provenance(engine)
+    raw = _collect_raw_provenance_in(engine, workflow)
 
     if "workflow" in raw:
         _flatten_workflow_info(raw["workflow"], metadata)
@@ -296,7 +262,7 @@ def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
 
     # Serialize the entire flow to commands. Only needed for embedded image metadata,
     # not the sidecar (the command tree is too large to be useful there).
-    flow_commands = _serialize_flow(engine)
+    flow_commands = _serialize_flow(workflow, fl["name"])
     if flow_commands:
         metadata[FLOW_COMMANDS_KEY] = flow_commands
 

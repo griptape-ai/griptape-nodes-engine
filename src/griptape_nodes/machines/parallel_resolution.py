@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.common.node_executor import ExecuteNodeFailedError, node_error_details_for
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
@@ -17,10 +19,6 @@ from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
-)
 from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -29,17 +27,20 @@ from griptape_nodes.retained_mode.events.execution_events import (
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
 )
+from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
 from griptape_nodes.serialization.values import encode_for_display
+from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.machines.dag_builder import DagBuilder, DagNode
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+    from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -71,15 +72,26 @@ class ParallelResolutionContext(EngineScoped):
     task_to_node: dict[asyncio.Task, DagNode]
     node_priority_queue: NodePriorityQueue
     dag_builder: DagBuilder | None
+    # The workflow the run is in.
+    workflow: WorkflowRuntime
+    # The run state of the workflow a top-level run belongs to. None for an isolated subflow.
+    flows: WorkflowFlows | None
+    is_isolated: bool
     last_resolved_node: BaseNode | None  # Track the last node that was resolved
     generation: int  # Bumped on reset so a resuming driver can tell its run was torn down
     new_work_event: asyncio.Event  # Set when the priority queue changes, so a parked driver wakes
+    # Nodes this run has already marked stale downstream of an executing node and that have not
+    # executed since. Shared across every unresolve walk in the run so each node is visited once.
+    unresolved_this_run: set[str]
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         flow_name: str,
         max_nodes_in_parallel: int | None = None,
         dag_builder: DagBuilder | None = None,
+        *,
+        workflow: WorkflowRuntime,
+        is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
         super().__init__(engine)
@@ -88,6 +100,9 @@ class ParallelResolutionContext(EngineScoped):
         self.error_message = None
         self.workflow_state = WorkflowState.NO_ERROR
         self.dag_builder = dag_builder
+        self.workflow = workflow
+        self.flows = None if is_isolated else workflow.flows
+        self.is_isolated = is_isolated
         self.last_resolved_node = None
         self.node_priority_queue = NodePriorityQueue(self)
 
@@ -97,6 +112,7 @@ class ParallelResolutionContext(EngineScoped):
         self.task_to_node = {}
         self.generation = 0
         self.new_work_event = asyncio.Event()
+        self.unresolved_this_run = set()
 
     @property
     def node_to_reference(self) -> dict[str, DagNode]:
@@ -164,6 +180,7 @@ class ParallelResolutionContext(EngineScoped):
 
         # Reset task counter
         self.running_tasks_count = 0
+        self.unresolved_this_run.clear()
 
         # Clear the priority queue when resetting
         # Create a new instance to ensure clean state
@@ -190,7 +207,7 @@ class ExecuteDagState(State):
         if context.dag_builder is not None:
             newly_available = context.dag_builder.remove_node_from_dependencies(current_node_name, network_name)
             for data_node_name in newly_available:
-                data_node = context.engine.node_manager.get_node_by_name(data_node_name)
+                data_node = context.engine.node_manager.get_node_by_name_in(context.workflow, data_node_name)
                 added_nodes = context.dag_builder.add_node_with_dependencies(data_node, data_node_name)
                 if added_nodes:
                     for added_node in added_nodes:
@@ -202,6 +219,9 @@ class ExecuteDagState(State):
 
         # Remove the node from the priority queue now that it's done
         context.node_priority_queue.remove_node(current_node.name)
+        # It has new outputs now, so if something upstream runs again later in this run, the
+        # stale-marking walk must be allowed to reach it a second time.
+        context.unresolved_this_run.discard(current_node.name)
 
         # Check if node was already resolved (shouldn't happen)
         if current_node.state == NodeResolutionState.RESOLVED and not current_node.lock:
@@ -211,6 +231,12 @@ class ExecuteDagState(State):
                 network_name,
             )
             return
+
+        # A locked node passes its frozen outputs through without executing. Record when that pass
+        # is the only reason it now reads RESOLVED, so unlocking it can put it back in the next run.
+        current_node.resolved_while_locked = current_node.lock and (
+            current_node.resolved_while_locked or current_node.state != NodeResolutionState.RESOLVED
+        )
 
         # Special handling for BaseIterativeStartNode
         # Remove it from the network so the end node can process control flow
@@ -224,6 +250,16 @@ class ExecuteDagState(State):
                     network.remove_node(current_node.name)
 
             return
+
+        await ExecuteDagState.publish_resolved_node(context, done_node)
+        # Now the final thing to do, is to take their directed graph and update it.
+        ExecuteDagState.get_next_control_graph(context, current_node, network_name)
+        ExecuteDagState.check_for_new_start_nodes(context, current_node.name, network_name)
+
+    @staticmethod
+    async def publish_resolved_node(context: ParallelResolutionContext, done_node: DagNode) -> None:
+        """Mark a node that finished executing RESOLVED and send its outputs to the editor."""
+        current_node = done_node.node_reference
 
         # Publish all parameter updates.
         current_node.state = NodeResolutionState.RESOLVED
@@ -257,15 +293,13 @@ class ExecuteDagState(State):
             # _emit_parameter_change_event already set correctly during execution.
             display_value = current_node.get_display_value_for_output(parameter_name, value)
             await context.engine.event_manager.aput_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(
-                        payload=ParameterValueUpdateEvent(
-                            node_name=current_node.name,
-                            parameter_name=parameter_name,
-                            data_type=data_type,
-                            value=display_value,
-                        )
-                    ),
+                context.workflow.execution_event(
+                    ParameterValueUpdateEvent(
+                        node_name=current_node.name,
+                        parameter_name=parameter_name,
+                        data_type=data_type,
+                        value=display_value,
+                    )
                 )
             )
         # Output values should already be saved!
@@ -284,20 +318,16 @@ class ExecuteDagState(State):
             for param_name, val in current_node.parameter_output_values.items()
         }
         await context.engine.event_manager.aput_event(
-            ExecutionGriptapeNodeEvent(
-                wrapped_event=ExecutionEvent(
-                    payload=NodeResolvedEvent(
-                        node_name=current_node.name,
-                        parameter_output_values=display_output_values,
-                        node_type=current_node.__class__.__name__,
-                        specific_library_name=library_name,
-                    )
+            context.workflow.execution_event(
+                NodeResolvedEvent(
+                    node_name=current_node.name,
+                    parameter_output_values=display_output_values,
+                    node_type=current_node.__class__.__name__,
+                    specific_library_name=library_name,
+                    run_seconds=done_node.run_seconds,
                 )
             )
         )
-        # Now the final thing to do, is to take their directed graph and update it.
-        ExecuteDagState.get_next_control_graph(context, current_node, network_name)
-        ExecuteDagState.check_for_new_start_nodes(context, current_node.name, network_name)
 
     @staticmethod
     def _unresolve_if_an_input_was_torn_down(node: BaseNode) -> None:
@@ -319,19 +349,15 @@ class ExecuteDagState(State):
     @staticmethod
     def get_next_control_graph(context: ParallelResolutionContext, node: BaseNode, network_name: str) -> None:
         """Get next control flow nodes and add them to the DAG graph."""
-        flow_manager = context.engine.flow_manager
-
         # Early returns for various conditions
-        if ExecuteDagState._should_skip_control_flow(context, node, network_name, flow_manager):
+        if ExecuteDagState._should_skip_control_flow(context, node, network_name):
             return
         next_output = node.get_next_control_output()
         if next_output is not None:
-            ExecuteDagState._process_next_control_node(context, node, next_output, network_name, flow_manager)
+            ExecuteDagState._process_next_control_node(context, node, next_output, network_name)
 
     @staticmethod
-    def _should_skip_control_flow(
-        context: ParallelResolutionContext, node: BaseNode, network_name: str, flow_manager: FlowManager
-    ) -> bool:
+    def _should_skip_control_flow(context: ParallelResolutionContext, node: BaseNode, network_name: str) -> bool:
         """Check if control flow processing should be skipped.
 
         A node that was only pulled into a graph to supply data must not advance control: it did
@@ -348,8 +374,9 @@ class ExecuteDagState(State):
         if network is None:
             msg = f"Network {network_name} not found in DAG builder"
             raise ValueError(msg)
-        is_isolated = context.dag_builder is not flow_manager.global_dag_builder
-        if flow_manager.global_single_node_resolution and not is_isolated:
+        # The run's own workflow decides, not whichever workflow is current when the run resumes.
+        single_node_resolution = context.flows is not None and context.flows.global_single_node_resolution
+        if single_node_resolution and not context.is_isolated:
             # Clean up nodes from emptied graphs in single node resolution mode
             if len(network) == 0 and context.dag_builder is not None:
                 context.dag_builder.cleanup_empty_graph_nodes(network_name)
@@ -366,10 +393,11 @@ class ExecuteDagState(State):
         node: BaseNode,
         next_output: Parameter,
         network_name: str,
-        flow_manager: FlowManager,
     ) -> None:
         """Process the next control node in the flow."""
-        node_connection = flow_manager.get_connections().get_connected_node(node, next_output, include_internal=False)
+        node_connection = context.workflow.flows.connections.get_connected_node(
+            node, next_output, include_internal=False
+        )
         if node_connection is not None:
             next_node, next_parameter = node_connection
 
@@ -388,9 +416,7 @@ class ExecuteDagState(State):
             # Locked nodes are not becoming the current control node, so they get no event.
             if not next_node.lock:
                 context.engine.event_manager.put_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=next_node.name))
-                    )
+                    context.workflow.execution_event(CurrentControlNodeEvent(node_name=next_node.name))
                 )
             ExecuteDagState.add_and_queue_nodes(context, next_node, network_name)
 
@@ -400,9 +426,7 @@ class ExecuteDagState(State):
         if context.dag_builder is not None:
             involved_nodes = list(context.node_to_reference.keys())
             context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
+                context.workflow.execution_event(InvolvedNodesEvent(involved_nodes=involved_nodes))
             )
 
     @staticmethod
@@ -459,7 +483,7 @@ class ExecuteDagState(State):
                 context.node_priority_queue.add_node(dag_node)
 
     @staticmethod
-    async def collect_values_from_upstream_nodes(engine: Engine, node_reference: DagNode) -> None:
+    async def collect_values_from_upstream_nodes(context: ParallelResolutionContext, node_reference: DagNode) -> None:
         """Collect output values from resolved upstream nodes and pass them to the current node.
 
         This method iterates through all input parameters of the current node, finds their
@@ -467,7 +491,7 @@ class ExecuteDagState(State):
         values and passes them through using SetParameterValueRequest.
 
         Args:
-            engine (Engine): The engine whose connections and request bus this run belongs to.
+            context (ParallelResolutionContext): The run, whose workflow holds the connections and takes the requests.
             node_reference (DagOrchestrator.DagNode): The node to collect values for.
         """
         current_node = node_reference.node_reference
@@ -480,7 +504,7 @@ class ExecuteDagState(State):
         if current_node.lock:
             return
 
-        connections = engine.flow_manager.get_connections()
+        connections = context.workflow.flows.connections
 
         for parameter in current_node.parameters:
             # Get the connected upstream node for this parameter
@@ -495,7 +519,7 @@ class ExecuteDagState(State):
                     output_value = upstream_node._get_raw_parameter_value(upstream_parameter.name)
 
                 # Pass the value through using the same mechanism as normal resolution
-                result = await engine.ahandle_request(
+                result = await context.workflow.ahandle_request(
                     SetParameterValueRequest(
                         parameter_name=parameter.name,
                         node_name=current_node.name,
@@ -507,8 +531,33 @@ class ExecuteDagState(State):
                 )
                 if isinstance(result, SetParameterValueResultFailure):
                     msg = f"Failed to set parameter value for node '{current_node.name}' and parameter '{parameter.name}'. Details: {result.result_details}"
-                    logger.error(msg)
                     raise RuntimeError(msg)
+
+    @staticmethod
+    def _seed_deferred_data_sinks(context: ParallelResolutionContext) -> bool:
+        """Seed the data sinks the control-flow seeder put off, now that the control graphs are done.
+
+        A data sink has no control wires, so nothing gates it and nothing waits on it. Seeding it
+        only after every control graph has finished means its upstream walk sees the control nodes
+        as truly RESOLVED (they have run this time) and the data nodes below them as UNRESOLVED
+        (marked stale when those control nodes started), so it adopts exactly the nodes that need to
+        recompute and reads final values from the rest. Seeding it at run start instead let it
+        adopt a RESOLVED-from-last-run chain with no edge to the control node that was about to
+        re-run beside it.
+
+        Returns True if any sink was seeded, so the caller re-reads the leaf nodes.
+        """
+        dag_builder = context.dag_builder
+        if dag_builder is None or not dag_builder.deferred_data_sinks:
+            return False
+
+        sinks = list(dag_builder.deferred_data_sinks)
+        dag_builder.deferred_data_sinks.clear()
+        for sink in sinks:
+            if sink.name in context.node_to_reference:
+                continue
+            ExecuteDagState.add_and_queue_nodes(context, sink, sink.name)
+        return True
 
     @staticmethod
     def build_node_states(context: ParallelResolutionContext) -> NodeStatesResult:
@@ -534,10 +583,9 @@ class ExecuteDagState(State):
         return NodeStatesResult(canceled_nodes=canceled_nodes, leaf_nodes=leaf_nodes)
 
     @staticmethod
-    async def pop_done_states(context: ParallelResolutionContext) -> None:  # noqa: C901 (one over, from tolerating a deleted node)
+    async def pop_done_states(context: ParallelResolutionContext) -> None:
         generation = context.generation
         networks = context.networks
-        handled_nodes = set()  # Track nodes we've already processed to avoid duplicates
 
         # Create a copy of items to avoid "dictionary changed size during iteration" error
         # This is necessary because handle_done_nodes can add new networks via the DAG builder
@@ -560,27 +608,19 @@ class ExecuteDagState(State):
                 if node_reference.node_reference.lock or node_state == NodeState.DONE:
                     node_reference.node_state = NodeState.DONE
 
-                    # Initialize successors set with data successors from this network
-                    successors = set()
-                    for other_node in network.nodes():
-                        if node in network._predecessors.get(other_node, set()):
-                            successors.add(other_node)
+                    # Set initial data successors (control successors will be added in handle_done_nodes).
+                    # Releasing the node from every network also means no later network in this
+                    # pass, or any later pass, can see it again, so it is handled exactly once.
+                    context.node_priority_queue._last_resolved_successors = ExecuteDagState._release_from_all_networks(
+                        context, node
+                    )
 
-                    # Set initial data successors (control successors will be added in handle_done_nodes)
-                    context.node_priority_queue._last_resolved_successors = successors
-
-                    network.remove_node(node)
-
-                    # Only call handle_done_nodes once per node (first network that processes it)
-                    if node not in handled_nodes:
-                        handled_nodes.add(node)
-                        # handle_done_nodes will append control successors to the set
-                        await ExecuteDagState.handle_done_nodes(context, node_reference, network_name)
-                        if context.was_reset_since(generation):
-                            # `networks` is a snapshot, so its graphs still name
-                            # nodes a teardown dropped from node_to_reference.
-                            ExecuteDagState._log_abandoned(context)
-                            return
+                    await ExecuteDagState.handle_done_nodes(context, node_reference, network_name)
+                    if context.was_reset_since(generation):
+                        # `networks` is a snapshot, so its graphs still name
+                        # nodes a teardown dropped from node_to_reference.
+                        ExecuteDagState._log_abandoned(context)
+                        return
 
             # After processing completions in this network, check if any remaining leaf nodes can now be queued
             remaining_leaf_nodes = [n for n in network.nodes() if network.in_degree(n) == 0]
@@ -591,9 +631,31 @@ class ExecuteDagState(State):
                 ExecuteDagState._try_queue_waiting_node(context, leaf_node)
 
     @staticmethod
-    async def execute_node(engine: Engine, current_node: DagNode) -> None:
-        executor = engine.flow_manager.node_executor
-        await executor.execute(current_node.node_reference)
+    def _release_from_all_networks(context: ParallelResolutionContext, node_name: str) -> set[str]:
+        """Remove a finished node from every network it appears in. Returns its data successors.
+
+        A node another resolve adopted as a data dependency also sits in that resolve's network.
+        It is done in all of them, so it has to leave all of them at once: finishing can empty the
+        network it belongs to, and emptying a network drops its nodes from node_to_reference
+        (``DagBuilder.cleanup_empty_graph_nodes``). After that the other network can no longer see
+        the node as done, and its successors there would wait on it forever.
+        """
+        successors = set()
+        for network in context.networks.values():
+            for other_node in network.nodes():
+                if node_name in network._predecessors.get(other_node, set()):
+                    successors.add(other_node)
+            network.remove_node(node_name)
+        return successors
+
+    @staticmethod
+    async def execute_node(context: ParallelResolutionContext, current_node: DagNode) -> None:
+        executor = context.engine.flow_manager.node_executor
+        started_at = time.perf_counter()
+        try:
+            await executor.execute(current_node.node_reference)
+        finally:
+            current_node.run_seconds = time.perf_counter() - started_at
 
     @staticmethod
     async def on_enter(context: ParallelResolutionContext) -> type[State] | None:
@@ -626,6 +688,10 @@ class ExecuteDagState(State):
         # Reinitialize leaf nodes since maybe we changed things up.
         # We removed nodes from the network. There may be new leaf nodes.
         node_states = ExecuteDagState.build_node_states(context)
+        # The control graphs have drained. Before calling the run complete, seed the data sinks
+        # the seeder put off, so they build their graphs against this run's results.
+        if not node_states.leaf_nodes and ExecuteDagState._seed_deferred_data_sinks(context):
+            node_states = ExecuteDagState.build_node_states(context)
         # We have no more leaf nodes. Quit early.
         if not node_states.leaf_nodes:
             context.workflow_state = WorkflowState.WORKFLOW_COMPLETE
@@ -663,18 +729,17 @@ class ExecuteDagState(State):
 
             # Collect parameter values from upstream nodes before executing
             try:
-                await ExecuteDagState.collect_values_from_upstream_nodes(context.engine, node_reference)
+                await ExecuteDagState.collect_values_from_upstream_nodes(context, node_reference)
             except Exception as e:
                 context.running_tasks_count -= 1  # Decrement on error
                 logger.exception("Error collecting parameter values for node '%s'", node_reference.node_reference.name)
                 error_node_name = node_reference.node_reference.name
                 await context.engine.event_manager.aput_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(
-                            payload=NodeErrorEvent(
-                                node_name=error_node_name,
-                                error_message=str(e),
-                            )
+                    context.workflow.execution_event(
+                        NodeErrorEvent(
+                            node_name=error_node_name,
+                            error_message=str(e),
+                            error=node_error_details_for(error_node_name, e),
                         )
                     )
                 )
@@ -692,19 +757,24 @@ class ExecuteDagState(State):
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
             node_reference.node_reference.parameter_output_values.silent_clear()
-            exceptions = node_reference.node_reference.validate_before_node_run()
+            # The check runs in a thread so a slow one doesn't freeze the editor. While it runs, the user
+            # can press Cancel. If they did, stop here: otherwise the node runs anyway (a provider node
+            # would submit its job) even though the run was cancelled.
+            exceptions = await async_utils.to_thread(node_reference.node_reference.validate_before_node_run)
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
                 msg = f"Node '{validation_node_name}' encountered problems: {exceptions}"
                 logger.error("Canceling flow run. %s", msg)
                 await context.engine.event_manager.aput_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(
-                            payload=NodeErrorEvent(
-                                node_name=validation_node_name,
-                                error_message=str(exceptions),
-                            )
+                    context.workflow.execution_event(
+                        NodeErrorEvent(
+                            node_name=validation_node_name,
+                            error_message=str(exceptions),
+                            error=build_node_error_details(validation_node_name, exceptions),
                         )
                     )
                 )
@@ -760,18 +830,27 @@ class ExecuteDagState(State):
             )
             # Set state BEFORE adding to task_to_node to avoid race condition
             node_reference.node_state = NodeState.PROCESSING
+            # This node is about to produce new outputs, so anything resolved against its previous
+            # outputs is stale. Without this, a re-run (pressing Run again, or the next pass of a
+            # loop) leaves downstream data nodes RESOLVED, and the upstream walk that gathers a
+            # later node's inputs skips them and hands on the previous run's values. The run's shared
+            # visited set keeps this walk incremental: a node already marked stale (and not run
+            # since) is not walked again, so a chain of N nodes costs O(N) per run, not O(N^2).
+            context.workflow.flows.connections.unresolve_future_nodes(
+                node_reference.node_reference, visited=context.unresolved_this_run
+            )
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
             node_reference.node_reference.clear_cancellation()
 
-            node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference))
+            node_task = asyncio.create_task(ExecuteDagState.execute_node(context, node_reference))
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
 
             # Send an event that this is a current data node:
 
             await context.engine.event_manager.aput_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=CurrentDataNodeEvent(node_name=node)))
+                context.workflow.execution_event(CurrentDataNodeEvent(node_name=node))
             )
 
         # Wait for a running node to finish, or for work to be injected into this run -
@@ -805,32 +884,40 @@ class ExecuteDagState(State):
             done_node_tasks = [task for task in done if task in context.task_to_node]
 
             if done_node_tasks:
-                # Decrement counter for completed tasks
-                context.running_tasks_count -= len(done_node_tasks)
                 # New node has finished - priorities are stale
                 context.node_priority_queue.mark_priorities_stale()
+            # Failures first: one ends this loop, and the tasks it leaves in task_to_node are
+            # reaped and published by ErrorState. A success reaped here before a failure would
+            # never be published, because the failure skips pop_done_states.
+            done_node_tasks.sort(key=lambda task: not (task.cancelled() or task.exception() is not None))
             # Check for task exceptions and handle them properly.
             for task in done_node_tasks:
                 dag_node = context.task_to_node.pop(task)
+                context.running_tasks_count -= 1
                 if task.cancelled():
                     # Task was cancelled - this is expected during flow cancellation
                     dag_node.node_state = NodeState.CANCELED
-                    logger.info("Task execution was cancelled.")
+                    logger.debug("Task execution was cancelled.")
                     return ErrorState
                 if (exc := task.exception()) is not None:
                     node_name = dag_node.node_reference.name
                     dag_node.node_state = NodeState.ERRORED
 
-                    logger.error("Error processing node '%s'", node_name, exc_info=exc)
-                    msg = f"Node '{node_name}' encountered a problem: {exc}"
+                    # Every caller of the machine reports the failure from `get_error_message()`.
+                    logger.debug("Node '%s' failed", node_name, exc_info=exc)
+                    # ExecuteNodeFailedError already names the node.
+                    if isinstance(exc, ExecuteNodeFailedError):
+                        msg = str(exc)
+                    else:
+                        msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await context.engine.event_manager.aput_event(
-                        ExecutionGriptapeNodeEvent(
-                            wrapped_event=ExecutionEvent(
-                                payload=NodeErrorEvent(
-                                    node_name=node_name,
-                                    error_message=str(exc),
-                                )
+                        context.workflow.execution_event(
+                            NodeErrorEvent(
+                                node_name=node_name,
+                                error_message=str(exc),
+                                error=node_error_details_for(node_name, exc),
+                                run_seconds=dag_node.run_seconds,
                             )
                         )
                     )
@@ -882,23 +969,48 @@ class ErrorState(State):
                 # Remove from priority queue since it's being canceled
                 context.node_priority_queue.remove_node(node.node_reference.name)
 
-        # Shut down and cancel all threads/tasks that haven't yet ran. Currently running ones will not be affected.
-        # Cancel async tasks
-        for task in list(context.task_to_node.keys()):
-            if not task.done():
-                task.cancel()
+        # A failed node stops new work but lets running nodes finish: they did nothing wrong, and a
+        # remote generation one of them started keeps running (and billing) even if its task is
+        # cancelled, so cancelling would only throw its result away. No error message means a
+        # node was cancelled, so the run itself is being cancelled and everything stops.
+        if context.error_message is None:
+            for task in list(context.task_to_node.keys()):
+                if not task.done():
+                    task.cancel()
         return ErrorState
 
     @staticmethod
     async def on_update(context: ParallelResolutionContext) -> type[State] | None:
-        # Don't modify lists while iterating through them.
+        # See `ParallelResolutionContext.was_reset_since`.
+        generation = context.generation
         task_to_node = context.task_to_node
-        for task, node in task_to_node.copy().items():
-            if task.done():
-                node.node_state = NodeState.DONE
-            elif task.cancelled():
-                node.node_state = NodeState.CANCELED
+
+        running_tasks = [task for task in task_to_node if not task.done()]
+        # Park only when nothing has finished yet: a node that finished in the same wake as the
+        # failure publishes now, not after the slowest running sibling.
+        if running_tasks and len(running_tasks) == len(task_to_node):
+            # Also wake on the new-work flag, which a teardown sets, so a reset ends this run
+            # now rather than when the slowest running node finishes. See ExecuteDagState.on_update.
+            context.new_work_event.clear()
+            wakeup_waiter = asyncio.create_task(context.new_work_event.wait())
+            try:
+                await asyncio.wait({*running_tasks, wakeup_waiter}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                wakeup_waiter.cancel()
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
+
+        # Don't modify the map while iterating through it.
+        for task, dag_node in list(task_to_node.items()):
+            if not task.done():
+                continue
             task_to_node.pop(task)
+            context.running_tasks_count -= 1
+            await ErrorState._reap_finished_task(context, task, dag_node)
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
 
         if len(task_to_node) == 0:
             # A node that did not finish is UNRESOLVED: it holds no valid outputs, and nothing else
@@ -924,8 +1036,36 @@ class ErrorState(State):
             context.node_to_reference.clear()
             context.task_to_node.clear()
             return DagCompleteState
-        # Let's continue going through until everything is cancelled.
+        # Keep reaping until every running node has finished.
         return ErrorState
+
+    @staticmethod
+    async def _reap_finished_task(context: ParallelResolutionContext, task: asyncio.Task, dag_node: DagNode) -> None:
+        """Record how a node that was still running when the run failed ended up."""
+        if task.cancelled():
+            dag_node.node_state = NodeState.CANCELED
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            node_name = dag_node.node_reference.name
+            dag_node.node_state = NodeState.ERRORED
+            logger.debug("Node '%s' failed", node_name, exc_info=exc)
+            # The run already reports the first failure; this one still reaches the node.
+            await context.engine.event_manager.aput_event(
+                context.workflow.execution_event(
+                    NodeErrorEvent(
+                        node_name=node_name,
+                        error_message=str(exc),
+                        error=node_error_details_for(node_name, exc),
+                        run_seconds=dag_node.run_seconds,
+                    )
+                )
+            )
+            return
+
+        dag_node.node_state = NodeState.DONE
+        await ExecuteDagState.publish_resolved_node(context, dag_node)
 
 
 class DagCompleteState(State):
@@ -944,22 +1084,30 @@ class DagCompleteState(State):
 class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
     """State machine for building DAG structure without execution."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         flow_name: str,
         max_nodes_in_parallel: int | None = None,
         dag_builder: DagBuilder | None = None,
+        *,
+        workflow: WorkflowRuntime,
+        is_isolated: bool = False,
         engine: Engine | None = None,
     ) -> None:
         resolution_context = ParallelResolutionContext(
-            flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder, engine=engine
+            flow_name,
+            max_nodes_in_parallel=max_nodes_in_parallel,
+            dag_builder=dag_builder,
+            workflow=workflow,
+            is_isolated=is_isolated,
+            engine=engine,
         )
         super().__init__(resolution_context)
 
     async def resolve_node(self, node: BaseNode | None = None) -> None:  # noqa: ARG002
         """Execute the DAG structure using the existing DagBuilder."""
-        if self.context.dag_builder is None:
-            self.context.dag_builder = self.context.engine.flow_manager.global_dag_builder
+        if self.context.dag_builder is None and self.context.flows is not None:
+            self.context.dag_builder = self.context.flows.global_dag_builder
         await self.start(ExecuteDagState)
 
     def inject_node(self, node: BaseNode, graph_name: str | None = None) -> list[BaseNode]:
@@ -977,6 +1125,9 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         context = self.context
         if context.dag_builder is None:
             msg = f"Attempted to run '{node.name}' as part of the current run, but that run has no dependency graph to add it to. Cancel the run and try again."
+            raise ValueError(msg)
+        if self.is_stopping_after_failure():
+            msg = f"Attempted to run '{node.name}' as part of the current run. Failed because a node in that run failed, and the run is waiting for its other nodes to finish. Try again once the run ends."
             raise ValueError(msg)
 
         added_nodes = ExecuteDagState.add_and_queue_nodes(context, node, graph_name or node.name)
@@ -1007,7 +1158,7 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         # add to node_to_reference, breaking this iteration mid-cancel.
         node_manager = self.context.engine.node_manager
         for dag_node in list(self.context.node_to_reference.values()):
-            await node_manager.cancel_worker_execution(dag_node.node_reference.name)
+            await node_manager.cancel_worker_execution_in(self.context.workflow, dag_node.node_reference.name)
 
         # Cancel all running tasks
         tasks = list(self.context.task_to_node.keys())
@@ -1037,6 +1188,10 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
 
     def is_errored(self) -> bool:
         return self._context.workflow_state == WorkflowState.ERRORED
+
+    def is_stopping_after_failure(self) -> bool:
+        """True while a failed run waits for its still-running nodes before it ends."""
+        return self._current_state is ErrorState
 
     def get_error_message(self) -> str | None:
         return self._context.error_message

@@ -11,10 +11,6 @@ from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
     ModelCatalogLibraryProperty,
     NodeDeclaration,
-    SuggestedWorkerMode,
-    WorkerCompatibility,
-    WorkerMode,
-    WorkerModeCompatibility,
     find_model_catalog,
     resolve_node_models,
 )
@@ -33,7 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+    from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary, MCPTool
     from griptape_nodes.node_library.library_declarations import ResolvedModel
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
@@ -41,6 +37,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 _constructing_node: ContextVar[bool] = ContextVar("_library_registry_constructing_node", default=False)
+# Set by ``constructing_node(throwaway=True)``; see there.
+_constructing_throwaway_node: ContextVar[bool] = ContextVar(
+    "_library_registry_constructing_throwaway_node", default=False
+)
 
 
 class LibraryRegistryError(KeyError):
@@ -140,31 +140,8 @@ class LibraryMetadata(BaseModel):
     # Resource requirements for this library. If None, library is assumed to work on any platform.
     resources: ResourceRequirements | None = None
     # Declarative properties / capabilities for this library. Applies to all nodes in the library.
-    # See griptape_nodes.node_library.library_declarations for the supported types,
-    # including WorkerModeCompatibility for orchestrator/worker hosting.
+    # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[LibraryDeclaration] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _reject_incompatible_with_suggested_worker(self) -> LibraryMetadata:
-        # A library declared INCOMPATIBLE with worker hosting must not also
-        # suggest WORKER as its launch mode. The two declarations live on
-        # the same metadata block, so the cross-axis check belongs here --
-        # the individual declaration models are independent and can't see
-        # each other.
-        capability = next((d for d in self.declarations if isinstance(d, WorkerModeCompatibility)), None)
-        if capability is None or capability.compatibility is not WorkerCompatibility.INCOMPATIBLE:
-            return self
-        suggested = next(
-            (d for d in self.declarations if isinstance(d, SuggestedWorkerMode)),
-            None,
-        )
-        if suggested is not None and suggested.mode is WorkerMode.WORKER:
-            msg = (
-                "Library declares WorkerModeCompatibility(compatibility=INCOMPATIBLE) but also "
-                "declares SuggestedWorkerMode(mode=WORKER); the two are contradictory."
-            )
-            raise ValueError(msg)
-        return self
 
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
@@ -376,12 +353,17 @@ class LibraryRegistry:
         del cls._libraries[library_name]
 
     @classmethod
-    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:
+    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:  # noqa: C901
         """Remove everything the engine registered on the library's behalf at load time."""
         if library._registered_app_event_listeners:
             for event_type, listener in library._registered_app_event_listeners:
                 event_manager.remove_listener_for_app_event(event_type, listener)
             library._registered_app_event_listeners.clear()
+
+        if library._registered_execution_event_listeners:
+            for event_type, listener in library._registered_execution_event_listeners:
+                event_manager.remove_listener_for_execution_event(event_type, listener)
+            library._registered_execution_event_listeners.clear()
 
         if library._registered_pre_dispatch_hooks:
             for hook in library._registered_pre_dispatch_hooks:
@@ -397,6 +379,8 @@ class LibraryRegistry:
             for request_type in library._registered_request_handler_types:
                 event_manager.remove_manager_from_request_type(request_type)
             library._registered_request_handler_types.clear()
+
+        library._mcp_tools.clear()
 
     @classmethod
     def get_library(cls, name: str) -> Library:
@@ -501,7 +485,7 @@ class LibraryRegistry:
 
     @classmethod
     @contextmanager
-    def constructing_node(cls) -> Iterator[None]:
+    def constructing_node(cls, *, throwaway: bool = False) -> Iterator[None]:
         """Mark the enclosed block as a node ``__init__`` running on the calling task.
 
         Sets the same task-local flag that ``create_node`` sets. Use at
@@ -509,30 +493,41 @@ class LibraryRegistry:
         (e.g. ``type(node)(name=...)`` or ``node_class(name=...)`` for
         an ephemeral probe / reference node), so:
 
-        - the parameter-mutation-during-aprocess detector skips the
-          declarative ``add_parameter`` calls inside the constructed
-          node's ``__init__`` (otherwise it would fire once per
-          parameter declared by the helper instance), and
-        - the reentrant-bus-in-init detector still fires for the
-          right reason if the constructed node's ``__init__`` issues
-          a bus request.
+        the parameter-mutation-during-aprocess detector skips the
+        declarative ``add_parameter`` calls inside the constructed node's
+        ``__init__`` (otherwise it would fire once per parameter declared
+        by the helper instance).
+
+        Pass ``throwaway=True`` for a node no client ever sees, such as the
+        serializer's reference copy or a type probe. It sends no element
+        events: saving an image serializes the whole flow into its metadata,
+        one reference copy per node, so those events grew with nodes times
+        saved images.
         """
         token = _constructing_node.set(True)
+        throwaway_token = _constructing_throwaway_node.set(True) if throwaway else None
         try:
             yield
         finally:
+            if throwaway_token is not None:
+                _constructing_throwaway_node.reset(throwaway_token)
             _constructing_node.reset(token)
 
     @classmethod
     def is_constructing_node(cls) -> bool:
         """Return True if a node ``__init__`` is currently running on the calling task.
 
-        The reentrant-bus-in-init and parameter-mutation-during-aprocess
-        strict-mode detectors consult this so they can fire from outside
-        ``LibraryRegistry`` without owning their own depth counter. The
-        flag is set by ``create_node`` and by ``constructing_node()``.
+        The parameter-mutation-during-aprocess strict-mode detector consults
+        this so it can fire from outside ``LibraryRegistry`` without owning
+        its own depth counter. The flag is set by ``create_node`` and by
+        ``constructing_node()``.
         """
         return _constructing_node.get()
+
+    @classmethod
+    def is_constructing_throwaway_node(cls) -> bool:
+        """Return True inside ``constructing_node(throwaway=True)``."""
+        return _constructing_throwaway_node.get()
 
     @classmethod
     def get_all_library_schemas(cls) -> dict[str, dict]:
@@ -623,9 +618,11 @@ class Library:
     # Tracks handlers registered on behalf of this library so they can be
     # deregistered automatically when the library is unloaded.
     _registered_app_event_listeners: list[tuple[type, Callable]]
+    _registered_execution_event_listeners: list[tuple[type, Callable]]
     _registered_pre_dispatch_hooks: list[Callable]
     _registered_post_dispatch_hooks: list[tuple[type, Callable]]
     _registered_request_handler_types: list[type]
+    _mcp_tools: list[MCPTool]
 
     def __init__(
         self,
@@ -647,9 +644,11 @@ class Library:
         self._beta_features = None
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
+        self._registered_execution_event_listeners = []
         self._registered_pre_dispatch_hooks = []
         self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
+        self._mcp_tools = []
 
     def get_beta_features(self) -> dict[str, BetaFeature]:
         """The valid beta features this library declares, keyed by id, including expired ones."""
@@ -661,6 +660,9 @@ class Library:
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)
+
+    def get_registered_execution_event_listeners(self) -> list[tuple[type, Callable]]:
+        return list(self._registered_execution_event_listeners)
 
     def get_registered_pre_dispatch_hooks(self) -> list[Callable]:
         return list(self._registered_pre_dispatch_hooks)
@@ -686,6 +688,13 @@ class Library:
         Returns a copy; mutating the returned list has no effect.
         """
         return list(self._registered_request_handler_types)
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        """Return the request types this library exposes on the engine's MCP server.
+
+        Returns a copy; mutating the returned list has no effect.
+        """
+        return list(self._mcp_tools)
 
     def register_new_node_type(self, node_class: type[BaseNode], metadata: NodeMetadata) -> LibraryProblem | None:
         """Register a new node type in this library. Returns a LibraryProblem if registration fails, or None if all clear."""

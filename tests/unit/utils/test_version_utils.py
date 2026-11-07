@@ -6,6 +6,7 @@ import importlib.metadata
 import sys
 import sysconfig
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,7 +22,18 @@ from griptape_nodes.utils.version_utils import (
     packages_shadowing_the_engine,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 _MODULE = "griptape_nodes.utils.version_utils"
+
+
+@pytest.fixture(autouse=True)
+def _uncached_engine_package_versions() -> Iterator[None]:
+    """Each test patches what the engine environment holds, so none may see another's cached answer."""
+    version_utils.engine_package_versions.cache_clear()
+    yield
+    version_utils.engine_package_versions.cache_clear()
 
 
 class TestFormatVersionString:

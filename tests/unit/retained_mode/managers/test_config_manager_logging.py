@@ -19,7 +19,6 @@ from unittest.mock import patch
 
 import pytest
 
-from griptape_nodes.common import log_capture
 from griptape_nodes.common.log_capture import default_log_directory
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.config_events import (
@@ -27,6 +26,7 @@ from griptape_nodes.retained_mode.events.config_events import (
     SetConfigCategoryResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.utils import engine_dirs
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -104,7 +104,7 @@ class TestLogDirectory:
 
         # Pointed inside `tmp_path` so the fallback's own log file is cleaned up with it.
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-        monkeypatch.setattr(log_capture, "xdg_state_home", no_home)
+        monkeypatch.setattr(engine_dirs, "xdg_state_home", no_home)
 
         manager = ConfigManager()
 

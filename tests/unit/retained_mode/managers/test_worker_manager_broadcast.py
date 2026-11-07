@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from griptape_nodes.app.worker_routing import RefreshSecretsRequest
-from griptape_nodes.retained_mode.events.base_events import EventRequest, EventSerializationError
+from griptape_nodes.retained_mode.events.base_events import EventRequest
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
 
 

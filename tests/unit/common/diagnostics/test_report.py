@@ -60,7 +60,7 @@ class TestClaimsThatDefaultAgainstThemselves:
         library = LibraryDiagnostics(name="Painter")
 
         assert library.worker_ready is None
-        assert library.requires_worker is False
+        assert library.executes_in_worker is False
 
     def test_a_workspace_that_was_never_checked_is_not_reported_as_unwritable(self) -> None:
         paths = PathDiagnostics()
@@ -135,7 +135,7 @@ class TestReadingAReportBackFromAFile:
                 merged={"log_level": "DEBUG"},
             ),
             secrets=[SecretDiagnostics(name="OPENAI_API_KEY", is_set=True, sources=["global .env"])],
-            libraries=[LibraryDiagnostics(name="Painter", requires_worker=True, worker_ready=False)],
+            libraries=[LibraryDiagnostics(name="Painter", executes_in_worker=True, worker_ready=False)],
             projects=[
                 ProjectDiagnostics(
                     project_id="proj-1",

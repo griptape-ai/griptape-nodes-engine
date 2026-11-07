@@ -236,7 +236,7 @@ class LibraryDependencies(EngineScoped):
         return list(dict.fromkeys([*roots, *dependencies]))
 
     @handles(InstallLibraryDependenciesRequest)
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: C901 (edit and execution environments each branch)
         """Install a library's dependencies into its edit-time and execution environments.
 
         Edit-time dependencies go into ``.venv``, which is always created even when there is
@@ -248,9 +248,7 @@ class LibraryDependencies(EngineScoped):
 
         # Load library metadata from file
         metadata_request = LoadLibraryMetadataFromFileRequest(file_path=library_file_path)
-        metadata_result = self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
-            metadata_request
-        )
+        metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(metadata_request)
 
         if not isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
             details = f"Attempted to read the library configuration at {library_file_path}. Failed due to: {metadata_result.result_details}"
@@ -259,6 +257,15 @@ class LibraryDependencies(EngineScoped):
         library_data = metadata_result.library_schema
         library_name = library_data.name
         library_metadata = library_data.metadata
+
+        # Neither environment is built, and nothing on disk is touched: the environment the engine
+        # was started in already holds this library's packages.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            details = f"Library '{library_name}' uses the packages its environment provides; nothing to install"
+            logger.debug(details)
+            return InstallLibraryDependenciesResultSuccess(
+                library_name=library_name, dependencies_installed=0, result_details=details
+            )
 
         pip_dependencies = []
         pip_dependencies_exec = []
@@ -346,7 +353,7 @@ class LibraryDependencies(EngineScoped):
             ),
             execution_failure,
         )
-        logger.info(details)
+        logger.debug(details)
         return InstallLibraryDependenciesResultSuccess(
             library_name=library_name, dependencies_installed=installed_count, result_details=details
         )
@@ -394,7 +401,9 @@ class LibraryDependencies(EngineScoped):
 
         Raises:
             subprocess.CalledProcessError: If uv exits with a non-zero status without the floors.
+            LibrariesProvidedByEnvironmentError: The environment provides the libraries.
         """
+        self.engine.library_manager.managed_environment.ensure_engine_provisions("install library packages")
         async with engine_version_constraints() as constraint_flags:
             try:
                 await subprocess_run([*argv, *constraint_flags], check=True, capture_output=capture_output, text=True)
@@ -403,7 +412,8 @@ class LibraryDependencies(EngineScoped):
                 reason = (constrained_error.stderr or "").strip()
                 if not reason:
                     reason = f"the installer exited with code {constrained_error.returncode}"
-                logger.warning(
+                # The library report names any components this leaves older than the engine's own.
+                logger.debug(
                     "Attempted to install dependencies into the environment at %s under the versions this engine runs "
                     "on. Installing without them; the result may hold components older than the engine's own. "
                     "Failed due to: %s",
@@ -489,7 +499,7 @@ class LibraryDependencies(EngineScoped):
         info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if info is None:
             return None
-        metadata_result = self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
+        metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
             LoadLibraryMetadataFromFileRequest(file_path=info.library_path)
         )
         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
@@ -520,10 +530,12 @@ class LibraryDependencies(EngineScoped):
         # Both callers need library_name, and one path can hold more than one entry -- a FAILURE
         # record alongside the copy that loaded -- so a match on the failed one answers "not
         # installed here" for a library that is. Prefer an entry that actually names itself.
+        managed = self.engine.library_manager.managed_environment
+        environment_mode = managed.provisioned_by_environment()
         matches = [
             info
             for info in self.engine.library_manager._library_file_path_to_info.values()
-            if repo_name in Path(info.library_path).parts
+            if managed.library_path_names_repo(info.library_path, repo_name, environment_mode=environment_mode)
         ]
         named = next((info for info in matches if info.library_name is not None), None)
         if named is not None:
@@ -543,7 +555,12 @@ class LibraryDependencies(EngineScoped):
         `_this_process_owns_the_edit_venv`, which claims it only when nothing has built it yet.
         What it never gets is this worker's execution environment, which belongs to the library
         this worker was spawned for and reaches it as PYTHONPATH.
+
+        A general-purpose worker loads every library but was spawned for none of them, so every
+        library it loads takes the nested-registration path above.
         """
+        if self.engine.library_manager.is_general_purpose_worker:
+            return False
         if self.engine.library_manager._target_library_names is None:
             return True
         return library_name in self.engine.library_manager._target_library_names
@@ -551,27 +568,20 @@ class LibraryDependencies(EngineScoped):
     def _this_process_owns_the_edit_venv(self, library_file_path: str) -> bool:
         """Whether this process may write `<library>/.venv`. Exactly one process may.
 
-        An execution-dependency library is loaded on the ORCHESTRATOR (real node classes, not
-        stubs), so the orchestrator builds that venv and keeps it on its own sys.path for the
-        session. A worker for such a library must not touch it: two concurrent `uv pip install`
-        runs at one target is the mild version, and the corrupt-install recovery path rmtrees
-        the directory outright -- so an execution-side retry would delete the environment the
-        orchestrator is importing from, which is the exact inverse of the isolation this design
-        exists to provide. The worker does not need it either way: `.venv-exec` is resolved
-        over BOTH dependency sets, so everything the edit-time set provides is already there.
+        Every library is loaded on the ORCHESTRATOR, so the orchestrator builds that venv and
+        keeps it on its own sys.path for the session. A worker must not touch it: two concurrent
+        `uv pip install` runs at one target is the mild version, and the corrupt-install recovery
+        path rmtrees the directory outright -- so an execution-side retry would delete the
+        environment the orchestrator is importing from, which is the exact inverse of the
+        isolation this design exists to provide. The worker does not need it either way:
+        `.venv-exec` is resolved over BOTH dependency sets, so everything the edit-time set
+        provides is already there.
 
-        A legacy worker-mode library is the other case: the orchestrator skips loading it
-        entirely (WORKER_DELEGATED), so nobody else creates `.venv` and the worker must.
-
-        A worker with NO record for the library cannot tell which case it is in, and guessing
-        wrong re-opens the double-writer hazard -- so it refuses, loudly.
+        A worker with NO record for the library cannot tell whether anything has built it, and
+        guessing wrong re-opens the double-writer hazard -- so it refuses, loudly.
         """
         if not self.engine.library_manager.is_worker:
-            # The worker-mode case above, from the orchestrator's side: it never loads such a
-            # library, so building the edit-time venv here would write a directory this process
-            # has no use for and put two writers on it the moment the worker builds its own.
-            library_info = self.engine.library_manager._library_file_path_to_info.get(library_file_path)
-            return not (library_info is not None and library_info.requires_worker)
+            return True
         library_info = self.engine.library_manager._library_file_path_to_info.get(library_file_path)
         # A library this worker was NOT spawned for arrives through a nested registration (one
         # library declaring another as a dependency), and registration continues here into module
@@ -598,8 +608,7 @@ class LibraryDependencies(EngineScoped):
                 "environment install rather than risk writing a venv another process owns.",
                 library_file_path,
             )
-            return False
-        return library_info.requires_worker
+        return False
 
     async def _retire_execution_env(self, library_name: str, library_file_path: str) -> None:
         """Remove an execution environment the library's manifest no longer declares.
@@ -662,7 +671,6 @@ class LibraryDependencies(EngineScoped):
 
         if not self.engine.library_manager.environment.can_write_to_venv_location(library_venv_python_path):
             msg = f"Attempted to set up the {venv_kind} environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
-            logger.warning(msg)
             raise DependencyInstallError(msg)
 
         config_manager = self.engine.config_manager
@@ -675,7 +683,7 @@ class LibraryDependencies(EngineScoped):
         if not pip_dependencies:
             return
 
-        logger.info("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
+        logger.debug("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
 
         try:

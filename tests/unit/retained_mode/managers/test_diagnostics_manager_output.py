@@ -144,9 +144,7 @@ class TestCollectFailsCleanly:
     """
 
     @pytest.mark.asyncio
-    async def test_a_staging_directory_that_cannot_be_written_to_returns_a_failure(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    async def test_a_staging_directory_that_cannot_be_written_to_returns_a_failure(self, tmp_path: Path) -> None:
         engine = Mock()
         engine.config_manager.log_directory = tmp_path
         manager = DiagnosticsManager(Mock(), engine=engine)
@@ -158,13 +156,11 @@ class TestCollectFailsCleanly:
             patch.object(DiagnosticsManager, "_known_secret_values", return_value=[]),
             patch(f"{_MODULE}.session_log_lines", return_value=["a line worth keeping"]),
             patch(f"{_MODULE}.DiagnosticsBundle", _UnwritableBundle),
-            caplog.at_level("ERROR", logger="griptape_nodes"),
         ):
             result = await manager.on_collect_diagnostics_request(request)
 
         assert isinstance(result, CollectDiagnosticsResultFailure)
         assert _DISK_FULL in str(result.result_details)
-        assert _DISK_FULL in caplog.text
 
     @pytest.mark.asyncio
     async def test_the_failure_says_what_was_being_attempted(self, tmp_path: Path) -> None:

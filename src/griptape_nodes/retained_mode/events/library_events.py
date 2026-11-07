@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path  # noqa: TC003 - read at runtime by the converter
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -145,15 +146,22 @@ class ListNodeTypesInLibraryRequest(RequestPayload):
     """List all node types available in a specific library.
 
     Use when: Discovering available nodes, building node creation UIs,
-    validating node types, exploring library contents.
+    validating node types, exploring library contents. Set include_metadata when choosing
+    which node types to create: it adds each type's category, display name, description,
+    and deprecation, read from the library's registered metadata, so no node code loads.
+    To survey every library in one round trip, send one request per library from
+    ListRegisteredLibrariesRequest in an EventRequestBatch. For a node type's parameters,
+    follow up with DescribeNodeTypeRequest.
 
     Args:
         library: Name of the library to list node types for
+        include_metadata: Also return each node type's metadata in node_metadata
 
     Results: ListNodeTypesInLibraryResultSuccess (with node types) | ListNodeTypesInLibraryResultFailure (library not found)
     """
 
     library: str
+    include_metadata: bool = False
 
 
 @dataclass
@@ -162,10 +170,13 @@ class ListNodeTypesInLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayload
     """Node types in library listed successfully.
 
     Args:
-        node_types: List of node type names available in the library
+        node_types: List of node type names available in the library, in registration order
+        node_metadata: Each node type's metadata, keyed by node type name, when the request
+            set include_metadata; otherwise None
     """
 
     node_types: list[str]
+    node_metadata: dict[str, NodeMetadata] | None = None
 
 
 @dataclass
@@ -227,6 +238,9 @@ class ParameterDescription:
         settable: Whether the parameter can be set directly by the user
         ui_options: UI configuration options (includes display_name when set)
         parent_container_name: Name of the parent ParameterGroup, if any
+        element_type: Element class name, e.g. "Parameter", "ParameterString", or "ParameterList".
+            "ParameterList" marks a multi-input that accepts several incoming connections, one per item.
+        max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
     """
 
     name: str
@@ -244,6 +258,8 @@ class ParameterDescription:
     settable: bool
     ui_options: dict | None
     parent_container_name: str | None
+    element_type: str
+    max_items: int | None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -253,6 +269,7 @@ class ParameterDescription:
         serialization used elsewhere (e.g. workflow shape extraction).
         """
         param_dict = param.to_dict()
+        max_items = param.max_items if isinstance(param, ParameterList) else None
 
         return cls(
             name=param_dict["name"],
@@ -270,6 +287,8 @@ class ParameterDescription:
             settable=param_dict["settable"],
             ui_options=param_dict["ui_options"],
             parent_container_name=param_dict["parent_container_name"],
+            element_type=param_dict["element_type"],
+            max_items=max_items,
         )
 
 
@@ -329,30 +348,39 @@ class DescribeNodeTypeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 @dataclass
 @PayloadRegistry.register
 class RegisterSandboxNodeFromSourceRequest(RequestPayload):
-    """Register the BaseNode subclasses declared in a Python source file already on disk inside the sandbox library directory.
+    """Register a node type from a `.py` file already on disk inside the sandbox library directory.
 
     Use when: An agent has just written a `.py` file into the configured sandbox directory
-    (via `WriteFileRequest` or any other means) and wants the engine to import it and
-    register its `BaseNode` subclasses without restarting. The engine never writes anything
-    itself; it only imports and registers what is already at `file_path`. The new node types
-    are immediately usable via `CreateNodeRequest` / `CreateNodesRequest`.
+    (via `WriteFileRequest` or any other means) and wants the engine to register it as node
+    types without restarting. The engine never writes anything itself; it only registers what
+    is already at `file_path`. The new node types are immediately usable via
+    `CreateNodeRequest` / `CreateNodesRequest`.
+
+    The file can be either of two kinds, told apart by its workflow metadata header:
+
+    - Python node source (no workflow header): imported, and each `BaseNode` subclass in it is
+      registered under its class name.
+    - A saved workflow (a `# /// script` header with a `[tool.griptape-nodes]` table): NOT
+      imported. It becomes one workflow-backed node with the workflow's Start Flow and End Flow
+      parameters as inputs and outputs, named from the workflow (`shout_workflow` becomes
+      `ShoutWorkflow`). It needs a Start Flow node and an End Flow node.
 
     The file persists on disk, so subsequent engine startups pick it up through the normal
     sandbox scan-and-load pipeline. Auto-generated metadata follows the same conventions the
     engine applies to files placed in the sandbox directory through the UI.
 
-    Security note: the imported source runs inside the engine process with no isolation.
-    Anyone who can reach this request, or who can write into the sandbox directory, can
-    execute arbitrary Python. This mirrors the existing sandbox-directory behaviour, but
+    Security note: imported Python node source runs inside the engine process with no
+    isolation. Anyone who can reach this request, or who can write into the sandbox directory,
+    can execute arbitrary Python. This mirrors the existing sandbox-directory behaviour, but
     makes that surface reachable via MCP.
 
     Args:
         file_path: Path to a `.py` file inside the configured sandbox library directory.
             Absolute paths must resolve under the sandbox directory; relative paths are
             resolved against it. The file must already exist on disk.
-        replace_if_exists: When True, any node type of the same class name already registered
-            in the Sandbox Library is unregistered before registering the new class. Existing
-            node instances of that class in a running workflow are NOT migrated.
+        replace_if_exists: When True, any node type of the same name already registered in
+            the Sandbox Library is unregistered before registering the new one. Existing node
+            instances of that type in a running workflow are NOT migrated.
 
     Results: RegisterSandboxNodeFromSourceResultSuccess | RegisterSandboxNodeFromSourceResultFailure
     """
@@ -364,14 +392,15 @@ class RegisterSandboxNodeFromSourceRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RegisterSandboxNodeFromSourceResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Source file imported and at least one BaseNode subclass registered.
+    """At least one node type registered from the file.
 
     Args:
-        file_path: Absolute path to the .py file that was imported.
-        library_name: Name of the library the class(es) were registered with (always the
+        file_path: Absolute path to the .py file that was registered.
+        library_name: Name of the library the node type(s) were registered with (always the
             Sandbox Library for now).
-        registered_class_names: Node class names that were registered by this call, in module
-            declaration order.
+        registered_class_names: Node types registered by this call: the BaseNode subclasses in
+            module declaration order for Python node source, or the single workflow-backed
+            node type for a saved workflow.
         replaced_class_names: Subset of registered_class_names for which an existing
             registration was unregistered first (only meaningful when replace_if_exists=True).
     """
@@ -389,7 +418,8 @@ class RegisterSandboxNodeFromSourceResultFailure(WorkflowNotAlteredMixin, Result
 
     Common causes: sandbox_library_directory not configured, file_path resolves outside the
     sandbox directory or has the wrong extension, file does not exist, Python import error
-    (syntax error, missing dependency), no BaseNode subclass found in the file, or name
+    (syntax error, missing dependency), no BaseNode subclass found in the file, a saved
+    workflow whose header cannot be read or that has no Start Flow and End Flow nodes, or name
     collision when replace_if_exists=False.
     """
 
@@ -431,7 +461,9 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                          sees in their config. None for libraries registered through other
                          channels (e.g. sandbox, ad-hoc loads).
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
+                    Also None when the request set `include_git_info` to False.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
+                 Also None when the request set `include_git_info` to False.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
         is_registered: Whether a library of this name is in the LibraryRegistry right now.
                        Metadata is derived from config while the registry holds what actually
@@ -440,6 +472,23 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                        following it with a name-keyed call (CheckLibraryUpdate,
                        GetAllInfoForLibrary) that would fail. Keyed on name because those
                        follow-up calls are name-keyed too.
+        lifecycle_state: How far the engine's last attempt to load this file got (a
+                         LibraryLifecycleState value such as "loaded" or "failure"). None when
+                         the engine has no record of the file. A library added since libraries
+                         were last loaded has either no record or one that stopped at
+                         "discovered" or "metadata_loaded"; tell it apart from a failed load by
+                         `problems`, not by this field. Set only by
+                         LoadMetadataForAllLibrariesRequest.
+        fitness: The LibraryFitness value of that attempt, or None alongside a None lifecycle_state.
+        problems: The problems that attempt recorded, collated for display, or None when there were
+                  none. A library that is not registered but has problems failed to load, as
+                  opposed to waiting for a refresh.
+        execution_env_failure: Why the library's execution environment (`.venv-exec`) failed to
+                               build, or None when it built or the library declares none.
+        reset_requires_restart: Whether a ResetLibraryRequest for this library would wait for the
+                                next engine start, because this engine has already loaded
+                                packages from the library's environment. Lets a client say so
+                                before the artist confirms.
     """
 
     library_schema: LibrarySchema
@@ -449,6 +498,11 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     enabled: bool
     is_registered: bool
     registered_path: str | None = None
+    lifecycle_state: str | None = None
+    fitness: str | None = None
+    problems: str | None = None
+    execution_env_failure: str | None = None
+    reset_requires_restart: bool = False
 
 
 @dataclass
@@ -492,7 +546,14 @@ class LoadMetadataForAllLibrariesRequest(RequestPayload):
 
     Provides a lightweight way to discover all available libraries and their schemas
     without the overhead of importing Python modules or registering them in the system.
+
+    Args:
+        include_git_info: Whether to look up each library's `git_remote` and `git_ref`. The lookup
+                          costs several git subprocesses per library, so callers that only need
+                          the schemas should pass False; both fields are then None.
     """
+
+    include_git_info: bool = True
 
 
 @dataclass
@@ -855,6 +916,40 @@ class ReloadAllLibrariesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess
 @PayloadRegistry.register
 class ReloadAllLibrariesResultFailure(ResultPayloadFailure):
     """Library reload failed. Common causes: library loading errors, system constraints, initialization failures."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ReloadSandboxLibraryRequest(RequestPayload):
+    """Reload only the sandbox library, picking up node files added or changed in the sandbox directory.
+
+    Unregisters the sandbox library, rescans `sandbox_library_directory`, and registers it again.
+    Every other library stays loaded and no worker process is restarted, so unlike
+    ReloadAllLibrariesRequest this does not clear workflow state. Nodes already in a workflow keep
+    the class they were created with until they are recreated. It never runs alongside
+    ReloadAllLibrariesRequest: whichever starts second waits for the first to finish.
+
+    It fails when the sandbox is off (`library.sandbox_enabled`; off by default when
+    `library.provisioned_by` is 'environment').
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ReloadSandboxLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The sandbox library was reloaded.
+
+    Args:
+        node_types: The node types the sandbox library registered after the reload.
+    """
+
+    node_types: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ReloadSandboxLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Sandbox library reload failed. Common causes: no sandbox directory configured, a sandbox not allowed in this environment, a node file that fails to import."""
 
 
 @dataclass
@@ -1238,6 +1333,56 @@ class InstallLibraryDependenciesResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class ResetLibraryRequest(RequestPayload):
+    """Delete a library's Python environments and build them again from its manifest.
+
+    Removes the library's edit-time environment (`.venv`) and execution environment
+    (`.venv-exec`), stopping the library's worker first, then registers the library again, which
+    rebuilds both. The library's files and its configuration are left alone. Works on a library
+    that failed to load.
+
+    When this engine has already imported packages from the library's `.venv`, nothing is removed
+    now: the removal is recorded and runs the next time the engine starts, before any library
+    loads, and the result reports restart_required.
+
+    Use when: A library fails to load or misbehaves because its installed packages are broken,
+    half-installed, or were changed by hand.
+
+    Args:
+        library_name: Name of the library to reset
+
+    Results: ResetLibraryResultSuccess | ResetLibraryResultFailure (library not found, disabled, environment provides the libraries)
+    """
+
+    library_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ResetLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Library environments reset, or scheduled to reset at the next engine start.
+
+    Args:
+        library_name: Name of the library that was reset
+        restart_required: True when some or all of the environments are removed at the next engine
+            start rather than now. The library keeps running on its current packages until then.
+        removed_paths: The environment directories removed now. Empty when the whole reset waits
+            for the next start.
+    """
+
+    library_name: str
+    restart_required: bool = False
+    removed_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ResetLibraryResultFailure(ResultPayloadFailure):
+    """Library reset failed. Common causes: library not found, library disabled, the environment provides the libraries, the library failed to load again after its environments were rebuilt."""
+
+
+@dataclass
+@PayloadRegistry.register
 class SyncLibrariesRequest(RequestPayload):
     """Sync all libraries to latest versions and ensure dependencies are installed.
 
@@ -1302,14 +1447,16 @@ class InspectLibraryRepoRequest(RequestPayload):
     validating library compatibility, checking library versions remotely.
 
     Args:
-        git_url: Git repository URL (supports GitHub shorthand like "user/repo")
-        ref: Branch, tag, or commit to inspect (defaults to "HEAD")
+        git_url: Git repository URL (supports GitHub shorthand like "user/repo"), optionally
+                 followed by @ref (e.g., "user/repo@stable")
+        ref: Branch, tag, or commit to inspect. Overrides a url@ref suffix. Defaults to the
+             suffix, or "HEAD" when there is none.
 
     Results: InspectLibraryRepoResultSuccess (with library metadata) | InspectLibraryRepoResultFailure (invalid URL, network error, no library JSON found)
     """
 
     git_url: str
-    ref: str = "HEAD"
+    ref: str | None = None
 
 
 @dataclass

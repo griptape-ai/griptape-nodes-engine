@@ -4,6 +4,7 @@ import json
 
 from griptape.artifacts import ImageUrlArtifact
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess, SkipTheLineMixin
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
@@ -48,7 +49,9 @@ class TestExecuteNodeWireForm:
         artifact = ImageUrlArtifact("https://example.com/a.png", name="a")
         request = ExecuteNodeRequest(node_name="n", parameter_values={"image": artifact, "pair": (1, "b")})
 
-        received = EventRequest.from_dict(json.loads(EventRequest(request=request).json()))
+        received = converters.engine.structure(
+            json.loads(converters.engine.dumps(EventRequest(request=request))), EventRequest
+        )
 
         values = received.request.parameter_values
         assert type(values["image"]) is ImageUrlArtifact
@@ -61,6 +64,6 @@ class TestExecuteNodeWireForm:
         )
         event = EventResultSuccess(request=ExecuteNodeRequest(node_name="n"), result=result)
 
-        received = EventResultSuccess.from_dict(json.loads(event.json()))
+        received = converters.engine.structure(json.loads(converters.engine.dumps(event)), EventResultSuccess)
 
         assert received.result.parameter_output_values == {"blob": b"\x00\x01", "tags": {"a", "b"}}

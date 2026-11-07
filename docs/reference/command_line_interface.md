@@ -187,6 +187,8 @@ Griptape Nodes stores its configuration in the following locations.
 - Configuration file: `griptape_nodes_config.json` in the configuration directory
 - Environment file: `.env` in the configuration directory
 
+Set `GTN_ENGINE_CONFIG_DIR` or `GTN_ENGINE_DATA_DIR` to an absolute path to use a different configuration or data directory. See [Configuration](../guides/configuration.md).
+
 Griptape Nodes Desktop keeps these two directories inside its own application data folder so they don't collide with a manually installed engine. See [Uninstalling Griptape Nodes](../uninstalling.md#griptape-nodes-desktop) for those paths.
 
 ## Workflow

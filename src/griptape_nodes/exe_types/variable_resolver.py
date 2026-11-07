@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from contextvars import ContextVar
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -182,8 +184,11 @@ class VariableResolver:
         _aprocess_variable_cache.reset(token)  # type: ignore[arg-type]
 
     @staticmethod
-    def is_substitution_enabled(engine: Engine) -> bool:
-        """Return True if variable substitution is enabled for the active workflow.
+    def is_substitution_enabled(engine: Engine, workflow: WorkflowRuntime | None) -> bool:
+        """Return True if variable substitution is enabled for `workflow`, or with None, the open workflow.
+
+        A node passes the workflow it joined, and None while it has joined none, such as during its
+        ``__init__``.
 
         KNOWN LIMITATION in a worker: this reads a local manager whose map is never populated.
         SetVariableSubstitutionEnabledRequest writes it, and a generated workflow file emits that as
@@ -201,17 +206,21 @@ class VariableResolver:
 
         Routing it through GetVariableSubstitutionEnabledRequest so it forwards was tried and
         backed out: `parameter_output_values[...] = x` inside a node `__init__` reaches this
-        through TrackedParameterOutputValues, so every node construction became a bus request
-        and tripped `reentrant-bus-in-init`. Fixing it properly means resolving the answer once
-        per execution and carrying it, rather than asking per value.
+        through TrackedParameterOutputValues, so every node construction became a bus request.
+        Fixing it properly means resolving the answer once per execution and carrying it,
+        rather than asking per value.
         """
-        return engine.workflow_manager.is_variable_substitution_enabled()
+        if workflow is None:
+            return engine.workflow_manager.variable_substitution.is_enabled()
+        return workflow.variables.substitution_enabled
 
     @staticmethod
-    def get_variables_if_enabled(engine: Engine, node_name: str) -> dict[str, str | int] | None:
+    def get_variables_if_enabled(
+        engine: Engine, workflow: WorkflowRuntime | None, node_name: str
+    ) -> dict[str, str | int] | None:
         """Return the variable dict if substitution is enabled, else None.
 
-        Checks the per-aprocess cache first to avoid repeated singleton lookups.
+        Checks the per-aprocess cache first to avoid repeating the workflow's variable lookup.
         Returns None if: substitution is disabled, node has no parent flow,
         or the cache indicates the flow lookup already failed (_NO_FLOW).
 
@@ -228,7 +237,7 @@ class VariableResolver:
         """
         # Same local read as is_substitution_enabled, and the same worker limitation applies;
         # see the note there.
-        if not engine.workflow_manager.is_variable_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled(engine, workflow):
             return None
 
         cached = _aprocess_variable_cache.get()
@@ -244,13 +253,18 @@ class VariableResolver:
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
         try:
-            flow_name = engine.node_manager.get_node_parent_flow_by_name(node_name)
+            if workflow is None:
+                flow_name = engine.node_manager.get_node_parent_flow_by_name(node_name)
+            else:
+                flow_name = workflow.nodes.parent_flow_name(node_name)
         except KeyError:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
-        result = engine.handle_request(
-            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
-        )
+        request = ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+        if workflow is None:
+            result = engine.handle_request(request)
+        else:
+            result = workflow.handle_request(request)
         if not isinstance(result, ListVariablesResultSuccess):
             logger.debug("Variable substitution skipped for node %s: %s", node_name, result.result_details)
             _aprocess_variable_cache.set(_NO_FLOW)
@@ -308,7 +322,9 @@ class VariableResolver:
         return VariableResolver._contains_string(value, rewrites)
 
     @staticmethod
-    def get_variables_without_memoizing(engine: Engine, node_name: str) -> dict[str, str | int] | None:
+    def get_variables_without_memoizing(
+        engine: Engine, workflow: WorkflowRuntime | None, node_name: str
+    ) -> dict[str, str | int] | None:
         """Like `get_variables_if_enabled`, but never leaves the memo cache set.
 
         ``get_variables_if_enabled`` memoises its lookup into the ContextVar without
@@ -319,18 +335,45 @@ class VariableResolver:
         outside ``aprocess_scope()``. An already-populated cache is left untouched.
         """
         if _aprocess_variable_cache.get() is not None:
-            return VariableResolver.get_variables_if_enabled(engine, node_name)
+            return VariableResolver.get_variables_if_enabled(engine, workflow, node_name)
         token = _aprocess_variable_cache.set(None)
         try:
-            return VariableResolver.get_variables_if_enabled(engine, node_name)
+            return VariableResolver.get_variables_if_enabled(engine, workflow, node_name)
         finally:
             _aprocess_variable_cache.reset(token)
 
     @staticmethod
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
-        """Filter a name→value dict to only str/int values (excluding bool) for macro substitution."""
-        return {
-            name: value
-            for name, value in variables.items()
-            if isinstance(value, (str, int)) and not isinstance(value, bool)
-        }
+        """Filter a name→value dict to the values that can substitute into {VAR} tokens.
+
+        str and int (excluding bool) pass through unchanged. Floats, bools, dicts, and lists pass as
+        strings, so the substitution and picker code downstream only ever sees str/int. A float,
+        bool, or dict is spelled as compact JSON (`1.5`, `true`, `{"a": 1}`), and a list has one
+        item per line.
+        """
+        filtered: dict[str, str | int] = {}
+        for name, value in variables.items():
+            if isinstance(value, list):
+                filtered[name] = VariableResolver._render_list(value)
+            # bool subclasses int, so it has to be caught before the int branch below.
+            elif isinstance(value, (bool, float, dict)):
+                filtered[name] = VariableResolver._render_value(value)
+            elif isinstance(value, (str, int)):
+                filtered[name] = value
+        return filtered
+
+    @staticmethod
+    def _render_list(items: list[Any]) -> str:
+        """Join list items into one string, one item per line."""
+        return "\n".join(VariableResolver._render_value(item) for item in items)
+
+    @staticmethod
+    def _render_value(item: Any) -> str:
+        """Strings pass through. Every other item is JSON, so a value is spelled the same at any depth."""
+        if isinstance(item, str):
+            return item
+        try:
+            return json.dumps(item)
+        except (TypeError, ValueError):
+            # Non-JSON values, or a container that contains itself.
+            return str(item)

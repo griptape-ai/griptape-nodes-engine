@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from typing import TYPE_CHECKING
 
@@ -18,10 +19,11 @@ from tests.unit.serialization.fixture_paths import FIXTURES
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
 
-_LIBRARY_JSON = FIXTURES / "pickle_era_library" / "griptape_nodes_library.json"
+_LIBRARY_DIR = FIXTURES / "pickle_era_library"
 _LIBRARY_MODULE_PREFIXES = (
     "griptape_nodes.node_libraries.pickle_era_fixture_library",
     "gtn_dynamic_module_legacy_values_node",
@@ -40,12 +42,24 @@ def _forget_fixture_library() -> None:
             del sys.modules[module_name]
 
 
+@pytest.fixture(scope="session")
+def library_json(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Copy the fixture library into a per-worker directory.
+
+    Registering creates a ``.venv`` beside the library file, so xdist workers sharing the
+    source copy race to create the same venv.
+    """
+    library_dir = tmp_path_factory.mktemp("pickle_era_library")
+    shutil.copytree(_LIBRARY_DIR, library_dir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".venv*"))
+    return library_dir / "griptape_nodes_library.json"
+
+
 @pytest.fixture
-def library_name(engine: Engine) -> Generator[str, None, None]:
+def library_name(engine: Engine, library_json: Path) -> Generator[str, None, None]:
     """Register the pickle-era fixture library into a clean engine."""
     _forget_fixture_library()
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(_LIBRARY_JSON)))
+    result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), result
     yield result.library_name
     _forget_fixture_library()

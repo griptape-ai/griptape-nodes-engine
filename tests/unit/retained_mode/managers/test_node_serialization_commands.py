@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
@@ -25,6 +25,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     DataNode,
     NodeDependencies,
+    NodeResolutionState,
     aprocess_scope,
 )
 from griptape_nodes.node_library.library_registry import (
@@ -198,6 +199,23 @@ class _ComputedValueNode(DataNode):
         pass
 
 
+class _ListNode(DataNode):
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(
+            ParameterList(
+                name="items",
+                input_types=["str"],
+                type="str",
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        return None
+
+
 class _GroupNode(BaseNodeGroup):
     """Minimal concrete BaseNodeGroup (not a SubflowNodeGroup) for group-serialization coverage."""
 
@@ -271,9 +289,8 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
         _RunGrownParameterNode, NodeMetadata(category="test", description="d", display_name="Run Grown")
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
-    engine.handle_request(
-        EnsureWorkflowAndFlowRequest(workflow_name="serialization_wf", flow_name="serialization_flow")
-    )
+    library.register_new_node_type(_ListNode, NodeMetadata(category="test", description="d", display_name="List"))
+    engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow"))
     try:
         yield _LIBRARY_NAME
     finally:
@@ -305,7 +322,8 @@ def _serialize(engine: Engine, node_name: str) -> tuple[SerializeNodeToCommandsR
     """Serialize a node, returning the commands and the value pool its value commands key into."""
     unique_values: dict = {}
     serialize_result = engine.node_manager.on_serialize_node_to_commands(
-        SerializeNodeToCommandsRequest(node_name=node_name, unique_parameter_uuid_to_values=unique_values)
+        SerializeNodeToCommandsRequest(node_name=node_name, unique_parameter_uuid_to_values=unique_values),
+        engine.current_workflow(),
     )
     assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess), serialize_result
     return serialize_result, unique_values
@@ -348,7 +366,9 @@ class TestSerializeNodeToCommandsBasics:
             engine, library_name, "N1", metadata={"position": {"x": 100, "y": 200}, "custom_key": "custom_value"}
         )
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         create_command = result.serialized_node_commands.create_node_command
@@ -359,16 +379,29 @@ class TestSerializeNodeToCommandsBasics:
         assert create_command.metadata["custom_key"] == "custom_value"
 
     def test_missing_node_name_with_empty_context_returns_failure(self, engine: Engine, library_name: str) -> None:  # noqa: ARG002
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=None))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=None), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultFailure)
 
     def test_unknown_node_name_returns_failure_not_an_exception(self, engine: Engine, library_name: str) -> None:  # noqa: ARG002
         result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name="DoesNotExist")
+            SerializeNodeToCommandsRequest(node_name="DoesNotExist"), engine.current_workflow()
         )
 
         assert isinstance(result, SerializeNodeToCommandsResultFailure)
+
+    def test_reference_node_broadcasts_no_events(
+        self, engine: Engine, library_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "N1")
+        events: list[object] = []
+        monkeypatch.setattr(engine.event_manager, "put_event", events.append)
+
+        _serialize(engine, node_name)
+
+        assert events == []
 
 
 class TestElementModificationCommands:
@@ -390,7 +423,9 @@ class TestElementModificationCommands:
         )
         assert isinstance(add_result, AddParameterToNodeResultSuccess), add_result
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         add_commands = [
@@ -400,10 +435,27 @@ class TestElementModificationCommands:
         ]
         assert len(add_commands) == 1
 
+    def test_user_defined_parameter_keeps_serializable_false_across_a_round_trip(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "N1")
+        add_result = engine.handle_request(
+            AddParameterToNodeRequest(node_name=node_name, parameter_name="extra", tooltip="", serializable=False)
+        )
+        assert isinstance(add_result, AddParameterToNodeResultSuccess), add_result
+
+        restored = _round_trip(engine, node_name)
+
+        parameter = restored.get_parameter_by_name("extra")
+        assert parameter is not None
+        assert parameter.serializable is False
+
     def test_unchanged_library_parameter_is_not_re_added(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         add_commands_for_text = [
@@ -423,7 +475,9 @@ class TestElementModificationCommands:
             )
         )
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         alter_commands = [
@@ -551,7 +605,9 @@ class TestElementModificationCommands:
         names_before = [parameter.name for parameter in node.parameters]
         assert "prompt_1" in names_before
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         assert not [
@@ -632,7 +688,9 @@ class TestLockState:
         lock_result = engine.handle_request(SetLockNodeStateRequest(node_name=node_name, lock=True))
         assert isinstance(lock_result, SetLockNodeStateResultSuccess), lock_result
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         lock_command = result.serialized_node_commands.lock_node_command
@@ -642,10 +700,38 @@ class TestLockState:
     def test_unlocked_node_emits_no_lock_command(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         assert result.serialized_node_commands.lock_node_command is None
+
+    @pytest.mark.parametrize(
+        ("resolved_while_locked", "expected_state"),
+        [
+            pytest.param(True, NodeResolutionState.UNRESOLVED, id="resolved-by-passing-through"),
+            pytest.param(False, NodeResolutionState.RESOLVED, id="resolved-by-executing"),
+        ],
+    )
+    def test_locked_resolved_node_saves_resolved_only_if_it_executed(
+        self,
+        engine: Engine,
+        library_name: str,
+        *,
+        resolved_while_locked: bool,
+        expected_state: NodeResolutionState,
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "N1")
+        engine.handle_request(SetLockNodeStateRequest(node_name=node_name, lock=True))
+        node = engine.node_manager.get_node_by_name(node_name)
+        node.state = NodeResolutionState.RESOLVED
+        node.resolved_while_locked = resolved_while_locked
+
+        result, _ = _serialize(engine, node_name)
+
+        assert result.serialized_node_commands.lock_node_command is not None
+        assert result.serialized_node_commands.create_node_command.resolution == expected_state.value
 
 
 class TestNodeUuidFreshness:
@@ -654,8 +740,12 @@ class TestNodeUuidFreshness:
     def test_two_serializations_of_same_node_yield_distinct_uuids(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")
 
-        first = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
-        second = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+        first = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
+        second = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
+        )
 
         assert isinstance(first, SerializeNodeToCommandsResultSuccess)
         assert isinstance(second, SerializeNodeToCommandsResultSuccess)
@@ -673,7 +763,8 @@ class TestParameterValueSerializationMode:
         result = engine.node_manager.on_serialize_node_to_commands(
             SerializeNodeToCommandsRequest(
                 node_name=node_name, use_pickling=use_pickling, unique_parameter_uuid_to_values=unique_values
-            )
+            ),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
@@ -695,10 +786,12 @@ class TestParameterValueSerializationMode:
         assert isinstance(result_create, CreateNodeResultSuccess), result_create
 
         without_flag = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name="C1", serialize_all_parameter_values=False)
+            SerializeNodeToCommandsRequest(node_name="C1", serialize_all_parameter_values=False),
+            engine.current_workflow(),
         )
         with_flag = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name="C1", serialize_all_parameter_values=True)
+            SerializeNodeToCommandsRequest(node_name="C1", serialize_all_parameter_values=True),
+            engine.current_workflow(),
         )
 
         assert isinstance(without_flag, SerializeNodeToCommandsResultSuccess)
@@ -713,12 +806,13 @@ class TestDeserializeNodeFromCommands:
     def test_deserialize_recreates_node_type_library_and_metadata(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1", metadata={"position": {"x": 1, "y": 2}})
         serialize_result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node_name)
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
         )
         assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
 
         result = engine.node_manager.on_deserialize_node_from_commands(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, DeserializeNodeFromCommandsResultSuccess)
@@ -729,12 +823,13 @@ class TestDeserializeNodeFromCommands:
     def test_deserialize_assigns_fresh_unique_name_on_collision(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")
         serialize_result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node_name)
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
         )
         assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
 
         result = engine.node_manager.on_deserialize_node_from_commands(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, DeserializeNodeFromCommandsResultSuccess)
@@ -757,12 +852,13 @@ class TestDeserializeNodeFromCommands:
             )
         )
         serialize_result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node_name)
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
         )
         assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
 
         result = engine.node_manager.on_deserialize_node_from_commands(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, DeserializeNodeFromCommandsResultSuccess)
@@ -791,7 +887,8 @@ class TestDeserializeNodeFromCommands:
         )
 
         result = engine.node_manager.on_deserialize_node_from_commands(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialized)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialized),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, DeserializeNodeFromCommandsResultFailure)
@@ -816,7 +913,7 @@ class TestSerializeGroupWithChildren:
         from griptape_nodes.retained_mode.events.node_events import SerializedParameterValueTracker
 
         group_serialization = engine.node_manager._serialize_group_with_children(
-            group_node, {}, SerializedParameterValueTracker()
+            engine.current_workflow(), group_node, {}, SerializedParameterValueTracker()
         )
 
         assert len(group_serialization.child_commands) == 1
@@ -857,10 +954,18 @@ class TestSerializeGroupWithChildren:
         from griptape_nodes.retained_mode.events.node_events import SerializedParameterValueTracker
 
         without_flag = engine.node_manager._serialize_group_with_children(
-            group_node, {}, SerializedParameterValueTracker(), serialize_all_parameter_values=False
+            engine.current_workflow(),
+            group_node,
+            {},
+            SerializedParameterValueTracker(),
+            serialize_all_parameter_values=False,
         )
         with_flag = engine.node_manager._serialize_group_with_children(
-            group_node, {}, SerializedParameterValueTracker(), serialize_all_parameter_values=True
+            engine.current_workflow(),
+            group_node,
+            {},
+            SerializedParameterValueTracker(),
+            serialize_all_parameter_values=True,
         )
 
         child_uuid_without_flag = without_flag.child_commands[0].node_uuid
@@ -880,7 +985,7 @@ class TestSerializeGroupWithChildren:
         from griptape_nodes.retained_mode.events.node_events import SerializedParameterValueTracker
 
         group_serialization = engine.node_manager._serialize_group_with_children(
-            group_node, {}, SerializedParameterValueTracker()
+            engine.current_workflow(), group_node, {}, SerializedParameterValueTracker()
         )
 
         assert group_serialization.group_command is not None
@@ -896,7 +1001,8 @@ class TestSerializeGroupWithChildren:
         group_node.metadata["subflow_name"] = "SomeSubflow"
 
         result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name="G1", include_existing_subflow_in_group=True)
+            SerializeNodeToCommandsRequest(node_name="G1", include_existing_subflow_in_group=True),
+            engine.current_workflow(),
         )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
@@ -911,7 +1017,9 @@ class TestSerializeGroupWithChildren:
         )
         assert isinstance(group_result, CreateNodeResultSuccess), group_result
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name="G1"))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name="G1"), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         assert result.serialized_node_commands.is_node_group is False
@@ -920,10 +1028,12 @@ class TestSerializeGroupWithChildren:
         node = _MinimalSubflowGroupNode(
             name="SG1", metadata={"library": library_name, "node_type": "_MinimalSubflowGroupNode"}
         )
-        engine.object_manager.add_object_by_name(node.name, node)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), node.name, node)
         engine.flow_manager.get_flow_by_name("serialization_flow").add_node(node)
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name="SG1"))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name="SG1"), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         assert result.serialized_node_commands.is_node_group is True
@@ -958,14 +1068,15 @@ class TestLocalObjectIdentityIsNeverCopied:
         original = engine.node_manager.get_node_by_name(node_name)
 
         serialize_result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node_name)
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
         )
         assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
         create_command = serialize_result.serialized_node_commands.create_node_command
         assert create_command.metadata is not None
 
         paste_result = engine.node_manager.on_deserialize_node_from_commands(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands),
+            engine.current_workflow(),
         )
         assert isinstance(paste_result, DeserializeNodeFromCommandsResultSuccess)
         clone = engine.node_manager.get_node_by_name(paste_result.node_name)
@@ -979,11 +1090,12 @@ class TestLocalObjectIdentityIsNeverCopied:
         original = engine.node_manager.get_node_by_name(node_name)
 
         serialize_result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node_name)
+            SerializeNodeToCommandsRequest(node_name=node_name), engine.current_workflow()
         )
         assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
         paste_result = engine.node_manager.on_deserialize_node_from_commands(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands),
+            engine.current_workflow(),
         )
         assert isinstance(paste_result, DeserializeNodeFromCommandsResultSuccess)
         clone = engine.node_manager.get_node_by_name(paste_result.node_name)
@@ -1008,3 +1120,22 @@ class TestLocalObjectIdentityIsNeverCopied:
 
         assert released == []
         assert engine.resource_manager.get_local_object(key, owner=original.local_objects.owner) is not None
+
+
+class TestAListRoundTrip:
+    """A list keeps no value of its own, so its rows alone have to carry it through a save."""
+
+    def test_its_items_come_back(self, engine: Engine, library_name: str) -> None:
+        result = engine.handle_request(
+            CreateNodeRequest(node_type="_ListNode", specific_library_name=library_name, node_name="Lister")
+        )
+        assert isinstance(result, CreateNodeResultSuccess), result
+        set_result = engine.handle_request(
+            SetParameterValueRequest(node_name="Lister", parameter_name="items", value=["a", "b"])
+        )
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        copy = _round_trip(engine, "Lister")
+
+        assert copy.get_parameter_value("items") == ["a", "b"]
+        assert "items" not in copy.parameter_values

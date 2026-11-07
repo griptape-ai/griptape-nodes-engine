@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class WriteVettingPolicy(StrEnum):
@@ -253,15 +254,31 @@ class BaseArtifactProvider(EngineScoped, ABC):
 
         return result
 
-    def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:  # noqa: ARG002
-        """Process content before writing to disk.
+    def collect_metadata_for_write(
+        self,
+        file_name: str,  # noqa: ARG002
+        workflow: WorkflowRuntime | None,  # noqa: ARG002
+    ) -> dict[str, str]:
+        """Collect the metadata to embed in a file of this format, or {} to embed none.
 
-        Override in subclasses for format-specific content processing
-        (e.g., metadata injection). Default implementation returns data unchanged.
+        Runs on the event loop, so it may read engine state. Default embeds nothing.
+
+        Args:
+            file_name: Resolved filename including extension (post-macro resolution and post-policy)
+            workflow: The workflow the file is written for, or None for a file written for none
+        """
+        return {}
+
+    def prepare_content_for_write(self, data: bytes, file_name: str, metadata: dict[str, str]) -> bytes:  # noqa: ARG002
+        """Embed `metadata` from `collect_metadata_for_write` into the file's bytes.
+
+        Runs on a worker thread, because re-encoding a large file takes seconds. It must not read
+        engine state; anything it needs comes in through `metadata`. Default returns data unchanged.
 
         Args:
             data: Raw file bytes
             file_name: Resolved filename including extension (post-macro resolution and post-policy)
+            metadata: What `collect_metadata_for_write` returned for this file
 
         Returns:
             Processed bytes (or original bytes if no processing needed)

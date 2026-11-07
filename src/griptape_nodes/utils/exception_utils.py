@@ -26,6 +26,10 @@ def readable_exception_message(err: BaseException) -> str:
         >>> readable_exception_message(ValueError("bad value"))
         'bad value'
     """
-    if isinstance(err, KeyError) and len(err.args) == 1 and isinstance(err.args[0], str):
-        return err.args[0]
-    return str(err)
+    # Only a class still using KeyError's own __str__ quotes; a subclass that overrides it already
+    # renders the way its author meant.
+    if not isinstance(err, KeyError) or type(err).__str__ is not KeyError.__str__:
+        return str(err)
+    if len(err.args) != 1 or not isinstance(err.args[0], str):
+        return str(err)
+    return err.args[0]

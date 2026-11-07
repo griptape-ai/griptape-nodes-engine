@@ -1,24 +1,36 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import threading
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
-from mcp.types import CallToolRequestParams
+from mcp.shared.exceptions import MCPError
+from mcp.types import CallToolRequestParams, ToolAnnotations
+from starlette.requests import Request
 
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
     _BATCH_PER_REQUEST_TIMEOUT_MS,
+    ENGINE_TOOLS,
     EVENT_REQUEST_BATCH_TOOL_NAME,
     SUPPORTED_REQUEST_EVENTS,
-    _build_batch_pairs,
+    ToolCallSender,
+    _build_batch_requests,
     _dispatch_to_engine,
     _event_request_batch_input_schema,
     _resolve_batch_timeout_ms,
     _summarize_result_details,
+    _tool_selection_for_request,
+    _tools_for_request,
     _trim_batch_results,
     _trim_response,
     call_tool,
@@ -26,10 +38,15 @@ from griptape_nodes.servers.mcp import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
     from mcp.server.context import ServerRequestContext
 
-# The 2.x handlers take a ServerRequestContext they never read, so tests pass a stand-in.
-_NO_CONTEXT = cast("ServerRequestContext[Any]", None)
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+# A context with no HTTP request, which the handlers serve the engine tools to.
+_NO_CONTEXT = cast("ServerRequestContext[Any]", SimpleNamespace(request=None))
 
 
 class TestSummarizeResultDetails:
@@ -116,13 +133,13 @@ class TestTrimResponse:
 
 class TestEventRequestBatchInputSchema:
     def test_enumerates_every_supported_request_type(self) -> None:
-        schema = _event_request_batch_input_schema()
+        schema = _event_request_batch_input_schema(["CreateNodeRequest", "ListRegisteredLibrariesRequest"])
 
         request_type_enum = schema["properties"]["requests"]["items"]["properties"]["request_type"]["enum"]
-        assert set(request_type_enum) == set(SUPPORTED_REQUEST_EVENTS)
+        assert request_type_enum == ["CreateNodeRequest", "ListRegisteredLibrariesRequest"]
 
     def test_marks_requests_required_and_non_empty(self) -> None:
-        schema = _event_request_batch_input_schema()
+        schema = _event_request_batch_input_schema(sorted(ENGINE_TOOLS))
 
         assert schema["required"] == ["requests"]
         assert schema["properties"]["requests"]["minItems"] == 1
@@ -143,36 +160,37 @@ class TestBuildBatchPairs:
             },
         ]
 
-        pairs = _build_batch_pairs(raw)
+        requests = _build_batch_requests(raw, ENGINE_TOOLS)
 
-        assert [request_type for request_type, _ in pairs] == ["CreateNodeRequest", "CreateConnectionRequest"]
-        # Defaults from the dataclasses are filled in, so payload dicts carry every field.
-        assert pairs[0][1]["node_type"] == "TextInput"
-        assert pairs[1][1]["source_node_name"] == "TextInput_1"
+        assert [type(request).__name__ for request in requests] == ["CreateNodeRequest", "CreateConnectionRequest"]
+        assert requests[0].node_type == "TextInput"  # type: ignore[attr-defined]
+        assert requests[1].source_node_name == "TextInput_1"  # type: ignore[attr-defined]
 
     def test_rejects_non_list_requests(self) -> None:
         with pytest.raises(TypeError, match="must be a list"):
-            _build_batch_pairs("not a list")
+            _build_batch_requests("not a list", ENGINE_TOOLS)
 
     def test_rejects_empty_list(self) -> None:
         with pytest.raises(ValueError, match="empty"):
-            _build_batch_pairs([])
+            _build_batch_requests([], ENGINE_TOOLS)
 
     def test_rejects_non_dict_entry(self) -> None:
         with pytest.raises(TypeError, match="entry 0"):
-            _build_batch_pairs(["not a dict"])
+            _build_batch_requests(["not a dict"], ENGINE_TOOLS)
 
     def test_rejects_unknown_request_type(self) -> None:
         with pytest.raises(ValueError, match="is not a supported tool"):
-            _build_batch_pairs([{"request_type": "NopeRequest", "request": {}}])
+            _build_batch_requests([{"request_type": "NopeRequest", "request": {}}], ENGINE_TOOLS)
 
     def test_rejects_non_dict_request_payload(self) -> None:
         with pytest.raises(TypeError, match="must be an object"):
-            _build_batch_pairs([{"request_type": "ListRegisteredLibrariesRequest", "request": "bad"}])
+            _build_batch_requests([{"request_type": "ListRegisteredLibrariesRequest", "request": "bad"}], ENGINE_TOOLS)
 
     def test_rejects_unknown_kwargs_in_inner_payload(self) -> None:
         with pytest.raises(ValueError, match="Attempted to construct CreateNodeRequest"):
-            _build_batch_pairs([{"request_type": "CreateNodeRequest", "request": {"node_type": "X", "bogus_field": 1}}])
+            _build_batch_requests(
+                [{"request_type": "CreateNodeRequest", "request": {"node_type": "X", "bogus_field": 1}}], ENGINE_TOOLS
+            )
 
 
 class TestResolveBatchTimeoutMs:
@@ -269,6 +287,29 @@ class TestListTools:
         assert names == set(SUPPORTED_REQUEST_EVENTS) | {EVENT_REQUEST_BATCH_TOOL_NAME}
 
     @pytest.mark.asyncio
+    async def test_advertises_flow_recovery_requests(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert {"CancelFlowRequest", "UnresolveFlowRequest"} <= names
+
+    @pytest.mark.asyncio
+    async def test_advertises_flow_validation_request(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert "ValidateFlowDependenciesRequest" in names
+
+    @pytest.mark.asyncio
+    async def test_list_node_types_tool_offers_optional_include_metadata(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        tools_by_name = {tool.name: tool for tool in result.tools}
+        list_tool = tools_by_name["ListNodeTypesInLibraryRequest"]
+        assert "include_metadata" in list_tool.input_schema["properties"]
+        assert "include_metadata" not in list_tool.input_schema.get("required", [])
+
+    @pytest.mark.asyncio
     async def test_every_tool_carries_an_object_input_schema(self) -> None:
         result = await list_tools(_NO_CONTEXT, None)
 
@@ -285,7 +326,7 @@ class TestCallTool:
 
     @pytest.mark.asyncio
     async def test_returns_trimmed_payload_as_text_content(self) -> None:
-        async def fake_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def fake_dispatch(_payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
             return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {"libraries": ["demo"]}}
 
         with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
@@ -300,7 +341,7 @@ class TestCallTool:
     async def test_treats_missing_arguments_as_empty(self) -> None:
         seen: dict[str, object] = {}
 
-        async def fake_dispatch(payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def fake_dispatch(payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
             seen["payload"] = payload
             return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {}}
 
@@ -328,7 +369,11 @@ class TestCallTool:
 
     @pytest.mark.asyncio
     async def test_reports_dispatch_timeout_as_error_result(self) -> None:
-        async def timing_out_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+        async def timing_out_dispatch(
+            _payload: object,
+            _sender: object,
+            timeout_ms: int | None = None,  # noqa: ARG001
+        ) -> dict[str, Any]:
             raise TimeoutError
 
         with patch.object(mcp_module, "_dispatch_to_engine", timing_out_dispatch):
@@ -340,8 +385,8 @@ class TestCallTool:
 
     @pytest.mark.asyncio
     async def test_dispatches_the_batch_envelope(self) -> None:
-        async def fake_batch_dispatch(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:  # noqa: ARG001
-            return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}} for _ in pairs]
+        async def fake_batch_dispatch(requests: list[RequestPayload], _sender: object, timeout_ms: int) -> list[Any]:  # noqa: ARG001
+            return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}} for _ in requests]
 
         with patch.object(mcp_module, "_dispatch_batch_to_engine", fake_batch_dispatch):
             result = await call_tool(
@@ -399,7 +444,7 @@ class TestDispatchToEngineShield:
         completed = threading.Event()
         cancelled = threading.Event()
 
-        async def slow_engine_handler(_payload: object) -> dict[str, bool]:
+        async def slow_engine_handler(_payload: object, _sender: object) -> dict[str, bool]:
             try:
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
@@ -416,7 +461,7 @@ class TestDispatchToEngineShield:
                 patch.object(mcp_module, "_handle_request_on_engine_loop", slow_engine_handler),
             ):
                 with pytest.raises(TimeoutError):
-                    await _dispatch_to_engine(self._a_request_payload(), timeout_ms=50)
+                    await _dispatch_to_engine(self._a_request_payload(), ToolCallSender(), timeout_ms=50)
 
                 # The shielded engine coroutine keeps running on its own loop after the
                 # wait times out; wait long enough for its 0.5s body to finish.
@@ -431,7 +476,7 @@ class TestDispatchToEngineShield:
     async def test_returns_result_when_engine_finishes_before_timeout(self) -> None:
         engine_loop, thread = self._run_engine_loop_in_thread()
 
-        async def fast_engine_handler(_payload: object) -> dict[str, bool]:
+        async def fast_engine_handler(_payload: object, _sender: object) -> dict[str, bool]:
             return {"ok": True}
 
         event_manager = MagicMock()
@@ -441,8 +486,387 @@ class TestDispatchToEngineShield:
                 patch.object(mcp_module.GriptapeNodes, "EventManager", return_value=event_manager),
                 patch.object(mcp_module, "_handle_request_on_engine_loop", fast_engine_handler),
             ):
-                result = await _dispatch_to_engine(self._a_request_payload(), timeout_ms=5000)
+                result = await _dispatch_to_engine(self._a_request_payload(), ToolCallSender(), timeout_ms=5000)
 
             assert result == {"ok": True}
         finally:
             self._stop_engine_loop(engine_loop, thread)
+
+
+@dataclass
+class ProbeListRendersRequest(RequestPayload):
+    """List the probe library's renders."""
+
+
+@dataclass
+class ProbeStartRenderRequest(RequestPayload):
+    """Start a probe render."""
+
+    frame: int = 1
+
+
+_PROBE_LIBRARY_NAME = "Probe Render Library"
+_PROBE_LIBRARY_SLUG = "probe_render_library"
+_PROBE_TOOLS = [MCPTool(ProbeListRendersRequest, read_only=True), MCPTool(ProbeStartRenderRequest)]
+
+
+def _context_for(url_path: str, query_string: bytes = b"") -> ServerRequestContext[Any]:
+    """A context whose HTTP request arrived at url_path on the server's /mcp mount."""
+    request = Request(
+        {"type": "http", "path": url_path, "root_path": "/mcp", "query_string": query_string, "headers": []}
+    )
+    return cast("ServerRequestContext[Any]", SimpleNamespace(request=request))
+
+
+@pytest.fixture
+def probe_library() -> Iterator[None]:
+    """Load a library exposing _PROBE_TOOLS, read on the calling thread instead of the engine loop."""
+    library = MagicMock()
+    library.get_mcp_tools.return_value = list(_PROBE_TOOLS)
+
+    async def run_inline(func: Callable[[], Any]) -> Any:
+        return func()
+
+    with (
+        patch.object(mcp_module, "_run_on_engine_loop", run_inline),
+        patch.object(mcp_module.LibraryRegistry, "list_libraries", return_value=[_PROBE_LIBRARY_NAME]),
+        patch.object(mcp_module.LibraryRegistry, "get_library", return_value=library),
+    ):
+        yield
+
+
+class TestToolSelectionForRequest:
+    def test_engine_endpoint_serves_engine_tools_only(self) -> None:
+        selection = _tool_selection_for_request(_context_for("/mcp/").request)
+
+        assert selection.include_engine_tools is True
+        assert selection.library_slugs == ()
+
+    def test_libraries_query_adds_libraries_to_engine_tools(self) -> None:
+        selection = _tool_selection_for_request(_context_for("/mcp/", b"libraries=b,%20a,,b").request)
+
+        assert selection.include_engine_tools is True
+        assert selection.library_slugs == ("b", "a")
+
+    @pytest.mark.parametrize("url_path", ["/mcp/libraries/acme/", "/mcp/libraries/acme"])
+    def test_library_endpoint_serves_one_library_only(self, url_path: str) -> None:
+        selection = _tool_selection_for_request(_context_for(url_path).request)
+
+        assert selection.include_engine_tools is False
+        assert selection.library_slugs == ("acme",)
+
+    def test_non_http_request_gets_engine_tools(self) -> None:
+        selection = _tool_selection_for_request(None)
+
+        assert selection.include_engine_tools is True
+        assert selection.library_slugs == ()
+
+
+@pytest.mark.usefixtures("probe_library")
+class TestLibraryTools:
+    @pytest.mark.asyncio
+    async def test_library_endpoint_lists_only_its_library_tools(self) -> None:
+        result = await list_tools(_context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"), None)
+
+        names = {tool.name for tool in result.tools}
+        assert names == {"ProbeListRendersRequest", "ProbeStartRenderRequest", EVENT_REQUEST_BATCH_TOOL_NAME}
+
+    @pytest.mark.asyncio
+    async def test_engine_endpoint_hides_library_tools(self) -> None:
+        result = await list_tools(_context_for("/mcp/"), None)
+
+        names = {tool.name for tool in result.tools}
+        assert "ProbeListRendersRequest" not in names
+
+    @pytest.mark.asyncio
+    async def test_libraries_query_adds_library_tools_to_engine_tools(self) -> None:
+        result = await list_tools(_context_for("/mcp/", f"libraries={_PROBE_LIBRARY_SLUG}".encode()), None)
+
+        names = {tool.name for tool in result.tools}
+        assert names == set(ENGINE_TOOLS) | {
+            "ProbeListRendersRequest",
+            "ProbeStartRenderRequest",
+            EVENT_REQUEST_BATCH_TOOL_NAME,
+        }
+
+    @pytest.mark.asyncio
+    async def test_marks_only_read_only_tools_with_the_hint(self) -> None:
+        result = await list_tools(_context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"), None)
+
+        tools_by_name = {tool.name: tool for tool in result.tools}
+        assert tools_by_name["ProbeListRendersRequest"].annotations == ToolAnnotations(read_only_hint=True)
+        assert tools_by_name["ProbeStartRenderRequest"].annotations is None
+
+    @pytest.mark.asyncio
+    async def test_batch_tool_enumerates_the_endpoints_tools(self) -> None:
+        result = await list_tools(_context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"), None)
+
+        batch_tool = next(tool for tool in result.tools if tool.name == EVENT_REQUEST_BATCH_TOOL_NAME)
+        request_type_schema = batch_tool.input_schema["properties"]["requests"]["items"]["properties"]["request_type"]
+        assert request_type_schema["enum"] == ["ProbeListRendersRequest", "ProbeStartRenderRequest"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_library_endpoint_fails_with_its_name(self) -> None:
+        with pytest.raises(MCPError, match="library 'missing'"):
+            await list_tools(_context_for("/mcp/libraries/missing/"), None)
+
+    @pytest.mark.asyncio
+    async def test_unknown_library_in_query_fails_with_its_name(self) -> None:
+        query = f"libraries={_PROBE_LIBRARY_SLUG},missing".encode()
+        with pytest.raises(MCPError, match="library 'missing'"):
+            await list_tools(_context_for("/mcp/", query), None)
+
+    @pytest.mark.asyncio
+    async def test_calls_a_library_tool(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            seen["payload"] = payload
+            return {"result_type": "ProbeStartRenderResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(
+                _context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"),
+                CallToolRequestParams(name="ProbeStartRenderRequest", arguments={"frame": 7}),
+            )
+
+        assert result.is_error is False
+        assert seen["payload"] == ProbeStartRenderRequest(frame=7)
+
+    @pytest.mark.asyncio
+    async def test_library_endpoint_rejects_engine_tools(self) -> None:
+        result = await call_tool(
+            _context_for(f"/mcp/libraries/{_PROBE_LIBRARY_SLUG}/"),
+            CallToolRequestParams(name="ListRegisteredLibrariesRequest", arguments={}),
+        )
+
+        assert result.is_error is True
+        assert "Unsupported tool: ListRegisteredLibrariesRequest" in result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_engine_tool_wins_a_name_clash(self) -> None:
+        clashing = MCPTool(type("ListRegisteredLibrariesRequest", (ProbeStartRenderRequest,), {}))
+        tools_by_slug = {"anything": [clashing]}
+
+        with patch.object(mcp_module, "_collect_library_tools", return_value=tools_by_slug):
+            served = await _tools_for_request(_context_for("/mcp/", b"libraries=anything"))
+
+        assert served["ListRegisteredLibrariesRequest"] is ENGINE_TOOLS["ListRegisteredLibrariesRequest"]
+
+    @pytest.mark.asyncio
+    async def test_first_listed_library_wins_a_name_clash(self) -> None:
+        first = MCPTool(ProbeStartRenderRequest)
+        second = MCPTool(ProbeStartRenderRequest, read_only=True)
+        tools_by_slug = {"first": [first], "second": [second]}
+
+        with patch.object(mcp_module, "_collect_library_tools", return_value=tools_by_slug):
+            served = await _tools_for_request(_context_for("/mcp/", b"libraries=first,second"))
+
+        assert served["ProbeStartRenderRequest"] is first
+
+
+def _http_context(headers: dict[str, str]) -> ServerRequestContext[Any]:
+    """A tool call that came over an HTTP request carrying `headers`, on the engine's own endpoint."""
+    raw_headers = [(name.lower().encode(), value.encode()) for name, value in headers.items()]
+    request = Request({"type": "http", "path": "/mcp/", "query_string": b"", "headers": raw_headers})
+    return cast("ServerRequestContext[Any]", SimpleNamespace(request=request))
+
+
+def _create_flow_call(flow_name: str) -> CallToolRequestParams:
+    return CallToolRequestParams(
+        name="CreateFlowRequest",
+        arguments={"parent_flow_name": None, "flow_name": flow_name, "set_as_new_context": False},
+    )
+
+
+def _payload(result: Any) -> Any:
+    return json.loads(result.content[0].text)
+
+
+class TestToolCallWorkflow:
+    """A tool call acts on the workflow its header names, else the one its MCP session opened."""
+
+    @pytest.fixture(autouse=True)
+    def dispatch_on_this_loop(self) -> Iterator[None]:
+        """Run tool calls on the test's loop, which stands in for the engine loop, with no sessions."""
+
+        async def dispatch_inline(
+            payload: RequestPayload,
+            sender: ToolCallSender,
+            timeout_ms: int | None = None,  # noqa: ARG001
+        ) -> dict[str, Any]:
+            return await mcp_module._handle_request_on_engine_loop(payload, sender)
+
+        with (
+            patch.object(mcp_module, "_dispatch_to_engine", dispatch_inline),
+            patch.dict(mcp_module._session_workflow_ids, {}, clear=True),
+        ):
+            yield
+
+    @pytest.fixture
+    def two_open(self, engine: Engine) -> tuple[WorkflowRuntime, WorkflowRuntime]:
+        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+        opened = []
+        for name in ("first", "second"):
+            entry = engine.workflow_registry.register_unsaved(name, listed=False)
+            opened.append(engine.open_workflow(entry.workflow_id))
+        return opened[0], opened[1]
+
+    @pytest.mark.asyncio
+    async def test_a_call_naming_no_workflow_acts_on_the_open_one(self, engine: Engine) -> None:
+        entry = engine.workflow_registry.register_unsaved("only", listed=False)
+        only = engine.open_workflow(entry.workflow_id)
+
+        result = await call_tool(_NO_CONTEXT, _create_flow_call("canvas"))
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in only.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_the_header_names_the_workflow(self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]) -> None:
+        first, second = two_open
+
+        result = await call_tool(
+            _http_context({"X-Griptape-Workflow-Id": second.workflow_id}), _create_flow_call("canvas")
+        )
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in second.flows.name_to_parent_name
+        assert "canvas" not in first.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_a_header_naming_a_workflow_that_is_not_open_fails(
+        self,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": "0" * 32}), _create_flow_call("canvas"))
+
+        assert not _payload(result)["ok"]
+        assert "isn't open" in result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_the_header_names_the_workflow_of_every_request_in_a_batch(
+        self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        first, second = two_open
+        batch = CallToolRequestParams(
+            name=EVENT_REQUEST_BATCH_TOOL_NAME,
+            arguments={
+                "requests": [
+                    {"request_type": "CreateFlowRequest", "request": {"parent_flow_name": None, "flow_name": name}}
+                    for name in ("one", "two")
+                ]
+            },
+        )
+
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": second.workflow_id}), batch)
+
+        assert [entry["ok"] for entry in _payload(result)] == [True, True]
+        assert {"one", "two"} <= set(second.flows.name_to_parent_name)
+        assert not {"one", "two"} & set(first.flows.name_to_parent_name)
+
+    @pytest.mark.asyncio
+    async def test_a_session_acts_on_the_workflow_it_opened(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+
+        opened = await call_tool(
+            session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={"display_name": "third"})
+        )
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        assert _payload(opened)["ok"], opened
+        third = engine.open_workflows.all_open()[-1]
+        assert third not in two_open
+        assert _payload(result)["ok"], result
+        assert "canvas" in third.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_sessions_that_opened_different_workflows_do_not_cross(
+        self,
+        engine: Engine,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        session_a = _http_context({"mcp-session-id": "session-a"})
+        session_b = _http_context({"mcp-session-id": "session-b"})
+
+        await call_tool(session_a, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        workflow_a = engine.open_workflows.all_open()[-1]
+        await call_tool(session_b, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        workflow_b = engine.open_workflows.all_open()[-1]
+        await call_tool(session_a, _create_flow_call("canvas_a"))
+        await call_tool(session_b, _create_flow_call("canvas_b"))
+
+        assert set(workflow_a.flows.name_to_parent_name) == {"canvas_a"}
+        assert set(workflow_b.flows.name_to_parent_name) == {"canvas_b"}
+
+    @pytest.mark.asyncio
+    async def test_a_session_forgets_its_workflow_once_it_closes(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        third = engine.open_workflows.all_open()[-1]
+        engine.close_workflow(third)
+
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        # With the session's workflow gone the call names none, and two are still open.
+        assert not _payload(result)["ok"]
+        assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
+
+    @pytest.mark.asyncio
+    async def test_a_header_follows_its_workflow_when_a_save_moves_it(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """Saving a template continues in a copy under another id, and the header still reaches it."""
+        _, second = two_open
+        held_id = second.workflow_id
+        copy = engine.workflow_registry.register_unsaved("copy", listed=False)
+        engine.open_workflows.move(second, copy.workflow_id)
+
+        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": held_id}), _create_flow_call("canvas"))
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in second.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_the_header_wins_over_the_sessions_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        first, _ = two_open
+        await call_tool(
+            _http_context({"mcp-session-id": "session-a"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+        third = engine.open_workflows.all_open()[-1]
+
+        result = await call_tool(
+            _http_context({"mcp-session-id": "session-a", "X-Griptape-Workflow-Id": first.workflow_id}),
+            _create_flow_call("canvas"),
+        )
+
+        assert _payload(result)["ok"], result
+        assert "canvas" in first.flows.name_to_parent_name
+        assert "canvas" not in third.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_remembering_a_session_forgets_sessions_whose_workflow_closed(
+        self,
+        engine: Engine,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        """Sessions end without telling the server, so their entries go once their workflow closes."""
+        await call_tool(
+            _http_context({"mcp-session-id": "ended"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+        engine.close_workflow(engine.open_workflows.all_open()[-1])
+
+        await call_tool(
+            _http_context({"mcp-session-id": "live"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+
+        assert set(mcp_module._session_workflow_ids) == {"live"}

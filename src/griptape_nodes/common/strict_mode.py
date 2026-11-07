@@ -4,12 +4,12 @@ Strict mode is a runtime contract for what node code is allowed to do
 across the orchestrator/worker split. This module owns scope, severity
 resolution, and violation reporting -- and nothing else.
 
-Two kinds of strict-mode scope exist:
-
-* ``RUNTIME_EXECUTE`` opens around ``NodeManager.on_execute_node_request``
-  for a single node's execution.
-* ``LOAD_PROBE`` opens around each class's schema probe in
-  ``LibraryWorkers.serialize_library_node_schemas``.
+Three kinds of strict-mode scope exist: ``RUNTIME_EXECUTE``, which opens
+around ``NodeManager.on_execute_node_request`` for a single node's
+execution; ``LOAD``, which opens while ``NodeManager`` creates a node
+or applies its saved state (a workflow load, a paste, or a worker
+rebuilding its copy); and ``EDIT``, which a node's value or connection
+hook opens around itself when no other scope is active.
 
 Detectors live at their own call sites (e.g. ``EventManager.handle_request``,
 ``BaseNode.add_parameter``) and import the module-level singleton
@@ -22,8 +22,7 @@ Severity is picked per-rule by the reporter's severity resolver:
 correctness rules fail on both sides, ergonomics rules warn on the
 orchestrator and escalate to ERROR on the worker. Callers that need to
 escalate a worker violation (e.g. convert ``ExecuteNodeResultSuccess``
-to a failure, or skip a class's schema) inspect the scope's
-``violations`` list after exit.
+to a failure) inspect the scope's ``violations`` list after exit.
 
 "Am I currently constructing a node?" and "What request is currently
 being dispatched?" are NOT owned here. Those facts belong to
@@ -67,7 +66,8 @@ class SeverityResolver(Protocol):
 
 class StrictModeScopeKind(StrEnum):
     RUNTIME_EXECUTE = "runtime_execute"
-    LOAD_PROBE = "load_probe"
+    LOAD = "load"
+    EDIT = "edit"
 
 
 class StrictModeSeverity(StrEnum):
@@ -191,6 +191,7 @@ class StrictModeReporter:
         subject: str,
         library_name: str | None,
         is_worker: bool,
+        hand_to_enclosing: bool = False,
     ) -> Iterator[StrictModeScope]:
         """Push a new strict-mode scope onto the per-task stack.
 
@@ -198,6 +199,11 @@ class StrictModeReporter:
         ``report()`` always operate on the innermost. When the reporter
         is disabled the yielded scope is detached (not on the stack), so
         ``report()`` finds no active scope and no-ops.
+
+        ``hand_to_enclosing`` adds this scope's violations to the enclosing
+        scope's on exit, for work that is part of what the enclosing scope
+        covers: a worker's rebuild of a node belongs to that node's
+        execution, whose result its violations must reach.
         """
         scope = StrictModeScope(kind=kind, subject=subject, library_name=library_name, is_worker=is_worker)
         if not self._enabled:
@@ -209,6 +215,8 @@ class StrictModeReporter:
             yield scope
         finally:
             self._scope_stack.reset(token)
+            if hand_to_enclosing and previous:
+                previous[-1].violations.extend(scope.violations)
 
     @asynccontextmanager
     async def scoped_execution(
@@ -280,13 +288,11 @@ class StrictModeReporter:
             message=message,
         )
         scope.violations.append(violation)
-        subject_label = "node" if scope.kind is StrictModeScopeKind.RUNTIME_EXECUTE else "class"
         log = self._logger.error if severity is StrictModeSeverity.ERROR else self._logger.warning
         log(
-            "strict-mode [%s/%s] %s=%s library=%s: %s",
+            "strict-mode [%s/%s] node=%s library=%s: %s",
             scope.kind.value,
             severity.value,
-            subject_label,
             scope.subject,
             scope.library_name,
             message,

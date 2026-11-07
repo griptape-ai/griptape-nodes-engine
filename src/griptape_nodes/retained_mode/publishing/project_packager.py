@@ -272,7 +272,6 @@ def _copy_tree(engine: Engine, source_path: Path, destination_path: Path, ignore
         # the copy request genuinely failed at runtime, so RuntimeError (which
         # the export handler catches) is the right type here.
         msg = f"Attempted to copy tree from '{source_path}' to '{destination_path}'. Failed during package staging."
-        logger.error(msg)
         raise RuntimeError(msg)  # noqa: TRY004
 
 

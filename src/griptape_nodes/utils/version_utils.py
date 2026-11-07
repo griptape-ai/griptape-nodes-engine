@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.metadata
 import json
 import sysconfig
 from pathlib import Path
-from typing import Literal, NamedTuple
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion
 from packaging.version import Version as PackagingVersion
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 console = Console()
 
@@ -150,8 +155,14 @@ def get_complete_version_string() -> str:
     return format_version_string(get_current_version(), ENGINE_PACKAGE_NAME)
 
 
-def engine_package_versions() -> dict[str, str]:
+@functools.cache
+def engine_package_versions() -> Mapping[str, str]:
     """Return the canonical name and installed version of every package in the engine's environment.
+
+    Cached for the life of the process. Nothing installs into the engine's own environment while it
+    runs, since every install targets a library environment, so the answer cannot change until a
+    restart. Reading it costs a metadata parse per installed package, and every library install and
+    shadowing check asks.
 
     Scoped to the running interpreter's site-packages rather than `sys.path`, which carries library
     environments spliced ahead of the engine's own: a path-wide scan reports those versions as the
@@ -179,7 +190,7 @@ def engine_package_versions() -> dict[str, str]:
             continue
         versions[name] = distribution.version
 
-    return versions
+    return MappingProxyType(versions)
 
 
 def engine_package_floors() -> tuple[str, ...]:

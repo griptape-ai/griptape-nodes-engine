@@ -167,10 +167,8 @@ class LibraryDiagnostics(BaseModel):
 
     Attributes:
         name: Registered library name, or the path when the name could not be read.
-        requires_worker: Whether the library declares legacy worker mode, which also keeps
-            its nodes from loading in this process at all.
-        executes_in_worker: Whether its nodes run in a separate worker process, for either
-            reason -- legacy worker mode, or execution dependencies.
+        executes_in_worker: Whether its nodes run in a separate worker process, because it
+            declares execution dependencies.
         worker_ready: Whether a worker is registered and serving the library, when one runs
             it at all. None when nothing about this library needs a worker.
         worker_unavailable_reason: Why no worker is serving it, when none is. Says the same
@@ -188,7 +186,6 @@ class LibraryDiagnostics(BaseModel):
     lifecycle_state: str | None = None
     enabled: bool = True
     is_sandbox: bool = False
-    requires_worker: bool = False
     executes_in_worker: bool = False
     worker_ready: bool | None = None
     worker_unavailable_reason: str | None = None

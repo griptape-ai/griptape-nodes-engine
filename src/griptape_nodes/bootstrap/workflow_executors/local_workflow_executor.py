@@ -88,7 +88,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
 
         await GriptapeNodes.EventManager().abroadcast_app_event(
             AppInitializationComplete(
-                skip_library_loading=self._skip_library_loading, workflows_to_register=self._workflows_to_register
+                skip_library_loading=self._skip_library_loading,
+                workflows_to_register=self._workflows_to_register,
+                defer_pending_library_resets=True,
             )
         )
         return self
@@ -100,7 +102,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
-        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
+        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
         if exc_val is not None and self._save_on_failure_path is not None:
             await self._save_failed_workflow(exc_val)
 
@@ -141,13 +143,11 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         load_result = await GriptapeNodes.ahandle_request(LoadProjectTemplateRequest(project_path=project_file_path))
         if not isinstance(load_result, LoadProjectTemplateResultSuccess):
             msg = f"Attempted to load project template from {project_file_path}. Failed with result: {load_result}"
-            logger.error(msg)
             raise LocalExecutorError(msg)
 
         set_result = await GriptapeNodes.ahandle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
         if set_result.failed():
             msg = f"Attempted to set project {load_result.project_id} as current. Failed with result: {set_result}"
-            logger.error(msg)
             raise LocalExecutorError(msg)
 
         logger.info("Loaded and activated project template from %s", project_file_path)
@@ -236,7 +236,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             return True, None
         if type(result_event.payload).__name__ == "ControlFlowCancelledEvent":
             msg = "Control flow cancelled"
-            logger.error(msg)
             return True, LocalExecutorError(msg)
 
         return False, None

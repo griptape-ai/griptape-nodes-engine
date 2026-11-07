@@ -1,12 +1,13 @@
 """Tests for inline workflow variable substitution in get_parameter_value()."""
 
+import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
+from griptape_nodes.exe_types.node_types import EndNode, TrackedParameterOutputValues, aprocess_scope
 from griptape_nodes.exe_types.variable_resolver import VariableResolver, _aprocess_variable_cache
 from griptape_nodes.retained_mode.events.base_events import ProgressEvent
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -96,7 +97,7 @@ def _engine_mock(
         if isinstance(req, ListConnectionsForNodeRequest)
         else MagicMock()
     )
-    engine.workflow_manager.is_variable_substitution_enabled.return_value = substitution_enabled
+    engine.workflow_manager.variable_substitution.is_enabled.return_value = substitution_enabled
     engine.node_manager.get_node_parent_flow_by_name.return_value = "test_flow"
     if captured is not None:
         engine.event_manager.put_event.side_effect = captured.append
@@ -118,7 +119,7 @@ def _mock_gn(
     """Put a stand-in engine under the nodes these tests build.
 
     connected_params: parameter names on "mock_node" that have incoming connections.
-    substitution_enabled: value returned by is_variable_substitution_enabled().
+    substitution_enabled: value returned by VariableSubstitution.is_enabled().
     """
     if connected_params is None:
         connected_params = set()
@@ -371,6 +372,116 @@ class TestVariableSubstitutionConnectionGating:
             value = node.get_parameter_value("text")
 
         assert value == "sc001"
+
+
+class TestTrackedOutputValuesConnectionGating:
+    """Writing a connected parameter's value to the output slot does not resolve it again.
+
+    A value that arrived over a connection was resolved by its producer, or the producer
+    opted out. Either way it is data by the time it reaches this node, so a node that copies
+    it onto its own output must pass it through as is.
+    """
+
+    def test_connected_param_is_not_substituted_on_write(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", ""))
+        engine = _engine_mock({"outputs": "/home/user/ws/outputs"}, connected_params={"text"})
+
+        with _patch_engine(engine), aprocess_scope():
+            node.parameter_output_values["text"] = "Saved to: {outputs}/a.mp4"
+
+        assert node.parameter_output_values["text"] == "Saved to: {outputs}/a.mp4"
+
+    def test_unconnected_param_is_still_substituted_on_write(self) -> None:
+        """The positive case is unchanged: a node's own template resolves on the way out."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", ""))
+        engine = _engine_mock({"outputs": "/home/user/ws/outputs"}, connected_params=set())
+
+        with _patch_engine(engine), aprocess_scope():
+            node.parameter_output_values["text"] = "Saved to: {outputs}/a.mp4"
+
+        assert node.parameter_output_values["text"] == "Saved to: /home/user/ws/outputs/a.mp4"
+
+    def test_connected_dict_param_is_not_substituted_on_write(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("data", {}))
+        raw = {"path": "{outputs}/a.mp4"}
+        engine = _engine_mock({"outputs": "/home/user/ws/outputs"}, connected_params={"data"})
+
+        with _patch_engine(engine), aprocess_scope():
+            node.parameter_output_values["data"] = raw
+
+        assert node.parameter_output_values["data"] == raw
+
+    def test_value_without_a_macro_never_asks_about_connections(self) -> None:
+        """The connection lookup is a request round trip and this runs per output write.
+
+        A streaming node appends once per token, so a value with no macro must be rejected
+        by the regex before the engine is asked anything.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", ""))
+        engine = _engine_mock({"outputs": "/home/user/ws/outputs"}, connected_params=set())
+
+        with _patch_engine(engine), aprocess_scope():
+            node.parameter_output_values["text"] = "plain token"
+
+        connection_requests = [
+            c for c in engine.handle_request.call_args_list if isinstance(c.args[0], ListConnectionsForNodeRequest)
+        ]
+        assert connection_requests == []
+
+    def test_opted_out_param_never_asks_about_connections(self) -> None:
+        """The flag is a local read and is checked ahead of the round trip."""
+        node = MockNode(name="mock_node")
+        param = _make_property_output_param("text", "")
+        param.allow_variable_substitution = False
+        node.add_parameter(param)
+        engine = _engine_mock({"outputs": "/home/user/ws/outputs"}, connected_params=set())
+
+        with _patch_engine(engine), aprocess_scope():
+            node.parameter_output_values["text"] = "Saved to: {outputs}/a.mp4"
+
+        assert node.parameter_output_values["text"] == "Saved to: {outputs}/a.mp4"
+        connection_requests = [
+            c for c in engine.handle_request.call_args_list if isinstance(c.args[0], ListConnectionsForNodeRequest)
+        ]
+        assert connection_requests == []
+
+
+class TestEndNodeKeepsConnectedStatusAsWritten:
+    """A save node's status wired into an End node reaches the End node's output unresolved.
+
+    The save node keeps ``Saved to: {outputs}/a.mp4`` as a macro so the saved workflow holds no
+    absolute path. End copies every parameter onto its own output; before the write-side
+    connection gate that copy resolved the macro, and the saved workflow held the absolute path
+    again, this time on the End node.
+    """
+
+    def test_connected_result_details_keeps_macro_in_end_output(self) -> None:
+        end = EndNode(name="end")
+        end._entry_control_parameter = end.succeeded_control
+        # What a connection from the save node's status would have delivered.
+        end.parameter_values["result_details"] = "Saved to: {outputs}/a.mp4"
+        engine = _engine_mock({"outputs": "/home/user/ws/outputs"}, connected_params={"result_details"})
+
+        with _patch_engine(engine), aprocess_scope():
+            end.process()
+
+        assert end.parameter_output_values["result_details"] == "[SUCCEEDED]\nSaved to: {outputs}/a.mp4"
+
+    def test_typed_result_details_still_resolves_in_end_output(self) -> None:
+        """Text a user types straight into the End node is their template, and still resolves."""
+        end = EndNode(name="end")
+        end._entry_control_parameter = end.succeeded_control
+        end.parameter_values["result_details"] = "Shot {SHOT} finished"
+        engine = _engine_mock({"SHOT": "sc001"}, connected_params=set())
+
+        with _patch_engine(engine), aprocess_scope():
+            end.process()
+
+        assert end.parameter_output_values["result_details"] == "[SUCCEEDED]\nShot sc001 finished"
 
 
 class TestVariableSubstitutionFallbacks:
@@ -1146,3 +1257,82 @@ class TestPredicateWalksSurviveCycles:
         value.append(value)
 
         assert VariableResolver.would_substitute(value, {"VAR": "x"}) is True
+
+
+class TestListVariableSubstitution:
+    def test_list_of_strings_renders_one_item_per_line(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"names": ["a", "b", "c"]})
+
+        assert VariableResolver.resolve_string("{names}", filtered) == "a\nb\nc"
+
+    def test_non_string_items_render_as_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"items": [1, True, None, {"k": True}, ["x"]]})
+
+        assert filtered["items"] == '1\ntrue\nnull\n{"k": true}\n["x"]'
+
+    def test_empty_list_renders_empty_string(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"items": []})
+
+        assert filtered["items"] == ""
+
+    def test_self_referential_list_does_not_raise(self) -> None:
+        value: list = ["a"]
+        value.append(value)
+
+        filtered = VariableResolver._filter_for_substitution({"items": value})
+
+        assert str(filtered["items"]).startswith("a\n")
+
+    def test_dict_renders_as_compact_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"d": {"a": 1, "b": [True, None]}})
+
+        assert filtered == {"d": '{"a": 1, "b": [true, null]}'}
+
+    def test_self_referential_dict_does_not_raise(self) -> None:
+        value: dict = {}
+        value["self"] = value
+
+        filtered = VariableResolver._filter_for_substitution({"d": value})
+
+        assert "d" in filtered
+
+    def test_unquoted_dict_token_in_a_json_template_stays_valid_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution(
+            {"SIZE_CONFIDENCE": {"1": 0.05, "2": 0.47}, "DEPT_CONFIDENCE": 0.99, "SIZE": "M"}
+        )
+        template = '{"Dept": {"Size": "{SIZE}", "Department Confidence": {DEPT_CONFIDENCE}, "Size Confidence": {SIZE_CONFIDENCE}}}'
+
+        resolved = VariableResolver.resolve_string(template, filtered)
+
+        assert json.loads(resolved) == {
+            "Dept": {"Size": "M", "Department Confidence": 0.99, "Size Confidence": {"1": 0.05, "2": 0.47}}
+        }
+
+
+class TestFloatAndBoolVariableSubstitution:
+    def test_float_substitutes(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"scale": 1.5, "whole": 2.0})
+
+        assert VariableResolver.resolve_string("{scale} and {whole}", filtered) == "1.5 and 2.0"
+
+    def test_bool_substitutes_as_lowercase_json(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"on": True, "off": False})
+
+        assert VariableResolver.resolve_string("{on} {off}", filtered) == "true false"
+
+    def test_int_is_unchanged_and_not_treated_as_bool(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"n": 1, "zero": 0})
+
+        assert filtered == {"n": 1, "zero": 0}
+
+    def test_non_finite_floats_render_as_json_spellings(self) -> None:
+        filtered = VariableResolver._filter_for_substitution(
+            {"nan": float("nan"), "up": float("inf"), "down": float("-inf")}
+        )
+
+        assert filtered == {"nan": "NaN", "up": "Infinity", "down": "-Infinity"}
+
+    def test_numeric_padding_on_a_float_leaves_the_token(self) -> None:
+        filtered = VariableResolver._filter_for_substitution({"scale": 1.5})
+
+        assert VariableResolver.resolve_string("{scale:03}", filtered) == "{scale:03}"

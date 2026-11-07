@@ -24,6 +24,10 @@ engine picks up `.py` node files from that directory, and what you
 see in the editor's Sandbox category depends on what's actually in
 it.
 
+The Sandbox Library can also turn your own saved workflows into
+nodes. See [Turning a workflow into a node](#turning-a-workflow-into-a-node)
+below.
+
 During `gtn init`, you're offered the **Advanced Media Library**
 (diffusion, image generation, video). You can register it then or
 re-run `gtn init` later to add it. See the
@@ -101,39 +105,19 @@ most artists.
 
 The same **Configuration Editor → Libraries** view also shows
 **Library Registration → Libraries To Register**. Each entry in
-that list is a library the engine loads at startup. Three controls
+that list is a library the engine loads at startup. Two controls
 per entry:
 
 - The toggle (left) — flip off to keep the library on disk but stop
     loading it on engine start.
-- The **Shared / Isolated** dropdown (middle) — choose where the
-    library runs (see below).
 - The trash icon (right) — remove the entry entirely. The clone on
     disk stays put; delete its directory manually if you want the
     disk space back.
 
-![Shared/Isolated library mode](../assets/img/libraries/worker_mode_toggle.png)
-
-### Shared vs. Isolated
-
-The dropdown picks the process a library runs in:
-
-- **Shared** — the library runs inside the main engine process,
-    alongside the other shared libraries.
-- **Isolated** — the library runs in its own separate process, so
-    its Python dependencies are walled off from every other library
-    and a crash in it can't take the rest of the engine down.
-
-The dropdown shows the mode the engine will actually use: the
-library author's suggested mode, unless you override it here. Pick
-**Isolated** for a heavy library you want walled off, or **Shared**
-to keep it in-process. Some libraries are marked by their author as
-incompatible with isolation; for those the dropdown is **locked to
-Shared**.
-
-The dropdown only appears when your engine version supports it
-(0.86.0 and later). Changes take effect on the next library
-refresh.
+Where a library's nodes run is not a setting. The library declares
+which of its dependencies are needed only while a node runs, and the
+engine routes execution from that; see
+[Process isolation](#process-isolation) below.
 
 The **Add Library** button below lets you point the engine at a
 `griptape_nodes_library.json` you already have on disk (a library
@@ -153,13 +137,11 @@ pin `torch==2.4.1`; library B can pin `torch==2.0.0`. Both are
 installed into separate `.venv` directories, and each library uses
 its own when its nodes run.
 
-This holds whether a library runs **Shared** or **Isolated** (see
-[Process isolation](#process-isolation-the-isolated-mode)): the
-`.venv` lives on disk next to the library's manifest either way.
-The difference is only which process loads those packages — the
-main engine process for Shared libraries, the library's own process
-for Isolated ones. From the artist's perspective the dependency
-isolation is the same.
+This holds wherever a library's nodes run (see
+[Process isolation](#process-isolation)): the `.venv` lives on disk
+next to the library's manifest either way. The only difference is
+which process loads those packages. From the artist's perspective
+the dependency isolation is the same.
 
 **You can install incompatibly-pinned libraries together without
 pip resolution conflicts.** This is the most important guarantee on
@@ -209,32 +191,25 @@ A library that declares them runs differently, in three ways:
     output with no plain-data form that isn't marked fails the node
     with an error that names it.
 
-### Process isolation: the Isolated mode
+### Process isolation
 
-Running a library **Isolated** (in its own dedicated process,
-instead of inside the engine's main process) gives you:
+A library that declares execution dependencies runs its nodes in its
+own process, which also gives you:
 
-- **Fault tolerance.** If the library crashes, only that library
-    goes down — the rest of the engine keeps running.
+- **Fault tolerance.** If the library crashes while running a node,
+    only that library goes down — the rest of the engine keeps
+    running.
 - **Resource isolation.** Anything the library loads into memory
     (model weights, GPU memory, background threads) lives in the
     library's own process and can't degrade other libraries.
 
-Heavy ML libraries (diffusion, transformers, custom CUDA stacks)
-benefit most; lightweight libraries (simple HTTP / data nodes)
-usually run fine Shared. You control this per library with the
-**Shared / Isolated** dropdown described in
-[Toggling and removing libraries](#shared-vs-isolated). The library
-author sets the suggested starting mode and whether the library is
-allowed to run Isolated at all; your dropdown choice overrides the
-author's suggestion for any library that permits it.
-
-Library authors declare isolation compatibility and a suggested
-mode in their `griptape_nodes_library.json` (the
-`worker_mode_compatibility` and `suggested_worker_mode`
-declarations) — see [Node Isolation with Workers](../development/custom_nodes/node_isolation_with_workers.md)
-for the schema. As an artist, the Shared / Isolated dropdown is the
-only surface you need.
+Heavy ML libraries (diffusion, transformers, custom CUDA stacks) are
+the ones that declare execution dependencies; lightweight libraries
+(simple HTTP / data nodes) have none to declare and run in the main
+engine process. This is the library author's call, made in
+`griptape_nodes_library.json` — see
+[Node Isolation with Workers](../development/custom_nodes/node_isolation_with_workers.md)
+for the schema. There is nothing for an artist to configure.
 
 ### Node-name collisions: not solved
 
@@ -272,6 +247,45 @@ Fix the underlying issue, then re-trigger the install (re-paste the
 URL in the **Add Library** modal, or use the CLI alternative below
 with `--overwrite`).
 
+### "A library stopped working after an install or update"
+
+A library's Python packages can end up broken: an install that
+stopped partway, an update that failed, or a package changed from
+outside Griptape Nodes. Press **Reset** on the library's row in the
+**Libraries** panel. It shows on libraries in the **Errors** filter
+too. Reset deletes the library's virtual environments (`.venv` and
+`.venv-exec`) and installs its packages again. The library's files
+and your settings stay as they are.
+
+Reset downloads the library's packages again, so it can take a
+while for a heavy library. If the engine has already loaded packages
+from the library, it can't swap them while it's running. In that case
+the reset finishes the next time the engine starts, and Griptape
+Nodes asks you to restart it. Libraries provided by your studio's
+environment can't be reset here. Ask whoever set up that environment.
+
+### "A library warns that it installs older components"
+
+The warning reads "Installs components older than the ones Griptape
+Nodes runs on" and lists each package with both versions. A
+library's environment comes ahead of Griptape Nodes' own packages,
+so those older copies are the ones Griptape Nodes uses, and features
+unrelated to the library can break. The library itself keeps
+working.
+
+The older packages are usually left over from an earlier install,
+for example running `uv sync` in a library you develop, which also
+installs that library's development tools. Updating or reloading
+the library doesn't remove them. In that case, pressing **Reset** on
+the library's row, as described above, rebuilds its environment from
+what the library currently declares and clears the warning.
+
+![The Libraries panel with the Griptape Nodes library row showing a red Problems label and a Reset button beside it](../assets/img/libraries/libraries-reset_on_problem_row.png)
+
+Reset can't help when the library itself requires the older
+versions: the warning comes back after the reset. Report that to the
+library's author.
+
 ### "A node looks broken or red in the editor"
 
 The engine couldn't construct that node — usually because its
@@ -284,8 +298,8 @@ reopening the workflow uses the real node again.
 
 The terminal window where the engine is running (the same window
 you launched the engine from) carries the verbose error log,
-including stack traces. Errors from libraries running Isolated
-appear there with a `Worker-<id>` prefix.
+including stack traces. Errors raised while a node runs in a
+library's own process appear there with a `Worker-<id>` prefix.
 
 ## CLI alternatives
 
@@ -302,6 +316,50 @@ engines, or just preference — the editor's library actions have
 
 See [Command Line Interface](../reference/command_line_interface.md) for the
 full reference.
+
+## Turning a workflow into a node
+
+Any saved workflow you put in your sandbox folder (the **Sandbox
+Library Directory** under **Settings → Library → Sandbox Settings**)
+shows up in the node chooser as a node. You'll find it in the
+**Sandbox Library**, under the **Sandbox** heading, next to any
+custom nodes you're developing there. Treat it like any other node
+in development: once it's settled, it can move into a library of
+its own.
+
+To qualify, the workflow needs a **Start Flow** node and an **End
+Flow** node. The Start Flow node's parameters become the node's
+inputs and the End Flow node's parameters become its outputs, so
+what you wire into the node is what the workflow receives, and what
+the workflow finishes with is what the node hands on.
+
+The node's name comes from the workflow's name: `shout_workflow`
+becomes **ShoutWorkflow**. Its display name and description in the
+node chooser come from the workflow's own name and description.
+
+A few things worth knowing:
+
+- **Changes show up when libraries load.** The sandbox folder is
+    read when the engine starts and each time you choose **Refresh
+    Libraries**. A workflow you add, edit, or remove in between isn't
+    picked up until then.
+- **Renaming a workflow gives you a different node.** Because the
+    node's name comes from the workflow's name, changing the
+    workflow's name turns it into a new node. Workflows that were
+    already using the old node won't find it any more.
+- **Publishing doesn't take the workflow with it.** A workflow that
+    uses one of these nodes won't run on another installation unless
+    the workflow behind the node is there too.
+- **Problems show up in the Libraries panel.** If a workflow can't
+    become a node (it has no Start Flow or End Flow node, or its
+    saved details can't be read), the **Sandbox Library** entry in
+    the **Libraries** panel says why. Fix it, save it, then choose
+    **Refresh Libraries**.
+- **A workflow and a custom node can't share a name.** If a
+    workflow's node name matches a custom node in the sandbox, the
+    workflow's node takes the name and the custom node is left out.
+    The **Sandbox Library** entry shows a duplicate-name problem.
+    Rename one of them, then choose **Refresh Libraries**.
 
 ## Where libraries are stored on disk
 

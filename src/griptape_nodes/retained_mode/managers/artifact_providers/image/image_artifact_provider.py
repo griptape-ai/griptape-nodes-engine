@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         BaseArtifactPreviewGenerator,
     )
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -169,22 +170,23 @@ class ImageArtifactProvider(BaseArtifactProvider):
         """
         return {"png"}
 
-    def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:  # noqa: PLR0911
+    def collect_metadata_for_write(self, file_name: str, workflow: WorkflowRuntime | None) -> dict[str, str]:
         ext = Path(file_name).suffix.lstrip(".").lower()
         if ext not in self.get_metadata_formats():
+            return {}
+
+        try:
+            return collect_workflow_metadata(self.engine, workflow)
+        except Exception as e:
+            logger.warning("Attempted to collect workflow metadata for %s. Failed because: %s", file_name, e)
+            return {}
+
+    def prepare_content_for_write(self, data: bytes, file_name: str, metadata: dict[str, str]) -> bytes:  # noqa: PLR0911
+        if not metadata:
             return data
 
         if not data:
             logger.warning("Cannot inject metadata: empty data")
-            return data
-
-        try:
-            metadata = collect_workflow_metadata(self.engine)
-        except Exception as e:
-            logger.warning("Attempted to collect workflow metadata for %s. Failed because: %s", file_name, e)
-            return data
-
-        if not metadata:
             return data
 
         try:

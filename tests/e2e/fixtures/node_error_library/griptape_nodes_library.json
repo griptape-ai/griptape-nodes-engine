@@ -1,0 +1,31 @@
+{
+  "name": "Node Error Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Loads the NodeError example node from the docs for the structured node error tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "ExampleNodeErrorNode",
+      "file_path": "example_node_error_node.py",
+      "metadata": {"category": "test", "description": "NodeError example from the docs", "display_name": "NodeError Example"}
+    }
+  ]
+}

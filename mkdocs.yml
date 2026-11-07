@@ -103,6 +103,7 @@ plugins:
           - tutorials/04_photography_team/index.md
         Desktop App:
           - guides/desktop/app_settings.md: Griptape Nodes Desktop App Settings — workspace, license, logs, update behavior, and the Stable/Nightly release channels
+          - guides/desktop/environment_variables.md: Desktop launch environment variables for licenses, updates, server endpoints, and HTTPS routing
         Editor:
           - guides/editor/index.md: Orientation tour of the visual editor (canvas, header, menus, sidebars)
           - guides/editor/keyboard_shortcuts.md: Complete keyboard shortcut reference
@@ -115,6 +116,7 @@ plugins:
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
           - guides/agent/threads.md: Conversation threads and local storage locations
+          - guides/agent/approvals.md: Approving workflow runs, image generation, and MCP tools before the agent uses them
           - guides/agent/using_in_workflows.md: Using the Agent node in workflows
           - guides/agent/personalization.md: Customizing agent tone, role, and system prompt
           - guides/agent/skills.md: Extending the agent with custom skill files
@@ -126,7 +128,10 @@ plugins:
           - guides/agent/providers/custom.md: Custom OpenAI-compatible endpoint setup
         Configuration and libraries:
           - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
+          - guides/local_editor.md: Serving the editor from the engine at 127.0.0.1:8126 instead of using the hosted editor
           - guides/libraries.md: Installing and managing node libraries
+          - guides/managed_environment.md: Running the engine inside an environment a studio's own tools prepare (library paths, provisioned by, worker command prefix)
+          - guides/run_nodes_on_another_computer.md: Running a library's nodes on another computer's engine (distributed_execution.libraries, advertise_url, requirements, troubleshooting)
         Project system:
           - guides/projects/index.md: Project system overview
           - guides/projects/gui_guide.md: Managing projects from the GUI
@@ -177,14 +182,15 @@ plugins:
           - development/custom_nodes/parameter_ui_reference.md: Parameter type to widget mapping, supported ui_options keys, and traits
           - development/custom_nodes/execution_and_lifecycle.md: Lifecycle callbacks and asynchronous API integration patterns
           - development/custom_nodes/project_system.md: Saving files from nodes through the project system (situations, macros, ProjectFileParameter)
+          - development/custom_nodes/direct_provider_budgets.md: Checking Griptape Cloud budgets before a direct provider call and reporting its cost after
           - development/custom_nodes/error_handling.md: Best practices for secrets, imports, parameter payload size, validation, error handling, and logging
           - development/custom_nodes/authoring_libraries.md: Library manifests, declarations, dependency management, and contributing to the standard library
-          - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, and registering node types without listing them in the manifest
+          - development/custom_nodes/advanced_libraries.md: AdvancedNodeLibrary lifecycle hooks, library-owned request handlers, post-dispatch hooks, execution and app event listeners, and registering node types without listing them in the manifest
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
-          - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
+          - development/custom_nodes/node_isolation_with_workers.md: Running a library's node execution in a worker subprocess for dependency isolation
           - development/custom_nodes/passing_unserializable_values.md: Passing pipelines, tensors and other unserializable values between nodes across a worker process boundary
-          - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
+          - development/custom_nodes/strict_mode.md: Strict-mode rules checked while a node executes
         Reference:
           - reference/command_line_interface.md: gtn CLI reference
           - reference/configuration_reference.md: Every engine setting with type, default, and env var
@@ -280,6 +286,7 @@ nav:
   - Guides:
       - Desktop App:
           - App Settings: guides/desktop/app_settings.md
+          - Environment Variables: guides/desktop/environment_variables.md
       - Editor:
           - Overview: guides/editor/index.md
           - Keyboard Shortcuts: guides/editor/keyboard_shortcuts.md
@@ -292,6 +299,7 @@ nav:
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md
+          - Approvals: guides/agent/approvals.md
           - Using in Workflows: guides/agent/using_in_workflows.md
           - Customization:
               - Personalization: guides/agent/personalization.md
@@ -306,7 +314,11 @@ nav:
                   - Custom (OpenAI-compatible): guides/agent/providers/custom.md
       - Engine:
           - Configuration: guides/configuration.md
+          - Transports: guides/transports.md
+          - Running the Editor Locally: guides/local_editor.md
           - Libraries: guides/libraries.md
+          - Managed Environment: guides/managed_environment.md
+          - Running Nodes on Another Computer: guides/run_nodes_on_another_computer.md
       - Projects:
           - Overview: guides/projects/index.md
           - Managing Projects in the GUI: guides/projects/gui_guide.md
@@ -552,6 +564,7 @@ nav:
           - Parameter UI Reference: development/custom_nodes/parameter_ui_reference.md
           - Execution and Lifecycle: development/custom_nodes/execution_and_lifecycle.md
           - Project System: development/custom_nodes/project_system.md
+          - Budgets for Direct Provider Calls: development/custom_nodes/direct_provider_budgets.md
           - Best Practices and Error Handling: development/custom_nodes/error_handling.md
           - Authoring Libraries: development/custom_nodes/authoring_libraries.md
           - Advanced Libraries: development/custom_nodes/advanced_libraries.md
@@ -561,6 +574,7 @@ nav:
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
           - Strict Mode Reference: development/custom_nodes/strict_mode.md
           - Example Control Node: development/custom_nodes/example_control_node.py
+          - Example NodeError Node: development/custom_nodes/example_node_error_node.py
       - For Agents: for_agents.md
   - Reference:
       - Command Line Interface: reference/command_line_interface.md

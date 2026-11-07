@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -191,7 +192,6 @@ class DiagnosticsManager(EngineScoped):
             details = (
                 "Attempted to collect a diagnostics report. Failed because the engine's host could not be identified."
             )
-            logger.error(details)
             return GetDiagnosticsReportResultFailure(result_details=details)
 
         return GetDiagnosticsReportResultSuccess(
@@ -218,7 +218,6 @@ class DiagnosticsManager(EngineScoped):
             details = (
                 "Attempted to run health checks. Failed because the engine's own state could not be collected first."
             )
-            logger.error(details)
             return RunHealthChecksResultFailure(result_details=details)
 
         # Redacted like the bundle's copy: most of a verdict is quoted from the already-clean
@@ -248,7 +247,6 @@ class DiagnosticsManager(EngineScoped):
                 "Failed because that is a path rather than a file name. Give a name with no folders in "
                 "it, and use the output path to choose where the bundle goes."
             )
-            logger.error(details)
             return CollectDiagnosticsResultFailure(result_details=details)
 
         redactor = Redactor(
@@ -266,12 +264,11 @@ class DiagnosticsManager(EngineScoped):
                 if request.include_logs:
                     self._stage_logs(bundle, warnings)
                 if request.include_current_workflow:
-                    self._stage_current_workflow(bundle, warnings)
+                    self._stage_open_workflows(bundle, warnings)
 
                 report = await self._build_report(redactor, warnings, normalize_identity=request.normalize_identity)
                 if report is None:
                     details = "Attempted to collect a diagnostics bundle. Failed because the engine's host could not be identified."
-                    logger.error(details)
                     return CollectDiagnosticsResultFailure(result_details=details)
 
                 if request.include_health_checks:
@@ -294,7 +291,6 @@ class DiagnosticsManager(EngineScoped):
                 data = bundle.to_zip_bytes()
         except OSError as err:
             details = f"Attempted to collect a diagnostics bundle. Failed because it could not be assembled: {err}"
-            logger.error(details)
             return CollectDiagnosticsResultFailure(result_details=details)
 
         file_name = request.file_name or self._default_bundle_file_name(report)
@@ -325,14 +321,13 @@ class DiagnosticsManager(EngineScoped):
                 existing_file_policy=ExistingFilePolicy.CREATE_NEW,
                 skip_metadata_injection=True,
                 coerce_extension_to_match_bytes=False,
-            )
+            ),
         )
         if not isinstance(result, WriteFileResultSuccess):
             details = (
                 f"Attempted to write the diagnostics bundle to '{strip_windows_long_path_prefix(destination)}'. "
                 f"Failed because the file could not be written: {result.result_details}"
             )
-            logger.error(details)
             return CollectDiagnosticsResultFailure(result_details=details)
 
         written_path = strip_windows_long_path_prefix(result.final_file_path)
@@ -363,13 +358,15 @@ class DiagnosticsManager(EngineScoped):
     def _write_bundle_to_static_files(
         self, file_name: str, data: bytes, manifest: DiagnosticsBundleManifest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
-        """Write a bundle to the engine's static files and return a link to it.
+        """Write a bundle to the workspace's static files folder and return a link to it.
 
         Goes through the static files manager rather than writing a path directly, so a
         bundle collected from an engine running on another machine is still downloadable.
+        The bundle describes the engine, not a workflow, so it goes to the workspace's folder
+        whether or not a workflow is open.
         """
         try:
-            url = self.engine.static_files_manager.save_static_file(
+            url = self.engine.static_files_manager.save_workspace_static_file(
                 data,
                 file_name,
                 ExistingFilePolicy.CREATE_NEW,
@@ -382,7 +379,6 @@ class DiagnosticsManager(EngineScoped):
                 f"Attempted to save the diagnostics bundle as '{file_name}'. "
                 f"Failed because it could not be written: {err}"
             )
-            logger.error(details)
             return CollectDiagnosticsResultFailure(result_details=details)
 
         written_name = self._file_name_from_url(url, fallback=file_name)
@@ -568,25 +564,34 @@ class DiagnosticsManager(EngineScoped):
             "most likely cannot be written to."
         )
 
-    def _stage_current_workflow(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
-        """Add the open workflow's saved file to a bundle, when there is one."""
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_workflow():
-            warnings.append("No workflow was open, so none is in this bundle.")
-            return
+    def _stage_open_workflows(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
+        """Add each open workflow's saved file to a bundle.
 
-        file_path = context_manager.get_current_workflow_file_path()
-        if file_path is None:
+        Read from the open workflows rather than the request, which names none: the bundle reports
+        what the engine has open, as the session section does.
+        """
+        open_workflows = self.engine.open_workflows.all_open()
+        if not open_workflows:
+            warnings.append("No workflow is open, so none is in this bundle.")
+            return
+        for workflow in open_workflows:
+            self._stage_workflow(bundle, warnings, workflow)
+
+    def _stage_workflow(self, bundle: DiagnosticsBundle, warnings: list[str], workflow: WorkflowRuntime) -> None:
+        """Add `workflow`'s saved file to a bundle, when it has one."""
+        entry = self.engine.workflow_registry.get(workflow.workflow_id)
+        workflow_path = entry.absolute_path
+        if workflow_path is None:
             warnings.append(
-                "The open workflow has never been saved, so it is not in this bundle. "
+                f"The open workflow '{entry.name}' has never been saved, so it is not in this bundle. "
                 "Save it and collect again to include it."
             )
             return
 
-        workflow_path = Path(file_path)
         if not workflow_path.exists():
             warnings.append(
-                f"The open workflow's file '{workflow_path.name}' is no longer on disk, so it is not in this bundle."
+                f"The open workflow '{entry.name}' has a file, '{workflow_path.name}', that is no longer on disk, "
+                "so it is not in this bundle."
             )
             return
 
@@ -830,7 +835,6 @@ class DiagnosticsManager(EngineScoped):
                     lifecycle_state=lib_info.lifecycle_state.value,
                     enabled=lib_info.enabled,
                     is_sandbox=lib_info.is_sandbox,
-                    requires_worker=lib_info.requires_worker,
                     executes_in_worker=lib_info.executes_in_worker,
                     worker_ready=self._worker_ready(lib_info),
                     worker_unavailable_reason=self._worker_unavailable_reason(lib_info, redactor),
@@ -916,19 +920,25 @@ class DiagnosticsManager(EngineScoped):
         )
 
     async def _build_session_section(self, redactor: Redactor, warnings: list[str]) -> SessionDiagnostics:
-        """Report what the engine currently has open."""
-        context_manager = self.engine.context_manager
-        object_manager = self.engine.object_manager
+        """Report what the engine currently has open: its workflow, when exactly one is open."""
+        open_workflows = self.engine.open_workflows.all_open()
+        workflow = None
+        if len(open_workflows) == 1:
+            workflow = open_workflows[0]
 
         workflow_name = None
         workflow_path = None
-        if context_manager.has_current_workflow():
+        flow_count = 0
+        node_count = 0
+        if workflow is not None:
+            entry = self.engine.workflow_registry.get(workflow.workflow_id)
             # Redacted even though it is a "name": a workflow saved outside the workspace is keyed
             # by its absolute path, so one saved to the desktop is named `/Users/sam/Desktop/flow`.
-            workflow_name = redactor.redact_text(context_manager.get_current_workflow_name())
-            current_path = context_manager.get_current_workflow_file_path()
-            if current_path is not None:
-                workflow_path = redactor.redact_path(current_path)
+            workflow_name = redactor.redact_text(entry.name)
+            if entry.absolute_path is not None:
+                workflow_path = redactor.redact_path(entry.absolute_path)
+            flow_count = len(workflow.objects.get_filtered_subset(type=ControlFlow))
+            node_count = len(workflow.objects.get_filtered_subset(type=BaseNode))
 
         registered_count = 0
         workflows_result = await self.engine.ahandle_request(ListAllWorkflowsRequest(broadcast_result=False))
@@ -940,8 +950,8 @@ class DiagnosticsManager(EngineScoped):
         return SessionDiagnostics(
             current_workflow_name=workflow_name,
             current_workflow_path=workflow_path,
-            flow_count=len(object_manager.get_filtered_subset(type=ControlFlow)),
-            node_count=len(object_manager.get_filtered_subset(type=BaseNode)),
+            flow_count=flow_count,
+            node_count=node_count,
             registered_workflow_count=registered_count,
         )
 

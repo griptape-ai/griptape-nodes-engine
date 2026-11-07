@@ -16,6 +16,8 @@ from griptape_nodes.exe_types.core_types import (
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
+    ISOLATED_EXECUTION,
+    LEGACY_PRIVATE_EXECUTION,
     LOCAL_EXECUTION,
     get_library_names_with_publish_handlers,
 )
@@ -148,7 +150,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             set_as_new_context=False,
             metadata=subflow_metadata,
         )
-        result = self.engine.handle_request(request)
+        result = self._handle_request_in_workflow(request)
         if not isinstance(result, CreateFlowResultSuccess):
             # Drop the name we optimistically recorded: no such flow exists, and leaving it set
             # makes every later lookup point at a phantom flow.
@@ -179,10 +181,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 return enclosing_subflow_name
 
         # A group can be built with no Flow on the context stack, so this may find nothing.
-        context_manager = self.engine.context_manager
-        if not context_manager.has_current_flow():
+        workflow_context = self._require_workflow().context
+        if not workflow_context.has_current_flow():
             return None
-        return context_manager.get_current_flow().name
+        return workflow_context.get_current_flow().name
 
     def _add_start_flow_parameters(self) -> None:
         """Add parameters from all registered StartFlow nodes to this SubflowNodeGroup.
@@ -343,6 +345,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             traits=traits_set,
             parent_container_name=param.parent_container_name,
             parent_element_name=param.parent_element_name,
+            serializable=param.serializable,
         )
 
         # Add the parameter to this node
@@ -377,9 +380,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             tooltip="",
             mode_allowed_input=True,
             mode_allowed_output=True,
+            # Carries the value the mirrored parameter holds, so saves it on the same terms.
+            serializable=original_param.serializable,
         )
         # Add with a request, because this will handle naming for us.
-        result = self.engine.handle_request(request)
+        result = self._handle_request_in_workflow(request)
         if not isinstance(result, AddParameterToNodeResultSuccess):
             msg = "Failed to add parameter to node."
             raise TypeError(msg)
@@ -433,7 +438,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             conn.source_node.name,
             conn.target_node.name,
         )
-        result = self.engine.handle_request(request)
+        result = self._handle_request_in_workflow(request)
         if not isinstance(result, DeleteConnectionResultSuccess):
             return False
         proxy_parameter = self._create_proxy_parameter_for_connection(grouped_parameter, is_incoming=is_incoming)
@@ -465,8 +470,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self._proxy_param_to_connections[proxy_parameter.name] = 2
         else:
             self._proxy_param_to_connections[proxy_parameter.name] += 2
-        self.engine.handle_request(create_first_connection)
-        self.engine.handle_request(create_second_connection)
+        self._handle_request_in_workflow(create_first_connection)
+        self._handle_request_in_workflow(create_second_connection)
 
     def unmap_node_connections(self, node: BaseNode, connections: Connections) -> None:  # noqa: C901
         """Remove tracking of an external connection, restore original connection, and clean up proxy parameter.
@@ -487,13 +492,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # get old connections first, since this will delete the proxy
                 remap_connections = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
                         source_node_name=node.name,
                         target_node_name=self.name,
-                    )
+                    ),
+                    self._require_workflow(),
                 )
                 if delete_result.failed():
                     msg = f"{self.name}: Failed to delete internal outgoing connection from {node.name}.{parameter_name} to proxy {proxy_parameter.name}: {delete_result.result_details}"
@@ -501,13 +507,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections from the proxy parameter
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
                             source_node_name=node.name,
                             target_node_name=connection.target_node.name,
-                        )
+                        ),
+                        self._require_workflow(),
                     )
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct outgoing connection from {node.name}.{parameter_name} to {connection.target_node.name}.{connection.target_parameter.name}: {create_result.result_details}"
@@ -522,13 +529,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Get the incoming connections to the proxy parameter
                 remap_connections = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
                         source_node_name=self.name,
                         target_node_name=node.name,
-                    )
+                    ),
+                    self._require_workflow(),
                 )
                 if delete_result.failed():
                     msg = f"{self.name}: Failed to delete internal incoming connection from proxy {proxy_parameter.name} to {node.name}.{parameter_name}: {delete_result.result_details}"
@@ -536,13 +544,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections to the proxy parameter
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
                             source_node_name=connection.source_node.name,
                             target_node_name=node.name,
-                        )
+                        ),
+                        self._require_workflow(),
                     )
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct incoming connection from {connection.source_node.name}.{connection.source_parameter.name} to {node.name}.{parameter_name}: {create_result.result_details}"
@@ -560,12 +569,29 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         self._proxy_param_to_connections[proxy_parameter.name] -= 1
         if self._proxy_param_to_connections[proxy_parameter.name] == 0:
-            self.engine.node_manager.on_remove_parameter_from_node_request(
-                request=RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name)
+            self.engine.node_manager.on_remove_parameter_from_node_request_in_workflow(
+                RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name),
+                self._require_workflow(),
             )
             del self._proxy_param_to_connections[proxy_parameter.name]
             if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
                 self.metadata[metadata_key].remove(proxy_parameter.name)
+
+    def _refresh_proxy_serializable(self, proxy_parameter: Parameter) -> None:
+        """Save a proxy's value only if every inner parameter connected to it saves its own.
+
+        Runs on every connect and disconnect, including those replayed when a workflow opens.
+        """
+        if isinstance(proxy_parameter, ControlParameter):
+            return
+        connections = self._require_workflow().flows.connections
+        incoming = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
+        outgoing = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
+        inner_parameters = [c.source_parameter for c in incoming if c.source_node.parent_group is self] + [
+            c.target_parameter for c in outgoing if c.target_node.parent_group is self
+        ]
+        if inner_parameters:
+            proxy_parameter.serializable = all(p.serializable for p in inner_parameters)
 
     def _remap_outgoing_connections(self, node: BaseNode, connections: Connections) -> None:
         """Remap outgoing connections that go through proxy parameters.
@@ -589,13 +615,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from this node to proxy
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
                         source_node_name=node.name,
                         target_node_name=self.name,
-                    )
+                    ),
+                    self._require_workflow(),
                 )
                 if delete_result.failed():
                     msg = f"{self.name}: Failed to delete internal outgoing connection from {node.name}.{parameter_name} to proxy {proxy_parameter.name}: {delete_result.result_details}"
@@ -603,13 +630,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from this node to target nodes
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
                             source_node_name=node.name,
                             target_node_name=connection.target_node.name,
-                        )
+                        ),
+                        self._require_workflow(),
                     )
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct outgoing connection from {node.name}.{parameter_name} to {connection.target_node.name}.{connection.target_parameter.name}: {create_result.result_details}"
@@ -618,13 +646,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete outgoing connections from proxy and clean up if no other incoming connections exist
                 if not other_incoming_exists:
                     for connection in remap_connections:
-                        delete_result = self.engine.flow_manager.on_delete_connection_request(
+                        delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=connection.target_parameter.name,
                                 source_node_name=connection.source_node.name,
                                 target_node_name=connection.target_node.name,
-                            )
+                            ),
+                            self._require_workflow(),
                         )
                         if delete_result.failed():
                             msg = f"{self.name}: Failed to delete external connection from proxy {proxy_parameter.name} to {connection.target_node.name}.{connection.target_parameter.name}: {delete_result.result_details}"
@@ -654,13 +683,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from proxy to this node
-                delete_result = self.engine.flow_manager.on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
                         source_node_name=self.name,
                         target_node_name=node.name,
-                    )
+                    ),
+                    self._require_workflow(),
                 )
                 if delete_result.failed():
                     msg = f"{self.name}: Failed to delete internal incoming connection from proxy {proxy_parameter.name} to {node.name}.{parameter_name}: {delete_result.result_details}"
@@ -668,13 +698,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from source nodes to this node
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
                             source_node_name=connection.source_node.name,
                             target_node_name=node.name,
-                        )
+                        ),
+                        self._require_workflow(),
                     )
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct incoming connection from {connection.source_node.name}.{connection.source_parameter.name} to {node.name}.{parameter_name}: {create_result.result_details}"
@@ -683,13 +714,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete incoming connections to proxy and clean up if no other outgoing connections exist
                 if not other_outgoing_exists:
                     for connection in remap_connections:
-                        delete_result = self.engine.flow_manager.on_delete_connection_request(
+                        delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=proxy_parameter.name,
                                 source_node_name=connection.source_node.name,
                                 target_node_name=self.name,
-                            )
+                            ),
+                            self._require_workflow(),
                         )
                         if delete_result.failed():
                             msg = f"{self.name}: Failed to delete external connection from {connection.source_node.name}.{connection.source_parameter.name} to proxy {proxy_parameter.name}: {delete_result.result_details}"
@@ -712,6 +744,18 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self._remap_outgoing_connections(node, connections)
             self._remap_incoming_connections(node, connections)
 
+    def after_incoming_connection(
+        self, source_node: BaseNode, source_parameter: Parameter, target_parameter: Parameter
+    ) -> None:
+        super().after_incoming_connection(source_node, source_parameter, target_parameter)
+        self._refresh_proxy_serializable(target_parameter)
+
+    def after_outgoing_connection(
+        self, source_parameter: Parameter, target_node: BaseNode, target_parameter: Parameter
+    ) -> None:
+        super().after_outgoing_connection(source_parameter, target_node, target_parameter)
+        self._refresh_proxy_serializable(source_parameter)
+
     def after_outgoing_connection_removed(
         self, source_parameter: Parameter, target_node: BaseNode, target_parameter: Parameter
     ) -> None:
@@ -721,6 +765,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         else:
             metadata_key = RIGHT_PARAMETERS_KEY
         self._cleanup_proxy_parameter(source_parameter, metadata_key)
+        self._refresh_proxy_serializable(source_parameter)
         return super().after_outgoing_connection_removed(source_parameter, target_node, target_parameter)
 
     def after_incoming_connection_removed(
@@ -732,7 +777,41 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         else:
             metadata_key = LEFT_PARAMETERS_KEY
         self._cleanup_proxy_parameter(target_parameter, metadata_key)
+        self._refresh_proxy_serializable(target_parameter)
         return super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        """Set a parameter, reading execution_environment's old Private Execution name as Isolated Execution.
+
+        Mapped here, ahead of every converter: the Options converter replaces a value it does not
+        offer with its first choice, so a group saved with Private Execution would otherwise open
+        as Local Execution.
+
+        Not a `SetParameterVersionCompatibilityCheck`, although those also run before the converters.
+        A check is handed only the node, name and value, and when it applies its result replaces the
+        rest of `SetParameterValueRequest`'s handling. Rewriting the value there would either run
+        this node's value hooks during a workflow load, since `initial_setup` does not reach the
+        check, or skip the connection checks and the unresolving of downstream nodes that follow it.
+        This only renames a value, so the normal path has to carry on. It also covers a direct
+        `set_parameter_value` call, which never reaches the manager.
+        """
+        if param_name == self.execution_environment.name and value == LEGACY_PRIVATE_EXECUTION:
+            value = ISOLATED_EXECUTION
+        super().set_parameter_value(
+            param_name,
+            value,
+            initial_setup=initial_setup,
+            emit_change=emit_change,
+            skip_before_value_set=skip_before_value_set,
+        )
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         super().after_value_set(parameter, value)
@@ -784,7 +863,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     self._discard_subflow_created_for_a_failed_add()
                 raise
 
-        connections = self.engine.flow_manager.get_connections()
+        connections = self._require_workflow().flows.connections
         node_names_in_group = set(self.nodes.keys())
         self.metadata["node_names_in_group"] = list(node_names_in_group)
         self.remap_to_internal(nodes, connections)
@@ -930,7 +1009,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if subflow_name is None:
             return
 
-        subflow = self.engine.object_manager.attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
+        subflow = self._require_workflow().objects.get_as_type(subflow_name, ControlFlow)
         if subflow is None:
             self.metadata.pop("subflow_name", None)
             return
@@ -944,7 +1023,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             )
             return
 
-        delete_result = self.engine.handle_request(DeleteFlowRequest(flow_name=subflow_name))
+        delete_result = self._handle_request_in_workflow(DeleteFlowRequest(flow_name=subflow_name))
         if isinstance(delete_result, DeleteFlowResultFailure):
             # Not worth failing the add twice over: it is already failing, and the message the artist
             # gets should be why their nodes did not move, not a leftover flow they cannot see.
@@ -969,7 +1048,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             NodeGroupMembershipError: If the engine refused the move, carrying the reason it gave
         """
         move_request = MoveNodeToNewFlowRequest(node_name=node.name, target_flow_name=flow_name)
-        move_result = self.engine.handle_request(move_request)
+        move_result = self._handle_request_in_workflow(move_request)
         if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
             # Carry the engine's own reason rather than only logging it: this is the innermost thing
             # that knows why the move was refused, and the caller turns it into what the artist reads.
@@ -1007,7 +1086,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         # editor but loses its contents on save, so the caller has to hear about it. Both callers
         # turn this into a failure result (see NodeManager.on_add_nodes_to_node_group_request).
         try:
-            self.engine.flow_manager.reparent_flow(child_subflow_name, parent_subflow_name)
+            self.engine.flow_manager.reparent_flow_in(self._require_workflow(), child_subflow_name, parent_subflow_name)
         except ValueError as err:
             msg = (
                 f"Attempted to change what group '{node.name}' belongs to. "
@@ -1093,7 +1172,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 conn.source_node.name,
                 conn.target_node.name,
             )
-            result = self.engine.handle_request(request)
+            result = self._handle_request_in_workflow(request)
             if not isinstance(result, DeleteConnectionResultSuccess):
                 logger.warning(
                     "%s failed to delete connection from %s.%s to %s.%s",
@@ -1135,7 +1214,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         Returns:
             The existing proxy parameter if found, None otherwise
         """
-        connections = self.engine.flow_manager.get_connections()
+        connections = self._require_workflow().flows.connections
 
         # Determine which proxy parameters to check based on direction
         if is_incoming:
@@ -1190,8 +1269,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         else:
             self._proxy_param_to_connections[proxy_parameter.name] += 2
 
-        self.engine.handle_request(create_first_connection)
-        self.engine.handle_request(create_second_connection)
+        self._handle_request_in_workflow(create_first_connection)
+        self._handle_request_in_workflow(create_second_connection)
 
     def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Move nodes back out to this group's own flow and stop claiming them.
@@ -1234,7 +1313,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             # Rolling back means going the way they came: into this group's subflow.
             self._relocate_nodes(nodes, destination_flow_name=parent_flow_name, rollback_flow_name=subflow_name)
 
-        connections = self.engine.flow_manager.get_connections()
+        connections = self._require_workflow().flows.connections
         for node in nodes:
             node.parent_group = None
             self.nodes.pop(node.name)
@@ -1267,12 +1346,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
-            result = await self.engine.flow_manager.on_start_local_subflow_request(
-                StartLocalSubflowRequest(flow_name=subflow)
+            result = await self.engine.flow_manager.on_start_local_subflow_request_in_workflow(
+                StartLocalSubflowRequest(flow_name=subflow), self._require_workflow()
             )
 
             if isinstance(result, StartLocalSubflowResultFailure):
-                logger.error("%s: %s", self.name, result.result_details)
                 # Clear partial outputs to prevent inconsistent state
                 self.parameter_output_values.clear()
                 # Re-raise the error message directly without wrapping
@@ -1287,7 +1365,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         For each right (output) proxy parameter, finds the internal node connected
         to it and copies the value to this group's parameter_output_values.
         """
-        connections = self.engine.flow_manager.get_connections()
+        connections = self._require_workflow().flows.connections
 
         right_params = self.metadata.get(RIGHT_PARAMETERS_KEY, [])
         for proxy_param_name in right_params:
@@ -1330,16 +1408,22 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.remove_nodes_from_group(nodes_to_remove)
         subflow_name = self.metadata.get("subflow_name")
         if subflow_name is not None:
-            subflow = self.engine.object_manager.attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
+            subflow = self._require_workflow().objects.get_as_type(subflow_name, ControlFlow)
             if subflow is not None:
-                delete_result = self.engine.handle_request(DeleteFlowRequest(flow_name=subflow_name))
+                delete_result = self._handle_request_in_workflow(DeleteFlowRequest(flow_name=subflow_name))
                 if isinstance(delete_result, DeleteFlowResultFailure):
                     # This will propagate up to DeleteNodeRequest, and prevent the node from deleting.
                     msg = f"Failed to delete subflow {subflow_name} when deleting node {self.name}"
                     raise ValueError(msg)
             else:
-                msg = f"Node {self.name} has a subflow name of {subflow_name} but {subflow_name} doesn't exist. Removing from metadata."
-                logger.warning(msg)
+                # Deleting a parent flow removes child flows before child nodes, so the subflow is
+                # already gone by the time its group node is deleted.
+                logger.debug(
+                    "Node %s has a subflow name of %s but %s doesn't exist. Removing from metadata.",
+                    self.name,
+                    subflow_name,
+                    subflow_name,
+                )
             # Delete the subflow name since now there is no subflow attached.
             self.metadata.pop("subflow_name")
 
@@ -1351,7 +1435,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         nowhere to put these nodes" rather than an error in itself.
         """
         try:
-            return self.engine.node_manager.get_node_parent_flow_by_name(self.name)
+            return self._require_workflow().nodes.parent_flow_name(self.name)
         except KeyError:
             logger.warning("%s has no parent flow", self.name)
             return None

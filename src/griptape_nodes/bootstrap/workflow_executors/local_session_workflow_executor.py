@@ -60,7 +60,9 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
         GriptapeNodes.EventManager().initialize_queue()
-        await GriptapeNodes.EventManager().abroadcast_app_event(AppInitializationComplete())
+        await GriptapeNodes.EventManager().abroadcast_app_event(
+            AppInitializationComplete(defer_pending_library_resets=True)
+        )
 
         logger.info("Setting up session %s", self._session_id)
         GriptapeNodes.SessionManager().save_session(self._session_id)
@@ -80,12 +82,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         GriptapeNodes.SessionManager().remove_session(self._session_id)
 
-        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
-
-    async def _process_execution_event_async(self, event: ExecutionGriptapeNodeEvent) -> None:
-        """Process execution events asynchronously for real-time websocket emission."""
-        logger.debug("REAL-TIME: Processing execution event for session %s", self._session_id)
-        self._send_event("execution_event", event.wrapped_event)
+        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
 
     async def arun(
         self,
@@ -162,7 +159,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
                 if isinstance(start_flow_result, StartFlowResultFailure):
                     msg = f"Failed to start flow {flow_name}"
-                    logger.error(msg)
                     event_result_failure = EventResultFailure(request=start_flow_request, result=start_flow_result)
                     self._send_result("failure_result", event_result_failure)
                     raise LocalExecutorError(msg) from start_flow_result.exception  # noqa: TRY301
@@ -215,9 +211,6 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 elif isinstance(event, ExecutionGriptapeNodeEvent):
                     # Emit execution event via WebSocket
                     result_send_failure = self._send_execution_event(event)
-                    task = asyncio.create_task(self._process_execution_event_async(event))
-                    background_tasks.add(task)
-                    task.add_done_callback(_handle_task_done)
                     is_flow_finished, error = await self._handle_execution_event(event, flow_name)
                     # The flow's own error, if any, is the cause worth reporting.
                     if result_send_failure is not None and error is None:
@@ -230,7 +223,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                         type=type(event).__name__,
                         value=event.value,
                     )
-                    execution_event = ExecutionEvent(payload=payload)
+                    execution_event = ExecutionEvent(payload=payload, workflow_id=event.workflow_id)
                     self._send_event("execution_event", execution_event)
 
                 event_queue.task_done()

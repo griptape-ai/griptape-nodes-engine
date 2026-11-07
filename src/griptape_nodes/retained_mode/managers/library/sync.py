@@ -49,6 +49,12 @@ class LibrarySync(EngineScoped):
     @handles(SyncLibrariesRequest)
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return SyncLibrariesResultFailure(
+                result_details=managed.environment_provides_libraries_message("sync libraries")
+            )
+
         # Phase 1: Download missing libraries from both config keys
         config_mgr = self.engine.config_manager
 
@@ -68,7 +74,7 @@ class LibrarySync(EngineScoped):
         libraries_downloaded = 0
 
         if all_git_urls:
-            logger.info("Found %d git URLs, downloading missing libraries", len(all_git_urls))
+            logger.debug("Found %d git URLs, downloading missing libraries", len(all_git_urls))
             download_results = await self.engine.library_manager.provisioning.download_libraries_from_git_urls(
                 all_git_urls
             )
@@ -84,10 +90,10 @@ class LibrarySync(EngineScoped):
                 elif result.get("error"):
                     logger.warning("Download failed for '%s': %s", git_url, result["error"])
 
-        logger.info("Downloaded %d new libraries", libraries_downloaded)
+        logger.debug("Downloaded %d new libraries", libraries_downloaded)
 
         # Phase 2: Load libraries to ensure newly downloaded ones are registered
-        logger.info("Loading libraries to register newly downloaded ones")
+        logger.debug("Loading libraries to register newly downloaded ones")
         load_request = LoadLibrariesRequest()
         load_result = await self.engine.ahandle_request(load_request)
 
@@ -104,12 +110,12 @@ class LibrarySync(EngineScoped):
 
         libraries_to_check = list_result.libraries
 
-        logger.info("Checking %d registered libraries for updates", len(libraries_to_check))
+        logger.debug("Checking %d registered libraries for updates", len(libraries_to_check))
 
         # Check all libraries for updates concurrently using task group
         async def check_library_for_update(library_name: str) -> tuple[str, ResultPayload]:
             """Check a single library for updates."""
-            logger.info("Checking library '%s' for updates", library_name)
+            logger.debug("Checking library '%s' for updates", library_name)
             check_result = await self.engine.ahandle_request(
                 CheckLibraryUpdateRequest(library_name=library_name, failure_log_level=logging.DEBUG)
             )
@@ -141,7 +147,7 @@ class LibrarySync(EngineScoped):
                 continue
 
             if not check_result.has_update:
-                logger.info("Library '%s' is up to date (version %s)", library_name, check_result.current_version)
+                logger.debug("Library '%s' is up to date (version %s)", library_name, check_result.current_version)
                 continue
 
             # An update exists but is withheld by the age gate: skip it this cycle rather than
@@ -149,7 +155,7 @@ class LibrarySync(EngineScoped):
             # later sync once the target commit reaches the minimum age.
             if check_result.update_gated_by_age:
                 libraries_deferred += 1
-                logger.info(
+                logger.debug(
                     "Library '%s' has an update (%s -> %s) withheld by the age gate; skipping this sync.",
                     library_name,
                     check_result.current_version,
@@ -168,7 +174,7 @@ class LibrarySync(EngineScoped):
             # Library has an update available
             old_version = check_result.current_version or "unknown"
             new_version = check_result.latest_version or "unknown"
-            logger.info("Library '%s' has update available: %s -> %s", library_name, old_version, new_version)
+            logger.debug("Library '%s' has update available: %s -> %s", library_name, old_version, new_version)
             libraries_to_update.append(
                 LibraryUpdateInfo(library_name=library_name, old_version=old_version, new_version=new_version)
             )
@@ -176,7 +182,7 @@ class LibrarySync(EngineScoped):
         # Update libraries concurrently using task group
         async def update_library(library_name: str, old_version: str, new_version: str) -> LibraryUpdateResult:
             """Update a single library."""
-            logger.info("Updating library '%s' from %s to %s", library_name, old_version, new_version)
+            logger.debug("Updating library '%s' from %s to %s", library_name, old_version, new_version)
             update_result = await self.engine.ahandle_request(
                 UpdateLibraryRequest(
                     library_name=library_name,
@@ -212,7 +218,7 @@ class LibrarySync(EngineScoped):
                 # sync once the target ages) so the summary and counts stay accurate.
                 if isinstance(update_result, UpdateLibraryResultFailure) and update_result.age_gated:
                     libraries_deferred += 1
-                    logger.info(
+                    logger.debug(
                         "Library '%s' update (%s -> %s) was withheld by the age gate at update time; deferring.",
                         library_name,
                         old_version,

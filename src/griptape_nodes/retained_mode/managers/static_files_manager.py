@@ -3,27 +3,29 @@ import binascii
 import logging
 import os
 import threading
+from functools import partial
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import anyio
-from xdg_base_dirs import xdg_config_home
+import anyio.to_thread
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
-from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+from griptape_nodes.drivers.storage.local_storage_driver import FileFingerprint, LocalStorageDriver
 from griptape_nodes.files.path_utils import FilenameParts, resolve_workspace_path
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
-from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetPreviewForArtifactRequest,
     GetPreviewForArtifactResultFailure,
     GetPreviewForArtifactResultSuccess,
     PreviewGenerationPolicy,
 )
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
@@ -44,6 +46,7 @@ from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileUploadUrlRequest,
     CreateStaticFileUploadUrlResultFailure,
     CreateStaticFileUploadUrlResultSuccess,
+    StaticFileChanged,
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SidecarContent,
@@ -53,6 +56,12 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.retained_mode.managers.settings import (
+    DEFAULT_REFRESH_PREVIEWS_MAX_FILES,
+    REFRESH_PREVIEWS_MAX_FILES_KEY,
+    coerce_refresh_previews_max_files,
+)
+from griptape_nodes.retained_mode.managers.static_file_watcher import StaticFileWatcher, WatchedFileChange
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers.static import (
     ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV,
@@ -60,11 +69,15 @@ from griptape_nodes.servers.static import (
     STATIC_SERVER_PORT,
     STATIC_SERVER_URL,
 )
+from griptape_nodes.utils.engine_dirs import engine_config_dir
 from griptape_nodes.utils.url_utils import uri_to_path
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
-USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
+USER_CONFIG_PATH = engine_config_dir() / "griptape_nodes_config.json"
 
 
 class ResolvedStaticFilePath(NamedTuple):
@@ -79,6 +92,16 @@ class ResolvedStaticFilePath(NamedTuple):
     path: Path
     policy: ExistingFilePolicy
     file_metadata: SidecarContent | None = None
+
+
+class StaticFilePathFailure(NamedTuple):
+    """Why a static file's situation path could not be resolved.
+
+    Attributes:
+        reason: Completes "Failed because ..." in the caller's message.
+    """
+
+    reason: str
 
 
 class PreviewResolution(NamedTuple):
@@ -96,6 +119,22 @@ class PreviewResolution(NamedTuple):
     path_to_serve: Path
     artifact_metadata: dict | None = None
     preview_failure_reason: str | None = None
+
+
+class WatchTarget(NamedTuple):
+    """A local file to watch for a client, read before its URL was minted.
+
+    Attributes:
+        path: Absolute path of the file on disk.
+        baseline: Its fingerprint before the preview was resolved and the URL minted, so a save
+            landing in between still counts as a change.
+    """
+
+    path: Path
+    baseline: FileFingerprint | None
+
+
+REFRESH_PREVIEWS_ON_FILE_CHANGE_KEY = "refresh_previews_on_file_change"
 
 
 class StaticFilesManager(EngineScoped):
@@ -132,6 +171,10 @@ class StaticFilesManager(EngineScoped):
         # consumer that needs the answer waits on this instead of sampling mid-race. A
         # threading.Event because waiters and the resolver can sit on different event loops.
         self._base_url_settled = threading.Event()
+
+        # Watches the local files clients mint URLs for, while the refresh_previews_on_file_change
+        # setting is on. Its thread starts with the first watched file.
+        self.file_watcher = StaticFileWatcher(on_change=self._on_watched_file_changed)
 
         # Seed the driver with any configured override so URLs built before initialization
         # completes still point at the tunnel or proxy fronting the host's server. The handler re-reads
@@ -181,6 +224,7 @@ class StaticFilesManager(EngineScoped):
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
             )
+            event_manager.add_listener_to_app_event(ConfigChanged, self._on_config_changed)
 
     @property
     def static_server_base_url(self) -> str:
@@ -226,15 +270,16 @@ class StaticFilesManager(EngineScoped):
         return self._static_server_base_url
 
     async def _generate_preview_if_needed(
-        self, file_path: Path, source_macro_path: MacroPath | None = None
+        self, file_path: Path, workflow: "WorkflowRuntime | None", source_macro_path: MacroPath | None = None
     ) -> PreviewResolution:
-        """Generate preview for a file if needed.
+        """Generate preview for a file if needed, in the preview folder of `workflow`.
 
         Serves the preview when one is available or can be generated; otherwise falls
         back to the original file and says why in preview_failure_reason.
 
         Args:
             file_path: Path to the original file
+            workflow: The workflow whose preview folder the preview goes in, or None
             source_macro_path: The original macro form of file_path, when known. Used
                 for the preview request so the generated metadata records the portable
                 macro template; without it the resolved absolute path is wrapped as a
@@ -262,7 +307,8 @@ class StaticFilesManager(EngineScoped):
         else:
             macro_path = MacroPath(ParsedMacro(str(file_path)), {})
 
-        result = await self.engine.ahandle_request(
+        result = await self.engine.artifact_manager.get_preview_for_artifact_in(
+            workflow,
             GetPreviewForArtifactRequest(
                 macro_path=macro_path,
                 artifact_provider_name=provider_name,
@@ -270,7 +316,7 @@ class StaticFilesManager(EngineScoped):
                 # DEBUG on the inner request so the failure logs once, here, at the
                 # layer that knows it is falling back to the original file.
                 failure_log_level=logging.DEBUG,
-            )
+            ),
         )
 
         if not isinstance(result, GetPreviewForArtifactResultSuccess) or not isinstance(result.paths_to_preview, str):
@@ -297,6 +343,7 @@ class StaticFilesManager(EngineScoped):
     def on_handle_create_static_file_request(
         self,
         request: CreateStaticFileRequest,
+        workflow: "WorkflowRuntime | None" = None,
     ) -> CreateStaticFileResultSuccess | CreateStaticFileResultFailure:
         file_name = request.file_name
 
@@ -307,7 +354,7 @@ class StaticFilesManager(EngineScoped):
             return CreateStaticFileResultFailure(error=msg, result_details=msg)
 
         try:
-            url = self.save_static_file(content_bytes, file_name)
+            url = self.save_static_file_in(workflow, content_bytes, file_name)
         except Exception as e:
             msg = f"Failed to create static file for file {file_name}: {e}"
             return CreateStaticFileResultFailure(error=msg, result_details=msg)
@@ -318,11 +365,13 @@ class StaticFilesManager(EngineScoped):
     def on_handle_create_static_file_upload_url_request(
         self,
         request: CreateStaticFileUploadUrlRequest,
+        workflow: "WorkflowRuntime | None" = None,
     ) -> CreateStaticFileUploadUrlResultSuccess | CreateStaticFileUploadUrlResultFailure:
         """Handle the request to create a presigned URL for uploading a static file.
 
         Args:
             request: The request object containing the file name.
+            workflow: The workflow the situation's `{workflow_dir}` resolves for, or None.
 
         Returns:
             A result object indicating success or failure.
@@ -330,9 +379,9 @@ class StaticFilesManager(EngineScoped):
         file_name = request.file_name
         situation_name = request.situation_name
 
-        resolved = self._resolve_static_file_path(file_name, situation_name)
-        if resolved is None:
-            msg = f"Attempted to create upload URL for '{file_name}'. Failed because the project template is missing the '{situation_name}' situation."
+        resolved = self._resolve_static_file_path(workflow, file_name, situation_name)
+        if isinstance(resolved, StaticFilePathFailure):
+            msg = f"Attempted to create upload URL for '{file_name}'. Failed because {resolved.reason}."
             return CreateStaticFileUploadUrlResultFailure(error=msg, result_details=msg)
 
         try:
@@ -353,19 +402,21 @@ class StaticFilesManager(EngineScoped):
     def on_handle_create_static_file_download_url_request(
         self,
         request: CreateStaticFileDownloadUrlRequest,
+        workflow: "WorkflowRuntime | None" = None,
     ) -> CreateStaticFileDownloadUrlResultSuccess | CreateStaticFileDownloadUrlResultFailure:
         """Handle the request to create a presigned URL for downloading a static file from the staticfiles directory.
 
         Args:
             request: The request object containing the file name.
+            workflow: The workflow the situation's `{workflow_dir}` resolves for, or None.
 
         Returns:
             A result object indicating success or failure.
         """
         situation_name = request.situation_name
-        resolved = self._resolve_static_file_path(request.file_name, situation_name)
-        if resolved is None:
-            msg = f"Attempted to create download URL for '{request.file_name}'. Failed because the project template is missing the '{situation_name}' situation."
+        resolved = self._resolve_static_file_path(workflow, request.file_name, situation_name)
+        if isinstance(resolved, StaticFilePathFailure):
+            msg = f"Attempted to create download URL for '{request.file_name}'. Failed because {resolved.reason}."
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         try:
@@ -436,6 +487,7 @@ class StaticFilesManager(EngineScoped):
     async def _resolve_preview_path(
         self,
         file_path: Path,
+        workflow: "WorkflowRuntime | None",
         *,
         preview: bool,
         metadata_only: bool = False,
@@ -445,6 +497,7 @@ class StaticFilesManager(EngineScoped):
 
         Args:
             file_path: Path to the original file.
+            workflow: The workflow whose preview folder a generated preview goes in, or None.
             preview: Whether to generate and serve a preview.
             metadata_only: When True, extract metadata without generating a preview. The
                 returned path is always the original file. Takes precedence over preview.
@@ -463,7 +516,9 @@ class StaticFilesManager(EngineScoped):
             logger.debug("Serving full image for %s", file_path)
             return PreviewResolution(path_to_serve=file_path)
         try:
-            resolution = await self._generate_preview_if_needed(file_path, source_macro_path=source_macro_path)
+            resolution = await self._generate_preview_if_needed(
+                file_path, workflow, source_macro_path=source_macro_path
+            )
         except Exception as e:
             logger.warning("Preview generation failed for %s, using original: %s", file_path, e)
             return PreviewResolution(path_to_serve=file_path, preview_failure_reason=str(e))
@@ -475,11 +530,13 @@ class StaticFilesManager(EngineScoped):
     async def on_handle_create_static_file_download_url_from_path_request(
         self,
         request: CreateStaticFileDownloadUrlFromPathRequest,
+        workflow: "WorkflowRuntime | None" = None,
     ) -> CreateStaticFileDownloadUrlFromPathResultSuccess | CreateStaticFileDownloadUrlResultFailure:
         """Handle request to create download URL from arbitrary file path.
 
         Args:
             request: Request containing file_path and preview parameters.
+            workflow: The workflow a macro path and a generated preview resolve for, or None.
 
         Returns:
             Result with download URL or failure message.
@@ -497,7 +554,6 @@ class StaticFilesManager(EngineScoped):
             parsed = ParsedMacro(file_path)
         except MacroSyntaxError as e:
             msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because the path has invalid macro syntax: {e}"
-            logger.warning(msg)
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         # Keep the original macro form alongside the resolved path: preview metadata
@@ -505,8 +561,8 @@ class StaticFilesManager(EngineScoped):
         # machine-specific path into a file that lives inside the project.
         source_macro_path: MacroPath | None = None
         if parsed.get_variables():
-            resolve_result = self.engine.handle_request(
-                GetPathForMacroRequest(parsed_macro=parsed, variables=request.macro_variables)
+            resolve_result = self.engine.project_manager.get_path_for_macro_in(
+                workflow, GetPathForMacroRequest(parsed_macro=parsed, variables=request.macro_variables)
             )
             if not isinstance(resolve_result, GetPathForMacroResultSuccess):
                 msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because macro resolution failed: {resolve_result.result_details}"
@@ -530,10 +586,15 @@ class StaticFilesManager(EngineScoped):
             # For local paths, convert URI to path
             file_path_for_driver = Path(uri_to_path(file_path))
 
+        watch_target: WatchTarget | None = None
+        if bucket_id is None:
+            watch_target = await self._watch_target(file_path_for_driver)
+
         # If preview requested, generate preview and get preview path + artifact metadata.
         # If metadata_only requested, extract metadata without generating a preview.
         resolution = await self._resolve_preview_path(
             file_path_for_driver,
+            workflow,
             preview=request.preview,
             metadata_only=request.metadata_only,
             source_macro_path=source_macro_path,
@@ -545,6 +606,13 @@ class StaticFilesManager(EngineScoped):
             msg = f"Failed to create presigned URL for file {file_path}: {e}"
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
+        if watch_target is not None:
+            # On a worker thread, like the stat in _watch_target, so the engine's loop never waits.
+            watch_file = partial(
+                self.file_watcher.watch_file, watch_target.path, request.file_path, baseline=watch_target.baseline
+            )
+            await anyio.to_thread.run_sync(watch_file)
+
         return CreateStaticFileDownloadUrlFromPathResultSuccess(
             url=url,
             file_url=driver.get_asset_url(file_path_for_driver),
@@ -552,6 +620,63 @@ class StaticFilesManager(EngineScoped):
             preview_failure_reason=resolution.preview_failure_reason,
             result_details="Successfully created static file download URL",
         )
+
+    async def _watch_target(self, file_path: Path) -> WatchTarget | None:
+        """The local file to watch for this request and its fingerprint now, or None to watch nothing.
+
+        Called before the preview is resolved and the URL minted. Reading the baseline afterwards
+        would take a save landing in between as the starting point, and it would never be reported.
+
+        Args:
+            file_path: The path handed to the storage driver, possibly workspace-relative.
+        """
+        # Under cloud storage, the client's URL points at the uploaded copy, not this file.
+        if not isinstance(self.storage_driver, LocalStorageDriver):
+            return None
+        # Workers mint URLs for their own nodes. The orchestrator is the process the editor talks to.
+        if self.engine.library_manager.is_worker:
+            return None
+        if not self._refresh_previews_on_file_change():
+            return None
+        # ConfigChanged covers edits while running. A limit set in a config file before the engine
+        # started never sends one, so apply the current value here too.
+        self.file_watcher.set_max_files(self._refresh_previews_max_files())
+        local_path = resolve_workspace_path(file_path, self.config_manager.workspace_path)
+        if not await anyio.Path(local_path).is_file():
+            return None
+
+        # On a worker thread: a stat can take seconds on a network drive.
+        baseline = await anyio.to_thread.run_sync(StaticFileWatcher.read_fingerprint, local_path)
+        return WatchTarget(path=local_path, baseline=baseline)
+
+    def _on_config_changed(self, payload: ConfigChanged) -> None:
+        # An empty key means the whole config was replaced.
+        if payload.key not in ("", REFRESH_PREVIEWS_ON_FILE_CHANGE_KEY, REFRESH_PREVIEWS_MAX_FILES_KEY):
+            return
+        if not self._refresh_previews_on_file_change():
+            # Stop watching now, so turning the setting off sheds the load right away.
+            self.file_watcher.clear()
+            return
+        self.file_watcher.set_max_files(self._refresh_previews_max_files())
+
+    def _on_watched_file_changed(self, change: WatchedFileChange) -> None:
+        # A change can be detected just before the watcher is cleared for the setting turning off.
+        if not self._refresh_previews_on_file_change():
+            return
+        # Runs on the watcher's thread. put_event hands the event to the engine's loop.
+        payload = StaticFileChanged(file_path=str(change.path), requested_file_paths=change.requested_file_paths)
+        self.engine.event_manager.put_event(AppEvent(payload=payload))
+
+    def _refresh_previews_on_file_change(self) -> bool:
+        return self.config_manager.get_config_value(REFRESH_PREVIEWS_ON_FILE_CHANGE_KEY, default=True, cast_type=bool)
+
+    def _refresh_previews_max_files(self) -> int:
+        # Read without cast_type, which raises on a non-number. The merged config keeps raw values,
+        # so apply the same rule as the Settings validator here.
+        value = self.config_manager.get_config_value(
+            REFRESH_PREVIEWS_MAX_FILES_KEY, default=DEFAULT_REFRESH_PREVIEWS_MAX_FILES
+        )
+        return coerce_refresh_previews_max_files(value)
 
     def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
         # try/finally rather than settling per branch: whatever resolution reached before raising
@@ -615,11 +740,33 @@ class StaticFilesManager(EngineScoped):
         *,
         skip_metadata_injection: bool = False,
     ) -> str:
-        """Saves a static file to the workspace directory.
+        """Save a static file for the open workflow; see `save_static_file_in`.
+
+        Edge method for node library code, which is not handed a workflow.
+        """
+        return self.save_static_file_in(
+            self.engine.current_workflow_or_none(),
+            data,
+            file_name,
+            existing_file_policy,
+            skip_metadata_injection=skip_metadata_injection,
+        )
+
+    def save_static_file_in(
+        self,
+        workflow: "WorkflowRuntime | None",
+        data: bytes,
+        file_name: str,
+        existing_file_policy: ExistingFilePolicy | None = None,
+        *,
+        skip_metadata_injection: bool = False,
+    ) -> str:
+        """Saves a static file to the workspace directory, at the `save_static_file` situation's path for `workflow`.
 
         This is used to save files that are generated by the node, such as images or other artifacts.
 
         Args:
+            workflow: The workflow the situation's `{workflow_dir}` resolves for, or None.
             data: The file data to save.
             file_name: The name of the file to save.
             existing_file_policy: How to handle existing files. When None, uses the policy from the
@@ -635,57 +782,104 @@ class StaticFilesManager(EngineScoped):
 
         Raises:
             FileExistsError: When existing_file_policy is FAIL and file already exists.
-            RuntimeError: If the project template is missing the save_static_file situation, or if the file write fails.
+            RuntimeError: If the save_static_file situation's path cannot be resolved, or if the file write fails.
         """
-        resolved = self._resolve_static_file_path(file_name)
-        if resolved is None:
-            msg = f"Attempted to save static file '{file_name}'. Failed because the project template is missing the '{BuiltInSituation.SAVE_STATIC_FILE}' situation."
-            raise RuntimeError(msg)
-
-        file_path = resolved.path
+        resolved = self._resolve_static_file_path(workflow, file_name)
+        if isinstance(resolved, StaticFilePathFailure):
+            msg = f"Attempted to save static file '{file_name}'. Failed because {resolved.reason}."
+            raise RuntimeError(msg)  # noqa: TRY004
 
         if existing_file_policy is None:
             effective_policy = resolved.policy
         else:
             effective_policy = existing_file_policy
 
+        return self._save_to_storage(
+            resolved.path,
+            data,
+            effective_policy,
+            skip_metadata_injection=skip_metadata_injection,
+            file_metadata=resolved.file_metadata,
+        )
+
+    def save_workspace_static_file(
+        self,
+        data: bytes,
+        file_name: str,
+        existing_file_policy: ExistingFilePolicy,
+        *,
+        skip_metadata_injection: bool = False,
+    ) -> str:
+        """Save a file in the workspace's static files folder, whatever workflow is open, and return its URL.
+
+        For output that belongs to the engine rather than to a workflow, such as a diagnostics bundle.
+        Skips the `save_static_file` situation, whose path is the workflow's folder.
+
+        Raises:
+            FileExistsError: When existing_file_policy is FAIL and file already exists.
+            RuntimeError: If the file write fails.
+        """
+        static_files_dir = self.config_manager.get_config_value("static_files_directory", default="staticfiles")
+        return self._save_to_storage(
+            Path(static_files_dir) / file_name,
+            data,
+            existing_file_policy,
+            skip_metadata_injection=skip_metadata_injection,
+            file_metadata=None,
+        )
+
+    def _save_to_storage(
+        self,
+        file_path: Path,
+        data: bytes,
+        existing_file_policy: ExistingFilePolicy,
+        *,
+        skip_metadata_injection: bool,
+        file_metadata: SidecarContent | None,
+    ) -> str:
+        """Write `data` through the storage driver at `file_path` and return a download URL for what it wrote.
+
+        Raises:
+            FileExistsError: When existing_file_policy is FAIL and file already exists.
+            RuntimeError: If the file write fails.
+        """
         try:
             saved_path = self.storage_driver.save_file(
                 file_path,
                 data,
-                effective_policy,
+                existing_file_policy,
                 skip_metadata_injection=skip_metadata_injection,
-                file_metadata=resolved.file_metadata,
+                file_metadata=file_metadata,
             )
         except FileExistsError:
             raise
         except Exception as e:
-            msg = f"Failed to save static file {file_name}: {e}"
-            logger.error(msg)
+            msg = f"Failed to save static file {file_path.name}: {e}"
             raise RuntimeError(msg) from e
         return self.storage_driver.create_signed_download_url(Path(saved_path))
 
     def _resolve_static_file_path(
-        self, file_name: str, situation_name: str = BuiltInSituation.SAVE_STATIC_FILE
-    ) -> ResolvedStaticFilePath | None:
-        """Resolve the file path for a static file using the given situation.
+        self,
+        workflow: "WorkflowRuntime | None",
+        file_name: str,
+        situation_name: str = BuiltInSituation.SAVE_STATIC_FILE,
+    ) -> ResolvedStaticFilePath | StaticFilePathFailure:
+        """Resolve the file path for a static file using the given situation, for `workflow`.
 
         Args:
+            workflow: The workflow the situation's `{workflow_dir}` resolves for, or None.
             file_name: The name of the file (e.g., "output.png").
             situation_name: The situation to use for path resolution. Defaults to
                 ``save_static_file``.
 
         Returns:
-            ResolvedStaticFilePath if situation resolution succeeds, or None on failure.
+            ResolvedStaticFilePath if situation resolution succeeds, or StaticFilePathFailure saying why not.
         """
         situation_result = self.engine.handle_request(GetSituationRequest(situation_name=situation_name))
         if not isinstance(situation_result, GetSituationResultSuccess):
-            logger.warning(
-                "Project template does not include '%s' situation; static files will save to the default directory. "
-                "Projects using StaticFilesManager.save_static_file require this situation in their project template.",
-                situation_name,
+            return StaticFilePathFailure(
+                reason=f"the project template is missing the '{situation_name}' situation",
             )
-            return None
 
         situation = situation_result.situation
 
@@ -694,18 +888,22 @@ class StaticFilesManager(EngineScoped):
         try:
             parsed_macro = ParsedMacro(situation.macro)
         except MacroSyntaxError as e:
-            logger.warning("Failed to parse %s situation macro: %s", situation_name, e)
-            return None
+            return StaticFilePathFailure(
+                reason=f"the '{situation_name}' situation's path '{situation.macro}' is not valid: {e}",
+            )
 
-        macro_result = self.engine.handle_request(
+        macro_result = self.engine.project_manager.get_path_for_macro_in(
+            workflow,
             GetPathForMacroRequest(
                 parsed_macro=parsed_macro,
                 variables={"file_name_base": parts.stem, "file_extension": parts.extension},
-            )
+            ),
         )
         if not isinstance(macro_result, GetPathForMacroResultSuccess):
-            logger.warning("Failed to resolve %s situation path: %s", situation_name, macro_result.result_details)
-            return None
+            # The resolver's own message names the cause, such as a `{workflow_dir}` with no workflow.
+            return StaticFilePathFailure(
+                reason=f"the '{situation_name}' situation's path could not be resolved. {macro_result.result_details}",
+            )
 
         workspace_dir = self.config_manager.workspace_path
         try:

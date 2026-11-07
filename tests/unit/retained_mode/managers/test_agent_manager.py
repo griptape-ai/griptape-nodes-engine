@@ -13,12 +13,17 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
 
 import httpx2
 import pytest
+from fastmcp.client.transports import StreamableHttpTransport
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.mcp_servers import GTN_WORKFLOW_ID_HEADER
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.agents.pydantic_ai.runner import (
     AgentRunResult,
@@ -37,6 +42,7 @@ from griptape_nodes.drivers.cloud_models import (
     ProviderCatalogEntry,
     provider_catalog_entries,
 )
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -79,7 +85,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
 )
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
@@ -88,6 +94,9 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultFailure,
     GetEnabledMCPServersResultSuccess,
+    LibraryMCPServer,
+    ListLibraryMCPServersRequest,
+    ListLibraryMCPServersResultSuccess,
     MCPServerConfig,
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
@@ -108,6 +117,8 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from griptape_nodes.servers.mcp import LibraryMCPTools
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError, refusal_from_body
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from tests.unit.utils.test_budget_refusal import a_refusal_body
@@ -240,6 +251,78 @@ class TestLookupEnabledMCPServers:
         engine = _RecordingEngine(GetEnabledMCPServersResultFailure(result_details="nope"))
 
         assert self._manager(engine)._lookup_enabled_mcp_servers() is None
+
+
+@dataclass
+class _ListRendersRequest(RequestPayload):
+    """List renders."""
+
+
+@dataclass
+class _StartRenderRequest(RequestPayload):
+    """Start a render."""
+
+
+_ACME = LibraryMCPTools(
+    library_name="Acme Render Tools",
+    slug="acme_render_tools",
+    tools=[MCPTool(_ListRendersRequest, read_only=True), MCPTool(_StartRenderRequest)],
+)
+
+
+class TestLibraryMCPServers:
+    @staticmethod
+    def _manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
+        manager = AgentManager.__new__(AgentManager)
+        manager._mcp_server_port = 9001
+        monkeypatch.setattr(f"{_AGENT_MANAGER_MODULE}.list_library_mcp_tools", lambda: [_ACME])
+        return manager
+
+    def test_lists_each_library_at_the_bound_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result = self._manager(monkeypatch).on_handle_list_library_mcp_servers_request(ListLibraryMCPServersRequest())
+
+        assert isinstance(result, ListLibraryMCPServersResultSuccess)
+        assert result.servers == [
+            LibraryMCPServer(
+                name="acme_render_tools",
+                library_name="Acme Render Tools",
+                url="http://localhost:9001/mcp/libraries/acme_render_tools/",
+                tool_names=["_ListRendersRequest", "_StartRenderRequest"],
+            )
+        ]
+
+    def test_builds_a_toolset_per_library_with_its_read_only_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager(monkeypatch)
+        built: list[tuple[str, str, frozenset[str], str | None]] = []
+        monkeypatch.setattr(
+            f"{_AGENT_MANAGER_MODULE}.streamable_http_library",
+            lambda name, url, read_only, *, workflow_id: built.append((name, url, read_only, workflow_id)) or name,
+        )
+        workflow = MagicMock(spec=WorkflowRuntime, workflow_id="wf-1")
+
+        toolsets = manager._library_toolsets(["acme_render_tools", "acme_render_tools"], workflow)
+
+        assert toolsets == ["acme_render_tools"]
+        # The library's tools act on the run's workflow, like the engine's own.
+        assert built == [
+            (
+                "acme_render_tools",
+                "http://localhost:9001/mcp/libraries/acme_render_tools/",
+                frozenset({"_ListRendersRequest"}),
+                "wf-1",
+            )
+        ]
+
+    def test_skips_a_library_that_serves_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = self._manager(monkeypatch)
+
+        with caplog.at_level(logging.WARNING):
+            toolsets = manager._library_toolsets(["missing"], None)
+
+        assert toolsets == []
+        assert "missing" in caplog.text
 
 
 class TestOnHandleListAgentModelsRequest:
@@ -1183,6 +1266,33 @@ class TestConfigureAgentActiveProvider:
         assert gc.model == "gpt-5"
 
 
+class TestEngineMcpToolset:
+    """Each run reaches the engine's MCP server addressed to the workflow the run was sent from."""
+
+    @staticmethod
+    def _transport(toolset: object) -> StreamableHttpTransport:
+        node: Any = toolset
+        while not isinstance(node, MCPToolset):
+            node = node.wrapped
+        transport = node.client.transport
+        assert isinstance(transport, StreamableHttpTransport)
+        return transport
+
+    def test_names_the_run_workflow_in_the_header(self, providers_manager: AgentManager) -> None:
+        providers_manager._mcp_server_port = 1234
+        workflow = WorkflowRuntime("tab-workflow", MagicMock())
+
+        transport = self._transport(providers_manager._engine_mcp_toolset(workflow))
+
+        assert transport.url == "http://localhost:1234/mcp/"
+        assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "tab-workflow"}
+
+    def test_a_run_from_no_workflow_sends_no_header(self, providers_manager: AgentManager) -> None:
+        providers_manager._mcp_server_port = 1234
+
+        assert self._transport(providers_manager._engine_mcp_toolset(None)).headers == {}
+
+
 class TestBuildRunnerCredential:
     """The Griptape Cloud runner accepts a license, not just `GT_CLOUD_API_KEY`."""
 
@@ -1296,7 +1406,7 @@ class TestExplainAgentRunError:
         assert refusal is not None
         halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
 
-        async def refused(_request: RunAgentRequest) -> None:
+        async def refused(_request: RunAgentRequest, _workflow: object) -> None:
             raise halt
 
         monkeypatch.setattr(providers_manager, "_run_agent", refused)
@@ -1311,7 +1421,7 @@ class TestExplainAgentRunError:
     async def test_any_other_failure_is_framed_as_an_agent_error(
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def broken(_request: RunAgentRequest) -> None:
+        async def broken(_request: RunAgentRequest, _workflow: object) -> None:
             msg = "the provider hung up"
             raise RuntimeError(msg)
 
@@ -1444,6 +1554,7 @@ class TestRunAgentResultPayloadContract:
         manager = AgentManager.__new__(AgentManager)
         manager._active_runs = {}
         manager._mcp_toolsets = MCPToolsetCache()
+        manager._mcp_server_port = 1234
 
         async def fake_run(*_args: object, **_kwargs: object) -> AgentRunResult:
             return result
@@ -1455,6 +1566,7 @@ class TestRunAgentResultPayloadContract:
         # A non-empty history keeps `is_first_run` False, so the title update is skipped.
         manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
             load_history=lambda _t: [object()],
+            get_thread_metadata=lambda _t: SimpleNamespace(tool_grants=[]),
             update_thread_metadata=lambda _t, **_kw: {},
             append_run_record=lambda thread_id, record: None,  # noqa: ARG005
         )
@@ -1469,6 +1581,10 @@ class TestRunAgentResultPayloadContract:
             # tests are about the result payload, so report none configured.
             handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
             ahandle_request=_no_attribution,
+            # Libraries still loading and no flow open, so the run's instructions carry
+            # neither the node types nor a flow.
+            library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
+            only_open_workflow_or_none=lambda: None,
         )
         return manager
 
@@ -1479,7 +1595,7 @@ class TestRunAgentResultPayloadContract:
     ) -> None:
         manager = self._manager(monkeypatch, result)
 
-        payload = await manager._run_agent(_run_request())
+        payload = await manager._run_agent(_run_request(), None)
 
         assert isinstance(payload, RunAgentResultSuccess)
         assert "truncated" in payload.output, f"the {branch} branch omits `truncated` from its payload"
@@ -1493,12 +1609,17 @@ class TestRunAgentResultPayloadContract:
         """One shape for all outcomes, so the frontend needs no per-branch handling."""
         manager = self._manager(monkeypatch, result)
 
-        payload = await manager._run_agent(_run_request())
+        payload = await manager._run_agent(_run_request(), None)
 
         assert isinstance(payload, RunAgentResultSuccess)
-        assert set(payload.output) == {"text", "message_count", "cancelled", "truncated", "generated_image_urls"}, (
-            f"the {branch} branch's payload keys differ from the other branches'"
-        )
+        assert set(payload.output) == {
+            "text",
+            "message_count",
+            "cancelled",
+            "truncated",
+            "generated_image_urls",
+            "pending_approvals",
+        }, f"the {branch} branch's payload keys differ from the other branches'"
 
     @pytest.mark.asyncio
     async def test_cancelled_run_does_not_append_run_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1508,7 +1629,7 @@ class TestRunAgentResultPayloadContract:
         manager = self._manager(monkeypatch, result)
         manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
 
-        await manager._run_agent(_run_request())
+        await manager._run_agent(_run_request(), None)
 
         assert recorded == [], "cancelled run must not record a RunRecord"
 
@@ -1529,7 +1650,7 @@ class TestRunAgentResultPayloadContract:
             provider_name="my-ollama",
             additional_mcp_servers=["brave"],
         )
-        await manager._run_agent(req)
+        await manager._run_agent(req, None)
 
         assert len(recorded) == 1
         r = recorded[0]
@@ -1555,7 +1676,7 @@ class TestRunAgentResultPayloadContract:
             provider_name="my-ollama",
             model_name="gpt-4o",
         )
-        await manager._run_agent(req)
+        await manager._run_agent(req, None)
 
         assert len(recorded) == 1
         assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"

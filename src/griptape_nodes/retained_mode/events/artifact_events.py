@@ -348,7 +348,7 @@ class GetPreviewGeneratorDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPay
     friendly_name: str
     supported_source_formats: set[str]
     supported_preview_formats: set[str]
-    parameters: dict[str, tuple[object, bool]]
+    parameters: dict[str, tuple[Any, bool]]
 
 
 @dataclass

@@ -93,13 +93,24 @@ install/dev: ## Install dev dependencies.
 install/test: ## Install test dependencies.
 	@uv sync --group test
 
+# The published app pins an exact engine version. Overriding that pin with this checkout stops uv
+# from falling back to an older app whose pin happens to accept the local engine version. The
+# override must be editable: a plain path install is built once and cached, so it goes stale when
+# the checkout changes.
+RUN_OVERRIDES := build/run-overrides.txt
+
+.PHONY: run/overrides
+run/overrides:
+	@mkdir -p $(dir $(RUN_OVERRIDES))
+	@printf -- '-e %s\n' "$(CURDIR)" > $(RUN_OVERRIDES)
+
 .PHONY: run
-run: ## Run the engine from this checkout (published app + local editable engine).
-	@uvx --python 3.12 --from griptape-nodes --with-editable . gtn $(ARGS)
+run: run/overrides ## Run the engine from this checkout (published app + local editable engine).
+	@uvx --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
 
 .PHONY: run/refresh
-run/refresh: ## Run the engine, pulling the latest published app first.
-	@uvx --refresh --python 3.12 --from griptape-nodes --with-editable . gtn $(ARGS)
+run/refresh: run/overrides ## Run the engine, pulling the latest published app first.
+	@uvx --refresh --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
 
 .PHONY: lint
 lint: ## Lint project.

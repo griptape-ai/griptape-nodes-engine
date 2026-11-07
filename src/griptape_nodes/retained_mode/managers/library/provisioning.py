@@ -198,6 +198,10 @@ class LibraryProvisioning(EngineScoped):
         if engine_version_failure is not None:
             return [engine_version_failure]
 
+        # The environment provides every library, so there is nothing here to provision.
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            return []
+
         config_mgr = self.engine.config_manager
         raw_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         downloads = normalize_library_downloads(raw_libraries)
@@ -253,6 +257,13 @@ class LibraryProvisioning(EngineScoped):
             logger.debug("No libraries to download from config")
             return
 
+        if self.engine.library_manager.managed_environment.provisioned_by_environment():
+            logger.info(
+                "Not downloading %d configured libraries: the environment provides this engine's libraries.",
+                len(git_urls),
+            )
+            return
+
         logger.debug("Starting download of %d libraries from config", len(git_urls))
 
         # Use shared download method
@@ -296,7 +307,23 @@ class LibraryProvisioning(EngineScoped):
                     "skipped": bool (optional, True if already exists),
                 }
             }
+
+        When the environment provides the libraries nothing is cloned: every URL fails with the
+        reason, so callers report it the way they report any failed download.
         """
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return {
+                git_url_with_ref: {
+                    "success": False,
+                    "library_name": None,
+                    "error": managed.environment_provides_libraries_message(
+                        f"download the library at '{git_url_with_ref}'"
+                    ),
+                }
+                for git_url_with_ref in git_urls_with_refs
+            }
+
         config_mgr = self.engine.config_manager
         libraries_path = config_mgr.resolved_libraries_root()
 

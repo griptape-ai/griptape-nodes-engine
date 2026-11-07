@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.exe_types.workflow_node import WorkflowNode
     from griptape_nodes.node_library.library_registry import (
         LibrarySchema,
     )
@@ -28,8 +29,6 @@ class LibraryLifecycleState(StrEnum):
     METADATA_LOADED = "metadata_loaded"
     EVALUATED = "evaluated"
     DEPENDENCIES_INSTALLED = "dependencies_installed"
-    WORKER_DELEGATED = "worker_delegated"
-    WORKER_PENDING = "worker_pending"
     LOADED = "loaded"
     DISABLED = "disabled"
 
@@ -66,8 +65,7 @@ class LibraryInfo:
 
     Attributes:
         lifecycle_state: Current phase of the library loading lifecycle (DISCOVERED → METADATA_LOADED →
-                       EVALUATED → DEPENDENCIES_INSTALLED → LOADED, or EVALUATED → WORKER_DELEGATED →
-                       WORKER_PENDING → LOADED once the worker confirms, or FAILURE at any phase)
+                       EVALUATED → DEPENDENCIES_INSTALLED → LOADED, or FAILURE at any phase)
         fitness: Health/quality assessment of the library (GOOD, FLAWED, UNUSABLE, NOT_EVALUATED)
         library_path: Absolute path to the library JSON file or sandbox directory
         is_sandbox: True if this is a sandbox library (user-created nodes in workspace), False for regular libraries
@@ -101,18 +99,10 @@ class LibraryInfo:
     # True for sandbox, ad-hoc, and bare-string entries; False only when the user
     # explicitly set enabled=false on the config object form.
     enabled: bool = True
-    # True when the library's declarations resolve to launching in a worker
-    # process (compatible per ``WorkerModeCompatibility`` and suggested per
-    # ``SuggestedWorkerMode``). Set whenever metadata is first successfully
-    # parsed (discovery or lifecycle progression). Absence of the relevant
-    # declarations falls through to False.
-    requires_worker: bool = False
-    # True when this library's nodes EXECUTE in a dedicated worker process, for either
-    # reason: legacy worker-mode declarations (requires_worker above, which also skips
-    # orchestrator-side loading in favor of stubs) or execution dependencies
-    # (pip_dependencies_exec -- the library loads REAL nodes on the orchestrator and
-    # only its process() runs in the worker, where .venv-exec is on sys.path).
-    # Consumed by execution routing; never by load-time skips.
+    # True when this library's nodes EXECUTE in a dedicated worker process, because it
+    # declares execution dependencies (pip_dependencies_exec). The library loads REAL
+    # nodes on the orchestrator and only its process() runs in the worker, where
+    # .venv-exec is on sys.path. Consumed by execution routing; never by load-time skips.
     executes_in_worker: bool = False
 
     # Why the last `.venv-exec` build failed; None when it succeeded. Deliberately separate
@@ -120,3 +110,6 @@ class LibraryInfo:
     # -- the spawn refusal reads THIS field, so a failure recorded at registration must survive
     # that clearing.
     execution_env_failure: str | None = None
+    # Node types this library registered from its `workflow_nodes` entries. Every workflow registry
+    # refresh lists their backing workflows again, keyed for the current workspace.
+    workflow_node_classes: list[type[WorkflowNode]] = field(default_factory=list)

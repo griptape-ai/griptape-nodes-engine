@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, TypedDict
 
@@ -13,8 +12,6 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
-
-logger = logging.getLogger("griptape_nodes")
 
 
 class CreateSignedUploadUrlResponse(TypedDict):
@@ -185,11 +182,9 @@ class BaseStorageDriver(ABC):
             return self.create_signed_download_url(path)
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to upload file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         except Exception as e:
             msg = f"Unexpected error uploading file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
     def download_file(self, path: Path, timeout: float | None = None) -> bytes:
@@ -214,11 +209,9 @@ class BaseStorageDriver(ABC):
             response.raise_for_status()
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to download file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         except Exception as e:
             msg = f"Unexpected error downloading file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
         else:
             return response.content

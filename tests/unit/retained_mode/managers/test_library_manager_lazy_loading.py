@@ -25,6 +25,8 @@ from griptape_nodes.node_library.library_registry import (
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultSuccess,
+    ListNodeTypesInLibraryRequest,
+    ListNodeTypesInLibraryResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_import_problem import (
     NodeModuleImportProblem,
@@ -266,6 +268,38 @@ class TestDescribeNodeTypeWithLazyImportFailure:
         # A broken lazy import yields a usable (metadata-only) description rather than a failure.
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         assert result.parameters == []
+
+
+class TestListNodeTypesMetadataUnderLazyLoading:
+    def test_metadata_lists_lazy_nodes_without_importing_their_modules(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
+        marker = tmp_path / "import_count.txt"
+        (tmp_path / "siblings.py").write_text(_SIBLINGS_SOURCE.format(marker=str(marker)))
+        (tmp_path / "broken_node.py").write_text(_BROKEN_NODE_SOURCE)
+        schema = _schema(
+            "Lazy Listed Library",
+            [
+                NodeDefinition(class_name="SiblingA", file_path="siblings.py", metadata=_node_metadata("A")),
+                NodeDefinition(class_name="BrokenNode", file_path="broken_node.py", metadata=_node_metadata("Broken")),
+            ],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        info = _library_info(schema, tmp_path)
+        manager.module_loading.attempt_load_nodes_from_library(
+            library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
+        )
+
+        result = manager.catalog.on_list_node_types_in_library_request(
+            ListNodeTypesInLibraryRequest(library=schema.name, include_metadata=True)
+        )
+
+        assert isinstance(result, ListNodeTypesInLibraryResultSuccess), result.result_details
+        assert result.node_metadata is not None
+        assert list(result.node_metadata) == ["SiblingA", "BrokenNode"]
+        # Neither module ran: the siblings file never wrote its marker, and the broken file's
+        # missing import never raised.
+        assert not marker.exists()
+        assert not any(isinstance(p, NodeModuleImportProblem) for p in info.problems)
 
 
 class TestStableNamespaceImportUnderLazyLoading:

@@ -38,8 +38,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.testing.offline_wheels import build_wheel, offline_install_flags
 from griptape_nodes.utils.version_utils import engine_version
-from tests.e2e.offline_wheels import build_wheel, offline_install_flags
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

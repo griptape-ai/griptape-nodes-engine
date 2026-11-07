@@ -192,7 +192,7 @@ def _generate_payload_workflow_source(engine: Engine, library_json: Path, *, laz
         # Skip the executable wrapper; we only need build_workflow to run end-to-end.
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
@@ -219,6 +219,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 
 
 async def _e2e_run() -> None:
+    GriptapeNodes.ContextManager().push_workflow(file_path=__file__)  # noqa: F821
     await build_workflow()  # noqa: F821 - defined by exec'd workflow source above
     top_level = await GriptapeNodes.ahandle_request(_E2EGetTopLevelFlowRequest())  # noqa: F821
     if not isinstance(top_level, _E2EGetTopLevelFlowResultSuccess) or top_level.flow_name is None:

@@ -82,13 +82,17 @@ class RunAgentRequest(RequestPayload):
     """Run an agent with input and optional artifacts.
 
     Use when: Executing conversational AI interactions, processing user queries,
-    running autonomous agents, handling multi-modal inputs with URLs.
+    running autonomous agents, handling multi-modal inputs with URLs. On a thread
+    whose last turn is waiting on ``pending_approvals``, the message declines
+    every waiting call and the agent answers the message instead.
 
     Args:
         input: Text input to send to the agent
         url_artifacts: List of URL artifacts to include with the request
         thread_id: Thread ID to use for conversation.
         additional_mcp_servers: List of additional MCP server names to include
+        library_mcp_servers: Names of library MCP servers whose tools to include, from
+            ``ListLibraryMCPServersRequest``.
 
     Results: RunAgentResultStarted -> RunAgentResultSuccess (with output) | RunAgentResultFailure (execution error)
     """
@@ -97,6 +101,7 @@ class RunAgentRequest(RequestPayload):
     url_artifacts: list[RunAgentRequestArtifact]
     thread_id: str
     additional_mcp_servers: list[str] = field(default_factory=list)
+    library_mcp_servers: list[str] = field(default_factory=list)
     provider_name: str | None = None
     model_name: str | None = None
 
@@ -122,7 +127,13 @@ class RunAgentResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
             ``text`` then holds whatever was streamed before cancellation), and
             ``truncated`` (``True`` when the model hit its output token limit
             before finishing; the run succeeded but ``text`` ends mid-thought, so
-            surface it rather than rendering the turn as a complete reply).
+            surface it rather than rendering the turn as a complete reply), and
+            ``pending_approvals`` (the tool calls the turn paused on until the
+            user decides, each ``{"tool_call_id", "tool_name", "args", "grant_keys"}``
+            where ``args`` is JSON truncated like ``AgentToolCallEvent.args`` and
+            ``grant_keys`` is what "Approve for conversation" grants. Answer them
+            with ``ResolveToolApprovalsRequest``. Always present; ``[]`` when the
+            turn did not pause).
         thread_id: The thread ID used for this conversation
     """
 
@@ -142,6 +153,98 @@ class RunAgentResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     error: dict
 
 
+TOOL_APPROVAL_APPROVE_ONCE = "approve_once"
+TOOL_APPROVAL_APPROVE_FOR_CONVERSATION = "approve_for_conversation"
+TOOL_APPROVAL_DENY = "deny"
+TOOL_APPROVAL_DECISIONS = frozenset(
+    {TOOL_APPROVAL_APPROVE_ONCE, TOOL_APPROVAL_APPROVE_FOR_CONVERSATION, TOOL_APPROVAL_DENY}
+)
+
+
+@dataclass
+class ToolApprovalDecision:
+    """The user's answer to one tool call a paused turn is waiting on.
+
+    Args:
+        tool_call_id: ``tool_call_id`` of an entry in ``pending_approvals``.
+        decision: ``"approve_once"`` runs this call, ``"approve_for_conversation"``
+            runs it and lets calls with the same ``grant_keys`` run without asking
+            for the rest of the thread, and ``"deny"`` tells the agent the user
+            declined.
+    """
+
+    tool_call_id: str
+    decision: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveToolApprovalsRequest(RequestPayload):
+    """Answer the tool calls a paused agent turn is waiting on, and continue the turn.
+
+    Use when: The user picks "Approve once", "Approve for conversation", or "Deny"
+    on the approval card of a chat turn whose ``RunAgentResultSuccess`` listed
+    ``pending_approvals``. Streams the same events as ``RunAgentRequest`` and can
+    be cancelled with ``CancelAgentRequest``.
+
+    Args:
+        thread_id: Thread whose paused turn to continue.
+        decisions: One decision per pending call. A call may be left out only
+            when an "Approve for conversation" decision in the same request
+            already covers its ``grant_keys``.
+        additional_mcp_servers: List of additional MCP server names to include
+        library_mcp_servers: Names of library MCP servers whose tools to include, as in
+            ``RunAgentRequest``.
+        provider_name: Chat provider to continue with, as in ``RunAgentRequest``.
+        model_name: Model to continue with, as in ``RunAgentRequest``.
+
+    Results: RunAgentResultSuccess (with output, which may list new ``pending_approvals``) |
+        RunAgentResultFailure (no paused turn, unknown or missing decision, execution error)
+    """
+
+    thread_id: str
+    decisions: list[ToolApprovalDecision]
+    additional_mcp_servers: list[str] = field(default_factory=list)
+    library_mcp_servers: list[str] = field(default_factory=list)
+    provider_name: str | None = None
+    model_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ClearToolGrantsRequest(RequestPayload):
+    """Forget every "Approve for conversation" choice made in a thread.
+
+    Use when: The user wants the chat agent to ask again before running things in
+    this conversation.
+
+    Args:
+        thread_id: ID of the thread whose grants to clear.
+
+    Results: ClearToolGrantsResultSuccess | ClearToolGrantsResultFailure (thread not found, storage error)
+    """
+
+    thread_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ClearToolGrantsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The thread's grants were cleared.
+
+    Args:
+        thread_id: ID of the thread whose grants were cleared.
+    """
+
+    thread_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ClearToolGrantsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Clearing the thread's grants failed. Common causes: thread not found, storage error."""
+
+
 @dataclass
 @PayloadRegistry.register
 class CancelAgentRequest(RequestPayload, SkipTheLineMixin):
@@ -151,7 +254,10 @@ class CancelAgentRequest(RequestPayload, SkipTheLineMixin):
     cancellation to the active :class:`RunAgentRequest` for ``thread_id``; the
     run unwinds promptly and returns a ``RunAgentResultSuccess`` whose ``output``
     carries ``cancelled: True`` and any text streamed so far. The cancelled
-    turn is not persisted to the thread.
+    turn is not persisted to the thread, except that cancelling a turn resumed
+    by ``ResolveToolApprovalsRequest`` (or by a message sent while approvals were
+    waiting) saves a result for each waiting call it ran, started, or denied. A
+    call it never started stays in ``pending_approvals``.
 
     ``SkipTheLineMixin`` so the cancel bypasses the event queue and reaches the
     dispatcher even while the run task is in flight.
@@ -324,6 +430,7 @@ class RunRecord:
     provider_name: str
     model: str | None
     mcp_servers: list[str] = field(default_factory=list)
+    library_mcp_servers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -339,6 +446,8 @@ class ThreadMetadata:
     local_id: str | None = None
     # None means runs were not fetched (e.g. from list_threads); [] means fetched and empty.
     runs: list[RunRecord] | None = None
+    # Grant keys the user chose "Approve for conversation" for, sorted.
+    tool_grants: list[str] = field(default_factory=list)
 
 
 @dataclass

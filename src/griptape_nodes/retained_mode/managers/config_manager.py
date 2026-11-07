@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from pydantic import ValidationError
-from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.log_capture import (
     DEFAULT_BUFFER_LINES,
@@ -73,12 +72,13 @@ from griptape_nodes.retained_mode.events.os_events import (
     RenameFileResultFailure,
     WriteFileRequest,
     WriteFileResultFailure,
+    WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
-    BETA_FEATURES_FROM_ENV_CONTEXT,
     DEFAULT_LIBRARIES_DIRECTORY,
     DISCOVERY_MAX_DEPTH_KEY,
+    FROM_ENV_CONTEXT,
     LIBRARIES_DIRECTORY_KEY,
     LOG_DIRECTORY_KEY,
     LOG_RETENTION_DAYS_KEY,
@@ -90,11 +90,12 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
+from griptape_nodes.utils.engine_dirs import engine_config_dir
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
 logger = logging.getLogger("griptape_nodes")
 
-USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
+USER_CONFIG_PATH = engine_config_dir() / "griptape_nodes_config.json"
 
 # Distinguishes "this layer's dict has no entry for this key" from "this layer's dict has an
 # entry whose value happens to be None" (e.g. `project_file: str | None`).
@@ -1011,7 +1012,7 @@ class ConfigManager(EngineScoped):
         candidate = set_dot_value({}, config_key, raw_value)
 
         try:
-            validated = Settings.model_validate(candidate, context={BETA_FEATURES_FROM_ENV_CONTEXT: True})
+            validated = Settings.model_validate(candidate, context={FROM_ENV_CONTEXT: True})
         except ValidationError:
             return _REJECTED_BAD_VALUE
 
@@ -1289,7 +1290,7 @@ class ConfigManager(EngineScoped):
 
         An exception is made for `workflows_to_register` since resetting it gives the appearance of the user losing their workflows.
         """
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1241 need a better way to annotate fields to ignore.
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/1241 need a better way to annotate fields to ignore.
         workflows_to_register = self.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
         USER_CONFIG_PATH.write_text(
             json.dumps(
@@ -1471,7 +1472,7 @@ class ConfigManager(EngineScoped):
 
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/437
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/437
         # Reapplies the log level and sinks from the reloaded merged config rather than from
         # `value`: logging is configured from several related settings at once.
         self.load_configs()
@@ -1583,12 +1584,12 @@ class ConfigManager(EngineScoped):
             result_details = "Attempted to get config value but no category or key was specified."
             return GetConfigValueResultFailure(result_details=result_details)
 
-        # See if we got something valid.
-        find_results = self.get_config_value(request.category_and_key)
-        if find_results is None:
+        key_path = tuple(request.category_and_key.split("."))
+        if self._layer_value_at(self.merged_config, key_path) is _KEY_NOT_IN_LAYER:
             result_details = f"Attempted to get config value for category.key '{request.category_and_key}'. Failed because no such category.key could be found."
             return GetConfigValueResultFailure(result_details=result_details)
 
+        find_results = self.get_config_value(request.category_and_key)
         source = self.value_source(request.category_and_key)
         result_details = f"Successfully returned the config value for section '{request.category_and_key}'."
         return GetConfigValueResultSuccess(
@@ -2147,9 +2148,9 @@ class ConfigManager(EngineScoped):
                 create_parents=True,  # Create parent directories if missing
                 skip_metadata_injection=True,
             )
-            create_result = os_manager.on_write_file_request(create_request)
+            create_result = self.engine.handle_request(create_request)
 
-            if isinstance(create_result, WriteFileResultFailure):
+            if not create_result.succeeded():
                 logger.error(
                     "Attempted to create user config file at '%s'. Failed due to: %s",
                     config_path_str,
@@ -2159,9 +2160,11 @@ class ConfigManager(EngineScoped):
 
         # Step 3: Read current config directly from disk.
         #
-        # We intentionally bypass the ReadFileRequest handler here. The enclosing writes
-        # already use os_manager.on_write_file_request directly (sync), so the read matches
-        # that bootstrap-path style and avoids coupling config load to event-loop state.
+        # We intentionally bypass the ReadFileRequest handler here: this runs on the bootstrap
+        # path, which may have no event loop, and a config read should not depend on one. The
+        # writes around it go through the engine's sync request path, which drives the async
+        # WriteFileRequest handler to completion before returning (on a loop of its own when none
+        # is running), so the file is fully written by the time this reads it.
         try:
             file_content = Path(config_path_str).read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -2238,7 +2241,17 @@ class ConfigManager(EngineScoped):
             existing_file_policy=ExistingFilePolicy.OVERWRITE,
             create_parents=True,
         )
-        write_result = os_manager.on_write_file_request(write_request)
+        write_result = self.engine.handle_request(write_request)
+
+        # A result that is neither success nor a write failure comes from the dispatcher itself
+        # (an unhandled exception, or a pre-dispatch hook declining the request).
+        if not isinstance(write_result, (WriteFileResultSuccess, WriteFileResultFailure)):
+            logger.error(
+                "Attempted to write merged config to '%s'. Failed with: %s",
+                config_path_str,
+                write_result.result_details,
+            )
+            return False
 
         # Handle write failures
         if isinstance(write_result, WriteFileResultFailure):

@@ -4,8 +4,11 @@ import logging
 import typing
 
 from griptape_nodes.common.project_templates import situation as situation_mod
-from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
+from griptape_nodes.files import workflow_requests
 from griptape_nodes.retained_mode.events import os_events, project_events
+
+if typing.TYPE_CHECKING:
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -38,6 +41,8 @@ def resolve_situation(
     situation_name: str,
     fallback_macro: str,
     default_policy: os_events.ExistingFilePolicy = os_events.ExistingFilePolicy.CREATE_NEW,
+    *,
+    workflow: "WorkflowRuntime | None" = None,
 ) -> ResolvedSituation:
     """Look up a situation by name and return its resolved configuration.
 
@@ -47,13 +52,15 @@ def resolve_situation(
         situation_name: Situation name to look up in the current project.
         fallback_macro: Macro template to use when the situation cannot be found.
         default_policy: ExistingFilePolicy to use in the fallback case.
+        workflow: The workflow whose project to look the situation up in, or None to look it up
+            as the caller is bound.
 
     Returns:
         ResolvedSituation with macro_template, existing_file_policy, create_parents,
         and situation_obj (None when falling back).
     """
-    result = griptape_nodes_mod.GriptapeNodes.handle_request(
-        project_events.GetSituationRequest(situation_name=situation_name)
+    result = workflow_requests.handle_request_in(
+        workflow, project_events.GetSituationRequest(situation_name=situation_name)
     )
     if isinstance(result, project_events.GetSituationResultSuccess):
         situation_obj = result.situation

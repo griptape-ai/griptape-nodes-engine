@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -14,8 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.connection_events import IncomingConnection, OutgoingConnection
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.serialization.converter import ElementDocument
-from griptape_nodes.serialization.values import DisplayValue, Value
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument, Value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -30,8 +30,9 @@ class AddParameterToNodeRequest(RequestPayload):
     building configurable nodes. Supports type validation, tooltips, and mode restrictions.
 
     Also adds an item slot to a ParameterList input (e.g. `items` on CreateImageList,
-    `input_images` on image generators). These lists start with no slots, and the list
-    parameter itself cannot be a connection target. Pass only node_name and
+    `input_images` on image generators). These lists start with no slots. A single item
+    connects to a slot, not to the list; a source that already outputs a list can connect to the
+    list itself. Pass only node_name and
     parent_container_name=<list name>; the slot copies the list's type and modes, and its
     generated name comes back as parameter_name (`<list name>_ParameterListUniqueParamID_<hex>`).
     Use that name as the target of CreateConnectionRequest or SetParameterValueRequest.
@@ -58,6 +59,7 @@ class AddParameterToNodeRequest(RequestPayload):
         initial_setup: Skip setup work when loading from file
         settable: Whether parameter can be set directly by the user or not
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
+        serializable: Whether the parameter's value is saved with the workflow
 
     Results: AddParameterToNodeResultSuccess (with parameter name) | AddParameterToNodeResultFailure
     """
@@ -80,6 +82,7 @@ class AddParameterToNodeRequest(RequestPayload):
     is_user_defined: bool = field(default=True)
     settable: bool = field(default=True)
     allow_variable_substitution: bool = field(default=True)
+    serializable: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
     traits: list[dict[str, Any]] | None = None
@@ -121,7 +124,7 @@ class AddParameterToNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveParameterFromNodeRequest(RequestPayload):
+class RemoveParameterFromNodeRequest(RequestPayload, GraphAccessMixin):
     """Remove a parameter from a node.
 
     Use when: Cleaning up unused parameters, dynamically restructuring node interfaces,
@@ -656,7 +659,7 @@ class RenameParameterResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConnectionsForParameterRequest(RequestPayload):
+class GetConnectionsForParameterRequest(RequestPayload, GraphAccessMixin):
     """Get connections for a specific parameter on a node.
 
     Use when: Checking if a parameter is connected, getting connection details for a parameter,

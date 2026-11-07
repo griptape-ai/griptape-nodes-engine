@@ -7,6 +7,7 @@ from typing import Any, NamedTuple
 from griptape_nodes.exe_types.node_types import NodeDependencies
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType, WorkflowShape
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -24,6 +25,12 @@ from griptape_nodes.retained_mode.events.variable_events import CreateVariableRe
 # flows the iterative executor deserializes.
 TRANSIENT_KEY = "transient"
 
+# Node-metadata flag on the StartFlow/EndFlow nodes the packager adds around a packaged body. They
+# are the packaged flow's boundary: they only pass values in and out, and their parameters are
+# added by request. Routing reads it to keep them in the orchestrator, where those parameters
+# exist. A Start/End node a user placed carries no flag and is routed like any other node.
+PACKAGED_FLOW_BOUNDARY_KEY = "packaged_flow_boundary"
+
 
 class FlowMetadataExtractionFailureReason(StrEnum):
     """Reasons why flow metadata extraction from image failed."""
@@ -39,7 +46,7 @@ class FlowMetadataExtractionFailureReason(StrEnum):
 
 @dataclass(kw_only=True)
 @PayloadRegistry.register
-class CreateFlowRequest(RequestPayload):
+class CreateFlowRequest(RequestPayload, GraphAccessMixin):
     """Create a new flow (sub-workflow) within a parent flow.
 
     Use when: Creating sub-workflows, organizing complex workflows into components,
@@ -81,7 +88,7 @@ class CreateFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload):
+class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin):
     """Import a workflow as a referenced sub-flow.
 
     Use when: Reusing workflows as components, creating modular workflows,
@@ -98,7 +105,7 @@ class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class DeleteFlowRequest(RequestPayload):
+class DeleteFlowRequest(RequestPayload, GraphAccessMixin):
     """Delete a flow and all its contents.
 
     Use when: Removing unused sub-workflows, cleaning up complex workflows,
@@ -128,7 +135,7 @@ class DeleteFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ListNodesInFlowRequest(RequestPayload):
+class ListNodesInFlowRequest(RequestPayload, GraphAccessMixin):
     """List all nodes in a specific flow.
 
     Use when: Inspecting flow contents, building flow visualizations,
@@ -165,6 +172,89 @@ class ListNodesInFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """Flow nodes listing failed. Common causes: flow not found, no current context."""
 
 
+@dataclass
+class FlowSummaryNode:
+    """One node in a flow summary.
+
+    Args:
+        name: Node name, the value to pass as `node_name` in other requests
+        type: Node type name
+        library: Name of the library the node type comes from
+        group: Name of the node group (such as a loop) the node sits in, or None at the top level
+        values: Values the user set: settable, unconnected inputs and properties whose value
+            differs from the parameter's default. Runtime objects such as artifacts are shown as
+            "<TypeName>", and long text and long lists are shortened. A ParameterList lists only
+            the items not fed by a connection, as {item parameter name: value}.
+        multi_inputs: Names of the node's ParameterList inputs. Each item of one is its own
+            parameter, so a connection into an item names the item's parameter.
+        position: Editor position as {"x": ..., "y": ...}, or None if the node has none
+    """
+
+    name: str
+    type: str
+    library: str
+    group: str | None
+    values: dict[str, Any]
+    multi_inputs: list[str]
+    position: dict[str, float] | None
+
+
+@dataclass
+class FlowSummaryConnection:
+    """One connection in a flow summary, each end written as "<node name>.<parameter name>".
+
+    A connection that crosses into or out of a node group passes through a proxy parameter on the
+    group, named after the parameter it stands in for, so it appears as two connections: one to the
+    group and one from it.
+    """
+
+    source: str
+    target: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetFlowSummaryRequest(RequestPayload, GraphAccessMixin):
+    """Summarize a flow's nodes, the values set on them, and their connections, in one call.
+
+    Use when: planning an edit to a workflow the user already has open, or checking what is in
+    a flow before adding to it. One call replaces ListNodesInFlowRequest followed by
+    GetAllNodeInfoRequest per node, and leaves out outputs, run results, and UI state. Read-only.
+    For a parameter's full details, follow up with GetAllNodeInfoRequest.
+
+    Args:
+        flow_name: Name of the flow to summarize (None for the current context flow)
+
+    Results: GetFlowSummaryResultSuccess (with the summary) | GetFlowSummaryResultFailure (flow not found, no current context)
+    """
+
+    flow_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetFlowSummaryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Flow summary retrieved successfully.
+
+    Args:
+        workflow_name: Name of the current workflow, or None when no workflow is open
+        flow_name: Name of the summarized flow
+        nodes: The flow's nodes in the order they were added, each node group followed by its members
+        connections: Connections between those nodes, data and control
+    """
+
+    workflow_name: str | None
+    flow_name: str
+    nodes: list[FlowSummaryNode]
+    connections: list[FlowSummaryConnection]
+
+
+@dataclass
+@PayloadRegistry.register
+class GetFlowSummaryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Flow summary failed. Common causes: flow not found, no current context."""
+
+
 # We have two different ways to list flows:
 # 1. ListFlowsInFlowRequest - List flows in a specific flow, or if parent_flow_name=None, list canvas/top-level flows
 # 2. ListFlowsInCurrentContext - List flows in whatever flow is at the top of the Current Context
@@ -172,7 +262,7 @@ class ListNodesInFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 # It was implemented this way to maintain backwards compatibility with the editor.
 @dataclass
 @PayloadRegistry.register
-class ListFlowsInCurrentContextRequest(RequestPayload):
+class ListFlowsInCurrentContextRequest(RequestPayload, GraphAccessMixin):
     pass
 
 
@@ -199,7 +289,7 @@ class NodePosition:
 
 @dataclass
 @PayloadRegistry.register
-class AutoLayoutFlowRequest(RequestPayload):
+class AutoLayoutFlowRequest(RequestPayload, GraphAccessMixin):
     """Auto-place every node in a flow on a topological column-and-row grid.
 
     Use when: an MCP client has just finished building a graph (nodes + connections) and
@@ -258,7 +348,7 @@ class AutoLayoutFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 # Gives a list of the flows directly parented by the node specified.
 @dataclass
 @PayloadRegistry.register
-class ListFlowsInFlowRequest(RequestPayload):
+class ListFlowsInFlowRequest(RequestPayload, GraphAccessMixin):
     # Pass in None to get the canvas.
     parent_flow_name: str | None = None
 
@@ -277,7 +367,7 @@ class ListFlowsInFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class GetTopLevelFlowRequest(RequestPayload):
+class GetTopLevelFlowRequest(RequestPayload, GraphAccessMixin):
     pass
 
 
@@ -392,7 +482,7 @@ class SerializedFlowCommands:
 
 @dataclass
 @PayloadRegistry.register
-class SerializeFlowToCommandsRequest(RequestPayload):
+class SerializeFlowToCommandsRequest(RequestPayload, GraphAccessMixin):
     """Request payload to serialize a flow into a sequence of commands.
 
     Attributes:
@@ -421,7 +511,7 @@ class SerializeFlowToCommandsResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class DeserializeFlowFromCommandsRequest(RequestPayload):
+class DeserializeFlowFromCommandsRequest(RequestPayload, GraphAccessMixin):
     serialized_flow_commands: SerializedFlowCommands
     pop_flow_context_after: bool = (
         True  # Whether to pop the flow context after deserialization (default: True for cleanup)
@@ -443,7 +533,7 @@ class DeserializeFlowFromCommandsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ExtractFlowCommandsFromImageMetadataRequest(RequestPayload):
+class ExtractFlowCommandsFromImageMetadataRequest(RequestPayload, GraphAccessMixin):
     """Extract flow commands from PNG image metadata.
 
     This request reads a PNG image file, extracts the embedded workflow metadata
@@ -502,7 +592,7 @@ class ExtractFlowCommandsFromImageMetadataResultFailure(WorkflowNotAlteredMixin,
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowDetailsRequest(RequestPayload):
+class GetFlowDetailsRequest(RequestPayload, GraphAccessMixin):
     """Request payload to get detailed information about a flow.
 
     This provides metadata about a flow including its reference status and parent hierarchy,
@@ -546,7 +636,7 @@ class GetFlowDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowMetadataRequest(RequestPayload):
+class GetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
     """Get metadata associated with a flow.
 
     Use when: Retrieving flow layout information, getting custom flow properties,
@@ -579,7 +669,7 @@ class GetFlowMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class SetFlowMetadataRequest(RequestPayload):
+class SetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
     """Set metadata associated with a flow.
 
     Use when: Updating flow layout information, storing custom flow properties,
@@ -635,7 +725,7 @@ class ParameterNameMapping(NamedTuple):
 
 @dataclass
 @PayloadRegistry.register
-class PackageNodesAsSerializedFlowRequest(RequestPayload):
+class PackageNodesAsSerializedFlowRequest(RequestPayload, GraphAccessMixin):
     """Package multiple nodes as a complete flow with artificial start and end nodes.
 
     Creates a serialized flow where:

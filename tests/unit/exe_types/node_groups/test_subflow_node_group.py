@@ -14,8 +14,11 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     RIGHT_PARAMETERS_KEY,
     SubflowNodeGroup,
 )
+from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LEGACY_PRIVATE_EXECUTION, LOCAL_EXECUTION
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -31,19 +34,13 @@ class TestSubflowNodeGroupCreateSubflow:
     ) -> None:
         """The group records the flow name it got back, not the (colliding) name it requested."""
         group = _MiniSubflowGroup(name="G")
+        # In a workflow with no flow on its context stack, so the request names no parent flow.
+        group._set_workflow(WorkflowRuntime("wf", engine))
 
         # Simulate the engine deduplicating the requested "G_subflow" (already taken) to "G_subflow_1".
         deduped_result = CreateFlowResultSuccess(flow_name="G_subflow_1", result_details="created")
         mock_handle = create_autospec(engine.handle_request, return_value=deduped_result)
         monkeypatch.setattr(engine, "handle_request", mock_handle)
-
-        # _create_subflow reads the current flow only to parent the request; keep it off engine state.
-        context_manager = engine.context_manager
-        monkeypatch.setattr(
-            context_manager,
-            "get_current_flow",
-            create_autospec(context_manager.get_current_flow, return_value=None),
-        )
 
         group._create_subflow()
 
@@ -272,6 +269,93 @@ class TestCreateProxyParameterForConnection:
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
         assert len(group.metadata[RIGHT_PARAMETERS_KEY]) == len(expected_right)
 
+    @pytest.mark.parametrize("serializable", [True, False])
+    def test_proxy_saves_its_value_on_the_mirrored_parameters_terms(
+        self, group: _MiniSubflowGroup, mock_handle_request: Mock, *, serializable: bool
+    ) -> None:
+        """A proxy holds the value of the parameter it mirrors, so it must not save what that parameter won't."""
+        group._create_proxy_parameter_for_connection(
+            Parameter(name=self.PROXY_NAME, tooltip="", serializable=serializable), is_incoming=False
+        )
+
+        (request,), _ = mock_handle_request.call_args
+        assert request.serializable is serializable
+
+
+class TestProxySerializable:
+    """A proxy saves its value only if every inner parameter it is connected to saves its own.
+
+    Recomputed on every connect and disconnect, including the internal connections replayed when a
+    workflow opens, which is how a proxy saved before proxies carried `serializable` gets it back.
+    """
+
+    @pytest.fixture
+    def workflow(self, engine: Engine) -> WorkflowRuntime:
+        return WorkflowRuntime("wf", engine)
+
+    @pytest.fixture
+    def group(self, workflow: WorkflowRuntime) -> _MiniSubflowGroup:
+        group = _MiniSubflowGroup(name="G")
+        group._set_workflow(workflow)
+        return group
+
+    @pytest.fixture
+    def connections(self, workflow: WorkflowRuntime) -> Mock:
+        """Connections on the proxy, which each test fills in."""
+        connections = Mock()
+        connections.get_incoming_connections_to_parameter.return_value = []
+        connections.get_outgoing_connections_from_parameter.return_value = []
+        workflow.flows.connections = connections
+        return connections
+
+    @staticmethod
+    def _inner_input(group: _MiniSubflowGroup, *, serializable: bool) -> Mock:
+        node = MockNode(f"inner_{serializable}")
+        node.parent_group = group
+        return Mock(target_node=node, target_parameter=Parameter(name="x", tooltip="", serializable=serializable))
+
+    def test_right_rail_proxy_takes_the_inner_outputs_setting(
+        self, group: _MiniSubflowGroup, connections: Mock
+    ) -> None:
+        proxy = Parameter(name="blob", tooltip="")
+        inner = MockNode("inner")
+        inner.parent_group = group
+        inner_output = Parameter(name="blob", tooltip="", serializable=False)
+        connections.get_incoming_connections_to_parameter.return_value = [
+            Mock(source_node=inner, source_parameter=inner_output)
+        ]
+
+        group.after_incoming_connection(inner, inner_output, proxy)
+
+        assert proxy.serializable is False
+
+    def test_left_rail_proxy_follows_its_inner_inputs_through_a_disconnect(
+        self, group: _MiniSubflowGroup, connections: Mock
+    ) -> None:
+        proxy = Parameter(name="blob", tooltip="")
+        saved = self._inner_input(group, serializable=True)
+        unsaved = self._inner_input(group, serializable=False)
+        connections.get_outgoing_connections_from_parameter.return_value = [saved, unsaved]
+
+        group.after_outgoing_connection(proxy, unsaved.target_node, unsaved.target_parameter)
+        assert proxy.serializable is False
+
+        connections.get_outgoing_connections_from_parameter.return_value = [saved]
+        group.after_outgoing_connection_removed(proxy, unsaved.target_node, unsaved.target_parameter)
+        assert proxy.serializable is True
+
+    def test_an_outside_connection_leaves_the_proxy_alone(self, group: _MiniSubflowGroup, connections: Mock) -> None:
+        proxy = Parameter(name="blob", tooltip="", serializable=False)
+        outside = MockNode("outside")
+        outside_output = Parameter(name="blob", tooltip="")
+        connections.get_incoming_connections_to_parameter.return_value = [
+            Mock(source_node=outside, source_parameter=outside_output)
+        ]
+
+        group.after_incoming_connection(outside, outside_output, proxy)
+
+        assert proxy.serializable is False
+
 
 class _MiniSubflowGroup(SubflowNodeGroup):
     """Minimal concrete SubflowNodeGroup exercising only _create_subflow."""
@@ -293,3 +377,27 @@ class _OldLibraryStyleGroup(_MiniSubflowGroup):
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata)
         self.metadata[RIGHT_PARAMETERS_KEY].extend(["old_a", "old_b"])
+
+
+class TestExecutionEnvironmentLegacyName:
+    """A group saved with the old "Private Execution" setting keeps it under its new name.
+
+    The Options converter replaces a value it does not offer with its first choice, Local
+    Execution, so without the mapping a saved group would quietly leave isolation.
+    """
+
+    @pytest.mark.parametrize("initial_setup", [True, False], ids=["loading a saved workflow", "setting it by hand"])
+    def test_the_old_name_is_read_as_isolated_execution(self, *, initial_setup: bool) -> None:
+        group = _MiniSubflowGroup(name="G")
+
+        group.set_parameter_value("execution_environment", LEGACY_PRIVATE_EXECUTION, initial_setup=initial_setup)
+
+        assert group.get_parameter_value("execution_environment") == ISOLATED_EXECUTION
+
+    @pytest.mark.parametrize("value", [LOCAL_EXECUTION, ISOLATED_EXECUTION])
+    def test_other_values_pass_through(self, value: str) -> None:
+        group = _MiniSubflowGroup(name="G")
+
+        group.set_parameter_value("execution_environment", value)
+
+        assert group.get_parameter_value("execution_environment") == value

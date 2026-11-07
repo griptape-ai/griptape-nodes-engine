@@ -1,8 +1,8 @@
-"""Parameter values reach the editor and API clients tagged with their type.
+"""Parameter values cross between engines tagged with their type, and reach clients without tags.
 
 Fields that carry a value to a client are typed ``DisplayValue``, and element trees are
 ``ElementDocument``. Both encode at the wire, and decode when they come back, so a value
-keeps its type across the trip and is never encoded twice.
+keeps its type between engines and is never encoded twice.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from griptape.artifacts import ImageUrlArtifact
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     EventResultSuccess,
@@ -40,8 +41,9 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SetVariableValueRequest,
 )
 from griptape_nodes.retained_mode.variable_types import FlowVariable
-from griptape_nodes.serialization.converter import converter
 from griptape_nodes.serialization.values import TYPE_KEY, VALUE_KEY, encode_value
+
+converter = converters.engine
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -63,11 +65,15 @@ def _element_id(engine: Engine, node_name: str, parameter_name: str) -> str:
 
 
 def _wire(event: Any) -> dict[str, Any]:
-    return json.loads(event.json())
+    return json.loads(converters.engine.dumps(event))
 
 
 def _execution_payload(payload: Any) -> dict[str, Any]:
     return _wire(ExecutionEvent(payload=payload))["payload"]
+
+
+def _client_wire(event: Any) -> dict[str, Any]:
+    return json.loads(converters.client.dumps(event))
 
 
 class TestDisplayValueFields:
@@ -97,11 +103,12 @@ class TestDisplayValueFields:
         )
 
     def test_tagged_value_sent_by_a_client_arrives_with_its_type(self) -> None:
-        request = EventRequest.from_dict(
+        request = converters.engine.structure(
             {
                 "request_type": "SetParameterValueRequest",
                 "request": {"parameter_name": "p", "value": {TYPE_KEY: "builtins:tuple", VALUE_KEY: [1, 2]}},
-            }
+            },
+            EventRequest,
         )
 
         assert request.request.value == (1, 2)
@@ -109,8 +116,9 @@ class TestDisplayValueFields:
     def test_untagged_artifact_dict_sent_by_the_editor_stays_a_dict(self) -> None:
         artifact = {"type": "ImageUrlArtifact", "value": "https://example.com/a.png"}
 
-        request = EventRequest.from_dict(
-            {"request_type": "SetParameterValueRequest", "request": {"parameter_name": "p", "value": artifact}}
+        request = converters.engine.structure(
+            {"request_type": "SetParameterValueRequest", "request": {"parameter_name": "p", "value": artifact}},
+            EventRequest,
         )
 
         assert request.request.value == artifact
@@ -131,16 +139,17 @@ class TestVariableValueFields:
             variable=FlowVariable(name="v", owning_flow_name=None, type="any", value=(1, Speed.FAST)),
         )
 
-        wire = _wire(EventResultSuccess(request=request, result=result))
+        sent = _wire(EventResultSuccess(request=request, result=result))
 
-        assert wire["result"]["variable"]["value"] == encode_value((1, Speed.FAST))
+        assert sent["result"]["variable"]["value"] == encode_value((1, Speed.FAST))
 
     def test_tagged_value_sent_by_a_client_arrives_with_its_type(self) -> None:
-        request = EventRequest.from_dict(
+        request = converters.engine.structure(
             {
                 "request_type": "SetVariableValueRequest",
                 "request": {"name": "v", "value": {TYPE_KEY: "builtins:tuple", VALUE_KEY: [1, 2]}},
-            }
+            },
+            EventRequest,
         )
 
         assert request.request.value == (1, 2)
@@ -174,6 +183,56 @@ class TestElementDocuments:
         assert forwarded == once
 
 
+class TestSentToClients:
+    def test_parameter_update_has_no_tags(self) -> None:
+        event = ExecutionEvent(
+            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=(1, Speed.FAST))
+        )
+
+        assert _client_wire(event)["payload"]["value"] == [1, "fast"]
+
+    def test_artifact_is_its_fields(self) -> None:
+        image = ImageUrlArtifact("https://example.com/a.png", name="a")
+        event = ExecutionEvent(
+            payload=NodeResolvedEvent(node_name="n", parameter_output_values={"image": image}, node_type="T")
+        )
+
+        sent = _client_wire(event)["payload"]["parameter_output_values"]["image"]
+
+        assert TYPE_KEY not in sent
+        assert sent["type"] == "ImageUrlArtifact"
+        assert sent["value"] == "https://example.com/a.png"
+
+    def test_value_with_no_plain_data_form_is_sent_as_text(self) -> None:
+        event = ExecutionEvent(
+            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=_Opaque())
+        )
+
+        assert _client_wire(event)["payload"]["value"] == "opaque thing"
+
+    def test_element_document_values_have_no_tags(self) -> None:
+        document = {
+            "element_id": "root",
+            "children": [{"element_id": "a", "value": (1, 2), "default_value": Speed.FAST, "children": []}],
+            "element_id_to_value": {"a": (1, 2)},
+        }
+
+        sent = _client_wire(ExecutionEvent(payload=AlterElementEvent(element_details=document)))["payload"]
+
+        (child,) = sent["element_details"]["children"]
+        assert child["value"] == [1, 2]
+        assert child["default_value"] == "fast"
+        assert sent["element_details"]["element_id_to_value"] == {"a": [1, 2]}
+
+    def test_sending_to_a_client_leaves_the_engine_wire_tagged(self) -> None:
+        event = ExecutionEvent(
+            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=(1, 2))
+        )
+        _client_wire(event)
+
+        assert _wire(event)["payload"]["value"] == encode_value((1, 2))
+
+
 @pytest.mark.usefixtures("flow_name")
 class TestHandlers:
     @pytest.fixture
@@ -198,9 +257,9 @@ class TestHandlers:
         request = GetParameterValueRequest(node_name=node_name, parameter_name="pair")
         result = engine.handle_request(request)
 
-        wire = _wire(EventResultSuccess(request=request, result=result))
+        sent = _wire(EventResultSuccess(request=request, result=result))
 
-        assert wire["result"]["value"] == encode_value((1, "b"))
+        assert sent["result"]["value"] == encode_value((1, "b"))
 
     def test_element_details_carry_tagged_values(self, engine: Engine, node_name: str) -> None:
         request = GetNodeElementDetailsRequest(node_name=node_name)
@@ -208,9 +267,9 @@ class TestHandlers:
         assert isinstance(result, GetNodeElementDetailsResultSuccess)
         pair_id = _element_id(engine, node_name, "pair")
 
-        wire = _wire(EventResultSuccess(request=request, result=result))
+        sent = _wire(EventResultSuccess(request=request, result=result))
 
-        assert wire["result"]["element_details"]["element_id_to_value"][pair_id] == encode_value((1, "b"))
+        assert sent["result"]["element_details"]["element_id_to_value"][pair_id] == encode_value((1, "b"))
 
     def test_all_node_info_carries_tagged_values(self, engine: Engine, node_name: str) -> None:
         request = GetAllNodeInfoRequest(node_name=node_name)
@@ -218,6 +277,16 @@ class TestHandlers:
         assert isinstance(result, GetAllNodeInfoResultSuccess)
         pair_id = _element_id(engine, node_name, "pair")
 
-        wire = _wire(EventResultSuccess(request=request, result=result))
+        sent = _wire(EventResultSuccess(request=request, result=result))
 
-        assert wire["result"]["element_id_to_value"][pair_id] == encode_value((1, "b"))
+        assert sent["result"]["element_id_to_value"][pair_id] == encode_value((1, "b"))
+
+    def test_all_node_info_sent_to_a_client_has_no_tags(self, engine: Engine, node_name: str) -> None:
+        request = GetAllNodeInfoRequest(node_name=node_name)
+        result = engine.handle_request(request)
+        assert isinstance(result, GetAllNodeInfoResultSuccess)
+        pair_id = _element_id(engine, node_name, "pair")
+
+        sent = _client_wire(EventResultSuccess(request=request, result=result))
+
+        assert sent["result"]["element_id_to_value"][pair_id] == [1, "b"]

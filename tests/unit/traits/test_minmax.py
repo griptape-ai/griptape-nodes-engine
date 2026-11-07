@@ -1,3 +1,5 @@
+import pytest  # type: ignore[reportMissingImports]
+
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.param_types.parameter_number import ParameterNumber
 from griptape_nodes.traits.minmax import MinMax
@@ -34,3 +36,26 @@ class TestRenderedOptions:
         param.add_trait(MinMax(min_val=0, max_val=10))
 
         assert param.ui_options["multiline"] is True
+
+
+class TestValidation:
+    @pytest.fixture
+    def param(self) -> Parameter:
+        return Parameter(name="width", type="float", default_value=None, tooltip="test", user_defined=True)
+
+    def test_none_passes(self, param: Parameter) -> None:
+        validate = MinMax(min_val=0, max_val=10).validators_for_trait()[0]
+
+        validate(param, None)
+
+    def test_in_range_value_passes(self, param: Parameter) -> None:
+        validate = MinMax(min_val=0, max_val=10).validators_for_trait()[0]
+
+        validate(param, 5)
+
+    @pytest.mark.parametrize("value", [-1, 11])
+    def test_out_of_range_value_raises(self, param: Parameter, value: int) -> None:
+        validate = MinMax(min_val=0, max_val=10).validators_for_trait()[0]
+
+        with pytest.raises(ValueError, match="Value out of range"):
+            validate(param, value)

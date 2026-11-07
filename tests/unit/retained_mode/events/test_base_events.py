@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
@@ -19,7 +20,8 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetAllSituationsForProjectResultFailure,
     GetAllSituationsForProjectResultSuccess,
 )
-from griptape_nodes.serialization.converter import converter
+
+converter = converters.engine
 
 
 class TestBroadcastResultDefaults:
@@ -218,7 +220,7 @@ class TestApplyPathTreeWarningDedup:
 
 
 class TestEventResultDictFiltering:
-    """Integration coverage for EventResult.dict()'s fields filtering.
+    """Integration coverage for converters.engine.unstructure(EventResult)'s fields filtering.
 
     The path-projection helpers are unit-tested above; these exercise the wire logic
     that wraps them: the succeeded() gate, framework-field re-add, and [] vs None.
@@ -229,7 +231,7 @@ class TestEventResultDictFiltering:
         result = GetAllSituationsForProjectResultSuccess(
             situations={"a": "macro"}, descriptions={"a": "desc"}, result_details="ok"
         )
-        return EventResultSuccess(request=request, result=result).dict()["result"]
+        return converters.engine.unstructure(EventResultSuccess(request=request, result=result))["result"]
 
     def test_none_returns_all_fields(self) -> None:
         keys = self._success(fields=None)
@@ -248,7 +250,7 @@ class TestEventResultDictFiltering:
         # A success-shaped fields filter on a failed request must not strip the exception.
         request = GetAllSituationsForProjectRequest(fields=["situations"])
         result = GetAllSituationsForProjectResultFailure(result_details="boom", exception=ValueError("kaboom"))
-        payload = EventResultFailure(request=request, result=result).dict()["result"]
+        payload = converters.engine.unstructure(EventResultFailure(request=request, result=result))["result"]
         assert payload["exception"]["message"] == "kaboom"
         assert "result_details" in payload
 

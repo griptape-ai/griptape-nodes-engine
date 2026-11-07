@@ -5,7 +5,7 @@ import time
 from hashlib import blake2b
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urljoin
 
 import httpx2
@@ -22,6 +22,28 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
 logger = logging.getLogger("griptape_nodes")
+
+
+class FileFingerprint(NamedTuple):
+    """The file identity local download URLs are versioned by.
+
+    A new inode, size, or modification time gives the next minted URL a new ``?v=``. The preview
+    watcher compares the same fingerprint to decide whether a change is worth reporting, so both
+    stay in step when the identity changes.
+    """
+
+    inode: int
+    size: int
+    mtime_ns: int
+
+
+def fingerprint_file(path: Path) -> FileFingerprint | None:
+    """Read a file's fingerprint, or None when it can't be stat'ed (missing, unreachable mount)."""
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return FileFingerprint(inode=stat_result.st_ino, size=stat_result.st_size, mtime_ns=stat_result.st_mtime_ns)
 
 
 class LocalStorageDriver(BaseStorageDriver):
@@ -56,7 +78,7 @@ class LocalStorageDriver(BaseStorageDriver):
         *,
         file_metadata: SidecarContent | None = None,  # noqa: ARG002
     ) -> CreateSignedUploadUrlResponse:
-        # on_write_file_request seems to work most reliably with an absolute path.
+        # WriteFileRequest seems to work most reliably with an absolute path.
         absolute_path = resolve_workspace_path(path, self.workspace_directory)
 
         # Always delegate the write for file path resolution and policy handling.
@@ -69,7 +91,7 @@ class LocalStorageDriver(BaseStorageDriver):
             existing_file_policy=existing_file_policy,
             skip_metadata_injection=True,
         )
-        result = self._os_manager.on_write_file_request(write_request)
+        result = self._os_manager.engine.handle_request(write_request)
 
         if not result.succeeded():
             msg = f"WriteFileRequest failed: {result.result_details}"
@@ -90,14 +112,12 @@ class LocalStorageDriver(BaseStorageDriver):
             response.raise_for_status()
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to create upload URL for file {resolved_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
         url = response_data.get("url")
         if url is None:
             msg = f"Failed to get upload URL for file {resolved_path}: {response_data}"
-            logger.error(msg)
             raise ValueError(msg)
 
         return {
@@ -134,7 +154,7 @@ class LocalStorageDriver(BaseStorageDriver):
         """
         absolute_path = resolve_workspace_path(path, self.workspace_directory)
 
-        result = self._os_manager.on_write_file_request(
+        result = self._os_manager.engine.handle_request(
             WriteFileRequest(
                 file_path=str(absolute_path),
                 content=file_content,
@@ -194,14 +214,13 @@ class LocalStorageDriver(BaseStorageDriver):
         # #5607's content-identity design exists to close.
         # Stat the pre-strip path: on Windows, a >MAX_PATH file can only be
         # stat'ed with the \\?\ prefix that the URL branches above had to drop.
-        try:
-            stat_result = resolved_path.stat()
-        except OSError:
+        fingerprint = fingerprint_file(resolved_path)
+        if fingerprint is None:
             # Nothing to fingerprint yet (file still being staged, unreachable
             # mount): fall back to mint time so the URL still busts caches.
             return f"{url}?v={time.time_ns() // 1_000_000}"
-        fingerprint = f"{stat_result.st_ino}:{stat_result.st_size}:{stat_result.st_mtime_ns}"
-        version = blake2b(fingerprint.encode(), digest_size=8).hexdigest()
+        identity = f"{fingerprint.inode}:{fingerprint.size}:{fingerprint.mtime_ns}"
+        version = blake2b(identity.encode(), digest_size=8).hexdigest()
         return f"{url}?v={version}"
 
     def delete_file(self, path: Path) -> None:
@@ -225,7 +244,6 @@ class LocalStorageDriver(BaseStorageDriver):
                 logger.debug("File %s is already absent from local storage; nothing to delete", path)
                 return
             msg = f"Failed to delete file {path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
     def list_files(self) -> list[str]:
@@ -242,7 +260,6 @@ class LocalStorageDriver(BaseStorageDriver):
             response.raise_for_status()
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to list files: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()

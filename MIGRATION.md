@@ -6,24 +6,52 @@ Rename the key in any config file or environment that sets it; the environment v
 `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`. The old name is not read, so a setting left behind
 silently reverts to the 600 second default.
 
-What the value bounds is unchanged: how long a worker may take to load its library, covering the boot
-wait for worker libraries, a node waiting for its library's worker, and a project switch waiting for
-each worker to adopt it. It no longer delays heartbeat enforcement, which is what the old name
-suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
+What the value bounds is unchanged: how long a worker may take to load its library, covering a node
+waiting for its library's worker and a project switch waiting for each worker to adopt it. It no
+longer delays heartbeat enforcement, which is what the old name suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
 
-## Parameter values carry their type
+## Libraries no longer choose a worker
 
-**Request API and editor clients.** A parameter value of a type JSON lacks arrives as a dict whose
-`$type` names its Python type. A tuple that arrived as `[1, 2]` now arrives as:
+Where a library's nodes execute now follows from its dependencies. A library that declared
+`SuggestedWorkerMode(WORKER)`, or that a user set to "Isolated" through `worker_mode_override`, used
+to be hosted whole in a worker process. It now loads into the engine process like any other
+library, and its `pip_dependencies` install into `<library>/.venv`, which sits on the engine's own
+import path. Packages that conflict with the engine's now conflict in that process.
+
+**Library authors.** Move the packages that need isolation into `pip_dependencies_exec`, under
+`metadata.dependencies` in `griptape-nodes-library.json`:
 
 ```json
-{"$type": "builtins:tuple", "$value": [1, 2]}
+"dependencies": {
+  "pip_dependencies": ["pillow"],
+  "pip_dependencies_exec": ["torch", "diffusers"]
+}
 ```
 
-Send a value back in the same form to set that exact type.
+The library's nodes still load in the engine, so the editor gets their real traits, converters,
+and validators. Only `process`/`aprocess` runs in a worker, against `<library>/.venv-exec`, which is
+resolved over both sets. A node module must stay importable without the execution set, so import
+those packages inside `process`. See
+[How to declare execution dependencies](docs/development/custom_nodes/node_isolation_with_workers.md#how-to-declare-execution-dependencies).
 
-[Parameter values](docs/guides/mcp/external_clients.md#parameter-values) lists the forms and which
-fields carry them.
+`WorkerModeCompatibility`, `SuggestedWorkerMode`, and the `worker_mode_override` key in
+`libraries_to_register` still parse, so neither old manifests nor old config files fail to load.
+They have no effect. While a library still asks for a worker and declares no
+`pip_dependencies_exec`, loading it logs one INFO line saying so.
+
+**Also removed:**
+
+- The `WORKER_DELEGATED` and `WORKER_PENDING` library lifecycle states.
+- `requires_worker` on a library's diagnostics.
+- `node_schemas` on `ReportLibraryLoadedRequest`, with the `WorkerNodeSchema` and
+    `WorkerParameterSchema` payloads it carried.
+- The strict-mode rules `reentrant-bus-in-init`, `parameter-behaviors-dropped-in-schema`,
+    `connection-hooks-inert-on-worker`, and `value-hooks-execute-only-on-worker`, and the
+    `LOAD_PROBE` scope kind. `parameter-mutation-during-aprocess` is the only rule left.
+- The fitness problems reporting that request handlers and post-dispatch hooks are unsupported in an
+    isolated library. Both now work in every library.
+
+## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter
 values must be annotated `Value`. A field typed `Any` that holds a griptape object, or any value
@@ -70,6 +98,29 @@ class MyLibrary(AdvancedNodeLibrary):
             from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
         )
 ```
+
+## Events are serialized by converters
+
+**Embedders and request API clients written in Python.** Events and payloads no longer have
+wire-format serialization methods. Use the cattrs converters in
+`griptape_nodes.retained_mode.events.converters` for the message's reader:
+
+```python
+from griptape_nodes.retained_mode.events import converters
+
+converters.client.dumps(event)  # was: event.json()
+converters.engine.unstructure(event)  # was: event.dict()
+converters.engine.dumps(result)  # was: result.strict_json()
+converters.engine.dumps_result(result).text  # was: result.failure_json(error)
+converters.engine.dumps(payload)  # was: payload.to_json()
+converters.engine.structure(data, EventResultSuccess)  # was: EventResultSuccess.from_dict(data)
+```
+
+`engine` preserves parameter types between engine processes; `client` writes plain JSON for
+the editor and other clients. `dumps` raises `EventSerializationError` from `converters`.
+Use `dumps_result(result).text` to send a failure when a result cannot be serialized.
+
+`event.json()` and `event.dict()` raise `TypeError`.
 
 ## `serializable=False` outputs are held in their own process across a worker boundary
 

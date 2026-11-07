@@ -3,7 +3,7 @@
 ``NodeExecutor._silence_packaged_node_creation_broadcasts`` clears ``broadcast_result`` on a
 packaged loop body's create commands so rebuilding the body stays invisible to editors. Workflow
 codegen, though, writes out every create-command field whose value differs from its default
-(``WorkflowManager._generate_node_creation_code``) -- so the same mutation applied anywhere upstream
+(``WorkflowCodeGenerator._generate_node_creation_code``) -- so the same mutation applied anywhere upstream
 of a save writes ``broadcast_result=False`` into the artist's ``.py`` file, and on the publish path
 into a library. That is why the silencing lives at the local deserialization boundaries, which never
 save, rather than at packaging time, which several branches do save from.
@@ -74,7 +74,7 @@ def _generate(engine: Engine, serialized_flow_commands: SerializedFlowCommands) 
         node_libraries_referenced=[],
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata
     )
 

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import logging
-import os
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import httpx2
 
-from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import join_cloud_url, resolve_cloud_base_url, resolve_cloud_credential
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import get_workspace_relative_path
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
@@ -44,7 +43,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         """
         super().__init__(config_manager)
 
-        self.base_url = kwargs.get("base_url") or os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        self.base_url = kwargs.get("base_url") or resolve_cloud_base_url()
         self.api_key = api_key if api_key is not None else resolve_cloud_credential()
         self.headers = kwargs.get("headers") or {"Authorization": f"Bearer {self.api_key}"}
         self.request_timeout = kwargs.get("request_timeout")
@@ -78,12 +77,11 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
         self._create_asset(normalized_path.as_posix())
 
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
         try:
             response = self._request("POST", url, json={"operation": "PUT"})
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to create presigned upload URL for file {normalized_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
@@ -132,7 +130,6 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
                     f"configured base URL '{self.base_url}'. "
                     f"Expected domain: '{expected_domain}'"
                 )
-                logger.error(msg)
                 raise ValueError(msg)
 
             # Extract path component for further processing
@@ -157,12 +154,11 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         # Parse cloud asset URLs before normalizing
         parsed_path = self._parse_cloud_asset_path(path)
         normalized_path = get_workspace_relative_path(parsed_path, self.workspace_directory)
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{normalized_path.as_posix()}")
         try:
             response = self._request("POST", url, json={"method": "GET"})
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to create presigned download URL for file {normalized_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
@@ -215,19 +211,17 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             )
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to upload file {normalized_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         # Return the full asset URL
-        return urljoin(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
+        return join_cloud_url(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
 
     def _create_asset(self, asset_name: str) -> str:
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
         try:
             response = self._request("PUT", url, json={"name": asset_name})
         except httpx2.HTTPStatusError as e:
             msg = str(e)
-            logger.error(msg)
             raise ValueError(msg) from e
 
         return response.json()["name"]
@@ -249,20 +243,19 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             RuntimeError: If bucket creation fails.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, "/api/buckets")
+        url = join_cloud_url(base_url, "/api/buckets")
         payload = {"name": bucket_name}
 
         try:
             response = request_with_retry("POST", url, json=payload, headers=headers, timeout=timeout)
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to create bucket '{bucket_name}': {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
         bucket_id = response_data["bucket_id"]
 
-        logger.info("Created new Griptape Cloud bucket '%s' with ID: %s", bucket_name, bucket_id)
+        logger.debug("Created new Griptape Cloud bucket '%s' with ID: %s", bucket_name, bucket_id)
         return bucket_id
 
     def list_files(self) -> list[str]:
@@ -274,12 +267,11 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Raises:
             RuntimeError: If file listing fails.
         """
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/assets")
         try:
             response = self._request("GET", url, params={"prefix": self.workspace_directory.name or ""})
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to list files in bucket {self.bucket_id}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         response_data = response.json()
@@ -309,7 +301,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         # Parse cloud asset URLs before normalizing
         parsed_path = self._parse_cloud_asset_path(path)
         normalized_path = get_workspace_relative_path(parsed_path, self.workspace_directory)
-        return urljoin(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
+        return join_cloud_url(self.base_url, f"/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
 
     @staticmethod
     def list_buckets(*, base_url: str, api_key: str, timeout: float | None = None) -> list[dict]:
@@ -324,13 +316,12 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             A list of dictionaries containing bucket information.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, "/api/buckets")
+        url = join_cloud_url(base_url, "/api/buckets")
 
         try:
             response = request_with_retry("GET", url, headers=headers, timeout=timeout)
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to list buckets: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         return response.json().get("buckets", [])
@@ -357,13 +348,12 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             RuntimeError: If the organizations request fails.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, "/api/organizations")
+        url = join_cloud_url(base_url, "/api/organizations")
 
         try:
             response = request_with_retry("GET", url, headers=headers, timeout=timeout)
         except httpx2.HTTPStatusError as e:
             msg = f"Failed to fetch organization default bucket: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         organizations = response.json().get("organizations", [])
@@ -394,7 +384,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             RuntimeError: If the existence check fails for a reason other than a 404.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        url = urljoin(base_url, f"/api/buckets/{bucket_id}")
+        url = join_cloud_url(base_url, f"/api/buckets/{bucket_id}")
 
         try:
             request_with_retry("GET", url, headers=headers, timeout=timeout)
@@ -402,7 +392,6 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             if e.response.status_code == HTTPStatus.NOT_FOUND:
                 return False
             msg = f"Failed to check bucket '{bucket_id}': {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
 
         return True
@@ -420,7 +409,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             path: The path of the file to delete.
         """
         normalized_path = get_workspace_relative_path(path, self.workspace_directory)
-        url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
+        url = join_cloud_url(self.base_url, f"/api/buckets/{self.bucket_id}/assets/{normalized_path.as_posix()}")
 
         try:
             self._request("DELETE", url)
@@ -433,110 +422,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
                 )
                 return
             msg = f"Failed to delete file {normalized_path}: {e}"
-            logger.error(msg)
             raise RuntimeError(msg) from e
-
-    def _is_cloud_asset_url(self, url_str: str) -> bool:
-        """Check if URL is a Griptape Cloud asset URL with domain validation.
-
-        Detects URLs matching pattern: https://cloud.griptape.ai/buckets/{id}/assets/{path}
-        Validates domain matches expected cloud domain.
-
-        Args:
-            url_str: String to check
-
-        Returns:
-            True if url_str is a valid cloud asset URL
-        """
-        # Fast negative checks first
-        if not url_str:
-            return False
-
-        # Must be a full URL with scheme
-        if not url_str.startswith(("http://", "https://")):
-            return False
-
-        # Parse URL to check domain
-        parsed = urlparse(url_str)
-        domain = parsed.netloc.lower()
-
-        # Get expected cloud domain from instance
-        expected_parsed = urlparse(self.base_url)
-        expected_domain = expected_parsed.netloc.lower()
-
-        # Domain must match
-        if domain != expected_domain:
-            return False
-
-        # Must contain both /buckets/ and /assets/ patterns
-        path = parsed.path
-        has_buckets = "/buckets/" in path
-        has_assets = "/assets/" in path
-
-        # Success path - valid cloud asset URL
-        return has_buckets and has_assets
-
-    def _extract_workspace_path_from_cloud_url(self, url_str: str) -> str | None:
-        """Extract workspace-relative path from cloud asset URL.
-
-        Parses URLs like: /buckets/{bucket_id}/assets/{workspace_path}
-        Returns just the {workspace_path} portion.
-
-        Args:
-            url_str: Cloud asset URL
-
-        Returns:
-            Workspace-relative path, or None if parsing fails
-        """
-        parsed = urlparse(url_str)
-        path = parsed.path
-
-        # Extract workspace-relative path from: /buckets/{bucket_id}/assets/{workspace_path}
-        expected_parts = 2
-        try:
-            parts = path.split("/assets/", 1)
-            if len(parts) != expected_parts:
-                return None
-            return parts[1]
-        except Exception:
-            return None
-
-    def _create_signed_download_url_from_asset_url(self, asset_url: str) -> str | None:
-        """Create a signed download URL for a cloud asset.
-
-        Args:
-            asset_url: Cloud asset URL to convert
-
-        Returns:
-            Signed download URL if successful, None if fails
-        """
-        # Extract workspace-relative path
-        workspace_path = self._extract_workspace_path_from_cloud_url(asset_url)
-        if not workspace_path:
-            logger.debug("Could not extract workspace path from cloud URL: %s", asset_url)
-            return None
-
-        # Build API URL for signed download URL
-        api_url = urljoin(self.base_url, f"/api/buckets/{self.bucket_id}/asset-urls/{workspace_path}")
-
-        # Make API request to get signed URL
-        try:
-            response = self._request("POST", api_url, json={"method": "GET"})
-
-            response_data = response.json()
-            signed_url = response_data["url"]
-
-            logger.info("Converted cloud asset URL to signed URL: %s", asset_url)
-        except Exception as e:
-            if isinstance(e, httpx2.HTTPStatusError):
-                logger.warning(
-                    "Failed to create signed download URL for %s: HTTP %s", asset_url, e.response.status_code
-                )
-            else:
-                logger.warning("Failed to create signed download URL for %s: %s", asset_url, e)
-            return None
-        else:
-            return signed_url
 
     @staticmethod
     def is_cloud_asset_url(url_str: str, base_url: str | None = None) -> bool:
@@ -567,7 +453,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
         # Get expected cloud domain from parameter or environment
         if base_url is None:
-            base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+            base_url = resolve_cloud_base_url()
 
         expected_parsed = urlparse(base_url)
         expected_domain = expected_parsed.netloc.lower()

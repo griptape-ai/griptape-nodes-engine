@@ -66,6 +66,8 @@ The editor and the application are separate programs, so events between them nee
 - **Direct WebSocket.** The application listens locally and the editor connects straight to it. Events never leave the machine. This is what Griptape Nodes Desktop uses when you activate with a license.
 - **Nodes API WebSocket.** The editor and the application each open their own outbound connection to Griptape Cloud, which relays events between them. This is what lets an editor in a browser drive an application on a different machine.
 
+Other programs, such as pipeline scripts and DCC panels, can reach the application the same ways, plus a local HTTP endpoint. See [Transports](guides/transports.md).
+
 The distinction matters for privacy, because editor traffic carries workflow content: node graphs, parameter values, and previews of generated assets. On the direct WebSocket none of it is exposed to the network. Either way your workspace stays on the machine that runs the workflows. The [SaaS configuration](#saas-configuration) section below draws both arrangements.
 
 ## SaaS configuration
@@ -207,6 +209,7 @@ Three properties carry the configuration.
 
 - [Installation](installation.md) covers installing Desktop or the application by hand.
 - [Configuration](guides/configuration.md) covers the workspace, storage backend, and static server settings.
+- [Transports](guides/transports.md) covers connecting scripts and other programs to the application.
 - [Assets and Outputs](guides/assets.md) explains where generated files go and how the editor previews them.
 - [Using the Admin Server](enterprise/using_the_admin_server.md) walks through activating with a license key.
 - [Admin Server](enterprise/admin_server.md) covers deploying and configuring the on-premises proxy.

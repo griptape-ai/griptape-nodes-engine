@@ -1,4 +1,4 @@
-"""Tests for the library registration and worker-compatibility fitness problem classes."""
+"""Tests for the library registration fitness problem classes."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AppEventListenerRegistrationProblem,
+    ExecutionEventListenerRegistrationProblem,
+    MCPToolRegistrationProblem,
     PostDispatchHookRegistrationProblem,
-    PostDispatchHooksWorkerIncompatibleProblem,
     PreDispatchHookRegistrationProblem,
     RequestHandlerRegistrationProblem,
 )
@@ -32,6 +33,40 @@ class TestAppEventListenerRegistrationProblem:
         assert caplog.records  # warning/error was logged
 
 
+class TestExecutionEventListenerRegistrationProblem:
+    def test_collate_single_problem(self) -> None:
+        problem = ExecutionEventListenerRegistrationProblem(error_message="listener boom")
+        result = ExecutionEventListenerRegistrationProblem.collate_problems_for_display([problem])
+        assert "listener boom" in result
+
+    def test_collate_multiple_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        problems = [
+            ExecutionEventListenerRegistrationProblem(error_message="err1"),
+            ExecutionEventListenerRegistrationProblem(error_message="err2"),
+        ]
+        with caplog.at_level("ERROR"):
+            result = ExecutionEventListenerRegistrationProblem.collate_problems_for_display(problems)
+        assert caplog.records
+        assert "err1" in result
+        assert "err2" in result
+
+
+class TestMCPToolRegistrationProblem:
+    def test_collate_single_problem(self) -> None:
+        problem = MCPToolRegistrationProblem(error_message="tool boom")
+        result = MCPToolRegistrationProblem.collate_problems_for_display([problem])
+        assert result == "Error registering MCP tools: tool boom"
+
+    def test_collate_multiple_logs_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        problems = [
+            MCPToolRegistrationProblem(error_message="err1"),
+            MCPToolRegistrationProblem(error_message="err2"),
+        ]
+        with caplog.at_level("ERROR"):
+            MCPToolRegistrationProblem.collate_problems_for_display(problems)
+        assert caplog.records
+
+
 class TestPostDispatchHookRegistrationProblem:
     def test_collate_single_problem(self) -> None:
         problem = PostDispatchHookRegistrationProblem(error_message="hook boom")
@@ -48,25 +83,6 @@ class TestPostDispatchHookRegistrationProblem:
         assert caplog.records
         assert "err1" in result
         assert "err2" in result
-
-
-class TestPostDispatchHooksWorkerIncompatibleProblem:
-    """The collated string is the only explanation an artist gets for a silent hook."""
-
-    def test_collate_names_the_library_and_the_hook_count(self) -> None:
-        problem = PostDispatchHooksWorkerIncompatibleProblem(library_name="My Library", hook_count=3)
-        result = PostDispatchHooksWorkerIncompatibleProblem.collate_problems_for_display([problem])
-        assert "My Library" in result
-        assert "3" in result
-
-    def test_collate_multiple_logs_error(self, caplog: pytest.LogCaptureFixture) -> None:
-        problems = [
-            PostDispatchHooksWorkerIncompatibleProblem(library_name="LibA", hook_count=1),
-            PostDispatchHooksWorkerIncompatibleProblem(library_name="LibB", hook_count=2),
-        ]
-        with caplog.at_level("ERROR"):
-            PostDispatchHooksWorkerIncompatibleProblem.collate_problems_for_display(problems)
-        assert caplog.records
 
 
 class TestPreDispatchHookRegistrationProblem:

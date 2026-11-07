@@ -56,6 +56,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultFailure,
     UnloadLibraryFromRegistryResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.external_environment import LIBRARY_PATHS_ENV_VAR
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     BetaFeatureSettingsCollisionProblem,
@@ -70,6 +71,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.library.common import LibraryFitness, LibraryInfo, LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.library.dependencies import parse_dependency_url
 from griptape_nodes.retained_mode.managers.library.environment import describe_unmet_requirements
+from griptape_nodes.retained_mode.managers.library.managed_environment import LibrariesProvidedByEnvironmentError
 from griptape_nodes.retained_mode.managers.library.workers import resolve_executes_in_worker
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import (
@@ -129,6 +131,19 @@ class LibraryRegistrar(EngineScoped):
         library_info = prereq_result.library_info
         file_path = prereq_result.file_path
 
+        # Checked here rather than only at discovery, so a library registered by path from the
+        # editor or a script is held to the same rule as one found at startup.
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment() and not await managed.is_allowed_in_environment(library_info):
+            managed.mark_not_provided_by_environment(library_info)
+            self.engine.library_manager._library_file_path_to_info[library_info.library_path] = library_info
+            details = (
+                f"Attempted to load the library at '{library_info.library_path}'. Failed because the engine is "
+                f"running in an environment that provides its libraries, and this library is not listed in "
+                f"{LIBRARY_PATHS_ENV_VAR}."
+            )
+            return RegisterLibraryFromFileResultFailure(result_details=details)
+
         # Phase 2: Progress through lifecycle phases
         progression_result = await self._progress_library_through_lifecycle(
             library_info=library_info, file_path=file_path, request=request
@@ -137,12 +152,17 @@ class LibraryRegistrar(EngineScoped):
         # FAILURE CHECK
         if isinstance(progression_result, RegisterLibraryFromFileResultFailure):
             return progression_result
+        self.engine.library_manager.workers.note_library_set_changed()
 
         # Phase 3: Return appropriate result based on fitness
         # At this point, library_name must be set (it's set during METADATA_LOADED phase)
         if library_info.library_name is None:
             details = "Library loaded but library_name was not set during metadata loading"
             return RegisterLibraryFromFileResultFailure(result_details=details)
+
+        # Its execution environment is built now, so its worker can start without waiting for the
+        # other libraries. Every way a library is registered passes through here, mid-session too.
+        await self.engine.library_manager.workers.start_worker_for_library(library_info.library_name)
 
         match library_info.fitness:
             case LibraryFitness.GOOD:
@@ -160,26 +180,21 @@ class LibraryRegistrar(EngineScoped):
             case LibraryFitness.UNUSABLE:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because no nodes were loaded. Check the log for more details."
                 return RegisterLibraryFromFileResultFailure(result_details=details)
-            case LibraryFitness.NOT_EVALUATED:
-                # Worker-delegated libraries on the orchestrator: node imports are skipped
-                # and fitness will be updated once the worker reports back via
-                # ReportLibraryLoadedRequest. Workers are started asynchronously (either by
-                # AppStartSessionRequest or by maybe_start_workers_for_existing_session)
-                # so we must NOT block here -- doing so would prevent the orchestrator from
-                # sending heartbeats to the worker process, causing it to self-terminate.
-                details = f"Successfully registered Library '{library_info.library_name}' from '{file_path}'. Node loading is delegated to a worker process."
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
-                    result_details=ResultDetails(message=details, level=logging.INFO),
-                )
             case _:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because an unknown/unexpected fitness '{library_info.fitness}' was returned."
                 return RegisterLibraryFromFileResultFailure(result_details=details)
 
     @handles(RegisterLibraryFromRequirementSpecifierRequest)
-    async def register_library_from_requirement_specifier_request(
+    async def register_library_from_requirement_specifier_request(  # noqa: PLR0911 (each failure returns its own result)
         self, request: RegisterLibraryFromRequirementSpecifierRequest
     ) -> ResultPayload:
+        managed = self.engine.library_manager.managed_environment
+        if managed.provisioned_by_environment():
+            return RegisterLibraryFromRequirementSpecifierResultFailure(
+                result_details=managed.environment_provides_libraries_message(
+                    f"install library '{request.requirement_specifier}'"
+                )
+            )
         try:
             package_name = Requirement(request.requirement_specifier).name
             # Determine venv path for dependency installation
@@ -234,6 +249,8 @@ class LibraryRegistrar(EngineScoped):
         except subprocess.CalledProcessError as e:
             details = f"Attempted to install library '{request.requirement_specifier}'. Failed: return code={e.returncode}, stdout={e.stdout}, stderr={e.stderr}"
             return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)
+        except LibrariesProvidedByEnvironmentError as e:
+            return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=str(e))
         except InvalidRequirement as e:
             details = f"Attempted to install library '{request.requirement_specifier}'. Failed due to invalid requirement specifier: {e}"
             return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)
@@ -259,6 +276,7 @@ class LibraryRegistrar(EngineScoped):
         except Exception as e:
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
+        self.engine.library_manager.workers.note_library_set_changed()
 
         # Release anything this library was holding in THIS process, so it cannot come back holding
         # objects its previous code built.
@@ -330,7 +348,7 @@ class LibraryRegistrar(EngineScoped):
 
             # If we don't have LibraryInfo yet, load metadata to get the name
             if not lib_info or not lib_info.library_name:
-                metadata_result = self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
+                metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
                     LoadLibraryMetadataFromFileRequest(file_path=file_path)
                 )
 
@@ -341,26 +359,18 @@ class LibraryRegistrar(EngineScoped):
 
                 library_name = metadata_result.library_schema.name
 
-                # Entering METADATA_LOADED directly, so the DISCOVERED-phase writer that
-                # normally resolves requires_worker never runs for this registration.
-                # Resolve it here too, or a library whose manifest suggests worker mode
-                # loads in-process when registered by file path (e.g. added to a running
-                # engine from the editor) -- its advanced module would then import in the
-                # orchestrator without the worker-managed dependency environment.
-                requires_worker = self.engine.library_manager.workers.resolve_requires_worker(
-                    lib_info.registered_path if lib_info else None,
-                    metadata_result.library_schema.metadata.declarations,
-                )
-
                 # Update or create LibraryInfo
-                executes_in_worker = resolve_executes_in_worker(
-                    requires_worker=requires_worker, metadata=metadata_result.library_schema.metadata
+                executes_in_worker = resolve_executes_in_worker(metadata=metadata_result.library_schema.metadata)
+                self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
+                    library_name=library_name,
+                    registered_path=lib_info.registered_path if lib_info else None,
+                    declarations=metadata_result.library_schema.metadata.declarations,
+                    executes_in_worker=executes_in_worker,
                 )
                 if lib_info:
                     lib_info.library_name = library_name
                     lib_info.library_version = metadata_result.library_schema.metadata.library_version
                     lib_info.lifecycle_state = LibraryLifecycleState.METADATA_LOADED
-                    lib_info.requires_worker = requires_worker
                     lib_info.executes_in_worker = executes_in_worker
                 else:
                     # Create new LibraryInfo since it doesn't exist yet
@@ -372,7 +382,6 @@ class LibraryRegistrar(EngineScoped):
                         library_version=metadata_result.library_schema.metadata.library_version,
                         fitness=LibraryFitness.NOT_EVALUATED,
                         problems=[],
-                        requires_worker=requires_worker,
                         executes_in_worker=executes_in_worker,
                     )
                     self.engine.library_manager._library_file_path_to_info[file_path] = lib_info
@@ -441,8 +450,7 @@ class LibraryRegistrar(EngineScoped):
         """Progress library through lifecycle states until LOADED.
 
         Advances library_info through states: DISCOVERED → METADATA_LOADED →
-        EVALUATED → DEPENDENCIES_INSTALLED → LOADED, or EVALUATED → WORKER_DELEGATED →
-        WORKER_PENDING (worker confirmation pending, not LOADED yet).
+        EVALUATED → DEPENDENCIES_INSTALLED → LOADED.
 
         Modifies library_info in place as it progresses through states.
 
@@ -479,10 +487,8 @@ class LibraryRegistrar(EngineScoped):
                 case LibraryLifecycleState.DISCOVERED:
                     # DISCOVERED → METADATA_LOADED
                     # All libraries (including sandbox) load metadata from JSON file
-                    metadata_result = (
-                        self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
-                            LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
-                        )
+                    metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
+                        LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
                     )
 
                     if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
@@ -492,23 +498,22 @@ class LibraryRegistrar(EngineScoped):
                     # Update library_info with metadata results
                     library_info.library_name = metadata_result.library_schema.name
                     library_info.library_version = metadata_result.library_schema.metadata.library_version
-                    library_info.requires_worker = self.engine.library_manager.workers.resolve_requires_worker(
-                        library_info.registered_path,
-                        metadata_result.library_schema.metadata.declarations,
-                    )
                     library_info.executes_in_worker = resolve_executes_in_worker(
-                        requires_worker=library_info.requires_worker,
                         metadata=metadata_result.library_schema.metadata,
+                    )
+                    self.engine.library_manager.workers.log_legacy_worker_mode_advisory(
+                        library_name=metadata_result.library_schema.name,
+                        registered_path=library_info.registered_path,
+                        declarations=metadata_result.library_schema.metadata.declarations,
+                        executes_in_worker=library_info.executes_in_worker,
                     )
                     library_info.lifecycle_state = LibraryLifecycleState.METADATA_LOADED
 
                 case LibraryLifecycleState.METADATA_LOADED:
                     # METADATA_LOADED → EVALUATED
                     # Need to load schema to pass to evaluate request
-                    metadata_result = (
-                        self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
-                            LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
-                        )
+                    metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
+                        LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
                     )
 
                     if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
@@ -555,16 +560,14 @@ class LibraryRegistrar(EngineScoped):
                     library_info.lifecycle_state = LibraryLifecycleState.EVALUATED
 
                 case LibraryLifecycleState.EVALUATED:
-                    # EVALUATED -> DEPENDENCIES_INSTALLED or WORKER_DELEGATED
+                    # EVALUATED -> DEPENDENCIES_INSTALLED
                     # Resolve library_dependencies before node imports: each dependency library must be
                     # fully loaded (including its venv added to sys.path via add_library_paths_to_sys_path)
                     # before this library's nodes are imported in the LOADED phase. Venvs are completely
                     # isolated - dependency packages are not accessible to this library's pip install
                     # subprocess.
-                    dep_metadata_result = (
-                        self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
-                            LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
-                        )
+                    dep_metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
+                        LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
                     )
                     if not isinstance(dep_metadata_result, LoadLibraryMetadataFromFileResultFailure):
                         dep_schema = dep_metadata_result.library_schema
@@ -582,23 +585,60 @@ class LibraryRegistrar(EngineScoped):
                                 default=LibraryDependencyInstallBehavior.ALWAYS,
                                 cast_type=str,
                             )
+                            managed = self.engine.library_manager.managed_environment
+                            environment_mode = managed.provisioned_by_environment()
                             for dep in griptape_library_deps:
                                 parsed_dep = parse_dependency_url(dep.url)
                                 repo_name = parsed_dep.repo_name
+                                # In environment mode only a library the environment provides can
+                                # satisfy it; a configured copy (even a disabled one) never loads.
+                                candidates = self._library_dependency_candidates(
+                                    repo_name, environment_mode=environment_mode
+                                )
                                 already_registered = any(
-                                    (info.library_name == repo_name or repo_name in Path(info.library_path).parts)
-                                    and info.lifecycle_state != LibraryLifecycleState.FAILURE
+                                    info.lifecycle_state != LibraryLifecycleState.FAILURE
                                     and info.fitness
                                     not in (
                                         LibraryFitness.UNUSABLE,
                                         LibraryFitness.MISSING,
                                     )
-                                    for info in self.engine.library_manager._library_file_path_to_info.values()
+                                    for info in candidates
                                 )
                                 if already_registered:
                                     logger.debug(
                                         "Library dependency '%s' is already registered, skipping download",
                                         dep.url,
+                                    )
+                                    continue
+                                # Only a library the environment provides can satisfy a dependency
+                                # then; a download would be a library nobody put in the environment.
+                                if environment_mode:
+                                    # The environment may provide it but have it fail to load; then the
+                                    # fix is that library's own problems, not adding it again.
+                                    if candidates:
+                                        failed = candidates[0]
+                                        failed_name = failed.library_name or failed.library_path
+                                        reason = (
+                                            f"The environment provides it as '{failed_name}', but that library "
+                                            "failed to load. See its problems in Library Management."
+                                        )
+                                    else:
+                                        reason = (
+                                            "The environment this engine runs in does not provide it, and "
+                                            "libraries are not downloaded in that case. Ask whoever set up "
+                                            "this environment to add it."
+                                        )
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(dependency_name=dep.url, error_message=reason)
+                                        )
+                                        library_info.fitness = LibraryFitness.FLAWED
+                                    logger.info(
+                                        "Library '%s' depends on '%s', which the environment does not provide "
+                                        "as a loaded library: %s",
+                                        library_info.library_name,
+                                        dep.url,
+                                        reason,
                                     )
                                     continue
                                 if install_behavior == LibraryDependencyInstallBehavior.NEVER:
@@ -644,13 +684,6 @@ class LibraryRegistrar(EngineScoped):
                                         dep_result.result_details,
                                     )
 
-                    # A worker-mode library still reaches the install, because the orchestrator has
-                    # to build its EXECUTION environment: the worker receives that directory as
-                    # PYTHONPATH and so cannot create it. Only the edit-time venv is the worker's,
-                    # and `_this_process_owns_the_edit_venv` is what declines it here. The lifecycle
-                    # still reports WORKER_DELEGATED and completes through LOADED, so the library is
-                    # registered for the editor and for workflow loading.
-                    delegated_to_worker = library_info.requires_worker and not self.engine.library_manager.is_worker
                     install_result = (
                         await self.engine.library_manager.dependencies.install_library_dependencies_request(
                             InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
@@ -698,22 +731,16 @@ class LibraryRegistrar(EngineScoped):
                     if shadowed_packages:
                         library_info.problems.append(ShadowedEnginePackagesProblem(packages=shadowed_packages))
 
-                    library_info.lifecycle_state = (
-                        LibraryLifecycleState.WORKER_DELEGATED
-                        if delegated_to_worker
-                        else LibraryLifecycleState.DEPENDENCIES_INSTALLED
-                    )
+                    library_info.lifecycle_state = LibraryLifecycleState.DEPENDENCIES_INSTALLED
 
-                case LibraryLifecycleState.DEPENDENCIES_INSTALLED | LibraryLifecycleState.WORKER_DELEGATED:
-                    # DEPENDENCIES_INSTALLED or WORKER_DELEGATED → LOADED
+                case LibraryLifecycleState.DEPENDENCIES_INSTALLED:
+                    # DEPENDENCIES_INSTALLED → LOADED
 
                     if not library_info.is_sandbox:
                         # REGULAR LIBRARIES: Standard registration from JSON file
                         # Load metadata and create library
-                        metadata_result = (
-                            self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
-                                LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
-                            )
+                        metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
+                            LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
                         )
 
                         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
@@ -729,28 +756,9 @@ class LibraryRegistrar(EngineScoped):
                             library_data.name, file_path, base_dir
                         )
 
-                        # Load the advanced library module if specified. Worker-delegated
-                        # libraries skip this on the orchestrator, mirroring the venv/pip and
-                        # node-import skips above and below: the module executes in this
-                        # process, its third-party imports resolve against the library venv,
-                        # and the orchestrator deliberately never created that venv -- so any
-                        # manifest dependency it imports would raise ModuleNotFoundError and
-                        # kill the registration. Nothing on the orchestrator invokes the
-                        # advanced hooks for a worker library anyway (node loading, their only
-                        # load-time caller, is skipped), and generate_new_library accepts
-                        # advanced_library=None. The worker loads the module in its own
-                        # process with the venv populated.
+                        # Load the advanced library module if specified.
                         advanced_library_instance = None
-                        skip_advanced_library = (
-                            library_info.requires_worker and not self.engine.library_manager.is_worker
-                        )
-                        if skip_advanced_library and library_data.advanced_library_path:
-                            logger.debug(
-                                "Skipping Advanced Library load for worker-delegated library '%s' on the "
-                                "orchestrator; the worker loads it in its own process.",
-                                library_data.name,
-                            )
-                        elif library_data.advanced_library_path:
+                        if library_data.advanced_library_path:
                             try:
                                 advanced_library_instance = (
                                     self.engine.library_manager.module_loading.load_advanced_library_module(
@@ -794,45 +802,30 @@ class LibraryRegistrar(EngineScoped):
                             self._check_beta_feature_settings_collision(library_data.name, library)
                         )
 
-                        # For worker-delegated libraries on the orchestrator, skip node module
-                        # imports entirely -- importing them would pull heavy deps (torch, triton,
-                        # etc.) into the orchestrator process.  The library is already registered
-                        # in LibraryRegistry (for the editor and workflow loading); the worker
-                        # process handles node loading and will report fitness via
-                        # ReportLibraryLoadedRequest once it finishes.
-                        if library_info.requires_worker and not self.engine.library_manager.is_worker:
-                            library_info.fitness = LibraryFitness.NOT_EVALUATED
-                            library_info.lifecycle_state = LibraryLifecycleState.WORKER_PENDING
-                            self.engine.library_manager._library_file_path_to_info[file_path] = library_info
-                        else:
-                            # Attempt to load nodes from the library (modifies library_info in place).
-                            await asyncio.to_thread(
-                                self.engine.library_manager.module_loading.attempt_load_nodes_from_library,
-                                library_data=library_data,
-                                library=library,
-                                base_dir=base_dir,
-                                library_info=library_info,
-                                lazy_loading=self.engine.library_manager.module_loading.should_lazy_load_nodes(),
-                            )
-                            self.engine.library_manager._library_file_path_to_info[file_path] = library_info
+                        # Attempt to load nodes from the library (modifies library_info in place).
+                        await asyncio.to_thread(
+                            self.engine.library_manager.module_loading.attempt_load_nodes_from_library,
+                            library_data=library_data,
+                            library=library,
+                            base_dir=base_dir,
+                            library_info=library_info,
+                            lazy_loading=self.engine.library_manager.module_loading.should_lazy_load_nodes(),
+                        )
+                        self.engine.library_manager._library_file_path_to_info[file_path] = library_info
 
-                        # A worker reports its load to the orchestrator, which never imported this
-                        # library and so has no other account of how it went. Schemas travel only
-                        # for a library the orchestrator cannot import: an exec-deps library already
-                        # registered its real classes there, and probing every node class to build
-                        # schemas it will discard costs a timeout apiece and can exceed 100 KB.
+                        # A worker reports its load so the orchestrator learns this library's nodes
+                        # can execute there. The orchestrator imported the library itself and keeps
+                        # its own fitness verdict; this is only the news that the worker is ready.
+                        #
+                        # Not from a general-purpose worker: it is no library's worker, so its load
+                        # is not the one the orchestrator is waiting on, and a report from it would
+                        # release a library's gate before that library's own worker had loaded it.
                         if (
                             self.engine.library_manager.is_worker
+                            and not self.engine.library_manager.is_general_purpose_worker
                             and library_info.lifecycle_state == LibraryLifecycleState.LOADED
                             and library_info.library_name
                         ):
-                            node_schemas = (
-                                await self.engine.library_manager.workers.serialize_library_node_schemas(
-                                    library_info.library_name
-                                )
-                                if library_info.requires_worker
-                                else None
-                            )
                             await self.engine.library_manager.workers.report_library_loaded(
                                 ReportLibraryLoadedRequest(
                                     library_name=library_info.library_name,
@@ -840,17 +833,14 @@ class LibraryRegistrar(EngineScoped):
                                     problem_details=self.engine.library_manager.catalog.collate_problems_for_lib_info(
                                         library_info
                                     ),
-                                    node_schemas=node_schemas,
                                 )
                             )
                     else:
                         # SANDBOX LIBRARIES: Full processing here (discovery + registration)
                         # Load metadata from JSON file (already generated in DISCOVERED → METADATA_LOADED)
                         sandbox_directory = Path(library_info.library_path).parent
-                        metadata_result = (
-                            self.engine.library_manager.metadata_loading.load_library_metadata_from_file_request(
-                                LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
-                            )
+                        metadata_result = self.engine.library_manager.metadata_loading.read_library_metadata(
+                            LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
                         )
 
                         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
@@ -882,6 +872,24 @@ class LibraryRegistrar(EngineScoped):
 
         # Success - progressed to LOADED state
         return None
+
+    def _library_dependency_candidates(self, repo_name: str, *, environment_mode: bool) -> list[LibraryInfo]:
+        """The known libraries that could satisfy a dependency on *repo_name*, whatever their state.
+
+        In environment mode only libraries the environment provides count.
+        """
+        managed = self.engine.library_manager.managed_environment
+        candidates: list[LibraryInfo] = []
+        for info in self.engine.library_manager._library_file_path_to_info.values():
+            names_repo = info.library_name == repo_name or managed.library_path_names_repo(
+                info.library_path, repo_name, environment_mode=environment_mode
+            )
+            if not names_repo:
+                continue
+            if environment_mode and not managed.is_known_environment_library(info.library_path):
+                continue
+            candidates.append(info)
+        return candidates
 
     def _apply_metadata_load_failure(
         self,
