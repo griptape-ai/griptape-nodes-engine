@@ -493,7 +493,7 @@ class TestIdsAcrossRescans:
         )
 
         assert failure is None
-        assert not engine.context_manager.has_current_workflow()
+        assert engine.open_workflows.all_open() == []
         assert _id_at(engine, opened_file) == opened_id
         assert _id_at(engine, closed_file) == closed_id
         assert engine.workflow_registry.get(closed_id or "").name == "closed"
@@ -954,7 +954,7 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         reopened = _run(engine, RunWorkflowFromRegistryRequest(workflow_name=moved.new_workflow_name))
         assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened.result_details
         assert reopened.workflow_id == workflow_id
-        assert engine.context_manager.get_current_workflow_id() == workflow_id
+        assert engine.open_workflows.is_open(workflow_id)
         _close(engine)
 
         _scan(engine, workspace)
