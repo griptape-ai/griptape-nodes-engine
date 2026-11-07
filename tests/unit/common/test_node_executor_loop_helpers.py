@@ -14,6 +14,8 @@ These tests cover small, near-pure helpers that decide loop control flow:
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
   creations from reaching editors.
+* ``_get_start_node_item_values`` / ``_extract_iteration_results_from_subprocess`` - collect
+  an item wired straight from the loop's start node into the end node's ``new_item_to_add``.
 """
 
 import logging
@@ -626,3 +628,164 @@ class TestSilencePackagedNodeCreationBroadcasts:
         package_result = _make_package_result_with_nodes(0)
         NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
         assert package_result.serialized_flow_commands.serialized_node_commands == []
+
+
+def _make_start_wired_end_node(source_param: str) -> tuple[MagicMock, list[MagicMock]]:
+    """Mock legacy end node whose new_item_to_add is wired from its start node's ``source_param``."""
+    start_node = MagicMock()
+    start_node.name = "LoopStart"
+    start_node._get_iteration_items.return_value = ["a", "b", "c"]
+    start_node.get_all_iteration_values.return_value = [10, 20, 30]
+    end_node = MagicMock(spec=BaseIterativeEndNode)
+    end_node.name = "LoopEnd"
+    end_node.start_node = start_node
+    conn = MagicMock()
+    conn.target_parameter_name = "new_item_to_add"
+    conn.source_node_name = "LoopStart"
+    conn.source_parameter_name = source_param
+    return end_node, [conn]
+
+
+class TestGetStartNodeItemValues:
+    """An item wired from the unpackaged start node takes each iteration's start node value."""
+
+    def test_returns_current_item_per_iteration(self) -> None:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        values = _make_executor()._get_start_node_item_values(end_node, connections, [0, 2])
+        assert values == {0: "a", 2: "c"}
+
+    def test_returns_loop_values_for_index(self) -> None:
+        end_node, connections = _make_start_wired_end_node("index")
+        values = _make_executor()._get_start_node_item_values(end_node, connections, [0, 1, 2])
+        assert values == {0: 10, 1: 20, 2: 30}
+
+    def test_returns_none_when_item_comes_from_a_body_node(self) -> None:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        connections[0].source_node_name = "Body"
+        assert _make_executor()._get_start_node_item_values(end_node, connections, [0]) is None
+
+    def test_returns_none_for_group_end_node(self) -> None:
+        _, connections = _make_start_wired_end_node("current_item")
+        group = MagicMock(spec=BaseIterativeNodeGroup)
+        assert _make_executor()._get_start_node_item_values(group, connections, [0]) is None
+
+
+class TestExtractIterationResultsFromSubprocessStartNodeItem:
+    """Isolated and publisher loops collect a start-node item for each successful iteration only."""
+
+    def test_collects_start_node_item_for_successful_iterations(self) -> None:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.incoming_connections = connections
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        iteration_outputs: list[tuple[int, bool, dict[str, Any] | None]] = [
+            (0, True, {}),
+            (1, False, None),
+            (2, True, {}),
+        ]
+
+        with patch.object(NodeExecutor, "_extract_parameter_output_values", return_value={}):
+            results, successful, _ = executor._extract_iteration_results_from_subprocess(
+                iteration_outputs, cast("Any", _make_package_result()), end_node
+            )
+
+        assert successful == [0, 2]
+        assert results == {0: "a", 2: "c"}
+
+
+class TestGetParameterValuesFromIterationsStartNodeItem:
+    """A start-node item is read from the start node, skipping iterations whose body failed."""
+
+    def _run(self, failed_iteration_indices: set[int] | None) -> dict[int, Any]:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.incoming_connections = connections
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        deserialized_flows = [(0, "flow_0", {}), (1, "flow_1", {}), (2, "flow_2", {})]
+
+        kwargs: dict[str, Any] = {}
+        if failed_iteration_indices is not None:
+            kwargs["failed_iteration_indices"] = failed_iteration_indices
+        return executor.get_parameter_values_from_iterations(
+            end_loop_node=end_node,
+            deserialized_flows=deserialized_flows,
+            package_flow_result_success=cast("Any", _make_package_result()),
+            **kwargs,
+        )
+
+    def test_collects_item_for_every_iteration_by_default(self) -> None:
+        assert self._run(None) == {0: "a", 1: "b", 2: "c"}
+
+    def test_skips_failed_iterations(self) -> None:
+        assert self._run({1}) == {0: "a", 2: "c"}
+
+
+class TestHandleEmptyLoopBody:
+    """An empty loop body collects only an item wired straight from the start node."""
+
+    @staticmethod
+    def _setup(
+        connections: list[MagicMock], *, list_succeeds: bool = True
+    ) -> tuple[NodeExecutor, MagicMock, MagicMock]:
+        end_node, _ = _make_start_wired_end_node("current_item")
+        start_node = end_node.start_node
+        start_node._get_total_iterations.return_value = 3
+        executor = _make_executor()
+        if list_succeeds:
+            result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+            result.incoming_connections = connections
+        else:
+            result = MagicMock()
+        cast("MagicMock", executor.engine).handle_request.return_value = result
+        start_node._require_workflow.return_value = _workflow_of(executor)
+        return executor, start_node, end_node
+
+    @pytest.mark.asyncio
+    async def test_collects_start_node_item_for_every_iteration(self) -> None:
+        _, connections = _make_start_wired_end_node("current_item")
+        executor, start_node, end_node = self._setup(connections)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == ["a", "b", "c"]
+        end_node._output_results_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_collects_nothing_when_item_is_not_wired_from_start(self) -> None:
+        _, connections = _make_start_wired_end_node("current_item")
+        connections[0].source_node_name = "Body"
+        executor, start_node, end_node = self._setup(connections)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == []
+        end_node._output_results_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_collects_nothing_when_connections_cannot_be_listed(self) -> None:
+        executor, start_node, end_node = self._setup([], list_succeeds=False)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == []
+        end_node._output_results_list.assert_called_once()
+
+
+class TestBuildResultsList:
+    """Results are ordered by iteration, with None for failures and nothing for results-less successes."""
+
+    def test_orders_results_by_iteration(self) -> None:
+        results = NodeExecutor._build_results_list(3, [0, 1, 2], {2: "c", 0: "a", 1: "b"})
+        assert results == ["a", "b", "c"]
+
+    def test_failed_iterations_become_none(self) -> None:
+        results = NodeExecutor._build_results_list(3, [0, 2], {0: "a", 2: "c"})
+        assert results == ["a", None, "c"]
+
+    def test_successful_iteration_without_result_adds_nothing(self) -> None:
+        results = NodeExecutor._build_results_list(3, [0, 1, 2], {0: "a", 2: "c"})
+        assert results == ["a", "c"]
