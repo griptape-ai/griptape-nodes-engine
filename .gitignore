@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+.run-overrides.txt
 develop-eggs/
 dist/
 downloads/
