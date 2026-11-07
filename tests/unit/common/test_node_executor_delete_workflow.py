@@ -23,18 +23,18 @@ def _make_delete_success() -> DeleteWorkflowResultSuccess:
     return DeleteWorkflowResultSuccess(result_details="ok")
 
 
-class TestDeleteWorkflowUsesTheRegisteredName:
-    """_delete_workflow deletes the entry the registry holds for the file, by that entry's name."""
+class TestDeleteWorkflowUsesTheRegisteredId:
+    """_delete_workflow deletes the entry the registry holds for the file, by that entry's id."""
 
     @pytest.mark.asyncio
-    async def test_deletes_the_registered_entry_by_its_name(self, tmp_path: Path) -> None:
+    async def test_deletes_the_registered_entry_by_its_id(self, tmp_path: Path) -> None:
         workflow_path = tmp_path / "subdir" / "my_flow.py"
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
         registered = MagicMock()
-        registered.name = "subdir/my_flow"
+        registered.workflow_id = "registered-id"
         mock_engine.workflow_registry.find_by_path.return_value = registered
 
         await executor._delete_workflow(workflow_path=workflow_path)
@@ -42,7 +42,8 @@ class TestDeleteWorkflowUsesTheRegisteredName:
         mock_engine.workflow_registry.find_by_path.assert_called_once_with(workflow_path)
         delete_request = mock_engine.ahandle_request.call_args.args[0]
         assert isinstance(delete_request, DeleteWorkflowRequest)
-        assert delete_request.name == "subdir/my_flow"
+        assert delete_request.workflow_id == "registered-id"
+        assert delete_request.name is None
         mock_engine.workflow_registry.register_file.assert_not_called()
 
 
@@ -64,14 +65,14 @@ class TestDeleteWorkflowRegistrationFallback:
         mock_engine.ahandle_request = AsyncMock(side_effect=[mock_metadata_result, _make_delete_success()])
         mock_registry = mock_engine.workflow_registry
         mock_registry.find_by_path.return_value = None
-        mock_registry.register_file.return_value.name = "my_flow"
+        mock_registry.register_file.return_value.workflow_id = "registered-id"
 
         await executor._delete_workflow(workflow_path=workflow_path)
 
         mock_registry.register_file.assert_called_once_with(workflow_path, mock_metadata, listed=False)
         delete_request = mock_engine.ahandle_request.call_args.args[0]
         assert isinstance(delete_request, DeleteWorkflowRequest)
-        assert delete_request.name == "my_flow"
+        assert delete_request.workflow_id == "registered-id"
 
     @pytest.mark.asyncio
     async def test_skips_the_delete_when_the_file_cannot_be_read(self, tmp_path: Path) -> None:

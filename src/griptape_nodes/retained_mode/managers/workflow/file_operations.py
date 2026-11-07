@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.workflow_registry import (
+    OpenWorkflowRemovalError,
     WorkflowAddressError,
     WorkflowPathTakenError,
 )
@@ -54,20 +55,23 @@ class WorkflowFileOperations(EngineScoped):
 
     @handles(DeleteWorkflowRequest)
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
-        # If the deleted workflow is open, tear down its flows/nodes and close it BEFORE
-        # removing the registry entry, which refuses to drop an open workflow's entry.
-        # Deleting a workflow that isn't open (e.g. published-workflow subprocess cleanup)
-        # goes straight to the registry/file cleanup and leaves any open workflow alone.
-        target = self.engine.workflow_registry.find_by_name(request.name)
-        if target is not None:
-            open_target = self.engine.open_workflows.find(target.workflow_id)
-            if open_target is not None:
-                await self.engine.aclose_workflow(open_target)
+        registry = self.engine.workflow_registry
         try:
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.name)
-            self.engine.workflow_registry.remove(workflow.workflow_id)
-        except Exception as e:
-            details = f"Failed to remove workflow from registry with name '{request.name}'. Exception: {e}"
+            workflow = registry.resolve_address(
+                workflow_id=request.workflow_id, workflow_name=request.name, action="delete"
+            )
+        except WorkflowAddressError as err:
+            return DeleteWorkflowResultFailure(result_details=str(err))
+        workflow_name = workflow.name
+        # The registry refuses to drop an open workflow's entry, so close it first. Deleting a
+        # workflow that isn't open leaves every open workflow alone.
+        open_target = self.engine.open_workflows.find(workflow.workflow_id)
+        if open_target is not None:
+            await self.engine.aclose_workflow(open_target)
+        try:
+            registry.remove(workflow.workflow_id)
+        except (KeyError, OpenWorkflowRemovalError) as e:
+            details = f"Failed to remove workflow from registry with name '{workflow_name}'. Exception: {e}"
             return DeleteWorkflowResultFailure(result_details=details)
         # Unsaved workflows have no backing file or config entry; dropping the registry
         # entry is the entire operation.
@@ -75,14 +79,14 @@ class WorkflowFileOperations(EngineScoped):
         if workflow_file_path is None:
             return DeleteWorkflowResultSuccess(
                 result_details=ResultDetails(
-                    message=f"Successfully deleted unsaved workflow: {request.name}", level=logging.INFO
+                    message=f"Successfully deleted unsaved workflow: {workflow_name}", level=logging.INFO
                 )
             )
         config_manager = self.engine.config_manager
         try:
             config_manager.delete_user_workflow(workflow_file_path)
         except Exception as e:
-            details = f"Failed to remove workflow from user config with name '{request.name}'. Exception: {e}"
+            details = f"Failed to remove workflow from user config with name '{workflow_name}'. Exception: {e}"
             return DeleteWorkflowResultFailure(result_details=details)
         # delete the actual file
         full_path = config_manager.workspace_path.joinpath(workflow_file_path)
@@ -97,7 +101,7 @@ class WorkflowFileOperations(EngineScoped):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
         return DeleteWorkflowResultSuccess(
-            result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
+            result_details=ResultDetails(message=f"Successfully deleted workflow: {workflow_name}", level=logging.INFO)
         )
 
     @handles(RenameWorkflowRequest)
@@ -136,16 +140,18 @@ class WorkflowFileOperations(EngineScoped):
     @handles(MoveWorkflowRequest)
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911
         try:
-            # Validate source workflow exists
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
-        except KeyError:
-            details = f"Failed to move workflow '{request.workflow_name}' because it does not exist."
-            return MoveWorkflowResultFailure(result_details=details)
+            workflow = self.engine.workflow_registry.resolve_address(
+                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="move"
+            )
+        except WorkflowAddressError as err:
+            return MoveWorkflowResultFailure(result_details=str(err))
+        # The name before the move, for messages: the entry's name follows its file.
+        workflow_name = workflow.name
 
         # Move is a disk-level operation; unsaved workflows have nothing to move.
         if workflow.file_path is None:
             details = (
-                f"Cannot move unsaved workflow '{request.workflow_name}' because it has no file on disk. "
+                f"Cannot move unsaved workflow '{workflow_name}' because it has no file on disk. "
                 "Save the workflow before moving it."
             )
             return MoveWorkflowResultFailure(result_details=details)
@@ -156,9 +162,7 @@ class WorkflowFileOperations(EngineScoped):
         # Get current file path
         current_file_path = self.engine.workflow_registry.get_complete_file_path(old_relative_path)
         if not Path(current_file_path).exists():
-            details = (
-                f"Failed to move workflow '{request.workflow_name}': File path '{current_file_path}' does not exist."
-            )
+            details = f"Failed to move workflow '{workflow_name}': File path '{current_file_path}' does not exist."
             return MoveWorkflowResultFailure(result_details=details)
 
         # Clean and validate target directory
@@ -182,9 +186,7 @@ class WorkflowFileOperations(EngineScoped):
 
         # Check if target file already exists
         if new_absolute_path.exists():
-            details = (
-                f"Failed to move workflow '{request.workflow_name}': Target file '{new_absolute_path}' already exists."
-            )
+            details = f"Failed to move workflow '{workflow_name}': Target file '{new_absolute_path}' already exists."
             return MoveWorkflowResultFailure(result_details=details)
 
         # A stale entry can still hold the target path, or the name it gives, after its file is
@@ -193,7 +195,7 @@ class WorkflowFileOperations(EngineScoped):
         try:
             self.engine.workflow_registry.raise_if_path_taken(workflow, new_relative_path)
         except WorkflowPathTakenError as err:
-            details = f"Failed to move workflow '{request.workflow_name}': Workflow '{err.existing.name}' is already registered at '{new_absolute_path}'."
+            details = f"Failed to move workflow '{workflow_name}': Workflow '{err.existing.name}' is already registered at '{new_absolute_path}'."
             return MoveWorkflowResultFailure(result_details=details)
 
         try:
@@ -216,18 +218,18 @@ class WorkflowFileOperations(EngineScoped):
             if new_absolute_path.exists() and not Path(current_file_path).exists():
                 try:
                     new_absolute_path.rename(current_file_path)
-                    rollback_message = f"Rolled back file move for workflow '{request.workflow_name}'"
+                    rollback_message = f"Rolled back file move for workflow '{workflow_name}'"
                     error_messages.append(ResultDetail(message=rollback_message, level=logging.INFO))
                 except OSError:
-                    rollback_failure = f"Failed to rollback file move for workflow '{request.workflow_name}'"
+                    rollback_failure = f"Failed to rollback file move for workflow '{workflow_name}'"
                     error_messages.append(ResultDetail(message=rollback_failure, level=logging.ERROR))
 
             return MoveWorkflowResultFailure(result_details=ResultDetails(*error_messages))
         except Exception as e:
-            details = f"Failed to move workflow '{request.workflow_name}': {e!s}"
+            details = f"Failed to move workflow '{workflow_name}': {e!s}"
             return MoveWorkflowResultFailure(result_details=details)
         else:
-            details = f"Successfully moved workflow '{request.workflow_name}' to '{new_relative_path}'"
+            details = f"Successfully moved workflow '{workflow_name}' to '{new_relative_path}'"
             return MoveWorkflowResultSuccess(
                 moved_file_path=new_relative_path,
                 new_workflow_name=workflow.name,

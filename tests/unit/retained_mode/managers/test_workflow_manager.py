@@ -391,7 +391,7 @@ class TestWorkflowManager:
         mock_workflow.metadata = mock_metadata
         mock_workflow.metadata_is_placeholder = False
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow):
+        with patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow):
             result = workflow_manager.catalog.on_get_workflow_metadata_request(request)
 
         assert isinstance(result, GetWorkflowMetadataResultSuccess)
@@ -478,7 +478,7 @@ class TestWorkflowManager:
         existing_content = "# /// script\n# [tool]\n# ///\nprint('body')\n"
 
         with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow),
             patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "is_file", return_value=True),
             patch.object(anyio.Path, "read_text", AsyncMock(return_value=existing_content)),
@@ -696,7 +696,7 @@ class TestWorkflowManager:
         mock_workflow.file_path = "my_workflow.py"
 
         with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow),
             patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "exists", return_value=False),
         ):
@@ -713,7 +713,7 @@ class TestWorkflowManager:
         mock_workflow.file_path = "my_workflow.py"
 
         with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow),
             patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "mkdir"),
@@ -2294,7 +2294,7 @@ class TestWorkflowManager:
         )
         workflow_manager._workflow_file_path_to_info[info_key] = wf_info
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow):
+        with patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow):
             result = workflow_manager.catalog.on_get_workflow_info_request(request)
 
         assert isinstance(result, GetWorkflowInfoResultSuccess)

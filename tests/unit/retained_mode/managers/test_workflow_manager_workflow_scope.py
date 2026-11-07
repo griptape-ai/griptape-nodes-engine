@@ -8,6 +8,7 @@ saved workflow a request acts on. Most tests open a second workflow beside the f
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -40,17 +41,36 @@ from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
+    BranchWorkflowRequest,
+    BranchWorkflowResultFailure,
+    BranchWorkflowResultSuccess,
+    CompareWorkflowsRequest,
+    CompareWorkflowsResultFailure,
+    CompareWorkflowsResultSuccess,
     DeleteWorkflowRequest,
+    DeleteWorkflowResultFailure,
     DeleteWorkflowResultSuccess,
     GetPublishOptionsRequest,
     GetPublishOptionsResultSuccess,
     GetVariableSubstitutionEnabledRequest,
+    GetWorkflowInfoRequest,
+    GetWorkflowInfoResultFailure,
+    GetWorkflowInfoResultSuccess,
+    GetWorkflowMetadataRequest,
+    GetWorkflowMetadataResultFailure,
+    GetWorkflowMetadataResultSuccess,
     GetWorkflowRunCommandRequest,
     GetWorkflowRunCommandResultFailure,
     GetWorkflowRunCommandResultSuccess,
     GetWorkflowShapeRequest,
     ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
+    MergeWorkflowBranchRequest,
+    MergeWorkflowBranchResultFailure,
+    MergeWorkflowBranchResultSuccess,
+    MoveWorkflowRequest,
+    MoveWorkflowResultFailure,
+    MoveWorkflowResultSuccess,
     PublishWorkflowRegisteredEventData,
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
@@ -59,6 +79,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RenameWorkflowRequest,
     RenameWorkflowResultFailure,
     RenameWorkflowResultSuccess,
+    ResetWorkflowBranchRequest,
+    ResetWorkflowBranchResultFailure,
+    ResetWorkflowBranchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
@@ -66,6 +89,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowRequest,
     SaveWorkflowResultSuccess,
     SetVariableSubstitutionEnabledRequest,
+    SetWorkflowMetadataRequest,
+    SetWorkflowMetadataResultFailure,
+    SetWorkflowMetadataResultSuccess,
+    WorkflowStatus,
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
@@ -84,7 +111,7 @@ from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from griptape_nodes.node_library.workflow_registry import Workflow
     from griptape_nodes.retained_mode.engine import Engine
@@ -318,6 +345,21 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert not project_engine.workflow_registry.get(tab.workflow_id).is_saved
         assert project_engine.open_workflows.is_open(tab.workflow_id)
 
+    def test_renaming_a_closed_workflow_keeps_it_in_its_folder(self, project_engine: Engine) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        moved = _send_async(
+            project_engine, MoveWorkflowRequest(workflow_id=closed.workflow_id, target_directory="shots"), None
+        )
+        assert isinstance(moved, MoveWorkflowResultSuccess), moved.result_details
+
+        renamed = _send_async(
+            project_engine, RenameWorkflowRequest(workflow_id=closed.workflow_id, requested_name="b"), None
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert renamed.new_workflow_name == "shots/b"
+        assert (project_engine.config_manager.workspace_path / "shots" / "b.py").is_file()
+
     def test_renaming_a_closed_workflow_to_its_own_name_rewrites_only_its_display_name(
         self, project_engine: Engine
     ) -> None:
@@ -410,6 +452,36 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert project_engine.open_workflows.is_open(target.workflow_id)
         assert not project_engine.workflow_registry.get(tab.workflow_id).is_saved
 
+    def test_moving_a_closed_workflow_from_another_tab_moves_its_own_file(self, project_engine: Engine) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        closed_content = closed.file_path.read_text(encoding="utf-8")
+        tab = _open_with_flow(project_engine, "tab")
+
+        moved = _send_async(
+            project_engine, MoveWorkflowRequest(workflow_id=closed.workflow_id, target_directory="moved"), tab
+        )
+
+        assert isinstance(moved, MoveWorkflowResultSuccess), moved.result_details
+        assert moved.workflow_id == closed.workflow_id
+        moved_path = project_engine.config_manager.workspace_path / moved.moved_file_path
+        assert moved_path.read_text(encoding="utf-8") == closed_content
+        assert not closed.file_path.exists()
+        assert project_engine.open_workflows.is_open(tab.workflow_id)
+        assert not project_engine.workflow_registry.get(tab.workflow_id).is_saved
+
+    def test_deleting_a_closed_workflow_by_id_from_another_tab_leaves_the_tab_alone(
+        self, project_engine: Engine
+    ) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        tab = _open_with_flow(project_engine, "tab")
+
+        deleted = _send_async(project_engine, DeleteWorkflowRequest(workflow_id=closed.workflow_id), tab)
+
+        assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
+        assert not closed.file_path.exists()
+        assert project_engine.workflow_registry.find_by_id(closed.workflow_id) is None
+        assert project_engine.open_workflows.is_open(tab.workflow_id)
+
     def test_renaming_an_open_workflow_from_another_tab_saves_that_workflow(self, engine: Engine) -> None:
         _allow_several_open(engine)
         tab = _open(engine, "tab")
@@ -492,6 +564,162 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert isinstance(published, PublishWorkflowResultFailure)
         assert "from another workflow's tab" in str(published.result_details)
         publish.assert_not_called()
+
+
+@dataclass(frozen=True)
+class _AddressedRequest:
+    """A saved-workflow request, built to name its workflow by the address fields a test passes."""
+
+    build: Callable[[dict[str, Any]], RequestPayload]
+    success: type[ResultPayload]
+    failure: type[ResultPayload]
+    # The workflow id the success reports for the workflow the request named, or None if it reports none.
+    reported_id: Callable[[Any], str | None] | None = None
+    # The field that holds the name: "workflow_name", or "name" for DeleteWorkflowRequest.
+    name_field: str = "workflow_name"
+    # Merge and reset act on a branch.
+    targets_branch: bool = False
+
+
+_ADDRESSED_REQUESTS = {
+    "rename": _AddressedRequest(
+        build=lambda address: RenameWorkflowRequest(requested_name="renamed", **address),
+        success=RenameWorkflowResultSuccess,
+        failure=RenameWorkflowResultFailure,
+        reported_id=lambda result: result.workflow_id,
+    ),
+    "move": _AddressedRequest(
+        build=lambda address: MoveWorkflowRequest(target_directory="moved", **address),
+        success=MoveWorkflowResultSuccess,
+        failure=MoveWorkflowResultFailure,
+        reported_id=lambda result: result.workflow_id,
+    ),
+    "delete": _AddressedRequest(
+        build=lambda address: DeleteWorkflowRequest(**address),
+        success=DeleteWorkflowResultSuccess,
+        failure=DeleteWorkflowResultFailure,
+        name_field="name",
+    ),
+    "branch": _AddressedRequest(
+        build=lambda address: BranchWorkflowRequest(**address),
+        success=BranchWorkflowResultSuccess,
+        failure=BranchWorkflowResultFailure,
+        reported_id=lambda result: result.original_workflow_id,
+    ),
+    "merge": _AddressedRequest(
+        build=lambda address: MergeWorkflowBranchRequest(**address),
+        success=MergeWorkflowBranchResultSuccess,
+        failure=MergeWorkflowBranchResultFailure,
+        targets_branch=True,
+    ),
+    "reset": _AddressedRequest(
+        build=lambda address: ResetWorkflowBranchRequest(**address),
+        success=ResetWorkflowBranchResultSuccess,
+        failure=ResetWorkflowBranchResultFailure,
+        reported_id=lambda result: result.workflow_id,
+        targets_branch=True,
+    ),
+    "compare": _AddressedRequest(
+        build=lambda address: CompareWorkflowsRequest(compare_workflow_name="other", **address),
+        success=CompareWorkflowsResultSuccess,
+        failure=CompareWorkflowsResultFailure,
+        reported_id=lambda result: result.workflow_id,
+    ),
+    "get_metadata": _AddressedRequest(
+        build=lambda address: GetWorkflowMetadataRequest(**address),
+        success=GetWorkflowMetadataResultSuccess,
+        failure=GetWorkflowMetadataResultFailure,
+    ),
+    "set_metadata": _AddressedRequest(
+        build=lambda address: SetWorkflowMetadataRequest(
+            workflow_metadata={"description": "described"},  # type: ignore[arg-type]
+            **address,
+        ),
+        success=SetWorkflowMetadataResultSuccess,
+        failure=SetWorkflowMetadataResultFailure,
+    ),
+    "get_info": _AddressedRequest(
+        build=lambda address: GetWorkflowInfoRequest(**address),
+        success=GetWorkflowInfoResultSuccess,
+        failure=GetWorkflowInfoResultFailure,
+        reported_id=lambda result: result.workflow_id,
+    ),
+}
+
+
+class TestSavedWorkflowRequestsResolveTheirAddress:
+    """Each request names its workflow by id, by name, or by both when they agree, whatever the envelope names."""
+
+    @pytest.fixture
+    def addressed(self, project_engine: Engine) -> dict[str, Any]:
+        """A saved, closed "source" workflow with a branch, a saved "other" one, and an open tab beside them."""
+        source = _save_and_close(project_engine, "source")
+        other = _save_and_close(project_engine, "other")
+        branch = _send_async(project_engine, BranchWorkflowRequest(workflow_id=source.workflow_id), None)
+        assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
+        assert branch.branched_workflow_id is not None
+        registry = project_engine.workflow_registry
+        # Info is reported for files a registry scan has loaded the metadata of.
+        info_key = str(source.file_path)
+        project_engine.workflow_manager._workflow_file_path_to_info[info_key] = WorkflowManager.WorkflowInfo(
+            status=WorkflowStatus.GOOD, workflow_path=info_key, workflow_name="source"
+        )
+        return {
+            "source": registry.get(source.workflow_id),
+            "branch": registry.get(branch.branched_workflow_id),
+            "other": registry.get(other.workflow_id),
+            "tab": _open_with_flow(project_engine, "tab"),
+        }
+
+    @pytest.mark.parametrize("address_by", ["id", "name", "both"])
+    @pytest.mark.parametrize("request_kind", list(_ADDRESSED_REQUESTS))
+    def test_an_id_a_name_or_both_reach_the_workflow(
+        self, project_engine: Engine, addressed: dict[str, Any], request_kind: str, address_by: str
+    ) -> None:
+        spec = _ADDRESSED_REQUESTS[request_kind]
+        target = addressed["branch"] if spec.targets_branch else addressed["source"]
+        address: dict[str, Any] = {}
+        if address_by in ("id", "both"):
+            address["workflow_id"] = target.workflow_id
+        if address_by in ("name", "both"):
+            address[spec.name_field] = target.name
+
+        result = _send_async(project_engine, spec.build(address), addressed["tab"])
+
+        assert isinstance(result, spec.success), result.result_details
+        if spec.reported_id is not None:
+            assert spec.reported_id(result) == target.workflow_id
+        assert project_engine.open_workflows.is_open(addressed["tab"].workflow_id)
+
+    @pytest.mark.parametrize(
+        ("address_by", "expected"),
+        [
+            ("disagreeing", "belongs to"),
+            ("neither", "names no workflow"),
+            ("unknown_id", "no workflow has that id"),
+            ("unknown_name", "no workflow has that name"),
+        ],
+    )
+    @pytest.mark.parametrize("request_kind", list(_ADDRESSED_REQUESTS))
+    def test_an_address_naming_no_single_workflow_fails(
+        self, project_engine: Engine, addressed: dict[str, Any], request_kind: str, address_by: str, expected: str
+    ) -> None:
+        spec = _ADDRESSED_REQUESTS[request_kind]
+        target = addressed["branch"] if spec.targets_branch else addressed["source"]
+        address: dict[str, Any] = {}
+        if address_by == "disagreeing":
+            address = {"workflow_id": target.workflow_id, spec.name_field: addressed["other"].name}
+        if address_by == "unknown_id":
+            address = {"workflow_id": "0" * 32}
+        if address_by == "unknown_name":
+            address = {spec.name_field: "gone"}
+        listed_before = project_engine.workflow_registry.list_workflows()
+
+        result = _send_async(project_engine, spec.build(address), addressed["tab"])
+
+        assert isinstance(result, spec.failure)
+        assert expected in str(result.result_details)
+        assert project_engine.workflow_registry.list_workflows() == listed_before
 
 
 def _publisher(handler: Any, get_publish_options: Any = None) -> RegisteredEventHandler:
