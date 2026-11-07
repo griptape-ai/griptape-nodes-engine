@@ -149,5 +149,8 @@ class OpenWorkflowSet:
         return workflow
 
     def all_open(self) -> list[WorkflowRuntime]:
-        """Every open workflow's runtime, in the order they were opened."""
+        """Every open workflow's runtime, in the order they were opened.
+
+        A workflow a save moved onto a copy counts as opened when it moved.
+        """
         return list(self._by_id.values())

@@ -81,7 +81,7 @@ The situation name is not displayed on the parameter's value, but it does appear
 
 Users override the situation per-node via the cog button on the parameter, which spawns a `FileOutputSettings` node pre-filled with your declared situation. When that node is connected, `build_file()` returns *its* `FileDestination` and your `situation` argument is bypassed. Choose the situation that honestly describes your node's operation and let users redirect from there.
 
-`build_file()` reads the connected settings node with `GetConnectedFileDestinationRequest`, which is answered where the settings node lives, so it works when your node runs in a worker too. If your node reads a connected settings node without going through `ProjectFileParameter`, send that request yourself and rebuild the destination with `file_destination_from_spec` from `griptape_nodes.files.project_file`. Don't look the settings node up by name: a worker doesn't have it. `ProjectDirectoryParameter` and `ProjectFileSequenceParameter` use `GetConnectedDirectoryDestinationRequest` and `GetConnectedFileSequenceDestinationRequest` the same way.
+`build_file()` reads the connected settings node with `GetConnectedFileDestinationRequest`, which is answered where the settings node lives, so it works when your node runs in a worker too. If your node reads a connected settings node without going through `ProjectFileParameter`, send that request yourself and rebuild the destination with `file_destination_from_spec(spec, self.workflow)` from `griptape_nodes.files.project_file`, so it writes in your node's workflow from any thread. Don't look the settings node up by name: a worker doesn't have it. `ProjectDirectoryParameter` and `ProjectFileSequenceParameter` use `GetConnectedDirectoryDestinationRequest` and `GetConnectedFileSequenceDestinationRequest` the same way.
 
 **❌ Common Mistake: Not Capturing write_bytes() Return Value**
 
@@ -130,6 +130,17 @@ def frames_to_video_artifact(frames: list, fps: int = 30, video_format: str = "m
 - Use `from_situation()` to create a destination with a named situation
 - The `filename` parameter is the base filename (will be transformed by the situation's macro)
 - The situation (e.g., "save_node_output") determines the final path and collision behavior
+
+### Saving from a Thread or Thread Pool
+
+Macros such as `{outputs}` resolve against the workflow your node is in. A `File`, `FileDestination`, `Directory`, or `FileSequence` keeps the workflow it was built for, so it writes there from any thread. `ProjectFileParameter.build_file()` and the other parameter builders build for the node's workflow wherever you call them, including inside a `threading.Thread` or a `ThreadPoolExecutor` job:
+
+```python
+with ThreadPoolExecutor() as pool:
+    list(pool.map(lambda job: self._output_file.build_file().write_bytes(render(job)), jobs))
+```
+
+Code on a plain thread or in a pool doesn't know which workflow it works for, so a handle built there with `ProjectFileDestination.from_situation()` or `File(...)` has no workflow of its own. Build it in `process()` or `aprocess()` and hand it to the thread, or name the workflow: call `ProjectFileDestination.from_situation_in_workflow(self.workflow, ...)`, or pass `workflow=self.workflow` to the `File`, `FileDestination`, `Directory`, or `FileSequence` constructor.
 
 ## Migration from StaticFilesManager
 

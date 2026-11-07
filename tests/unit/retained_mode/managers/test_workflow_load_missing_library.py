@@ -1085,7 +1085,7 @@ class TestRefusedSubflowIsNotOrphaned:
         # request path is unavailable and _load_subflow needs the parent-flow mapping to resolve.
         node = self._node_class_for(tmp_path / relative_path)(name="Wrapper")
         reopened.flow_manager.get_flow_by_name(host_flow.flow_name).add_node(node)
-        reopened.object_manager.add_object_by_name(node.name, node)
+        reopened.object_manager.add_object_by_name_in(reopened.current_workflow(), node.name, node)
         reopened.current_workflow().nodes.name_to_parent_flow_name[node.name] = host_flow.flow_name
 
         flows_before = set(reopened.object_manager.get_filtered_subset(type=ControlFlow))

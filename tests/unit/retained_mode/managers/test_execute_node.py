@@ -709,7 +709,7 @@ class TestTheWorkerLoadsACopy:
             _ORCHESTRATOR_WORKFLOW_ID, None, None, None
         )
         with worker_engine.run_in_worker_workflow(workflow):
-            worker_engine.object_manager.add_object_by_name("Echo", object())
+            worker_engine.object_manager.add_object_by_name_in(worker_engine.current_workflow(), "Echo", object())
 
         result = await worker_engine.ahandle_request(_request_for("_EchoNode"))
 

@@ -227,7 +227,7 @@ class TestObjectsOnTheRuntime:
         assert engine.current_workflow().objects.has("canvas")
         assert engine.object_manager.has_object_with_name("canvas")
 
-    def test_lookups_find_nothing_and_changes_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
+    def test_lookups_find_nothing_with_no_workflow_open(self, engine: Engine) -> None:
         object_manager = engine.object_manager
 
         assert object_manager.get_filtered_subset() == {}
@@ -235,24 +235,17 @@ class TestObjectsOnTheRuntime:
         assert object_manager.generate_name_for_object("ControlFlow") == "ControlFlow_1"
         with pytest.raises(KeyError):
             object_manager.get_object_by_name("canvas")
-        with pytest.raises(NoOpenWorkflowError):
-            object_manager.add_object_by_name("thing", object())
-        with pytest.raises(NoOpenWorkflowError):
-            object_manager.del_obj_by_name("thing")
         assert engine.current_workflow_or_none() is None
 
-    def test_work_bound_to_no_workflow_finds_no_objects_and_cannot_add_one(self, engine: Engine) -> None:
+    def test_work_bound_to_no_workflow_finds_no_objects(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
         object_manager = engine.object_manager
 
         with engine.bind_workflow(NO_WORKFLOW):
             assert not object_manager.has_object_with_name("canvas")
-            with pytest.raises(NoOpenWorkflowError):
-                object_manager.add_object_by_name("thing", object())
 
         assert object_manager.has_object_with_name("canvas")
-        assert not object_manager.has_object_with_name("thing")
 
     def test_rename_moves_the_object_within_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -294,7 +287,7 @@ class TestObjectsOnTheRuntime:
         node = MockNode(name="node")
         parameter = Parameter(name="text", tooltip="Text", type="str")
         node.add_parameter(parameter)
-        engine.object_manager.add_object_by_name("node", node)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), "node", node)
         parameter.track_change("tooltip", "Changed")
         # Closing refuses a workflow that still holds objects once its flows are deleted.
         engine.current_workflow().objects.remove("node")
@@ -317,7 +310,7 @@ class TestObjectsOnTheRuntime:
             parameter = Parameter(name="text", tooltip="Text", type="str")
             node.add_parameter(parameter)
             with engine.bind_workflow(workflow):
-                engine.object_manager.add_object_by_name("node", node)
+                engine.object_manager.add_object_by_name_in(engine.current_workflow(), "node", node)
             parameter.track_change("tooltip", "Changed")
             nodes[workflow] = node
 
@@ -443,9 +436,7 @@ class TestNodesAndFlowsOnTheRuntime:
         assert result.flow_names == []
 
     @pytest.mark.asyncio
-    async def test_runs_and_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
-        with pytest.raises(NoOpenWorkflowError):
-            await engine.flow_manager.cancel_flow_run()
+    async def test_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
         with pytest.raises(NoOpenWorkflowError):
             engine.flow_manager.reset_global_execution_state()
 

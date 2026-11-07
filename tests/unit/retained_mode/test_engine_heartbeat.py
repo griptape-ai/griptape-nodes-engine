@@ -10,6 +10,7 @@ from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
+    OpenWorkflowInfo,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
@@ -107,3 +108,31 @@ class TestEngineHeartbeatRunId:
         assert isinstance(after, EngineHeartbeatResultSuccess)
         assert after.engine_run_id is not None
         assert after.engine_run_id != before.engine_run_id
+
+
+class TestEngineHeartbeatOpenWorkflows:
+    """Heartbeat lists the open workflows, and reports the one opened last as the current one."""
+
+    def test_reports_no_open_workflows_when_none_is_open(self, engine: Engine) -> None:
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-none-open"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.open_workflows == []
+        assert result.current_workflow_id is None
+
+    def test_reports_the_open_workflow(self, engine: Engine) -> None:
+        workflow = engine.workflow_registry.register_unsaved("only", listed=False)
+        engine.open_workflow(workflow.workflow_id)
+
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-one-open"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.open_workflows == [
+            OpenWorkflowInfo(
+                workflow_id=workflow.workflow_id,
+                name=result.current_workflow or "",
+                workflow_file_path=None,
+                has_active_flow=False,
+            )
+        ]
+        assert result.current_workflow_id == workflow.workflow_id

@@ -37,6 +37,23 @@ class OrganizationInfo:
 
 
 @dataclass
+class OpenWorkflowInfo:
+    """A workflow the engine has open, as the heartbeat reports it.
+
+    Args:
+        workflow_id: The workflow's id, which a request envelope's `open_workflow_id` names.
+        name: The workflow's name.
+        workflow_file_path: Path to the workflow file (None while it is unsaved).
+        has_active_flow: Whether the workflow has a current flow.
+    """
+
+    workflow_id: str
+    name: str
+    workflow_file_path: str | None
+    has_active_flow: bool
+
+
+@dataclass
 class UserInfo:
     """User information from Griptape Cloud."""
 
@@ -532,10 +549,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         instance_region: Cloud instance region (None if not applicable)
         instance_provider: Cloud provider name (None if not applicable)
         deployment_type: Type of deployment (None if not applicable)
-        current_workflow: Name of active workflow (None if none)
-        current_workflow_id: Id of active workflow (None if none)
-        workflow_file_path: Path to workflow file (None if none)
-        has_active_flow: Whether there's an active flow running
+        current_workflow: Name of the workflow opened last (None if none is open)
+        current_workflow_id: Id of the workflow opened last (None if none is open)
+        workflow_file_path: Path to that workflow's file (None if none, or while it is unsaved)
+        has_active_flow: Whether that workflow has a current flow
+        open_workflows: Every workflow the engine has open, in the order they were opened
         engine_name: Human-readable engine name
         engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
         user: User information including ID, email, and name (None if not logged in)
@@ -583,8 +601,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # Entries leave when the host is displaced or the session ends; nothing expires them, so a
     # host that crashed stays listed until then. Defaulted for backward compatibility.
     clients: list[SessionClient] = field(default_factory=list)
-    # Id of the active workflow (None if none). Defaulted for backward compatibility.
+    # Id of the workflow opened last (None if none). Defaulted for backward compatibility.
     current_workflow_id: str | None = None
+    # Every open workflow, oldest first; the last is the one the `current_*` fields describe.
+    # Defaulted for backward compatibility.
+    open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)
     # Changes on every engine restart, unlike session_id. None from an engine too old to report it.
     engine_run_id: str | None = None
 

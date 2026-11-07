@@ -32,8 +32,8 @@ from griptape_nodes.retained_mode.events.project_events import (
     PathResolutionFailureReason,
 )
 
-HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
-AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.handle_request"
+AHANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.ahandle_request"
 # These modules read the workspace off the engine they resolve, so the tests patch that
 # resolution and hand back a stand-in whose config_manager is the mock.
 CURRENT_ENGINE_PATH = "griptape_nodes.files.file.current_engine"

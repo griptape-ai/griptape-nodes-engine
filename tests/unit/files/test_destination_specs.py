@@ -56,8 +56,12 @@ _FILE_SPECS = [
 ]
 
 
+# A workflow can't cross processes, so a spec leaves it out and the side that rebuilds supplies its own.
+_NOT_IN_SPEC = {"self", "workflow"}
+
+
 def _init_argument_names(cls: type) -> set[str]:
-    return {name for name in inspect.signature(cls.__init__).parameters if name != "self"}
+    return {name for name in inspect.signature(cls.__init__).parameters if name not in _NOT_IN_SPEC}
 
 
 def _field_names(spec_type: type) -> set[str]:
