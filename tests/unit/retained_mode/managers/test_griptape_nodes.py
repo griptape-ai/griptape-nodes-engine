@@ -12,11 +12,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind, StrictModeSeverity
+from griptape_nodes.exe_types.core_types import ParameterGroup
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 
 if TYPE_CHECKING:
@@ -255,6 +257,73 @@ class TestFacadeCallersBoundToNothing:
 
         assert isinstance(results[0], CreateFlowResultSuccess), results[0].result_details
         assert "canvas" in only.flows.name_to_parent_name
+
+    def test_a_manager_read_from_a_raw_thread_reads_the_only_open_workflow(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+        created = only.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+        flow_names: list[str] = []
+
+        def read_the_flow() -> None:
+            flow_names.append(GriptapeNodes.ContextManager().get_current_flow().name)
+            assert GriptapeNodes.FlowManager().get_flow_by_name("canvas") is not None
+            assert GriptapeNodes.ObjectManager().has_object_with_name("canvas")
+
+        thread = threading.Thread(target=lambda: contextvars.Context().run(read_the_flow))
+        thread.start()
+        thread.join(timeout=10)
+
+        assert flow_names == ["canvas"]
+
+    def test_a_manager_context_block_from_an_unbound_caller_runs_in_the_only_open_workflow(
+        self, engine: Engine
+    ) -> None:
+        only = _open(engine, "only")
+        created = only.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+
+        with GriptapeNodes.ContextManager().flow("canvas") as flow:
+            assert flow.name == "canvas"
+
+    def test_a_manager_hands_back_an_element_as_it_is(self, engine: Engine) -> None:
+        """An element is a context manager too, but only the block methods' results are wrapped."""
+        _open(engine, "only")
+        element = ParameterGroup(name="group")
+
+        with patch.object(ContextManager, "get_current_element", lambda _self: element):
+            handed = GriptapeNodes.ContextManager().get_current_element()
+
+        assert handed is element
+
+    @pytest.mark.usefixtures("multiple_open_workflows")
+    def test_a_stored_manager_follows_its_callers_binding(self, engine: Engine) -> None:
+        first = _open(engine, "first")
+        stored = GriptapeNodes.ContextManager()
+        second = _open(engine, "second")
+        for workflow, flow_name in ((first, "first_canvas"), (second, "second_canvas")):
+            created = workflow.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name=flow_name))
+            assert isinstance(created, CreateFlowResultSuccess), created.result_details
+
+        with engine.bind_workflow(second):
+            current_id = stored.get_current_workflow_id()
+            with stored.flow("second_canvas") as flow:
+                entered_in = engine.current_workflow()
+
+        assert current_id == second.workflow_id
+        assert flow.name == "second_canvas"
+        assert entered_in is second
+
+    @pytest.mark.usefixtures("multiple_open_workflows")
+    def test_a_manager_read_finds_no_workflow_while_several_are_open(self, engine: Engine) -> None:
+        _open(engine, "first")
+        _open(engine, "second")
+
+        assert not GriptapeNodes.ContextManager().has_current_workflow()
+
+    def test_engine_code_reading_a_manager_finds_no_workflow(self, engine: Engine) -> None:
+        _open(engine, "only")
+
+        assert not engine.context_manager.has_current_workflow()
 
     @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_request_fails_while_several_are_open(self, engine: Engine) -> None:

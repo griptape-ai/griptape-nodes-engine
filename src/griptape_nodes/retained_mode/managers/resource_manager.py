@@ -40,7 +40,6 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeInstance
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
@@ -705,11 +704,8 @@ class ResourceManager(EngineScoped):
         return len(doomed)
 
     def _current_workflow_id(self) -> str | None:
-        """The id of the workflow the current work acts on, or None when it acts on none or cannot tell which."""
-        try:
-            workflow = self.engine.current_workflow_or_none()
-        except WorkflowNotNamedError:
-            return None
+        """The id of the workflow the current work acts on, or None when it acts on none."""
+        workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             return None
         return workflow.workflow_id
