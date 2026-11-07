@@ -693,3 +693,32 @@ class TestExtractIterationResultsFromSubprocessStartNodeItem:
 
         assert successful == [0, 2]
         assert results == {0: "a", 2: "c"}
+
+
+class TestGetParameterValuesFromIterationsStartNodeItem:
+    """A start-node item is read from the start node, skipping iterations whose body failed."""
+
+    def _run(self, failed_iteration_indices: set[int] | None) -> dict[int, Any]:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.incoming_connections = connections
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        deserialized_flows = [(0, "flow_0", {}), (1, "flow_1", {}), (2, "flow_2", {})]
+
+        kwargs: dict[str, Any] = {}
+        if failed_iteration_indices is not None:
+            kwargs["failed_iteration_indices"] = failed_iteration_indices
+        return executor.get_parameter_values_from_iterations(
+            end_loop_node=end_node,
+            deserialized_flows=deserialized_flows,
+            package_flow_result_success=cast("Any", _make_package_result()),
+            **kwargs,
+        )
+
+    def test_collects_item_for_every_iteration_by_default(self) -> None:
+        assert self._run(None) == {0: "a", 1: "b", 2: "c"}
+
+    def test_skips_failed_iterations(self) -> None:
+        assert self._run({1}) == {0: "a", 2: "c"}
