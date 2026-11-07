@@ -272,6 +272,9 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
     workflow and a flow are already in the current context, returns their names without
     creating new ones. Only creates the pieces that are missing.
 
+    Acts on the workflow the envelope's `open_workflow_id` names. A request that names none
+    adopts the only open workflow, opens one when none is open, and fails while several are open.
+
     Args:
         workflow_name: Registered workflow to enter if no workflow is in context. Ignored
             when a workflow is already in context. When None, the engine registers a new
@@ -306,8 +309,9 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
         created_workflow: True if this call created the workflow; False if an existing one was reused.
         created_flow: True if this call created the flow; False if an existing one was reused.
         workflow_id: Id of the workflow in the current context.
-        open_workflow: The workflow this call opened, as the heartbeat lists it, or None when it
-            reused an open one.
+        open_workflow: The workflow this call opened, or adopted because the request named none
+            and it was the only one open, as the heartbeat lists it. None when the request named
+            the workflow on its envelope.
     """
 
     workflow_name: str

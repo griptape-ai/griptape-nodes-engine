@@ -2,6 +2,6 @@
   and `RunWorkflowFromScratchResultSuccess` now carry `open_workflow`, the workflow open after the
   request, in the form `EngineHeartbeatResultSuccess.open_workflows` uses.
   `RunWorkflowWithCurrentStateResultSuccess` carries it when the request opened the file as a new
-  workflow, and `EnsureWorkflowAndFlowResultSuccess` when it opened one. After a save, it tells
-  whether the open workflow is the file saved or the save wrote a copy.
+  workflow, and `EnsureWorkflowAndFlowResultSuccess` when it opened one or used the only open one.
+  After a save, it tells whether the open workflow is the file saved or the save wrote a copy.
   [#6199](https://github.com/griptape-ai/griptape-nodes-engine/issues/6199)

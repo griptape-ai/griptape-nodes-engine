@@ -23,6 +23,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,7 +71,7 @@ def _record_node_errors(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list
 async def _run_with_failure(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, create_node: Callable[..., str], failure: str
 ) -> NodeErrorEvent:
-    engine.context_manager.push_workflow(workflow_name=f"structured_errors_{failure}")
+    bind(engine.context_manager.open_workflow(workflow_name=f"structured_errors_{failure}"))
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Flow", set_as_new_context=False))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     create_node(NODE_TYPE, NODE_NAME, flow.flow_name, library_name=LIBRARY_NAME)

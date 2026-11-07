@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListCallableWorkflowsRequest,
     ListCallableWorkflowsResultSuccess,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -163,7 +164,7 @@ def test_workflow_node_registers_with_shape_derived_parameters(
     assert isinstance(list_result, ListNodeTypesInLibraryResultSuccess), list_result
     assert WORKFLOW_NODE_TYPE in list_result.node_types
 
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_shape")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_shape"))
 
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
@@ -192,7 +193,7 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
     create_node: Callable[..., str],
 ) -> None:
     """Running the generated node executes the workflow and surfaces its End Flow values."""
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e"))
 
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
@@ -241,7 +242,7 @@ async def test_two_workflow_nodes_run_independently(
     The second import renames the workflow's Start/End nodes (their names are already taken), so
     this covers the path where the saved shape's node names no longer match the live subflow.
     """
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_pair")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_pair"))
 
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
@@ -332,7 +333,7 @@ async def test_a_library_installed_in_the_workspace_lists_its_backing_workflow(
 
     await engine.workflow_manager.refresh_workflow_registry()
 
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_installed")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_installed"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
@@ -453,7 +454,7 @@ async def test_workflow_node_reuses_the_key_the_workspace_scan_registered(
     """A workflow inside the workspace is listed once, however the node reached it."""
     await engine.workflow_manager.refresh_workflow_registry()
 
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_registry")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_registry"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
@@ -486,7 +487,7 @@ def test_workflow_node_outside_the_workspace_keeps_its_full_path_as_the_key(
     create_node: Callable[..., str],
 ) -> None:
     """A library shipping its own workflow keeps naming it by its full path; nothing else can."""
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_external_registry")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_external_registry"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
@@ -515,7 +516,7 @@ async def test_workflow_node_reached_through_a_link_keeps_the_link_as_its_key(
     """A workflow linked into the workspace is listed once, named by where the link sits."""
     await engine.workflow_manager.refresh_workflow_registry()
 
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_linked_registry")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_linked_registry"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
@@ -551,7 +552,7 @@ async def test_workflow_node_reached_through_a_linked_parent_folder_reuses_the_s
     """A workflow reached through a link to a parent folder is listed once, under the scan's key."""
     await engine.workflow_manager.refresh_workflow_registry()
 
-    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_parent_linked_registry")
+    bind(engine.context_manager.open_workflow(workflow_name="workflow_node_e2e_parent_linked_registry"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )

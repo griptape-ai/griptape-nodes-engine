@@ -57,6 +57,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import handle_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -290,7 +291,9 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     library.register_new_node_type(_ListNode, NodeMetadata(category="test", description="d", display_name="List"))
-    engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow"))
+    handle_and_bind(
+        engine, EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow")
+    )
     try:
         yield _LIBRARY_NAME
     finally:

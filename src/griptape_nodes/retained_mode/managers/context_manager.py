@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
+from griptape_nodes.retained_mode.managers.event_manager import current_request_sender
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.workflow_registry import Workflow
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
@@ -346,12 +348,31 @@ class ContextManager(EngineScoped):
     ) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 
-        Uses the open `workflow`, and otherwise opens one with its flow, so callers can go from a
-        blank engine to CreateNode in a single round trip.
+        Uses the `workflow` the request names. A request that names none adopts the engine's only
+        open workflow, and opens one with its flow when none is open, so callers can go from a blank
+        engine to CreateNode in a single round trip. The result's `open_workflow` reports the
+        workflow it opened or adopted, which an MCP session then keeps. This adoption is the one
+        fallback to the only open workflow outside `GriptapeNodes.only_open_workflow_for_unbound_caller`.
+        Another engine's request that names none acts on no workflow, so it never adopts one.
         """
-        if workflow is None:
+        if workflow is not None:
+            return self._ensure_flow(request, workflow, open_workflow=None)
+        if current_request_sender() is not None:
             return self._open_workflow_with_flow(request)
-        return self._ensure_flow(request, workflow)
+        open_workflows = self.engine.open_workflows.all_open()
+        if len(open_workflows) > 1:
+            listed = ", ".join(f"'{info.name}' ({info.workflow_id})" for info in self.engine.open_workflow_infos())
+            return EnsureWorkflowAndFlowResultFailure(
+                result_details=(
+                    f"Attempted to ensure a workflow + flow context. Failed because the request names no workflow "
+                    f"and {len(open_workflows)} are open: {listed}. Name one on the request envelope, or with the "
+                    "X-Griptape-Workflow-Id header from an MCP client, or open one with OpenWorkflowRequest."
+                )
+            )
+        if open_workflows:
+            adopted = open_workflows[0]
+            return self._ensure_flow(request, adopted, open_workflow=self.engine.open_workflow_info(adopted))
+        return self._open_workflow_with_flow(request)
 
     def _open_workflow_with_flow(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
         """Open the workflow an Ensure request names, or a new one, with its top-level flow.
@@ -372,7 +393,9 @@ class ContextManager(EngineScoped):
                 result_details=f"Attempted to ensure a workflow + flow context. Failed while opening the workflow: {err}"
             )
         if opened.already_open:
-            return self._ensure_flow(request, opened.workflow)
+            return self._ensure_flow(
+                request, opened.workflow, open_workflow=self.engine.open_workflow_info(opened.workflow)
+            )
 
         workflow = opened.workflow
         workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
@@ -390,8 +413,14 @@ class ContextManager(EngineScoped):
             ),
         )
 
-    def _ensure_flow(self, request: EnsureWorkflowAndFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
-        """Give the open `workflow` a top-level flow if it has none, for an Ensure request."""
+    def _ensure_flow(
+        self,
+        request: EnsureWorkflowAndFlowRequest,
+        workflow: WorkflowRuntime,
+        *,
+        open_workflow: OpenWorkflowInfo | None,
+    ) -> ResultPayload:
+        """Give the open `workflow` a top-level flow if it has none, for an Ensure request that reports `open_workflow`."""
         workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
         created_flow = False
         if workflow.context.has_current_flow():
@@ -414,6 +443,7 @@ class ContextManager(EngineScoped):
             flow_name=flow_name,
             created_workflow=False,
             created_flow=created_flow,
+            open_workflow=open_workflow,
             result_details=(
                 f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
                 f"(created_workflow=False, created_flow={created_flow})."

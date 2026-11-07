@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -187,7 +188,7 @@ def _find_node(commands: SerializedFlowCommands, node_name: str) -> _NodeInFlow:
 def loop_flow(tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]) -> str:
     """A parent flow holding the loop, with Target already in the stale state."""
     _register_library(tmp_path, engine, materialize_library)
-    engine.context_manager.push_workflow(workflow_name="loop_body_values")
+    bind(engine.context_manager.open_workflow(workflow_name="loop_body_values"))
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Parent", set_as_new_context=False))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     _build_loop(engine, flow.flow_name)
@@ -276,7 +277,7 @@ def test_restore_failure_says_why(engine: Engine, loop_flow: str) -> None:
 def loop_flow_with_connected_note(tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]) -> str:
     """The loop, with Target.note wired from Source.result instead of typed, and no value stored on it."""
     _register_library(tmp_path, engine, materialize_library)
-    engine.context_manager.push_workflow(workflow_name="loop_body_connected_note")
+    bind(engine.context_manager.open_workflow(workflow_name="loop_body_connected_note"))
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Parent", set_as_new_context=False))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     _build_loop(engine, flow.flow_name)
@@ -309,7 +310,7 @@ async def test_pre_run_validation_still_reports_a_blank_unconnected_input(
 ) -> None:
     """Nothing is wired into Target.note and nothing is typed, so the run is refused before it starts."""
     _register_library(tmp_path, engine, materialize_library)
-    engine.context_manager.push_workflow(workflow_name="loop_body_blank_note")
+    bind(engine.context_manager.open_workflow(workflow_name="loop_body_blank_note"))
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Parent", set_as_new_context=False))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     _build_loop(engine, flow.flow_name)

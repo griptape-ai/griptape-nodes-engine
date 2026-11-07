@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
 
 
 def _open_workflow(engine: Engine) -> WorkflowRuntime:
-    engine.context_manager.push_workflow(workflow_name="open")
+    bind(engine.context_manager.open_workflow(workflow_name="open"))
     return engine.current_workflow()
 
 
