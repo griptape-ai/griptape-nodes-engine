@@ -214,9 +214,10 @@ class ContextManager(EngineScoped):
         `OpenWorkflowRequest`, `SetWorkflowContextRequest`, `EnsureWorkflowAndFlowRequest`,
         `RunWorkflowFromRegistryRequest` and `RunWorkflowFromScratchRequest` open here. Name the
         workflow by at most one of `workflow_id`, `workflow_name` and `file_path`; naming none
-        opens a new unsaved workflow. A workflow already open comes back unchanged, whatever the
-        other arguments ask. Every refusal comes before anything is registered or opened, except a
-        flow that can't be created, which closes the workflow again.
+        opens a new unsaved workflow. A workflow already open comes back unchanged: the arguments
+        that only shape a new open (`display_name`, `working_directory`, `create_flow`,
+        `flow_name`) are neither applied nor checked. Every refusal comes before anything is
+        registered or opened, except a flow that can't be created, which closes the workflow again.
 
         A saved workflow opens empty: `WorkflowRunner.open_and_build_workflow` builds its file into
         it. Clients hear of the workflow from the result of the request that opened it (see
@@ -242,13 +243,14 @@ class ContextManager(EngineScoped):
         if len(named) > 1:
             msg = "Attempted to open a workflow. Failed because the request named it more than one way. Give its id or its name, not both."
             raise self.OpenRefusedError(msg)
-        normalized_directory = self._normalize_working_directory(working_directory)
         registry = self.engine.workflow_registry
         entry = self._find_requested_workflow(workflow_id, workflow_name, file_path)
         if entry is not None:
             already_open = self.engine.open_workflows.find(entry.workflow_id)
             if already_open is not None:
                 return OpenedWorkflow(workflow=already_open, already_open=True)
+
+        normalized_directory = self._normalize_working_directory(working_directory)
 
         blocking = self.engine.open_workflows.workflow_blocking_open()
         if blocking is not None:

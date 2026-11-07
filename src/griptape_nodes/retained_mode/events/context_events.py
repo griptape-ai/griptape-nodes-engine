@@ -160,8 +160,9 @@ class OpenWorkflowRequest(RequestPayload):
         create_flow: Whether to give the workflow its top-level flow when it has none once opened,
             which a new workflow needs before it can be saved. A saved workflow's file builds its own.
 
-    A workflow already open comes back as it is, with `already_open` set, and nothing changes. A
-    saved workflow opens and its file builds its graph into it. A new or unsaved workflow opens empty.
+    A workflow already open comes back as it is, with `already_open` set, and nothing changes. One
+    that another request is still opening comes back once its file has built. A saved workflow
+    opens and its file builds its graph into it. A new or unsaved workflow opens empty.
 
     Results: OpenWorkflowResultSuccess | WorkflowNotFoundResultFailure (no workflow has that id or
         name, such as an unsaved workflow lost to an engine restart) |

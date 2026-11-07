@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from collections import defaultdict
@@ -160,6 +161,8 @@ def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
 class WorkflowRunner(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
+        # Each workflow `open_and_build_workflow` opened and is still building, set once its build ends.
+        self._building: dict[WorkflowRuntime, asyncio.Event] = {}
         event_manager.register_request_handlers(self)
 
     async def run_workflow(self, relative_file_path: str, workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
@@ -400,12 +403,13 @@ class WorkflowRunner(EngineScoped):
     ) -> OpenedWorkflowBuild:
         """Open the workflow a request names (`ContextManager.open_requested_workflow`) and build its file into it.
 
-        A workflow already open comes back unchanged. A workflow with a file is built from it,
-        and a build that fails closes the workflow again. `create_flow` gives the workflow its
-        top-level flow when it has none once built.
+        A workflow already open comes back unchanged, once any build another request started has
+        ended. A workflow with a file is built from it, and a build that fails closes the workflow
+        again. `create_flow` gives the workflow its top-level flow when it has none once built.
 
         Raises:
-            ContextManager.OpenRefusedError: The open was refused, as `open_requested_workflow` raises.
+            ContextManager.OpenRefusedError: The open was refused, as `open_requested_workflow` raises,
+                or the workflow was already open and the build another request started failed.
         """
         opened = self.engine.context_manager.open_requested_workflow(
             workflow_id=workflow_id,
@@ -416,8 +420,25 @@ class WorkflowRunner(EngineScoped):
         )
         workflow = opened.workflow
         if opened.already_open:
+            await self._wait_for_build(workflow)
             return OpenedWorkflowBuild(workflow_id=workflow.workflow_id, already_open=True, execution_result=None)
 
+        build_ended = asyncio.Event()
+        self._building[workflow] = build_ended
+        try:
+            return await self._build_opened_workflow(workflow, file_path=file_path, create_flow=create_flow)
+        finally:
+            del self._building[workflow]
+            build_ended.set()
+
+    async def _build_opened_workflow(
+        self, workflow: WorkflowRuntime, *, file_path: str | None, create_flow: bool
+    ) -> OpenedWorkflowBuild:
+        """Build the file of `workflow`, which was just opened, into it, closing it again if the build fails.
+
+        Raises:
+            ContextManager.OpenRefusedError: `create_flow` asked for a flow that could not be created.
+        """
         relative_file_path = file_path
         if relative_file_path is None:
             relative_file_path = self.engine.workflow_registry.get(workflow.workflow_id).file_path
@@ -552,6 +573,28 @@ class WorkflowRunner(EngineScoped):
             engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
+
+    async def _wait_for_build(self, workflow: WorkflowRuntime) -> None:
+        """Wait for the build of `workflow` that another request started, if one is under way.
+
+        Raises:
+            ContextManager.OpenRefusedError: That build failed, which closed the workflow.
+        """
+        build_ended = self._building.get(workflow)
+        if build_ended is None:
+            return
+        await build_ended.wait()
+        if self.engine.open_workflows.find(workflow.workflow_id) is workflow:
+            return
+        entry = self.engine.workflow_registry.find_by_id(workflow.workflow_id)
+        label = workflow.workflow_id
+        if entry is not None:
+            label = entry.name
+        msg = (
+            f"Attempted to open workflow '{label}'. Failed because another request was opening it "
+            "and its file failed to build."
+        )
+        raise ContextManager.OpenRefusedError(msg)
 
     def _open_workflow_info(self, workflow_id: str | None) -> OpenWorkflowInfo | None:
         """What clients are told of the workflow a load opened, or None when it opened none or it closed since."""

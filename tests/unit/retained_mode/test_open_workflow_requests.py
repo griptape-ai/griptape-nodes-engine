@@ -46,6 +46,8 @@ from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecu
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers.mcp import SUPPORTED_REQUEST_EVENTS
 
+ORIGINAL_RUN_WORKFLOW = WorkflowRunner.run_workflow
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
@@ -259,6 +261,20 @@ class TestOpenWorkflowAlreadyOpen:
         assert result.result.already_open
         assert not result.result.open_workflow.has_active_flow
 
+    def test_arguments_for_a_new_workflow_are_not_checked(self, engine: Engine, tmp_path: Path) -> None:
+        opened = _send(engine, OpenWorkflowRequest(display_name="draft")).result
+        assert isinstance(opened, OpenWorkflowResultSuccess)
+        not_a_folder = tmp_path / "file.txt"
+        not_a_folder.write_text("x")
+
+        result = _send(
+            engine,
+            OpenWorkflowRequest(workflow_id=opened.open_workflow.workflow_id, working_directory=str(not_a_folder)),
+        ).result
+
+        assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
+        assert result.already_open
+
     def test_closes_none_of_the_others_when_several_are_open(self, engine: Engine) -> None:
         _allow_several_open(engine)
         first = _open_new(engine, "first")
@@ -354,3 +370,66 @@ class TestOlderOpenRequestsShareTheCode:
         assert again.workflow_id == first.workflow_id
         assert before.closed
         assert engine.open_workflows.get(first.workflow_id) is not before
+
+
+class TestOpenWorkflowWhileAnotherRequestOpensIt:
+    """A second open of a workflow still building waits for the build instead of returning an empty graph."""
+
+    @staticmethod
+    def _gated_run(gate: asyncio.Event, entered: asyncio.Event, run: object) -> object:
+        async def gated(runner: WorkflowRunner, relative_file_path: str, workflow: WorkflowRuntime | None) -> object:
+            entered.set()
+            await gate.wait()
+            if isinstance(run, WorkflowExecutionResult):
+                return run
+            return await ORIGINAL_RUN_WORKFLOW(runner, relative_file_path=relative_file_path, workflow=workflow)
+
+        return gated
+
+    @staticmethod
+    async def _open_twice(
+        engine: Engine, workflow_id: str, run: object
+    ) -> list[EventResultSuccess | EventResultFailure]:
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        request = OpenWorkflowRequest(workflow_id=workflow_id)
+        gated = TestOpenWorkflowWhileAnotherRequestOpensIt._gated_run(gate, entered, run)
+        with patch.object(WorkflowRunner, "run_workflow", gated):
+            first = asyncio.create_task(engine.event_manager.ahandle_request(request, result_context=ResultContext()))
+            await entered.wait()
+            second = asyncio.create_task(engine.event_manager.ahandle_request(request, result_context=ResultContext()))
+            await asyncio.sleep(0.05)
+            assert not second.done()
+            gate.set()
+            return list(await asyncio.gather(first, second))
+
+    def test_the_second_open_returns_the_workflow_once_built_and_it_is_announced_once(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
+        workflow_id = _saved_workflow_id(engine, saved_workflow_name)
+
+        first, second = asyncio.run(self._open_twice(engine, workflow_id, run=None))
+
+        assert isinstance(first.result, OpenWorkflowResultSuccess), first.result.result_details
+        assert isinstance(second.result, OpenWorkflowResultSuccess), second.result.result_details
+        assert not first.result.already_open
+        assert second.result.already_open
+        assert second.result.open_workflow.has_active_flow
+        assert second.result.open_workflow == first.result.open_workflow
+        assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=first.result.open_workflow)]
+
+    def test_the_second_open_fails_when_the_build_fails_and_nothing_is_announced(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
+        workflow_id = _saved_workflow_id(engine, saved_workflow_name)
+        failed_run = WorkflowExecutionResult(
+            execution_successful=False, execution_details="broken file", status=WorkflowStatus.UNUSABLE
+        )
+
+        first, second = asyncio.run(self._open_twice(engine, workflow_id, run=failed_run))
+
+        assert type(first.result) is OpenWorkflowResultFailure
+        assert type(second.result) is OpenWorkflowResultFailure
+        assert "failed to build" in str(second.result.result_details)
+        assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(queue) == []
