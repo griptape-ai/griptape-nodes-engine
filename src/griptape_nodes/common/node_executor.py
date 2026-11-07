@@ -4450,7 +4450,7 @@ class NodeExecutor(EngineScoped):
                 logger.debug("Could not register workflow '%s' to clean it up: %s", workflow_path, err)
                 return
 
-        delete_request = DeleteWorkflowRequest(name=workflow.name)
+        delete_request = DeleteWorkflowRequest(workflow_id=workflow.workflow_id)
         delete_result = await self.engine.ahandle_request(delete_request)
         if not isinstance(delete_result, DeleteWorkflowResultFailure):
             logger.debug(

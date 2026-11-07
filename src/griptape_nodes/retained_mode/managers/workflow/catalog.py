@@ -10,6 +10,7 @@ import anyio
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowMetadataError,
     read_workflow_metadata,
@@ -56,9 +57,8 @@ logger = logging.getLogger("griptape_nodes")
 
 
 class WorkflowPathResolution(NamedTuple):
-    """Resolution result for workflow and its corresponding file path."""
+    """The file path of a workflow whose metadata is about to be written, or why it has none."""
 
-    workflow: Workflow | None
     file_path: Path | None
     error: str | None
 
@@ -103,10 +103,11 @@ class WorkflowCatalog(EngineScoped):
     @handles(GetWorkflowInfoRequest)
     def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
-        except KeyError:
-            details = f"Attempted to get workflow info. Failed because workflow '{request.workflow_name}' was not found in the registry."
-            return GetWorkflowInfoResultFailure(result_details=details)
+            workflow = self.engine.workflow_registry.resolve_address(
+                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="get info for"
+            )
+        except WorkflowAddressError as err:
+            return GetWorkflowInfoResultFailure(result_details=str(err))
 
         # Unsaved workflows never went through the on-disk metadata load, so
         # the manager has no load record for them. Report a healthy stub.
@@ -118,7 +119,7 @@ class WorkflowCatalog(EngineScoped):
                 problems=[],
                 workflow_dependencies=[],
                 workflow_id=workflow.workflow_id,
-                result_details=f"Workflow '{request.workflow_name}' is unsaved; returning empty info stub.",
+                result_details=f"Workflow '{workflow.name}' is unsaved; returning empty info stub.",
             )
 
         workflow_file_path = self._build_workflow_info_key(workflow.file_path)
@@ -174,11 +175,11 @@ class WorkflowCatalog(EngineScoped):
         # Every open workflow has an entry (a file opened from outside the workspace registers
         # unlisted), so the registry answers for it too.
         try:
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
-        except KeyError:
-            return GetWorkflowMetadataResultFailure(
-                result_details=f"Failed to get metadata. Workflow '{request.workflow_name}' not found."
+            workflow = self.engine.workflow_registry.resolve_address(
+                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="get metadata for"
             )
+        except WorkflowAddressError as err:
+            return GetWorkflowMetadataResultFailure(result_details=str(err))
         # Placeholder metadata stands in for a header that could not be read; report why.
         if workflow.metadata_is_placeholder and workflow.absolute_path is not None:
             try:
@@ -196,37 +197,40 @@ class WorkflowCatalog(EngineScoped):
         )
 
     @handles(SetWorkflowMetadataRequest)
-    async def on_set_workflow_metadata_request(self, request: SetWorkflowMetadataRequest) -> ResultPayload:
+    async def on_set_workflow_metadata_request(self, request: SetWorkflowMetadataRequest) -> ResultPayload:  # noqa: PLR0911
         await self.engine.workflow_manager.wait_for_workflows_loaded()
+
+        try:
+            workflow = self.engine.workflow_registry.resolve_address(
+                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="set metadata for"
+            )
+        except WorkflowAddressError as err:
+            return SetWorkflowMetadataResultFailure(result_details=str(err))
 
         # Unsaved workflows have no file on disk; update the in-memory registry entry only.
         # This keeps display-name / description edits in sync with the registry so a refresh
         # re-hydrates the latest state without needing a save.
-        if self.engine.workflow_registry.has_workflow_with_name(request.workflow_name):
-            workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
-            if workflow.file_path is None:
-                try:
-                    merged = self._merge_metadata(workflow.metadata, request.workflow_metadata)
-                except ValueError as e:
-                    return SetWorkflowMetadataResultFailure(result_details=str(e))
-                merged.last_modified_date = datetime.now(tz=UTC)
-                workflow.metadata = merged
-                return SetWorkflowMetadataResultSuccess(
-                    result_details=ResultDetails(
-                        message=(
-                            f"Successfully updated in-memory metadata for unsaved workflow '{request.workflow_name}'."
-                        ),
-                        level=logging.INFO,
-                    )
+        if workflow.file_path is None:
+            try:
+                merged = self._merge_metadata(workflow.metadata, request.workflow_metadata)
+            except ValueError as e:
+                return SetWorkflowMetadataResultFailure(result_details=str(e))
+            merged.last_modified_date = datetime.now(tz=UTC)
+            workflow.metadata = merged
+            return SetWorkflowMetadataResultSuccess(
+                result_details=ResultDetails(
+                    message=f"Successfully updated in-memory metadata for unsaved workflow '{workflow.name}'.",
+                    level=logging.INFO,
                 )
+            )
 
-        # Resolve workflow and file path for saved workflows
-        resolution = self._get_workflow_and_path(request.workflow_name)
-        if resolution.error is not None or resolution.workflow is None or resolution.file_path is None:
+        # Resolve the file path for saved workflows
+        resolution = self._get_workflow_file_path(workflow)
+        if resolution.error is not None or resolution.file_path is None:
             return SetWorkflowMetadataResultFailure(result_details=resolution.error or "Failed to resolve workflow.")
 
         try:
-            new_metadata = self._merge_metadata(resolution.workflow.metadata, request.workflow_metadata)
+            new_metadata = self._merge_metadata(workflow.metadata, request.workflow_metadata)
         except ValueError as e:
             return SetWorkflowMetadataResultFailure(result_details=str(e))
         # Refresh last_modified_date to reflect this change
@@ -238,11 +242,11 @@ class WorkflowCatalog(EngineScoped):
             return SetWorkflowMetadataResultFailure(result_details=write_error)
 
         # Update registry
-        resolution.workflow.metadata = new_metadata
+        workflow.metadata = new_metadata
 
         return SetWorkflowMetadataResultSuccess(
             result_details=ResultDetails(
-                message=f"Successfully updated metadata for workflow '{request.workflow_name}'.", level=logging.INFO
+                message=f"Successfully updated metadata for workflow '{workflow.name}'.", level=logging.INFO
             )
         )
 
@@ -268,30 +272,22 @@ class WorkflowCatalog(EngineScoped):
             workflow_id=workflow_id,
         )
 
-    def _get_workflow_and_path(self, workflow_name: str) -> WorkflowPathResolution:
-        """Resolve workflow from registry and return absolute file path.
+    def _get_workflow_file_path(self, workflow: Workflow) -> WorkflowPathResolution:
+        """Return the absolute file path of the saved `workflow`, whose metadata is about to be written.
 
         Returns an error resolution for unsaved workflows since there is no file on disk
         to read or update, and for files whose header could not be read, since writing
         metadata would replace what the header holds with made-up values.
         """
-        try:
-            workflow = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
-        except KeyError:
-            return WorkflowPathResolution(
-                workflow=None, file_path=None, error=f"Failed to set metadata. Workflow '{workflow_name}' not found."
-            )
-
+        workflow_name = workflow.name
         if workflow.file_path is None:
             return WorkflowPathResolution(
-                workflow=workflow,
                 file_path=None,
                 error=f"Failed to set metadata. Workflow '{workflow_name}' is unsaved (no file on disk).",
             )
 
         if workflow.metadata_is_placeholder:
             return WorkflowPathResolution(
-                workflow=workflow,
                 file_path=None,
                 error=(
                     f"Attempted to set metadata for workflow '{workflow_name}'. Failed because its file's metadata "
@@ -303,12 +299,11 @@ class WorkflowCatalog(EngineScoped):
         file_path_obj = Path(complete_file_path)
         if not file_path_obj.is_file():
             return WorkflowPathResolution(
-                workflow=workflow,
                 file_path=None,
                 error=f"Failed to set metadata. File path '{complete_file_path}' does not exist.",
             )
 
-        return WorkflowPathResolution(workflow=workflow, file_path=file_path_obj, error=None)
+        return WorkflowPathResolution(file_path=file_path_obj, error=None)
 
     async def _write_metadata_header(self, file_path: Path, workflow_metadata: WorkflowMetadata) -> str | None:
         """Replace the workflow header and persist changes to disk."""

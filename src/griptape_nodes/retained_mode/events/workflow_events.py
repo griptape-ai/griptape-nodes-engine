@@ -368,13 +368,19 @@ class DeleteWorkflowRequest(RequestPayload):
     Use when: Removing obsolete workflows, cleaning up workflow libraries,
     unregistering workflows, workflow management.
 
+    Name the workflow by `workflow_id`, by `name`, or by both when they name the same one. It
+    acts on that workflow whichever one the envelope's `open_workflow_id` names, and closes it
+    first if it is open.
+
     Args:
-        name: Name of the workflow to delete from the registry
+        name: Registry name of the workflow to delete
+        workflow_id: Id of the workflow to delete
 
     Results: DeleteWorkflowResultSuccess | DeleteWorkflowResultFailure (workflow not found, deletion error)
     """
 
-    name: str
+    name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -419,8 +425,15 @@ class RenameWorkflowRequest(RequestPayload):
     Use when: Updating workflow names, organizing workflow libraries,
     fixing naming conflicts, workflow management.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
+    one. It acts on that workflow whichever one the envelope's `open_workflow_id` names. An open
+    workflow saves its graph to the new file. A closed one moves its file and rewrites the name
+    in its header. Either way it keeps its id, and the old file is removed. A rename never
+    replaces another workflow's file.
+
     Args:
-        workflow_name: Current name of the workflow
+        workflow_name: Current registry name of the workflow
+        workflow_id: Id of the workflow
         requested_name: New name for the workflow (drives the on-disk filename)
         display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
             ``MATCH_FILE_NAME`` to preserve historical wire behavior — callers who want the
@@ -433,8 +446,9 @@ class RenameWorkflowRequest(RequestPayload):
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
-    workflow_name: str
-    requested_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    requested_name: str = field(kw_only=True)
     display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
     display_name: str | None = None
 
@@ -783,8 +797,11 @@ class BranchWorkflowRequest(RequestPayload):
     Use when: Creating workflow variants, branching workflows for experimentation,
     creating personal copies of shared workflows, preparing for workflow collaboration.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the workflow to branch
+        workflow_name: Registry name of the workflow to branch
+        workflow_id: Id of the workflow to branch
         branched_workflow_name: Registry key for the branched workflow (None for auto-generated)
         branched_workflow_display_name: Human-readable label (``metadata.name``) for the branch.
             None derives one from the source workflow's display name, e.g. branching
@@ -793,7 +810,8 @@ class BranchWorkflowRequest(RequestPayload):
     Results: BranchWorkflowResultSuccess (with branch name) | BranchWorkflowResultFailure (branch error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
     branched_workflow_name: str | None = None
     branched_workflow_display_name: str | None = None
 
@@ -872,13 +890,17 @@ class MergeWorkflowBranchRequest(RequestPayload):
     Use when: Integrating branch changes back into the original workflow, consolidating
     successful branch experiments, applying approved branch modifications to source.
 
+    Name the branch by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the branch workflow to merge back into its source
+        workflow_name: Registry name of the branch workflow to merge back into its source
+        workflow_id: Id of the branch workflow
 
     Results: MergeWorkflowBranchResultSuccess (with merge details) | MergeWorkflowBranchResultFailure (merge error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -909,13 +931,17 @@ class ResetWorkflowBranchRequest(RequestPayload):
     Use when: Discarding branch modifications, reverting branch to source state,
     abandoning branch experiments, syncing branch with latest source changes.
 
+    Name the branch by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the branch workflow to reset to its source
+        workflow_name: Registry name of the branch workflow to reset to its source
+        workflow_id: Id of the branch workflow
 
     Results: ResetWorkflowBranchResultSuccess (with reset details) | ResetWorkflowBranchResultFailure (reset error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -946,15 +972,21 @@ class CompareWorkflowsRequest(RequestPayload):
     Use when: Checking if branched workflows need updates, determining if local changes exist,
     managing workflow synchronization, preparing for merge operations.
 
+    Name each workflow by id, by name, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the workflow to evaluate
-        compare_workflow_name: Name of the workflow to compare against
+        workflow_name: Registry name of the workflow to evaluate
+        compare_workflow_name: Registry name of the workflow to compare against
+        workflow_id: Id of the workflow to evaluate
+        compare_workflow_id: Id of the workflow to compare against
 
     Results: CompareWorkflowsResultSuccess (with status details) | CompareWorkflowsResultFailure (evaluation error)
     """
 
-    workflow_name: str
-    compare_workflow_name: str
+    workflow_name: str | None = None
+    compare_workflow_name: str | None = None
+    workflow_id: str | None = None
+    compare_workflow_id: str | None = None
 
 
 @dataclass
@@ -969,6 +1001,8 @@ class CompareWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
         workflow_last_modified: Last modified timestamp of the workflow
         source_last_modified: Last modified timestamp of the source (if exists)
         details: Additional details about the comparison
+        workflow_id: Id of the evaluated workflow
+        compare_workflow_id: Id of the workflow being compared against, None when it no longer exists
     """
 
     workflow_name: str
@@ -977,6 +1011,8 @@ class CompareWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
     workflow_last_modified: str | None
     source_last_modified: str | None
     details: str
+    workflow_id: str | None = None
+    compare_workflow_id: str | None = None
 
 
 @dataclass
@@ -993,15 +1029,19 @@ class MoveWorkflowRequest(RequestPayload):
     Use when: Organizing workflows into directories, restructuring workflow hierarchies,
     moving workflows to categorized folders, cleaning up workspace organization.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the workflow to move
+        workflow_name: Registry name of the workflow to move
+        workflow_id: Id of the workflow to move
         target_directory: Target directory path relative to workspace root
 
     Results: MoveWorkflowResultSuccess (with new path) | MoveWorkflowResultFailure (move error)
     """
 
-    workflow_name: str
-    target_directory: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    target_directory: str = field(kw_only=True)
 
 
 @dataclass
@@ -1029,9 +1069,13 @@ class MoveWorkflowResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class GetWorkflowMetadataRequest(RequestPayload):
-    """Get selected metadata for a workflow by name from the registry."""
+    """Get a workflow's metadata from the registry.
 
-    workflow_name: str
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+    """
+
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -1084,13 +1128,17 @@ class GetWorkflowInfoRequest(RequestPayload):
     Use when: Displaying workflow health warnings in the UI, checking whether a workflow
     has compatibility issues before loading it, showing dependency status.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
         workflow_name: Registry key for the workflow.
+        workflow_id: Id of the workflow.
 
     Results: GetWorkflowInfoResultSuccess (with status and details) | GetWorkflowInfoResultFailure (not found)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -1118,7 +1166,7 @@ class GetWorkflowInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 @dataclass
 @PayloadRegistry.register
 class GetWorkflowInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow info retrieval failed. Common causes: workflow not found, neither or both identifiers provided."""
+    """Workflow info retrieval failed. Common causes: workflow not found, no workflow named, an id and a name of two different workflows."""
 
 
 @dataclass
@@ -1176,10 +1224,14 @@ class ListAllWorkflowInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 @dataclass
 @PayloadRegistry.register
 class SetWorkflowMetadataRequest(RequestPayload):
-    """Replace the workflow's metadata entirely and persist to file."""
+    """Replace the workflow's metadata entirely and persist to file.
 
-    workflow_name: str
-    workflow_metadata: WorkflowMetadata
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+    """
+
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    workflow_metadata: WorkflowMetadata = field(kw_only=True)
 
 
 @dataclass
