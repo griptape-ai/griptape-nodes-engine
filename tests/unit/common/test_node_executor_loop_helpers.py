@@ -722,3 +722,55 @@ class TestGetParameterValuesFromIterationsStartNodeItem:
 
     def test_skips_failed_iterations(self) -> None:
         assert self._run({1}) == {0: "a", 2: "c"}
+
+
+class TestHandleEmptyLoopBody:
+    """An empty loop body collects only an item wired straight from the start node."""
+
+    @staticmethod
+    def _setup(
+        connections: list[MagicMock], *, list_succeeds: bool = True
+    ) -> tuple[NodeExecutor, MagicMock, MagicMock]:
+        end_node, _ = _make_start_wired_end_node("current_item")
+        start_node = end_node.start_node
+        start_node._get_total_iterations.return_value = 3
+        start_node._require_workflow.return_value = None
+        executor = _make_executor()
+        if list_succeeds:
+            result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+            result.incoming_connections = connections
+        else:
+            result = MagicMock()
+        cast("MagicMock", executor.engine).handle_request.return_value = result
+        start_node._require_workflow.return_value = _workflow_of(executor)
+        return executor, start_node, end_node
+
+    @pytest.mark.asyncio
+    async def test_collects_start_node_item_for_every_iteration(self) -> None:
+        _, connections = _make_start_wired_end_node("current_item")
+        executor, start_node, end_node = self._setup(connections)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == ["a", "b", "c"]
+        end_node._output_results_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_collects_nothing_when_item_is_not_wired_from_start(self) -> None:
+        _, connections = _make_start_wired_end_node("current_item")
+        connections[0].source_node_name = "Body"
+        executor, start_node, end_node = self._setup(connections)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == []
+        end_node._output_results_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_collects_nothing_when_connections_cannot_be_listed(self) -> None:
+        executor, start_node, end_node = self._setup([], list_succeeds=False)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == []
+        end_node._output_results_list.assert_called_once()
