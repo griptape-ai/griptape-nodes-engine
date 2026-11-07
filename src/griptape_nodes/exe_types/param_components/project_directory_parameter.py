@@ -150,7 +150,7 @@ def _build_directory_destination_from_situation(
 
     Raises:
         ValueError: If ``dirname`` is a web address, another address that cannot be saved to,
-            or a ``~`` path whose home folder cannot be found.
+            or a ``~`` path whose home folder cannot be found. ``~name`` is a plain name.
     """
     explicit_path = _explicit_directory_path(dirname)
     if explicit_path is not None:
@@ -209,14 +209,19 @@ def _explicit_directory_path(dirname: str) -> str | None:
         )
         raise ValueError(msg)
 
-    try:
-        expanded = pathlib.Path(dirname).expanduser()
-    except RuntimeError as e:
-        msg = (
-            f"Attempted to save to directory '{dirname}'. Failed because the home folder it starts with "
-            f"could not be found on this computer. Use a full folder path instead."
-        )
-        raise ValueError(msg) from e
+    # Only `~` and `~/` expand. Expanding `~name` is inconsistent across operating systems: POSIX
+    # fails for an unknown user while Windows swaps the name into the profile's parent folder.
+    if dirname != "~" and not dirname.startswith(("~/", "~\\")):
+        expanded = pathlib.Path(dirname)
+    else:
+        try:
+            expanded = pathlib.Path(dirname).expanduser()
+        except RuntimeError as e:
+            msg = (
+                f"Attempted to save to directory '{dirname}'. Failed because the home folder it starts with "
+                f"could not be found on this computer. Use a full folder path instead."
+            )
+            raise ValueError(msg) from e
     if expanded.is_absolute():
         return str(expanded)
     return None

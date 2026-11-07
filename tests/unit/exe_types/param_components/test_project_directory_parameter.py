@@ -62,11 +62,24 @@ class TestBuildDirectoryDestinationFromSituation:
         handle_request.assert_not_called()
         assert dest._directory._dir_path == str(tmp_path / "extracted")
 
-    def test_unknown_home_folder_raises(self) -> None:
-        with pytest.raises(ValueError, match="home folder"):
-            project_directory_parameter._build_directory_destination_from_situation(
-                "~no_such_user_xyz/out", "save_output_directory"
+    def test_unresolvable_home_folder_raises(self) -> None:
+        with (
+            mock.patch.object(pathlib.Path, "expanduser", side_effect=RuntimeError("no home")),
+            pytest.raises(ValueError, match="home folder"),
+        ):
+            project_directory_parameter._build_directory_destination_from_situation("~/out", "save_output_directory")
+
+    def test_tilde_name_is_a_plain_name(self) -> None:
+        sit = _make_situation("{outputs}/{dir_name}_v{_index:03}")
+        success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
+
+        with mock.patch(HANDLE_REQUEST_PATH, return_value=success):
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                "~old_renders", "save_output_directory"
             )
+
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.variables["dir_name"] == "~old_renders"
 
     def test_web_address_raises(self) -> None:
         with pytest.raises(ValueError, match="cannot save to"):
