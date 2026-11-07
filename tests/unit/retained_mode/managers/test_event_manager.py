@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     current_request_sender,
     current_request_type,
     require_request_sender,
+    result_context_from_request,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
@@ -2495,3 +2496,17 @@ class TestAWorkerRequestingAnotherEngine:
                 "timeout_ms": 5000,
             }
         ]
+
+
+class TestResultContextFromRequest:
+    def test_carries_every_envelope_field_dispatch_reads(self) -> None:
+        """A field added to `ResultContext` but not here would be dropped by every transport."""
+        sender = RequestSender(engine_id="other", session_id="s1")
+        event = EventRequest(
+            request=_ProbeRequest(), request_id="req-1", response_topic="t", sender=sender, open_workflow_id="wf-1"
+        )
+
+        context = result_context_from_request(event)
+
+        assert context == ResultContext(response_topic="t", request_id="req-1", sender=sender, open_workflow_id="wf-1")
+        assert context.keys() == ResultContext.__annotations__.keys()

@@ -244,6 +244,20 @@ class ResultContext(TypedDict, total=False):
     open_workflow_id: str | None
 
 
+def result_context_from_request(event: EventRequest) -> ResultContext:
+    """The `ResultContext` for dispatching `event.request`, from every envelope field dispatch carries.
+
+    A transport that reads an `EventRequest` off the wire builds its context here, so a new envelope
+    field reaches dispatch without each transport copying it by hand.
+    """
+    return ResultContext(
+        response_topic=event.response_topic,
+        request_id=event.request_id,
+        sender=event.sender,
+        open_workflow_id=event.open_workflow_id,
+    )
+
+
 class _RequestWorkflowError(Exception):
     """A request names no workflow its handler can act on, so dispatch answers with `failure` instead."""
 
