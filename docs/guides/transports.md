@@ -113,9 +113,9 @@ Results are delivered on the `response_topic` you named, to every connection tha
 
 Results then arrive as messages whose `type` is `success_result` or `failure_result`, with your `request_id` inside `payload`. A result's `open_workflow_id` names the open workflow the request acted on. That is the one you named, or, when you left it out, the one the engine chose: the only open workflow, or a run's own workflow for a request the run sent. A request that opens a workflow names the workflow it opened, or found already open, and `CloseWorkflowRequest` names the one it closed. It is `null` when the request acted on no workflow, such as `EngineHeartbeatRequest` or `ClearAllObjectStateRequest`, even if you named one. A request that fails before it runs, with `WorkflowNotOpenResultFailure` or `WorkflowNotNamedResultFailure`, names the id you sent, or `null` if you sent none, so you can tell which of your workflows the failure is about.
 
-While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each one has an `open_workflow_id` naming the open workflow it belongs to, like a result's, so you can tell which tab it is for when node names repeat across workflows. It is `null` for events that belong to no workflow, such as publishing progress.
+While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each one has an `open_workflow_id` naming the open workflow it belongs to, like a result's, so you can tell which tab it is for when node names repeat across workflows. It is `null` for events that belong to no workflow, such as publishing progress. Execution events, like the opened and closed events below, arrive on their own topics, not your `response_topic`. See [Following a workflow](#following-a-workflow).
 
-The engine also tells every connection when a workflow opens or closes, whichever connection sent the request:
+The engine also tells every connection on the session when a workflow opens or closes, whichever connection sent the request:
 
 - `WorkflowOpenedEvent` arrives once the opened workflow is built, so you can read its graph right away. Its `open_workflow` describes the workflow in the form `ListOpenWorkflowsRequest` lists it.
 - `WorkflowClosedEvent` names the closed workflow in `open_workflow_id`. A close, a clear, a library reload and a project switch all send it, one for each workflow they close. When a request closes the open workflow before opening another, the closed event comes first. Saving never opens or closes a workflow.
@@ -138,6 +138,26 @@ Only one workflow can be open at a time unless the **Multiple open workflows** [
 Requests about saved workflows, such as `RenameWorkflowRequest`, `MoveWorkflowRequest`, `DeleteWorkflowRequest` and `BranchWorkflowRequest`, act on the workflow they name, not the one `open_workflow_id` names, so a tab can rename or delete a workflow that isn't open. Name it by its `workflow_id`, which stays the same through a rename or a move, or by its `workflow_name`, which changes with them. A request that gives both fails unless they name the same workflow. A `workflow_id` inside a request or result names the workflow that request or result is about, which may not be open, such as the copy a Save As creates. Renaming an open workflow saves it to the new file. Renaming one that isn't open moves its file. Either way, a rename never replaces another workflow's file. Results of requests that open or save a workflow carry `open_workflow`, the workflow open afterwards, in the form `ListOpenWorkflowsRequest` lists it. After a save, compare its `workflow_id` to the result's own: when they match, the open workflow is the saved file, and when they differ, the save wrote a copy and the original stays open. A Save As or a versioned save with `continue_in_copy` set keeps the open workflow, its `workflow_id` and everything in it, on the new file instead, and registers the original file as a separate workflow with a new id. The result's `open_workflow` then reports the new name and file. A save never writes over the file of another open workflow.
 
 If your organization uses license keys, the engine checks each request against your license. A request your license doesn't permit is refused rather than run.
+
+### Following a workflow
+
+The engine sends each message on a topic, and a connection gets only the topics it subscribes to:
+
+| Topic                                                       | Carries                                                                                                                                      |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| The `response_topic` you named                              | The result of each of your own requests                                                                                                      |
+| `sessions/<session_id>/workflows/<open_workflow_id>/events` | One open workflow's execution events, and the results of requests that acted on it, whoever sent them                                        |
+| `sessions/<session_id>/response`                            | Events about the engine, such as `WorkflowOpenedEvent` and `WorkflowClosedEvent`, and the results and execution events that name no workflow |
+
+`EngineHeartbeatRequest` reports the `session_id` and `engine_id`. When the engine has no session, the last two topics are `engines/<engine_id>/workflows/<open_workflow_id>/events` and `engines/<engine_id>/response`.
+
+A result arrives on your `response_topic`. Most requests are broadcast, so their result arrives once more on the topic of the workflow it names, or on the session topic when it names none. That second copy is how every client showing a workflow sees a change, including one an MCP client or an agent made. If you subscribe to both, match results by `request_id` and drop the one you already have. Use a `response_topic` of your own, not a workflow or session topic, so other clients don't get your replies.
+
+To follow a workflow:
+
+1. Subscribe to the session topic.
+1. Send `ListOpenWorkflowsRequest` and subscribe to the topic of each workflow you want to follow.
+1. On `WorkflowOpenedEvent`, subscribe to the new workflow's topic. On `WorkflowClosedEvent`, unsubscribe from the topic of the workflow it names.
 
 ## Examples
 
