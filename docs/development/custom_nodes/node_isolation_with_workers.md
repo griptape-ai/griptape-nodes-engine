@@ -187,6 +187,12 @@ way a saved workflow reopens:
     when a workflow reopens. A `set_parameter_value` override runs,
     with `initial_setup=True`.
 
+The copy is built from the orchestrator's node as it is about to run, not
+from a saved description of it, and it is discarded after the run. That
+is deliberate: a worker holds no state between calls, so its copy path is
+separate from the one that saves a workflow, rebuilds a loop body and
+pastes a selection.
+
 The copy has the orchestrator's parameters, types and values. It has no
 connections and no other nodes around it, and nothing your node's code
 sends while it loads reaches the orchestrator. Then `process` runs, and
@@ -240,9 +246,10 @@ correctly, and strict mode checks each one (see below).
 1. **Loading doesn't touch the graph.** While `initial_setup` is set,
     and in `before_value_set`, change the node itself
     (parameters, types, visibility) and leave connections and other
-    nodes alone. A load makes connections before values, a paste
-    after them, and a worker's copy has none, so asking about them
-    gives an answer that depends on how the node was loaded.
+    nodes alone. A load, a paste and a loop body wire their connections
+    with `initial_setup` after the nodes are built, and a worker's copy
+    has none, so asking about them while loading gives an answer that
+    depends on how the node was loaded.
 
 ### Mutating the parameter list during execute does not propagate
 

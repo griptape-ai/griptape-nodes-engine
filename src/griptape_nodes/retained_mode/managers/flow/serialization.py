@@ -68,7 +68,7 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands
 from griptape_nodes.serialization.legacy_pickle import LegacyPickleError, read_legacy_image_flow_commands
-from griptape_nodes.serialization.values import Unencodable, decode_value, try_encode, value_key
+from griptape_nodes.serialization.values import Unencodable, try_encode, value_key
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -756,14 +756,19 @@ class FlowSerialization(EngineScoped):
             created_new_flow = True  # Mark that we created this flow
 
         # Deserializing a flow goes in a specific order: every node in this Flow AND its subflows
-        # first, then connections, then values. Connections are serialized against a Flow's whole
-        # subtree (see _aggregate_connections), so an edge crossing a Flow boundary names a node
-        # that lives one or more levels down. Connections are wired only after every node in the
+        # first, each with its saved values, then connections. Connections are serialized against a
+        # Flow's whole subtree (see _aggregate_connections), so an edge crossing a Flow boundary names
+        # a node that lives one or more levels down. Connections are wired only after every node in the
         # subtree exists, subflows included, because any earlier and such an edge fails with "node
-        # did not exist within the flow" and fails the whole load.
+        # did not exist within the flow" and fails the whole load. They are wired with initial_setup,
+        # so they push nothing into nodes that already hold their saved values.
         try:
             deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
-                workflow, serialized_flow_commands=request.serialized_flow_commands
+                workflow,
+                serialized_flow_commands=request.serialized_flow_commands,
+                connected_parameter_names_by_node=self._connected_parameter_names_by_node(
+                    request.serialized_flow_commands
+                ),
             )
 
             # Now apply the connections, for this Flow and every Flow beneath it.
@@ -782,15 +787,6 @@ class FlowSerialization(EngineScoped):
                 serialized_flow_commands=request.serialized_flow_commands,
                 deserialized_nodes=deserialized_nodes,
                 created_connection_keys=set(),
-            )
-
-            # Now assign the values, again across the whole subtree.
-            # This is the same issue that we handle for Connections:
-            # we don't know the exact node name that would be used, but we do know the UUIDs.
-            self._deserialize_values_for_flow_and_subflows(
-                workflow,
-                serialized_flow_commands=request.serialized_flow_commands,
-                deserialized_nodes=deserialized_nodes,
             )
         except FlowDeserializationError as err:
             details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
@@ -812,7 +808,10 @@ class FlowSerialization(EngineScoped):
         )
 
     def _deserialize_nodes_for_flow_and_subflows(
-        self, workflow: WorkflowRuntime, serialized_flow_commands: SerializedFlowCommands
+        self,
+        workflow: WorkflowRuntime,
+        serialized_flow_commands: SerializedFlowCommands,
+        connected_parameter_names_by_node: dict[SerializedNodeCommands.NodeUUID, set[str]],
     ) -> DeserializedFlowNodes:
         """Rebuild every node in a Flow and, recursively, in each of its subflows.
 
@@ -827,6 +826,8 @@ class FlowSerialization(EngineScoped):
         Args:
             workflow: The workflow the Flow is rebuilt in
             serialized_flow_commands: The commands for the Flow being rebuilt
+            connected_parameter_names_by_node: For every node in the outermost Flow's tree, the inputs a
+                connection will feed once the nodes exist (see _connected_parameter_names_by_node)
 
         Returns:
             The rebuilt nodes of this Flow and its whole subtree
@@ -849,16 +850,28 @@ class FlowSerialization(EngineScoped):
 
         for serialized_node in regular_node_commands:
             self._deserialize_and_record_node(
-                workflow, serialized_node=serialized_node, deserialized_nodes=deserialized_nodes
+                workflow,
+                serialized_node=serialized_node,
+                serialized_flow_commands=serialized_flow_commands,
+                deserialized_nodes=deserialized_nodes,
+                connected_parameter_names_by_node=connected_parameter_names_by_node,
             )
 
         for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
-            sub_flow_nodes = self._deserialize_subflow_nodes(workflow, sub_flow_commands=sub_flow_commands)
+            sub_flow_nodes = self._deserialize_subflow_nodes(
+                workflow,
+                sub_flow_commands=sub_flow_commands,
+                connected_parameter_names_by_node=connected_parameter_names_by_node,
+            )
             deserialized_nodes.merge(sub_flow_nodes)
 
         for serialized_node in node_group_commands:
             self._deserialize_and_record_node(
-                workflow, serialized_node=serialized_node, deserialized_nodes=deserialized_nodes
+                workflow,
+                serialized_node=serialized_node,
+                serialized_flow_commands=serialized_flow_commands,
+                deserialized_nodes=deserialized_nodes,
+                connected_parameter_names_by_node=connected_parameter_names_by_node,
             )
 
         return deserialized_nodes
@@ -867,20 +880,28 @@ class FlowSerialization(EngineScoped):
         self,
         workflow: WorkflowRuntime,
         serialized_node: SerializedNodeCommands,
+        serialized_flow_commands: SerializedFlowCommands,
         deserialized_nodes: DeserializedFlowNodes,
+        connected_parameter_names_by_node: dict[SerializedNodeCommands.NodeUUID, set[str]],
     ) -> None:
-        """Rebuild one node and record the name it was given under both keys callers look it up by.
+        """Rebuild one node, with its saved values, and record the name it was given under both keys callers look it up by.
 
         Args:
             workflow: The workflow the node is rebuilt in
             serialized_node: The commands for the node being rebuilt
+            serialized_flow_commands: The Flow the node belongs to, holding its saved values and their pool
             deserialized_nodes: The collection to record the rebuilt node in
+            connected_parameter_names_by_node: The inputs a connection will feed, by node
 
         Raises:
             FlowDeserializationError: If the node could not be rebuilt
         """
         node_name = self._deserialize_one_node(
-            workflow, serialized_node=serialized_node, deserialized_nodes=deserialized_nodes
+            workflow,
+            serialized_node=serialized_node,
+            serialized_flow_commands=serialized_flow_commands,
+            deserialized_nodes=deserialized_nodes,
+            connected_parameter_names=connected_parameter_names_by_node.get(serialized_node.node_uuid, set()),
         )
         deserialized_nodes.node_uuid_to_node_name[serialized_node.node_uuid] = node_name
         original_node_name = serialized_node.create_node_command.node_name
@@ -892,14 +913,18 @@ class FlowSerialization(EngineScoped):
         self,
         workflow: WorkflowRuntime,
         serialized_node: SerializedNodeCommands,
+        serialized_flow_commands: SerializedFlowCommands,
         deserialized_nodes: DeserializedFlowNodes,
+        connected_parameter_names: set[str],
     ) -> str:
-        """Rebuild a single node, resolving any group membership it declares.
+        """Rebuild a single node with its saved values, resolving any group membership it declares.
 
         Args:
             workflow: The workflow the node is rebuilt in
             serialized_node: The commands for the node being rebuilt
+            serialized_flow_commands: The Flow the node belongs to, holding its saved values and their pool
             deserialized_nodes: Nodes rebuilt so far, used to resolve group membership UUIDs
+            connected_parameter_names: This node's inputs a connection will feed once every node exists
 
         Returns:
             The name the rebuilt node was given
@@ -924,11 +949,18 @@ class FlowSerialization(EngineScoped):
             serialized_node_for_deserialization = replace(serialized_node, create_node_command=create_cmd_copy)
 
         deserialize_node_request = DeserializeNodeFromCommandsRequest(
-            serialized_node_commands=serialized_node_for_deserialization
+            serialized_node_commands=serialized_node_for_deserialization,
+            set_parameter_value_commands=serialized_flow_commands.set_parameter_value_commands.get(
+                serialized_node.node_uuid, []
+            ),
+            unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
+            connected_parameter_names=connected_parameter_names,
         )
         deserialized_node_result = workflow.handle_request(deserialize_node_request)
         if not isinstance(deserialized_node_result, DeserializeNodeFromCommandsResultSuccess):
-            msg = f"Failed while rebuilding the node '{create_cmd.node_name}'."
+            msg = (
+                f"Failed while rebuilding the node '{create_cmd.node_name}'. {deserialized_node_result.result_details}"
+            )
             raise FlowDeserializationError(msg)
 
         return deserialized_node_result.node_name
@@ -1012,13 +1044,17 @@ class FlowSerialization(EngineScoped):
         return remapped_metadata
 
     def _deserialize_subflow_nodes(
-        self, workflow: WorkflowRuntime, sub_flow_commands: SerializedFlowCommands
+        self,
+        workflow: WorkflowRuntime,
+        sub_flow_commands: SerializedFlowCommands,
+        connected_parameter_names_by_node: dict[SerializedNodeCommands.NodeUUID, set[str]],
     ) -> DeserializedFlowNodes:
         """Create one subflow and rebuild the nodes inside it, and inside its own subflows.
 
         Args:
             workflow: The workflow the subflow is rebuilt in
             sub_flow_commands: The commands for the subflow being rebuilt
+            connected_parameter_names_by_node: The inputs a connection will feed, by node, for the whole tree
 
         Returns:
             The rebuilt nodes of the subflow and its whole subtree
@@ -1030,7 +1066,11 @@ class FlowSerialization(EngineScoped):
         if flow_initialization_command is None:
             # No creation command means "deserialize into the Flow already in context", which is
             # this Flow: the nodes belong here rather than in a child.
-            return self._deserialize_nodes_for_flow_and_subflows(workflow, serialized_flow_commands=sub_flow_commands)
+            return self._deserialize_nodes_for_flow_and_subflows(
+                workflow,
+                serialized_flow_commands=sub_flow_commands,
+                connected_parameter_names_by_node=connected_parameter_names_by_node,
+            )
 
         sub_flow_name = self._create_flow_for_deserialization(
             workflow, flow_initialization_command=flow_initialization_command
@@ -1044,7 +1084,9 @@ class FlowSerialization(EngineScoped):
         # while rebuilding its contents and leave it afterwards.
         with workflow.context.flow(sub_flow):
             sub_flow_nodes = self._deserialize_nodes_for_flow_and_subflows(
-                workflow, serialized_flow_commands=sub_flow_commands
+                workflow,
+                serialized_flow_commands=sub_flow_commands,
+                connected_parameter_names_by_node=connected_parameter_names_by_node,
             )
 
         # Record what this flow was saved as against what it came back as. A group node saved a
@@ -1055,6 +1097,25 @@ class FlowSerialization(EngineScoped):
             sub_flow_nodes.original_flow_name_to_flow_name[original_flow_name] = sub_flow_name
 
         return sub_flow_nodes
+
+    @staticmethod
+    def _connected_parameter_names_by_node(
+        serialized_flow_commands: SerializedFlowCommands,
+    ) -> dict[SerializedNodeCommands.NodeUUID, set[str]]:
+        """Index, by node, the inputs the connections of this Flow's whole tree will feed.
+
+        Built once from the outermost Flow's connections and handed down the rebuild. The outermost
+        list is the only complete one: an edge is recorded on the lowest Flow holding both of its
+        nodes (see FlowManager._get_connections_for_flow), so an edge from a parent Flow into a group's
+        subflow is in the parent's list and absent from the subflow's own. Aggregation runs upward
+        (see _aggregate_connections), so the outermost list holds every edge exactly once.
+        """
+        connected_parameter_names_by_node: dict[SerializedNodeCommands.NodeUUID, set[str]] = {}
+        for connection in serialized_flow_commands.serialized_connections:
+            connected_parameter_names_by_node.setdefault(connection.target_node_uuid, set()).add(
+                connection.target_parameter_name
+            )
+        return connected_parameter_names_by_node
 
     def _original_flow_name_of(
         self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
@@ -1158,6 +1219,8 @@ class FlowSerialization(EngineScoped):
                 source_parameter_name=indirect_connection.source_parameter_name,
                 target_node_name=target_node_name,
                 target_parameter_name=indirect_connection.target_parameter_name,
+                # The rebuilt nodes already hold their saved values; wiring must not push anything.
+                initial_setup=True,
             )
             create_connection_result = workflow.handle_request(create_connection_request)
             if create_connection_result.failed():
@@ -1171,84 +1234,6 @@ class FlowSerialization(EngineScoped):
                 deserialized_nodes=deserialized_nodes,
                 created_connection_keys=created_connection_keys,
             )
-
-    def _deserialize_values_for_flow_and_subflows(
-        self,
-        workflow: WorkflowRuntime,
-        serialized_flow_commands: SerializedFlowCommands,
-        deserialized_nodes: DeserializedFlowNodes,
-    ) -> None:
-        """Reapply the parameter values of a Flow and every Flow beneath it.
-
-        Args:
-            workflow: The workflow the Flow is rebuilt in
-            serialized_flow_commands: The commands for the Flow being rebuilt
-            deserialized_nodes: Every node rebuilt for this Flow's whole subtree
-
-        Raises:
-            FlowDeserializationError: If a value belongs to a node that was not rebuilt, or could not be set
-        """
-        for node_uuid, set_value_command_list in serialized_flow_commands.set_parameter_value_commands.items():
-            node_name = deserialized_nodes.node_uuid_to_node_name.get(node_uuid)
-            if node_name is None:
-                msg = "Failed while restoring saved values because the node they belong to was not rebuilt."
-                raise FlowDeserializationError(msg)
-            node = workflow.objects.get_as_type(node_name, BaseNode)
-            if node is None:
-                msg = f"Failed while restoring the saved values of '{node_name}'."
-                raise FlowDeserializationError(msg)
-
-            with workflow.context.node(node):
-                for indirect_set_value_command in set_value_command_list:
-                    self._apply_deserialized_parameter_value(
-                        workflow,
-                        indirect_set_value_command=indirect_set_value_command,
-                        node=node,
-                        unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
-                    )
-
-        for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
-            self._deserialize_values_for_flow_and_subflows(
-                workflow, serialized_flow_commands=sub_flow_commands, deserialized_nodes=deserialized_nodes
-            )
-
-    def _apply_deserialized_parameter_value(
-        self,
-        workflow: WorkflowRuntime,
-        indirect_set_value_command: SerializedNodeCommands.IndirectSetParameterValueCommand,
-        node: BaseNode,
-        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
-    ) -> None:
-        """Set one saved parameter value on a rebuilt node.
-
-        Args:
-            workflow: The workflow the node is rebuilt in
-            indirect_set_value_command: The saved assignment, referencing its value by UUID
-            node: The node the value belongs to
-            unique_parameter_uuid_to_values: The pool the value UUID resolves against
-
-        Raises:
-            FlowDeserializationError: If the value is missing from the pool, or could not be set
-        """
-        parameter_name = indirect_set_value_command.set_parameter_value_command.parameter_name
-        unique_value_uuid = indirect_set_value_command.unique_value_uuid
-        if unique_value_uuid not in unique_parameter_uuid_to_values:
-            msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}' because the value was missing."
-            raise FlowDeserializationError(msg)
-
-        # Call the SetParameterValueRequest, subbing in a freshly decoded copy of the pooled value.
-        indirect_set_value_command.set_parameter_value_command.value = decode_value(
-            unique_parameter_uuid_to_values[unique_value_uuid]
-        )
-        # Update the parameter value command to have the correct name.
-        indirect_set_value_command.set_parameter_value_command.node_name = node.name
-        set_parameter_value_result = workflow.handle_request(indirect_set_value_command.set_parameter_value_command)
-        if set_parameter_value_result.failed():
-            msg = (
-                f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
-                f"{set_parameter_value_result.result_details}"
-            )
-            raise FlowDeserializationError(msg)
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
