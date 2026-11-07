@@ -419,8 +419,15 @@ class RenameWorkflowRequest(RequestPayload):
     Use when: Updating workflow names, organizing workflow libraries,
     fixing naming conflicts, workflow management.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
+    one. It acts on that workflow whichever one the envelope's `open_workflow_id` names. An open
+    workflow saves its graph to the new file. A closed one moves its file and rewrites the name
+    in its header. Either way it keeps its id, and the old file is removed. A rename never
+    replaces another workflow's file.
+
     Args:
-        workflow_name: Current name of the workflow
+        workflow_name: Current registry name of the workflow
+        workflow_id: Id of the workflow
         requested_name: New name for the workflow (drives the on-disk filename)
         display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
             ``MATCH_FILE_NAME`` to preserve historical wire behavior — callers who want the
@@ -433,8 +440,9 @@ class RenameWorkflowRequest(RequestPayload):
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
-    workflow_name: str
-    requested_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    requested_name: str = field(kw_only=True)
     display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
     display_name: str | None = None
 

@@ -1,7 +1,7 @@
 """Workflow managers' handlers act on the workflow dispatch hands them, or on the saved workflow they name.
 
-The request envelope names the tab's open workflow; a body `workflow_name` names the saved workflow a
-request acts on. Most tests open a second workflow beside the first, so a handler that fell back to
+The request envelope names the tab's open workflow; a body `workflow_id` or `workflow_name` names the
+saved workflow a request acts on. Most tests open a second workflow beside the first, so a handler that fell back to
 "the only open workflow" would fail instead of passing by luck.
 """
 
@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
+from typing import TYPE_CHECKING, Any, NamedTuple
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape, read_workflow_metadata
 from griptape_nodes.retained_mode.events.context_events import (
     CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
@@ -55,7 +55,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
+    RenameDisplayNameBehavior,
     RenameWorkflowRequest,
+    RenameWorkflowResultFailure,
     RenameWorkflowResultSuccess,
     RunWorkflowWithCurrentStateRequest,
     SaveSubflowToWorkflowRequest,
@@ -109,7 +111,6 @@ _WORKFLOW_REQUESTS = {
     ImportWorkflowAsReferencedSubFlowRequest,
     GetVariableSubstitutionEnabledRequest,
     SetVariableSubstitutionEnabledRequest,
-    RenameWorkflowRequest,
     PublishWorkflowRequest,
     GetWorkflowShapeRequest,
 }
@@ -156,6 +157,36 @@ def _create_flow(engine: Engine, workflow: WorkflowRuntime, flow_name: str) -> s
     result = _send(engine, CreateFlowRequest(parent_flow_name=None, flow_name=flow_name), workflow)
     assert isinstance(result, CreateFlowResultSuccess), result.result_details
     return result.flow_name
+
+
+def _open_with_flow(engine: Engine, display_name: str) -> WorkflowRuntime:
+    """Open a new unsaved workflow with a top-level flow, so it can be saved."""
+    ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
+    assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess), ensured.result_details
+    assert ensured.workflow_id is not None
+    return engine.open_workflows.get(ensured.workflow_id)
+
+
+class _SavedWorkflow(NamedTuple):
+    workflow_id: str
+    workflow_name: str
+    file_path: Path
+
+
+def _save_and_close(engine: Engine, display_name: str) -> _SavedWorkflow:
+    """Create, save and close a workflow."""
+    workflow = _open_with_flow(engine, display_name)
+    saved = _send_async(engine, SaveWorkflowRequest(), workflow)
+    assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+    _send_async(engine, CloseWorkflowRequest(), workflow)
+    return _SavedWorkflow(
+        workflow_id=workflow.workflow_id, workflow_name=saved.workflow_name, file_path=Path(saved.file_path)
+    )
+
+
+def _body(path: Path) -> str:
+    """A workflow file's content after its metadata header."""
+    return path.read_text(encoding="utf-8").split("\n# ///\n", 1)[1]
 
 
 def _write_saved_workflow(engine: Engine, path: Path, *, workflow_shape: WorkflowShape | None = None) -> Workflow:
@@ -268,6 +299,117 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert project_engine.open_workflows.is_open(tab.workflow_id)
         assert project_engine.workflow_registry.find_by_id(other.workflow_id) is None
 
+    def test_renaming_a_closed_workflow_from_another_tab_moves_its_own_file(self, project_engine: Engine) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        closed_body = _body(closed.file_path)
+        tab = _open_with_flow(project_engine, "tab")
+
+        renamed = _send_async(
+            project_engine, RenameWorkflowRequest(workflow_name=closed.workflow_name, requested_name="renamed"), tab
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert renamed.workflow_id == closed.workflow_id
+        renamed_path = closed.file_path.with_name("renamed.py")
+        assert _body(renamed_path) == closed_body
+        assert read_workflow_metadata(renamed_path).name == "renamed"
+        assert not closed.file_path.exists()
+        assert project_engine.workflow_registry.get(closed.workflow_id).absolute_path == renamed_path
+        assert not project_engine.workflow_registry.get(tab.workflow_id).is_saved
+        assert project_engine.open_workflows.is_open(tab.workflow_id)
+
+    def test_renaming_a_closed_workflow_to_its_own_name_rewrites_only_its_display_name(
+        self, project_engine: Engine
+    ) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        closed_body = _body(closed.file_path)
+
+        renamed = _send_async(
+            project_engine,
+            RenameWorkflowRequest(
+                workflow_id=closed.workflow_id,
+                requested_name=closed.file_path.stem,
+                display_name_behavior=RenameDisplayNameBehavior.OVERRIDE,
+                display_name="Shot 010",
+            ),
+            None,
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert renamed.new_workflow_name == closed.workflow_name
+        assert read_workflow_metadata(closed.file_path).name == "Shot 010"
+        assert _body(closed.file_path) == closed_body
+        assert project_engine.workflow_registry.get(closed.workflow_id).metadata.name == "Shot 010"
+
+    def test_renaming_a_closed_workflow_onto_another_workflows_file_is_refused(self, project_engine: Engine) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        taken = _save_and_close(project_engine, "taken")
+        closed_content = closed.file_path.read_text(encoding="utf-8")
+        taken_content = taken.file_path.read_text(encoding="utf-8")
+
+        renamed = _send_async(
+            project_engine,
+            RenameWorkflowRequest(workflow_id=closed.workflow_id, requested_name=taken.file_path.stem),
+            None,
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert "already exists" in str(renamed.result_details)
+        assert closed.file_path.read_text(encoding="utf-8") == closed_content
+        assert taken.file_path.read_text(encoding="utf-8") == taken_content
+        assert project_engine.workflow_registry.get(closed.workflow_id).name == closed.workflow_name
+        assert project_engine.workflow_registry.get(taken.workflow_id).name == taken.workflow_name
+
+    def test_renaming_an_open_workflow_onto_another_workflows_file_is_refused(self, project_engine: Engine) -> None:
+        taken = _save_and_close(project_engine, "taken")
+        taken_content = taken.file_path.read_text(encoding="utf-8")
+        tab = _open_with_flow(project_engine, "tab")
+        saved = _send_async(project_engine, SaveWorkflowRequest(), tab)
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+
+        renamed = _send_async(
+            project_engine,
+            RenameWorkflowRequest(workflow_id=tab.workflow_id, requested_name=taken.file_path.stem),
+            None,
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert taken.file_path.read_text(encoding="utf-8") == taken_content
+        assert Path(saved.file_path).is_file()
+        assert project_engine.workflow_registry.get(taken.workflow_id).name == taken.workflow_name
+
+    def test_renaming_a_closed_library_workflow_is_refused(self, project_engine: Engine) -> None:
+        closed = _save_and_close(project_engine, "library")
+        project_engine.workflow_registry.get(closed.workflow_id).metadata.is_griptape_provided = True
+
+        renamed = _send_async(
+            project_engine, RenameWorkflowRequest(workflow_id=closed.workflow_id, requested_name="mine"), None
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert "a library provides it" in str(renamed.result_details)
+        assert closed.file_path.is_file()
+
+    def test_renaming_an_open_workflow_by_id_from_another_tab_saves_its_own_graph(self, project_engine: Engine) -> None:
+        _allow_several_open(project_engine)
+        target = _open_with_flow(project_engine, "target")
+        saved = _send_async(project_engine, SaveWorkflowRequest(), target)
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        target_body = _body(Path(saved.file_path))
+        tab = _open(project_engine, "tab")
+
+        renamed = _send_async(
+            project_engine, RenameWorkflowRequest(workflow_id=target.workflow_id, requested_name="renamed"), tab
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert renamed.workflow_id == target.workflow_id
+        renamed_path = Path(saved.file_path).with_name("renamed.py")
+        assert _body(renamed_path) == target_body
+        assert not Path(saved.file_path).exists()
+        assert project_engine.open_workflows.is_open(target.workflow_id)
+        assert not project_engine.workflow_registry.get(tab.workflow_id).is_saved
+
     def test_renaming_an_open_workflow_from_another_tab_saves_that_workflow(self, engine: Engine) -> None:
         _allow_several_open(engine)
         tab = _open(engine, "tab")
@@ -291,24 +433,16 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
         assert saved_runtimes == [target]
 
-    def test_renaming_a_name_no_workflow_has_saves_the_handed_workflow(self, engine: Engine) -> None:
-        _allow_several_open(engine)
+    def test_renaming_a_name_no_workflow_has_fails_and_saves_nothing(self, engine: Engine) -> None:
         tab = _open(engine, "tab")
-        _open(engine, "beside")
-        saved_in: list[Any] = []
+        save = AsyncMock()
 
-        async def save(workflow: WorkflowRuntime, _request: SaveWorkflowRequest, **_: Any) -> Any:
-            saved_in.append(workflow)
-            return SaveWorkflowResultSuccess(file_path="renamed.py", workflow_name="renamed", result_details="ok")
-
-        with (
-            patch.object(engine.workflow_manager.saver, "save_open_workflow", side_effect=save),
-            patch.object(engine.workflow_manager, "persist_external_workflow_registration"),
-        ):
+        with patch.object(engine.workflow_manager.saver, "save_open_workflow", save):
             renamed = _send_async(engine, RenameWorkflowRequest(workflow_name="gone", requested_name="renamed"), tab)
 
-        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
-        assert saved_in == [tab]
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert "no workflow has that name" in str(renamed.result_details)
+        save.assert_not_called()
 
     def test_publishing_saves_and_publishes_the_workflow_it_is_handed(self, engine: Engine, tmp_path: Path) -> None:
         _allow_several_open(engine)
