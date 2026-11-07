@@ -20,6 +20,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeResultSuccess,
 )
 from griptape_nodes.serialization.values import encodable_default
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -35,7 +36,7 @@ class _Opaque:
 def clean_object_state(engine: Engine) -> Generator[None, None, None]:
     """Clear all object state around a test so leftover flows never bleed across tests."""
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    engine.context_manager.push_workflow(workflow_name="wf_default_value_saving")
+    bind(engine.context_manager.open_workflow(workflow_name="wf_default_value_saving"))
     try:
         yield
     finally:

@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import DeleteNodeRequest, DeleteNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -101,7 +102,7 @@ def registered_library(engine: Engine, tmp_path: Path, materialize_library: Call
 
 def _new_flow(engine: Engine, workflow_name: str) -> str:
     """Create a workflow context and a single top-level flow to hold the test's nodes."""
-    engine.context_manager.push_workflow(workflow_name=workflow_name)
+    bind(engine.context_manager.open_workflow(workflow_name=workflow_name))
     result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Flow", set_as_new_context=False))
     assert isinstance(result, CreateFlowResultSuccess), result
     return result.flow_name

@@ -35,6 +35,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -98,7 +99,7 @@ async def test_outside_loose_sink_sees_current_run_value(
     config_manager.set_config_value("max_nodes_in_parallel", 4)
 
     try:
-        engine.context_manager.push_workflow(workflow_name="loop_outside_sink_e2e_workflow")
+        bind(engine.context_manager.open_workflow(workflow_name="loop_outside_sink_e2e_workflow"))
         flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="LoopFlow", set_as_new_context=False)
         )
