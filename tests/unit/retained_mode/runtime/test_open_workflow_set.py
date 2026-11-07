@@ -25,8 +25,10 @@ class TestOpenWorkflowSet:
 
         assert workflows.all_open() == [first]
 
-    def test_the_test_seam_lets_a_second_workflow_open_beside_the_first(self) -> None:
-        workflows = OpenWorkflowSet(MagicMock(), allow_several_open=True)
+    def test_the_beta_feature_lets_a_second_workflow_open_beside_the_first(
+        self, multiple_open_workflows: Engine
+    ) -> None:
+        workflows = OpenWorkflowSet(multiple_open_workflows)
         first = workflows.open("abc")
         second = workflows.open("def")
 

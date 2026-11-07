@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from griptape_nodes.retained_mode.beta_features import MULTIPLE_OPEN_WORKFLOWS, is_beta_enabled
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 if TYPE_CHECKING:
@@ -21,21 +22,19 @@ class NoOpenWorkflowError(OpenWorkflowError):
 class OpenWorkflowSet:
     """The runtimes of the workflows the engine has open, by workflow id.
 
-    One workflow is open at a time. Reads never open anything: only `open` adds a runtime.
-    `Engine.open_workflow` and `Engine.close_workflow` are the operations that open and close one.
+    One workflow is open at a time, or several with the `multiple_open_workflows` beta feature on.
+    Reads never open anything: only `open` adds a runtime. `Engine.open_workflow` and
+    `Engine.close_workflow` are the operations that open and close one.
     """
 
-    def __init__(self, engine: Engine, *, allow_several_open: bool = False) -> None:
+    def __init__(self, engine: Engine) -> None:
         """Make an empty set.
 
         Args:
             engine: The engine holding the runtimes, handed to each one.
-            allow_several_open: Test seam that lets a workflow open beside another. The engine never
-                sets it: it opens one workflow at a time.
         """
         self._engine = engine
         self._by_id: dict[str, WorkflowRuntime] = {}
-        self._allow_several_open = allow_several_open
 
     def open(self, workflow_id: str) -> WorkflowRuntime:
         """Open the workflow with this id and return its empty runtime.
@@ -71,8 +70,14 @@ class OpenWorkflowSet:
         workflow.closed = True
 
     def workflow_blocking_open(self) -> WorkflowRuntime | None:
-        """The open workflow that keeps another from opening: the one open, when only one may be."""
-        if self._allow_several_open or not self._by_id:
+        """The open workflow that keeps another from opening, or None when another can open.
+
+        Reads the `multiple_open_workflows` beta feature on every call, so turning it off closes
+        nothing and refuses the next open.
+        """
+        if not self._by_id:
+            return None
+        if is_beta_enabled(MULTIPLE_OPEN_WORKFLOWS, self._engine.config_manager):
             return None
         return next(iter(self._by_id.values()))
 

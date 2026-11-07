@@ -58,6 +58,16 @@ or an environment variable sets it. A note under the toggle says which
 one. Change the value there, or remove it, to control the feature from
 this page again.
 
+## Multiple open workflows
+
+With **Multiple open workflows** on, the engine keeps several workflows
+open at once, one for each editor tab, instead of one at a time. Opening
+a workflow leaves the others open, and so does running a saved workflow
+from a script or an agent. Turn it off and the workflows already open
+stay open. Close all but one to go back to working with one workflow at
+a time. Developers connecting their own tools can read what changes for
+them in [Transports](../transports.md#open-workflows).
+
 ## What to expect from a beta feature
 
 - **Beta features can change or disappear.** Each one is either made a

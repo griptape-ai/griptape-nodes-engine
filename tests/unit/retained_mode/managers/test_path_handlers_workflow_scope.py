@@ -68,7 +68,6 @@ from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -112,21 +111,10 @@ def _declared_scopes(
     }
 
 
-def _open(engine: Engine, working_directory: Path, *, beside: bool = False) -> WorkflowRuntime:
-    """Open an unsaved workflow created in `working_directory`, beside any open one when `beside`."""
-    if beside:
-        engine._open_workflows = _several_allowed(engine)
+def _open(engine: Engine, working_directory: Path) -> WorkflowRuntime:
+    """Open an unsaved workflow created in `working_directory`."""
     entry = engine.workflow_registry.register_unsaved(working_directory.name, str(working_directory), listed=False)
     return engine.open_workflow(entry.workflow_id)
-
-
-def _several_allowed(engine: Engine) -> OpenWorkflowSet:
-    """The engine's open set, swapped for one that lets a second workflow open next to the first."""
-    current = engine.open_workflows
-    several = OpenWorkflowSet(engine, allow_several_open=True)
-    for workflow in current.all_open():
-        several._by_id[workflow.workflow_id] = workflow
-    return several
 
 
 def _send(engine: Engine, request: RequestPayload, workflow: WorkflowRuntime | None = None) -> ResultPayload:
@@ -180,11 +168,12 @@ class TestPathHandlerScopes:
 
 
 class TestMacrosResolveForTheDispatchedWorkflow:
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_get_path_for_macro_resolves_the_addressed_workflow_not_the_open_one(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
         _open(nothing_open, tmp_path / "open")
-        addressed = _open(nothing_open, tmp_path / "addressed", beside=True)
+        addressed = _open(nothing_open, tmp_path / "addressed")
 
         result = _send(
             nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}), addressed
@@ -193,11 +182,12 @@ class TestMacrosResolveForTheDispatchedWorkflow:
         assert isinstance(result, GetPathForMacroResultSuccess), result.result_details
         assert result.absolute_path == _folder(tmp_path / "addressed" / "outputs" / "img.png")
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_attempt_map_resolves_directories_for_the_addressed_workflow(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
         _open(nothing_open, tmp_path / "open")
-        addressed = _open(nothing_open, tmp_path / "addressed", beside=True)
+        addressed = _open(nothing_open, tmp_path / "addressed")
         written = tmp_path / "addressed" / "outputs" / "img.png"
 
         result = _send(nothing_open, AttemptMapAbsolutePathToProjectRequest(absolute_path=written), addressed)
@@ -229,11 +219,12 @@ class TestMacrosResolveForTheDispatchedWorkflow:
         assert isinstance(result, GetPathForMacroResultSuccess), result.result_details
         assert result.absolute_path == _folder(tmp_path / "open" / "outputs" / "img.png")
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_request_naming_no_workflow_while_several_are_open_fails(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
         _open(nothing_open, tmp_path / "a")
-        _open(nothing_open, tmp_path / "b", beside=True)
+        _open(nothing_open, tmp_path / "b")
 
         result = _send(
             nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={})
@@ -242,12 +233,13 @@ class TestMacrosResolveForTheDispatchedWorkflow:
         assert not result.succeeded()
         assert "did not name one" in str(result.result_details)
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_naming_no_workflow_while_several_are_open_fails_even_without_a_workflow_builtin(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
         """Dispatch picks the workflow before the macro is read, so it can't tell the macro needs none."""
         _open(nothing_open, tmp_path / "a")
-        _open(nothing_open, tmp_path / "b", beside=True)
+        _open(nothing_open, tmp_path / "b")
 
         result = _send(
             nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{workspace_dir}/img.png"), variables={})
@@ -309,9 +301,10 @@ class TestAWorkerResolvesForTheWorkflowItRunsANodeFor:
 class TestFileHandlersResolveForTheDispatchedWorkflow:
     """OS handlers resolve macro paths, and address the requests they send, to the workflow they are handed."""
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_write_file_lands_in_the_addressed_workflows_outputs(self, nothing_open: Engine, tmp_path: Path) -> None:
         _open(nothing_open, tmp_path / "open")
-        addressed = _open(nothing_open, tmp_path / "addressed", beside=True)
+        addressed = _open(nothing_open, tmp_path / "addressed")
 
         result = _send(
             nothing_open,
@@ -325,9 +318,10 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         assert Path(result.final_file_path) == _folder(tmp_path / "addressed" / "outputs" / "notes.txt")
         assert not (tmp_path / "open" / "outputs").exists()
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_sidecar_records_the_addressed_workflow(self, nothing_open: Engine, tmp_path: Path) -> None:
         open_workflow = _open(nothing_open, tmp_path / "open")
-        addressed = _open(nothing_open, tmp_path / "addressed", beside=True)
+        addressed = _open(nothing_open, tmp_path / "addressed")
         written = tmp_path / "addressed" / "notes.txt"
 
         result = _send(
@@ -345,11 +339,12 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         assert recorded_name == nothing_open.workflow_registry.get(addressed.workflow_id).name
         assert recorded_name != nothing_open.workflow_registry.get(open_workflow.workflow_id).name
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_list_directory_resolves_a_macro_for_the_addressed_workflow(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
         _open(nothing_open, tmp_path / "open")
-        addressed = _open(nothing_open, tmp_path / "addressed", beside=True)
+        addressed = _open(nothing_open, tmp_path / "addressed")
         (tmp_path / "addressed" / "outputs").mkdir(parents=True)
         (tmp_path / "addressed" / "outputs" / "a.txt").write_text("a")
 
@@ -371,11 +366,12 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
 class TestStaticFilesResolveForTheDispatchedWorkflow:
     """Static files and previews go to the folder of the workflow they are for."""
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_static_file_url_points_into_the_addressed_workflows_folder(
         self, nothing_open: Engine, workspace: Path
     ) -> None:
         _open(nothing_open, workspace / "open")
-        addressed = _open(nothing_open, workspace / "addressed", beside=True)
+        addressed = _open(nothing_open, workspace / "addressed")
 
         result = _send(
             nothing_open,
@@ -387,13 +383,14 @@ class TestStaticFilesResolveForTheDispatchedWorkflow:
         assert Path(result.file_url) == workspace / "addressed" / "staticfiles" / "notes.txt"
         assert "/workspace/addressed/staticfiles/notes.txt" in result.url
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_a_preview_is_looked_up_in_the_addressed_workflows_preview_folder(
         self, nothing_open: Engine, workspace: Path
     ) -> None:
         """Generating one writes through unaddressed requests, so this checks where it is looked for."""
         nothing_open.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
         _open(nothing_open, workspace / "open")
-        addressed = _open(nothing_open, workspace / "addressed", beside=True)
+        addressed = _open(nothing_open, workspace / "addressed")
         image_path = workspace / "img.png"
         Image.new("RGB", (64, 64), color="red").save(image_path)
 

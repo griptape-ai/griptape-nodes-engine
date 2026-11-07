@@ -91,7 +91,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -1148,9 +1147,9 @@ class TestLibraryWorkflowsOpenAsCopies:
         assert second.blocking_workflow.workflow_id == first_copy_id
         assert _copies_of(project_engine, library.workflow_id) == [first_copy_id]
 
+    @pytest.mark.usefixtures("multiple_open_workflows")
     def test_opening_it_twice_beside_each_other_makes_two_copies(self, project_engine: Engine) -> None:
         library = _library_workflow(project_engine, "library_flow")
-        project_engine._open_workflows = OpenWorkflowSet(project_engine, allow_several_open=True)
 
         first_copy_id = _open_library_workflow(project_engine, "open_by_id", library)
         second_copy_id = _open_library_workflow(project_engine, "open_by_id", library)

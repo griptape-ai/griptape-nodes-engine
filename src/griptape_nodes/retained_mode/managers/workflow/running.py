@@ -226,8 +226,9 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            if not await self._close_blocking_workflow():
-                details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
+            close_failure = await self._close_blocking_workflow()
+            if close_failure is not None:
+                details = f"Attempted to run '{complete_file_path}'. Failed because {close_failure}"
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
             # By the path a standalone run opens it with (`push_workflow(file_path=__file__)`), so
@@ -337,9 +338,11 @@ class WorkflowRunner(EngineScoped):
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate and not await self._close_blocking_workflow():
-                details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
-                return RunWorkflowFromRegistryResultFailure(result_details=details)
+            if request.run_with_clean_slate:
+                close_failure = await self._close_blocking_workflow()
+                if close_failure is not None:
+                    details = f"Attempted to run workflow '{request.workflow_name}'. Failed because {close_failure}"
+                    return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             try:
                 built = await self.open_and_build_workflow(workflow_name=request.workflow_name)
@@ -663,16 +666,25 @@ class WorkflowRunner(EngineScoped):
         except OpenWorkflowError as err:
             logger.warning("Failed to close workflow '%s' after its file failed to run: %s", workflow_id, err)
 
-    async def _close_blocking_workflow(self) -> bool:
-        """Close the open workflow while only one may be open, returning False if closing it failed."""
-        blocking = self.engine.open_workflows.workflow_blocking_open()
+    async def _close_blocking_workflow(self) -> str | None:
+        """Close the open workflow while only one may be open, returning why it could not, or None.
+
+        Closes nothing while several are open and only one may be, as after the
+        `multiple_open_workflows` beta feature is turned off: closing one would not make room.
+        """
+        open_workflows = self.engine.open_workflows
+        blocking = open_workflows.workflow_blocking_open()
         if blocking is None:
-            return True
+            return None
+        open_count = len(open_workflows.all_open())
+        if open_count > 1:
+            return f"{open_count} workflows are open and only one can be. Close all but one first."
+        blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
         try:
             await self.engine.aclose_workflow(blocking)
-        except OpenWorkflowError:
-            return False
-        return True
+        except OpenWorkflowError as err:
+            return f"closing the open workflow '{blocking_name}' failed: {err}"
+        return None
 
     async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
         """Ensure `workflow`, which a file just built into, has a current flow."""
