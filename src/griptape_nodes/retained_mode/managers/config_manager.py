@@ -1314,12 +1314,14 @@ class ConfigManager(EngineScoped):
         default_workflows = self.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
         if not default_workflows:
             return True
-        default_workflows = [
+        remaining_workflows = [
             saved_workflow
             for saved_workflow in default_workflows
             if (saved_workflow.lower() != workflow_file_name.lower())
         ]
-        return self.set_config_value(WORKFLOWS_TO_REGISTER_KEY, default_workflows)
+        if len(remaining_workflows) == len(default_workflows):
+            return True
+        return self.set_config_value(WORKFLOWS_TO_REGISTER_KEY, remaining_workflows)
 
     def get_full_path(self, relative_path: str) -> Path:
         """Get a full path by combining the base path with a relative path.
