@@ -1247,42 +1247,27 @@ class NodeExecutor(EngineScoped):
             end_node.name,
         )
 
-        # Check if there are direct data connections from start to end
-        list_connections_request = ListConnectionsForNodeRequest(node_name=start_node.name)
+        # An item wired straight from start to end is the only thing an empty body can collect
+        list_connections_request = ListConnectionsForNodeRequest(node_name=end_node.name)
         list_connections_result = workflow.handle_request(list_connections_request)
 
-        connected_source_param = None
+        start_node_item_values = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-            for conn in list_connections_result.outgoing_connections:
-                if conn.target_node_name == end_node.name and conn.target_parameter_name == "new_item_to_add":
-                    connected_source_param = conn.source_parameter_name
-                    break
+            start_node_item_values = self._get_start_node_item_values(
+                end_node, list_connections_result.incoming_connections, range(total_iterations)
+            )
 
         logger.debug(
-            "Processing %d iterations for empty loop from '%s' to '%s' (connected param: %s)",
+            "Processing %d iterations for empty loop from '%s' to '%s' (item wired from start: %s)",
             total_iterations,
             start_node.name,
             end_node.name,
-            connected_source_param,
+            start_node_item_values is not None,
         )
 
-        # Process iterations to collect results from direct connections
         end_node._results_list = []
-        if connected_source_param:
-            for iteration_index in range(total_iterations):
-                start_node._current_iteration_count = iteration_index
-
-                # Get the value based on which parameter is connected
-                if connected_source_param == "current_item":
-                    value = start_node._get_current_item_value()
-                elif connected_source_param == "index":
-                    value = start_node.get_current_index()
-                else:
-                    start_node._get_current_item_value()
-                    value = start_node.parameter_output_values.get(connected_source_param)
-
-                if value is not None:
-                    end_node._results_list.append(value)
+        if start_node_item_values:
+            end_node._results_list = [start_node_item_values[index] for index in sorted(start_node_item_values)]
 
         end_node._output_results_list()
 
@@ -1938,14 +1923,11 @@ class NodeExecutor(EngineScoped):
             total_iterations - len(successful_iterations),
         )
 
-        # Step 6: Build results list in iteration order, with None for failed iterations
-        node._results_list = []
-        for iteration_index in range(total_iterations):
-            if iteration_index in iteration_results:
-                value = iteration_results[iteration_index]
-            else:
-                value = None  # Failed iterations get None
-            node._results_list.append(value)
+        # Step 6: Build results list in iteration order, with None for failed iterations. A
+        # successful iteration with no result (skipped, or nothing wired to new_item_to_add) adds nothing.
+        failed_iteration_results = dict.fromkeys(set(range(total_iterations)) - set(successful_iterations))
+        collected_results = failed_iteration_results | iteration_results
+        node._results_list = [collected_results[index] for index in sorted(collected_results)]
 
         # Step 7: Output final results to the results parameter
         node._output_results_list()
@@ -3718,10 +3700,21 @@ class NodeExecutor(EngineScoped):
                         ),
                     )
 
-                # Step 6: Extract parameter values from iterations BEFORE cleanup
+                # Step 6: Extract parameter values from iterations BEFORE cleanup. An iteration that
+                # exited through skip_iteration adds nothing. Every iteration has already run, so a
+                # break_loop exit has nothing left to stop and its result is collected.
+                end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
+                skipped_iteration_indices = {
+                    iteration_index
+                    for iteration_index, _, node_name_mappings in deserialized_flows
+                    if self._get_iteration_control_action(end_loop_node, end_node_mapping, node_name_mappings)
+                    == IterationControlAction.SKIP
+                }
                 iteration_results = self.get_parameter_values_from_iterations(
                     end_loop_node=end_loop_node,
-                    deserialized_flows=deserialized_flows,
+                    deserialized_flows=[
+                        flow_ref for flow_ref in deserialized_flows if flow_ref[0] not in skipped_iteration_indices
+                    ],
                     package_flow_result_success=package_result,
                     failed_iteration_indices=set(failed_iteration_indices),
                 )
@@ -3729,7 +3722,7 @@ class NodeExecutor(EngineScoped):
                 # Add None values for failed iterations that didn't produce any results
                 # (e.g., nested loops may fail but still produce partial output)
                 for failed_idx in failed_iteration_indices:
-                    if failed_idx not in iteration_results:
+                    if failed_idx not in iteration_results and failed_idx not in skipped_iteration_indices:
                         iteration_results[failed_idx] = None
 
                 # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)

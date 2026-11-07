@@ -61,6 +61,15 @@
       }
     },
     {
+      "class_name": "SkipSecondNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Sends control out `drop` on the item `second`, otherwise out `keep`",
+        "display_name": "Skip Second"
+      }
+    },
+    {
       "class_name": "LoopJoinNode",
       "file_path": "loop_nodes.py",
       "metadata": {

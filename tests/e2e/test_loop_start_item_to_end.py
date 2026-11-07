@@ -2,7 +2,7 @@
 
 The start node is not part of the packaged loop body, so the end node's item comes from no
 body node. With a non-empty body the loop must still collect the start node's per-pass value,
-the same way an empty body does, and collect nothing for a pass whose body failed.
+the same way an empty body does, and collect nothing for a pass whose body failed or skipped.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ def _connect(engine: Engine, source: str, source_param: str, target: str, target
     assert isinstance(result, CreateConnectionResultSuccess), result
 
 
-async def _run_loop(  # noqa: PLR0913 (fixtures plus the three knobs that shape the loop)
+async def _run_loop(  # noqa: PLR0913 (fixtures plus the knobs that shape the loop)
     engine: Engine,
     materialize_library: Callable[..., Path],
     tmp_path: Path,
@@ -80,8 +80,12 @@ async def _run_loop(  # noqa: PLR0913 (fixtures plus the three knobs that shape 
     body_node_type: str,
     source_param: str,
     run_in_order: bool,
+    body_exits: tuple[tuple[str, str], ...] = (("exec_out", "add_item"),),
 ) -> list | None:
-    """Run start -> body -> end with ``source_param`` wired from the start node to ``new_item_to_add``."""
+    """Run start -> body -> end with ``source_param`` wired from the start node to ``new_item_to_add``.
+
+    ``body_exits`` pairs each body control output with the end node control input it leads to.
+    """
     library_json = materialize_library(
         tmp_path / "loop_library",
         template=FIXTURE_LIBRARY_JSON_TEMPLATE,
@@ -114,7 +118,8 @@ async def _run_loop(  # noqa: PLR0913 (fixtures plus the three knobs that shape 
 
         _connect(engine, start_name, "current_item", body_name, "text")
         _connect(engine, start_name, "exec_out", body_name, "exec_in")
-        _connect(engine, body_name, "exec_out", end_node.name, "add_item")
+        for body_output, end_input in body_exits:
+            _connect(engine, body_name, body_output, end_node.name, end_input)
         _connect(engine, start_name, source_param, end_node.name, "new_item_to_add")
 
         await engine.ahandle_request(StartFlowRequest(flow_name=flow_name))
@@ -164,3 +169,25 @@ async def test_start_node_item_not_collected_for_failed_pass(
         run_in_order=False,
     )
     assert results == ["first", None, "third"], f"The loop collected {results!r}."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_in_order", [True, False])
+async def test_start_node_item_not_collected_for_skipped_pass(
+    engine: Engine,
+    materialize_library: Callable[..., Path],
+    tmp_path: Path,
+    *,
+    run_in_order: bool,
+) -> None:
+    """A filter body that exits through skip_iteration drops that pass's item, in either run order."""
+    results = await _run_loop(
+        engine,
+        materialize_library,
+        tmp_path,
+        body_node_type="SkipSecondNode",
+        source_param="current_item",
+        run_in_order=run_in_order,
+        body_exits=(("keep", "add_item"), ("drop", "skip_iteration")),
+    )
+    assert results == ["first", "third"], f"The loop collected {results!r}."

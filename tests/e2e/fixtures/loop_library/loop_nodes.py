@@ -14,8 +14,13 @@ from __future__ import annotations
 from typing import Any
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import DataNode, EndNode, StartNode
+from griptape_nodes.exe_types.core_types import (
+    ControlParameterInput,
+    ControlParameterOutput,
+    Parameter,
+    ParameterMode,
+)
+from griptape_nodes.exe_types.node_types import BaseNode, DataNode, EndNode, StartNode
 
 
 class StartFlow(StartNode):
@@ -72,6 +77,33 @@ class FailOnSecondNode(LoopBodyNode):
             msg = "FailOnSecondNode refuses 'second'"
             raise RuntimeError(msg)
         super().process()
+
+
+class SkipSecondNode(BaseNode):
+    """A loop filter: sends control out ``drop`` on the item ``"second"`` and out ``keep`` otherwise."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(ControlParameterInput(name="exec_in"))
+        self.add_parameter(ControlParameterOutput(name="keep"))
+        self.add_parameter(ControlParameterOutput(name="drop"))
+        self.add_parameter(
+            Parameter(
+                name="text",
+                tooltip="Item to filter",
+                type="str",
+                default_value="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        return None
+
+    def get_next_control_output(self) -> Parameter | None:
+        if self.get_parameter_value("text") == "second":
+            return self.get_parameter_by_name("drop")
+        return self.get_parameter_by_name("keep")
 
 
 class LoopJoinNode(DataNode):
