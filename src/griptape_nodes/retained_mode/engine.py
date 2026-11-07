@@ -809,7 +809,7 @@ class Engine:
         self._event_manager.put_event(AppEvent(payload=opened_event))
 
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
-        """What clients are told of an open workflow: its id, name, file and whether it has a flow."""
+        """What clients are told of an open workflow: its id, name, file, whether it is saved and whether it has a flow."""
         entry = self.workflow_registry.get(workflow.workflow_id)
         file_path = None
         if entry.absolute_path is not None:
@@ -818,6 +818,7 @@ class Engine:
             workflow_id=workflow.workflow_id,
             name=entry.name,
             workflow_file_path=file_path,
+            is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
         )
 
