@@ -633,10 +633,19 @@ class Engine:
         self._engine_transports = engine_transports
         engine_transports.on_engine_lost(self._on_engine_lost)
 
-    async def request(self, engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+    async def request(
+        self,
+        engine_id: str,
+        request: RequestPayload,
+        *,
+        timeout_s: float | None,
+        open_workflow_id: str | None = None,
+        worker_engine_id: str | None = None,
+    ) -> ResultPayload:
         """Send `request` to the engine `engine_id`, wherever it runs, and return its result.
 
-        The app finds that engine and chooses how to reach it.
+        The app finds that engine and chooses how to reach it. `open_workflow_id` and
+        `worker_engine_id` go on the request's envelope (see `EngineTransports.request`).
 
         Raises:
             EngineNotFoundError: The engine cannot be reached, did not answer within `timeout_s`,
@@ -645,32 +654,13 @@ class Engine:
         if self._engine_transports is None:
             msg = f"Attempted to reach engine {engine_id}. Failed because this engine has no connections to other engines."
             raise EngineNotFoundError(msg)
-        return await self._engine_transports.request(engine_id, request, timeout_s=timeout_s)
-
-    def hosted_worker_environment(self, engine_id: str) -> dict[str, str]:
-        """The environment a worker this engine runs for `engine_id` needs to reach that engine.
-
-        Raises:
-            EngineNotFoundError: This engine has no way to reach other engines.
-        """
-        if self._engine_transports is None:
-            msg = f"Attempted to start a worker for engine {engine_id}. Failed because this engine has no connections to other engines."
-            raise EngineNotFoundError(msg)
-        return self._engine_transports.hosted_worker_environment(engine_id)
-
-    def worker_host(self, worker_engine_id: str) -> str | None:
-        """The engine that runs the worker `worker_engine_id` for this one, or None for a local or unknown worker.
-
-        The transports ask this to carry a worker's traffic to the engine that runs it.
-        """
-        return self._worker_manager.worker_host(worker_engine_id)
-
-    def hosted_for(self, worker_engine_id: str) -> str | None:
-        """The engine this one runs the worker `worker_engine_id` for, or None for a worker it runs for no other engine.
-
-        The transports ask this to reach such a worker the way it reaches that engine.
-        """
-        return self._worker_manager.hosted_for(worker_engine_id)
+        return await self._engine_transports.request(
+            engine_id,
+            request,
+            timeout_s=timeout_s,
+            open_workflow_id=open_workflow_id,
+            worker_engine_id=worker_engine_id,
+        )
 
     @contextmanager
     def bind_workflow(self, workflow: WorkflowRuntime | NoWorkflow) -> Iterator[None]:

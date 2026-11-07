@@ -193,7 +193,7 @@ class TestGone:
         worker = _Worker(pair.worker)
         worker_id, proc = await _connected(manager, _LIBRARY, pair)
         running = asyncio.create_task(
-            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id, "")
+            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id)
         )
         assert await asyncio.to_thread(worker.request_arrived.wait, _TIMEOUT_S)
 
@@ -213,7 +213,7 @@ class TestGone:
         worker = _Worker(pair.worker)
         worker_id, _ = await _connected(manager, _LIBRARY, pair)
         running = asyncio.create_task(
-            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id, "")
+            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id)
         )
         assert await asyncio.to_thread(worker.request_arrived.wait, _TIMEOUT_S)
 
@@ -239,7 +239,7 @@ class TestRelayedEvents:
         _engine(manager).get_session_id.return_value = "session-1"
         payload = {"event_type": "AppEvent", "payload_type": "CurrentProjectChanged", "payload": {"project_id": "p"}}
 
-        await manager._relay_local_worker_event("AppEvent", payload)
+        await manager._relay_worker_event("AppEvent", payload)
 
         send_message.assert_awaited_once()
         event_type, _, topic = send_message.await_args_list[0].args

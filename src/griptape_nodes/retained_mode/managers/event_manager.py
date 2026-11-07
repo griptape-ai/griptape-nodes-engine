@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
 import functools
 import inspect
 import logging
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
     import types
     from collections.abc import Awaitable, Callable, Iterator
     from collections.abc import Set as AbstractSet
+    from datetime import datetime
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -85,6 +87,25 @@ class WorkerRequestGateDecision(NamedTuple):
 
     forward: dict | None
     denials: list[str]
+
+
+@dataclass(frozen=True)
+class SessionCredential:
+    """The credential of this engine's current license session, which Griptape Cloud accepts as a bearer.
+
+    It ends with the session, unlike the license it was issued for, so it is what this engine gives a
+    library's worker another engine runs for it.
+    """
+
+    token: str = dataclasses.field(repr=False)
+    expires_at: datetime
+
+
+class HostedWorkerRequest(NamedTuple):
+    """A request a worker another engine runs for this one sent, admitted to be handled here as this engine's own worker's."""
+
+    request: RequestPayload
+    result_context: ResultContext
 
 
 class WorkerRequestSender(Protocol):
@@ -254,12 +275,14 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 class ResultContext(TypedDict, total=False):
-    """Request envelope fields dispatch carries to the result. All but `sender` are echoed on the result envelope."""
+    """Request envelope fields dispatch carries to the result. All but `sender` and `worker_engine_id` are echoed on the result envelope."""
 
     response_topic: str | None
     request_id: str | None
     sender: RequestSender | None
     open_workflow_id: str | None
+    # The worker another engine runs for this one that sent the request, which `sender` relayed.
+    worker_engine_id: str | None
 
 
 class _RequestWorkflowError(Exception):
@@ -411,6 +434,12 @@ class EventManager(EngineScoped):
         # Screens each request a library's worker process sends this engine. See add_worker_request_gate.
         self._worker_request_gates: list[Callable[[dict], WorkerRequestGateDecision]] = []
         self._worker_request_gates_lock = threading.Lock()
+        # Supplies this engine's license session credential. See set_session_credential_provider.
+        self._session_credential_provider: Callable[[], SessionCredential | None] | None = None
+        # Admits the requests a worker another engine runs for this one sends. See admit_hosted_worker_requests.
+        self._admit_hosted_worker_request: (
+            Callable[[RequestPayload, ResultContext], Awaitable[HostedWorkerRequest | ResultPayload]] | None
+        ) = None
 
     @property
     def event_queue(self) -> asyncio.Queue:
@@ -978,6 +1007,45 @@ class EventManager(EngineScoped):
             except ValueError:
                 return
 
+    def set_session_credential_provider(self, provider: Callable[[], SessionCredential | None] | None) -> None:
+        """Install what supplies this engine's license session credential, replacing any before it. None removes it.
+
+        The engine has no license session of its own: the app holds it and installs this. A library's
+        worker that another engine runs for this one reads its Griptape Cloud credential from here, so
+        with no provider, or one that returns None, that worker gets no credential.
+        """
+        self._session_credential_provider = provider
+
+    def session_credential(self) -> SessionCredential | None:
+        """This engine's current license session credential, or None if it has none. A provider that raises gives None."""
+        provider = self._session_credential_provider
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception as exc:
+            logging.getLogger("griptape_nodes").error(
+                "Could not read this engine's license session credential: %s", type(exc).__name__
+            )
+            return None
+
+    def admit_hosted_worker_requests(
+        self, admit: Callable[[RequestPayload, ResultContext], Awaitable[HostedWorkerRequest | ResultPayload]]
+    ) -> None:
+        """Decide the requests another engine relays from a worker it runs for this one, which `ahandle_request` needs.
+
+        `admit` is given a request whose envelope names a `worker_engine_id`, and returns it admitted
+        with the context to handle it in, or the result to answer with instead. The manager that asks
+        other engines for workers gives it, once.
+
+        Raises:
+            ValueError: Another manager already gave one.
+        """
+        if self._admit_hosted_worker_request is not None:
+            msg = "Attempted to give the engine a way to admit hosted workers' requests. Failed because it already has one."
+            raise ValueError(msg)
+        self._admit_hosted_worker_request = admit
+
     def evaluate_worker_request_gate(self, envelope: dict) -> WorkerRequestGateDecision:
         """Run the registered worker request gates over `envelope`. Fails closed: a hook that raises denies."""
         with self._worker_request_gates_lock:
@@ -1315,27 +1383,6 @@ class EventManager(EngineScoped):
             response_topic=result_context.get("response_topic"),
             engine_id=self.engine.get_engine_id(),
         )
-
-    async def request_engine_from_worker(self, engine_id: str, request: RequestPayload) -> ResultPayload:
-        """Send a request from this worker to the engine `engine_id`, as one of that engine's own clients, and return its result.
-
-        For a worker another engine runs, to reach that engine rather than its orchestrator. It travels
-        the connection the worker's orchestrator traffic does, which that engine carries, and is answered
-        on this worker's own engine topic, which no orchestrator listens on.
-
-        Raises:
-            TimeoutError: The engine did not answer within the worker's forwarding timeout.
-        """
-        own_engine_id = self.engine.get_engine_id()
-        if own_engine_id is None:
-            msg = f"Attempted to send a {type(request).__name__} to engine {engine_id}. Failed because this worker has no engine ID."
-            raise RuntimeError(msg)
-        response_payload = await self._send_from_worker(
-            request,
-            request_topic=f"engines/{engine_id}/request",
-            response_topic=f"engines/{own_engine_id}/response",
-        )
-        return read_forwarded_result(request, response_payload)
 
     async def _send_from_worker(
         self, request: RequestPayload, *, request_topic: str, response_topic: str, open_workflow_id: str | None = None
@@ -1795,6 +1842,9 @@ class EventManager(EngineScoped):
             raise TypeError(msg)
         self._report_graph_access_while_loading(request)
 
+        if result_context.get("worker_engine_id") is not None:
+            return await self._ahandle_hosted_worker_request(request, result_context)
+
         refusal = self._refusal_for_sender(request, result_context)
         if refusal is not None:
             return self._handle_request_core(request, refusal, context=result_context)
@@ -1844,6 +1894,27 @@ class EventManager(EngineScoped):
             _active_request_type.reset(token)
             if binding_token is not None:
                 bound_workflow.reset(binding_token)
+
+    async def _ahandle_hosted_worker_request(
+        self, request: RequestPayload, result_context: ResultContext
+    ) -> EventResultSuccess | EventResultFailure:
+        """Handle a request another engine relayed from a worker it runs for this one, once it is admitted.
+
+        Admitted, it is handled as this engine's own worker's request is, in the context `admit` gives.
+        """
+        admit = self._admit_hosted_worker_request
+        if admit is None:
+            details = (
+                f"Attempted to handle a {type(request).__name__} from a worker another engine runs for this one. "
+                "Failed because this engine runs no workers on other engines."
+            )
+            return self._handle_request_core(
+                request, GenericResultFailure(result_details=details), context=result_context
+            )
+        admitted = await admit(request, result_context)
+        if isinstance(admitted, HostedWorkerRequest):
+            return await self.ahandle_request(admitted.request, result_context=admitted.result_context)
+        return self._handle_request_core(request, admitted, context=result_context)
 
     @staticmethod
     def _report_graph_access_while_loading(request: RequestPayload) -> None:
@@ -1902,6 +1973,15 @@ class EventManager(EngineScoped):
             msg = f"No manager found to handle request of type '{request_type.__name__}'."
             raise TypeError(msg)
         self._report_graph_access_while_loading(request)
+
+        if result_context.get("worker_engine_id") is not None:
+            details = (
+                f"Attempted to handle a {request_type.__name__} from a worker another engine runs for this one. "
+                "Failed because such a request is admitted only by ahandle_request."
+            )
+            return self._handle_request_core(
+                request, GenericResultFailure(result_details=details), context=result_context
+            )
 
         refusal = self._refusal_for_sender(request, result_context)
         if refusal is not None:

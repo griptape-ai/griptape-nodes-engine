@@ -11,7 +11,7 @@ import asyncio
 import contextvars
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import AppEvent, ExecutionEvent, ExecutionGriptapeNodeEvent
@@ -117,17 +117,7 @@ class ParentEnd:
 
     def answer_checkpoint(self, body: dict[str, Any]) -> dict[str, Any]:
         """Decide a worker's checkpoint with this engine's authorization hooks. Unreadable denies."""
-        try:
-            checkpoint = read_payload(body, AuthorizationCheckpoint)
-        except WireFormatError as e:
-            logger.error("Denied a checkpoint from a library's worker process because %s.", e)
-            detail = f"Attempted to check a permission for a library's worker process. Failed because {e}."
-            denial = CheckpointDenial(failures=(CheckpointFailure(detail=detail),))
-            return {"denial": json.loads(converters.engine.dumps(denial))}
-        denial = self._engine.event_manager.evaluate_authorization_checkpoint(checkpoint)
-        if denial is None:
-            return {"denial": None}
-        return {"denial": json.loads(converters.engine.dumps(denial))}
+        return decide_worker_checkpoint(self._engine, body)
 
     def _on_request(self, body: dict[str, Any]) -> dict[str, Any]:
         """Answer one gated request. Runs on a channel pool thread, so it may wait on the engine loop."""
@@ -164,29 +154,13 @@ class ParentEnd:
             logger.error("Dropped an event from a library's worker process: %s.", e)
 
     def _accept_notification(self, body: dict[str, Any]) -> None:
-        body_type = body.get("type")
         loop = self._require_loop()
-        if body_type == EXECUTION_EVENT:
-            execution_event = read_payload(body, ExecutionEvent)
-            if not isinstance(execution_event.payload, RELAYED_EXECUTION_PAYLOADS):
-                msg = f"a worker does not send '{type(execution_event.payload).__name__}' events"
-                raise WireFormatError(msg)
-            event = ExecutionGriptapeNodeEvent(wrapped_event=execution_event)
-            loop.call_soon_threadsafe(self._engine.event_manager.put_event, event)
+        notification = read_worker_notification(body)
+        if isinstance(notification, QueuedWorkerEvent):
+            loop.call_soon_threadsafe(self._engine.event_manager.put_event, notification.event)
             return
-        if body_type in (APP_EVENT, EVENT_RESULT):
-            payload = body.get("payload")
-            if not isinstance(payload, dict):
-                msg = f"a '{body_type}' carried no payload"
-                raise WireFormatError(msg)
-            if body_type == APP_EVENT and payload.get("payload_type") in _QUEUED_APP_PAYLOAD_NAMES:
-                loop.call_soon_threadsafe(self._engine.event_manager.put_event, read_payload(body, AppEvent))
-                return
-            relay = self._run_on_loop(self._relay_to_editor(body_type, payload))
-            relay.add_done_callback(_log_relay_failure)
-            return
-        msg = f"a '{body_type}' is not something a worker sends"
-        raise WireFormatError(msg)
+        relay = self._run_on_loop(self._relay_to_editor(notification.event_type, notification.payload))
+        relay.add_done_callback(_log_relay_failure)
 
     def _run_on_loop(self, coro: Coroutine[Any, Any, Any], *, bound_to_no_workflow: bool = True) -> Future[Any]:
         """Run `coro` on the engine loop from a channel thread.
@@ -205,6 +179,80 @@ class ParentEnd:
             msg = "ParentEnd.attach() must be called before the channel delivers anything."
             raise RuntimeError(msg)
         return self._loop
+
+
+def decide_worker_checkpoint(engine: Engine, body: dict[str, Any]) -> dict[str, Any]:
+    """Decide a worker's checkpoint body with `engine`'s authorization hooks, as the reply the worker reads. Unreadable denies."""
+    try:
+        checkpoint = read_payload(body, AuthorizationCheckpoint)
+    except WireFormatError as e:
+        logger.error("Denied a checkpoint from a library's worker process because %s.", e)
+        detail = f"Attempted to check a permission for a library's worker process. Failed because {e}."
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail=detail),))
+        return {"denial": json.loads(converters.engine.dumps(denial))}
+    denial = engine.event_manager.evaluate_authorization_checkpoint(checkpoint)
+    if denial is None:
+        return {"denial": None}
+    return {"denial": json.loads(converters.engine.dumps(denial))}
+
+
+class QueuedWorkerEvent(NamedTuple):
+    """A worker's event the engine queues as if a node of its own emitted it."""
+
+    event: Any
+
+
+class EditorBoundWorkerEvent(NamedTuple):
+    """A worker's event the engine sends on to the editor without acting on it, by wire `event_type` and payload."""
+
+    event_type: str
+    payload: dict[str, Any]
+
+
+def read_worker_notification(body: dict[str, Any]) -> QueuedWorkerEvent | EditorBoundWorkerEvent:
+    """What the engine a worker works for does with one of the worker's one-way bodies.
+
+    Raises:
+        WireFormatError: The body is not something a worker sends, or does not have its type's shape.
+    """
+    body_type = body.get("type")
+    if body_type == EXECUTION_EVENT:
+        execution_event = read_payload(body, ExecutionEvent)
+        if not isinstance(execution_event.payload, RELAYED_EXECUTION_PAYLOADS):
+            msg = f"a worker does not send '{type(execution_event.payload).__name__}' events"
+            raise WireFormatError(msg)
+        return QueuedWorkerEvent(event=ExecutionGriptapeNodeEvent(wrapped_event=execution_event))
+    if body_type in (APP_EVENT, EVENT_RESULT):
+        payload = body.get("payload")
+        if not isinstance(payload, dict):
+            msg = f"a '{body_type}' carried no payload"
+            raise WireFormatError(msg)
+        if body_type == APP_EVENT and payload.get("payload_type") in _QUEUED_APP_PAYLOAD_NAMES:
+            return QueuedWorkerEvent(event=read_payload(body, AppEvent))
+        return EditorBoundWorkerEvent(event_type=body_type, payload=payload)
+    msg = f"a '{body_type}' is not something a worker sends"
+    raise WireFormatError(msg)
+
+
+async def apply_worker_notifications(
+    engine: Engine,
+    bodies: list[dict[str, Any]],
+    relay_to_editor: Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]],
+) -> None:
+    """On the engine loop, do with each of a worker's one-way bodies, in order, what `ParentEnd` does with them."""
+    for body in bodies:
+        try:
+            notification = read_worker_notification(body)
+        except WireFormatError as e:
+            logger.error("Dropped an event from a library's worker process: %s.", e)
+            continue
+        if isinstance(notification, QueuedWorkerEvent):
+            engine.event_manager.put_event(notification.event)
+            continue
+        try:
+            await relay_to_editor(notification.event_type, notification.payload)
+        except Exception as e:
+            logger.error("Could not send what a library's worker process sent on to the editor: %s", e)
 
 
 def _log_relay_failure(relay: Future[Any]) -> None:

@@ -87,8 +87,10 @@ async def test_a_local_worker_runs_as_this_engines_child_and_asks_it_for_everyth
         assert worker_manager.worker_unavailable_reason(None) is None
         worker = worker_manager.get_worker_for_key(None)
         assert worker is not None
+        worker_engine_id, _worker_request_topic = worker
         raw = await asyncio.wait_for(
-            worker_manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), *worker), _BOOT_TIMEOUT_S
+            worker_manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_engine_id),
+            _BOOT_TIMEOUT_S,
         )
     finally:
         await worker_manager.reset_workers()
