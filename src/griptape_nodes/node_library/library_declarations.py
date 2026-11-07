@@ -19,11 +19,12 @@ schema shape.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -94,6 +95,36 @@ class LifecycleStageLibraryProperty(BaseModel):
 
     type: Literal["lifecycle_stage"] = "lifecycle_stage"
     stage: LifecycleStage
+
+
+# The editor opens this URL directly in a new browser tab/window, so only http(s) is
+# accepted -- a javascript:/data: URL must never reach that call. Shared by the library-
+# and node-level properties below.
+_DOCUMENTATION_URL_PATTERN = re.compile(r"^https?://")
+
+
+def _validate_documentation_url(url: str) -> str:
+    if not _DOCUMENTATION_URL_PATTERN.match(url):
+        msg = f"Documentation url '{url}' is not valid. It must start with 'http://' or 'https://'."
+        raise ValueError(msg)
+    return url
+
+
+class DocumentationLibraryProperty(BaseModel):
+    """A documentation link for the library as a whole.
+
+    Node-level `documentation` (see `DocumentationNodeProperty`) overrides this for an
+    individual node, the same way `lifecycle_stage` does. Consumers resolve that
+    inheritance at display time; this model stores only what the author wrote.
+    """
+
+    type: Literal["documentation"] = "documentation"
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def _url_is_http_or_https(cls, v: str) -> str:
+        return _validate_documentation_url(v)
 
 
 class WorkerModeCompatibility(BaseModel):
@@ -223,7 +254,8 @@ LibraryDeclaration = Annotated[
     | WorkerModeCompatibility
     | SuggestedWorkerMode
     | ModelCatalogLibraryProperty
-    | LibraryDependencyDeclaration,
+    | LibraryDependencyDeclaration
+    | DocumentationLibraryProperty,
     Field(discriminator="type"),
 ]
 
@@ -278,6 +310,24 @@ class LifecycleStageNodeProperty(BaseModel):
     stage: LifecycleStage
 
 
+class DocumentationNodeProperty(BaseModel):
+    """Documentation link override for an individual node.
+
+    Absence of this property on a node means "inherit the library's documentation
+    link," the same way `LifecycleStageNodeProperty` inherits `lifecycle_stage`.
+    Presence overrides with the declared value. Consumers (UI) resolve inheritance
+    at display time; the schema layer stores only what the author wrote.
+    """
+
+    type: Literal["documentation"] = "documentation"
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def _url_is_http_or_https(cls, v: str) -> str:
+        return _validate_documentation_url(v)
+
+
 class ModelUsageNodeProperty(BaseModel):
     """References specific catalog models the node uses, by their catalog dict keys.
 
@@ -323,9 +373,36 @@ NodeDeclaration = Annotated[
     LifecycleStageNodeProperty
     | ModelUsageNodeProperty
     | ModelProviderUsageNodeProperty
-    | ArbitraryPythonExecutionNodeProperty,
+    | ArbitraryPythonExecutionNodeProperty
+    | DocumentationNodeProperty,
     Field(discriminator="type"),
 ]
+
+
+def resolve_node_documentation_url(
+    node_declarations: Sequence[NodeDeclaration],
+    library_declarations: Sequence[LibraryDeclaration],
+) -> str | None:
+    """Resolve a node's effective documentation url: its own override, else the library's.
+
+    Mirrors how `lifecycle_stage` inherits from the library when a node declares no
+    override of its own (see `LifecycleStageNodeProperty`). Returns `None` when neither
+    the node nor the library declares a `documentation` url.
+    """
+    node_url = next(
+        (declaration.url for declaration in node_declarations if isinstance(declaration, DocumentationNodeProperty)),
+        None,
+    )
+    if node_url is not None:
+        return node_url
+    return next(
+        (
+            declaration.url
+            for declaration in library_declarations
+            if isinstance(declaration, DocumentationLibraryProperty)
+        ),
+        None,
+    )
 
 
 def _iter_referenced_models(
