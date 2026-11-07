@@ -415,8 +415,10 @@ class _WorkflowRegistry:
         `action` is the verb the request performs ("rename", "move"), for the error message.
 
         Raises:
-            UnknownWorkflowAddressError: No workflow has the id, or the name.
-            WorkflowAddressError: Neither is given, or the id and the name belong to different workflows.
+            UnknownWorkflowAddressError: Nothing given names a workflow: the id, or the name, or both,
+                match none.
+            WorkflowAddressError: Neither is given, or the id and the name don't name the same
+                workflow, including when only one of them matches one.
         """
         if workflow_id is None:
             if workflow_name is None:
@@ -426,10 +428,19 @@ class _WorkflowRegistry:
                 raise WorkflowAddressError(msg)
             return self._resolve_name(workflow_name, action=action)
         workflow = self._by_id.get(workflow_id)
+        by_name = None
+        if workflow_name is not None:
+            by_name = self.find_by_name(workflow_name)
+        if workflow is None and by_name is not None:
+            msg = (
+                f"Attempted to {action} workflow '{workflow_id}' named '{workflow_name}'. Failed because no "
+                "workflow has that id, though one has that name."
+            )
+            raise WorkflowAddressError(msg)
         if workflow is None:
             msg = f"Attempted to {action} workflow '{workflow_id}'. Failed because no workflow has that id."
             raise UnknownWorkflowAddressError(msg)
-        if workflow_name is not None and self._resolve_name(workflow_name, action=action) is not workflow:
+        if workflow_name is not None and by_name is not workflow:
             msg = (
                 f"Attempted to {action} workflow '{workflow_id}' named '{workflow_name}'. Failed because that id "
                 f"belongs to '{workflow.name}', not '{workflow_name}'."

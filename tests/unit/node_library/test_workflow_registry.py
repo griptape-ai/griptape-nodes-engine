@@ -741,12 +741,24 @@ class TestResolveAddress:
         with pytest.raises(UnknownWorkflowAddressError, match="no workflow has that name"):
             registry.resolve_address(workflow_id=None, workflow_name="gone", action="move")
 
-    def test_a_known_id_with_an_unknown_name_fails(self, registry: _WorkflowRegistry) -> None:
+    def test_a_known_id_with_an_unknown_name_fails_as_a_disagreement(self, registry: _WorkflowRegistry) -> None:
         flow = registry.find_by_name("flow")
         assert flow is not None
 
-        with pytest.raises(UnknownWorkflowAddressError, match="no workflow has that name"):
+        with pytest.raises(WorkflowAddressError, match="belongs to 'flow', not 'gone'") as raised:
             registry.resolve_address(workflow_id=flow.workflow_id, workflow_name="gone", action="move")
+
+        assert not isinstance(raised.value, UnknownWorkflowAddressError)
+
+    def test_an_unknown_id_with_a_known_name_fails_as_a_disagreement(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(WorkflowAddressError, match="no workflow has that id, though one has that name") as raised:
+            registry.resolve_address(workflow_id="0" * 32, workflow_name="flow", action="move")
+
+        assert not isinstance(raised.value, UnknownWorkflowAddressError)
+
+    def test_an_unknown_id_and_an_unknown_name_name_nothing(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(UnknownWorkflowAddressError, match="no workflow has that id"):
+            registry.resolve_address(workflow_id="0" * 32, workflow_name="gone", action="move")
 
 
 class TestNameKeyedMethods:

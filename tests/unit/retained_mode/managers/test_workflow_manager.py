@@ -1428,15 +1428,18 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "my_workflow_renamed"
 
-    def test_rename_surfaces_a_failed_delete_of_the_old_file(self, engine: Engine) -> None:
-        """When the old file can't be deleted after the save, rename surfaces RenameWorkflowResultFailure.
+    @pytest.mark.parametrize("failing_cleanup", ["file", "config"])
+    def test_rename_reports_a_failed_cleanup_of_the_old_file_as_a_warning(
+        self, engine: Engine, failing_cleanup: str
+    ) -> None:
+        """A rename whose old file or config entry can't be removed afterwards still succeeds, and says what is left.
 
-        The save succeeds, but the follow-up DeleteFileRequest for the old file fails. The caller
-        must not see a success while the old file is still on disk.
+        The workflow already lives in its new file, so reporting a failure would tell the caller
+        the rename did not happen.
         """
         from griptape_nodes.retained_mode.events.workflow_events import (
             RenameWorkflowRequest,
-            RenameWorkflowResultFailure,
+            RenameWorkflowResultSuccess,
             SaveWorkflowRequest,
             SaveWorkflowResultSuccess,
         )
@@ -1454,11 +1457,14 @@ class TestWorkflowManager:
             return SaveWorkflowResultSuccess(file_path="/workspace/new.py", workflow_name="new", result_details="ok")
 
         async def fake_ahandle_request(req: object) -> object:
-            if isinstance(req, DeleteFileRequest):
+            if isinstance(req, DeleteFileRequest) and failing_cleanup == "file":
                 return DeleteFileResultFailure(
                     failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details="file locked"
                 )
-            msg = f"Unexpected request in delete-failure test: {type(req).__name__}"
+            if isinstance(req, DeleteFileRequest):
+                # Anything but a failure counts as deleted.
+                return MagicMock()
+            msg = f"Unexpected request in cleanup-failure test: {type(req).__name__}"
             raise AssertionError(msg)
 
         with (
@@ -1466,7 +1472,7 @@ class TestWorkflowManager:
             patch.object(engine.open_workflows, "find", return_value=WorkflowRuntime("renamed", engine)),
             patch.object(workflow_manager.saver, "save_open_workflow", side_effect=fake_save),
             patch.object(workflow_manager, "persist_external_workflow_registration"),
-            patch.object(engine.config_manager, "delete_user_workflow"),
+            patch.object(engine.config_manager, "delete_user_workflow", return_value=failing_cleanup != "config"),
             patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
         ):
             result = asyncio.run(
@@ -1475,11 +1481,14 @@ class TestWorkflowManager:
                 )
             )
 
-        assert isinstance(result, RenameWorkflowResultFailure)
-        # Match the quoted-name form the failure message renders so the assertions
-        # don't pass on incidental substrings ("renew", "olden", ...).
-        assert "'old'" in str(result.result_details)
-        assert "'new'" in str(result.result_details)
+        assert isinstance(result, RenameWorkflowResultSuccess), result.result_details
+        assert isinstance(result.result_details, ResultDetails)
+        warnings = [detail for detail in result.result_details.result_details if detail.level == logging.WARNING]
+        assert len(warnings) == 1
+        if failing_cleanup == "file":
+            assert str(Path("/workspace/old.py")) in warnings[0].message
+        else:
+            assert "'old.py'" in warnings[0].message
 
     def test_resolve_named_save_path_absolute_skips_sub_dirs(self, engine: Engine) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""

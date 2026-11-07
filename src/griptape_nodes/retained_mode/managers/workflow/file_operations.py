@@ -280,25 +280,27 @@ class WorkflowFileOperations(EngineScoped):
         # If the renamed file landed outside the workspace, keep it registered at its new path.
         self.engine.workflow_manager.persist_external_workflow_registration(str(save_result.file_path))
 
+        cleanup_warnings: list[ResultDetail] = []
         if previous_file_path is not None and previous_absolute_path is not None:
-            remove_error = await self._remove_file_renamed_from(
+            cleanup_warnings = await self._remove_file_renamed_from(
                 source,
                 previous_name=previous_name,
                 previous_file_path=previous_file_path,
                 previous_absolute_path=previous_absolute_path,
             )
-            if remove_error is not None:
-                return RenameWorkflowResultFailure(result_details=remove_error)
 
         return RenameWorkflowResultSuccess(
             new_workflow_name=save_result.workflow_name,
             workflow_id=source.workflow_id,
             result_details=ResultDetails(
-                message=f"Successfully renamed workflow to: {save_result.workflow_name}", level=logging.INFO
+                ResultDetail(
+                    message=f"Successfully renamed workflow to: {save_result.workflow_name}", level=logging.INFO
+                ),
+                *cleanup_warnings,
             ),
         )
 
-    async def _rename_closed_workflow(  # noqa: PLR0911
+    async def _rename_closed_workflow(
         self, source: Workflow, *, sanitized_stem: str, display_name: str
     ) -> ResultPayload:
         """Rename a workflow that isn't open: move its file and rewrite the name in its header.
@@ -355,20 +357,19 @@ class WorkflowFileOperations(EngineScoped):
             self.engine.workflow_manager.persist_external_workflow_registration(str(new_absolute_path))
         source.metadata = renamed_metadata
 
-        remove_error = await self._remove_file_renamed_from(
+        cleanup_warnings = await self._remove_file_renamed_from(
             source,
             previous_name=previous_name,
             previous_file_path=previous_file_path,
             previous_absolute_path=previous_absolute_path,
         )
-        if remove_error is not None:
-            return RenameWorkflowResultFailure(result_details=remove_error)
 
         return RenameWorkflowResultSuccess(
             new_workflow_name=source.name,
             workflow_id=source.workflow_id,
             result_details=ResultDetails(
-                message=f"Successfully renamed workflow to: {source.name}", level=logging.INFO
+                ResultDetail(message=f"Successfully renamed workflow to: {source.name}", level=logging.INFO),
+                *cleanup_warnings,
             ),
         )
 
@@ -409,15 +410,23 @@ class WorkflowFileOperations(EngineScoped):
         previous_name: str,
         previous_file_path: str,
         previous_absolute_path: Path,
-    ) -> str | None:
-        """Delete the file `source` was renamed away from, and its config entry. Returns a failure message, or None.
+    ) -> list[ResultDetail]:
+        """Delete the file `source` was renamed away from, and its config entry. Returns a warning for each step that failed.
 
-        Nothing is deleted when the rename kept the file where it was.
+        By now the workflow is renamed, so a failure here leaves a stale file or config entry for
+        the user to remove, not a failed rename. Nothing is deleted when the rename kept the file
+        where it was.
         """
         if previous_absolute_path == source.absolute_path:
-            return None
+            return []
+        warnings: list[ResultDetail] = []
         # Remove the config entry an externally imported workflow has.
-        self.engine.config_manager.delete_user_workflow(previous_file_path)
+        if not self.engine.config_manager.delete_user_workflow(previous_file_path):
+            message = (
+                f"Renamed workflow '{previous_name}' to '{source.name}', but could not remove '{previous_file_path}' "
+                "from the workflow files your settings register. Remove it there, or it will be registered again."
+            )
+            warnings.append(ResultDetail(message=message, level=logging.WARNING))
         delete_result = await self.engine.ahandle_request(
             DeleteFileRequest(
                 path=str(previous_absolute_path),
@@ -426,11 +435,13 @@ class WorkflowFileOperations(EngineScoped):
             )
         )
         if isinstance(delete_result, DeleteFileResultFailure):
-            return (
-                f"Attempted to rename workflow '{previous_name}' to '{source.name}'. "
-                f"Failed while deleting the original file '{previous_absolute_path}': {delete_result.result_details}"
+            message = (
+                f"Renamed workflow '{previous_name}' to '{source.name}', but could not delete the original file "
+                f"'{previous_absolute_path}': {delete_result.result_details}. Delete it yourself, or it will show up "
+                "as a second workflow."
             )
-        return None
+            warnings.append(ResultDetail(message=message, level=logging.WARNING))
+        return warnings
 
     def _validate_rename_display_name(self, request: RenameWorkflowRequest, *, source: Workflow) -> str | None:
         """Return a failure message when the request's display-name arguments are invalid, else None.

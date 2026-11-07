@@ -8,6 +8,7 @@ saved workflow a request acts on. Most tests open a second workflow beside the f
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -17,6 +18,7 @@ import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape, read_workflow_metadata
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.context_events import (
     CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
@@ -35,6 +37,11 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.os_events import (
+    DeleteFileRequest,
+    DeleteFileResultFailure,
+    FileIOFailureReason,
+)
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
@@ -344,6 +351,34 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert project_engine.workflow_registry.get(closed.workflow_id).absolute_path == renamed_path
         assert not project_engine.workflow_registry.get(tab.workflow_id).is_saved
         assert project_engine.open_workflows.is_open(tab.workflow_id)
+
+    def test_renaming_a_closed_workflow_whose_old_file_cannot_be_deleted_succeeds_with_a_warning(
+        self, project_engine: Engine
+    ) -> None:
+        closed = _save_and_close(project_engine, "closed")
+        handle_request = project_engine.ahandle_request
+
+        async def refuse_deletes(request: RequestPayload) -> ResultPayload:
+            if isinstance(request, DeleteFileRequest):
+                return DeleteFileResultFailure(
+                    failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details="file locked"
+                )
+            return await handle_request(request)
+
+        with patch.object(project_engine, "ahandle_request", side_effect=refuse_deletes):
+            renamed = _send_async(
+                project_engine, RenameWorkflowRequest(workflow_id=closed.workflow_id, requested_name="renamed"), None
+            )
+
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        assert isinstance(renamed.result_details, ResultDetails)
+        warnings = [detail for detail in renamed.result_details.result_details if detail.level == logging.WARNING]
+        assert len(warnings) == 1
+        assert str(closed.file_path) in warnings[0].message
+        renamed_path = closed.file_path.with_name("renamed.py")
+        assert project_engine.workflow_registry.get(closed.workflow_id).absolute_path == renamed_path
+        assert renamed_path.is_file()
+        assert closed.file_path.is_file()
 
     def test_renaming_a_closed_workflow_keeps_it_in_its_folder(self, project_engine: Engine) -> None:
         closed = _save_and_close(project_engine, "closed")
@@ -695,6 +730,7 @@ class TestSavedWorkflowRequestsResolveTheirAddress:
         ("address_by", "expected"),
         [
             ("disagreeing", "belongs to"),
+            ("stale_name", "belongs to"),
             ("neither", "names no workflow"),
             ("unknown_id", "no workflow has that id"),
             ("unknown_name", "no workflow has that name"),
@@ -709,6 +745,8 @@ class TestSavedWorkflowRequestsResolveTheirAddress:
         address: dict[str, Any] = {}
         if address_by == "disagreeing":
             address = {"workflow_id": target.workflow_id, spec.name_field: addressed["other"].name}
+        if address_by == "stale_name":
+            address = {"workflow_id": target.workflow_id, spec.name_field: "gone"}
         if address_by == "unknown_id":
             address = {"workflow_id": "0" * 32}
         if address_by == "unknown_name":
@@ -720,6 +758,66 @@ class TestSavedWorkflowRequestsResolveTheirAddress:
         assert isinstance(result, spec.failure)
         assert expected in str(result.result_details)
         assert project_engine.workflow_registry.list_workflows() == listed_before
+
+    @pytest.mark.parametrize(
+        "compare_address",
+        [
+            {"compare_workflow_id": "0" * 32},
+            {"compare_workflow_name": "gone"},
+            {"compare_workflow_id": "0" * 32, "compare_workflow_name": "gone"},
+        ],
+        ids=["unknown_id", "unknown_name", "both_unknown"],
+    )
+    def test_comparing_with_a_workflow_nothing_names_any_more_reports_no_source(
+        self, project_engine: Engine, addressed: dict[str, Any], compare_address: dict[str, str]
+    ) -> None:
+        source = addressed["source"]
+
+        result = _send_async(
+            project_engine,
+            CompareWorkflowsRequest(
+                workflow_id=source.workflow_id,
+                compare_workflow_id=compare_address.get("compare_workflow_id"),
+                compare_workflow_name=compare_address.get("compare_workflow_name"),
+            ),
+            None,
+        )
+
+        assert isinstance(result, CompareWorkflowsResultSuccess), result.result_details
+        assert result.status == "no_source"
+        assert result.compare_workflow_id is None
+
+    @pytest.mark.parametrize(
+        ("compare_address_by", "expected"),
+        [
+            ("stale_name", "belongs to"),
+            ("unknown_id_known_name", "though one has that name"),
+            ("disagreeing", "belongs to"),
+        ],
+    )
+    def test_comparing_with_an_id_and_a_name_that_disagree_fails(
+        self, project_engine: Engine, addressed: dict[str, Any], compare_address_by: str, expected: str
+    ) -> None:
+        source = addressed["source"]
+        other = addressed["other"]
+        compare_address = {"compare_workflow_id": other.workflow_id, "compare_workflow_name": "gone"}
+        if compare_address_by == "unknown_id_known_name":
+            compare_address = {"compare_workflow_id": "0" * 32, "compare_workflow_name": other.name}
+        if compare_address_by == "disagreeing":
+            compare_address = {"compare_workflow_id": other.workflow_id, "compare_workflow_name": source.name}
+
+        result = _send_async(
+            project_engine,
+            CompareWorkflowsRequest(
+                workflow_id=source.workflow_id,
+                compare_workflow_id=compare_address.get("compare_workflow_id"),
+                compare_workflow_name=compare_address.get("compare_workflow_name"),
+            ),
+            None,
+        )
+
+        assert isinstance(result, CompareWorkflowsResultFailure)
+        assert expected in str(result.result_details)
 
 
 def _publisher(handler: Any, get_publish_options: Any = None) -> RegisteredEventHandler:
