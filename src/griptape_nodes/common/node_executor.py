@@ -513,6 +513,18 @@ class NodeExecutor(EngineScoped):
         self.engine.event_manager.put_event(workflow.execution_event(payload))
 
     @staticmethod
+    def _build_results_list(
+        total_iterations: int, successful_iterations: Collection[int], iteration_results: dict[int, Any]
+    ) -> list[Any]:
+        """Order collected iteration results by iteration, with None for each failed iteration.
+
+        A successful iteration with no result (skipped, or nothing wired to new_item_to_add) adds nothing.
+        """
+        failed_iteration_results = dict.fromkeys(set(range(total_iterations)) - set(successful_iterations))
+        collected_results = failed_iteration_results | iteration_results
+        return [collected_results[index] for index in sorted(collected_results)]
+
+    @staticmethod
     def _outcome_after_return(node: BaseNode) -> NodeProcessOutcome:
         """A node that returned after a cancel was requested stopped early on purpose: it was cancelled."""
         if node.is_cancellation_requested:
@@ -1925,9 +1937,7 @@ class NodeExecutor(EngineScoped):
 
         # Step 6: Build results list in iteration order, with None for failed iterations. A
         # successful iteration with no result (skipped, or nothing wired to new_item_to_add) adds nothing.
-        failed_iteration_results = dict.fromkeys(set(range(total_iterations)) - set(successful_iterations))
-        collected_results = failed_iteration_results | iteration_results
-        node._results_list = [collected_results[index] for index in sorted(collected_results)]
+        node._results_list = self._build_results_list(total_iterations, successful_iterations, iteration_results)
 
         # Step 7: Output final results to the results parameter
         node._output_results_list()

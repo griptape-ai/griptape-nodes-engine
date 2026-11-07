@@ -773,3 +773,19 @@ class TestHandleEmptyLoopBody:
 
         assert end_node._results_list == []
         end_node._output_results_list.assert_called_once()
+
+
+class TestBuildResultsList:
+    """Results are ordered by iteration, with None for failures and nothing for results-less successes."""
+
+    def test_orders_results_by_iteration(self) -> None:
+        results = NodeExecutor._build_results_list(3, [0, 1, 2], {2: "c", 0: "a", 1: "b"})
+        assert results == ["a", "b", "c"]
+
+    def test_failed_iterations_become_none(self) -> None:
+        results = NodeExecutor._build_results_list(3, [0, 2], {0: "a", 2: "c"})
+        assert results == ["a", None, "c"]
+
+    def test_successful_iteration_without_result_adds_nothing(self) -> None:
+        results = NodeExecutor._build_results_list(3, [0, 1, 2], {0: "a", 2: "c"})
+        assert results == ["a", "c"]
