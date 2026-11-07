@@ -734,7 +734,6 @@ class TestHandleEmptyLoopBody:
         end_node, _ = _make_start_wired_end_node("current_item")
         start_node = end_node.start_node
         start_node._get_total_iterations.return_value = 3
-        start_node._require_workflow.return_value = None
         executor = _make_executor()
         if list_succeeds:
             result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
