@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.topics import REQUEST_TOPIC, client_response_topic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,11 +72,14 @@ class RequestClient:
         Args:
             client: Client instance to use for communication
             request_topic_fn: Function to determine request topic (defaults to "request")
-            response_topic_fn: Function to determine response topic (defaults to "response")
+            response_topic_fn: Function to determine response topic (defaults to this client's own
+                reply topic, `clients/<client_id>/response`, so no other client gets its results)
         """
         self.client = client
-        self.request_topic_fn = request_topic_fn or (lambda: "request")
-        self.response_topic_fn = response_topic_fn or (lambda: "response")
+        self.client_id = uuid.uuid4().hex
+        own_response_topic = client_response_topic(None, self.client_id)
+        self.request_topic_fn = request_topic_fn or (lambda: REQUEST_TOPIC)
+        self.response_topic_fn = response_topic_fn or (lambda: own_response_topic)
 
         # Map of request_id -> pending request where tag identifies the originating worker/caller
         self._pending_requests: dict[str, _PendingRequest] = {}
