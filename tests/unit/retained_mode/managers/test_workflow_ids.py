@@ -56,6 +56,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     CreateWorkflowFromTemplateResultSuccess,
     DeleteWorkflowRequest,
     DeleteWorkflowResultSuccess,
+    GetWorkflowRunCommandRequest,
+    GetWorkflowRunCommandResultFailure,
     ImportWorkflowRequest,
     ImportWorkflowResultSuccess,
     ListAllWorkflowsRequest,
@@ -1235,6 +1237,15 @@ class TestLibraryWorkflowsOpenAsCopies:
         assert isinstance(opened, OpenWorkflowResultFailure)
         assert project_engine.open_workflows.all_open() == []
         assert _copies_of(project_engine, library.workflow_id) == []
+
+    def test_asking_for_the_run_command_of_an_open_copy_asks_to_save_it_first(self, project_engine: Engine) -> None:
+        library = _library_workflow(project_engine, "library_flow")
+        _open_library_workflow(project_engine, "open_by_id", library)
+
+        result = _run(project_engine, GetWorkflowRunCommandRequest())
+
+        assert isinstance(result, GetWorkflowRunCommandResultFailure)
+        assert "isn't saved" in str(result.result_details)
 
 
 class TestSaveAsContinuingInTheCopy:

@@ -537,6 +537,14 @@ class WorkflowRunner(EngineScoped):
                         "because the workflow was not found in the registry. Save the workflow first, or provide file_path."
                     )
                 )
+            if saved.file_path is None:
+                # Such as the open workflow when it is a Griptape-provided workflow's unsaved copy.
+                return GetWorkflowRunCommandResultFailure(
+                    result_details=(
+                        f"Attempted to get workflow run command. Failed with workflow_name='{workflow_name}' "
+                        "because the workflow isn't saved, so it has no file to run. Save the workflow first."
+                    )
+                )
             relative_file_path = saved.file_path
             workflow_shape = saved.metadata.workflow_shape
         else:
