@@ -6,7 +6,7 @@ This page calls your computer the **workstation** and the other one the **remote
 
 ## How it works
 
-Some libraries run their nodes in a separate process called a **worker**. Normally your engine starts that worker on your workstation. When you send a library to a remote computer, your engine asks the remote engine to start the worker there instead. The worker then reports back to your engine, so your workflow runs the same way it always does.
+Some libraries run their nodes in a separate process called a **worker**. Normally your engine starts that worker on your workstation. When you send a library to a remote computer, your engine asks the remote engine to start the worker there instead. The remote engine runs the worker and passes everything it does back to your engine, so your workflow runs the same way it always does. Only the two engines connect to each other; the worker connects to nothing but the remote engine.
 
 Every engine has an **engine ID**, a long string like `3f2c8e1a-5b7d-4c9e-a0f1-2b3c4d5e6f70`. You tell your engine which libraries to send where by pairing each library's name with the remote engine's ID. Your engine looks that ID up in the **engine registry**, a list of running engines that Griptape Cloud keeps, or that your studio's admin server keeps. The `GT_CLOUD_BASE_URL` setting says which one an engine uses. Because the lookup is by ID, you never type the remote computer's address.
 
@@ -18,7 +18,7 @@ Check each of these. If one doesn't hold, running the library's nodes fails with
 - **Same libraries.** The remote computer has each library you send it installed and loaded, at the same version as your workstation.
 - **A shared workspace.** Both computers open the same workspace folder, for example on a shared network drive. Files never travel between the engines; each one reads and writes the shared folder.
 - **The same engine registry.** Both engines use the same `GT_CLOUD_BASE_URL`.
-- **Credentials on the remote computer.** The remote computer has its own Griptape Nodes license or Griptape Cloud API key, in `GRIPTAPE_NODES_LICENSE` or `GT_CLOUD_API_KEY`. Nodes that run there use it, just as the remote engine does. Your workstation doesn't send its license or API key.
+- **Credentials on the remote computer.** The remote engine runs on its own Griptape Nodes license or Griptape Cloud API key, in `GRIPTAPE_NODES_LICENSE` or `GT_CLOUD_API_KEY`, as any engine does. Your nodes that run there don't use it: they run on your workstation's license session. See [Your nodes run on your license](#your-nodes-run-on-your-license).
 - **A way to connect.** Either your workstation can reach the remote computer over your network, or both engines connect to Griptape Cloud. See step 2.
 
 ## Step 1: Find the remote engine's ID
@@ -134,11 +134,20 @@ To limit how many workers the remote computer runs at once, set `distributed_exe
 }
 ```
 
+## Your nodes run on your license
+
+A node that runs on the remote computer works for your workstation, so it runs on your workstation's license session, not on the remote computer's license:
+
+- **Your license decides what it may do.** Your workstation checks each thing the node asks for, such as creating a node of a type your license restricts, against your license, exactly as for a node on your workstation.
+- **Its Griptape Cloud calls use your session.** A node that calls Griptape Cloud authenticates with your workstation's current license session. Your workstation never sends its license or API key, and the session it sends ends when your session does. If your workstation has no license session, such as when it runs with an API key, those calls have no Griptape Cloud credential.
+- **The remote computer's license covers only the remote engine itself**, such as accepting your workstation's connection.
+
 ## Good to know
 
 - **Only some libraries can run elsewhere.** A library can run on another computer only if its nodes run in a worker, which is up to the library's author. Libraries with heavy dependencies, such as machine learning models, usually do. If you list one that doesn't, nothing fails: its nodes keep running on your workstation.
 - **Secrets come from your workstation.** When a node asks for a secret by name, such as a provider API key, it gets your workstation's value.
 - **Only use a remote computer you trust.** Your nodes running there act for your workstation: they can read your secrets and your workspace files, and work as your engine does. So you're trusting the remote computer, anyone who can connect to its Griptape Nodes port, and anyone whose nodes run on it, such as other people sharing it. Keep it on a network only your team reaches.
+- **Two computers can each run a library for the other.** Your workstation can send a library to the remote computer while the remote computer sends another library to your workstation, whichever of the two connected first.
 - **If the remote computer moves to a new address**, restart Griptape Nodes on your workstation so it looks the remote engine up again.
 - **You can share one config file between computers.** A library listed with an engine's own ID runs on that engine. So computers that share a workspace can share its `griptape_nodes_config.json`: the remote computer runs its libraries itself, and your workstation sends them there.
 
