@@ -114,6 +114,10 @@ class OpenedWorkflowBuild:
     already_open: bool
     execution_result: WorkflowExecutionResult | None
 
+    @property
+    def build_failed(self) -> bool:
+        return self.execution_result is not None and not self.execution_result.execution_successful
+
 
 def execution_result_details(
     execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
@@ -170,14 +174,17 @@ class WorkflowRunner(EngineScoped):
 
         A saved file never decides whether to open a workflow; its caller does. The file's requests
         name no workflow, so the run binds the workflow it builds into, and the binding ends with
-        the run. The result names that workflow.
+        the run. The result names that workflow. With None, the file opens through
+        `open_and_build_workflow`, so a concurrent open of it waits for the build.
         """
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
+        if workflow is None:
+            return await self._open_file_and_build(complete_file_path)
         # Problems found anywhere under this load land in the frame, including those of a
         # referenced subflow imported from inside exec() -- see LoadProblemFrame.
-        # Bound to no workflow until the file's own is known, so opening it never sees the caller's.
+        # Bound to no workflow; the run binds `workflow` around the file's own requests.
         with LoadProblemFrame() as frame, self.engine.bind_workflow(NO_WORKFLOW):
             return await self._run_workflow_in_frame(
                 relative_file_path=relative_file_path,
@@ -185,6 +192,23 @@ class WorkflowRunner(EngineScoped):
                 frame=frame,
                 workflow=workflow,
             )
+
+    async def _open_file_and_build(self, complete_file_path: Path) -> WorkflowExecutionResult:
+        """Open the file at `complete_file_path` as a workflow and build it, reporting a refused open as a failed run."""
+        try:
+            # Bound to no workflow, so opening the file never sees the caller's.
+            with self.engine.bind_workflow(NO_WORKFLOW):
+                built = await self.open_and_build_workflow(file_path=str(complete_file_path))
+        except ContextManager.OpenRefusedError as err:
+            return WorkflowExecutionResult(
+                execution_successful=False, execution_details=str(err), status=WorkflowStatus.UNUSABLE
+            )
+        if built.already_open or built.execution_result is None:
+            details = f"Attempted to run workflow file '{complete_file_path}'. Failed because it is already open."
+            return WorkflowExecutionResult(
+                execution_successful=False, execution_details=details, status=WorkflowStatus.UNUSABLE
+            )
+        return built.execution_result
 
     @handles(RunWorkflowFromScratchRequest)
     async def on_run_workflow_from_scratch_request(  # noqa: PLR0911
@@ -267,9 +291,6 @@ class WorkflowRunner(EngineScoped):
                 open_workflow=opened_workflow,
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
-        # Only a workflow this load opened is closed: one it built into was the caller's, open before.
-        if workflow is None and execution_result.workflow_id is not None:
-            await self._close_failed_load(execution_result.workflow_id)
         return RunWorkflowWithCurrentStateResultFailure(
             result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
         )
@@ -404,8 +425,9 @@ class WorkflowRunner(EngineScoped):
         """Open the workflow a request names (`ContextManager.open_requested_workflow`) and build its file into it.
 
         A workflow already open comes back unchanged, once any build another request started has
-        ended. A workflow with a file is built from it, and a build that fails closes the workflow
-        again. `create_flow` gives the workflow its top-level flow when it has none once built.
+        ended. A workflow with a file is built from it, and a build that fails or is cancelled
+        closes the workflow again, before a concurrent open of it stops waiting. `create_flow` gives
+        the workflow its top-level flow when it has none once built.
 
         Raises:
             ContextManager.OpenRefusedError: The open was refused, as `open_requested_workflow` raises,
@@ -425,16 +447,24 @@ class WorkflowRunner(EngineScoped):
 
         build_ended = asyncio.Event()
         self._building[workflow] = build_ended
+        finished = False
         try:
-            return await self._build_opened_workflow(workflow, file_path=file_path, create_flow=create_flow)
+            built = await self._build_opened_workflow(workflow, file_path=file_path, create_flow=create_flow)
+            finished = not built.build_failed
         finally:
-            del self._building[workflow]
-            build_ended.set()
+            try:
+                # Also on cancellation, so a waiter never gets a half-built workflow.
+                if not finished:
+                    await self._close_failed_load(workflow.workflow_id)
+            finally:
+                del self._building[workflow]
+                build_ended.set()
+        return built
 
     async def _build_opened_workflow(
         self, workflow: WorkflowRuntime, *, file_path: str | None, create_flow: bool
     ) -> OpenedWorkflowBuild:
-        """Build the file of `workflow`, which was just opened, into it, closing it again if the build fails.
+        """Build the file of `workflow`, which was just opened, into it.
 
         Raises:
             ContextManager.OpenRefusedError: `create_flow` asked for a flow that could not be created.
@@ -446,7 +476,6 @@ class WorkflowRunner(EngineScoped):
         if relative_file_path is not None:
             execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=workflow)
             if not execution_result.execution_successful:
-                await self._close_failed_load(workflow.workflow_id)
                 return OpenedWorkflowBuild(
                     workflow_id=workflow.workflow_id, already_open=False, execution_result=execution_result
                 )
@@ -578,7 +607,7 @@ class WorkflowRunner(EngineScoped):
         """Wait for the build of `workflow` that another request started, if one is under way.
 
         Raises:
-            ContextManager.OpenRefusedError: That build failed, which closed the workflow.
+            ContextManager.OpenRefusedError: That build failed or was cancelled, which closed the workflow.
         """
         build_ended = self._building.get(workflow)
         if build_ended is None:
@@ -592,7 +621,7 @@ class WorkflowRunner(EngineScoped):
             label = entry.name
         msg = (
             f"Attempted to open workflow '{label}'. Failed because another request was opening it "
-            "and its file failed to build."
+            "and did not finish building it."
         )
         raise ContextManager.OpenRefusedError(msg)
 
@@ -660,12 +689,9 @@ class WorkflowRunner(EngineScoped):
         relative_file_path: str,
         complete_file_path: Path,
         frame: LoadProblemFrame,
-        workflow: WorkflowRuntime | None,
+        workflow: WorkflowRuntime,
     ) -> WorkflowExecutionResult:
-        """Read, resolve libraries for, and exec one workflow file into `workflow`, recording problems in `frame`.
-
-        With no `workflow`, the file is opened as one first.
-        """
+        """Read, resolve libraries for, and exec one workflow file into `workflow`, recording problems in `frame`."""
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -675,11 +701,6 @@ class WorkflowRunner(EngineScoped):
             # be registered (discovery is triggered if needed) so node construction
             # inside the script can succeed.
             frame.problems.extend(await self._ensure_libraries_for_workflow(relative_file_path=relative_file_path))
-
-            # By the path a standalone run opens it with (`push_workflow(file_path=__file__)`), so
-            # both find the same registry entry.
-            if workflow is None:
-                workflow = self.engine.context_manager.open_workflow(file_path=str(complete_file_path))
 
             # _generate_workflow_run_prerequisite_code emits one registration per header entry,
             # so each library we just failed to register is about to fail again on a request the
@@ -719,7 +740,7 @@ class WorkflowRunner(EngineScoped):
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
                 status=WorkflowStatus.UNUSABLE,
                 problems=tuple(frame.problems),
-                workflow_id=self._workflow_id_of(workflow),
+                workflow_id=workflow.workflow_id,
             )
         return WorkflowExecutionResult(
             execution_successful=True,
@@ -797,9 +818,3 @@ class WorkflowRunner(EngineScoped):
                     )
                 )
         return problems
-
-    @staticmethod
-    def _workflow_id_of(workflow: WorkflowRuntime | None) -> str | None:
-        if workflow is None:
-            return None
-        return workflow.workflow_id

@@ -37,6 +37,8 @@ from griptape_nodes.retained_mode.events.project_events import (
 from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryRequest,
     RunWorkflowFromRegistryResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultSuccess,
     SaveWorkflowRequest,
     SaveWorkflowResultSuccess,
     WorkflowStatus,
@@ -376,40 +378,59 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
     """A second open of a workflow still building waits for the build instead of returning an empty graph."""
 
     @staticmethod
-    def _gated_run(gate: asyncio.Event, entered: asyncio.Event, run: object) -> object:
+    def _gated_run(gate: asyncio.Event, entered: asyncio.Event, run: WorkflowExecutionResult | None) -> object:
+        """`run_workflow` that holds each build into an open workflow until `gate` is set, then runs it or returns `run`."""
+
         async def gated(runner: WorkflowRunner, relative_file_path: str, workflow: WorkflowRuntime | None) -> object:
+            # With None, run_workflow opens the file first and comes back here with the workflow.
+            if workflow is None:
+                return await ORIGINAL_RUN_WORKFLOW(runner, relative_file_path=relative_file_path, workflow=None)
             entered.set()
             await gate.wait()
-            if isinstance(run, WorkflowExecutionResult):
+            if run is not None:
                 return run
             return await ORIGINAL_RUN_WORKFLOW(runner, relative_file_path=relative_file_path, workflow=workflow)
 
         return gated
 
     @staticmethod
-    async def _open_twice(
-        engine: Engine, workflow_id: str, run: object
-    ) -> list[EventResultSuccess | EventResultFailure]:
+    async def _race(
+        engine: Engine,
+        first_request: RequestPayload,
+        second_request: RequestPayload,
+        *,
+        run: WorkflowExecutionResult | None = None,
+        cancel_first: bool = False,
+    ) -> list[EventResultSuccess | EventResultFailure | BaseException]:
+        """Send `first_request`, then `second_request` while the first is building, then let the build end or cancel it."""
         gate = asyncio.Event()
         entered = asyncio.Event()
-        request = OpenWorkflowRequest(workflow_id=workflow_id)
         gated = TestOpenWorkflowWhileAnotherRequestOpensIt._gated_run(gate, entered, run)
         with patch.object(WorkflowRunner, "run_workflow", gated):
-            first = asyncio.create_task(engine.event_manager.ahandle_request(request, result_context=ResultContext()))
-            await entered.wait()
-            second = asyncio.create_task(engine.event_manager.ahandle_request(request, result_context=ResultContext()))
+            first = asyncio.create_task(
+                engine.event_manager.ahandle_request(first_request, result_context=ResultContext())
+            )
+            await asyncio.wait_for(entered.wait(), 5)
+            second = asyncio.create_task(
+                engine.event_manager.ahandle_request(second_request, result_context=ResultContext())
+            )
             await asyncio.sleep(0.05)
             assert not second.done()
-            gate.set()
-            return list(await asyncio.gather(first, second))
+            if cancel_first:
+                first.cancel()
+            else:
+                gate.set()
+            return list(await asyncio.gather(first, second, return_exceptions=True))
 
     def test_the_second_open_returns_the_workflow_once_built_and_it_is_announced_once(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
-        workflow_id = _saved_workflow_id(engine, saved_workflow_name)
+        request = OpenWorkflowRequest(workflow_id=_saved_workflow_id(engine, saved_workflow_name))
 
-        first, second = asyncio.run(self._open_twice(engine, workflow_id, run=None))
+        first, second = asyncio.run(self._race(engine, request, request))
 
+        assert isinstance(first, EventResultSuccess)
+        assert isinstance(second, EventResultSuccess)
         assert isinstance(first.result, OpenWorkflowResultSuccess), first.result.result_details
         assert isinstance(second.result, OpenWorkflowResultSuccess), second.result.result_details
         assert not first.result.already_open
@@ -421,15 +442,49 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
     def test_the_second_open_fails_when_the_build_fails_and_nothing_is_announced(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
-        workflow_id = _saved_workflow_id(engine, saved_workflow_name)
+        request = OpenWorkflowRequest(workflow_id=_saved_workflow_id(engine, saved_workflow_name))
         failed_run = WorkflowExecutionResult(
             execution_successful=False, execution_details="broken file", status=WorkflowStatus.UNUSABLE
         )
 
-        first, second = asyncio.run(self._open_twice(engine, workflow_id, run=failed_run))
+        first, second = asyncio.run(self._race(engine, request, request, run=failed_run))
 
+        assert isinstance(first, EventResultFailure)
+        assert isinstance(second, EventResultFailure)
         assert type(first.result) is OpenWorkflowResultFailure
         assert type(second.result) is OpenWorkflowResultFailure
-        assert "failed to build" in str(second.result.result_details)
+        assert "did not finish building it" in str(second.result.result_details)
         assert engine.open_workflows.all_open() == []
         assert _lifecycle_events(queue) == []
+
+    def test_a_cancelled_build_closes_the_workflow_before_the_second_open_stops_waiting(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
+        request = OpenWorkflowRequest(workflow_id=_saved_workflow_id(engine, saved_workflow_name))
+
+        first, second = asyncio.run(self._race(engine, request, request, cancel_first=True))
+
+        assert isinstance(first, asyncio.CancelledError)
+        assert isinstance(second, EventResultFailure)
+        assert type(second.result) is OpenWorkflowResultFailure
+        assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(queue) == []
+
+    def test_an_open_waits_for_a_run_with_current_state_that_is_opening_the_file(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
+        entry = engine.workflow_registry.get_workflow_by_name(saved_workflow_name)
+        assert entry.file_path is not None
+        run_request = RunWorkflowWithCurrentStateRequest(file_path=entry.file_path)
+        open_request = OpenWorkflowRequest(workflow_id=entry.workflow_id)
+
+        first, second = asyncio.run(self._race(engine, run_request, open_request))
+
+        assert isinstance(first, EventResultSuccess)
+        assert isinstance(second, EventResultSuccess)
+        assert isinstance(first.result, RunWorkflowWithCurrentStateResultSuccess), first.result.result_details
+        assert isinstance(second.result, OpenWorkflowResultSuccess), second.result.result_details
+        assert second.result.already_open
+        assert second.result.open_workflow.workflow_id == entry.workflow_id
+        assert second.result.open_workflow.has_active_flow
+        assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=second.result.open_workflow)]
