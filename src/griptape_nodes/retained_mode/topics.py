@@ -1,7 +1,4 @@
-"""Pub/sub topic names that engines, apps and clients share.
-
-Pure string building: callers supply the identity, so nothing here resolves an engine. Every
-`<id>` below is an engine id, a session id, a client id or an open workflow id.
+"""Pub/sub topic names that engines, apps and clients share. Callers supply every id.
 
 | Topic | Carries |
 |---|---|
