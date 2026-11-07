@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _MAX_NODE_DESCRIPTION_LENGTH,
     _NO_FLOW_INSTRUCTION,
+    _NO_WORKFLOW_INSTRUCTION,
     _NODE_TYPES_NOT_LISTED_INSTRUCTION,
     _TOOL_APPROVAL_INSTRUCTIONS,
     AgentManager,
@@ -189,12 +190,19 @@ def chat_manager(engine: Engine) -> Iterator[AgentManager]:
 
 class TestWorkflowContext:
     @pytest.mark.asyncio
-    async def test_no_flow_open_gives_the_node_types_and_says_there_is_no_flow(
-        self, chat_manager: AgentManager
-    ) -> None:
+    async def test_no_workflow_gives_the_node_types_and_says_to_open_one(self, chat_manager: AgentManager) -> None:
         context = await chat_manager._workflow_context(None)
 
         assert f"Library '{_LIBRARY_NAME}':\n  text:\n    - _ContextNode: Holds a prompt" in context.node_types
+        assert context.flow == _NO_WORKFLOW_INSTRUCTION
+        assert "EnsureWorkflowAndFlowRequest" in context.flow
+
+    @pytest.mark.asyncio
+    async def test_a_workflow_with_no_flow_says_to_create_one(self, engine: Engine, chat_manager: AgentManager) -> None:
+        workflow = engine.open_workflow(engine.workflow_registry.register_unsaved("flowless").workflow_id)
+
+        context = await chat_manager._workflow_context(workflow)
+
         assert context.flow == _NO_FLOW_INSTRUCTION
 
     @pytest.mark.asyncio
@@ -252,7 +260,7 @@ class TestWorkflowContext:
 
         assert handed.flow.startswith("Current flow: 'main',")
         # Handed none, it describes none rather than guessing.
-        assert unnamed.flow == _NO_FLOW_INSTRUCTION
+        assert unnamed.flow == _NO_WORKFLOW_INSTRUCTION
 
     @pytest.mark.asyncio
     async def test_flow_that_cannot_be_rendered_is_left_out(

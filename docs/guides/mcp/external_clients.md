@@ -163,10 +163,10 @@ Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP
 
 Tool calls that build or change a workflow act on one open workflow. A client names it in one of two ways:
 
-- **A header.** Send the workflow's id in an `X-Griptape-Workflow-Id` header. Every tool call acts on that workflow, including each request inside `EventRequestBatch`. If that workflow isn't open, the call fails. A workflow keeps its id when it is saved. `GetWorkflowContextRequest` and `EnsureWorkflowAndFlowRequest` return the `workflow_id` of the workflow they report, and `ListOpenWorkflowsRequest` lists every open workflow with its id.
-- **The session's own workflow.** A client that sends no header can start with `EnsureWorkflowAndFlowRequest` or `SetWorkflowContextRequest`. Later calls in the same MCP session act on the workflow that call opened or selected, until that workflow closes.
+- **A header.** Send the workflow's id in an `X-Griptape-Workflow-Id` header. Every tool call acts on that workflow, including each request inside `EventRequestBatch`. A workflow keeps its id when it is saved. `ListOpenWorkflowsRequest` lists every open workflow with its id.
+- **The session's own workflow.** A client that sends no header can open a workflow with `OpenWorkflowRequest`. Name an open workflow's `workflow_id` to work in it: it comes back with `already_open` set and nothing about it changes. Name none, with `create_flow` set to `true`, to start a new one. Later calls in the same MCP session act on that workflow. Any call that reports the workflow it opened in `open_workflow` does the same, such as `SetWorkflowContextRequest`, or `EnsureWorkflowAndFlowRequest` when it opens one.
 
-A call with neither acts on the workflow that's open in the engine.
+When the workflow a call acts on isn't open, such as after its tab was closed, the call fails with `WorkflowNotOpenResultFailure`. Its `open_workflows` lists the workflows that are open, so you can open one of them with `OpenWorkflowRequest`. A session's own workflow is forgotten after that failure. A call with neither a header nor a workflow of its session's own acts on the workflow that's open in the engine.
 
 ## Parameter values
 
