@@ -3,5 +3,8 @@
   open comes back as it is, with `already_open` set. It never closes a workflow: it fails with
   `AnotherWorkflowOpenResultFailure` while another is open, and with
   `WorkflowNotFoundResultFailure` for an id or name the engine doesn't know, such as an unsaved
-  workflow that was closed or lost to a restart. MCP clients get it as a tool.
+  workflow that was closed or lost to a restart. A `working_directory` that names a file fails with
+  `InvalidWorkingDirectoryResultFailure`, so a client can retry without it. MCP clients get it as a
+  tool.
   [#6221](https://github.com/griptape-ai/griptape-nodes-engine/issues/6221)
+  [#6241](https://github.com/griptape-ai/griptape-nodes-engine/issues/6241)
