@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.context_manager import read_metadata_for_open_file
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.workflow.loading import EPOCH_START
@@ -251,15 +252,16 @@ class WorkflowSaver(EngineScoped):
     async def on_save_workflow_request(self, request: SaveWorkflowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         return await self.save_open_workflow(workflow, request)
 
-    async def save_open_workflow(  # noqa: C901, PLR0912, PLR0915
+    async def save_open_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, workflow: WorkflowRuntime, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
     ) -> ResultPayload:
         """Save the open `workflow` as `request` describes.
 
         Where the file lands decides which workflow it is. The workflow's own file, and the first
         save of an unsaved workflow, continue the workflow under its id; anything else is a copy
-        with an id of its own. `keep_open_workflow_identity` makes the save move the workflow to
-        the new file instead of copying it, which is what a rename is.
+        with an id of its own, unless `request.continue_in_copy` keeps the workflow on the copy.
+        `keep_open_workflow_identity` makes the save move the workflow to the new file instead of
+        copying it, which is what a rename is. A save onto another open workflow's file is refused.
         """
         # Determine save target (file path, name, metadata)
         current_workflow = self.engine.workflow_registry.get(workflow.workflow_id)
@@ -315,6 +317,20 @@ class WorkflowSaver(EngineScoped):
             )
             return SaveWorkflowResultFailure(result_details=msg)
 
+        # Writing there would take the file, and so the identity, of a workflow open in another tab.
+        workflow_at_destination = self._workflow_at_destination(destination)
+        if (
+            workflow_at_destination is not None
+            and workflow_at_destination is not current_workflow
+            and self.engine.open_workflows.is_open(workflow_at_destination.workflow_id)
+        ):
+            details = (
+                f"Attempted to save workflow '{current_workflow_name}' to '{relative_file_path}'. "
+                f"Failed because that file belongs to workflow '{workflow_at_destination.name}', which is open. "
+                "Close it first, or save under another name."
+            )
+            return SaveWorkflowResultFailure(result_details=details)
+
         logger.debug(
             "Save workflow: scenario=%s, file_name=%s, registry_key=%s, destination=%s, "
             "self_save=%s, overwrite_existing=%s, branched_from=%s",
@@ -359,6 +375,7 @@ class WorkflowSaver(EngineScoped):
             current_workflow=current_workflow,
             keep_open_workflow_identity=keep_open_workflow_identity,
         )
+        continues_in_copy = request.continue_in_copy and not continues_open_workflow
 
         # Build save request inline (preserve existing display_name/description/image/is_template if present)
         existing = self._get_existing_metadata(registry_key)
@@ -422,6 +439,7 @@ class WorkflowSaver(EngineScoped):
             written_path=save_file_result.file_path,
             workflow_metadata=save_file_result.workflow_metadata,
             continues_open_workflow=continues_open_workflow,
+            continues_in_copy=continues_in_copy,
         )
 
         details = f"Successfully saved workflow to: {save_file_result.file_path}"
@@ -445,7 +463,8 @@ class WorkflowSaver(EngineScoped):
         Decided before the write, while `destination` can still be compared with the workflow's
         own file. The open workflow continues into its own file, into the first file an unsaved
         workflow is saved to, and into the file a rename moves it to. Every other save is a copy
-        (Save As, a versioned save), which is a new workflow with an id of its own.
+        (Save As, a versioned save), which is a new workflow with an id of its own unless the
+        save continues in it.
         """
         if keep_open_workflow_identity or not current_workflow.is_saved:
             return True
@@ -472,19 +491,25 @@ class WorkflowSaver(EngineScoped):
         written_path: str,
         workflow_metadata: WorkflowMetadata,
         continues_open_workflow: bool,
+        continues_in_copy: bool,
     ) -> Workflow:
         """Update the registry for a file a save just wrote, and return the workflow it holds.
 
         A file that continues the open workflow is the open workflow's: its entry moves there if
-        it was not already. Any other file is a new workflow. Either way, a different workflow
-        registered at that path is removed, since the file that was its identity now holds
+        it was not already. So is a copy the save continues in, and the file it leaves behind is
+        registered as a new workflow. Any other file is a new workflow. Either way, a different
+        workflow registered at that path is removed, since the file that was its identity now holds
         another workflow.
         """
         registry = self.engine.workflow_registry
         current_workflow = registry.get(workflow.workflow_id)
         displaced = registry.find_by_path(written_path)
 
-        if continues_open_workflow:
+        if continues_open_workflow or continues_in_copy:
+            left_behind_path = None
+            if continues_in_copy and displaced is not current_workflow:
+                left_behind_path = current_workflow.absolute_path
+            left_behind_listed = current_workflow.listed
             if displaced is not None and displaced is not current_workflow:
                 registry.remove(displaced.workflow_id)
             if displaced is not current_workflow:
@@ -493,11 +518,24 @@ class WorkflowSaver(EngineScoped):
             current_workflow.metadata_is_placeholder = False
             # A file registered only because it was opened is listed once it is saved.
             current_workflow.listed = True
+            if left_behind_path is not None:
+                self._register_file_left_behind(left_behind_path, listed=left_behind_listed)
             return current_workflow
 
         if displaced is not None:
             registry.remove(displaced.workflow_id)
         return registry.register_file(written_path, workflow_metadata)
+
+    def _register_file_left_behind(self, path: Path, *, listed: bool) -> None:
+        """Register the file a save that continued in its copy left behind, as a closed workflow with a new id."""
+        opened = read_metadata_for_open_file(path)
+        try:
+            self.engine.workflow_registry.register_file(
+                path, opened.metadata, listed=listed, metadata_is_placeholder=opened.metadata_is_placeholder
+            )
+        except ValueError as err:
+            # The file is gone, or its name was taken while the save ran; a rescan finds it if it is there.
+            logger.warning("Failed to register workflow file '%s' after saving a copy of it: %s", path, err)
 
     def generate_unique_filename(self, base_name: str) -> str:
         """Generate a unique filename for a workflow, avoiding collisions.

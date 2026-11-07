@@ -1201,3 +1201,72 @@ class TestLibraryWorkflowsOpenAsCopies:
         assert project_engine.context_manager.get_current_workflow_id() == workflow_id
         assert copy.open_workflow is not None
         assert copy.open_workflow.name == mine.workflow_name
+
+
+class TestSaveAsContinuingInTheCopy:
+    """`continue_in_copy` keeps the open workflow, its id and its graph, on the file a Save As writes."""
+
+    def _open_saved_workflow_with_an_unsaved_edit(self, engine: Engine) -> str:
+        """Open a workflow, save it, then add a flow the save doesn't hold, and return its id."""
+        workflow_id = _open_new_workflow(engine, "original")
+        _save(engine)
+        top_level = engine.handle_request(GetTopLevelFlowRequest())
+        assert isinstance(top_level, GetTopLevelFlowResultSuccess)
+        created = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top_level.flow_name, flow_name="unsaved_edit", set_as_new_context=False)
+        )
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+        return workflow_id
+
+    def test_the_open_workflow_keeps_its_id_and_graph_and_names_the_new_file(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        workflow = project_engine.open_workflows.get(workflow_id)
+        original_path = project_engine.workflow_registry.get(workflow_id).absolute_path
+
+        copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
+
+        assert copy.workflow_id == workflow_id
+        assert copy.workflow_name == "the_copy"
+        assert copy.open_workflow is not None
+        assert copy.open_workflow.workflow_id == workflow_id
+        assert copy.open_workflow.name == "the_copy"
+        assert copy.open_workflow.workflow_file_path == str(Path(copy.file_path).resolve())
+        assert _id_at(project_engine, copy.file_path) == workflow_id
+        # The same runtime, with the edit made after the last save.
+        assert project_engine.open_workflows.get(workflow_id) is workflow
+        assert "unsaved_edit" in workflow.flows.name_to_parent_name
+        assert project_engine.context_manager.get_current_workflow_id() == workflow_id
+        # The original file is a separate, closed workflow under a new id.
+        assert original_path is not None
+        left_behind_id = _id_at(project_engine, original_path)
+        assert left_behind_id not in (None, workflow_id)
+        assert not project_engine.open_workflows.is_open(left_behind_id)  # type: ignore[arg-type]
+        assert any(listed["workflow_id"] == left_behind_id for listed in _listed(project_engine).values())
+
+    def test_the_next_save_lands_in_the_copy(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
+
+        again = _save(project_engine, SaveWorkflowRequest(file_name=copy.workflow_name))
+
+        assert again.file_path == copy.file_path
+        assert again.workflow_id == workflow_id
+
+    def test_a_versioned_save_can_continue_in_the_version(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        original_path = project_engine.workflow_registry.get(workflow_id).absolute_path
+
+        version = _save(project_engine, SaveWorkflowRequest(create_versioned=True, continue_in_copy=True))
+
+        assert version.workflow_id == workflow_id
+        assert _id_at(project_engine, version.file_path) == workflow_id
+        assert original_path is not None
+        assert _id_at(project_engine, original_path) not in (None, workflow_id)
+
+    def test_it_changes_nothing_for_a_first_save(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "first")
+
+        saved = _save(project_engine, SaveWorkflowRequest(file_name="first_file", continue_in_copy=True))
+
+        assert saved.workflow_id == workflow_id
+        assert [workflow["workflow_id"] for workflow in _listed(project_engine).values()].count(workflow_id) == 1

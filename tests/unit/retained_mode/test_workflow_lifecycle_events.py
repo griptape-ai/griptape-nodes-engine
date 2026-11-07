@@ -454,6 +454,25 @@ class TestClosing:
         assert _lifecycle_events(_drain(queue)) == []
 
 
+class TestSavingAWorkflow:
+    def test_a_save_as_that_continues_in_the_copy_announces_nothing(
+        self, engine: Engine, queue: asyncio.Queue, saved_workflow_name: str
+    ) -> None:
+        """The tab's workflow is the same workflow under a new name, so nothing opens or closes."""
+        loaded = asyncio.run(engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)))
+        assert isinstance(loaded, RunWorkflowFromRegistryResultSuccess), loaded.result_details
+        _drain(queue)
+
+        copy = asyncio.run(
+            _send_async(engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True), loaded.workflow_id)
+        )
+
+        assert isinstance(copy.result, SaveWorkflowResultSuccess), copy.result.result_details
+        assert copy.result.workflow_id == loaded.workflow_id
+        assert copy.open_workflow_id == loaded.workflow_id
+        assert _lifecycle_events(_drain(queue)) == []
+
+
 class TestWorkers:
     @pytest.fixture
     def worker_engine(self, engine: Engine) -> Engine:
