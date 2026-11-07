@@ -791,23 +791,6 @@ class Engine:
         opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
         self._event_manager.put_event(AppEvent(payload=opened_event))
 
-    def move_open_workflow(self, workflow: WorkflowRuntime, workflow_id: str) -> None:
-        """Keep an open workflow open under another id (`OpenWorkflowSet.move`), telling clients if it was announced.
-
-        Clients hear of it as a close of the old id followed by an open of the new one, so none keeps
-        an id that names nothing.
-
-        Raises:
-            OpenWorkflowError: That runtime is not open, or another workflow is open under the new id.
-        """
-        old_workflow_id = workflow.workflow_id
-        self._open_workflows.move(workflow, workflow_id)
-        if workflow not in self._announced_workflows:
-            return
-        self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(open_workflow_id=old_workflow_id)))
-        opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
-        self._event_manager.put_event(AppEvent(payload=opened_event))
-
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
         """What clients are told of an open workflow: its id, name, file, whether it is saved and whether it has a flow."""
         entry = self.workflow_registry.get(workflow.workflow_id)

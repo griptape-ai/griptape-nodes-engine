@@ -168,7 +168,8 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             standing in for nodes whose library could not be registered -- editable, but not
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
-        workflow_id: Id of the workflow now open.
+        workflow_id: Id of the workflow now open. For a Griptape-provided workflow, the id of the
+            new unsaved copy it opened as, not the requested workflow's.
         open_workflow: The workflow now open, as the heartbeat lists it. None when the file opened none.
     """
 
@@ -532,9 +533,10 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
         workflow_id: Id of the saved workflow. A Save As or versioned save
             writes a copy, with a new id.
-        open_workflow: The workflow open after the save, as the heartbeat lists it. When its id is
-            `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
-            workflow moves onto its copy. Otherwise the save wrote a copy and the original stays open.
+        open_workflow: The workflow the save was sent in, as the heartbeat lists it, with the name
+            and file it has after the save. When its id is `workflow_id`, the open workflow is the
+            file saved: a save to its own file, or a first save. Otherwise the save wrote a copy and
+            the open workflow stays on its original file.
     """
 
     file_path: str

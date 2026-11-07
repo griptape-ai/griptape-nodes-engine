@@ -454,44 +454,6 @@ class TestClosing:
         assert _lifecycle_events(_drain(queue)) == []
 
 
-class TestMovingAnOpenWorkflow:
-    """A save of a Griptape-provided workflow moves the open workflow onto its copy's id."""
-
-    def test_an_announced_workflow_is_closed_under_its_old_id_and_opened_under_the_new(
-        self, engine: Engine, queue: asyncio.Queue
-    ) -> None:
-        workflow = _open_new_workflow(engine, "library")
-        old_workflow_id = workflow.workflow_id
-        copy_id = engine.workflow_registry.register_unsaved("copy", listed=False).workflow_id
-        _drain(queue)
-
-        engine.move_open_workflow(workflow, copy_id)
-
-        assert _lifecycle_events(_drain(queue)) == [
-            WorkflowClosedEvent(open_workflow_id=old_workflow_id),
-            WorkflowOpenedEvent(open_workflow=engine.open_workflow_info(workflow)),
-        ]
-        assert workflow.workflow_id == copy_id
-
-    def test_a_workflow_never_announced_moves_without_an_event(self, engine: Engine, queue: asyncio.Queue) -> None:
-        unannounced = engine.open_workflow(engine.workflow_registry.register_unsaved("quiet", listed=False).workflow_id)
-        copy_id = engine.workflow_registry.register_unsaved("copy", listed=False).workflow_id
-
-        engine.move_open_workflow(unannounced, copy_id)
-
-        assert _lifecycle_events(_drain(queue)) == []
-
-    def test_its_later_close_names_the_new_id(self, engine: Engine, queue: asyncio.Queue) -> None:
-        workflow = _open_new_workflow(engine, "library")
-        copy_id = engine.workflow_registry.register_unsaved("copy", listed=False).workflow_id
-        engine.move_open_workflow(workflow, copy_id)
-        _drain(queue)
-
-        engine.close_workflow(workflow)
-
-        assert _lifecycle_events(_drain(queue)) == [WorkflowClosedEvent(open_workflow_id=copy_id)]
-
-
 class TestWorkers:
     @pytest.fixture
     def worker_engine(self, engine: Engine) -> Engine:

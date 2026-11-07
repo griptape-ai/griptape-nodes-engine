@@ -162,7 +162,9 @@ class OpenWorkflowRequest(RequestPayload):
 
     A workflow already open comes back as it is, with `already_open` set, and nothing changes. One
     that another request is still opening comes back once its file has built. A saved workflow
-    opens and its file builds its graph into it. A new or unsaved workflow opens empty.
+    opens and its file builds its graph into it. A Griptape-provided workflow never opens itself:
+    each open of one opens a new unsaved copy with an id of its own and the library's file built
+    into it. A new or unsaved workflow opens empty.
 
     Results: OpenWorkflowResultSuccess | WorkflowNotFoundResultFailure (no workflow has that id or
         name, such as an unsaved workflow lost to an engine restart) |

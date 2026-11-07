@@ -817,21 +817,6 @@ class TestToolCallWorkflow:
         assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
 
     @pytest.mark.asyncio
-    async def test_a_header_follows_its_workflow_when_a_save_moves_it(
-        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
-    ) -> None:
-        """Saving a template continues in a copy under another id, and the header still reaches it."""
-        _, second = two_open
-        held_id = second.workflow_id
-        copy = engine.workflow_registry.register_unsaved("copy", listed=False)
-        engine.open_workflows.move(second, copy.workflow_id)
-
-        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": held_id}), _create_flow_call("canvas"))
-
-        assert _payload(result)["ok"], result
-        assert "canvas" in second.flows.name_to_parent_name
-
-    @pytest.mark.asyncio
     async def test_the_header_wins_over_the_sessions_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:

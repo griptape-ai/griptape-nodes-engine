@@ -409,6 +409,22 @@ class _WorkflowRegistry:
             return None
         return candidate
 
+    def suggested_file_stem(self, workflow: Workflow) -> str | None:
+        """The file stem `workflow` is named by before it has a file, or None if nothing file-safe is left.
+
+        A library workflow's unsaved copy takes the library file's stem. Any other workflow takes
+        its display name, with each run of characters a file name can't hold replaced by "_".
+        """
+        if not workflow.is_saved and workflow.seeded_from_workflow_id is not None:
+            library_workflow = self.find_by_id(workflow.seeded_from_workflow_id)
+            if library_workflow is not None and library_workflow.absolute_path is not None:
+                return library_workflow.absolute_path.stem
+        display_name = (workflow.metadata.name or "").strip()
+        sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
+        if not sanitized:
+            return None
+        return sanitized
+
     def resolve_address(self, *, workflow_id: str | None, workflow_name: str | None, action: str) -> Workflow:
         """Return the workflow a request names by id, by legacy name, or by both when they agree.
 
@@ -610,6 +626,22 @@ class _WorkflowRegistry:
             listed=listed,
         )
         self._add(workflow)
+        return workflow
+
+    def register_unsaved_copy(self, source: Workflow) -> Workflow:
+        """Register a new unsaved workflow seeded from `source`, which is how a library workflow opens.
+
+        The copy has an id of its own and no file. It takes the source's display name, description,
+        image and workflow shape, is neither library-provided nor a template, and records the
+        source's id as its `seeded_from_workflow_id`. It is unlisted, like a file registered only
+        because it was opened, so the workflow list doesn't show it beside the source until it is
+        saved.
+        """
+        workflow = self.register_unsaved(source.metadata.name, listed=False)
+        workflow.metadata.description = source.metadata.description
+        workflow.metadata.image = source.metadata.image
+        workflow.metadata.workflow_shape = source.metadata.workflow_shape
+        workflow.seeded_from_workflow_id = source.workflow_id
         return workflow
 
     def set_file_path(self, workflow: Workflow, new_path: str | Path) -> None:
@@ -1054,6 +1086,8 @@ class Workflow:
         # True when `metadata` was made up for a header that could not be read, so it must not be
         # written back to a file. A save replaces it with real metadata.
         self.metadata_is_placeholder = metadata_is_placeholder
+        # The library workflow this one was opened as a copy of (`register_unsaved_copy`), or None.
+        self.seeded_from_workflow_id: str | None = None
         # Path in the registry's form, legacy names, and path keys: the registry sets them whenever the paths change.
         self._keys = _NO_KEYS
 

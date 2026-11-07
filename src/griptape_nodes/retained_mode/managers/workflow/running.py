@@ -471,7 +471,7 @@ class WorkflowRunner(EngineScoped):
         """
         relative_file_path = file_path
         if relative_file_path is None:
-            relative_file_path = self.engine.workflow_registry.get(workflow.workflow_id).file_path
+            relative_file_path = self._file_to_build(workflow)
         execution_result = None
         if relative_file_path is not None:
             execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=workflow)
@@ -484,6 +484,17 @@ class WorkflowRunner(EngineScoped):
         return OpenedWorkflowBuild(
             workflow_id=workflow.workflow_id, already_open=False, execution_result=execution_result
         )
+
+    def _file_to_build(self, workflow: WorkflowRuntime) -> str | None:
+        """The file an open of `workflow` builds into it: its own, or for a library workflow's unsaved copy, the library's."""
+        registry = self.engine.workflow_registry
+        entry = registry.get(workflow.workflow_id)
+        if entry.file_path is not None or entry.seeded_from_workflow_id is None:
+            return entry.file_path
+        library_workflow = registry.find_by_id(entry.seeded_from_workflow_id)
+        if library_workflow is None:
+            return None
+        return library_workflow.file_path
 
     @handles(GetWorkflowRunCommandRequest)
     async def on_get_workflow_run_command_request(  # noqa: C901, PLR0911, PLR0912

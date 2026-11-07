@@ -3,5 +3,5 @@
   request, in the form `EngineHeartbeatResultSuccess.open_workflows` uses.
   `RunWorkflowWithCurrentStateResultSuccess` carries it when the request opened the file as a new
   workflow, and `EnsureWorkflowAndFlowResultSuccess` when it opened one. After a save, it tells
-  whether the open workflow moved onto the copy, which a save of a Griptape-provided workflow does.
+  whether the open workflow is the file saved or the save wrote a copy.
   [#6199](https://github.com/griptape-ai/griptape-nodes-engine/issues/6199)

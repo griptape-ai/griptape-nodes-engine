@@ -464,7 +464,7 @@ async def _handle_in_named_workflow(request_payload: RequestPayload, workflow_id
     engine = GriptapeNodes.get_instance()
     if workflow_id is None:
         return await engine.ahandle_request(request_payload)
-    workflow = engine.open_workflows.find_following_moves(workflow_id)
+    workflow = engine.open_workflows.find(workflow_id)
     if workflow is None:
         details = (
             f"Attempted to handle {type(request_payload).__name__} in workflow '{workflow_id}'. "
@@ -477,8 +477,7 @@ async def _handle_in_named_workflow(request_payload: RequestPayload, workflow_id
 def _workflow_id_for_sender(sender: ToolCallSender) -> str | None:
     """The workflow a tool call acts on: its header's, else the one its session opened, else none.
 
-    A session's workflow that has closed since is forgotten and counts as none. One that moved,
-    as when a save continues in a copy, is followed.
+    A session's workflow that has closed since is forgotten and counts as none.
     """
     if sender.header_workflow_id is not None:
         return sender.header_workflow_id
@@ -487,11 +486,10 @@ def _workflow_id_for_sender(sender: ToolCallSender) -> str | None:
     workflow_id = _session_workflow_ids.get(sender.session_id)
     if workflow_id is None:
         return None
-    workflow = GriptapeNodes.get_instance().open_workflows.find_following_moves(workflow_id)
-    if workflow is None:
+    if not GriptapeNodes.get_instance().open_workflows.is_open(workflow_id):
         del _session_workflow_ids[sender.session_id]
         return None
-    return workflow.workflow_id
+    return workflow_id
 
 
 def _remember_session_workflow(sender: ToolCallSender, result: ResultPayload) -> None:
@@ -506,7 +504,7 @@ def _remember_session_workflow(sender: ToolCallSender, result: ResultPayload) ->
     # Sessions end without telling the server, so forget the ones whose workflow has closed.
     open_workflows = GriptapeNodes.get_instance().open_workflows
     for session_id, remembered in list(_session_workflow_ids.items()):
-        if open_workflows.find_following_moves(remembered) is None:
+        if not open_workflows.is_open(remembered):
             del _session_workflow_ids[session_id]
     _session_workflow_ids[sender.session_id] = workflow_id
 
