@@ -165,6 +165,7 @@ class TestOpenWorkflowNew:
         assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
         assert not result.already_open
         assert result.open_workflow.workflow_file_path is None
+        assert not result.open_workflow.is_saved
         assert not result.open_workflow.has_active_flow
         assert engine.workflow_registry.get(result.open_workflow.workflow_id).metadata.name == "fresh"
         assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=result.open_workflow)]
@@ -200,6 +201,7 @@ class TestOpenWorkflowSaved:
         assert result.status == WorkflowStatus.GOOD
         assert result.open_workflow.workflow_id == workflow_id
         assert result.open_workflow.workflow_file_path is not None
+        assert result.open_workflow.is_saved
         # Built: the file's flow is in place.
         assert result.open_workflow.has_active_flow
         assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=result.open_workflow)]

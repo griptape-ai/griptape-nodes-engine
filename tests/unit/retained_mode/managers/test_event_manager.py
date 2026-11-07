@@ -2420,7 +2420,9 @@ class TestResultWorkflowId:
         assert workflow_id == "named"
 
     def test_a_request_that_opened_a_workflow_names_the_one_it_opened(self) -> None:
-        opened = OpenWorkflowInfo(workflow_id="opened", name="opened", workflow_file_path=None, has_active_flow=True)
+        opened = OpenWorkflowInfo(
+            workflow_id="opened", name="opened", workflow_file_path=None, is_saved=False, has_active_flow=True
+        )
         result = SetWorkflowContextSuccess(
             workflow_name="opened", workflow_id="opened", open_workflow=opened, result_details="ok"
         )

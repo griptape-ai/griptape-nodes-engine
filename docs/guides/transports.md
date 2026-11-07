@@ -124,7 +124,7 @@ The engine also tells every connection when a workflow opens or closes, whicheve
 
 A client that shows each workflow in its own tab uses three requests and the two events above:
 
-- `ListOpenWorkflowsRequest` returns the open workflows in `open_workflows`, and the engine's `engine_run_id`. Send it when you connect, to find the workflow your tab had open.
+- `ListOpenWorkflowsRequest` returns the open workflows in `open_workflows`, and the engine's `engine_run_id`. Send it when you connect, to find the workflow your tab had open. Each workflow has its `workflow_id`, `name`, `workflow_file_path`, `is_saved` and `has_active_flow`. `workflow_file_path` is `null` exactly while the workflow is unsaved, and `is_saved` says the same thing for clients that aren't sent paths.
 - `OpenWorkflowRequest` opens a workflow for a tab. Name it by `workflow_id` or by `workflow_name`, or name neither to start a new unsaved workflow. Set `create_flow` to give a new workflow the top-level flow it needs before it can be saved. A saved workflow opens with its file built into it. A workflow that's already open comes back as it is, with `already_open` set, so you don't need to check first. It never closes a workflow: while another workflow is open and only one can be, it fails with `AnotherWorkflowOpenResultFailure`, whose `blocking_workflow` names the open one. An id or name the engine doesn't know fails with `WorkflowNotFoundResultFailure`. For an unsaved workflow, that means it was lost when the engine restarted.
 - `CloseWorkflowRequest` closes the workflow `open_workflow_id` names, for when its tab closes. To show another workflow in the same tab, close the open one, then open the next.
 

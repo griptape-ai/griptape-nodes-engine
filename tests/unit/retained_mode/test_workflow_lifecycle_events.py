@@ -513,7 +513,9 @@ class TestWorkers:
         self, worker_engine: Engine, queue: asyncio.Queue
     ) -> None:
         worker_engine.context_manager.adopt_orchestrator_workflow(PEER_ID, None, None, None)
-        relayed = OpenWorkflowInfo(workflow_id=PEER_ID, name="peer", workflow_file_path=None, has_active_flow=True)
+        relayed = OpenWorkflowInfo(
+            workflow_id=PEER_ID, name="peer", workflow_file_path=None, is_saved=False, has_active_flow=True
+        )
 
         def relay_open(_request: _RelayedOpenRequest) -> ResultPayload:
             return SetWorkflowContextSuccess(workflow_id=PEER_ID, open_workflow=relayed, result_details="opened")
