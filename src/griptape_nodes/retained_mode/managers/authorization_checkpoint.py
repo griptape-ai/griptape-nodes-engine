@@ -132,12 +132,17 @@ class CheckpointDenial:
         """The per-failure detail sentences, for plain-text rendering."""
         return [failure.detail for failure in self.failures]
 
-    def reason(self, *, separator: str = "; ", default: str = "Denied by the license policy.") -> str:
+    def reason(self, *, separator: str | None = None, default: str = "Denied by the license policy.") -> str:
         """The denial as one display string: every failure detail joined, or `default`.
 
         A hook returns `None` (not an empty denial) to allow, so empty `failures` is
         a contract violation; `default` keeps the surfaced message coherent if one
-        slips through. Callers pass `separator` to match their surrounding format
-        (inline `"; "` in a failure result, a newline in a multi-line node error).
+        slips through. With no `separator`, details are joined as sentences: each
+        ends in punctuation exactly once, then a space. Callers pass `separator` to
+        match their surrounding format, such as a newline in a multi-line node error.
         """
-        return separator.join(self.messages()) or default
+        messages = self.messages()
+        if separator is not None:
+            return separator.join(messages) or default
+        sentences = [message if message.endswith((".", "!", "?")) else f"{message}." for message in messages]
+        return " ".join(sentences) or default

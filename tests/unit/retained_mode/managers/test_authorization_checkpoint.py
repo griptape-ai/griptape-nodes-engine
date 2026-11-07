@@ -9,14 +9,23 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 class TestCheckpointDenialReason:
     """`reason` renders the denial as one display string with a safe fallback."""
 
-    def test_joins_failure_details_with_default_separator(self) -> None:
+    def test_joins_failure_details_as_sentences(self) -> None:
         denial = CheckpointDenial(
             failures=(
                 CheckpointFailure(detail="Labs libraries are disabled."),
                 CheckpointFailure(detail="Ask your admin to enable them."),
             )
         )
-        assert denial.reason() == "Labs libraries are disabled.; Ask your admin to enable them."
+        assert denial.reason() == "Labs libraries are disabled. Ask your admin to enable them."
+
+    def test_terminates_unpunctuated_details_once(self) -> None:
+        denial = CheckpointDenial(
+            failures=(
+                CheckpointFailure(detail="Labs libraries are disabled"),
+                CheckpointFailure(detail="Ask your admin!"),
+            )
+        )
+        assert denial.reason() == "Labs libraries are disabled. Ask your admin!"
 
     def test_honors_custom_separator(self) -> None:
         denial = CheckpointDenial(
