@@ -117,6 +117,31 @@ class GetWorkflowContextFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class CloseWorkflowRequest(RequestPayload):
+    """Close the open workflow the envelope's `open_workflow_id` names, leaving other open workflows alone.
+
+    Use when: A client is done with its workflow. Deletes the workflow's flows and nodes and ends
+    its run. Its saved file, if any, stays as it is. ClearAllObjectStateRequest closes every open
+    workflow instead.
+
+    Results: CloseWorkflowResultSuccess | CloseWorkflowResultFailure (closing the workflow failed)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class CloseWorkflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """The workflow is closed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CloseWorkflowResultFailure(ResultPayloadFailure):
+    """Closing the workflow failed, so it stays open."""
+
+
+@dataclass
+@PayloadRegistry.register
 class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
     """Ensure a workflow + flow context exists, creating scratch ones if needed.
 
