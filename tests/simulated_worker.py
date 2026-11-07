@@ -73,8 +73,17 @@ class SimulatedWorker:
     received: list[ExecuteNodeRequest] = field(default_factory=list)
     forwarded: list[RequestPayload] = field(default_factory=list)
 
-    async def route_to_worker(self, event_request: EventRequest, *_worker: Any) -> dict[str, Any]:
-        """Stands in for `WorkerManager.route_to_worker`, returning the raw result the worker's channel end replies with."""
+    async def route_to_worker(
+        self,
+        event_request: EventRequest,
+        *_worker: Any,
+        lease_id: str | None = None,  # noqa: ARG002
+    ) -> dict[str, Any]:
+        """Stands in for `WorkerManager.route_to_worker`, returning the raw result the worker's channel end replies with.
+
+        `lease_id` is accepted to match the real signature; this single-process stand-in has no engine
+        to check a lease against, so it is unused.
+        """
         sent = read_event_request(event_request_envelope(event_request))
         self.received.append(cast("ExecuteNodeRequest", sent.request))
         return await _in_own_context(answer_event_request(self.engine, sent))

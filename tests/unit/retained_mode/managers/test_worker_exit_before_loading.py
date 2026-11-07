@@ -1,7 +1,7 @@
-"""A worker process that exits before it has loaded settles the runs waiting on it.
+"""A worker process that exits before it has connected settles the runs waiting on it.
 
-Such a worker never registered -- refused a license session, a crash on import -- so it never
-unregisters and is never evicted. Without the orchestrator watching the process itself, a node
+Such a worker never connects -- refused a license session, a crash on import -- so its channel
+never opens and it is never taken on. Without the engine watching the process itself, a node
 waiting on it would wait out the whole load timeout.
 """
 
@@ -17,6 +17,7 @@ from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 
 _LIBRARY = "My Library"
 _ARGS = ["/usr/bin/gtn", "engine"]
+_TIMEOUT_S = 5.0
 
 
 class _FakeProc:
@@ -61,24 +62,39 @@ def _worker_manager() -> WorkerManager:
     return manager
 
 
-async def _spawn(manager: WorkerManager, proc: Any) -> None:
+async def _until(predicate: Any) -> None:
+    """Wait for state a background task writes, giving up after `_TIMEOUT_S`."""
+    async with asyncio.timeout(_TIMEOUT_S):
+        while not predicate():  # noqa: ASYNC110 (nothing here to set an Event from)
+            await asyncio.sleep(0.01)
+
+
+async def _spawn(manager: WorkerManager, proc: Any) -> asyncio.Task[None]:
+    """Start the worker's connect phase in the background, with `proc` standing in for its process.
+
+    Returns once the process is spawned and tracked, parked waiting for it to connect -- the state
+    the test needs before it decides whether `proc` connects, exits, or is stopped out from under it.
+    """
     with patch("asyncio.create_subprocess_exec", return_value=proc):
-        await manager.spawn_worker(_ARGS, _LIBRARY)
+        task = asyncio.create_task(manager._spawn_local_worker(_ARGS, _LIBRARY))
+        await _until(lambda: manager._managed_worker_processes.get(_LIBRARY) is proc)
+    return task
 
 
 @pytest.mark.asyncio
-async def test_an_exit_before_loading_releases_the_waiters_with_the_reason() -> None:
+async def test_an_exit_before_connecting_releases_the_waiters_with_the_reason() -> None:
     """The waiter is released as soon as the process exits, not when the load timeout runs out."""
     manager = _worker_manager()
     manager.expect_worker(_LIBRARY)
     proc = _FakeProc()
-    await _spawn(manager, proc)
+    task = await _spawn(manager, proc)
     waiter = asyncio.create_task(manager.wait_until_executable(_LIBRARY))
     await asyncio.sleep(0)
     assert not waiter.done()
 
     proc.exit(1)
-    await asyncio.wait_for(waiter, timeout=1)
+    await asyncio.wait_for(waiter, timeout=_TIMEOUT_S)
+    await asyncio.wait_for(task, timeout=_TIMEOUT_S)
 
     assert manager.has_settled(_LIBRARY)
     reason = manager.worker_unavailable_reason(_LIBRARY)
@@ -93,25 +109,26 @@ async def test_a_process_this_manager_stopped_is_not_a_death() -> None:
     """A reload stops every worker and spawns them again; the exits it causes blame nothing."""
     manager = _worker_manager()
     manager.expect_worker(_LIBRARY)
-    await _spawn(manager, _FakeProc())
+    proc = _FakeProc()
+    task = await _spawn(manager, proc)
 
     await manager.reset_workers()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(task, timeout=_TIMEOUT_S)
 
     assert manager.worker_unavailable_reason(_LIBRARY) is None
 
 
 @pytest.mark.asyncio
-async def test_an_exit_after_loading_is_left_to_the_heartbeat() -> None:
-    """A loaded worker that dies is evicted when it stops answering, and that eviction says so."""
+async def test_an_exit_after_loading_is_left_to_the_channel_ending() -> None:
+    """A loaded worker is watched through its channel, not through this early-exit path."""
     manager = _worker_manager()
     manager.expect_worker(_LIBRARY)
     proc = _FakeProc()
-    await _spawn(manager, proc)
+    task = await _spawn(manager, proc)
     manager.note_library_loaded(_LIBRARY)
 
     proc.exit(1)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(task, timeout=_TIMEOUT_S)
 
     assert manager.worker_unavailable_reason(_LIBRARY) is None
     assert manager._managed_worker_processes[_LIBRARY] is proc

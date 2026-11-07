@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextlib
 import json
 import logging
 import os
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
@@ -23,6 +21,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
+from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME, LICENSE_SECRET_NAME
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine_transports import (
     DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
@@ -47,12 +46,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, _active_request_sender
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
-from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _REPORT_ATTEMPTS,
     _STATIC_URL_SETTLE_TIMEOUT_S,
-    HOST_ENGINE_ID_ENV,
     EngineLease,
     WorkerManager,
     WorkerRegistration,
@@ -60,6 +57,7 @@ from griptape_nodes.retained_mode.managers.worker_manager import (
 )
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
+from griptape_nodes.worker.wire import WORKER_ENGINE_ID_ENV
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -104,6 +102,24 @@ class _FakeRequestClient:
             entry.future.cancel()
 
 
+class _FakeChannel:
+    """Minimal stand-in for a local worker's `Channel`: records what is notified through it."""
+
+    def __init__(self) -> None:
+        self.notified: list[dict[str, Any]] = []
+        self.requested: list[dict[str, Any]] = []
+
+    def notify(self, body: dict[str, Any]) -> None:
+        self.notified.append(body)
+
+    async def request_async(self, body: dict[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:  # noqa: ARG002
+        self.requested.append(body)
+        return {}
+
+    def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 def worker_manager() -> WorkerManager:
     """Construct a WorkerManager with AsyncMock transport callables for isolated testing."""
@@ -116,7 +132,7 @@ def worker_manager() -> WorkerManager:
     gtn.config_manager.get_config_value.side_effect = lambda _key, default=None, cast_type=None, **_kwargs: (
         default if cast_type is None else cast_type(default)
     )
-    # spawn_worker builds the child env from the orchestrator's pre-project environ;
+    # _base_worker_environ builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
     gtn.project_manager.get_pre_project_environ.return_value = {}
     # Registration answers from the committed pair; a bare MagicMock cannot be unpacked.
@@ -151,92 +167,6 @@ def _managed_proc_mock() -> MagicMock:
     return proc
 
 
-async def _sweep_until_evicted(worker_manager: WorkerManager) -> None:
-    """Run the orchestrator's sweep until it evicts ``_ENGINE``, giving up after 5s.
-
-    Waits for the eviction rather than a fixed window: the sweep ticks in real time, and a garbage
-    collection pause or a loaded test runner can hold off the tick that evicts past a short window.
-    """
-    evicted = asyncio.Event()
-    evict_worker = worker_manager.evict_worker
-
-    async def evict_and_signal(worker_engine_id: str) -> None:
-        await evict_worker(worker_engine_id)
-        evicted.set()
-
-    with patch.object(worker_manager, "evict_worker", new=evict_and_signal):
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(evicted.wait(), timeout=5.0)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-
-class TestHandleRegisterWorkerRequest:
-    @pytest.mark.asyncio
-    async def test_adds_worker_to_registered_workers(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        await worker_manager.handle_register_worker_request(request)
-
-        assert _ENGINE in worker_manager._workers
-        assert worker_manager._workers[_ENGINE].request_topic == _WORKER_REQUEST_TOPIC
-
-    @pytest.mark.asyncio
-    async def test_subscribes_to_worker_response_topic(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        await worker_manager.handle_register_worker_request(request)
-
-        worker_manager._tx.subscribe_to_topic.assert_called_once_with(_WORKER_RESPONSE_TOPIC)  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_returns_success_with_engine_id(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        result = await worker_manager.handle_register_worker_request(request)
-
-        assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
-        assert result.worker_engine_id == _ENGINE
-
-
-class TestRegistrationActivatesTheProject:
-    @pytest.mark.asyncio
-    async def test_registering_sends_the_worker_its_first_activation(self, worker_manager: WorkerManager) -> None:
-        """One sender and one adoption path, rather than a reply that has to be ordered against a fan-out.
-
-        The reply carries no project, so a switch landing mid-registration is a second message on
-        the same channel instead of a second source the worker has to reconcile.
-        """
-        committed_generation = 7
-        worker_manager.engine.project_manager.committed_project.return_value = ("proj-42", committed_generation)  # type: ignore[union-attr]
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        result = await worker_manager.handle_register_worker_request(request)
-
-        assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
-        sent = cast("MagicMock", worker_manager._tx.send_message).await_args_list
-        activations = [call for call in sent if "ActivateProjectRequest" in str(call)]
-        assert len(activations) == 1, "registration must send exactly one activation"
-        assert "proj-42" in str(activations[0])
-        assert f'"generation": {committed_generation}' in str(activations[0])
-
-    @pytest.mark.asyncio
-    async def test_the_activation_is_sent_for_system_defaults_too(self, worker_manager: WorkerManager) -> None:
-        """A worker has to be told what it is on even when that is the rest state.
-
-        Skipping it there would leave nothing distinguishing "told" from "not yet told", and the
-        worker's wait before library load would never lift.
-        """
-        worker_manager.engine.project_manager.committed_project.return_value = (SYSTEM_DEFAULTS_KEY, 0)  # type: ignore[union-attr]
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        await worker_manager.handle_register_worker_request(request)
-
-        sent = cast("MagicMock", worker_manager._tx.send_message).await_args_list
-        assert any("ActivateProjectRequest" in str(call) for call in sent)
-
-
 class TestProjectSwitchWaitsForWorkers:
     @pytest.mark.asyncio
     async def test_switch_awaits_each_worker_and_reports_failures(self, worker_manager: WorkerManager) -> None:
@@ -256,7 +186,7 @@ class TestProjectSwitchWaitsForWorkers:
         }
         awaited: list[str] = []
 
-        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+        async def fake_route(_event: object, worker_engine_id: str) -> dict:
             awaited.append(worker_engine_id)
             return replies[worker_engine_id]
 
@@ -279,7 +209,7 @@ class TestProjectSwitchWaitsForWorkers:
             "alive": WorkerRegistration(request_topic="t/alive", worker_key=None),
         }
 
-        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+        async def fake_route(_event: object, worker_engine_id: str) -> dict:
             if worker_engine_id == "dead":
                 msg = "worker is gone"
                 raise RuntimeError(msg)
@@ -308,7 +238,7 @@ class TestProjectSwitchWaitsForWorkers:
         peak = 0
         in_flight = 0
 
-        async def fake_route(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+        async def fake_route(_event: object, _worker_engine_id: str) -> dict:
             nonlocal peak, in_flight
             in_flight += 1
             peak = max(peak, in_flight)
@@ -337,7 +267,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.library_load_timeout_s = 0.05
         worker_manager._workers = {"stuck": WorkerRegistration(request_topic="t/stuck", worker_key=None)}
 
-        async def never_answers(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+        async def never_answers(_event: object, _worker_engine_id: str) -> dict:
             await asyncio.sleep(30)
             msg = "unreachable"
             raise AssertionError(msg)
@@ -362,7 +292,7 @@ class TestProjectSwitchWaitsForWorkers:
         """
         worker_manager._workers = {"w": WorkerRegistration(request_topic="t/w", worker_key=None)}
 
-        async def odd_reply(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+        async def odd_reply(_event: object, _worker_engine_id: str) -> dict:
             return {"result_type": "SuccessorLookupResultFailure", "result": {"result_details": "nope"}}
 
         worker_manager.route_to_worker = odd_reply  # type: ignore[method-assign]
@@ -387,7 +317,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.engine.project_manager.committed_project.return_value = ("proj-9", 4)  # type: ignore[union-attr]
         sent: list[tuple[str, int]] = []
 
-        async def carrying_route(event: EventRequest, _worker_engine_id: str, _topic: str) -> dict:
+        async def carrying_route(event: EventRequest, _worker_engine_id: str) -> dict:
             sent.append((event.request.project_id, event.request.generation))  # type: ignore[attr-defined]
             return {"result_type": "ActivateProjectResultSuccess", "result": {}}
 
@@ -399,180 +329,27 @@ class TestProjectSwitchWaitsForWorkers:
         assert sent == [("proj-9", 4)]
 
 
-class TestHandleRegisterWorkerRequestEngineVersion:
-    @pytest.mark.asyncio
-    async def test_rejects_mismatched_engine_version(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version="0.0.0-mismatch")
-
-        result = await worker_manager.handle_register_worker_request(request)
-
-        assert isinstance(result, worker_events.RegisterWorkerResultFailure)
+class TestAWorkerChannelEndingReleasesWaiters:
+    """A local worker's channel ending is its own liveness signal: gone, it stops its process and releases waiters."""
 
     @pytest.mark.asyncio
-    async def test_mismatched_version_does_not_register_worker(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version="0.0.0-mismatch")
-
-        await worker_manager.handle_register_worker_request(request)
-
-        assert _ENGINE not in worker_manager._workers
-        worker_manager._tx.subscribe_to_topic.assert_not_called()  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_mismatched_version_failure_details_identify_both_versions(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version="0.0.0-mismatch")
-
-        result = await worker_manager.handle_register_worker_request(request)
-
-        assert isinstance(result, worker_events.RegisterWorkerResultFailure)
-        details = str(result.result_details)
-        assert "0.0.0-mismatch" in details
-        assert engine_version in details
-
-
-class TestHandleWorkerHeartbeatRequest:
-    def test_returns_success_echoing_heartbeat_id(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.WorkerHeartbeatRequest(heartbeat_id="hb-001")
-
-        result = worker_manager.handle_worker_heartbeat_request(request)
-
-        assert isinstance(result, worker_events.WorkerHeartbeatResultSuccess)
-        assert result.heartbeat_id == "hb-001"
-
-    def test_updates_last_received_timestamp(self, worker_manager: WorkerManager) -> None:
-        worker_manager._worker_heartbeat_last_received_at = 0.0
-        request = worker_events.WorkerHeartbeatRequest(heartbeat_id="hb-002")
-
-        worker_manager.handle_worker_heartbeat_request(request)
-
-        assert worker_manager._worker_heartbeat_last_received_at > 0.0
-
-
-class TestWorkerHeartbeatMonitor:
-    @pytest.mark.asyncio
-    async def test_raises_after_timeout(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Monitor raises RuntimeError when no heartbeat arrives within the timeout."""
-        monkeypatch.setattr(WorkerManager, "MINIMUM_ORCHESTRATOR_SILENCE_S", 0.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
-        worker_manager._worker_heartbeat_last_received_at = 0.0
-
-        with pytest.raises(RuntimeError, match="Orchestrator heartbeat lost"):
-            await worker_manager.worker_heartbeat_monitor()
-
-    @pytest.mark.asyncio
-    async def test_raises_on_the_heartbeat_timeout_not_the_library_load_timeout(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A worker whose orchestrator is gone shuts down within the timeout, not after the load deadline."""
-        monkeypatch.setattr(WorkerManager, "MINIMUM_ORCHESTRATOR_SILENCE_S", 0.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.05)
-        monkeypatch.setattr(worker_manager, "library_load_timeout_s", 600.0)
-        worker_manager._worker_heartbeat_last_received_at = 0.0
-
-        with pytest.raises(RuntimeError, match="Orchestrator heartbeat lost"):
-            await asyncio.wait_for(worker_manager.worker_heartbeat_monitor(), timeout=5.0)
-
-    def test_tolerates_more_silence_than_an_eviction_costs(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The orchestrator's sweep can run tens of seconds late, and a worker cannot tell that from death."""
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 15.0)
-
-        assert worker_manager.orchestrator_silence_allowed_s == 30.0  # noqa: PLR2004
-
-    def test_never_gives_up_before_the_orchestrator_does(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A configured timeout above the floor has to win, or workers shut down while still wanted."""
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 120.0)
-
-        assert worker_manager.orchestrator_silence_allowed_s == 120.0  # noqa: PLR2004
-
-    @pytest.mark.asyncio
-    async def test_does_not_raise_before_the_first_heartbeat_is_due(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Silence is counted from when the monitor started, not from a heartbeat that never came."""
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
-        worker_manager._worker_heartbeat_last_received_at = 0.0
-
-        task = asyncio.create_task(worker_manager.worker_heartbeat_monitor())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    @pytest.mark.asyncio
-    async def test_does_not_raise_while_heartbeats_arrive(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Monitor does not raise when the timestamp is kept current."""
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
-        worker_manager._worker_heartbeat_last_received_at = time.monotonic()
-
-        task = asyncio.create_task(worker_manager.worker_heartbeat_monitor())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-
-class TestHandleUnregisterWorkerRequest:
-    @pytest.mark.asyncio
-    async def test_removes_worker_from_registered_workers(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        await worker_manager.handle_unregister_worker_request(request)
-
-        assert _ENGINE not in worker_manager._workers
-
-    @pytest.mark.asyncio
-    async def test_unsubscribes_from_worker_response_topic(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        await worker_manager.handle_unregister_worker_request(request)
-
-        worker_manager._tx.unsubscribe_from_topic.assert_called_once_with(_WORKER_RESPONSE_TOPIC)  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_returns_success_with_engine_id(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        result = await worker_manager.handle_unregister_worker_request(request)
-
-        assert isinstance(result, worker_events.UnregisterWorkerResultSuccess)
-        assert result.worker_engine_id == _ENGINE
-
-    @pytest.mark.asyncio
-    async def test_tolerates_unknown_worker(self, worker_manager: WorkerManager) -> None:
-        """Unregistering a worker that is not in the registry must not raise."""
-        request = worker_events.UnregisterWorkerRequest(worker_engine_id="ghost-engine")
-
-        result = await worker_manager.handle_unregister_worker_request(request)
-
-        assert isinstance(result, worker_events.UnregisterWorkerResultSuccess)
-
-    @pytest.mark.asyncio
-    async def test_removes_managed_process_for_library(self, worker_manager: WorkerManager) -> None:
-        proc = MagicMock()
+    async def test_removes_it_from_the_registry_and_its_managed_process(self, worker_manager: WorkerManager) -> None:
+        proc = _managed_proc_mock()
         worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library", process=proc
         )
         worker_manager._managed_worker_processes["My Library"] = proc
 
-        await worker_manager.handle_unregister_worker_request(
-            worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        )
+        await worker_manager._forget_local_worker(_ENGINE)
 
+        assert _ENGINE not in worker_manager._workers
         assert "My Library" not in worker_manager._managed_worker_processes
+        proc.terminate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tolerates_an_unknown_worker(self, worker_manager: WorkerManager) -> None:
+        """Forgetting a worker not in the registry must not raise."""
+        await worker_manager._forget_local_worker("ghost-engine")
 
     @pytest.mark.asyncio
     async def test_releases_a_library_whose_worker_left_before_loading_it(self, worker_manager: WorkerManager) -> None:
@@ -582,94 +359,19 @@ class TestHandleUnregisterWorkerRequest:
             request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
         )
 
-        await worker_manager.handle_unregister_worker_request(
-            worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        )
+        await worker_manager._forget_local_worker(_ENGINE)
 
         assert worker_manager.has_settled("My Library"), "a waiter would otherwise block until the load timeout"
-        assert worker_manager.worker_unavailable_reason("My Library") == (
-            "the worker process that runs it shut down before loading it."
-        )
+        assert worker_manager.worker_unavailable_reason("My Library") is not None
 
     @pytest.mark.asyncio
-    async def test_leaves_a_library_its_worker_already_loaded_alone(self, worker_manager: WorkerManager) -> None:
-        """A clean shutdown unregisters through the same path, and must not mark a loaded library unavailable."""
-        worker_manager.expect_worker("My Library")
-        worker_manager.note_library_loaded("My Library")
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
+    async def test_forget_library_drops_the_recorded_reason(self, worker_manager: WorkerManager) -> None:
+        """Keyed by a bare name, so it has to be dropped with the library rather than outlive it."""
+        worker_manager.note_worker_unavailable("Lib", "the worker stopped responding.")
 
-        await worker_manager.handle_unregister_worker_request(
-            worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        )
+        worker_manager.forget_library("Lib")
 
-        assert worker_manager.worker_unavailable_reason("My Library") is None
-
-
-class TestEvictionCountsUnansweredChallenges:
-    """A worker is evicted for not answering, never for time passing.
-
-    The sweep shares a loop with library load, so a wall-clock timeout charges the orchestrator's
-    own latency to the worker: an 18s boot evicted a healthy worker that had never been challenged.
-    """
-
-    @pytest.mark.asyncio
-    async def test_a_worker_it_has_not_challenged_enough_survives(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A worker past its challenge allowance is evicted."""
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.05)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.025)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-        assert _ENGINE in worker_manager._workers
-        assert worker_manager._workers[_ENGINE].unanswered_challenges > 0, "guard: it must have been challenged"
-
-    @pytest.mark.asyncio
-    async def test_a_worker_that_stops_answering_is_evicted(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.01)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        await _sweep_until_evicted(worker_manager)
-
-        assert _ENGINE not in worker_manager._workers
-
-    @pytest.mark.asyncio
-    async def test_a_heartbeat_reply_clears_the_count(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=None, unanswered_challenges=2
-        )
-        payload = {
-            "event_type": "EventResultSuccess",
-            "result_type": worker_events.WorkerHeartbeatResultSuccess.__name__,
-            "result": {"heartbeat_id": "hb-1"},
-            "response_topic": _WORKER_RESPONSE_TOPIC,
-        }
-
-        await worker_manager.relay_worker_result(payload)
-
-        assert worker_manager._workers[_ENGINE].unanswered_challenges == 0
-
-    def test_the_allowance_tracks_the_configured_values(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Derived on read, so tuning either value takes effect without a restart."""
-        challenges_in_fifteen_seconds = 3
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 15.0)
-        assert worker_manager.unanswered_challenges_allowed == challenges_in_fifteen_seconds
-
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
-        assert worker_manager.unanswered_challenges_allowed == 1, "never evict on the first challenge"
+        assert worker_manager.worker_unavailable_reason("Lib") is None
 
 
 class TestGetMessageFilters:
@@ -710,32 +412,6 @@ class TestGetMessageFilters:
 
 class TestRelayWorkerResult:
     @pytest.mark.asyncio
-    async def test_heartbeat_success_updates_last_seen(self, worker_manager: WorkerManager) -> None:
-        payload = {
-            "event_type": "EventResultSuccess",
-            "result_type": worker_events.WorkerHeartbeatResultSuccess.__name__,
-            "result": {"heartbeat_id": "hb-1"},
-            "response_topic": _WORKER_RESPONSE_TOPIC,
-        }
-
-        await worker_manager.relay_worker_result(payload)
-
-        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_heartbeat_with_malformed_topic_does_not_crash(self, worker_manager: WorkerManager) -> None:
-        payload = {
-            "event_type": "EventResultSuccess",
-            "result_type": worker_events.WorkerHeartbeatResultSuccess.__name__,
-            "result": {"heartbeat_id": "hb-1"},
-            "response_topic": "bad/topic",
-        }
-
-        await worker_manager.relay_worker_result(payload)
-
-        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
     async def test_non_heartbeat_result_is_forwarded_to_gui(self, worker_manager: WorkerManager) -> None:
         payload = {
             "event_type": "EventResultSuccess",
@@ -767,69 +443,6 @@ class TestRelayWorkerResult:
         assert relayed["response_topic"] == f"sessions/{_SESSION}/response"
 
 
-class TestEvictWorker:
-    @pytest.mark.asyncio
-    async def test_records_why_its_library_can_no_longer_execute(self, worker_manager: WorkerManager) -> None:
-        """A recorded reason is what stops the next run blaming a worker that is already gone.
-
-        Nothing respawns an evicted worker, so without it the next run reports that the worker "may
-        still be starting up" for the rest of the session, and anything already waiting on it waits
-        out the whole startup grace first.
-        """
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
-        worker_manager.expect_worker("Lib")
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        reason = worker_manager.worker_unavailable_reason("Lib")
-        assert reason is not None
-        assert "stopped responding" in reason
-        assert worker_manager.has_settled("Lib"), "a waiter must not hold on for a worker already gone"
-
-    @pytest.mark.asyncio
-    async def test_forget_library_drops_the_recorded_reason(self, worker_manager: WorkerManager) -> None:
-        """Keyed by a bare name, so it has to be dropped with the library rather than outlive it."""
-        worker_manager.note_worker_unavailable("Lib", "the worker stopped responding.")
-
-        worker_manager.forget_library("Lib")
-
-        assert worker_manager.worker_unavailable_reason("Lib") is None
-
-    @pytest.mark.asyncio
-    async def test_removes_worker_from_state(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        assert _ENGINE not in worker_manager._workers
-
-    @pytest.mark.asyncio
-    async def test_calls_unsubscribe_for_response_topic(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        worker_manager._tx.unsubscribe_from_topic.assert_called_once_with(_WORKER_RESPONSE_TOPIC)  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_tolerates_unknown_worker(self, worker_manager: WorkerManager) -> None:
-        """Evicting a worker not in the registry must not raise."""
-        await worker_manager.evict_worker("ghost-engine")
-
-    @pytest.mark.asyncio
-    async def test_terminates_managed_subprocess_for_library(self, worker_manager: WorkerManager) -> None:
-        proc = _managed_proc_mock()
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
-        worker_manager._managed_worker_processes["My Library"] = proc
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        proc.terminate.assert_called_once()
-        assert "My Library" not in worker_manager._managed_worker_processes
-
-
 class TestRelayWorkerResultPendingFuture:
     # Note: future resolution for tracked requests is now handled by
     # RequestClient._handle_response, not relay_worker_result. The tests
@@ -847,26 +460,6 @@ class TestRelayWorkerResultPendingFuture:
         await worker_manager.relay_worker_result(payload)
 
         worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-
-
-class TestLibraryWorkerRegistration:
-    @pytest.mark.asyncio
-    async def test_library_name_stored_on_registration(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(
-            worker_engine_id=_ENGINE, engine_version=engine_version, library_name="My Library"
-        )
-
-        await worker_manager.handle_register_worker_request(request)
-
-        assert worker_manager._workers[_ENGINE].worker_key == "My Library"
-
-    @pytest.mark.asyncio
-    async def test_general_worker_has_none_library(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        await worker_manager.handle_register_worker_request(request)
-
-        assert worker_manager._workers[_ENGINE].worker_key is None
 
 
 class TestGetWorkerForKey:
@@ -904,39 +497,23 @@ class TestGetWorkerForKey:
         assert result is None
 
 
-class TestLibraryWorkerCleanup:
-    def _seed(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
+class TestStartWorkerProcess:
+    """`_start_worker_process` is what spawns every worker process now: general-purpose, library, and hosted alike."""
 
-    @pytest.mark.asyncio
-    async def test_unregister_removes_worker(self, worker_manager: WorkerManager) -> None:
-        self._seed(worker_manager)
+    @staticmethod
+    def _environ(worker_manager: WorkerManager, worker_key: str | None) -> Callable[[], Awaitable[dict[str, str]]]:
+        return lambda: worker_manager._base_worker_environ(worker_key, worker_key)
 
-        await worker_manager.handle_unregister_worker_request(
-            worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        )
-
-        assert _ENGINE not in worker_manager._workers
-
-    @pytest.mark.asyncio
-    async def test_evict_removes_worker(self, worker_manager: WorkerManager) -> None:
-        self._seed(worker_manager)
-
-        await worker_manager.evict_worker(_ENGINE)
-
-        assert _ENGINE not in worker_manager._workers
-
-
-class TestSpawnWorker:
     @pytest.mark.asyncio
     async def test_duplicate_spawn_is_noop(self, worker_manager: WorkerManager) -> None:
         worker_manager._managed_worker_processes["my-key"] = MagicMock()
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+            proc = await worker_manager._start_worker_process(
+                ["/usr/bin/gtn", "engine"], "my-key", self._environ(worker_manager, "my-key")
+            )
 
+        assert proc is None
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
@@ -959,8 +536,12 @@ class TestSpawnWorker:
             patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec,
         ):
             await asyncio.gather(
-                worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"),
-                worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"),
+                worker_manager._start_worker_process(
+                    ["/usr/bin/gtn", "engine"], "My Library", self._environ(worker_manager, "My Library")
+                ),
+                worker_manager._start_worker_process(
+                    ["/usr/bin/gtn", "engine"], "My Library", self._environ(worker_manager, "My Library")
+                ),
             )
 
         mock_exec.assert_called_once()
@@ -979,12 +560,16 @@ class TestSpawnWorker:
             patch("asyncio.create_subprocess_exec", side_effect=OSError("no interpreter")),
             pytest.raises(OSError, match="no interpreter"),
         ):
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+            await worker_manager._start_worker_process(
+                ["/usr/bin/gtn", "engine"], "My Library", self._environ(worker_manager, "My Library")
+            )
 
         assert "My Library" not in worker_manager._spawns_in_flight
 
         with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+            await worker_manager._start_worker_process(
+                ["/usr/bin/gtn", "engine"], "My Library", self._environ(worker_manager, "My Library")
+            )
 
         mock_exec.assert_called_once()
 
@@ -1010,7 +595,11 @@ class TestSpawnWorker:
             patch.object(worker_manager, "_orchestrator_static_server_base_url", _park_until_released),
             patch("asyncio.create_subprocess_exec", side_effect=OSError("stale spawn died")),
         ):
-            stale = asyncio.create_task(worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"))
+            stale = asyncio.create_task(
+                worker_manager._start_worker_process(
+                    ["/usr/bin/gtn", "engine"], "My Library", self._environ(worker_manager, "My Library")
+                )
+            )
             await asyncio.sleep(0.01)
             assert "My Library" in worker_manager._spawns_in_flight
 
@@ -1026,7 +615,9 @@ class TestSpawnWorker:
         assert worker_manager._spawns_in_flight.get("My Library") is reload_claim
 
         with patch("asyncio.create_subprocess_exec") as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+            await worker_manager._start_worker_process(
+                ["/usr/bin/gtn", "engine"], "My Library", self._environ(worker_manager, "My Library")
+            )
 
         mock_exec.assert_not_called()
 
@@ -1037,7 +628,7 @@ class TestSpawnWorker:
         args = ["/usr/local/bin/gtn", "engine", "--session-id", "sess-abc", "--library-name", "My Library"]
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            await worker_manager.spawn_worker(args, "My Library")
+            await worker_manager._start_worker_process(args, "My Library", self._environ(worker_manager, "My Library"))
 
         mock_exec.assert_called_once_with(*args, env=ANY, stdout=sys.stdout, stderr=sys.stderr)
         assert worker_manager._managed_worker_processes["My Library"] is mock_proc
@@ -1049,7 +640,9 @@ class TestSpawnWorker:
         # pipe) never reaches the child unless passed explicitly, so the worker would log
         # to an invisible console instead.
         with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+            await worker_manager._start_worker_process(
+                ["/usr/bin/gtn", "engine"], "my-key", self._environ(worker_manager, "my-key")
+            )
 
         assert mock_exec.call_args.kwargs["stdout"] is sys.stdout
         assert mock_exec.call_args.kwargs["stderr"] is sys.stderr
@@ -1057,47 +650,22 @@ class TestSpawnWorker:
         # log lines from stalling in Python's block buffer.
         assert mock_exec.call_args.kwargs["env"]["PYTHONUNBUFFERED"] == "1"
 
+
+class TestBaseWorkerEnviron:
     @pytest.mark.asyncio
-    async def test_spawn_does_not_pin_the_workspace_into_the_env(self, worker_manager: WorkerManager) -> None:
+    async def test_does_not_pin_the_workspace_into_the_env(self, worker_manager: WorkerManager) -> None:
         """The spawn env must not carry GTN_CONFIG_WORKSPACE_DIRECTORY.
 
         Workers spawn before any project resolves, so the value at spawn time is the CWD-relative
         placeholder -- and GTN_CONFIG_ outranks the runtime project override, so a worker handed it
-        could never follow its orchestrator onto a project's workspace again. The workspace comes
-        from the project adopted out of the registration reply instead.
+        could never follow its orchestrator onto a project's workspace again. The workspace arrives
+        with the project the engine that runs it activates on it instead.
         """
         worker_manager.engine.config_manager.workspace_path = Path("/somewhere/else/GriptapeNodes")  # type: ignore[union-attr]
 
-        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+        env = await worker_manager._base_worker_environ("my-key", "my-key")
 
-        assert "GTN_CONFIG_WORKSPACE_DIRECTORY" not in mock_exec.call_args.kwargs["env"]
-
-    @pytest.mark.asyncio
-    async def test_spawn_env_stamps_orchestrator_engine_id(self, worker_manager: WorkerManager) -> None:
-        # The worker must learn its parent orchestrator's id so it can report it in its
-        # discovery heartbeat (orchestrator_engine_id), which the GUI uses to nest workers.
-        worker_manager.engine.engine_identity_manager.active_engine_id = _ENGINE  # type: ignore[union-attr]
-
-        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
-
-        env = mock_exec.call_args.kwargs["env"]
-        assert env["GTN_ORCHESTRATOR_ENGINE_ID"] == _ENGINE
-        # The worker still gets its own fresh engine id, distinct from the orchestrator's.
-        assert env["GTN_ENGINE_ID"] != _ENGINE
-
-    @pytest.mark.asyncio
-    async def test_spawn_env_omits_orchestrator_id_when_unknown(self, worker_manager: WorkerManager) -> None:
-        # Defensive: never put a None into the subprocess env dict. If the orchestrator has
-        # no id yet, the key is simply absent (worker heartbeats as an orchestrator).
-        worker_manager.engine.engine_identity_manager.active_engine_id = None  # type: ignore[union-attr]
-
-        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
-
-        env = mock_exec.call_args.kwargs["env"]
-        assert "GTN_ORCHESTRATOR_ENGINE_ID" not in env
+        assert "GTN_CONFIG_WORKSPACE_DIRECTORY" not in env
 
 
 class TestOrchestratorStaticServerBaseUrl:
@@ -1220,7 +788,11 @@ class TestResetWorkers:
         await worker_manager.reset_workers()
 
         with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
-            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+            await worker_manager._start_worker_process(
+                ["/usr/bin/gtn", "engine"],
+                "My Library",
+                lambda: worker_manager._base_worker_environ("My Library", "My Library"),
+            )
 
         mock_exec.assert_called_once()
 
@@ -1281,21 +853,6 @@ class TestResetWorkers:
         proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_unsubscribes_response_topic_for_each_registered_worker(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers["eng-1"] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/eng-1/request", worker_key=None
-        )
-        worker_manager._workers["eng-2"] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/eng-2/request", worker_key=None
-        )
-
-        await worker_manager.reset_workers()
-
-        unsubscribed = {call.args[0] for call in worker_manager._tx.unsubscribe_from_topic.call_args_list}  # type: ignore[union-attr]
-        assert f"sessions/{_SESSION}/workers/eng-1/response" in unsubscribed
-        assert f"sessions/{_SESSION}/workers/eng-2/response" in unsubscribed
-
 
 class TestStopWorkerForLibrary:
     """Stopping the worker of one library, as a library reset does before deleting its environment."""
@@ -1324,8 +881,6 @@ class TestStopWorkerForLibrary:
         await worker_manager.stop_worker_for_library("Lib A")
 
         assert list(worker_manager._workers) == ["eng-b"]
-        unsubscribed = [call.args[0] for call in worker_manager._tx.unsubscribe_from_topic.call_args_list]  # type: ignore[union-attr]
-        assert unsubscribed == [f"sessions/{_SESSION}/workers/eng-a/response"]
 
     @pytest.mark.asyncio
     async def test_waits_out_a_spawn_in_flight_and_stops_what_it_started(self, worker_manager: WorkerManager) -> None:
@@ -1345,7 +900,11 @@ class TestStopWorkerForLibrary:
             patch.object(worker_manager, "_orchestrator_static_server_base_url", park_until_released),
             patch("asyncio.create_subprocess_exec", return_value=proc),
         ):
-            spawn = asyncio.create_task(worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "Lib A"))
+            spawn = asyncio.create_task(
+                worker_manager._start_worker_process(
+                    ["/usr/bin/gtn", "engine"], "Lib A", lambda: worker_manager._base_worker_environ("Lib A", "Lib A")
+                )
+            )
             await asyncio.sleep(0.01)
             stop = asyncio.create_task(worker_manager.stop_worker_for_library("Lib A"))
             await asyncio.sleep(0.01)
@@ -1358,39 +917,6 @@ class TestStopWorkerForLibrary:
         proc.terminate.assert_called_once()
         assert "Lib A" not in worker_manager._managed_worker_processes
         assert "Lib A" not in worker_manager._spawns_in_flight
-
-    @pytest.mark.asyncio
-    async def test_settles_requests_awaiting_that_worker(self, worker_manager: WorkerManager) -> None:
-        """A node running in the worker fails with the reason instead of waiting on a process that is gone."""
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        worker_manager._workers = {_ENGINE: WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")}
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
-
-        async def stop_mid_flight() -> None:
-            await asyncio.sleep(0)
-            await worker_manager.stop_worker_for_library("Lib")
-
-        asyncio.create_task(stop_mid_flight())  # noqa: RUF006
-
-        with pytest.raises(worker_events.WorkerGoneError, match="shut down to reset library 'Lib'"):
-            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
-
-    @pytest.mark.asyncio
-    async def test_forgets_a_worker_that_registers_while_its_process_is_stopping(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        """A booting worker can register during the termination await; it must not stay routable."""
-        worker_manager._managed_worker_processes["Lib A"] = _managed_proc_mock()
-
-        async def register_during_termination(_library_name: str, _proc: object) -> None:
-            worker_manager._workers["eng-late"] = WorkerRegistration(
-                request_topic=f"sessions/{_SESSION}/workers/eng-late/request", worker_key="Lib A"
-            )
-
-        with patch.object(worker_manager, "_terminate_via_spawn_loop", side_effect=register_during_termination):
-            await worker_manager.stop_worker_for_library("Lib A")
-
-        assert worker_manager.get_worker_for_key("Lib A") is None
 
     @pytest.mark.asyncio
     async def test_releases_anything_waiting_for_that_library_to_become_executable(
@@ -1743,148 +1269,6 @@ class TestSpawnLibraryWorker:
         assert not worker_manager._session_ready_event.is_set()
 
 
-class TestRouteToWorker:
-    @pytest.mark.asyncio
-    async def test_sends_request_to_worker_and_returns_raw_payload(self, worker_manager: WorkerManager) -> None:
-        """route_to_worker dispatches to the worker and resolves when RequestClient resolves the future."""
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        fake_rc = worker_manager._tx.request_client
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={"x": 1}))
-        expected_payload = {
-            "event_type": "EventResultSuccess",
-            "result_type": ExecuteNodeResultSuccess.__name__,
-            "result": {"parameter_output_values": {"out": 99}, "result_details": "ok"},
-            "request_id": "",  # overwritten below
-        }
-
-        async def resolve_via_future() -> None:
-            # Yield once so route_to_worker can register the future before we resolve it.
-            await asyncio.sleep(0)
-            request_id = next(iter(fake_rc._pending_requests))
-            entry = fake_rc._pending_requests[request_id]
-            payload = {**expected_payload, "request_id": request_id}
-            entry.future.set_result(payload)
-
-        asyncio.create_task(resolve_via_future())  # noqa: RUF006
-        result = await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
-
-        assert result["result_type"] == ExecuteNodeResultSuccess.__name__
-        assert result["result"]["parameter_output_values"] == {"out": 99}
-        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_evicted_worker_raises_with_the_reason(self, worker_manager: WorkerManager) -> None:
-        """A worker taken away mid-request surfaces as WorkerGoneError, carrying why.
-
-        Cancelling instead would be indistinguishable from the artist pressing stop, and the
-        resolution machine reaps those silently as CANCELED -- no NodeErrorEvent, only an unnamed
-        INFO line, so the node comes back UNRESOLVED with nothing anywhere saying why.
-        """
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        fake_rc = worker_manager._tx.request_client
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
-
-        async def evict_mid_flight() -> None:
-            await asyncio.sleep(0)
-            await fake_rc.fail_requests_by_tag(
-                _ENGINE, worker_events.WorkerGoneError(f"worker '{_ENGINE}' stopped responding and was shut down")
-            )
-
-        asyncio.create_task(evict_mid_flight())  # noqa: RUF006
-
-        with pytest.raises(worker_events.WorkerGoneError, match="stopped responding and was shut down"):
-            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
-
-    @pytest.mark.asyncio
-    async def test_reset_settles_in_flight_requests_too(self, worker_manager: WorkerManager) -> None:
-        """reset_workers is the other path that takes a worker away, and it clears the registry.
-
-        Eviction is not reachable afterwards -- the heartbeat loop can only evict ids it can still
-        see -- and route_to_worker has no wall-clock ceiling, so a node dispatched into a worker a
-        library reload terminates would await a future nothing ever settles: RESOLVING forever.
-        """
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        worker_manager._workers = {_ENGINE: WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")}
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
-
-        async def reset_mid_flight() -> None:
-            await asyncio.sleep(0)
-            await worker_manager.reset_workers()
-
-        asyncio.create_task(reset_mid_flight())  # noqa: RUF006
-
-        with pytest.raises(worker_events.WorkerGoneError, match="shut down to reload library 'Lib'"):
-            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
-
-    @pytest.mark.asyncio
-    async def test_flow_cancellation_still_cancels(self, worker_manager: WorkerManager) -> None:
-        """Cancelling the awaiting task must still raise CancelledError, so stop stays stop."""
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
-
-        task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
-        await asyncio.sleep(0)
-        task.cancel()
-
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    @pytest.mark.asyncio
-    async def test_flow_cancellation_stops_tracking_the_request(self, worker_manager: WorkerManager) -> None:
-        """A cancelled run must not leave its request behind in the pending map.
-
-        Nothing else pops it on this path, so the entry would outlive the run -- one per cancelled
-        node execution for the life of the process -- and each keeps its worker's tag, so a later
-        fail_requests_by_tag walks and re-settles long-dead requests.
-        """
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        fake_rc = worker_manager._tx.request_client
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
-
-        task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
-        # Long enough to be parked on the response, which is the await the cancellation has to
-        # unwind from for the entry to be the caller's to remove.
-        await asyncio.sleep(0.01)
-        assert len(fake_rc._pending_requests) == 1
-
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-        assert fake_rc._pending_requests == {}
-
-    @pytest.mark.asyncio
-    async def test_cancellation_during_the_publish_stops_tracking_the_request(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        """The publish is an await too, so the entry has to be released if it unwinds there.
-
-        Registering before publishing is deliberate -- the response can arrive the instant the
-        request lands -- which leaves a window where the entry exists and the publish has not
-        returned. A cancellation delivered in that window leaks exactly the entry the response-side
-        guard exists to release.
-        """
-        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
-        fake_rc = worker_manager._tx.request_client
-        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
-        publishing = asyncio.Event()
-
-        async def _park_in_the_publish(*_args: object, **_kwargs: object) -> None:
-            publishing.set()
-            await asyncio.sleep(3600)
-
-        with patch.object(worker_manager, "forward_event_to_worker", new=_park_in_the_publish):
-            task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
-            await publishing.wait()
-            assert len(fake_rc._pending_requests) == 1
-
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-        assert fake_rc._pending_requests == {}
-
-
 class TestGetTopicsToSubscribe:
     def test_orchestrator_includes_base_request_topic(self, worker_manager: WorkerManager) -> None:
         assert "request" in worker_manager.get_topics_to_subscribe(is_worker=False)
@@ -1931,33 +1315,25 @@ class TestGetTopicsToSubscribe:
 
 class TestForwardEventToWorker:
     @pytest.mark.asyncio
-    async def test_sends_message_to_worker_request_topic(self, worker_manager: WorkerManager) -> None:
-        from griptape_nodes.retained_mode.events.base_events import EventRequest
-        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
-
+    async def test_notifies_a_local_workers_channel(self, worker_manager: WorkerManager) -> None:
+        channel = _FakeChannel()
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic="",
+            worker_key=None,
+            channel=channel,  # type: ignore[arg-type]
+        )
         event = EventRequest(request=ExecuteNodeRequest(node_name="TestNode", parameter_values={}))
 
-        await worker_manager.forward_event_to_worker(
-            event, worker_engine_id=_ENGINE, worker_request_topic=_WORKER_REQUEST_TOPIC
-        )
+        await worker_manager.forward_event_to_worker(event, worker_engine_id=_ENGINE)
 
-        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-        assert worker_manager._tx.send_message.call_args[0][2] == _WORKER_REQUEST_TOPIC  # type: ignore[union-attr]
+        assert len(channel.notified) == 1
+        assert channel.notified[0]["payload"]["request_type"] == "ExecuteNodeRequest"
 
     @pytest.mark.asyncio
-    async def test_sets_response_topic_to_worker_response_topic(self, worker_manager: WorkerManager) -> None:
-        from griptape_nodes.retained_mode.events.base_events import EventRequest
-        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
-
+    async def test_is_a_noop_for_an_unknown_worker(self, worker_manager: WorkerManager) -> None:
         event = EventRequest(request=ExecuteNodeRequest(node_name="TestNode", parameter_values={}))
 
-        await worker_manager.forward_event_to_worker(
-            event, worker_engine_id=_ENGINE, worker_request_topic=_WORKER_REQUEST_TOPIC
-        )
-
-        sent_body = worker_manager._tx.send_message.call_args[0][1]  # type: ignore[union-attr]
-        sent_payload = json.loads(sent_body)
-        assert sent_payload.get("response_topic") == _WORKER_RESPONSE_TOPIC
+        await worker_manager.forward_event_to_worker(event, worker_engine_id="ghost-engine")
 
 
 class TestDetermineResponseTopic:
@@ -1982,49 +1358,6 @@ class TestDetermineResponseTopic:
         assert topic == "response"
 
 
-class TestOrchestratorHeartbeatLoop:
-    @pytest.mark.asyncio
-    async def test_evicts_stale_worker(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        await _sweep_until_evicted(worker_manager)
-
-        assert _ENGINE not in worker_manager._workers
-
-    @pytest.mark.asyncio
-    async def test_sends_heartbeat_challenge_to_live_worker(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-        # A challenge is counted only once it has actually been sent.
-        worker_manager._tx.send_message.assert_called()  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_does_not_evict_fresh_worker(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-        assert _ENGINE in worker_manager._workers
-
-
 class TestBroadcastToWorkers:
     @pytest.mark.asyncio
     async def test_no_workers_is_noop(self, worker_manager: WorkerManager) -> None:
@@ -2040,24 +1373,23 @@ class TestBroadcastToWorkers:
     async def test_sends_one_message_per_registered_worker(self, worker_manager: WorkerManager) -> None:
         from griptape_nodes.app.worker_routing import ReloadConfigRequest
 
-        expected_broadcast_count = 2
-        worker_a, worker_b = "eng-a", "eng-b"
-        worker_manager._workers[worker_a] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/{worker_a}/request", worker_key=None
+        worker_a, worker_b = _FakeChannel(), _FakeChannel()
+        worker_manager._workers["eng-a"] = WorkerRegistration(
+            request_topic="",
+            worker_key=None,
+            channel=worker_a,  # type: ignore[arg-type]
         )
-        worker_manager._workers[worker_b] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/{worker_b}/request", worker_key=None
+        worker_manager._workers["eng-b"] = WorkerRegistration(
+            request_topic="",
+            worker_key=None,
+            channel=worker_b,  # type: ignore[arg-type]
         )
         event = EventRequest(request=ReloadConfigRequest())
 
         await worker_manager.broadcast_to_workers(event)
 
-        assert worker_manager._tx.send_message.call_count == expected_broadcast_count  # type: ignore[union-attr]
-        topics = {call.args[2] for call in worker_manager._tx.send_message.call_args_list}  # type: ignore[union-attr]
-        assert topics == {
-            f"sessions/{_SESSION}/workers/{worker_a}/request",
-            f"sessions/{_SESSION}/workers/{worker_b}/request",
-        }
+        assert len(worker_a.notified) == 1
+        assert len(worker_b.notified) == 1
 
 
 class TestScheduleBroadcast:
@@ -2065,28 +1397,36 @@ class TestScheduleBroadcast:
     async def test_fans_out_request_to_each_registered_worker(self, worker_manager: WorkerManager) -> None:
         from griptape_nodes.app.worker_routing import ReloadConfigRequest
 
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        channel = _FakeChannel()
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic="",
+            worker_key=None,
+            channel=channel,  # type: ignore[arg-type]
+        )
 
         worker_manager.schedule_broadcast(ReloadConfigRequest)
         # create_task on the running loop -- let it run.
         await asyncio.sleep(0)
 
-        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-        sent_payload = json.loads(worker_manager._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
-        assert sent_payload["request_type"] == "ReloadConfigRequest"
+        assert len(channel.notified) == 1
+        assert channel.notified[0]["payload"]["request_type"] == "ReloadConfigRequest"
 
     @pytest.mark.asyncio
     async def test_refresh_secrets_payload_round_trips(self, worker_manager: WorkerManager) -> None:
         from griptape_nodes.app.worker_routing import RefreshSecretsRequest
 
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        channel = _FakeChannel()
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic="",
+            worker_key=None,
+            channel=channel,  # type: ignore[arg-type]
+        )
 
         worker_manager.schedule_broadcast(RefreshSecretsRequest)
         await asyncio.sleep(0)
 
-        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-        sent_payload = json.loads(worker_manager._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
-        assert sent_payload["request_type"] == "RefreshSecretsRequest"
+        assert len(channel.notified) == 1
+        assert channel.notified[0]["payload"]["request_type"] == "RefreshSecretsRequest"
 
     @pytest.mark.asyncio
     async def test_no_workers_is_noop(self, worker_manager: WorkerManager) -> None:
@@ -2131,14 +1471,14 @@ class TestWorkerManagerDomainEventListeners:
         from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 
         wm = worker_manager_with_real_events
-        wm._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        channel = _FakeChannel()
+        wm._workers[_ENGINE] = WorkerRegistration(request_topic="", worker_key=None, channel=channel)  # type: ignore[arg-type]
 
         wm._event_manager.broadcast_app_event(ConfigChanged(key="x.y", old_value=None, new_value="v"))
         await asyncio.sleep(0)
 
-        wm._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-        sent_payload = json.loads(wm._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
-        assert sent_payload["request_type"] == "ReloadConfigRequest"
+        assert len(channel.notified) == 1
+        assert channel.notified[0]["payload"]["request_type"] == "ReloadConfigRequest"
 
     @pytest.mark.asyncio
     async def test_secret_changed_event_triggers_refresh_secrets_broadcast(
@@ -2147,14 +1487,14 @@ class TestWorkerManagerDomainEventListeners:
         from griptape_nodes.retained_mode.events.app_events import SecretChanged
 
         wm = worker_manager_with_real_events
-        wm._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        channel = _FakeChannel()
+        wm._workers[_ENGINE] = WorkerRegistration(request_topic="", worker_key=None, channel=channel)  # type: ignore[arg-type]
 
         wm._event_manager.broadcast_app_event(SecretChanged(key="MY_KEY"))
         await asyncio.sleep(0)
 
-        wm._tx.send_message.assert_called_once()  # type: ignore[union-attr]
-        sent_payload = json.loads(wm._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
-        assert sent_payload["request_type"] == "RefreshSecretsRequest"
+        assert len(channel.notified) == 1
+        assert channel.notified[0]["payload"]["request_type"] == "RefreshSecretsRequest"
 
     @pytest.mark.asyncio
     async def test_no_broadcast_when_there_are_no_registered_workers(
@@ -2169,56 +1509,6 @@ class TestWorkerManagerDomainEventListeners:
         await asyncio.sleep(0)
 
         wm._tx.send_message.assert_not_called()  # type: ignore[union-attr]
-
-    def test_broadcast_completes_when_listener_is_dispatched_via_threadrunner(
-        self, worker_manager_with_real_events: WorkerManager
-    ) -> None:
-        """Production path: sync request handler -> sync broadcast_app_event -> ThreadRunner side loop.
-
-        ``EventManager.broadcast_app_event`` runs the listener fan-out on a transient
-        ``ThreadRunner`` side loop, which is torn down as soon as the listener returns -- so a
-        listener that schedules its fan-out with ``asyncio.create_task`` leaves an orphan that
-        never runs. The listener awaits inline instead, and this confirms the broadcast has landed
-        by the time ``broadcast_app_event`` returns, even when the transport ``await`` does not
-        resolve synchronously (the production shape -- a real WebSocket send
-        yields back to the loop).
-        """
-        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
-
-        wm = worker_manager_with_real_events
-        wm._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-
-        # Force send_message to yield repeatedly before recording the call.
-        # An orphan ``asyncio.create_task`` scheduled inside the listener
-        # would lose its race with ``ThreadRunner.__exit__`` -> ``loop.stop()``
-        # under enough yield points, so the broadcast would silently drop.
-        # ``AsyncMock`` returns synchronously which would mask the bug;
-        # the production transport awaits real I/O and yields many times.
-        send_calls: list[tuple] = []
-
-        async def slow_send(*args: object) -> None:
-            for _ in range(50):
-                await asyncio.sleep(0)
-            send_calls.append(args)
-
-        wm._tx.send_message = slow_send  # type: ignore[union-attr,assignment]
-
-        async def driver() -> None:
-            # Inside this coroutine there is a running loop on the main
-            # thread. ``broadcast_app_event`` is sync; calling it from
-            # here triggers the ThreadRunner side-loop branch -- the same
-            # branch that runs in production when a sync request handler
-            # (e.g. ``on_handle_set_config_value_request``) calls
-            # ``set_config_value`` which calls ``broadcast_app_event``.
-            wm._event_manager.broadcast_app_event(ConfigChanged(key="x.y", old_value=None, new_value="v"))
-
-        asyncio.run(driver())
-
-        # By the time broadcast_app_event returns, the listener (and the
-        # awaited broadcast inside it) must have completed.
-        assert len(send_calls) == 1
-        sent_payload = json.loads(send_calls[0][1])
-        assert sent_payload["request_type"] == "ReloadConfigRequest"
 
 
 class TestWorkerExecutionPath:
@@ -2237,7 +1527,11 @@ class TestWorkerExecutionPath:
         environment.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
-            await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
+            await worker_manager._start_worker_process(
+                [sys.executable, "-c", ""],
+                "My Library",
+                lambda: worker_manager._base_worker_environ("My Library", "My Library"),
+            )
 
         env = spawn.call_args.kwargs["env"]
         assert env["PYTHONPATH"] == "/libs/mine/.venv-exec/sp"
@@ -2255,7 +1549,11 @@ class TestWorkerExecutionPath:
         worker_manager.engine.project_manager.get_pre_project_environ.return_value = {"PYTHONPATH": "/host/libs"}  # type: ignore[attr-defined]
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
-            await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
+            await worker_manager._start_worker_process(
+                [sys.executable, "-c", ""],
+                "My Library",
+                lambda: worker_manager._base_worker_environ("My Library", "My Library"),
+            )
 
         env = spawn.call_args.kwargs["env"]
         # Library first, so a package the library pins wins; the engine's own environment still
@@ -2272,127 +1570,13 @@ class TestWorkerExecutionPath:
         worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[attr-defined]
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
-            await worker_manager.spawn_worker([sys.executable, "-c", ""], "Light Library")
+            await worker_manager._start_worker_process(
+                [sys.executable, "-c", ""],
+                "Light Library",
+                lambda: worker_manager._base_worker_environ("Light Library", "Light Library"),
+            )
 
         assert "PYTHONPATH" not in spawn.call_args.kwargs["env"]
-
-
-class TestHeartbeatIntervalFloor:
-    """A configured interval the code cannot run is raised to the minimum, loudly.
-
-    The interval divides the timeout to size the challenge allowance and is the sleep in both
-    heartbeat loops, so a non-positive value is a ZeroDivisionError on one path and a hot loop on
-    the other.
-    """
-
-    @staticmethod
-    def _manager_with_interval(interval: float) -> WorkerManager:
-        gtn = MagicMock()
-        gtn.get_session_id.return_value = _SESSION
-        gtn.get_engine_id.return_value = _ENGINE
-
-        def _config(key: str, default: float, cast_type: type = float) -> float:
-            from griptape_nodes.retained_mode.managers.settings import WORKER_HEARTBEAT_INTERVAL_KEY
-
-            if key == WORKER_HEARTBEAT_INTERVAL_KEY:
-                return cast_type(interval)
-            return cast_type(default)
-
-        gtn.config_manager.get_config_value.side_effect = _config
-        return WorkerManager(engine=gtn, event_manager=MagicMock())
-
-    def test_a_zero_interval_is_raised_to_the_minimum(self) -> None:
-        manager = self._manager_with_interval(0.0)
-
-        assert manager.heartbeat_interval_s == WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S
-
-    def test_a_negative_interval_is_raised_to_the_minimum(self) -> None:
-        manager = self._manager_with_interval(-5.0)
-
-        assert manager.heartbeat_interval_s == WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S
-
-    def test_a_zero_interval_leaves_the_challenge_allowance_computable(self) -> None:
-        """The division is what a zero interval used to break."""
-        manager = self._manager_with_interval(0.0)
-
-        assert manager.unanswered_challenges_allowed >= 1
-
-    def test_raising_the_interval_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING):
-            self._manager_with_interval(0.0)
-
-        assert "cannot be used" in caplog.text
-
-    def test_a_usable_interval_is_left_alone(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING):
-            manager = self._manager_with_interval(2.5)
-
-        assert manager.heartbeat_interval_s == 2.5  # noqa: PLR2004
-        assert "cannot be used" not in caplog.text
-
-
-class TestChallengeSendFailure:
-    """A send that fails is the orchestrator's problem, not the worker's.
-
-    The counter decides eviction, so a challenge that never left must not be counted, and the
-    loop must survive a transport that raises while a connection is re-establishing.
-    """
-
-    @pytest.mark.asyncio
-    async def test_a_failed_send_is_not_counted_against_the_worker(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._tx.send_message.side_effect = ConnectionError("no socket")  # type: ignore[union-attr]
-
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-        assert worker_manager._workers[_ENGINE].unanswered_challenges == 0
-
-    @pytest.mark.asyncio
-    async def test_a_failed_send_does_not_end_the_loop(
-        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """If the loop exits, nothing evicts a worker for the rest of the process's life."""
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._tx.send_message.side_effect = ConnectionError("no socket")  # type: ignore[union-attr]
-
-        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
-        await asyncio.sleep(0.05)
-        still_running = not task.done()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-        assert still_running
-
-
-class TestChallengeAllowanceRounding:
-    """The allowance must not tolerate less silence than the configured timeout."""
-
-    def test_a_fractional_ratio_rounds_up(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 12.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
-
-        # Nearest would give 2, evicting after ~10s against a 12s timeout.
-        assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
-
-    def test_a_half_ratio_rounds_up(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Banker's rounding makes `round(2.5)` 2, which is below the configured tolerance."""
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 12.5)
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
-
-        assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
-
-    def test_an_exact_ratio_is_unchanged(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 15.0)
-        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
-
-        assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
 
 
 _HOST_ENGINE = "gpu-01-engine-id"
@@ -2418,17 +1602,16 @@ class _FakeEngineTransports:
         self.blocked: dict[str, asyncio.Event] = {}
         self.arrived: dict[str, asyncio.Event] = {}
         self.link_lost: Callable[[str], Awaitable[None]] | None = None
-        # What a worker run for another engine is given to reach it, by that engine.
-        self.worker_environments: dict[str, dict[str, str]] = {}
-        self.worker_environment_asks: list[str] = []
 
-    def hosted_worker_environment(self, engine_id: str) -> dict[str, str]:
-        self.worker_environment_asks.append(engine_id)
-        if self.not_found is not None:
-            raise EngineNotFoundError(self.not_found)
-        return self.worker_environments.get(engine_id, {})
-
-    async def request(self, engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+    async def request(
+        self,
+        engine_id: str,
+        request: RequestPayload,
+        *,
+        timeout_s: float | None,
+        open_workflow_id: str | None = None,  # noqa: ARG002
+        worker_engine_id: str | None = None,  # noqa: ARG002
+    ) -> ResultPayload:
         self.sent.append((engine_id, request, timeout_s))
         if self.not_found is not None:
             raise EngineNotFoundError(self.not_found)
@@ -2492,7 +1675,6 @@ def _host_engine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None
     # As Engine.attach_engine_transports does: requests go through the transports, and a lost connection reaches here.
     engine.can_reach_other_engines = True  # type: ignore[misc]
     engine.request = links.request  # type: ignore[method-assign]
-    engine.hosted_worker_environment = links.hosted_worker_environment  # type: ignore[method-assign]
     links.on_engine_lost(worker_manager.on_engine_lost)
     return links
 
@@ -2531,7 +1713,7 @@ class TestStartingAWorkerOnAnotherEngine:
     ) -> None:
         links = _host_engine(worker_manager)
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await _start_on_host_engine(worker_manager)
 
         spawn.assert_not_awaited()
@@ -2764,7 +1946,7 @@ class TestStartingAWorkerOnAnotherEngine:
         """Running it here would run it in the one place it was assigned away from."""
         _assign_libraries(worker_manager, {_LIBRARY: _HOST_ENGINE})
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await _start_on_host_engine(worker_manager)
 
         spawn.assert_not_awaited()
@@ -2776,7 +1958,7 @@ class TestStartingAWorkerOnAnotherEngine:
     async def test_a_library_with_no_assignment_still_spawns_here(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await _start_on_host_engine(worker_manager, "Local Lib")
 
         spawn.assert_awaited_once()
@@ -2788,7 +1970,7 @@ class TestStartingAWorkerOnAnotherEngine:
         links = _host_engine(worker_manager)
         worker_manager.engine.get_engine_id.return_value = _HOST_ENGINE  # type: ignore[union-attr]
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await _start_on_host_engine(worker_manager)
 
         spawn.assert_awaited_once()
@@ -2856,71 +2038,33 @@ class TestStartingAWorkerOnAnotherEngine:
 
 class TestARemoteWorkerRegisters:
     @pytest.mark.asyncio
-    async def test_a_worker_this_engine_asked_for_registers_as_running_on_its_engine(
+    async def test_a_worker_this_engine_asked_for_is_taken_into_service_as_running_on_its_engine(
         self, worker_manager: WorkerManager
     ) -> None:
         links = _host_engine(worker_manager)
         await _start_on_host_engine(worker_manager)
         worker_engine_id = _started_worker_id(links)
 
-        result = await worker_manager.handle_register_worker_request(
-            worker_events.RegisterWorkerRequest(
-                worker_engine_id=worker_engine_id, engine_version=engine_version, library_name=_LIBRARY
-            )
+        result = await worker_manager.handle_report_hosted_worker_ready_request(
+            worker_events.ReportHostedWorkerReadyRequest(worker_engine_id=worker_engine_id)
         )
 
-        assert isinstance(result, worker_events.RegisterWorkerResultSuccess), result.result_details
+        assert isinstance(result, worker_events.ReportHostedWorkerReadyResultSuccess), result.result_details
         assert worker_manager._workers[worker_engine_id].host_engine_id == _HOST_ENGINE
         assert worker_manager.worker_host(worker_engine_id) == _HOST_ENGINE
         assert worker_manager._remote_starts == {}
-        worker_manager._tx.subscribe_to_topic.assert_awaited_once_with(  # type: ignore[union-attr]
-            f"sessions/{_SESSION}/workers/{worker_engine_id}/response"
-        )
 
     @pytest.mark.asyncio
     async def test_a_worker_this_engine_did_not_ask_for_is_refused(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
 
-        result = await worker_manager.handle_register_worker_request(
-            worker_events.RegisterWorkerRequest(
-                worker_engine_id="stranger", engine_version=engine_version, library_name=_LIBRARY
-            )
+        result = await worker_manager.handle_report_hosted_worker_ready_request(
+            worker_events.ReportHostedWorkerReadyRequest(worker_engine_id="stranger")
         )
 
-        assert isinstance(result, worker_events.RegisterWorkerResultFailure)
-        assert _HOST_ENGINE in str(result.result_details)
+        assert isinstance(result, worker_events.ReportHostedWorkerReadyResultFailure)
         assert worker_manager._workers == {}
         assert worker_manager.worker_host("stranger") is None
-
-    @pytest.mark.asyncio
-    async def test_a_worker_registering_for_another_library_than_it_was_started_for_is_refused(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        links = _host_engine(worker_manager)
-        await _start_on_host_engine(worker_manager)
-
-        result = await worker_manager.handle_register_worker_request(
-            worker_events.RegisterWorkerRequest(
-                worker_engine_id=_started_worker_id(links), engine_version=engine_version, library_name="Other"
-            )
-        )
-
-        assert isinstance(result, worker_events.RegisterWorkerResultFailure)
-        assert worker_manager._workers == {}
-
-    @pytest.mark.asyncio
-    async def test_an_evicted_worker_is_stopped_on_its_engine(self, worker_manager: WorkerManager) -> None:
-        """A hung worker cannot shut itself down, so only the engine running it can free what it holds."""
-        links = _host_engine(worker_manager)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
-        )
-
-        await worker_manager.evict_worker(_ENGINE)
-        await asyncio.gather(*worker_manager._stop_requests)
-
-        (stop,) = links.sent_of(worker_events.StopWorkerForEngineRequest)
-        assert cast("worker_events.StopWorkerForEngineRequest", stop).worker_engine_id == _ENGINE
 
     @pytest.mark.asyncio
     async def test_a_reset_forgets_remote_workers_and_starts(self, worker_manager: WorkerManager) -> None:
@@ -2972,19 +2116,18 @@ class TestARemoteWorkerExits:
     @pytest.mark.asyncio
     async def test_a_registered_worker_that_exits_is_removed_at_once(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
+        registration = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
         )
-        request_client = cast("_FakeRequestClient", worker_manager._tx.request_client)
-        pending = await request_client.track_request("r1", tag=_ENGINE)
+        worker_manager._workers[_ENGINE] = registration
 
         await _sent_by(
             _FROM_HOST_ENGINE, worker_manager.handle_report_worker_exited_request, _exited(_ENGINE, "exited")
         )
 
         assert _ENGINE not in worker_manager._workers
-        assert isinstance(pending.exception(), worker_events.WorkerGoneError)
-        worker_manager._tx.unsubscribe_from_topic.assert_awaited_once_with(_WORKER_RESPONSE_TOPIC)  # type: ignore[union-attr]
+        # Anything awaiting this worker through `route_to_worker` watches `gone`, not a tracked future.
+        assert registration.gone.is_set()
         assert worker_manager.worker_unavailable_reason(_LIBRARY) is not None
 
     @pytest.mark.asyncio
@@ -3103,17 +2246,33 @@ def _register_session(worker_manager: WorkerManager, **overrides: object) -> obj
 def _start_for_artist(
     library_name: str = _LIBRARY, worker_engine_id: str = "w1"
 ) -> worker_events.StartWorkerForEngineRequest:
-    return worker_events.StartWorkerForEngineRequest(library_name=library_name, worker_engine_id=worker_engine_id)
+    return worker_events.StartWorkerForEngineRequest(
+        library_name=library_name, worker_engine_id=worker_engine_id, project_id="proj-1", project_generation=1
+    )
+
+
+async def _skip_connecting(
+    _worker_engine_id: str, _hosted: object, _proc: object, listener: Any, **_kwargs: object
+) -> None:
+    """Stand in for `_connect_hosted_worker`: the connection itself is a separate concern.
+
+    Releases the real `ChannelListener` the start allocated, since nothing here will ever connect to it.
+    """
+    listener.close()
 
 
 async def _host(worker_manager: WorkerManager, *, returncode: int = 0, exits: asyncio.Event | None = None) -> MagicMock:
     """Start worker "w1" for the artist's session, standing in a process that exits as `_worker_proc_mock` does."""
     proc = _worker_proc_mock(returncode, exits)
 
-    async def record_spawn(_args: list[str], worker_key: str, **_kwargs: object) -> None:
+    async def record_spawn(_args: list[str], worker_key: str | None, _environ: object) -> MagicMock:
         worker_manager._managed_worker_processes[worker_key] = proc
+        return proc
 
-    with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
+    with (
+        patch.object(worker_manager, "_start_worker_process", side_effect=record_spawn),
+        patch.object(worker_manager, "_connect_hosted_worker", side_effect=_skip_connecting),
+    ):
         await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
     return proc
 
@@ -3160,37 +2319,48 @@ class TestServingAnotherEnginesSession:
     ) -> None:
         """The transports reach such a worker the way they reach the engine it serves."""
         worker_manager._hosted_workers["w1"] = _HostedWorker(
-            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
+            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}",
+            engine_id=_ARTIST_ENGINE,
+            session_id=_ARTIST_SESSION,
+            library_name=_LIBRARY,
         )
 
         assert worker_manager.hosted_for("w1") == _ARTIST_ENGINE
         assert worker_manager.hosted_for("stranger") is None
 
     @pytest.mark.asyncio
-    async def test_the_worker_joins_the_session_under_its_id_on_this_machines_credentials(
+    async def test_the_worker_is_started_on_this_engines_license_without_this_engines_identity(
         self, worker_manager: WorkerManager
     ) -> None:
+        """It runs with `--library-name`, its own GTN_ENGINE_ID, and this session's static URL -- never this engine's."""
         _host_engine(worker_manager)
         _register_session(worker_manager)
-        spawned: dict[str, object] = {}
+        captured: dict[str, object] = {}
 
-        async def record_spawn(args: list[str], worker_key: str, **kwargs: object) -> None:
-            spawned.update(kwargs, args=args, worker_key=worker_key)
+        async def record_spawn(
+            args: list[str], worker_key: str | None, environ: Callable[[], Awaitable[dict[str, str]]]
+        ) -> MagicMock:
+            captured["args"] = args
+            captured["worker_key"] = worker_key
+            captured["environ"] = await environ()
+            return _managed_proc_mock()
 
-        with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
+        with (
+            patch.object(worker_manager, "_start_worker_process", side_effect=record_spawn),
+            patch.object(worker_manager, "_connect_hosted_worker", side_effect=_skip_connecting),
+        ):
             await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
-        assert spawned["worker_key"] == f"{_ARTIST_SESSION}/{_LIBRARY}"
-        assert spawned["worker_engine_id"] == "w1"
-        args = cast("list[str]", spawned["args"])
-        assert args[args.index("--session-id") + 1] == _ARTIST_SESSION
-        assert spawned["library_name"] == _LIBRARY
-        # Nothing overrides the license or API key, so the worker inherits this machine's. It knows this
-        # engine, which it asks before each node.
-        assert spawned["environ_overrides"] == {
-            ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV: "http://workstation:8124",
-            HOST_ENGINE_ID_ENV: _ENGINE,
-        }
+        assert captured["worker_key"] == f"{_ARTIST_SESSION}/{_LIBRARY}"
+        args = cast("list[str]", captured["args"])
+        assert args == [sys.executable, "-m", "griptape_nodes.worker", "--library-name", _LIBRARY]
+        environ = cast("dict[str, str]", captured["environ"])
+        assert environ[WORKER_ENGINE_ID_ENV] == "w1"
+        # It runs on the artist's license session, which it asks the artist's engine for, never this engine's.
+        assert LICENSE_SECRET_NAME not in environ
+        assert API_KEY_SECRET_NAME not in environ
+        # Its asset URLs are opened by the artist's editor, which reaches the artist's engine's server.
+        assert environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] == "http://workstation:8124"
 
     @pytest.mark.asyncio
     async def test_an_engine_with_no_id_starts_no_worker(self, worker_manager: WorkerManager) -> None:
@@ -3199,7 +2369,7 @@ class TestServingAnotherEnginesSession:
         _register_session(worker_manager)
         worker_manager.engine.get_engine_id.return_value = None  # type: ignore[attr-defined]
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
@@ -3207,46 +2377,10 @@ class TestServingAnotherEnginesSession:
         spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_worker_reaches_the_artist_the_way_the_artist_reached_this_engine(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        """The transport decides how; the worker gets what it says."""
-        links = _host_engine(worker_manager)
-        _register_session(worker_manager)
-        links.worker_environments[_ARTIST_ENGINE] = {"REACH_THE_ARTIST": "over the relay"}
-        spawned: dict[str, object] = {}
-
-        async def record_spawn(_args: list[str], _worker_key: str, **kwargs: object) -> None:
-            spawned.update(kwargs)
-
-        with patch.object(worker_manager, "spawn_worker", side_effect=record_spawn):
-            await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
-
-        assert links.worker_environment_asks == [_ARTIST_ENGINE]
-        environ = cast("dict[str, str]", spawned["environ_overrides"])
-        assert environ["REACH_THE_ARTIST"] == "over the relay"
-
-    @pytest.mark.asyncio
-    async def test_a_start_the_worker_could_not_reach_the_artist_from_fails_and_blocks_nothing(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        links = _host_engine(worker_manager)
-        _register_session(worker_manager)
-        links.not_found = "it sent no Griptape Cloud credential for the worker to connect with."
-
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
-            result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
-
-        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
-        assert "credential" in str(result.result_details)
-        assert worker_manager._hosted_workers == {}
-        spawn.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_a_start_for_an_unregistered_session_is_refused(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _dispatched_by(worker_manager, _ARTIST, _start_for_artist())
 
         assert not result.succeeded()
@@ -3263,7 +2397,7 @@ class TestServingAnotherEnginesSession:
         )
 
         offered = await _dispatched_by(worker_manager, _ARTIST, offer)
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()):
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()):
             started = await _dispatched_by(worker_manager, _ARTIST, _start_for_artist())
 
         assert isinstance(offered.result, worker_events.OfferSessionForWorkersResultSuccess)
@@ -3279,7 +2413,7 @@ class TestServingAnotherEnginesSession:
         _register_session(worker_manager)
         impostor = RequestSender(engine_id="impostor", session_id=_ARTIST_SESSION)
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _dispatched_by(worker_manager, impostor, _start_for_artist())
 
         assert not result.succeeded()
@@ -3295,7 +2429,10 @@ class TestServingAnotherEnginesSession:
 
         with (
             patch.object(worker_manager, "_terminate_via_spawn_loop", new=AsyncMock()) as terminate,
-            patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn,
+            patch.object(
+                worker_manager, "_start_worker_process", new=AsyncMock(return_value=_managed_proc_mock())
+            ) as spawn,
+            patch.object(worker_manager, "_connect_hosted_worker", side_effect=_skip_connecting),
         ):
             await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
@@ -3310,7 +2447,7 @@ class TestServingAnotherEnginesSession:
         _host_engine(worker_manager)
         _register_session(worker_manager)
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _sent_by(
                 _ARTIST,
                 worker_manager.handle_start_worker_for_engine_request,
@@ -3326,7 +2463,7 @@ class TestServingAnotherEnginesSession:
         _host_engine(worker_manager)
         _register_session(worker_manager, library_versions={_LIBRARY: "2.0.0"})
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
@@ -3358,7 +2495,7 @@ class TestServingAnotherEnginesSession:
             library_version="1.1.0", lifecycle_state=LibraryLifecycleState.LOADED
         )
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
@@ -3374,7 +2511,7 @@ class TestServingAnotherEnginesSession:
             library_version="1.0.0", lifecycle_state=LibraryLifecycleState.DISABLED
         )
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
@@ -3386,7 +2523,7 @@ class TestServingAnotherEnginesSession:
         _host_engine(worker_manager)
         _register_session(worker_manager)
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()):
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock(return_value=None)):
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
@@ -3445,12 +2582,14 @@ class TestServingAnotherEnginesSession:
         async def slow_terminate(*_args: object) -> None:
             await replacing.wait()
 
-        async def record_spawn(_args: list[str], key: str, **_kwargs: object) -> None:
+        async def record_spawn(_args: list[str], key: str | None, _environ: object) -> MagicMock:
             worker_manager._managed_worker_processes[key] = proc
+            return proc
 
         with (
             patch.object(worker_manager, "_terminate_via_spawn_loop", side_effect=slow_terminate) as terminate,
-            patch.object(worker_manager, "spawn_worker", side_effect=record_spawn),
+            patch.object(worker_manager, "_start_worker_process", side_effect=record_spawn),
+            patch.object(worker_manager, "_connect_hosted_worker", side_effect=_skip_connecting),
         ):
             start = asyncio.ensure_future(
                 _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
@@ -3486,7 +2625,8 @@ class TestServingAnotherEnginesSession:
 
         with (
             patch.object(worker_manager, "_terminate_via_spawn_loop", side_effect=slow_terminate),
-            patch.object(worker_manager, "spawn_worker", new=AsyncMock()),
+            patch.object(worker_manager, "_start_worker_process", new=AsyncMock()),
+            patch.object(worker_manager, "_connect_hosted_worker", side_effect=_skip_connecting),
         ):
             first = asyncio.ensure_future(
                 _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
@@ -3500,6 +2640,10 @@ class TestServingAnotherEnginesSession:
 
         assert isinstance(second, worker_events.StartWorkerForEngineResultFailure)
         assert "already starting" in str(second.result_details)
+        watchers = list(worker_manager._exit_watchers)
+        for watcher in watchers:
+            watcher.cancel()
+        await asyncio.gather(*watchers, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_a_stop_from_another_engine_is_refused(self, worker_manager: WorkerManager) -> None:
@@ -3865,8 +3009,10 @@ class TestSharingThisEngineBetweenRuns:
             worker_manager,
             {"distributed_execution.release.which": which, "distributed_execution.release.how": how},
         )
-        incoming = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1")
-        other = _HostedWorker(worker_key="s2/lib", engine_id="another-artist-engine", session_id="s2")
+        incoming = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1", library_name="lib")
+        other = _HostedWorker(
+            worker_key="s2/lib", engine_id="another-artist-engine", session_id="s2", library_name="lib"
+        )
         worker_manager._hosted_workers.update({"w-incoming": incoming, "w-other": other})
         by_worker = {id(incoming): "w-incoming", id(other): "w-other"}
 
@@ -3889,7 +3035,7 @@ class TestSharingThisEngineBetweenRuns:
             {"distributed_execution.release.which": "all", "distributed_execution.release.how": "recycle"},
         )
         answered = asyncio.Event()
-        hosted = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1")
+        hosted = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1", library_name="lib")
         hosted.exit_watcher = asyncio.create_task(answered.wait())
         worker_manager._hosted_workers["w1"] = hosted
 
@@ -3904,7 +3050,9 @@ class TestSharingThisEngineBetweenRuns:
     async def test_freeing_a_worker_that_exits_ends_when_it_exits(self, worker_manager: WorkerManager) -> None:
         """Otherwise the next run would wait out the whole timeout for a worker that is gone."""
         _host_engine(worker_manager)
-        hosted = _HostedWorker(worker_key="s1/lib", engine_id="another-artist-engine", session_id="s1")
+        hosted = _HostedWorker(
+            worker_key="s1/lib", engine_id="another-artist-engine", session_id="s1", library_name="lib"
+        )
         worker_manager._hosted_workers["w1"] = hosted
         exited = asyncio.Event()
 
@@ -3924,21 +3072,30 @@ class TestSharingThisEngineBetweenRuns:
         await watcher
 
     @pytest.mark.asyncio
-    async def test_freeing_a_worker_asks_it_in_its_session_and_hears_back_on_this_engine_s_topic(
-        self, worker_manager: WorkerManager
-    ) -> None:
-        """The worker is in the session of the engine it serves, which is not this engine's."""
-        hosted = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1")
+    async def test_freeing_a_worker_asks_it_through_its_channel(self, worker_manager: WorkerManager) -> None:
+        """The worker is reached through the channel this engine runs it on, not a topic."""
+        channel = _FakeChannel()
+        hosted = _HostedWorker(
+            worker_key="s1/lib",
+            engine_id=_ARTIST_ENGINE,
+            session_id="s1",
+            library_name="lib",
+            channel=channel,  # type: ignore[arg-type]
+        )
 
-        with patch("griptape_nodes.retained_mode.managers.worker_manager._ENGINE_REQUEST_TIMEOUT_S", new=0.01):
-            await worker_manager._drop_library_named_objects("w1", hosted)
+        await worker_manager._drop_library_named_objects("w1", hosted)
 
-        message_type, body, topic = worker_manager._tx.send_message.call_args.args  # type: ignore[union-attr]
-        sent = json.loads(body)
-        assert message_type == "EventRequest"
-        assert topic == "sessions/s1/workers/w1/request"
-        assert sent["response_topic"] == f"engines/{_ENGINE}/response"
-        assert worker_manager._tx.request_client._pending_requests == {}  # type: ignore[attr-defined]
+        assert len(channel.requested) == 1
+        assert channel.requested[0]["payload"]["request_type"] == "DropLibraryNamedLocalObjectsRequest"
+
+    @pytest.mark.asyncio
+    async def test_freeing_a_worker_that_never_connected_asks_nothing(self, worker_manager: WorkerManager) -> None:
+        """It holds nothing yet, so there is nothing to free."""
+        hosted = _HostedWorker(worker_key="s1/lib", engine_id=_ARTIST_ENGINE, session_id="s1", library_name="lib")
+
+        await worker_manager._drop_library_named_objects("w1", hosted)
+
+        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_an_engine_that_is_lost_lets_its_leases_go(self, worker_manager: WorkerManager) -> None:
@@ -3996,10 +3153,13 @@ class TestSharingThisEngineBetweenRuns:
         _register_session(worker_manager)
         # Still starting, which counts as much as a running one.
         worker_manager._hosted_workers["w-other"] = _HostedWorker(
-            worker_key="another-sess/lib", engine_id="another-artist-engine", session_id="another-sess"
+            worker_key="another-sess/lib",
+            engine_id="another-artist-engine",
+            session_id="another-sess",
+            library_name="lib",
         )
 
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+        with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:
             result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
@@ -4017,113 +3177,6 @@ class TestSharingThisEngineBetweenRuns:
         worker_manager._managed_worker_processes["Local Library"] = _worker_proc_mock()
 
         assert worker_manager._capacity_refusal(f"{_ARTIST_SESSION}/{_LIBRARY}") is None
-
-
-async def _checked_locally(
-    worker_manager: WorkerManager, lease_id: str = "a1", worker_engine_id: str = "w1"
-) -> EventResultSuccess | EventResultFailure:
-    """Dispatch a CheckLeaseRequest the way a worker this engine runs sends one: as one of its own clients."""
-    event_manager = EventManager()
-    event_manager.register_request_handlers(worker_manager)
-    request = worker_events.CheckLeaseRequest(lease_id=lease_id, worker_engine_id=worker_engine_id)
-    return await event_manager.ahandle_request(request)
-
-
-class TestAWorkerAskingWhetherItsNodeMayRun:
-    """The worker a node was sent to asks this engine, so this engine alone decides when other engines' nodes run."""
-
-    @pytest.mark.asyncio
-    async def test_a_lease_holding_this_engine_lets_the_node_run(self, worker_manager: WorkerManager) -> None:
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        line = _FakeLine(worker_manager)
-        worker_manager._hosted_workers["w1"] = _HostedWorker(
-            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
-        )
-        hold = await _granted(worker_manager, line)
-
-        result = await _checked_locally(worker_manager)
-
-        assert isinstance(result.result, worker_events.CheckLeaseResultSuccess)
-        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
-        await hold
-
-    @pytest.mark.asyncio
-    async def test_a_lease_still_waiting_in_line_does_not(self, worker_manager: WorkerManager) -> None:
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        _FakeLine(worker_manager)
-        worker_manager._hosted_workers["w1"] = _HostedWorker(
-            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
-        )
-        acquiring = asyncio.create_task(_sent_by(_ARTIST, worker_manager.handle_acquire_lease_request, _acquire("a1")))
-        await _settle()
-
-        result = await _checked_locally(worker_manager)
-
-        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
-        assert "not holding itself" in str(result.result.result_details)
-        acquiring.cancel()
-
-    @pytest.mark.asyncio
-    async def test_a_released_lease_does_not(self, worker_manager: WorkerManager) -> None:
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        line = _FakeLine(worker_manager)
-        worker_manager._hosted_workers["w1"] = _HostedWorker(
-            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
-        )
-        hold = await _granted(worker_manager, line)
-        await _sent_by(_ARTIST, worker_manager.handle_release_lease_request, _release("a1"))
-        await hold
-
-        result = await _checked_locally(worker_manager)
-
-        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
-
-    @pytest.mark.asyncio
-    async def test_another_engine_s_lease_does_not_let_this_worker_run(self, worker_manager: WorkerManager) -> None:
-        """A worker runs only under a lease of the engine it serves, whatever lease it names."""
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        line = _FakeLine(worker_manager)
-        worker_manager._hosted_workers["w-other"] = _HostedWorker(
-            worker_key="another-sess/lib", engine_id="another-artist-engine", session_id="another-sess"
-        )
-        hold = await _granted(worker_manager, line)
-
-        result = await _checked_locally(worker_manager, worker_engine_id="w-other")
-
-        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
-        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
-        await hold
-
-    @pytest.mark.asyncio
-    async def test_a_worker_this_engine_does_not_run_is_refused(self, worker_manager: WorkerManager) -> None:
-        result = await _checked_locally(worker_manager, worker_engine_id="stranger")
-
-        assert isinstance(result.result, worker_events.CheckLeaseResultFailure)
-        assert "runs no worker stranger" in str(result.result.result_details)
-
-    @pytest.mark.asyncio
-    async def test_another_engine_may_not_ask(self, worker_manager: WorkerManager) -> None:
-        """Only the workers this engine runs reach it as its own clients."""
-        _host_engine(worker_manager)
-        _register_session(worker_manager)
-        line = _FakeLine(worker_manager)
-        worker_manager._hosted_workers["w1"] = _HostedWorker(
-            worker_key=f"{_ARTIST_SESSION}/{_LIBRARY}", engine_id=_ARTIST_ENGINE, session_id=_ARTIST_SESSION
-        )
-        hold = await _granted(worker_manager, line)
-
-        result = await _dispatched_by(
-            worker_manager, _ARTIST, worker_events.CheckLeaseRequest(lease_id="a1", worker_engine_id="w1")
-        )
-
-        assert isinstance(result, EventResultFailure)
-        assert not isinstance(result.result, worker_events.CheckLeaseResultSuccess)
-        worker_manager._engine_runs[(_ARTIST_ENGINE, "a1")].released.set()
-        await hold
 
 
 def _in_run(worker_manager: WorkerManager, run_id: str = "run-1") -> MagicMock:
