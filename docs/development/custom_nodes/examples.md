@@ -779,16 +779,17 @@ Create reusable utility functions for common operations:
 # accessor is refused while a node executes in a worker, where connections belong to the
 # orchestrator; the request is answered by whichever process owns them.
 def _connections_for(node_name: str) -> ListConnectionsForNodeResultSuccess | None:
+    from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
     from griptape_nodes.retained_mode.events.connection_events import (
         ListConnectionsForNodeRequest,
         ListConnectionsForNodeResultSuccess,
     )
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-    result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
-    if isinstance(result, ListConnectionsForNodeResultSuccess):
-        return result
-    return None
+    result = GriptapeNodes.try_request(ListConnectionsForNodeRequest(node_name=node_name))
+    if isinstance(result, ResultPayloadFailure):
+        return None
+    return result
 
 
 def _outgoing_connection_exists(source_node: str, source_param: str) -> bool:
