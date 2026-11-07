@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
@@ -51,6 +51,20 @@ class OpenWorkflowInfo:
     name: str
     workflow_file_path: str | None
     has_active_flow: bool
+
+
+@runtime_checkable
+class OpenedWorkflowResult(Protocol):
+    """A result of a request that opened a workflow, which names the workflow on its envelope.
+
+    Dispatch labels the result with `open_workflow`'s id, not the workflow the request was sent in,
+    and announces it with `WorkflowOpenedEvent`.
+
+    Args:
+        open_workflow: The workflow the request opened, or None when it opened none.
+    """
+
+    open_workflow: OpenWorkflowInfo | None
 
 
 @dataclass
@@ -152,6 +166,38 @@ class AppInitializationComplete(AppPayload):
     # URL of the static file server the host process runs for this workspace. The engine serves
     # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
+    # `Engine.engine_run_id` of the engine that sent the event, so a client that reconnects sees a
+    # restart without waiting for a heartbeat. The host process forwards a worker's copy too
+    # (`is_worker` True) carrying the worker's own id, so clients read it only when `is_worker` is False.
+    engine_run_id: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowOpenedEvent(AppPayload):
+    """A workflow opened, and its graph is built, so a client can read it right away.
+
+    Every client gets it, whichever one sent the request that opened the workflow.
+
+    Args:
+        open_workflow: The workflow that opened.
+    """
+
+    open_workflow: OpenWorkflowInfo
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowClosedEvent(AppPayload):
+    """An open workflow closed. Requests that name its id now fail with `WorkflowNotOpenResultFailure`.
+
+    Sent only for a workflow that had a `WorkflowOpenedEvent`.
+
+    Args:
+        open_workflow_id: Id of the workflow that closed.
+    """
+
+    open_workflow_id: str
 
 
 @dataclass

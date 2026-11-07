@@ -116,10 +116,13 @@ class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPaylo
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
+        open_workflow: The workflow the file opened, as the heartbeat lists it. None when the file
+            built into the open workflow the envelope named.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass

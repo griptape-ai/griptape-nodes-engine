@@ -37,8 +37,11 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    WorkflowClosedEvent,
+    WorkflowOpenedEvent,
 )
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     GriptapeNodeEvent,
     ResultPayloadFailure,
 )
@@ -250,6 +253,9 @@ class Engine:
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
         self._open_workflows = OpenWorkflowSet(self)
+        # The open workflows clients were told of with WorkflowOpenedEvent, so only those get a
+        # WorkflowClosedEvent. See `announce_opened_workflow`.
+        self._announced_workflows: set[WorkflowRuntime] = set()
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
         self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
@@ -432,6 +438,11 @@ class Engine:
     @property
     def worker_workflows(self) -> WorkerWorkflowSet:
         return self._worker_workflows
+
+    @property
+    def engine_run_id(self) -> str:
+        """Id minted when this engine started, never saved. A new one means workflow ids from before name nothing."""
+        return self._engine_run_id
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -653,25 +664,6 @@ class Engine:
         finally:
             bound_workflow.reset(token)
 
-    def enter_opened_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on `workflow`, which the current request just opened, for the rest of that request.
-
-        A load acts on the workflow it opens, so the loaded file builds into it. Only the current
-        context is bound, so dispatch's token reset ends the binding with the request.
-        """
-        bound_workflow.set(workflow)
-
-    def leave_closed_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on no workflow for the rest of the current work, if it acted on `workflow`, which it just closed.
-
-        Bound to NO_WORKFLOW rather than unbound, so the rest of the work never falls back to another
-        open workflow. A load bound to the workflow it closes then acts on the one it opens
-        (`enter_opened_workflow`). Only the current context is rebound: tasks spawned earlier keep their
-        binding, so a run that wakes after the close never reaches the next workflow.
-        """
-        if bound_workflow.get() is workflow:
-            bound_workflow.set(NO_WORKFLOW)
-
     @contextmanager
     def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:
         """Run a worker's node in the runtime it keeps for the node's orchestrator workflow.
@@ -777,10 +769,44 @@ class Engine:
     def open_workflow(self, workflow_id: str) -> WorkflowRuntime:
         """Open the registered workflow with this id and return its empty runtime.
 
+        Clients are not told yet: the request that opened it announces it once it is built
+        (`announce_opened_workflow`).
+
         Raises:
             OpenWorkflowError: That workflow, or another one, is already open.
         """
         return self._open_workflows.open(workflow_id)
+
+    def announce_opened_workflow(self, workflow_id: str) -> None:
+        """Send every client a `WorkflowOpenedEvent` for the open workflow `workflow_id`, now that it is built.
+
+        Dispatch calls this for the result of a request that opened a workflow (`OpenedWorkflowResult`),
+        so a failed open, which returns no such result, is never announced. Does nothing for a workflow
+        already announced, or not open here, such as one a worker keeps for its orchestrator.
+        """
+        workflow = self._open_workflows.find(workflow_id)
+        if workflow is None or workflow in self._announced_workflows:
+            return
+        self._announced_workflows.add(workflow)
+        opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+        self._event_manager.put_event(AppEvent(payload=opened_event))
+
+    def move_open_workflow(self, workflow: WorkflowRuntime, workflow_id: str) -> None:
+        """Keep an open workflow open under another id (`OpenWorkflowSet.move`), telling clients if it was announced.
+
+        Clients hear of it as a close of the old id followed by an open of the new one, so none keeps
+        an id that names nothing.
+
+        Raises:
+            OpenWorkflowError: That runtime is not open, or another workflow is open under the new id.
+        """
+        old_workflow_id = workflow.workflow_id
+        self._open_workflows.move(workflow, workflow_id)
+        if workflow not in self._announced_workflows:
+            return
+        self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(open_workflow_id=old_workflow_id)))
+        opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+        self._event_manager.put_event(AppEvent(payload=opened_event))
 
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
         """What clients are told of an open workflow: its id, name, file and whether it has a flow."""
@@ -900,13 +926,20 @@ class Engine:
             )
             raise OpenWorkflowError(msg)
         self._open_workflows.close(workflow)
-        self.leave_closed_workflow(workflow)
+        self._announce_closed_workflow(workflow)
 
         # Every key referring to a held object kept for it lived on a node just deleted, so each entry
         # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
         dropped = self._resource_manager.drop_objects_for_workflow(workflow.workflow_id)
         if dropped:
             logger.debug("Released %d held object(s) while closing the workflow.", dropped)
+
+    def _announce_closed_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Send every client a `WorkflowClosedEvent` for `workflow`, which just closed, if they were told it opened."""
+        if workflow not in self._announced_workflows:
+            return
+        self._announced_workflows.discard(workflow)
+        self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(open_workflow_id=workflow.workflow_id)))
 
     def _delete_workflow_flows(self, workflow: WorkflowRuntime) -> None:
         """Delete `workflow`'s flows, which deletes their nodes.
