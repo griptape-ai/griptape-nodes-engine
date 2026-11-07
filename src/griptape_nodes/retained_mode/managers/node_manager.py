@@ -2042,9 +2042,7 @@ class NodeManager(EngineScoped):
             )
             raise _ConnectedDestinationError(msg)
 
-        connection_mgr = workflow.flows.connections
-        connection_ids = connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, [])
-        sources = [connection_mgr.connections[connection_id].source_node for connection_id in connection_ids]
+        sources = self._sources_through_group_proxies(workflow, node_name, parameter_name)
         provider = next((source for source in sources if isinstance(source, provider_type)), None)
         if provider is None:
             return _ConnectedDestination(spec=None, details=f"No output settings are connected to {target}.")
@@ -2059,6 +2057,29 @@ class NodeManager(EngineScoped):
         return _ConnectedDestination(
             spec=destination.to_spec(), details=f"Read the destination '{provider_name}' supplies to {target}."
         )
+
+    def _sources_through_group_proxies(
+        self, workflow: WorkflowRuntime, node_name: str, parameter_name: str
+    ) -> list[BaseNode]:
+        """The nodes feeding ``node_name.parameter_name``, looking through group proxy parameters.
+
+        A wire that crosses a group's boundary, into it or out of it, runs through a proxy parameter on the
+        group, so the source a node sees can be the group. Following what feeds that proxy finds the node
+        at the other end.
+        """
+        connection_mgr = workflow.flows.connections
+        sources: list[BaseNode] = []
+        for connection_id in connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, []):
+            connection = connection_mgr.connections[connection_id]
+            if isinstance(connection.source_node, SubflowNodeGroup):
+                sources.extend(
+                    self._sources_through_group_proxies(
+                        workflow, connection.source_node.name, connection.source_parameter.name
+                    )
+                )
+            else:
+                sources.append(connection.source_node)
+        return sources
 
     @handles(ListParametersOnNodeRequest)
     def on_list_parameters_on_node_request(
