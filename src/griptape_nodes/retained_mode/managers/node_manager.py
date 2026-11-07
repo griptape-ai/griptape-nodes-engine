@@ -387,7 +387,7 @@ class _NodeInstantiationDeniedError(Exception):
     """
 
     def __init__(self, denial: CheckpointDenial, library_name: str) -> None:
-        super().__init__(denial.reason())
+        super().__init__(denial.reason(separator="\n"))
         self.denial = denial
         self.library_name = library_name
 

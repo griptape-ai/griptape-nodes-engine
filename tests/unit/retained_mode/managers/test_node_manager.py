@@ -801,7 +801,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
 
         assert excinfo.value.denial is denial
         assert excinfo.value.library_name == self._LIBRARY_NAME
-        assert str(excinfo.value) == "First rule applies. Second rule applies."
+        assert str(excinfo.value) == "First rule applies.\nSecond rule applies."
 
     def test_create_node_substitutes_a_proxy_carrying_the_structured_denial(self, engine: Engine) -> None:
         from griptape_nodes.exe_types.core_types import ParameterMessage
