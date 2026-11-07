@@ -14,6 +14,8 @@ These tests cover small, near-pure helpers that decide loop control flow:
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
   creations from reaching editors.
+* ``_get_start_node_item_values`` / ``_extract_iteration_results_from_subprocess`` - collect
+  an item wired straight from the loop's start node into the end node's ``new_item_to_add``.
 """
 
 import logging
@@ -626,3 +628,68 @@ class TestSilencePackagedNodeCreationBroadcasts:
         package_result = _make_package_result_with_nodes(0)
         NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
         assert package_result.serialized_flow_commands.serialized_node_commands == []
+
+
+def _make_start_wired_end_node(source_param: str) -> tuple[MagicMock, list[MagicMock]]:
+    """Mock legacy end node whose new_item_to_add is wired from its start node's ``source_param``."""
+    start_node = MagicMock()
+    start_node.name = "LoopStart"
+    start_node._get_iteration_items.return_value = ["a", "b", "c"]
+    start_node.get_all_iteration_values.return_value = [10, 20, 30]
+    end_node = MagicMock(spec=BaseIterativeEndNode)
+    end_node.name = "LoopEnd"
+    end_node.start_node = start_node
+    conn = MagicMock()
+    conn.target_parameter_name = "new_item_to_add"
+    conn.source_node_name = "LoopStart"
+    conn.source_parameter_name = source_param
+    return end_node, [conn]
+
+
+class TestGetStartNodeItemValues:
+    """An item wired from the unpackaged start node takes each iteration's start node value."""
+
+    def test_returns_current_item_per_iteration(self) -> None:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        values = _make_executor()._get_start_node_item_values(end_node, connections, [0, 2])
+        assert values == {0: "a", 2: "c"}
+
+    def test_returns_loop_values_for_index(self) -> None:
+        end_node, connections = _make_start_wired_end_node("index")
+        values = _make_executor()._get_start_node_item_values(end_node, connections, [0, 1, 2])
+        assert values == {0: 10, 1: 20, 2: 30}
+
+    def test_returns_none_when_item_comes_from_a_body_node(self) -> None:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        connections[0].source_node_name = "Body"
+        assert _make_executor()._get_start_node_item_values(end_node, connections, [0]) is None
+
+    def test_returns_none_for_group_end_node(self) -> None:
+        _, connections = _make_start_wired_end_node("current_item")
+        group = MagicMock(spec=BaseIterativeNodeGroup)
+        assert _make_executor()._get_start_node_item_values(group, connections, [0]) is None
+
+
+class TestExtractIterationResultsFromSubprocessStartNodeItem:
+    """Isolated and publisher loops collect a start-node item for each successful iteration only."""
+
+    def test_collects_start_node_item_for_successful_iterations(self) -> None:
+        end_node, connections = _make_start_wired_end_node("current_item")
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.incoming_connections = connections
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        iteration_outputs: list[tuple[int, bool, dict[str, Any] | None]] = [
+            (0, True, {}),
+            (1, False, None),
+            (2, True, {}),
+        ]
+
+        with patch.object(NodeExecutor, "_extract_parameter_output_values", return_value={}):
+            results, successful, _ = executor._extract_iteration_results_from_subprocess(
+                iteration_outputs, cast("Any", _make_package_result()), end_node
+            )
+
+        assert successful == [0, 2]
+        assert results == {0: "a", 2: "c"}

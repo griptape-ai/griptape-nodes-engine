@@ -64,6 +64,16 @@ class LoopBodyNode(DataNode):
         self.parameter_output_values["result"] = self.get_parameter_value("text") or ""
 
 
+class FailOnSecondNode(LoopBodyNode):
+    """A loop body node that raises on the item ``"second"``, so one pass fails."""
+
+    def process(self) -> None:
+        if self.get_parameter_value("text") == "second":
+            msg = "FailOnSecondNode refuses 'second'"
+            raise RuntimeError(msg)
+        super().process()
+
+
 class LoopJoinNode(DataNode):
     """A body node with two inputs, so one can come from outside the loop: ``prefix`` + ``item``."""
 

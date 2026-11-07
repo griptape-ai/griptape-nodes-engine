@@ -52,6 +52,15 @@
       }
     },
     {
+      "class_name": "FailOnSecondNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Copies `text` to `result`, raising on the item `second`",
+        "display_name": "Fail On Second"
+      }
+    },
+    {
       "class_name": "LoopJoinNode",
       "file_path": "loop_nodes.py",
       "metadata": {
