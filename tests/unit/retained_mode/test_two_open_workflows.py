@@ -1204,31 +1204,11 @@ def saved_workflow_name(engine: Engine, spike_library: None, tmp_path: Path) -> 
 class TestLoadingASavedFileWhileAnotherIsOpen:
     """Scenario (i)."""
 
-    def test_a_clean_slate_load_into_b_leaves_a_open(self, engine: Engine, saved_workflow_name: str) -> None:
-        _allow_several_open(engine)
-        a = _open(engine, "A")
-        b = _open(engine, "B")
-        _make_canvas(engine, a)
-        _make_node(engine, a, "_ValueNode", "survivor")
-
-        result = asyncio.run(
-            _send_async(
-                engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=True), b
-            )
-        )
-
-        assert result.succeeded(), result.result_details
-        open_now = engine.open_workflows.all_open()
-        assert open_now[0] is a
-        assert b not in open_now
-        assert len(open_now) == 2  # noqa: PLR2004
-        assert a.objects.has("survivor")
-
     @pytest.mark.parametrize("request_type", ["registry", "scratch"])
-    def test_a_clean_slate_load_with_no_id_refuses_while_several_are_open(
+    def test_a_clean_slate_load_that_replaces_nothing_opens_beside_the_others(
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
-        """A tab that names no workflow must not close every other tab's workflow."""
+        """A load that names no workflow to replace must not close any tab's workflow."""
         _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
@@ -1242,25 +1222,33 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         result = asyncio.run(_send_async(engine, request, None))
 
-        assert _failed_for_no_workflow_named(result), result.result_details
-        assert engine.open_workflows.all_open() == [a, b]
+        assert result.succeeded(), result.result_details
+        open_now = engine.open_workflows.all_open()
+        assert open_now[:2] == [a, b]
+        assert len(open_now) == 3  # noqa: PLR2004
 
-    def test_a_load_without_a_clean_slate_into_an_open_tab_fails_with_a_registry_failure(
-        self, engine: Engine, saved_workflow_name: str
+    @pytest.mark.parametrize("request_type", ["registry", "scratch"])
+    def test_a_load_ignores_an_envelope_naming_a_closed_workflow(
+        self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
-        """Naming an open workflow without a clean slate is refused as the request's own failure."""
+        """A tab whose workflow closed can still open another; opens never read the envelope."""
         _allow_several_open(engine)
         a = _open(engine, "A")
-        b = _open(engine, "B")
+        closed = _open(engine, "closed")
+        _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), closed)
+        assert engine.open_workflows.all_open() == [a]
+        request: RequestPayload = RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)
+        if request_type == "scratch":
+            file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+            assert file_path is not None
+            request = RunWorkflowFromScratchRequest(file_path=file_path)
 
-        result = asyncio.run(
-            _send_async(
-                engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=False), b
-            )
-        )
+        result = asyncio.run(_send_async(engine, request, closed))
 
-        assert isinstance(result, RunWorkflowFromRegistryResultFailure), result.result_details
-        assert engine.open_workflows.all_open() == [a, b]
+        assert result.succeeded(), result.result_details
+        open_now = engine.open_workflows.all_open()
+        assert open_now[0] is a
+        assert len(open_now) == 2  # noqa: PLR2004
 
     def test_loading_a_workflow_that_is_already_open_fails_with_a_registry_failure(
         self, engine: Engine, saved_workflow_name: str
@@ -1306,7 +1294,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert loaded.objects.get_filtered_subset() != {}
         assert a.objects.has("canvas")
 
-    def test_a_load_from_scratch_into_b_leaves_a_open_and_names_the_workflow_it_opened(
+    def test_a_load_from_scratch_leaves_the_others_open_and_names_the_workflow_it_opened(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
@@ -1316,24 +1304,23 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         b = _open(engine, "B")
         _make_canvas(engine, a)
 
-        result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), b))
+        result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), None))
 
         assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
         open_now = engine.open_workflows.all_open()
-        assert open_now[0] is a
-        assert b not in open_now
+        assert open_now[:2] == [a, b]
         assert result.workflow_id == open_now[-1].workflow_id
         assert a.objects.has("canvas")
 
     def test_a_load_from_scratch_stays_bound_to_the_workflow_it_opened_after_the_run(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
-        """Post-dispatch hooks act on the workflow the file opened, not the one the clean slate closed."""
+        """Post-dispatch hooks act on the workflow the file opened, not one already open."""
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
         assert file_path is not None
         _allow_several_open(engine)
         _open(engine, "A")
-        b = _open(engine, "B")
+        _open(engine, "B")
         bound_in_hook: list[object] = []
 
         def record_binding(_request: RunWorkflowFromScratchRequest, _result: ResultPayload) -> None:
@@ -1341,7 +1328,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         engine.event_manager.add_post_dispatch_hook(RunWorkflowFromScratchRequest, record_binding)
         try:
-            result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), b))
+            result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), None))
         finally:
             engine.event_manager.remove_post_dispatch_hook(RunWorkflowFromScratchRequest, record_binding)
 
