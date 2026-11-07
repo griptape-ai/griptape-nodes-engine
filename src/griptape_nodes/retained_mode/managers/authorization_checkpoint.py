@@ -144,5 +144,8 @@ class CheckpointDenial:
         messages = self.messages()
         if separator is not None:
             return separator.join(messages) or default
-        sentences = [message if message.endswith((".", "!", "?")) else f"{message}." for message in messages]
+        stripped = (message.rstrip() for message in messages)
+        sentences = [
+            message if message.endswith((".", "!", "?", "…")) else f"{message}." for message in stripped if message
+        ]
         return " ".join(sentences) or default

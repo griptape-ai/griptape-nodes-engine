@@ -27,6 +27,10 @@ class TestCheckpointDenialReason:
         )
         assert denial.reason() == "Labs libraries are disabled. Ask your admin!"
 
+    def test_ignores_trailing_whitespace_when_terminating(self) -> None:
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail="Denied.\n"), CheckpointFailure(detail="Wait…")))
+        assert denial.reason() == "Denied. Wait…"
+
     def test_honors_custom_separator(self) -> None:
         denial = CheckpointDenial(
             failures=(
