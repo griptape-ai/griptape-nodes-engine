@@ -476,8 +476,7 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """
 
     payload: E
-    # Required, with None written out for a host event, so an event can't lose its workflow by omission.
-    open_workflow_id: str | None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an ExecutionEvent, inferring the generic type if needed."""
