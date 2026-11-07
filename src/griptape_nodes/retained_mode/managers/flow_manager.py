@@ -357,17 +357,6 @@ class FlowManager(EngineScoped):
                 return True
         return False
 
-    def get_connected_output_parameters(self, node: BaseNode, param: Parameter) -> list[tuple[BaseNode, Parameter]]:
-        """Get connected output parameters.
-
-        Edge method for code not handed a workflow; engine code calls `get_connected_output_parameters_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        workflow = self.engine.current_workflow()
-        return self.get_connected_output_parameters_in(workflow, node, param)
-
     def get_connected_output_parameters_in(
         self, workflow: WorkflowRuntime, node: BaseNode, param: Parameter
     ) -> list[tuple[BaseNode, Parameter]]:
@@ -423,20 +412,6 @@ class FlowManager(EngineScoped):
 
         return flow_connections
 
-    def get_parent_flow(self, flow_name: str) -> str | None:
-        """The name of the flow's parent, None for the top-level flow.
-
-        Edge method for code not handed a workflow; engine code calls `get_parent_flow_in`.
-
-        Raises:
-            ValueError: No flow of that name is in the open workflow, or no workflow is open.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            msg = f"Flow with name {flow_name} doesn't exist"
-            raise ValueError(msg)
-        return self.get_parent_flow_in(workflow, flow_name)
-
     def get_parent_flow_in(self, workflow: WorkflowRuntime, flow_name: str) -> str | None:
         """The name of the flow's parent, None for the top-level flow.
 
@@ -448,13 +423,6 @@ class FlowManager(EngineScoped):
             return name_to_parent_name[flow_name]
         msg = f"Flow with name {flow_name} doesn't exist"
         raise ValueError(msg)
-
-    def reparent_flow(self, flow_name: str, new_parent_flow_name: str) -> None:
-        """Move a Flow of the open workflow under a different parent Flow; see `reparent_flow_in`.
-
-        Edge method for code not handed a workflow.
-        """
-        self.reparent_flow_in(self.engine.current_workflow(), flow_name, new_parent_flow_name)
 
     def reparent_flow_in(self, workflow: WorkflowRuntime, flow_name: str, new_parent_flow_name: str) -> None:
         """Move a Flow under a different parent Flow.
@@ -960,24 +928,6 @@ class FlowManager(EngineScoped):
             raise KeyError(msg)
 
         return flow
-
-    def unresolve_all_nodes_in_flow(self, flow_name: str) -> None:
-        """Reset all nodes in a flow to UNRESOLVED state.
-
-        Edge method for code not handed a workflow; engine and `exe_types` code calls
-        `unresolve_all_nodes_in_flow_in`.
-
-        Args:
-            flow_name: Name of the flow whose nodes should be unresolved
-
-        Raises:
-            KeyError: No flow of that name is in the open workflow, or no workflow is open.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            msg = f"Flow with name {flow_name} doesn't exist"
-            raise KeyError(msg)
-        self.unresolve_all_nodes_in_flow_in(workflow, flow_name)
 
     def unresolve_all_nodes_in_flow_in(self, workflow: WorkflowRuntime, flow_name: str) -> None:
         """Reset all nodes in `workflow`'s flow `flow_name` to UNRESOLVED state."""
@@ -2449,15 +2399,11 @@ class FlowManager(EngineScoped):
         """Cancel a run of `workflow`, returning whether there was one; see `cancel_run`."""
         return await self.cancel_run(run_id, flows=workflow.flows)
 
-    async def cancel_run(self, run_id: str, *, flows: WorkflowFlows | None = None) -> bool:
-        """Cancel a run of the current workflow, or of the line `flows` names, returning whether there was one.
+    async def cancel_run(self, run_id: str, *, flows: WorkflowFlows) -> bool:
+        """Cancel a run in the line `flows` names, returning whether there was one.
 
         A waiting run leaves the line, the run in progress stops.
         """
-        if flows is None:
-            flows = self._current_flows_or_none()
-        if flows is None:
-            return False
         waiting = [run for run in flows.run_queue.snapshot() if run.run_id == run_id]
         if waiting:
             self._turn_away(flows, waiting, "it was cancelled.")
@@ -2720,9 +2666,6 @@ class FlowManager(EngineScoped):
             return False
         return self._run_is_advancing(flows)
 
-    async def cancel_flow_run(self) -> None:
-        await self._cancel_run(self._current_flows())
-
     async def _cancel_run(self, flows: WorkflowFlows) -> None:
         """Cancel the run in `flows`, the run state of the workflow the run belongs to."""
         if not self._flow_is_running(flows):
@@ -2772,7 +2715,7 @@ class FlowManager(EngineScoped):
                 logger.exception("Failed to cancel a run that had already failed. Abandoning it instead.")
 
         if cancelled_gracefully:
-            # cancel_flow_run already reset the machine and told the editor the run is over.
+            # _cancel_run already reset the machine and told the editor the run is over.
             return
 
         run_seconds = None
@@ -2826,39 +2769,12 @@ class FlowManager(EngineScoped):
         self._global_flow_queue.task_done()
         return queue_item.node
 
-    def clear_execution_queue(self, flow: ControlFlow) -> None:
-        """Clear all nodes from the global execution queue, nothing when no workflow is open.
-
-        Edge method for code not handed a workflow; engine code calls `clear_execution_queue_in`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return
-        self.clear_execution_queue_in(workflow, flow)
-
     def clear_execution_queue_in(self, workflow: WorkflowRuntime, flow: ControlFlow) -> None:
         """Clear all nodes from the workflow's execution queue when `flow` is the one it is running."""
         flows = workflow.flows
         machine = flows.global_control_flow_machine
         if machine and machine.context.flow_name == flow.name:
             flows.global_flow_queue.queue.clear()
-
-    def has_connection(
-        self,
-        source_node: BaseNode,
-        source_parameter: Parameter,
-        target_node: BaseNode,
-        target_parameter: Parameter,
-    ) -> bool:
-        """Check if a connection exists between the specified nodes and parameters.
-
-        Edge method for code not handed a workflow; engine code calls `has_connection_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        workflow = self.engine.current_workflow()
-        return self.has_connection_in(workflow, source_node, source_parameter, target_node, target_parameter)
 
     # Internal execution queue helper methods to consolidate redundant operations
     async def _handle_flow_start_if_not_running(
@@ -3057,16 +2973,6 @@ class FlowManager(EngineScoped):
             # Clear entry control parameter for new execution
             node.set_entry_control_parameter(None)
 
-    def flow_state(self, flow: ControlFlow) -> tuple[list[str], list[str], list[str]]:
-        """The control, resolving and involved node names of the open workflow's run, empty when no workflow is open.
-
-        Edge method for code not handed a workflow; engine code calls `flow_state_in`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return [], [], []
-        return self.flow_state_in(workflow, flow)
-
     def flow_state_in(self, workflow: WorkflowRuntime, flow: ControlFlow) -> tuple[list[str], list[str], list[str]]:
         """The control, resolving and involved node names of the workflow's run."""
         if not self._flow_is_running(workflow.flows):
@@ -3123,17 +3029,6 @@ class FlowManager(EngineScoped):
                 nodes_to_visit.extend(node.nodes.values())
         return involved_node_names
 
-    def get_start_node_from_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:
-        """The node a run of `flow` starts from to reach `node`.
-
-        Edge method for code not handed a workflow; engine code calls `get_start_node_from_node_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        workflow = self.engine.current_workflow()
-        return self.get_start_node_from_node_in(workflow, flow, node)
-
     def get_start_node_from_node_in(
         self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode
     ) -> BaseNode | None:
@@ -3149,17 +3044,6 @@ class FlowManager(EngineScoped):
             curr_node = prev_node
             prev_node = self.get_prev_node_in(workflow, flow, prev_node)
         return curr_node
-
-    def get_prev_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:
-        """The node whose control output leads into `node`.
-
-        Edge method for code not handed a workflow; engine code calls `get_prev_node_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        workflow = self.engine.current_workflow()
-        return self.get_prev_node_in(workflow, flow, node)
 
     def get_prev_node_in(self, workflow: WorkflowRuntime, flow: ControlFlow, node: BaseNode) -> BaseNode | None:  # noqa: ARG002
         """The node whose control output leads into `node`."""
@@ -3178,16 +3062,6 @@ class FlowManager(EngineScoped):
                             continue
                         return connection.get_source_node()
         return None
-
-    def get_start_node_queue(self) -> Queue | None:
-        """Fill the open workflow's run queue with the nodes a run starts from, None when there are none.
-
-        Edge method for code not handed a workflow; engine code calls `get_start_node_queue_in`.
-
-        Raises:
-            OpenWorkflowError: No workflow is open, or more than one is.
-        """
-        return self.get_start_node_queue_in(self.engine.current_workflow())
 
     def get_start_node_queue_in(self, workflow: WorkflowRuntime) -> Queue | None:
         """Fill the workflow's run queue with the nodes a run starts from, None when there are none."""
@@ -3338,17 +3212,13 @@ class FlowManager(EngineScoped):
 
         return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes)
 
-    def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:
-        """Edge method for code not handed a workflow."""
-        return self.get_connected_input_from_node_in(self.engine.current_workflow(), flow, node)
-
     def get_connected_input_from_node_in(
         self,
         workflow: WorkflowRuntime,
         flow: ControlFlow,  # noqa: ARG002
         node: BaseNode,
     ) -> list[tuple[BaseNode, Parameter]]:
-        """See `get_connected_input_from_node`, for `workflow`'s connections."""
+        """Every (source node, source parameter) connected into `node` in the workflow."""
         global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.incoming_index:
@@ -3360,17 +3230,13 @@ class FlowManager(EngineScoped):
                 connections.append((connection.source_node, connection.source_parameter))
         return connections
 
-    def get_connected_output_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:
-        """Edge method for code not handed a workflow."""
-        return self.get_connected_output_from_node_in(self.engine.current_workflow(), flow, node)
-
     def get_connected_output_from_node_in(
         self,
         workflow: WorkflowRuntime,
         flow: ControlFlow,  # noqa: ARG002
         node: BaseNode,
     ) -> list[tuple[BaseNode, Parameter]]:
-        """See `get_connected_output_from_node`, for `workflow`'s connections."""
+        """Every (target node, target parameter) `node` connects out to in the workflow."""
         global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.outgoing_index:
@@ -3382,15 +3248,6 @@ class FlowManager(EngineScoped):
                 connections.append((connection.target_node, connection.target_parameter))
         return connections
 
-    def get_connected_input_parameters(
-        self,
-        flow: ControlFlow,
-        node: BaseNode,
-        param: Parameter,
-    ) -> list[tuple[BaseNode, Parameter]]:
-        """Edge method for code not handed a workflow."""
-        return self.get_connected_input_parameters_in(self.engine.current_workflow(), flow, node, param)
-
     def get_connected_input_parameters_in(
         self,
         workflow: WorkflowRuntime,
@@ -3398,7 +3255,7 @@ class FlowManager(EngineScoped):
         node: BaseNode,
         param: Parameter,
     ) -> list[tuple[BaseNode, Parameter]]:
-        """See `get_connected_input_parameters`, for `workflow`'s connections."""
+        """Every (source node, source parameter) connected into `node`'s `param` in the workflow."""
         global_connections = workflow.flows.connections
         connections = []
         if node.name in global_connections.incoming_index:
@@ -3409,12 +3266,8 @@ class FlowManager(EngineScoped):
                     connections.append((connection.source_node, connection.source_parameter))
         return connections
 
-    def get_connections_on_node(self, node: BaseNode) -> list[BaseNode] | None:
-        """Edge method for code not handed a workflow."""
-        return self.get_connections_on_node_in(self.engine.current_workflow(), node)
-
     def get_connections_on_node_in(self, workflow: WorkflowRuntime, node: BaseNode) -> list[BaseNode] | None:
-        """See `get_connections_on_node`, for `workflow`'s connections."""
+        """The nodes connected to `node` in the workflow."""
         return self._connected_nodes(workflow.flows.connections, node)
 
     def get_all_connected_nodes(self, node: BaseNode) -> list[BaseNode]:

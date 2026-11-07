@@ -1047,9 +1047,11 @@ class TestReparentFlow:
         assert isinstance(inner, CreateFlowResultSuccess)
 
         flow_manager = engine.flow_manager
-        flow_manager.reparent_flow(inner.flow_name, outer.flow_name)
+        flow_manager.reparent_flow_in(flow_manager.engine.current_workflow(), inner.flow_name, outer.flow_name)
 
-        assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
+        assert (
+            flow_manager.get_parent_flow_in(flow_manager.engine.current_workflow(), inner.flow_name) == outer.flow_name
+        )
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_rejects_unknown_flows(self, engine: Engine) -> None:
@@ -1061,9 +1063,9 @@ class TestReparentFlow:
         flow_manager = engine.flow_manager
 
         with pytest.raises(ValueError, match="doesn't exist"):
-            flow_manager.reparent_flow("ghost", real.flow_name)
+            flow_manager.reparent_flow_in(flow_manager.engine.current_workflow(), "ghost", real.flow_name)
         with pytest.raises(ValueError, match="doesn't exist"):
-            flow_manager.reparent_flow(real.flow_name, "ghost")
+            flow_manager.reparent_flow_in(flow_manager.engine.current_workflow(), real.flow_name, "ghost")
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_rejects_making_a_flow_its_own_parent(self, engine: Engine) -> None:
@@ -1074,7 +1076,7 @@ class TestReparentFlow:
         assert isinstance(solo, CreateFlowResultSuccess)
 
         with pytest.raises(ValueError, match="its own parent"):
-            engine.flow_manager.reparent_flow(solo.flow_name, solo.flow_name)
+            engine.flow_manager.reparent_flow_in(engine.current_workflow(), solo.flow_name, solo.flow_name)
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_rejects_moving_a_flow_inside_its_own_descendant(self, engine: Engine) -> None:
@@ -1091,11 +1093,13 @@ class TestReparentFlow:
 
         flow_manager = engine.flow_manager
         with pytest.raises(ValueError, match="already inside"):
-            flow_manager.reparent_flow(outer.flow_name, inner.flow_name)
+            flow_manager.reparent_flow_in(flow_manager.engine.current_workflow(), outer.flow_name, inner.flow_name)
 
         # The rejected move must leave the hierarchy untouched.
-        assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
-        assert flow_manager.get_parent_flow(outer.flow_name) is None
+        assert (
+            flow_manager.get_parent_flow_in(flow_manager.engine.current_workflow(), inner.flow_name) == outer.flow_name
+        )
+        assert flow_manager.get_parent_flow_in(flow_manager.engine.current_workflow(), outer.flow_name) is None
 
 
 @pytest.fixture
@@ -1218,7 +1222,7 @@ class TestRunsTakeTurns:
         await asyncio.sleep(0)
         waiting_run = flow_manager.submit_run(_Spec("second", second))
 
-        assert await flow_manager.cancel_run(waiting_run.run_id) is True
+        assert await flow_manager.cancel_run_in(engine.current_workflow(), waiting_run.run_id) is True
         first_may_end.set()
         await asyncio.wait_for(running, timeout=1.0)
 
@@ -1305,7 +1309,7 @@ class TestRunsEndCleanly:
         waiting = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", second)))
         await asyncio.sleep(0)
 
-        assert await flow_manager.cancel_run(first_run.run_id) is True
+        assert await flow_manager.cancel_run_in(engine.current_workflow(), first_run.run_id) is True
         may_start.set()
 
         first_result = await asyncio.wait_for(first_request, timeout=1.0)
@@ -1323,7 +1327,7 @@ class TestRunsEndCleanly:
             return _ran("body")
 
         run = flow_manager.submit_run(_Spec("flow", body))
-        assert await flow_manager.cancel_run(run.run_id) is True
+        assert await flow_manager.cancel_run_in(engine.current_workflow(), run.run_id) is True
 
         result = await asyncio.wait_for(run.outcome, timeout=1.0)
         assert "did not start: it was cancelled" in str(result.result_details)
@@ -1424,7 +1428,7 @@ class TestRunsEndCleanly:
             await asyncio.sleep(0)
 
             with ThreadRunner() as runner:
-                runner.run(flow_manager.cancel_run(first_run.run_id))
+                runner.run(flow_manager.cancel_run_in(engine.current_workflow(), first_run.run_id))
 
             result = await asyncio.wait_for(waiting, timeout=1.0)
         assert str(result.result_details) == "second ran"
@@ -1459,7 +1463,7 @@ class TestRunsEndCleanly:
             first_run.ended.add_done_callback(on_run_ended)
 
             with ThreadRunner() as runner:
-                runner.run(flow_manager.cancel_run(first_run.run_id))
+                runner.run(flow_manager.cancel_run_in(engine.current_workflow(), first_run.run_id))
 
             await asyncio.wait_for(reported.wait(), timeout=1.0)
         assert loops == [asyncio.get_running_loop()]
@@ -1568,7 +1572,7 @@ class TestRunSpecHooks:
         spec = _HearingSpec("second", never)
         waiting_run = flow_manager.submit_run(spec)
 
-        await flow_manager.cancel_run(waiting_run.run_id)
+        await flow_manager.cancel_run_in(engine.current_workflow(), waiting_run.run_id)
         await asyncio.wait_for(waiting_run.ended, timeout=1.0)
 
         assert spec.turned_away == ["The run did not start: it was cancelled."]
@@ -1750,7 +1754,7 @@ class TestRunResultsNameTheirRun:
         await asyncio.sleep(0)
         waiting_run = flow_manager.submit_run(_Spec("second", second))
 
-        await flow_manager.cancel_run(waiting_run.run_id)
+        await flow_manager.cancel_run_in(engine.current_workflow(), waiting_run.run_id)
         first_may_end.set()
         await asyncio.wait_for(running, timeout=1.0)
 

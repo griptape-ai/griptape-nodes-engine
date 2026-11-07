@@ -263,7 +263,7 @@ class TestNodeGroupRoundTrip:
         inner_subflow = restored_inner.metadata.get("subflow_name")
         outer_subflow = restored_outer.metadata.get("subflow_name")
         assert isinstance(inner_subflow, str), "inner group lost its subflow on load"
-        assert engine.flow_manager.get_parent_flow(inner_subflow) == outer_subflow
+        assert engine.flow_manager.get_parent_flow_in(engine.current_workflow(), inner_subflow) == outer_subflow
 
     def test_creates_each_connection_once_even_though_every_level_reports_it(
         self, engine: Engine, library_name: str, monkeypatch: pytest.MonkeyPatch

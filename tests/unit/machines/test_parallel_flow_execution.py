@@ -256,7 +256,7 @@ class TestFlowManagerDagBuilderIntegration:
         flow_manager._global_control_flow_machine = mock_control_flow
 
         with patch.object(flow_manager, "_flow_is_running", return_value=True):
-            await flow_manager.cancel_flow_run()
+            await flow_manager._cancel_run(flow_manager._current_flows())
 
         assert flow_manager.global_dag_builder.node_to_reference == {}
 
@@ -487,7 +487,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
     async def test_a_cancel_that_never_reaches_error_state_still_gives_nodes_back(self) -> None:
         """The path a user-initiated cancel actually takes.
 
-        `cancel_flow_run` calls `reset(cancel=True)`, which bumps the generation; every
+        `_cancel_run` calls `reset(cancel=True)`, which bumps the generation; every
         `was_reset_since` guard in ExecuteDagState then abandons the run by returning None,
         without entering ErrorState. So the ErrorState reset never runs for this path, and a
         cancelled node kept reporting RESOLVING -- the editor spinning on it indefinitely.

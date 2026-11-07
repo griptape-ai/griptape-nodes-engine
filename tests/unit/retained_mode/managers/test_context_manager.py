@@ -34,6 +34,14 @@ from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from tests.workflow_context import empty_workflow_registry
 
 
+def _file_path(context_manager: ContextManager) -> str | None:
+    """The current workflow's file path, or None while it is unsaved."""
+    absolute_path = context_manager.get_current_workflow().absolute_path
+    if absolute_path is None:
+        return None
+    return str(absolute_path)
+
+
 def _metadata(name: str) -> WorkflowMetadata:
     return WorkflowMetadata(
         name=name,
@@ -152,8 +160,8 @@ class TestPushWorkflow:
                 workflow = context_manager.get_current_workflow()
                 assert not workflow.is_saved
                 assert workflow.metadata.name == "not_written_yet"
-                assert context_manager.get_current_workflow_file_path() is None
-                assert context_manager.get_current_workflow_working_directory() == str(workflow_file.parent)
+                assert _file_path(context_manager) is None
+                assert context_manager.get_current_workflow().working_directory == str(workflow_file.parent)
             finally:
                 context_manager.pop_workflow()
 
@@ -175,11 +183,11 @@ class TestPushWorkflow:
                 workflow_file.write_text("# stub")
                 context_manager.push_workflow(file_path=str(workflow_file))
 
-                assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+                assert _file_path(context_manager) == str(workflow_file)
 
                 # Simulate a project switch: the workspace moves under the open workflow.
                 config_manager.workspace_path = Path(other_dir)
-                assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+                assert _file_path(context_manager) == str(workflow_file)
             finally:
                 config_manager.workspace_path = original
                 context_manager.pop_workflow()
@@ -195,7 +203,7 @@ class TestPushWorkflow:
 
         context_manager.push_workflow(workflow_name="not_registered_anywhere")
         try:
-            assert context_manager.get_current_workflow_file_path() is None
+            assert _file_path(context_manager) is None
         finally:
             context_manager.pop_workflow()
 
@@ -236,22 +244,15 @@ class TestPushWorkflow:
                     context_manager.push_workflow(workflow_name="subdir/my_flow")
                     try:
                         expected = str(workflow_file.resolve())
-                        assert context_manager.get_current_workflow_file_path() == expected
+                        assert _file_path(context_manager) == expected
 
                         # Simulate a project switch: the key is now meaningless, the path is not.
                         config_manager.workspace_path = Path(other_dir)
-                        assert context_manager.get_current_workflow_file_path() == expected
+                        assert _file_path(context_manager) == expected
                     finally:
                         context_manager.pop_workflow()
             finally:
                 config_manager.workspace_path = original
-
-    def test_get_current_workflow_file_path_requires_a_workflow(self, engine: Engine) -> None:
-        """Asking outside a workflow context is an error, matching get_current_workflow_name."""
-        context_manager = engine.context_manager
-
-        with pytest.raises(context_manager.NoActiveWorkflowError):
-            context_manager.get_current_workflow_file_path()
 
     def test_push_workflow_raises_when_both_provided(self, engine: Engine) -> None:
         """Raises ValueError when both workflow_name and file_path are given."""
@@ -324,7 +325,7 @@ class TestWorkflowWorkingDirectory:
                 assert isinstance(result, SetWorkflowContextSuccess)
                 # The folder is NOT the registry key: the workflow is still unsaved.
                 assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
-                assert context_manager.get_current_workflow_file_path() is None
+                assert _file_path(context_manager) is None
 
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
             finally:
@@ -348,7 +349,7 @@ class TestWorkflowWorkingDirectory:
             try:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
-                assert context_manager.get_current_workflow_working_directory() is None
+                assert context_manager.get_current_workflow().working_directory is None
 
                 assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
             finally:
@@ -434,7 +435,7 @@ class TestWorkflowWorkingDirectory:
                 assert isinstance(result, SetWorkflowContextSuccess)
 
                 expected = workspace / "shots" / "sh020"
-                assert context_manager.get_current_workflow_working_directory() == str(expected)
+                assert context_manager.get_current_workflow().working_directory == str(expected)
                 assert self._resolve_outputs(engine) == expected / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
@@ -564,13 +565,6 @@ class TestWorkflowWorkingDirectory:
                 config_manager.workspace_path = original
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
-
-    def test_get_working_directory_requires_a_workflow(self, engine: Engine) -> None:
-        """Asking outside a workflow context is an error, matching the other context accessors."""
-        context_manager = engine.context_manager
-
-        with pytest.raises(context_manager.NoActiveWorkflowError):
-            context_manager.get_current_workflow_working_directory()
 
 
 class TestUnsavedWorkflowNames:
@@ -843,7 +837,7 @@ class _RecordsWorkflowContextNode(DataNode):
     def process(self) -> None:
         context_manager = current_engine().context_manager
         self.parameter_output_values["workflow_id"] = context_manager.get_current_workflow_id()
-        self.parameter_output_values["file_path"] = context_manager.get_current_workflow_file_path()
+        self.parameter_output_values["file_path"] = _file_path(context_manager)
 
 
 @contextmanager

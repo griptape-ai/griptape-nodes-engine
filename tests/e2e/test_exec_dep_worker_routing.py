@@ -233,7 +233,7 @@ class TestParameterBehaviorsSurviveOnRealClasses:
             node_type="BehaviorPreservationNode", name="behaviors", specific_library_name="Behavior Library"
         )
         current_engine().context_manager.push_workflow(workflow_name="behaviors_workflow")
-        current_engine().object_manager.add_object_by_name("behaviors", node)
+        current_engine().object_manager.add_object_by_name_in(current_engine().current_workflow(), "behaviors", node)
 
         parameter = node.get_parameter_by_name("model_manager")
         assert parameter is not None

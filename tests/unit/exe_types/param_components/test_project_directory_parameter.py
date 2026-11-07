@@ -7,7 +7,7 @@ from griptape_nodes.exe_types.param_components import project_directory_paramete
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
 
-HANDLE_REQUEST_PATH = "griptape_nodes.files.project_file.GriptapeNodes.handle_request"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.handle_request"
 
 _POLICY_MAP = {
     "CREATE_NEW": situation.SituationFilePolicy.CREATE_NEW,

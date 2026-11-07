@@ -58,7 +58,7 @@ def _get(param: _ConcreteParam) -> object | None:
     return param._get_upstream_destination(
         _request(param),
         destination_events.GetConnectedDirectoryDestinationResultSuccess,
-        lambda spec: ("rebuilt", spec),
+        lambda spec, workflow: ("rebuilt", spec, workflow),
     )
 
 
@@ -81,12 +81,12 @@ class TestGetUpstreamDestination:
 
         assert _get(param) is None
 
-    def test_rebuilds_the_destination_from_its_spec(self) -> None:
+    def test_rebuilds_the_destination_from_its_spec_in_the_nodes_workflow(self) -> None:
         param = _make_param(
             destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=_SPEC, result_details="ok")
         )
 
-        assert _get(param) == ("rebuilt", _SPEC)
+        assert _get(param) == ("rebuilt", _SPEC, _mock_node(param).workflow)
 
     def test_raises_with_the_failure_details(self) -> None:
         param = _make_param(

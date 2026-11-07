@@ -9,9 +9,11 @@ import pathlib
 import typing
 
 from griptape_nodes.common import macro_parser
-from griptape_nodes.files import project_file
-from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
+from griptape_nodes.files import project_file, workflow_requests
 from griptape_nodes.retained_mode.events import destination_events, os_events, project_events
+
+if typing.TYPE_CHECKING:
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class DirectoryError(Exception):
@@ -31,14 +33,19 @@ class Directory:
     Supports MacroPath resolution: pass a MacroPath (which contains variables)
     or a plain string path. Plain strings containing macro variables are
     automatically wrapped in a MacroPath.
+
+    Macros resolve in the workflow the directory was built for (see ``File``).
     """
 
-    def __init__(self, dir_path: str | project_events.MacroPath) -> None:
+    def __init__(self, dir_path: str | project_events.MacroPath, *, workflow: WorkflowRuntime | None = None) -> None:
         """Store directory reference. No I/O is performed.
 
         Args:
             dir_path: Path to the directory. Can be a plain string or a MacroPath.
+            workflow: The workflow to resolve macros in. Defaults to the workflow the calling
+                code is bound to (see ``File``).
         """
+        self._workflow = workflow if workflow is not None else workflow_requests.workflow_building_now()
         if isinstance(dir_path, str):
             try:
                 parsed = macro_parser.ParsedMacro(dir_path)
@@ -61,7 +68,7 @@ class Directory:
         Raises:
             DirectoryError: If macro resolution fails (e.g. no project loaded).
         """
-        return pathlib.Path(_resolve_dir_path(self._dir_path))
+        return pathlib.Path(_resolve_dir_path(self._dir_path, self._workflow))
 
     @property
     def location(self) -> str:
@@ -73,6 +80,11 @@ class Directory:
         if isinstance(self._dir_path, project_events.MacroPath):
             return self._dir_path.parsed_macro.template
         return self._dir_path
+
+    @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The workflow this directory resolves macros in, or None for the caller's."""
+        return self._workflow
 
     @property
     def name(self) -> str:
@@ -99,6 +111,7 @@ class DirectoryDestination:
         *,
         existing_dir_policy: os_events.ExistingFilePolicy = os_events.ExistingFilePolicy.CREATE_NEW,
         create_parents: bool = True,
+        workflow: WorkflowRuntime | None = None,
     ) -> None:
         """Store directory path and creation configuration. No I/O is performed.
 
@@ -109,8 +122,10 @@ class DirectoryDestination:
                 Defaults to CREATE_NEW.
             create_parents: If True, create intermediate directories automatically.
                 Defaults to True.
+            workflow: The workflow to create the directory in. Defaults to the workflow the
+                calling code is bound to (see ``File``).
         """
-        self._directory = Directory(dir_path)
+        self._directory = Directory(dir_path, workflow=workflow)
         self._existing_dir_policy = existing_dir_policy
         self._create_parents = create_parents
 
@@ -193,8 +208,9 @@ class DirectoryDestination:
 
         # Get the next available version index for this macro path.
         # The macro is expected to contain an {_index} variable, which is used to find the next available version.
-        index_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            os_events.GetNextVersionIndexRequest(macro_path=macro_path)
+        workflow = self._directory.workflow
+        index_result = workflow_requests.handle_request_in(
+            workflow, os_events.GetNextVersionIndexRequest(macro_path=macro_path)
         )
         if not isinstance(index_result, os_events.GetNextVersionIndexResultSuccess):
             msg = f"Attempted to create versioned directory. Failed to find available version index: {index_result.result_details}"
@@ -202,51 +218,60 @@ class DirectoryDestination:
 
         index = index_result.index if index_result.index is not None else 1
         variables = macro_path.variables | {macro_parser.SEQUENCE_VARIABLE_NAME: index}
-        resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=variables)
+        resolve_result = workflow_requests.handle_request_in(
+            workflow, project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=variables)
         )
         if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
             msg = f"Attempted to create versioned directory. Failed to resolve macro: {resolve_result.result_details}"
             raise DirectoryError(msg)
 
         absolute_path = resolve_result.absolute_path
-        mkdir_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            os_events.MakeDirectoryRequest(path=str(absolute_path), create_parents=self._create_parents, exist_ok=False)
+        mkdir_result = workflow_requests.handle_request_in(
+            workflow,
+            os_events.MakeDirectoryRequest(
+                path=str(absolute_path), create_parents=self._create_parents, exist_ok=False
+            ),
         )
         if not isinstance(mkdir_result, os_events.MakeDirectoryResultSuccess):
             msg = f"Attempted to create versioned directory. Failed to create '{absolute_path}': {mkdir_result.result_details}"
             raise DirectoryError(msg)
 
         locked_macro = project_events.MacroPath(macro_path.parsed_macro, variables)
-        return _map_to_macro_directory(absolute_path, locked_macro)
+        return _map_to_macro_directory(absolute_path, locked_macro, workflow)
 
     def _create_direct(self, *, exist_ok: bool = True) -> Directory:
         """Create the directory without versioning."""
         resolved = self._directory.resolve()
-        mkdir_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            os_events.MakeDirectoryRequest(path=str(resolved), create_parents=self._create_parents, exist_ok=exist_ok)
+        workflow = self._directory.workflow
+        mkdir_result = workflow_requests.handle_request_in(
+            workflow,
+            os_events.MakeDirectoryRequest(path=str(resolved), create_parents=self._create_parents, exist_ok=exist_ok),
         )
         if not isinstance(mkdir_result, os_events.MakeDirectoryResultSuccess):
             msg = f"Attempted to create directory. Failed to create '{resolved}': {mkdir_result.result_details}"
             raise DirectoryError(msg)
 
-        return _map_to_macro_directory(resolved, self._directory._dir_path)
+        return _map_to_macro_directory(resolved, self._directory._dir_path, workflow)
 
     @classmethod
-    def from_spec(cls, spec: destination_events.DirectoryDestinationSpec) -> DirectoryDestination:
-        """Rebuild a destination from ``to_spec`` output."""
+    def from_spec(
+        cls, spec: destination_events.DirectoryDestinationSpec, workflow: WorkflowRuntime | None = None
+    ) -> DirectoryDestination:
+        """Rebuild a destination from ``to_spec`` output, creating it in ``workflow`` (see ``__init__``)."""
         return cls(
             spec.dir_path,
             existing_dir_policy=spec.existing_dir_policy,
             create_parents=spec.create_parents,
+            workflow=workflow,
         )
 
 
-def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
+def _resolve_dir_path(dir_path: str | project_events.MacroPath, workflow: WorkflowRuntime | None) -> str:
     """Resolve a directory path, handling MacroPath resolution if needed.
 
     Args:
         dir_path: A plain path string or a MacroPath.
+        workflow: The workflow to resolve a MacroPath in, or None to resolve it as the caller is bound.
 
     Returns:
         A resolved path string.
@@ -266,8 +291,9 @@ def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
     else:
         macro_path = dir_path
 
-    resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-        project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
+    resolve_result = workflow_requests.handle_request_in(
+        workflow,
+        project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables),
     )
     if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
         msg = f"Failed to resolve macro path '{macro_path.parsed_macro.template}': {resolve_result.result_details}"
@@ -275,19 +301,21 @@ def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
     return str(resolve_result.absolute_path)
 
 
-def _map_to_macro_directory(absolute_path: pathlib.Path, fallback_path: str | project_events.MacroPath) -> Directory:
+def _map_to_macro_directory(
+    absolute_path: pathlib.Path, fallback_path: str | project_events.MacroPath, workflow: WorkflowRuntime | None
+) -> Directory:
     """Attempt to map the created directory path to a portable macro form.
 
     Returns a Directory holding the macro template when the path is inside
     a project directory, so callers can store a portable reference.
     Falls back to the locked MacroPath or absolute path string if mapping fails.
     """
-    mapped = project_file._attempt_map_to_project(absolute_path)
+    mapped = project_file._attempt_map_to_project(absolute_path, workflow)
     if mapped is not None:
-        return Directory(mapped)
+        return Directory(mapped, workflow=workflow)
     if isinstance(fallback_path, project_events.MacroPath):
-        return Directory(fallback_path)
-    return Directory(str(absolute_path))
+        return Directory(fallback_path, workflow=workflow)
+    return Directory(str(absolute_path), workflow=workflow)
 
 
 @typing.runtime_checkable

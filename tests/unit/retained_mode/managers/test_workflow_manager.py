@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+    from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -115,6 +116,14 @@ from griptape_nodes.retained_mode.managers.workflow_manager import (
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.workflow_context import empty_workflow_registry
+
+
+def _file_path(context_manager: "ContextManager") -> str | None:
+    """The current workflow's file path, or None while it is unsaved."""
+    absolute_path = context_manager.get_current_workflow().absolute_path
+    if absolute_path is None:
+        return None
+    return str(absolute_path)
 
 
 def _valid_workflow_source(name: str, libraries: list[str] | None = None) -> str:
@@ -821,9 +830,7 @@ class TestWorkflowManager:
 
                     assert isinstance(result, MoveWorkflowResultSuccess)
                     assert context_manager.get_current_workflow_name() == "subdir/my_workflow"
-                    assert context_manager.get_current_workflow_file_path() == str(
-                        workspace / "subdir" / "my_workflow.py"
-                    )
+                    assert _file_path(context_manager) == str(workspace / "subdir" / "my_workflow.py")
                 finally:
                     context_manager.pop_workflow()
         finally:
@@ -938,7 +945,7 @@ class TestWorkflowManager:
                 # ...and it now carries the location it gained by being saved. `workflow_dir`
                 # prefers this over a registry lookup, and the lookup is what goes stale on the
                 # next project switch.
-                assert context_manager.get_current_workflow_file_path() == str(saved_full_path)
+                assert _file_path(context_manager) == str(saved_full_path)
             finally:
                 engine.config_manager.workspace_path = original_workspace
                 if context_manager.has_current_workflow():

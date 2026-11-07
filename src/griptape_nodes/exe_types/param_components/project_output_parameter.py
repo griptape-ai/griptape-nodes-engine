@@ -15,6 +15,7 @@ if typing.TYPE_CHECKING:
 
     from griptape_nodes.exe_types import node_types
     from griptape_nodes.retained_mode.events import base_events
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class _ConnectedDestinationResult[SpecT](typing.Protocol):
@@ -136,17 +137,18 @@ class ProjectOutputParameter(abc.ABC):
         self,
         request: base_events.RequestPayload,
         success_type: type[_ConnectedDestinationResult[SpecT]],
-        from_spec: Callable[[SpecT], DestinationT],
+        from_spec: Callable[[SpecT, WorkflowRuntime | None], DestinationT],
     ) -> DestinationT | None:
         """Return the destination a settings node connected to this parameter supplies.
 
         The request is answered where the settings node lives, so this gives the same answer
-        in-process and in a worker.
+        in-process and in a worker. The destination is rebuilt in the node's workflow, so it can
+        be used from any thread.
 
         Args:
             request: A ``GetConnected...DestinationRequest`` naming this node and parameter.
             success_type: The success result that request returns.
-            from_spec: Rebuilds the destination from the result's plain-data form.
+            from_spec: Rebuilds the destination in a workflow from the result's plain-data form.
 
         Returns:
             The destination, or None when no settings node is connected.
@@ -166,7 +168,7 @@ class ProjectOutputParameter(abc.ABC):
             raise TypeError(msg)
         if result.destination is None:
             return None
-        return from_spec(result.destination)
+        return from_spec(result.destination, self._node.workflow)
 
     def _on_configure_button_clicked(
         self,

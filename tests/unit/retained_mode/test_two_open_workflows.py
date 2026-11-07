@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,8 +23,13 @@ from griptape_nodes.exe_types.base_iterative_nodes import _incoming_connection_e
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import ControlNode, DataNode
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
+from griptape_nodes.files.file import File
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
-from griptape_nodes.retained_mode.events.app_events import EngineHeartbeatRequest, GetEngineVersionRequest
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineHeartbeatRequest,
+    EngineHeartbeatResultSuccess,
+    GetEngineVersionRequest,
+)
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionGriptapeNodeEvent,
     GriptapeNodeEvent,
@@ -79,7 +84,11 @@ from griptape_nodes.retained_mode.events.node_events import (
     ListParametersOnNodeRequest,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest, RenameObjectRequest
-from griptape_nodes.retained_mode.events.os_events import ResolveMacroPathRequest
+from griptape_nodes.retained_mode.events.os_events import (
+    ResolveMacroPathRequest,
+    ResolveMacroPathResultSuccess,
+    WriteFileRequest,
+)
 from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     GetParameterValueResultSuccess,
@@ -191,8 +200,11 @@ class _ParkNode(ControlNode):
         self.parameter_output_values["result"] = f"done:{self.get_parameter_value('value')}"
 
 
+_RAW_THREAD_FILE = "{workflow_dir}/{workflow_name}.png"
+
+
 class _RawThreadNode(ControlNode):
-    """Node code that starts a plain `threading.Thread` (no copied context) and asks for its workflow there."""
+    """Node code that hands file work to a plain `threading.Thread`, which does not carry its binding."""
 
     seen: ClassVar[dict[str, Any]] = {}
 
@@ -201,20 +213,21 @@ class _RawThreadNode(ControlNode):
 
     async def aprocess(self) -> None:
         engine = self.engine
+        built_in_node_code = File(_RAW_THREAD_FILE)
+        _RawThreadNode.seen["in_node_code"] = built_in_node_code.resolve()
 
-        def read_in_raw_thread() -> None:
+        def in_raw_thread() -> None:
+            _RawThreadNode.seen["built_in_node_code"] = built_in_node_code.resolve()
+            _RawThreadNode.seen["built_for_the_node"] = File(_RAW_THREAD_FILE, workflow=self.workflow).resolve()
             try:
-                _RawThreadNode.seen["workflow"] = engine.current_workflow_or_none()
+                _RawThreadNode.seen["ambient"] = engine.current_workflow_or_none()
             except WorkflowNotNamedError as err:
-                _RawThreadNode.seen["workflow"] = err
-            result = engine.handle_request(_resolve("{workflow_dir}/out.png"))
-            _RawThreadNode.seen["workflow_dir"] = result
+                _RawThreadNode.seen["ambient"] = err
+            _RawThreadNode.seen["ambient_resolve"] = engine.handle_request(_resolve(_RAW_THREAD_FILE))
 
-        thread = threading.Thread(target=read_in_raw_thread)
+        thread = threading.Thread(target=in_raw_thread)
         thread.start()
         await asyncio.to_thread(thread.join)
-        # The same read through asyncio.to_thread, which copies the context.
-        _RawThreadNode.seen["to_thread_workflow"] = await asyncio.to_thread(engine.current_workflow_or_none)
 
 
 @pytest.fixture
@@ -1123,30 +1136,27 @@ class TestWorkerForTwoOrchestratorWorkflows:
 
 
 class TestRawThreadInNodeCode:
-    """Scenario (h)."""
+    """Scenario (h): a plain thread does not carry the node's binding, so node code reaches its workflow through its files."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "FINDING h1: a plain threading.Thread does not copy the ContextVar binding, "
-            "so node code in one is unbound; with two workflows open "
-            "Engine.current_workflow_or_none raises WorkflowNotNamedError and "
-            "{workflow_dir} fails to resolve. asyncio.to_thread copies the context and works."
-        ),
-    )
     @pytest.mark.asyncio
-    async def test_node_code_in_a_raw_thread_finds_its_workflow(
+    async def test_files_node_code_builds_resolve_in_its_workflow_from_a_raw_thread(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
-        a, _ = two_open
+        a, b = two_open
         _make_node(engine, a, "_RawThreadNode", "threaded")
+        in_b = _send(engine, _resolve(_RAW_THREAD_FILE), b)
+        assert isinstance(in_b, ResolveMacroPathResultSuccess), in_b.result_details
 
         result = await _send_async(engine, StartFlowRequest(flow_name="canvas", flow_node_name="threaded"), a)
 
         assert isinstance(result, StartFlowResultSuccess), result.result_details
-        assert _RawThreadNode.seen["to_thread_workflow"] is a
-        assert _RawThreadNode.seen["workflow"] is a
-        assert _RawThreadNode.seen["workflow_dir"].succeeded()
+        in_a = _RawThreadNode.seen["in_node_code"]
+        assert in_a != str(in_b.resolved_path)
+        assert _RawThreadNode.seen["built_in_node_code"] == in_a
+        assert _RawThreadNode.seen["built_for_the_node"] == in_a
+        # An ambient read can't tell which workflow the thread works for, so it is refused, not guessed.
+        assert isinstance(_RawThreadNode.seen["ambient"], WorkflowNotNamedError)
+        assert _RawThreadNode.seen["ambient_resolve"].failed()
 
     @pytest.mark.asyncio
     async def test_with_one_workflow_open_a_raw_thread_falls_back_to_it(
@@ -1161,8 +1171,9 @@ class TestRawThreadInNodeCode:
         result = await _send_async(engine, StartFlowRequest(flow_name="canvas", flow_node_name="threaded"), only)
 
         assert isinstance(result, StartFlowResultSuccess), result.result_details
-        assert _RawThreadNode.seen["workflow"] is only
-        assert _RawThreadNode.seen["workflow_dir"].succeeded()
+        assert _RawThreadNode.seen["ambient"] is only
+        assert _RawThreadNode.seen["ambient_resolve"].succeeded()
+        assert _RawThreadNode.seen["built_in_node_code"] == _RawThreadNode.seen["in_node_code"]
 
 
 def _use_default_project(engine: Engine, workspace: Path) -> None:
@@ -1360,22 +1371,29 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 class TestOtherSharedState:
     """Scenario (j): state shared across workflows that a run or request reads."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "FINDING j1: the heartbeat reports one current workflow (Engine._get_current_workflow_info), "
-            "read from the engine's one open workflow. With two open it reports none."
-        ),
-    )
-    def test_the_heartbeat_reports_an_open_workflow_while_two_are_open(
-        self,
-        engine: Engine,
-        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    def test_the_heartbeat_reports_every_open_workflow_and_the_one_opened_last_as_current(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
+        a, b = two_open
 
-        info = engine._get_current_workflow_info()
+        heartbeat = _send(engine, EngineHeartbeatRequest(heartbeat_id="h"), None)
 
-        assert info["current_workflow_id"] is not None
+        assert isinstance(heartbeat, EngineHeartbeatResultSuccess), heartbeat.result_details
+        assert [info.workflow_id for info in heartbeat.open_workflows] == [a.workflow_id, b.workflow_id]
+        assert heartbeat.current_workflow_id == b.workflow_id
+
+    def test_an_image_written_for_b_collects_bs_metadata(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime], tmp_path: Path
+    ) -> None:
+        _, b = two_open
+        provider = MagicMock()
+        provider.collect_metadata_for_write.return_value = {}
+
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
+            result = _send(engine, WriteFileRequest(file_path=str(tmp_path / "out.png"), content=b"png"), b)
+
+        assert result.succeeded(), result.result_details
+        provider.collect_metadata_for_write.assert_called_once_with("out.png", b)
 
     @pytest.mark.asyncio
     async def test_a_post_dispatch_hook_sees_the_workflow_its_request_was_addressed_to(
