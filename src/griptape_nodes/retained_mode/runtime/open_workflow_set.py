@@ -47,10 +47,10 @@ class OpenWorkflowSet:
             raise OpenWorkflowError(msg)
         blocking = self.workflow_blocking_open()
         if blocking is not None:
-            msg = (
-                f"Attempted to open workflow '{workflow_id}'. Failed because workflow '{blocking.workflow_id}' "
-                "is already open."
-            )
+            reason = self.several_open_refusal()
+            if reason is None:
+                reason = f"workflow '{blocking.workflow_id}' is already open."
+            msg = f"Attempted to open workflow '{workflow_id}'. Failed because {reason}"
             raise OpenWorkflowError(msg)
 
         workflow = WorkflowRuntime(workflow_id, self._engine)
@@ -80,6 +80,17 @@ class OpenWorkflowSet:
         if is_beta_enabled(MULTIPLE_OPEN_WORKFLOWS, self._engine.config_manager):
             return None
         return next(iter(self._by_id.values()))
+
+    def several_open_refusal(self) -> str | None:
+        """Why an open is refused while several are open and only one may be, or None otherwise.
+
+        Phrased to follow "Failed because". Several are open only when the `multiple_open_workflows`
+        beta feature was turned off after they opened, and closing just the blocking one would not
+        make room.
+        """
+        if self.workflow_blocking_open() is None or len(self._by_id) < 2:  # noqa: PLR2004
+            return None
+        return f"{len(self._by_id)} workflows are open and only one can be. Close all but one first."
 
     def is_open(self, workflow_id: str) -> bool:
         return workflow_id in self._by_id

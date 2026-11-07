@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from griptape_nodes.node_library.workflow_registry import (
+        Workflow,
         WorkflowShape,
     )
     from griptape_nodes.retained_mode.engine import Engine
@@ -214,7 +215,7 @@ class WorkflowRunner(EngineScoped):
     async def on_run_workflow_from_scratch_request(  # noqa: PLR0911
         self, request: RunWorkflowFromScratchRequest
     ) -> ResultPayload:
-        """Close the open workflow while only one may be open, then open the file as a workflow."""
+        """Close what a clean slate closes (`_clear_slate_for`), then open the file as a workflow."""
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with self.engine.workflow_manager.squelch_workflow_altered():
             # Check if file path exists
@@ -226,7 +227,9 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            close_failure = await self._close_blocking_workflow()
+            close_failure = await self._clear_slate_for(
+                self.engine.workflow_registry.find_by_path(str(complete_file_path))
+            )
             if close_failure is not None:
                 details = f"Attempted to run '{complete_file_path}'. Failed because {close_failure}"
                 return RunWorkflowFromScratchResultFailure(result_details=details)
@@ -302,7 +305,7 @@ class WorkflowRunner(EngineScoped):
     ) -> ResultPayload:
         """Open the registered workflow and run its file into it.
 
-        With a clean slate, closes the open workflow first while only one may be open.
+        With a clean slate, first closes what `_clear_slate_for` closes.
         """
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
@@ -325,24 +328,13 @@ class WorkflowRunner(EngineScoped):
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-        # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
-        # Refused before anything is registered or run.
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if not request.run_with_clean_slate and blocking is not None:
-            details = (
-                f"Attempted to run workflow '{request.workflow_name}'. Failed because workflow "
-                f"'{self.engine.workflow_registry.get(blocking.workflow_id).name}' is open. Clear the open workflow first, "
-                "or run it with a clean slate (run_with_clean_slate=True)."
-            )
-            return RunWorkflowFromRegistryResultFailure(result_details=details)
-
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate:
-                close_failure = await self._close_blocking_workflow()
-                if close_failure is not None:
-                    details = f"Attempted to run workflow '{request.workflow_name}'. Failed because {close_failure}"
-                    return RunWorkflowFromRegistryResultFailure(result_details=details)
+            # Refused before anything is registered or run.
+            room_failure = await self._make_room_for(registered, clean_slate=request.run_with_clean_slate)
+            if room_failure is not None:
+                details = f"Attempted to run workflow '{request.workflow_name}'. Failed because {room_failure}"
+                return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             try:
                 built = await self.open_and_build_workflow(workflow_name=request.workflow_name)
@@ -666,24 +658,52 @@ class WorkflowRunner(EngineScoped):
         except OpenWorkflowError as err:
             logger.warning("Failed to close workflow '%s' after its file failed to run: %s", workflow_id, err)
 
-    async def _close_blocking_workflow(self) -> str | None:
-        """Close the open workflow while only one may be open, returning why it could not, or None.
+    async def _make_room_for(self, target: Workflow, *, clean_slate: bool) -> str | None:
+        """Make room for `target` to open, returning why there is none, or None.
 
-        Closes nothing while several are open and only one may be, as after the
-        `multiple_open_workflows` beta feature is turned off: closing one would not make room.
+        With a clean slate, closes what `_clear_slate_for` closes. Without one, closes nothing:
+        workflows do not nest, so while another is open and only one may be, the run is refused.
         """
+        if clean_slate:
+            return await self._clear_slate_for(target)
+        return self._refusal_without_clean_slate()
+
+    def _refusal_without_clean_slate(self) -> str | None:
+        """Why a run without a clean slate can't open its workflow beside the open ones, or None."""
         open_workflows = self.engine.open_workflows
         blocking = open_workflows.workflow_blocking_open()
         if blocking is None:
             return None
-        open_count = len(open_workflows.all_open())
-        if open_count > 1:
-            return f"{open_count} workflows are open and only one can be. Close all but one first."
-        blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
+        several_open_refusal = open_workflows.several_open_refusal()
+        if several_open_refusal is not None:
+            return several_open_refusal
+        return (
+            f"workflow '{self.engine.workflow_registry.get(blocking.workflow_id).name}' is open. "
+            "Clear the open workflow first, or run it with a clean slate (run_with_clean_slate=True)."
+        )
+
+    async def _clear_slate_for(self, target: Workflow | None) -> str | None:
+        """Close what a clean slate closes before `target` opens, returning why it could not, or None.
+
+        A clean slate starts `target` over, so it closes `target` when it is open, whether or not
+        several workflows may be open. While only one may be, it also closes the one that is open.
+        It closes nothing while several are open and only one may be, as after the
+        `multiple_open_workflows` beta feature is turned off: closing one would not make room.
+        """
+        open_workflows = self.engine.open_workflows
+        several_open_refusal = open_workflows.several_open_refusal()
+        if several_open_refusal is not None:
+            return several_open_refusal
+        to_close = open_workflows.workflow_blocking_open()
+        if to_close is None and target is not None:
+            to_close = open_workflows.find(target.workflow_id)
+        if to_close is None:
+            return None
+        to_close_name = self.engine.workflow_registry.get(to_close.workflow_id).name
         try:
-            await self.engine.aclose_workflow(blocking)
+            await self.engine.aclose_workflow(to_close)
         except OpenWorkflowError as err:
-            return f"closing the open workflow '{blocking_name}' failed: {err}"
+            return f"closing the open workflow '{to_close_name}' failed: {err}"
         return None
 
     async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
