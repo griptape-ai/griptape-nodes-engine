@@ -11,7 +11,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class RenameObjectRequest(RequestPayload):
+class RenameObjectRequest(RequestPayload["RenameObjectResultSuccess", "RenameObjectResultFailure"]):
     """Rename an object (node, flow, etc.) in the system.
 
     Use when: Organizing workflows, fixing naming conflicts, implementing rename features,
@@ -56,7 +56,9 @@ class RenameObjectResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ClearAllObjectStateRequest(RequestPayload):
+class ClearAllObjectStateRequest(
+    RequestPayload["ClearAllObjectStateResultSuccess", "ClearAllObjectStateResultFailure"]
+):
     """WARNING: Clear all object state - wipes all flows, nodes, connections, everything!
 
     Use when: Resetting to clean state, recovering from corruption, starting fresh,

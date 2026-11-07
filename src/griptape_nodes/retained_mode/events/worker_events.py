@@ -27,7 +27,7 @@ class WorkerGoneError(Exception):
 
 @dataclass
 @PayloadRegistry.register
-class RegisterWorkerRequest(RequestPayload):
+class RegisterWorkerRequest(RequestPayload["RegisterWorkerResultSuccess", "RegisterWorkerResultFailure"]):
     """Sent by a worker engine to the orchestrator's session topic to announce itself.
 
     The orchestrator stores the worker's engine_id and subscribes to the worker's
@@ -73,7 +73,7 @@ class RegisterWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class WorkerHeartbeatRequest(RequestPayload, SkipTheLineMixin):
+class WorkerHeartbeatRequest(RequestPayload["WorkerHeartbeatResultSuccess"], SkipTheLineMixin):
     """Sent by the orchestrator to a worker to verify it is still alive.
 
     Uses SkipTheLineMixin so the worker processes it immediately without queuing,
@@ -100,7 +100,7 @@ class WorkerHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 
 @dataclass
 @PayloadRegistry.register
-class UnregisterWorkerRequest(RequestPayload):
+class UnregisterWorkerRequest(RequestPayload["UnregisterWorkerResultSuccess", "UnregisterWorkerResultFailure"]):
     """Sent by a worker to the orchestrator's session topic on graceful shutdown.
 
     Args:
@@ -131,7 +131,7 @@ class UnregisterWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 
 @dataclass
 @PayloadRegistry.register
-class StartWorkerRequest(RequestPayload):
+class StartWorkerRequest(RequestPayload["StartWorkerResultSuccess", "StartWorkerResultFailure"]):
     """Internal request to spawn a worker subprocess for a library that requires one.
 
     Sent by LibraryManager when a worker-delegated library finishes loading on the
@@ -161,7 +161,9 @@ class StartWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartWorkerForEngineRequest(RequestPayload):
+class StartWorkerForEngineRequest(
+    RequestPayload["StartWorkerForEngineResultSuccess", "StartWorkerForEngineResultFailure"]
+):
     """Sent by the artist's engine to the engine its distribution settings assign a library to.
 
     That engine starts the library's worker under `worker_engine_id` in the session of the engine
@@ -203,7 +205,9 @@ class StartWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class OfferSessionForWorkersRequest(RequestPayload):
+class OfferSessionForWorkersRequest(
+    RequestPayload["OfferSessionForWorkersResultSuccess", "OfferSessionForWorkersResultFailure"]
+):
     """Sent by the artist's engine to another engine before asking it to start any worker.
 
     Sent once per session for each engine the distribution settings assign a library to. That
@@ -250,7 +254,9 @@ class OfferSessionForWorkersResultFailure(WorkflowNotAlteredMixin, ResultPayload
 
 @dataclass
 @PayloadRegistry.register
-class WithdrawSessionOfferRequest(RequestPayload):
+class WithdrawSessionOfferRequest(
+    RequestPayload["WithdrawSessionOfferResultSuccess", "WithdrawSessionOfferResultFailure"]
+):
     """Sent by the artist's engine to each engine it offered its session to, once it is done with them.
 
     Sent when the artist's engine resets its workers, as when its session ends or it shuts down. The
@@ -275,7 +281,9 @@ class WithdrawSessionOfferResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class StopWorkerForEngineRequest(RequestPayload):
+class StopWorkerForEngineRequest(
+    RequestPayload["StopWorkerForEngineResultSuccess", "StopWorkerForEngineResultFailure"]
+):
     """Sent by the artist's engine to the engine it asked to start a worker, to stop that worker.
 
     Sent when the start is withdrawn after it was sent, as when the library is reset while the
@@ -304,7 +312,7 @@ class StopWorkerForEngineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class ReportWorkerExitedRequest(RequestPayload):
+class ReportWorkerExitedRequest(RequestPayload["ReportWorkerExitedResultSuccess", "ReportWorkerExitedResultFailure"]):
     """Sent by an engine to the artist's engine whenever a worker it runs for that artist exits.
 
     Sent for every exit, whatever ended the worker, so the artist's engine settles a start that
@@ -338,7 +346,7 @@ class ReportWorkerExitedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class AcquireLeaseRequest(RequestPayload):
+class AcquireLeaseRequest(RequestPayload["AcquireLeaseResultSuccess", "AcquireLeaseResultFailure"]):
     """Sent by the artist's engine to the engine whose worker will run a run's nodes, before sending the first of them.
 
     That engine runs one run at a time, its own and other engines' alike, in the order they asked. It
@@ -371,7 +379,7 @@ class AcquireLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ReleaseLeaseRequest(RequestPayload):
+class ReleaseLeaseRequest(RequestPayload["ReleaseLeaseResultSuccess", "ReleaseLeaseResultFailure"]):
     """Sent by the artist's engine once it is done with a lease, so that engine serves the next run.
 
     Sent when the lease's run ends, or, for a node run on its own, when the node ends, however either
@@ -399,7 +407,7 @@ class ReleaseLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ReportPlaceInLineRequest(RequestPayload):
+class ReportPlaceInLineRequest(RequestPayload["ReportPlaceInLineResultSuccess", "ReportPlaceInLineResultFailure"]):
     """Sent by an engine to the artist's engine while one of its leases waits there, each time its place changes.
 
     Sent once more with position 0 when the lease stops waiting.
@@ -428,7 +436,7 @@ class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 @PayloadRegistry.register
-class CheckLeaseRequest(RequestPayload):
+class CheckLeaseRequest(RequestPayload["CheckLeaseResultSuccess", "CheckLeaseResultFailure"]):
     """Sent by a worker that another engine runs, to that engine, before it runs a node.
 
     The engine answers whether the lease the node was sent under holds it now, for the engine the
@@ -459,7 +467,10 @@ class CheckLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DropLibraryNamedLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+class DropLibraryNamedLocalObjectsRequest(
+    RequestPayload["DropLibraryNamedLocalObjectsResultSuccess", "DropLibraryNamedLocalObjectsResultFailure"],
+    SkipTheLineMixin,
+):
     """Sent to a worker to release what its libraries keep between runs, such as a loaded model.
 
     Sent by an engine that runs nodes for other engines, as it passes from one engine's run to another's,

@@ -88,7 +88,7 @@ class ConfigLayer(BaseModel):
 
 @dataclass
 @PayloadRegistry.register
-class GetConfigValueRequest(RequestPayload):
+class GetConfigValueRequest(RequestPayload["GetConfigValueResultSuccess", "GetConfigValueResultFailure"]):
     """Get a specific configuration value.
 
     Use when: Reading application settings, checking node configurations, retrieving user preferences,
@@ -133,7 +133,7 @@ class GetConfigValueResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class SetConfigValueRequest(RequestPayload):
+class SetConfigValueRequest(RequestPayload["SetConfigValueResultSuccess", "SetConfigValueResultFailure"]):
     """Set a specific configuration value.
 
     Use when: Updating application settings, configuring node behavior, storing user preferences,
@@ -183,7 +183,7 @@ class SetConfigValueResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConfigCategoryRequest(RequestPayload):
+class GetConfigCategoryRequest(RequestPayload["GetConfigCategoryResultSuccess", "GetConfigCategoryResultFailure"]):
     """Get all configuration values within a category.
 
     Use when: Retrieving multiple related settings, displaying configuration sections in UIs,
@@ -225,7 +225,7 @@ class GetConfigCategoryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 @PayloadRegistry.register
-class SetConfigCategoryRequest(RequestPayload):
+class SetConfigCategoryRequest(RequestPayload["SetConfigCategoryResultSuccess", "SetConfigCategoryResultFailure"]):
     """Set multiple configuration values within a category.
 
     Use when: Bulk updating configuration settings, restoring configuration sections,
@@ -277,7 +277,7 @@ class SetConfigCategoryResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetWorkspaceRequest(RequestPayload):
+class GetWorkspaceRequest(RequestPayload["GetWorkspaceResultSuccess"]):
     """Get the absolute path to the configured workspace directory.
 
     Use when: Resolving relative FILE_SYSTEM-category settings (e.g. `sandbox_library_directory`,
@@ -305,7 +305,7 @@ class GetWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class GetConfigPathRequest(RequestPayload):
+class GetConfigPathRequest(RequestPayload["GetConfigPathResultSuccess", "GetConfigPathResultFailure"]):
     """Get the path to the configuration file.
 
     Use when: Locating configuration files, debugging configuration issues,
@@ -335,7 +335,7 @@ class GetConfigPathResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConfigLayersRequest(RequestPayload):
+class GetConfigLayersRequest(RequestPayload["GetConfigLayersResultSuccess"]):
     """Get the full config layer stack, in isolation, lowest to highest priority.
 
     Use when: diagnosing why a setting doesn't take effect, building a settings UI that
@@ -364,7 +364,7 @@ class GetConfigLayersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 
 @dataclass
 @PayloadRegistry.register
-class ResetConfigRequest(RequestPayload):
+class ResetConfigRequest(RequestPayload["ResetConfigResultSuccess", "ResetConfigResultFailure"]):
     """Reset configuration to default values.
 
     Use when: Recovering from configuration errors, restoring default settings,
@@ -388,7 +388,7 @@ class ResetConfigResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConfigSchemaRequest(RequestPayload):
+class GetConfigSchemaRequest(RequestPayload["GetConfigSchemaResultSuccess", "GetConfigSchemaResultFailure"]):
     """Get the JSON schema for the configuration model.
 
     Use when: Frontend needs to understand field types, enums, and validation rules
@@ -418,7 +418,7 @@ class GetConfigSchemaResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class ListBetaFeaturesRequest(RequestPayload):
+class ListBetaFeaturesRequest(RequestPayload["ListBetaFeaturesResultSuccess"]):
     """List the beta features this engine and its loaded libraries define.
 
     Use when: Showing engine and library features on the editor's Beta settings page. Values are
@@ -447,7 +447,9 @@ class ListBetaFeaturesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
 
 @dataclass
 @PayloadRegistry.register
-class IsBetaFeatureEnabledRequest(RequestPayload):
+class IsBetaFeatureEnabledRequest(
+    RequestPayload["IsBetaFeatureEnabledResultSuccess", "IsBetaFeatureEnabledResultFailure"]
+):
     """Check whether a beta feature is on.
 
     Use when: Node code needs to know whether a beta feature from its library is on. Nodes call

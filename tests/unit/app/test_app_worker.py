@@ -2515,7 +2515,7 @@ def _host_engine(worker_manager: WorkerManager, *, refuse: dict[str, str] | None
     links = _FakeEngineTransports(refuse=refuse)
     # As Engine.attach_engine_transports does: requests go through the transports, and a lost connection reaches here.
     engine.can_reach_other_engines = True  # type: ignore[misc]
-    engine.request = links.request  # type: ignore[method-assign]
+    engine.request_engine = links.request  # type: ignore[method-assign]
     engine.hosted_worker_environment = links.hosted_worker_environment  # type: ignore[method-assign]
     links.on_engine_lost(worker_manager.on_engine_lost)
     return links
@@ -2738,7 +2738,7 @@ class TestStartingAWorkerOnAnotherEngine:
                 raise EngineNotFoundError(msg)
             return await answer(engine_id, request, timeout_s=timeout_s)
 
-        worker_manager.engine.request = leave_the_start_unanswered  # type: ignore[method-assign]
+        worker_manager.engine.request_engine = leave_the_start_unanswered  # type: ignore[method-assign]
 
         await _start_on_host_engine(worker_manager)
 
@@ -2854,7 +2854,7 @@ class TestStartingAWorkerOnAnotherEngine:
                 raise RuntimeError(msg)
             return result
 
-        worker_manager.engine.request = fail_the_start  # type: ignore[method-assign]
+        worker_manager.engine.request_engine = fail_the_start  # type: ignore[method-assign]
         with patch.object(worker_manager, "_orchestrator_static_server_base_url", new=AsyncMock(return_value=None)):
             await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=_LIBRARY))
             await asyncio.gather(worker_manager._requested_spawns[_LIBRARY], return_exceptions=True)
@@ -4186,7 +4186,7 @@ class TestReleasingALeaseOnAnotherEngine:
                     raise EngineNotFoundError(msg)
             return await answer(engine_id, request, timeout_s=timeout_s)
 
-        worker_manager.engine.request = lost_once  # type: ignore[method-assign]
+        worker_manager.engine.request_engine = lost_once  # type: ignore[method-assign]
         with patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0):
             lease = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
             worker_manager.release_after_node(lease)
@@ -4213,7 +4213,7 @@ class TestReleasingALeaseOnAnotherEngine:
                 raise EngineNotFoundError(msg)
             return await answer(engine_id, request, timeout_s=timeout_s)
 
-        worker_manager.engine.request = lost_twice  # type: ignore[method-assign]
+        worker_manager.engine.request_engine = lost_twice  # type: ignore[method-assign]
         with (
             patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0),
             caplog.at_level(logging.WARNING),

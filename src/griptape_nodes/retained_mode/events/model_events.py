@@ -11,7 +11,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class DownloadModelRequest(RequestPayload):
+class DownloadModelRequest(RequestPayload["DownloadModelResultSuccess", "DownloadModelResultFailure"]):
     """Download a model from Hugging Face Hub.
 
     Use when: Downloading models for local inference, caching models for offline use,
@@ -88,7 +88,7 @@ class QueryInfo:
 
 @dataclass
 @PayloadRegistry.register
-class ListModelsRequest(RequestPayload):
+class ListModelsRequest(RequestPayload["ListModelsResultSuccess", "ListModelsResultFailure"]):
     """List all downloaded models from the local cache.
 
     Use when: Viewing what models are available locally, checking cache usage,
@@ -118,7 +118,7 @@ class ListModelsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DeleteModelRequest(RequestPayload):
+class DeleteModelRequest(RequestPayload["DeleteModelResultSuccess", "DeleteModelResultFailure"]):
     """Delete a downloaded model from the local cache.
 
     Use when: Cleaning up disk space, removing unused models, managing local storage.
@@ -154,7 +154,7 @@ class DeleteModelResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ListModelDownloadsRequest(RequestPayload):
+class ListModelDownloadsRequest(RequestPayload["ListModelDownloadsResultSuccess", "ListModelDownloadsResultFailure"]):
     """List download status for a specific model or all downloads.
 
     Use when: Checking progress of ongoing downloads, viewing download history,
@@ -208,7 +208,9 @@ class ListModelDownloadsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class DeleteModelDownloadRequest(RequestPayload):
+class DeleteModelDownloadRequest(
+    RequestPayload["DeleteModelDownloadResultSuccess", "DeleteModelDownloadResultFailure"]
+):
     """Delete download status tracking records for a model.
 
     Use when: Cleaning up orphaned download status files, removing tracking data
@@ -245,7 +247,7 @@ class DeleteModelDownloadResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class PauseModelDownloadRequest(RequestPayload):
+class PauseModelDownloadRequest(RequestPayload["PauseModelDownloadResultSuccess", "PauseModelDownloadResultFailure"]):
     """Pause an in-progress model download, keeping the files it has finished.
 
     Use when: Stopping a large download for now without losing its progress.
@@ -281,7 +283,9 @@ class PauseModelDownloadResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class ResumeModelDownloadRequest(RequestPayload):
+class ResumeModelDownloadRequest(
+    RequestPayload["ResumeModelDownloadResultSuccess", "ResumeModelDownloadResultFailure"]
+):
     """Resume a paused model download, skipping the files it had finished.
 
     Use when: Continuing a download stopped with PauseModelDownloadRequest.
@@ -317,7 +321,7 @@ class ResumeModelDownloadResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class SearchModelsRequest(RequestPayload):
+class SearchModelsRequest(RequestPayload["SearchModelsResultSuccess", "SearchModelsResultFailure"]):
     """Search for models on Hugging Face Hub.
 
     Use when: Finding models by name, filtering models by task or library,
@@ -370,7 +374,7 @@ class SearchModelsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetModelInfoRequest(RequestPayload):
+class GetModelInfoRequest(RequestPayload["GetModelInfoResultSuccess", "GetModelInfoResultFailure"]):
     """Fetch detailed information for a specific model from Hugging Face Hub.
 
     Use when: Retrieving exact storage size before downloading, inspecting model
@@ -421,7 +425,9 @@ class GetModelInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DeclareModelInvocationRequest(RequestPayload):
+class DeclareModelInvocationRequest(
+    RequestPayload["DeclareModelInvocationResultSuccess", "DeclareModelInvocationResultFailure"]
+):
     """Declare that a node is about to invoke a catalog model, so the call is subject to entitlements.
 
     This is how a well-intentioned node opts into the permission system: before

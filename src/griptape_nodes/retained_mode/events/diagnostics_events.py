@@ -18,7 +18,9 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class GetDiagnosticsReportRequest(RequestPayload):
+class GetDiagnosticsReportRequest(
+    RequestPayload["GetDiagnosticsReportResultSuccess", "GetDiagnosticsReportResultFailure"]
+):
     """Collect a snapshot of the engine's state for troubleshooting.
 
     Use when: Someone reporting a problem needs to say what version they are running, on
@@ -66,7 +68,7 @@ class GetDiagnosticsReportResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class CollectDiagnosticsRequest(RequestPayload):
+class CollectDiagnosticsRequest(RequestPayload["CollectDiagnosticsResultSuccess", "CollectDiagnosticsResultFailure"]):
     """Collect a diagnostics bundle: one zip holding everything needed to troubleshoot.
 
     Use when: A user reporting a problem should send one file rather than assembling logs,
@@ -143,7 +145,7 @@ class CollectDiagnosticsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class RunHealthChecksRequest(RequestPayload):
+class RunHealthChecksRequest(RequestPayload["RunHealthChecksResultSuccess", "RunHealthChecksResultFailure"]):
     """Check whether this installation is set up correctly and say what to fix.
 
     Use when: Someone says "it isn't working" and the symptom is not clear yet. Where

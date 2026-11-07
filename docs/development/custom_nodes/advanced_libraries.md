@@ -185,14 +185,15 @@ There are three pieces to build. See
 [the worked example](#example-a-library-that-serves-a-request-type) for all of them in
 context.
 
-**1. Define the payloads.** A request type and at least one result type, each a dataclass
-registered with `PayloadRegistry` so it can be resolved by name over the WebSocket and
-MCP surfaces:
+**1. Define the payloads.** A request type and its success and failure result types, each a
+dataclass registered with `PayloadRegistry` so it can be resolved by name over the WebSocket and
+MCP surfaces. The request names its result types, quoted because they are defined after it, so
+callers get them back typed:
 
 ```python
 @dataclass
 @PayloadRegistry.register
-class ConvertColorspaceRequest(RequestPayload):
+class ConvertColorspaceRequest(RequestPayload["ConvertColorspaceResultSuccess", "ConvertColorspaceResultFailure"]):
     color: tuple[float, float, float]
     source: str
     target: str
@@ -236,16 +237,27 @@ Keeping the handler's own annotation precise is worth more than matching the bas
 signature exactly.
 
 **3. Dispatch it.** Any caller in the orchestrator process sends the request through the
-normal bus and gets your result back:
+normal bus and gets your result back. `GriptapeNodes.request` returns the success type the request
+names, and raises `RequestFailedError`, carrying the failure's `result_details`, when it fails:
 
 ```python
-result = GriptapeNodes.handle_request(ConvertColorspaceRequest(color=(1.0, 0.0, 0.0), source="rgb", target="hsv"))
-if result.failed():
-    msg = f"Attempted to convert a color in '{self.name}'. Failed because {result.result_details}"
-    raise RuntimeError(msg)
-
-success = cast("ConvertColorspaceResultSuccess", result)
+success = GriptapeNodes.request(ConvertColorspaceRequest(color=(1.0, 0.0, 0.0), source="rgb", target="hsv"))
 ```
+
+To handle a failure yourself instead of raising, use `GriptapeNodes.try_request`. It returns the
+success, the request's failure, or a `DispatchFailure`, and never raises:
+
+```python
+match GriptapeNodes.try_request(ConvertColorspaceRequest(color=(1.0, 0.0, 0.0), source="rgb", target="hsv")):
+    case ConvertColorspaceResultSuccess() as success:
+        ...
+    case ConvertColorspaceResultFailure() as failure:
+        ...
+    case DispatchFailure() as failure:
+        ...
+```
+
+Use `arequest` and `atry_request` from async code.
 
 Two rules for callers:
 
@@ -253,8 +265,8 @@ Two rules for callers:
     request can deadlock against handlers that await engine startup.
 - **Always handle failure.** The providing library might not be installed, might have
     failed to load, or might have been unloaded. In those cases the request has no handler
-    at all, and the engine returns a generic failure result rather than your library's
-    failure type. Check `result.failed()` before narrowing to your success type.
+    at all, and the engine returns a `DispatchFailure` rather than your library's failure
+    type. `request` raises for it like any other failure, and `try_request` returns it.
 
 Constraints on the mechanism:
 

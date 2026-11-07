@@ -51,7 +51,7 @@ class NewPosition(NamedTuple):
 
 @dataclass
 @PayloadRegistry.register
-class CreateNodeRequest(RequestPayload):
+class CreateNodeRequest(RequestPayload["CreateNodeResultSuccess", "CreateNodeResultFailure"]):
     """Create a new node in a workflow.
 
     Use when: Building workflows programmatically, responding to user requests ("add a CSV reader"),
@@ -170,7 +170,9 @@ class DeleteNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetNodeResolutionStateRequest(RequestPayload):
+class GetNodeResolutionStateRequest(
+    RequestPayload["GetNodeResolutionStateResultSuccess", "GetNodeResolutionStateResultFailure"]
+):
     """Get the current resolution state of a node.
 
     Use when: Checking if node is ready to execute, monitoring execution progress,
@@ -206,7 +208,9 @@ class GetNodeResolutionStateResultFailure(WorkflowNotAlteredMixin, ResultPayload
 
 @dataclass
 @PayloadRegistry.register
-class ListParametersOnNodeRequest(RequestPayload):
+class ListParametersOnNodeRequest(
+    RequestPayload["ListParametersOnNodeResultSuccess", "ListParametersOnNodeResultFailure"]
+):
     """List all parameter names available on a node.
 
     Use when: Parameter discovery, validation before setting values, generating UIs,
@@ -242,7 +246,7 @@ class ListParametersOnNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class GetNodeMetadataRequest(RequestPayload):
+class GetNodeMetadataRequest(RequestPayload["GetNodeMetadataResultSuccess", "GetNodeMetadataResultFailure"]):
     """Retrieve metadata associated with a node.
 
     Use when: Getting node position for layout, retrieving custom properties, implementing selection,
@@ -278,7 +282,7 @@ class GetNodeMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class SetNodeMetadataRequest(RequestPayload):
+class SetNodeMetadataRequest(RequestPayload["SetNodeMetadataResultSuccess", "SetNodeMetadataResultFailure"]):
     """Update metadata associated with a node.
 
     Use when: Updating node position, storing custom properties/annotations, implementing styling,
@@ -310,7 +314,9 @@ class SetNodeMetadataResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeMetadataRequest(RequestPayload):
+class BatchSetNodeMetadataRequest(
+    RequestPayload["BatchSetNodeMetadataResultSuccess", "BatchSetNodeMetadataResultFailure"]
+):
     """Update metadata for multiple nodes in a single request.
 
     Use when: Updating positions for multiple nodes at once, applying bulk styling changes,
@@ -356,7 +362,9 @@ class BatchSetNodeMetadataResultFailure(ResultPayloadFailure):
 # ...jumbode?
 @dataclass
 @PayloadRegistry.register
-class GetAllNodeInfoRequest(RequestPayload, GraphAccessMixin):
+class GetAllNodeInfoRequest(
+    RequestPayload["GetAllNodeInfoResultSuccess", "GetAllNodeInfoResultFailure"], GraphAccessMixin
+):
     """Retrieve comprehensive information about a node in a single call.
 
     Use when: Populating UIs, implementing node inspection/debugging, gathering complete state
@@ -404,7 +412,9 @@ class GetAllNodeInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class SetLockNodeStateRequest(WorkflowNotAlteredMixin, RequestPayload):
+class SetLockNodeStateRequest(
+    WorkflowNotAlteredMixin, RequestPayload["SetLockNodeStateResultSuccess", "SetLockNodeStateResultFailure"]
+):
     """Lock a node.
 
     Args:
@@ -435,7 +445,9 @@ class SetLockNodeStateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeLockStateRequest(WorkflowNotAlteredMixin, RequestPayload):
+class BatchSetNodeLockStateRequest(
+    WorkflowNotAlteredMixin, RequestPayload["BatchSetNodeLockStateResultSuccess", "BatchSetNodeLockStateResultFailure"]
+):
     """Set lock state for multiple nodes in a single request.
 
     Use when: Locking or unlocking multiple nodes at once, consistent with BatchSetNodeMetadataRequest.
@@ -560,7 +572,9 @@ class SerializedParameterValueTracker:
 
 @dataclass
 @PayloadRegistry.register
-class SerializeNodeToCommandsRequest(RequestPayload):
+class SerializeNodeToCommandsRequest(
+    RequestPayload["SerializeNodeToCommandsResultSuccess", "SerializeNodeToCommandsResultFailure"]
+):
     """Serialize a node into a sequence of commands.
 
     Use when: Implementing copy/paste, exporting nodes, creating templates, backing up nodes.
@@ -643,7 +657,11 @@ class SerializedSelectedNodesCommands:
 
 @dataclass
 @PayloadRegistry.register
-class SerializeSelectedNodesToCommandsRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
+class SerializeSelectedNodesToCommandsRequest(
+    WorkflowNotAlteredMixin,
+    RequestPayload["SerializeSelectedNodesToCommandsResultSuccess", "SerializeSelectedNodesToCommandsResultFailure"],
+    GraphAccessMixin,
+):
     """Serialize multiple selected nodes into commands.
 
     Use when: Implementing copy/paste, exporting workflow sections, creating templates,
@@ -690,7 +708,13 @@ class SerializeSelectedNodesToCommandsResultFailure(WorkflowNotAlteredMixin, Res
 
 @dataclass
 @PayloadRegistry.register
-class DeserializeSelectedNodesFromCommandsRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
+class DeserializeSelectedNodesFromCommandsRequest(
+    WorkflowNotAlteredMixin,
+    RequestPayload[
+        "DeserializeSelectedNodesFromCommandsResultSuccess", "DeserializeSelectedNodesFromCommandsResultFailure"
+    ],
+    GraphAccessMixin,
+):
     """Recreate nodes from serialized commands.
 
     Use when: Implementing paste functionality, importing configurations, restoring from backups,
@@ -733,7 +757,9 @@ class DeserializeSelectedNodesFromCommandsResultFailure(WorkflowNotAlteredMixin,
 
 @dataclass
 @PayloadRegistry.register
-class DeserializeNodeFromCommandsRequest(RequestPayload):
+class DeserializeNodeFromCommandsRequest(
+    RequestPayload["DeserializeNodeFromCommandsResultSuccess", "DeserializeNodeFromCommandsResultFailure"]
+):
     """Recreate a single node from serialized commands.
 
     Use when: Restoring individual nodes from backups/templates, implementing node-level copy/paste,
@@ -772,7 +798,11 @@ class DeserializeNodeFromCommandsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DuplicateSelectedNodesRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
+class DuplicateSelectedNodesRequest(
+    WorkflowNotAlteredMixin,
+    RequestPayload["DuplicateSelectedNodesResultSuccess", "DuplicateSelectedNodesResultFailure"],
+    GraphAccessMixin,
+):
     """Duplicate selected nodes with new positions.
 
     Use when: Implementing duplicate functionality, creating multiple instances of same configuration,
@@ -814,7 +844,7 @@ class DuplicateSelectedNodesResultFailure(WorkflowNotAlteredMixin, ResultPayload
 
 @dataclass
 @PayloadRegistry.register
-class SendNodeMessageRequest(RequestPayload):
+class SendNodeMessageRequest(RequestPayload["SendNodeMessageResultSuccess", "SendNodeMessageResultFailure"]):
     """Send a message to a specific node.
 
     Use when: External systems need to signal or send data directly to individual nodes,
@@ -864,7 +894,9 @@ class SendNodeMessageResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowForNodeRequest(RequestPayload, GraphAccessMixin):
+class GetFlowForNodeRequest(
+    RequestPayload["GetFlowForNodeResultSuccess", "GetFlowForNodeResultFailure"], GraphAccessMixin
+):
     """Get the flow name that contains a specific node.
 
     Use when: Need to determine which flow a node belongs to for variable scoping,
@@ -902,7 +934,9 @@ class GetFlowForNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class CanResetNodeToDefaultsRequest(RequestPayload):
+class CanResetNodeToDefaultsRequest(
+    RequestPayload["CanResetNodeToDefaultsResultSuccess", "CanResetNodeToDefaultsResultFailure"]
+):
     """Check if a node can be reset to its default state.
 
     Use when: Need to validate whether a node reset operation is allowed before attempting it,
@@ -943,7 +977,9 @@ class CanResetNodeToDefaultsResultFailure(WorkflowNotAlteredMixin, ResultPayload
 
 @dataclass
 @PayloadRegistry.register
-class ResetNodeToDefaultsRequest(RequestPayload):
+class ResetNodeToDefaultsRequest(
+    RequestPayload["ResetNodeToDefaultsResultSuccess", "ResetNodeToDefaultsResultFailure"]
+):
     """Reset a node to its default state while preserving connections where possible.
 
     Use when: Need to reset a node's configuration back to defaults, clear customizations,
@@ -987,7 +1023,9 @@ class ResetNodeToDefaultsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AddNodesToNodeGroupRequest(RequestPayload, GraphAccessMixin):
+class AddNodesToNodeGroupRequest(
+    RequestPayload["AddNodesToNodeGroupResultSuccess", "AddNodesToNodeGroupResultFailure"], GraphAccessMixin
+):
     """Adds nodes to a NodeGroup.
 
     Use when: Need to add nodes to an existing NodeGroup, building node groups programmatically,
@@ -1034,7 +1072,9 @@ class AddNodesToNodeGroupResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveNodeFromNodeGroupRequest(RequestPayload, GraphAccessMixin):
+class RemoveNodeFromNodeGroupRequest(
+    RequestPayload["RemoveNodeFromNodeGroupResultSuccess", "RemoveNodeFromNodeGroupResultFailure"], GraphAccessMixin
+):
     """Remove nodes from a NodeGroup.
 
     Use when: Need to remove nodes from a NodeGroup, reorganizing workflow structure,
@@ -1081,7 +1121,9 @@ class RemoveNodeFromNodeGroupResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class MoveNodeToNewFlowRequest(RequestPayload, GraphAccessMixin):
+class MoveNodeToNewFlowRequest(
+    RequestPayload["MoveNodeToNewFlowResultSuccess", "MoveNodeToNewFlowResultFailure"], GraphAccessMixin
+):
     """Move a node from one flow to another flow.
 
     Use when: Reorganizing nodes between flows, adding nodes to NodeGroup subflows,
@@ -1129,7 +1171,9 @@ class MoveNodeToNewFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveNodeRequest(RequestPayload, GraphAccessMixin):
+class UnresolveNodeRequest(
+    RequestPayload["UnresolveNodeResultSuccess", "UnresolveNodeResultFailure"], GraphAccessMixin
+):
     """Mark a node UNRESOLVED without resetting its parameter values.
 
     Use when: Forcing a node to re-execute without resetting its parameter values.

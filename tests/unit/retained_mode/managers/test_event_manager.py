@@ -15,6 +15,7 @@ from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    DispatchFailure,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
@@ -577,7 +578,7 @@ class TestLogResultDetailsSkipsStrictModeViolations:
 
 
 @dataclass(kw_only=True)
-class _DeniedResult(ResultPayloadFailure):
+class _DeniedResult(DispatchFailure):
     """Minimal failure payload a pre-dispatch hook can use to short-circuit dispatch."""
 
 

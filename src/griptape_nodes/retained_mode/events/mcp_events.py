@@ -91,7 +91,7 @@ class DiscoverMCPServerCapabilitiesResultFailure(WorkflowNotAlteredMixin, Result
 
 @dataclass
 @PayloadRegistry.register
-class ListMCPServersRequest(RequestPayload):
+class ListMCPServersRequest(RequestPayload["ListMCPServersResultSuccess", "ListMCPServersResultFailure"]):
     """List all configured MCP servers.
 
     Args:
@@ -117,7 +117,7 @@ class ListMCPServersResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class GetMCPServerRequest(RequestPayload):
+class GetMCPServerRequest(RequestPayload["GetMCPServerResultSuccess", "GetMCPServerResultFailure"]):
     """Get configuration for a specific MCP server.
 
     Args:
@@ -143,7 +143,7 @@ class GetMCPServerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CreateMCPServerRequest(RequestPayload):
+class CreateMCPServerRequest(RequestPayload["CreateMCPServerResultSuccess", "CreateMCPServerResultFailure"]):
     """Create a new MCP server configuration.
 
     Args:
@@ -207,7 +207,7 @@ class CreateMCPServerResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UpdateMCPServerRequest(RequestPayload):
+class UpdateMCPServerRequest(RequestPayload["UpdateMCPServerResultSuccess", "UpdateMCPServerResultFailure"]):
     """Update an existing MCP server configuration.
 
     Args:
@@ -272,7 +272,7 @@ class UpdateMCPServerResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DeleteMCPServerRequest(RequestPayload):
+class DeleteMCPServerRequest(RequestPayload["DeleteMCPServerResultSuccess", "DeleteMCPServerResultFailure"]):
     """Delete an MCP server configuration.
 
     Args:
@@ -298,7 +298,7 @@ class DeleteMCPServerResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class EnableMCPServerRequest(RequestPayload):
+class EnableMCPServerRequest(RequestPayload["EnableMCPServerResultSuccess", "EnableMCPServerResultFailure"]):
     """Enable an MCP server.
 
     Args:
@@ -324,7 +324,7 @@ class EnableMCPServerResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DisableMCPServerRequest(RequestPayload):
+class DisableMCPServerRequest(RequestPayload["DisableMCPServerResultSuccess", "DisableMCPServerResultFailure"]):
     """Disable an MCP server.
 
     Args:
@@ -350,7 +350,9 @@ class DisableMCPServerResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetEnabledMCPServersRequest(RequestPayload):
+class GetEnabledMCPServersRequest(
+    RequestPayload["GetEnabledMCPServersResultSuccess", "GetEnabledMCPServersResultFailure"]
+):
     """Get all enabled MCP servers."""
 
 
@@ -388,7 +390,9 @@ class LibraryMCPServer:
 
 @dataclass
 @PayloadRegistry.register
-class ListLibraryMCPServersRequest(RequestPayload):
+class ListLibraryMCPServersRequest(
+    RequestPayload["ListLibraryMCPServersResultSuccess", "ListLibraryMCPServersResultFailure"]
+):
     """List the loaded libraries that expose tools on the engine's MCP server.
 
     Use when: Offering library tools to the chat agent, or showing where an external MCP client

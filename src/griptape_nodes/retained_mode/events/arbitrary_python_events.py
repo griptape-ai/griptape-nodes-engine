@@ -17,7 +17,9 @@ from griptape_nodes.serialization.values import DisplayValue
 
 @dataclass
 @PayloadRegistry.register
-class RunArbitraryPythonStringRequest(RequestPayload):
+class RunArbitraryPythonStringRequest(
+    RequestPayload["RunArbitraryPythonStringResultSuccess", "RunArbitraryPythonStringResultFailure"]
+):
     """Execute arbitrary Python code string.
 
     Use when: Development/debugging, testing code snippets, prototyping,

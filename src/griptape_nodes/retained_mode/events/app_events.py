@@ -64,7 +64,7 @@ class UserInfo:
 
 @dataclass
 @PayloadRegistry.register
-class AppStartSessionRequest(RequestPayload):
+class AppStartSessionRequest(RequestPayload["AppStartSessionResultSuccess", "AppStartSessionResultFailure"]):
     """Start a new application session.
 
     Use when: Initializing client connections, beginning new workflow sessions,
@@ -100,7 +100,7 @@ class AppStartSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AppGetSessionRequest(RequestPayload):
+class AppGetSessionRequest(RequestPayload["AppGetSessionResultSuccess", "AppGetSessionResultFailure"]):
     """Get the current session information.
 
     Use when: Checking session status, retrieving session details,
@@ -259,7 +259,9 @@ class LibraryLoadedNotification(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
-class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
+class ReportLibraryLoadedRequest(
+    RequestPayload["ReportLibraryLoadedResultSuccess", "ReportLibraryLoadedResultFailure"], SkipTheLineMixin
+):
     """Sent by a worker to the orchestrator to report how a library loaded in the worker.
 
     It is what releases anything waiting to route execution to that worker.
@@ -294,7 +296,9 @@ class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class ReportGeneralPurposeWorkerReadyRequest(RequestPayload, SkipTheLineMixin):
+class ReportGeneralPurposeWorkerReadyRequest(
+    RequestPayload["ReportGeneralPurposeWorkerReadyResultSuccess"], SkipTheLineMixin
+):
     """Sent by a general-purpose worker to the orchestrator once it has loaded its libraries.
 
     A worker registers before it loads anything, so registration alone does not mean it can create
@@ -382,7 +386,7 @@ class CurrentProjectChanged(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
-class GetEngineVersionRequest(RequestPayload):
+class GetEngineVersionRequest(RequestPayload["GetEngineVersionResultSuccess", "GetEngineVersionResultFailure"]):
     """Get the engine version information.
 
     Use when: Checking compatibility, displaying version info,
@@ -416,7 +420,7 @@ class GetEngineVersionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 
 @dataclass
 @PayloadRegistry.register
-class AppEndSessionRequest(RequestPayload):
+class AppEndSessionRequest(RequestPayload["AppEndSessionResultSuccess", "AppEndSessionResultFailure"]):
     """End the current application session.
 
     Use when: Closing client connections, cleaning up session resources,
@@ -446,7 +450,7 @@ class AppEndSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AppJoinSessionRequest(RequestPayload):
+class AppJoinSessionRequest(RequestPayload["AppJoinSessionResultSuccess", "AppJoinSessionResultFailure"]):
     """Join the named session, which must be the active one, and list the client on it.
 
     Start creates-or-joins without naming a session; Join is for a client that already holds a
@@ -473,7 +477,7 @@ class AppJoinSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AppLeaveSessionRequest(RequestPayload):
+class AppLeaveSessionRequest(RequestPayload["AppLeaveSessionResultSuccess", "AppLeaveSessionResultFailure"]):
     """Delist a client from the active session without ending it."""
 
     client_id: str
@@ -493,7 +497,9 @@ class AppLeaveSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
+class SessionHeartbeatRequest(
+    RequestPayload["SessionHeartbeatResultSuccess", "SessionHeartbeatResultFailure"], SkipTheLineMixin
+):
     """Request clients can use ensure the engine session is still active."""
 
 
@@ -511,7 +517,9 @@ class SessionHeartbeatResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
+class EngineHeartbeatRequest(
+    RequestPayload["EngineHeartbeatResultSuccess", "EngineHeartbeatResultFailure"], SkipTheLineMixin
+):
     """Request clients can use to discover active engines and their status.
 
     Attributes:
@@ -624,7 +632,7 @@ class EngineHeartbeatResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SetEngineNameRequest(RequestPayload):
+class SetEngineNameRequest(RequestPayload["SetEngineNameResultSuccess", "SetEngineNameResultFailure"]):
     """Set the human-readable engine name.
 
     Use when: Customizing engine identification, setting up engine instances,
@@ -665,7 +673,7 @@ class SetEngineNameResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetEngineNameRequest(RequestPayload):
+class GetEngineNameRequest(RequestPayload["GetEngineNameResultSuccess", "GetEngineNameResultFailure"]):
     """Get the current engine name.
 
     Use when: Displaying engine information, checking engine identity,

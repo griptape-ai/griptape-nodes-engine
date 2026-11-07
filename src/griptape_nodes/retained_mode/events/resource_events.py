@@ -19,7 +19,9 @@ if TYPE_CHECKING:
 # List Registered Resource Types Events
 @dataclass
 @PayloadRegistry.register
-class ListRegisteredResourceTypesRequest(RequestPayload):
+class ListRegisteredResourceTypesRequest(
+    RequestPayload["ListRegisteredResourceTypesResultSuccess", "ListRegisteredResourceTypesResultFailure"]
+):
     """List all registered resource types.
 
     Use when: Discovering what types of resources are available for allocation
@@ -44,7 +46,9 @@ class ListRegisteredResourceTypesResultFailure(WorkflowNotAlteredMixin, ResultPa
 # Register Resource Type Events
 @dataclass
 @PayloadRegistry.register
-class RegisterResourceTypeRequest(RequestPayload):
+class RegisterResourceTypeRequest(
+    RequestPayload["RegisterResourceTypeResultSuccess", "RegisterResourceTypeResultFailure"]
+):
     """Register a new resource type handler.
 
     Use when: Adding support for a new type of resource (GPU, CPU, Pipeline, etc.)
@@ -72,7 +76,9 @@ class RegisterResourceTypeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 # Create Resource Instance Events
 @dataclass
 @PayloadRegistry.register
-class CreateResourceInstanceRequest(RequestPayload):
+class CreateResourceInstanceRequest(
+    RequestPayload["CreateResourceInstanceResultSuccess", "CreateResourceInstanceResultFailure"]
+):
     """Create a new resource instance.
 
     Use when: Creating a new instance of a resource that can be tracked, locked,
@@ -104,7 +110,9 @@ class CreateResourceInstanceResultFailure(WorkflowNotAlteredMixin, ResultPayload
 # Free Resource Instance Events
 @dataclass
 @PayloadRegistry.register
-class FreeResourceInstanceRequest(RequestPayload):
+class FreeResourceInstanceRequest(
+    RequestPayload["FreeResourceInstanceResultSuccess", "FreeResourceInstanceResultFailure"]
+):
     """Free a resource instance.
 
     Use when: Permanently removing a resource instance from tracking and freeing
@@ -134,7 +142,9 @@ class FreeResourceInstanceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 # Acquire Resource Lock Events
 @dataclass
 @PayloadRegistry.register
-class AcquireResourceInstanceLockRequest(RequestPayload):
+class AcquireResourceInstanceLockRequest(
+    RequestPayload["AcquireResourceInstanceLockResultSuccess", "AcquireResourceInstanceLockResultFailure"]
+):
     """Acquire a lock on an existing resource instance.
 
     Use when: Attempting to acquire exclusive access to a resource instance that
@@ -168,7 +178,9 @@ class AcquireResourceInstanceLockResultFailure(WorkflowNotAlteredMixin, ResultPa
 # Release Resource Lock Events
 @dataclass
 @PayloadRegistry.register
-class ReleaseResourceInstanceLockRequest(RequestPayload):
+class ReleaseResourceInstanceLockRequest(
+    RequestPayload["ReleaseResourceInstanceLockResultSuccess", "ReleaseResourceInstanceLockResultFailure"]
+):
     """Release a lock on a resource instance.
 
     Use when: Releasing exclusive access to a resource instance that was
@@ -198,7 +210,9 @@ class ReleaseResourceInstanceLockResultFailure(WorkflowNotAlteredMixin, ResultPa
 # List Compatible Resource Instances Events
 @dataclass
 @PayloadRegistry.register
-class ListCompatibleResourceInstancesRequest(RequestPayload):
+class ListCompatibleResourceInstancesRequest(
+    RequestPayload["ListCompatibleResourceInstancesResultSuccess", "ListCompatibleResourceInstancesResultFailure"]
+):
     """List resource instances compatible with requirements.
 
     Use when: Discovering what resource instances are available that match
@@ -232,7 +246,9 @@ class ListCompatibleResourceInstancesResultFailure(WorkflowNotAlteredMixin, Resu
 # Get Resource Instance Status Events
 @dataclass
 @PayloadRegistry.register
-class GetResourceInstanceStatusRequest(RequestPayload):
+class GetResourceInstanceStatusRequest(
+    RequestPayload["GetResourceInstanceStatusResultSuccess", "GetResourceInstanceStatusResultFailure"]
+):
     """Get status information for a resource instance.
 
     Use when: Checking the current state of a specific resource instance,
@@ -262,7 +278,9 @@ class GetResourceInstanceStatusResultFailure(WorkflowNotAlteredMixin, ResultPayl
 # List Resource Instances By Type Events
 @dataclass
 @PayloadRegistry.register
-class ListResourceInstancesByTypeRequest(RequestPayload):
+class ListResourceInstancesByTypeRequest(
+    RequestPayload["ListResourceInstancesByTypeResultSuccess", "ListResourceInstancesByTypeResultFailure"]
+):
     """List resource instances of a specific type.
 
     Use when: Listing all instances of a particular resource type for
@@ -294,7 +312,7 @@ class ListResourceInstancesByTypeResultFailure(WorkflowNotAlteredMixin, ResultPa
 # Get Execution Device Events
 @dataclass
 @PayloadRegistry.register
-class GetExecutionDeviceRequest(RequestPayload):
+class GetExecutionDeviceRequest(RequestPayload["GetExecutionDeviceResultSuccess", "GetExecutionDeviceResultFailure"]):
     """Ask which compute device a node should run on.
 
     Use when: A node needs a device to place a model or tensor on, and does not want to import a

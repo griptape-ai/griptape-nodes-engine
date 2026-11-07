@@ -40,7 +40,7 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 from griptape_nodes.retained_mode.events.base_events import (
     GriptapeNodeEvent,
-    ResultPayloadFailure,
+    TypedRequestsMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelAllRunsRequest,
@@ -48,6 +48,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
@@ -160,7 +161,7 @@ class EngineScoped:
         return self._engine
 
 
-class Engine:
+class Engine(TypedRequestsMixin):
     """Owns one complete set of managers.
 
     Managers are created here and hold a reference back to this engine, so they resolve
@@ -550,7 +551,7 @@ class Engine:
                 type(request).__name__,
                 request.request_id,
             )
-            return ResultPayloadFailure(
+            return GenericResultFailure(
                 exception=e, result_details=f"Unhandled exception while processing {type(request).__name__}: {e}"
             )
         else:
@@ -577,7 +578,7 @@ class Engine:
                 type(request).__name__,
                 request.request_id,
             )
-            return ResultPayloadFailure(
+            return GenericResultFailure(
                 exception=e, result_details=f"Unhandled exception while processing async {type(request).__name__}: {e}"
             )
         else:
@@ -605,7 +606,9 @@ class Engine:
         self._engine_transports = engine_transports
         engine_transports.on_engine_lost(self._on_engine_lost)
 
-    async def request(self, engine_id: str, request: RequestPayload, *, timeout_s: float | None) -> ResultPayload:
+    async def request_engine(
+        self, engine_id: str, request: RequestPayload, *, timeout_s: float | None
+    ) -> ResultPayload:
         """Send `request` to the engine `engine_id`, wherever it runs, and return its result.
 
         The app finds that engine and chooses how to reach it.

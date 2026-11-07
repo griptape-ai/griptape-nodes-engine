@@ -13,7 +13,9 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 @dataclass
 @PayloadRegistry.register
-class ValidateFlowDependenciesRequest(RequestPayload, GraphAccessMixin):
+class ValidateFlowDependenciesRequest(
+    RequestPayload["ValidateFlowDependenciesResultSuccess", "ValidateFlowDependenciesResultFailure"], GraphAccessMixin
+):
     """Validate that a flow has all required dependencies before execution.
 
     Use when: Pre-flight checks before flow execution, preventing runtime failures,
@@ -57,7 +59,9 @@ class ValidateFlowDependenciesResultFailure(WorkflowNotAlteredMixin, ResultPaylo
 
 @dataclass
 @PayloadRegistry.register
-class ValidateNodeDependenciesRequest(RequestPayload):
+class ValidateNodeDependenciesRequest(
+    RequestPayload["ValidateNodeDependenciesResultSuccess", "ValidateNodeDependenciesResultFailure"]
+):
     """Validate that a node has all required dependencies before execution.
 
     Use when: Pre-flight checks before node execution, preventing runtime failures,

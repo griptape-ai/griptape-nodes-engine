@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import functools
 import logging
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, NoReturn, TypeVar
+from typing import Any, ForwardRef, Generic, NamedTuple, NoReturn, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field
+from typing_extensions import TypeVar
 
 
 @dataclass(frozen=True)
@@ -94,10 +97,21 @@ class Payload(ABC):  # noqa: B024
     """Base class for all payload types. Customers will derive from this."""
 
 
+# The results a request declares. Quote them in the subscript, since results are defined after their requests:
+# `class FooRequest(RequestPayload["FooResultSuccess", "FooResultFailure"])`. A request that declares none
+# returns `ResultPayloadSuccess` and `ResultPayloadFailure`.
+SuccessT_co = TypeVar("SuccessT_co", bound="ResultPayloadSuccess", default="ResultPayloadSuccess", covariant=True)
+FailureT_co = TypeVar("FailureT_co", bound="ResultPayloadFailure", default="ResultPayloadFailure", covariant=True)
+
+
 # Request payload base class with optional request ID
 @dataclass(kw_only=True)
-class RequestPayload(Payload, ABC):
+class RequestPayload(Payload, ABC, Generic[SuccessT_co, FailureT_co]):
     """Base class for all request payloads.
+
+    Declare the success and failure results the handler returns as the type arguments, so
+    `Engine.request` and `Engine.try_request` return those types instead of `ResultPayload`.
+    A request can also fail with a `DispatchFailure`, which the dispatcher returns for any request.
 
     Args:
         request_id: Optional request ID for tracking.
@@ -138,6 +152,16 @@ class RequestPayload(Payload, ABC):
     request_id: str | None = None
     failure_log_level: int | None = None
     fields: list[str] | None = None
+
+    @classmethod
+    def success_type(cls) -> type[ResultPayloadSuccess]:
+        """The success result this request declares, or `ResultPayloadSuccess` when it declares none."""
+        return _declared_results(cls).success
+
+    @classmethod
+    def failure_type(cls) -> type[ResultPayloadFailure]:
+        """The failure result this request declares, or `ResultPayloadFailure` when it declares none."""
+        return _declared_results(cls).failure
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -261,6 +285,13 @@ class ResultPayloadFailure(ResultPayload, ABC):
     result_details: ResultDetails | str
     exception: Exception | None = None
 
+    def as_exception(self, request: RequestPayload) -> Exception:
+        """The exception `Engine.request` raises for this failure.
+
+        Override to raise an error callers can catch by type, such as a refusal.
+        """
+        return RequestFailedError(request, self)
+
     def __post_init__(self) -> None:
         """Initialize failure result with ERROR level default for strings."""
         if isinstance(self.result_details, str):
@@ -273,6 +304,134 @@ class ResultPayloadFailure(ResultPayload, ABC):
             bool: Always False
         """
         return False
+
+
+@dataclass(kw_only=True)
+class DispatchFailure(ResultPayloadFailure, ABC):
+    """A failure the dispatcher returns instead of the request's own, for any request.
+
+    The handler raised, the request was refused before reaching it (a pre-dispatch hook, an
+    unknown sender), or the envelope named no workflow it can act on.
+    """
+
+
+class RequestFailedError(Exception):
+    """A request sent with `Engine.request` failed.
+
+    The message is the failure's `result_details`. `result` is the failure itself, and the exception
+    the handler hit, if any, is chained as the cause.
+    """
+
+    def __init__(self, request: RequestPayload, result: ResultPayloadFailure) -> None:
+        super().__init__(str(result.result_details))
+        self.request = request
+        self.result = result
+
+
+class TypedRequestsMixin(ABC):
+    """Typed request methods for anything that dispatches requests.
+
+    `request` returns the success result a request declares and raises on failure. `try_request`
+    returns the success, the declared failure, or a `DispatchFailure`, for callers that handle a
+    failure themselves.
+    """
+
+    @abstractmethod
+    def handle_request(self, request: RequestPayload) -> ResultPayload: ...
+
+    @abstractmethod
+    async def ahandle_request(self, request: RequestPayload) -> ResultPayload: ...
+
+    def request[S: ResultPayloadSuccess, F: ResultPayloadFailure](self, request: RequestPayload[S, F]) -> S:
+        """Handle `request` and return the success result it declares.
+
+        Raises:
+            RequestFailedError: The request failed. A failure type can raise its own error instead
+                (see `ResultPayloadFailure.as_exception`).
+        """
+        return expect_success(request, self.handle_request(request))
+
+    async def arequest[S: ResultPayloadSuccess, F: ResultPayloadFailure](self, request: RequestPayload[S, F]) -> S:
+        """Async `request`."""
+        return expect_success(request, await self.ahandle_request(request))
+
+    def try_request[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+        self, request: RequestPayload[S, F]
+    ) -> S | F | DispatchFailure:
+        """Handle `request` and return the result it declares, or the `DispatchFailure` it failed with."""
+        return declared_result(request, self.handle_request(request))
+
+    async def atry_request[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+        self, request: RequestPayload[S, F]
+    ) -> S | F | DispatchFailure:
+        """Async `try_request`."""
+        return declared_result(request, await self.ahandle_request(request))
+
+
+def expect_success[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+    request: RequestPayload[S, F], result: ResultPayload
+) -> S:
+    """Return `result` as the success `request` declares, or raise the failure's exception."""
+    narrowed = declared_result(request, result)
+    if isinstance(narrowed, ResultPayloadFailure):
+        raise narrowed.as_exception(request) from narrowed.exception
+    return narrowed
+
+
+def declared_result[S: ResultPayloadSuccess, F: ResultPayloadFailure](
+    request: RequestPayload[S, F], result: ResultPayload
+) -> S | F | DispatchFailure:
+    """Check `result` against the results `request` declares, and return it typed as one of them."""
+    if isinstance(result, DispatchFailure):
+        return result
+    declared = _declared_results(type(request))
+    expected = declared.failure if isinstance(result, ResultPayloadFailure) else declared.success
+    if not isinstance(result, expected):
+        msg = (
+            f"{type(request).__name__} declares {expected.__name__}, but its handler returned {type(result).__name__}."
+        )
+        raise TypeError(msg)
+    return result  # pyright: ignore[reportReturnType] -- checked against the declared type above
+
+
+class DeclaredResults(NamedTuple):
+    success: type[ResultPayloadSuccess]
+    failure: type[ResultPayloadFailure]
+
+
+@functools.cache
+def _declared_results(request_type: type[RequestPayload]) -> DeclaredResults:
+    """Find the `RequestPayload[...]` arguments in `request_type`'s bases and resolve them to classes."""
+    for klass in request_type.__mro__:
+        for base in klass.__dict__.get("__orig_bases__", ()):
+            if get_origin(base) is not RequestPayload:
+                continue
+            arguments = get_args(base)
+            success = _resolve_result_type(arguments[0], klass, ResultPayloadSuccess)
+            failure = ResultPayloadFailure
+            if len(arguments) > 1:
+                failure = _resolve_result_type(arguments[1], klass, ResultPayloadFailure)
+            return DeclaredResults(success=success, failure=failure)
+    return DeclaredResults(success=ResultPayloadSuccess, failure=ResultPayloadFailure)
+
+
+def _resolve_result_type[T: ResultPayload](argument: Any, declaring_class: type, base: type[T]) -> type[T]:
+    if isinstance(argument, str):
+        argument = ForwardRef(argument)
+    if isinstance(argument, ForwardRef):
+        module = sys.modules[declaring_class.__module__]
+        resolved = getattr(module, argument.__forward_arg__, None)
+        if resolved is None:
+            msg = (
+                f"{declaring_class.__name__} declares '{argument.__forward_arg__}' as a result, "
+                f"but {module.__name__} defines no class by that name."
+            )
+            raise TypeError(msg)
+        argument = resolved
+    if not (isinstance(argument, type) and issubclass(argument, base)):
+        # A type variable, from a generic intermediate class, declares nothing yet.
+        return base
+    return argument
 
 
 class ExecutionPayload(Payload):

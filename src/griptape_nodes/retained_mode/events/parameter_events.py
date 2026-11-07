@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 @dataclass
 @PayloadRegistry.register
-class AddParameterToNodeRequest(RequestPayload):
+class AddParameterToNodeRequest(RequestPayload["AddParameterToNodeResultSuccess", "AddParameterToNodeResultFailure"]):
     """Add a new parameter to a node.
 
     Use when: Dynamically adding inputs/outputs to nodes, customizing node interfaces,
@@ -115,7 +115,9 @@ class AddParameterToNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveParameterFromNodeRequest(RequestPayload, GraphAccessMixin):
+class RemoveParameterFromNodeRequest(
+    RequestPayload["RemoveParameterFromNodeResultSuccess", "RemoveParameterFromNodeResultFailure"], GraphAccessMixin
+):
     """Remove a parameter from a node.
 
     Use when: Cleaning up unused parameters, dynamically restructuring node interfaces,
@@ -147,7 +149,9 @@ class RemoveParameterFromNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AddParameterGroupToNodeRequest(RequestPayload):
+class AddParameterGroupToNodeRequest(
+    RequestPayload["AddParameterGroupToNodeResultSuccess", "AddParameterGroupToNodeResultFailure"]
+):
     """Add a new ParameterGroup to a node.
 
     Use when: Dynamically organizing parameters into collapsible groups,
@@ -194,7 +198,9 @@ class AddParameterGroupToNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AlterParameterGroupDetailsRequest(RequestPayload):
+class AlterParameterGroupDetailsRequest(
+    RequestPayload["AlterParameterGroupDetailsResultSuccess", "AlterParameterGroupDetailsResultFailure"]
+):
     """Alter the details and configuration of a ParameterGroup.
 
     Use when: Modifying ParameterGroup UI options (collapsed state, visibility, etc.),
@@ -233,7 +239,7 @@ class AlterParameterGroupDetailsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SetParameterValueRequest(RequestPayload):
+class SetParameterValueRequest(RequestPayload["SetParameterValueResultSuccess", "SetParameterValueResultFailure"]):
     """Set the value of a parameter on a node.
 
     Use when: Configuring node inputs, setting property values, loading saved workflows,
@@ -291,7 +297,9 @@ class SetParameterValueResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetParameterDetailsRequest(RequestPayload):
+class GetParameterDetailsRequest(
+    RequestPayload["GetParameterDetailsResultSuccess", "GetParameterDetailsResultFailure"]
+):
     """Get detailed information about a parameter.
 
     Use when: Inspecting parameter configuration, validating parameter properties,
@@ -357,7 +365,9 @@ class GetParameterDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class AlterParameterDetailsRequest(RequestPayload):
+class AlterParameterDetailsRequest(
+    RequestPayload["AlterParameterDetailsResultSuccess", "AlterParameterDetailsResultFailure"]
+):
     """Alter the details and configuration of a parameter.
 
     Use when: Modifying parameter types, updating tooltips, changing allowed modes,
@@ -462,7 +472,7 @@ class AlterParameterDetailsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetParameterValueRequest(RequestPayload):
+class GetParameterValueRequest(RequestPayload["GetParameterValueResultSuccess", "GetParameterValueResultFailure"]):
     """Get the current value of a parameter.
 
     Use when: Reading parameter values, debugging workflow state, displaying current values in UIs,
@@ -515,7 +525,9 @@ class OnParameterValueChanged(WorkflowAlteredMixin, ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class GetCompatibleParametersRequest(RequestPayload):
+class GetCompatibleParametersRequest(
+    RequestPayload["GetCompatibleParametersResultSuccess", "GetCompatibleParametersResultFailure"]
+):
     """Get parameters that are compatible for connections.
 
     Use when: Creating connections between nodes, validating connection compatibility,
@@ -560,7 +572,9 @@ class GetCompatibleParametersResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class GetNodeElementDetailsRequest(RequestPayload):
+class GetNodeElementDetailsRequest(
+    RequestPayload["GetNodeElementDetailsResultSuccess", "GetNodeElementDetailsResultFailure"]
+):
     """Get detailed information about a node element.
 
     Use when: Inspecting node structure, debugging element configuration,
@@ -599,7 +613,7 @@ class AlterElementEvent(ExecutionPayload):
 
 @dataclass
 @PayloadRegistry.register
-class RenameParameterRequest(RequestPayload):
+class RenameParameterRequest(RequestPayload["RenameParameterResultSuccess", "RenameParameterResultFailure"]):
     """Rename a parameter on a node.
 
     Use when: Refactoring parameter names, improving parameter clarity, updating parameter
@@ -650,7 +664,10 @@ class RenameParameterResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConnectionsForParameterRequest(RequestPayload, GraphAccessMixin):
+class GetConnectionsForParameterRequest(
+    RequestPayload["GetConnectionsForParameterResultSuccess", "GetConnectionsForParameterResultFailure"],
+    GraphAccessMixin,
+):
     """Get connections for a specific parameter on a node.
 
     Use when: Checking if a parameter is connected, getting connection details for a parameter,
@@ -734,7 +751,9 @@ class ConversionConfig:
 
 @dataclass
 @PayloadRegistry.register
-class ReorderParameterListItemRequest(RequestPayload):
+class ReorderParameterListItemRequest(
+    RequestPayload["ReorderParameterListItemResultSuccess", "ReorderParameterListItemResultFailure"]
+):
     """Reorder an item within a ParameterList.
 
     Use when: User drags to reorder list items in the UI, implementing undo/redo for list reordering,
@@ -773,7 +792,7 @@ class ReorderParameterListItemResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class MigrateParameterRequest(RequestPayload):
+class MigrateParameterRequest(RequestPayload["MigrateParameterResultSuccess", "MigrateParameterResultFailure"]):
     """Request to migrate a parameter from one node to another with optional conversions.
 
     Args:

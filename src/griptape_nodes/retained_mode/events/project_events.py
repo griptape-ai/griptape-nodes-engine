@@ -104,7 +104,9 @@ class UnresolvedSequenceSlotBehavior(StrEnum):
 
 @dataclass
 @PayloadRegistry.register
-class LoadProjectTemplateRequest(RequestPayload):
+class LoadProjectTemplateRequest(
+    RequestPayload["LoadProjectTemplateResultSuccess", "LoadProjectTemplateResultFailure"]
+):
     """Load user's project.yml and merge with system defaults.
 
     Use when: User opens a workspace, user creates new project, user modifies project.yml.
@@ -150,7 +152,7 @@ class LoadProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class GetProjectTemplateRequest(RequestPayload):
+class GetProjectTemplateRequest(RequestPayload["GetProjectTemplateResultSuccess", "GetProjectTemplateResultFailure"]):
     """Get cached project template for a project ID.
 
     Use when: Querying current project configuration, checking validation status.
@@ -187,7 +189,7 @@ class GetProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class ResolveProjectWorkspaceRequest(RequestPayload):
+class ResolveProjectWorkspaceRequest(RequestPayload["ResolveProjectWorkspaceResultSuccess"]):
     """Resolve the workspace directory a project would use, WITHOUT loading/activating it.
 
     Use when: Showing a project's effective workspace in the detail view when the project does not
@@ -281,7 +283,7 @@ class ProjectTemplateInfo:
 
 @dataclass
 @PayloadRegistry.register
-class ListProjectTemplatesRequest(RequestPayload):
+class ListProjectTemplatesRequest(RequestPayload["ListProjectTemplatesResultSuccess"]):
     """List all project templates that have been loaded or attempted to load.
 
     Use when: Displaying available projects, checking which projects are loaded.
@@ -311,7 +313,7 @@ class ListProjectTemplatesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
 
 @dataclass
 @PayloadRegistry.register
-class RefreshProjectTemplatesRequest(RequestPayload):
+class RefreshProjectTemplatesRequest(RequestPayload["RefreshProjectTemplatesResultSuccess"]):
     """Re-check every path in projects_to_register and load the projects that have appeared since startup.
 
     Use when: A registered project became reachable after the engine started, such as a project on a
@@ -329,7 +331,7 @@ class RefreshProjectTemplatesResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class GetSituationRequest(RequestPayload):
+class GetSituationRequest(RequestPayload["GetSituationResultSuccess", "GetSituationResultFailure"]):
     """Get the full situation template for a specific situation.
 
     Returns the complete SituationTemplate including macro and policy.
@@ -370,7 +372,7 @@ class GetSituationResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetPathForMacroRequest(RequestPayload):
+class GetPathForMacroRequest(RequestPayload["GetPathForMacroResultSuccess", "GetPathForMacroResultFailure"]):
     """Resolve ANY macro schema with variables to produce final file path.
 
     Use when: Resolving paths, saving files. Works with any macro string, not tied to situations.
@@ -438,7 +440,7 @@ class GetPathForMacroResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class SetCurrentProjectRequest(RequestPayload):
+class SetCurrentProjectRequest(RequestPayload["SetCurrentProjectResultSuccess", "SetCurrentProjectResultFailure"]):
     """Set which project user has currently selected.
 
     Use when: User switches between projects, opens a new workspace.
@@ -472,7 +474,7 @@ class SetCurrentProjectResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetCurrentProjectRequest(RequestPayload):
+class GetCurrentProjectRequest(RequestPayload["GetCurrentProjectResultSuccess", "GetCurrentProjectResultFailure"]):
     """Get the currently selected project path.
 
     Use when: Need to know which project user is working with.
@@ -501,7 +503,9 @@ class GetCurrentProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 @PayloadRegistry.register
-class SaveProjectTemplateRequest(RequestPayload):
+class SaveProjectTemplateRequest(
+    RequestPayload["SaveProjectTemplateResultSuccess", "SaveProjectTemplateResultFailure"]
+):
     """Save user customizations to project.yml file.
 
     Use when: User modifies project configuration, exports template.
@@ -537,7 +541,9 @@ class SaveProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class ValidateProjectTemplateRequest(RequestPayload):
+class ValidateProjectTemplateRequest(
+    RequestPayload["ValidateProjectTemplateResultSuccess", "ValidateProjectTemplateResultFailure"]
+):
     """Validate a project template dict without saving or loading it.
 
     Use when: UI needs to check whether a template would be accepted by the
@@ -581,7 +587,9 @@ class ValidateProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class AttemptMatchPathAgainstMacroRequest(RequestPayload):
+class AttemptMatchPathAgainstMacroRequest(
+    RequestPayload["AttemptMatchPathAgainstMacroResultSuccess", "AttemptMatchPathAgainstMacroResultFailure"]
+):
     """Attempt to match a path against a macro schema and extract variables.
 
     Use when: Validating paths, extracting info from file paths,
@@ -638,7 +646,7 @@ class AttemptMatchPathAgainstMacroResultFailure(WorkflowNotAlteredMixin, ResultP
 
 @dataclass
 @PayloadRegistry.register
-class GetStateForMacroRequest(RequestPayload):
+class GetStateForMacroRequest(RequestPayload["GetStateForMacroResultSuccess", "GetStateForMacroResultFailure"]):
     """Analyze a macro and return comprehensive state information.
 
     Use when: Building UI forms, real-time validation, checking if resolution
@@ -695,7 +703,9 @@ class GetStateForMacroResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 
 @dataclass
 @PayloadRegistry.register
-class AttemptMapAbsolutePathToProjectRequest(RequestPayload):
+class AttemptMapAbsolutePathToProjectRequest(
+    RequestPayload["AttemptMapAbsolutePathToProjectResultSuccess", "AttemptMapAbsolutePathToProjectResultFailure"]
+):
     """Find out if an absolute path exists anywhere within a Project directory.
 
     Use when: User selects or types an absolute path via FilePicker and you need to know:
@@ -779,7 +789,9 @@ class AttemptMapAbsolutePathToProjectResultFailure(WorkflowNotAlteredMixin, Resu
 
 @dataclass
 @PayloadRegistry.register
-class UnregisterProjectTemplateRequest(RequestPayload):
+class UnregisterProjectTemplateRequest(
+    RequestPayload["UnregisterProjectTemplateResultSuccess", "UnregisterProjectTemplateResultFailure"]
+):
     """Remove a registered project template from the engine.
 
     Removes the template from in-memory caches and from the persisted
@@ -817,7 +829,9 @@ class UnregisterProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayl
 
 @dataclass
 @PayloadRegistry.register
-class GetAllSituationsForProjectRequest(RequestPayload):
+class GetAllSituationsForProjectRequest(
+    RequestPayload["GetAllSituationsForProjectResultSuccess", "GetAllSituationsForProjectResultFailure"]
+):
     """Get all situation names and schemas from a project template.
 
     Args:
@@ -848,7 +862,9 @@ class GetAllSituationsForProjectResultFailure(WorkflowNotAlteredMixin, ResultPay
 
 @dataclass
 @PayloadRegistry.register
-class ActivateWorkspaceProjectRequest(RequestPayload):
+class ActivateWorkspaceProjectRequest(
+    RequestPayload["ActivateWorkspaceProjectResultSuccess", "ActivateWorkspaceProjectResultFailure"]
+):
     """Resolve and activate the workspace project before app initialization completes.
 
     Emitted by the app orchestrator after role setup but before the
@@ -878,7 +894,7 @@ class ActivateWorkspaceProjectResultFailure(WorkflowNotAlteredMixin, ResultPaylo
 
 @dataclass
 @PayloadRegistry.register
-class ExportProjectRequest(RequestPayload):
+class ExportProjectRequest(RequestPayload["ExportProjectResultSuccess", "ExportProjectResultFailure"]):
     """Package a loaded project and its dependencies into a portable .zip.
 
     Use when: User wants to archive or branch an entire project. The package
@@ -935,7 +951,9 @@ class ExportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class PreviewImportProjectRequest(RequestPayload):
+class PreviewImportProjectRequest(
+    RequestPayload["PreviewImportProjectResultSuccess", "PreviewImportProjectResultFailure"]
+):
     """Read a project package's manifest without extracting it.
 
     Use when: The GUI wants to show what a .zip contains (libraries, required
@@ -980,7 +998,7 @@ class PreviewImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
-class ImportProjectRequest(RequestPayload):
+class ImportProjectRequest(RequestPayload["ImportProjectResultSuccess", "ImportProjectResultFailure"]):
     """Extract a project package to a target directory and register it.
 
     Use when: User archives or branches a project. The mirrored base-dir tree is
@@ -1043,7 +1061,9 @@ class ImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UpgradeProjectSchemaRequest(RequestPayload):
+class UpgradeProjectSchemaRequest(
+    RequestPayload["UpgradeProjectSchemaResultSuccess", "UpgradeProjectSchemaResultFailure"]
+):
     """Electively upgrade a loaded project to the latest schema MAJOR version.
 
     A within-major version advance happens automatically on save; crossing a MAJOR

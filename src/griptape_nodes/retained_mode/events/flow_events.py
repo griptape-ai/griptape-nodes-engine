@@ -46,7 +46,7 @@ class FlowMetadataExtractionFailureReason(StrEnum):
 
 @dataclass(kw_only=True)
 @PayloadRegistry.register
-class CreateFlowRequest(RequestPayload, GraphAccessMixin):
+class CreateFlowRequest(RequestPayload["CreateFlowResultSuccess", "CreateFlowResultFailure"], GraphAccessMixin):
     """Create a new flow (sub-workflow) within a parent flow.
 
     Use when: Creating sub-workflows, organizing complex workflows into components,
@@ -105,7 +105,7 @@ class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin)
 
 @dataclass
 @PayloadRegistry.register
-class DeleteFlowRequest(RequestPayload, GraphAccessMixin):
+class DeleteFlowRequest(RequestPayload["DeleteFlowResultSuccess", "DeleteFlowResultFailure"], GraphAccessMixin):
     """Delete a flow and all its contents.
 
     Use when: Removing unused sub-workflows, cleaning up complex workflows,
@@ -135,7 +135,9 @@ class DeleteFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ListNodesInFlowRequest(RequestPayload, GraphAccessMixin):
+class ListNodesInFlowRequest(
+    RequestPayload["ListNodesInFlowResultSuccess", "ListNodesInFlowResultFailure"], GraphAccessMixin
+):
     """List all nodes in a specific flow.
 
     Use when: Inspecting flow contents, building flow visualizations,
@@ -214,7 +216,9 @@ class FlowSummaryConnection:
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowSummaryRequest(RequestPayload, GraphAccessMixin):
+class GetFlowSummaryRequest(
+    RequestPayload["GetFlowSummaryResultSuccess", "GetFlowSummaryResultFailure"], GraphAccessMixin
+):
     """Summarize a flow's nodes, the values set on them, and their connections, in one call.
 
     Use when: planning an edit to a workflow the user already has open, or checking what is in
@@ -262,7 +266,9 @@ class GetFlowSummaryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 # It was implemented this way to maintain backwards compatibility with the editor.
 @dataclass
 @PayloadRegistry.register
-class ListFlowsInCurrentContextRequest(RequestPayload, GraphAccessMixin):
+class ListFlowsInCurrentContextRequest(
+    RequestPayload["ListFlowsInCurrentContextResultSuccess", "ListFlowsInCurrentContextResultFailure"], GraphAccessMixin
+):
     pass
 
 
@@ -289,7 +295,9 @@ class NodePosition:
 
 @dataclass
 @PayloadRegistry.register
-class AutoLayoutFlowRequest(RequestPayload, GraphAccessMixin):
+class AutoLayoutFlowRequest(
+    RequestPayload["AutoLayoutFlowResultSuccess", "AutoLayoutFlowResultFailure"], GraphAccessMixin
+):
     """Auto-place every node in a flow on a topological column-and-row grid.
 
     Use when: an MCP client has just finished building a graph (nodes + connections) and
@@ -348,7 +356,9 @@ class AutoLayoutFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 # Gives a list of the flows directly parented by the node specified.
 @dataclass
 @PayloadRegistry.register
-class ListFlowsInFlowRequest(RequestPayload, GraphAccessMixin):
+class ListFlowsInFlowRequest(
+    RequestPayload["ListFlowsInFlowResultSuccess", "ListFlowsInFlowResultFailure"], GraphAccessMixin
+):
     # Pass in None to get the canvas.
     parent_flow_name: str | None = None
 
@@ -367,7 +377,7 @@ class ListFlowsInFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class GetTopLevelFlowRequest(RequestPayload, GraphAccessMixin):
+class GetTopLevelFlowRequest(RequestPayload["GetTopLevelFlowResultSuccess"], GraphAccessMixin):
     pass
 
 
@@ -482,7 +492,9 @@ class SerializedFlowCommands:
 
 @dataclass
 @PayloadRegistry.register
-class SerializeFlowToCommandsRequest(RequestPayload, GraphAccessMixin):
+class SerializeFlowToCommandsRequest(
+    RequestPayload["SerializeFlowToCommandsResultSuccess", "SerializeFlowToCommandsResultFailure"], GraphAccessMixin
+):
     """Request payload to serialize a flow into a sequence of commands.
 
     Attributes:
@@ -511,7 +523,10 @@ class SerializeFlowToCommandsResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 
 @dataclass
 @PayloadRegistry.register
-class DeserializeFlowFromCommandsRequest(RequestPayload, GraphAccessMixin):
+class DeserializeFlowFromCommandsRequest(
+    RequestPayload["DeserializeFlowFromCommandsResultSuccess", "DeserializeFlowFromCommandsResultFailure"],
+    GraphAccessMixin,
+):
     serialized_flow_commands: SerializedFlowCommands
     pop_flow_context_after: bool = (
         True  # Whether to pop the flow context after deserialization (default: True for cleanup)
@@ -533,7 +548,12 @@ class DeserializeFlowFromCommandsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ExtractFlowCommandsFromImageMetadataRequest(RequestPayload, GraphAccessMixin):
+class ExtractFlowCommandsFromImageMetadataRequest(
+    RequestPayload[
+        "ExtractFlowCommandsFromImageMetadataResultSuccess", "ExtractFlowCommandsFromImageMetadataResultFailure"
+    ],
+    GraphAccessMixin,
+):
     """Extract flow commands from PNG image metadata.
 
     This request reads a PNG image file, extracts the embedded workflow metadata
@@ -592,7 +612,9 @@ class ExtractFlowCommandsFromImageMetadataResultFailure(WorkflowNotAlteredMixin,
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowDetailsRequest(RequestPayload, GraphAccessMixin):
+class GetFlowDetailsRequest(
+    RequestPayload["GetFlowDetailsResultSuccess", "GetFlowDetailsResultFailure"], GraphAccessMixin
+):
     """Request payload to get detailed information about a flow.
 
     This provides metadata about a flow including its reference status and parent hierarchy,
@@ -636,7 +658,9 @@ class GetFlowDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
+class GetFlowMetadataRequest(
+    RequestPayload["GetFlowMetadataResultSuccess", "GetFlowMetadataResultFailure"], GraphAccessMixin
+):
     """Get metadata associated with a flow.
 
     Use when: Retrieving flow layout information, getting custom flow properties,
@@ -669,7 +693,9 @@ class GetFlowMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 
 @dataclass
 @PayloadRegistry.register
-class SetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
+class SetFlowMetadataRequest(
+    RequestPayload["SetFlowMetadataResultSuccess", "SetFlowMetadataResultFailure"], GraphAccessMixin
+):
     """Set metadata associated with a flow.
 
     Use when: Updating flow layout information, storing custom flow properties,
@@ -725,7 +751,10 @@ class ParameterNameMapping(NamedTuple):
 
 @dataclass
 @PayloadRegistry.register
-class PackageNodesAsSerializedFlowRequest(RequestPayload, GraphAccessMixin):
+class PackageNodesAsSerializedFlowRequest(
+    RequestPayload["PackageNodesAsSerializedFlowResultSuccess", "PackageNodesAsSerializedFlowResultFailure"],
+    GraphAccessMixin,
+):
     """Package multiple nodes as a complete flow with artificial start and end nodes.
 
     Creates a serialized flow where:

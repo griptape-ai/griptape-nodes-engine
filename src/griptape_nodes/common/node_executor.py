@@ -55,12 +55,12 @@ from griptape_nodes.retained_mode.events.base_events import (
     ForwardedException,
     ProgressEvent,
     ResultPayload,
+    ResultPayloadFailure,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
     ListConnectionsForNodeRequest,
-    ListConnectionsForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowCancelledEvent,
@@ -1248,11 +1248,10 @@ class NodeExecutor(EngineScoped):
         )
 
         # Check if there are direct data connections from start to end
-        list_connections_request = ListConnectionsForNodeRequest(node_name=start_node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
+        list_connections_result = workflow.try_request(ListConnectionsForNodeRequest(node_name=start_node.name))
 
         connected_source_param = None
-        if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+        if not isinstance(list_connections_result, ResultPayloadFailure):
             for conn in list_connections_result.outgoing_connections:
                 if conn.target_node_name == end_node.name and conn.target_parameter_name == "new_item_to_add":
                     connected_source_param = conn.source_parameter_name
@@ -1309,9 +1308,8 @@ class NodeExecutor(EngineScoped):
         """
         workflow = end_loop_node._require_workflow()
         # Get incoming connections to the end_loop_node (the iterative group)
-        list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
-        if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+        list_connections_result = workflow.try_request(ListConnectionsForNodeRequest(node_name=end_loop_node.name))
+        if isinstance(list_connections_result, ResultPayloadFailure):
             logger.warning("Failed to list connections for node %s", end_loop_node.name)
             return IterationControlAction.ADD
 
@@ -2351,9 +2349,8 @@ class NodeExecutor(EngineScoped):
         workflow = node._require_workflow()
         iteration_params: list[str] = []
 
-        list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
-        if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+        list_connections_result = workflow.try_request(ListConnectionsForNodeRequest(node_name=node.name))
+        if isinstance(list_connections_result, ResultPayloadFailure):
             logger.warning("Failed to list connections for while group node %s", node.name)
             return iteration_params
 
@@ -2397,9 +2394,8 @@ class NodeExecutor(EngineScoped):
             WhileControlParam.DONE, WhileControlParam.CONTINUE, or None
         """
         workflow = while_node._require_workflow()
-        list_connections_request = ListConnectionsForNodeRequest(node_name=while_node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
-        if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+        list_connections_result = workflow.try_request(ListConnectionsForNodeRequest(node_name=while_node.name))
+        if isinstance(list_connections_result, ResultPayloadFailure):
             logger.warning("Failed to list connections for while group node %s", while_node.name)
             return None
 
@@ -2929,13 +2925,7 @@ class NodeExecutor(EngineScoped):
         # not just 0-based iteration indices
         index_values = iteration_source.get_all_iteration_values()
 
-        list_connections_request = ListConnectionsForNodeRequest(node_name=iteration_source.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
-        if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-            msg = (
-                f"Failed to list connections for node {iteration_source.name}: {list_connections_result.result_details}"
-            )
-            raise RuntimeError(msg)  # noqa: TRY004 This should be a runtime error because it happens during execution.
+        list_connections_result = workflow.request(ListConnectionsForNodeRequest(node_name=iteration_source.name))
         # Build parameter values for each iteration
         outgoing_connections = list_connections_result.outgoing_connections
 
@@ -3276,11 +3266,7 @@ class NodeExecutor(EngineScoped):
         """
         workflow = end_loop_node._require_workflow()
         # Step 1: Get incoming connections TO the end_loop_node
-        list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
-        if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-            msg = f"Failed to list connections for node {end_loop_node.name}: {list_connections_result.result_details}"
-            raise RuntimeError(msg)  # noqa: TRY004
+        list_connections_result = workflow.request(ListConnectionsForNodeRequest(node_name=end_loop_node.name))
 
         incoming_connections = list_connections_result.incoming_connections
 
@@ -3954,11 +3940,10 @@ class NodeExecutor(EngineScoped):
         end_node_param_mappings = end_node_mapping.parameter_mappings
 
         # Find which EndFlow parameter corresponds to new_item_to_add
-        list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
+        list_connections_result = workflow.try_request(ListConnectionsForNodeRequest(node_name=end_loop_node.name))
 
         endflow_param_name = None
-        if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+        if not isinstance(list_connections_result, ResultPayloadFailure):
             endflow_param_name = self._find_endflow_param_for_end_loop_node(
                 workflow, list_connections_result.incoming_connections, end_node_param_mappings
             )

@@ -32,6 +32,7 @@ from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
@@ -251,9 +252,9 @@ class TestOnHandleDeclareModelInvocationRequest:
         event_manager = EventManager()
         ModelManager(event_manager)
 
-        def deny(request: RequestPayload, _context: object) -> DeclareModelInvocationResultFailure | None:
+        def deny(request: RequestPayload, _context: object) -> GenericResultFailure | None:
             if isinstance(request, DeclareModelInvocationRequest) and request.model_id == "blocked_model":
-                return DeclareModelInvocationResultFailure(result_details="This model is blocked by your license.")
+                return GenericResultFailure(result_details="This model is blocked by your license.")
             return None
 
         event_manager.add_pre_dispatch_hook(deny)
@@ -261,7 +262,7 @@ class TestOnHandleDeclareModelInvocationRequest:
         denied = event_manager.handle_request(DeclareModelInvocationRequest(model_id="blocked_model"))
         allowed = event_manager.handle_request(DeclareModelInvocationRequest(model_id="gtc_gpt_5"))
 
-        assert isinstance(denied.result, DeclareModelInvocationResultFailure)
+        assert isinstance(denied.result, GenericResultFailure)
         assert "blocked by your license" in str(denied.result.result_details)
         # The allowed declaration reached the handler, which cleared it.
         assert isinstance(allowed.result, DeclareModelInvocationResultSuccess)
