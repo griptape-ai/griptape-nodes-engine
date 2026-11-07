@@ -178,7 +178,9 @@ class WorkflowPackager:
         """Emit a publish progress event."""
         self._progress = min(self._progress + additional, 100.0)
         event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=PublishWorkflowProgressEvent(progress=self._progress, message=message))
+            wrapped_event=ExecutionEvent(
+                payload=PublishWorkflowProgressEvent(progress=self._progress, message=message), open_workflow_id=None
+            )
         )
         GriptapeNodes.EventManager().put_event(event)
 

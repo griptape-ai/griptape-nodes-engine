@@ -120,7 +120,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 result_details="Encountered an error during workflow execution",
                 exception=e,
             )
-            execution_event = ExecutionEvent(payload=control_flow_cancelled_event)
+            execution_event = ExecutionEvent(payload=control_flow_cancelled_event, open_workflow_id=None)
             self._send_event("execution_event", execution_event)
             await self._wait_for_websocket_queue_flush()
             await asyncio.sleep(1)

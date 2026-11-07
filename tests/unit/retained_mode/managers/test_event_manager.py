@@ -2091,7 +2091,7 @@ class TestExecutionEventSubscription:
 
     @staticmethod
     def _wrap(payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
-        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=None))
 
     @pytest.mark.asyncio
     async def test_listener_receives_matching_payloads_in_order(self) -> None:
@@ -2356,10 +2356,14 @@ class TestNodeProcessEventTranslation:
         )
 
         with EventTranslationContext(manager, {"Body_1": "Body", "Start_Package_MultiNode_1": "Start"}):
-            manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish)))
+            manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish, open_workflow_id=None))
+            )
             # A copy's name is translated; everything else on the event survives the copy it makes.
             manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=replace(finish, node_name="Body_1")))
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=replace(finish, node_name="Body_1"), open_workflow_id=None)
+                )
             )
 
         assert received == [finish, finish]
