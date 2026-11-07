@@ -13,7 +13,7 @@ from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import situation_resolver
-from griptape_nodes.retained_mode.events import project_events
+from griptape_nodes.retained_mode.events import destination_events, project_events
 from griptape_nodes.traits import file_system_picker
 
 if typing.TYPE_CHECKING:
@@ -93,8 +93,8 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
     def build_directory(self, **extra_vars: str | int) -> directory_mod.DirectoryDestination:
         """Build a DirectoryDestination from the parameter's current value.
 
-        If an upstream node implements ``DirectoryDestinationProvider``, its
-        ``DirectoryDestination`` is retrieved directly. Otherwise the parameter's
+        If a node implementing ``DirectoryDestinationProvider`` is connected to this
+        parameter, its ``DirectoryDestination`` is used. Otherwise the parameter's
         string value is used as the directory name, combined with the situation macro.
 
         Args:
@@ -107,12 +107,14 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
         built and used from any thread.
 
         Raises:
-            ValueError: If an upstream DirectoryDestinationProvider is connected but returns None.
+            ValueError: If the connected settings node can't be read or has no destination set.
         """
         upstream = self._get_upstream_destination(
-            directory_mod.DirectoryDestinationProvider,
-            lambda provider: provider.directory_destination,
-            "DirectoryDestination",
+            destination_events.GetConnectedDirectoryDestinationRequest(
+                node_name=self._node.name, parameter_name=self._name
+            ),
+            destination_events.GetConnectedDirectoryDestinationResultSuccess,
+            directory_mod.DirectoryDestination.from_spec,
         )
         if upstream is not None:
             return upstream
