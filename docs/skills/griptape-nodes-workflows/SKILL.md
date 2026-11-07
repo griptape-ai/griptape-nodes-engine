@@ -169,6 +169,26 @@ submitted. So either:
 The one-batch + explicit names path is almost always shorter and is what the
 batched recipe below uses.
 
+## Choose the Workflow
+
+Calls act on the workflow your client's `X-Griptape-Workflow-Id` header names. With
+no header, pick one before building:
+
+```
+A. griptape_nodes_ListOpenWorkflowsRequest()
+   → open_workflows lists each open workflow with its workflow_id and name.
+
+B. griptape_nodes_OpenWorkflowRequest(workflow_id="<id>")
+   → work in that open workflow. It comes back with already_open set; nothing changes.
+   or griptape_nodes_OpenWorkflowRequest(create_flow=True)
+   → start a new workflow. Fails with AnotherWorkflowOpenResultFailure while another
+     workflow is open and only one may be.
+```
+
+Every later call in the MCP session acts on the workflow step B opened. A call whose
+workflow has closed fails with `WorkflowNotOpenResultFailure`, whose `open_workflows`
+lists the workflows still open.
+
 ## Canonical Cold-Start Recipe
 
 For a typical 3-node linear pipeline (`TextInput → Agent → DisplayText`), once the
@@ -410,6 +430,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
 | See which workflows are open, and their ids                                         | `ListOpenWorkflowsRequest()`                                                                                                                              |
+| Work in an open workflow, or start a new one                                        | `OpenWorkflowRequest(workflow_id=...)`, `OpenWorkflowRequest(create_flow=True)`                                                                           |
 | Close only your workflow                                                            | `CloseWorkflowRequest()`                                                                                                                                  |
 | Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 

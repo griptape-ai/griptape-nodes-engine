@@ -32,6 +32,7 @@ from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import library_config_slug
 from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.app_events import OpenedWorkflowResult
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
@@ -50,11 +51,10 @@ from griptape_nodes.retained_mode.events.connection_events import (
 from griptape_nodes.retained_mode.events.context_events import (
     CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
-    EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     ListOpenWorkflowsRequest,
+    OpenWorkflowRequest,
     SetWorkflowContextRequest,
-    SetWorkflowContextSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
@@ -72,7 +72,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListFlowsInCurrentContextRequest,
     ListNodesInFlowRequest,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     GetEngineSourceInfoRequest,
@@ -112,6 +111,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
@@ -122,6 +122,7 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "SetWorkflowContextRequest": SetWorkflowContextRequest,
     "GetWorkflowContextRequest": GetWorkflowContextRequest,
     "EnsureWorkflowAndFlowRequest": EnsureWorkflowAndFlowRequest,
+    "OpenWorkflowRequest": OpenWorkflowRequest,
     "CloseWorkflowRequest": CloseWorkflowRequest,
     "ListOpenWorkflowsRequest": ListOpenWorkflowsRequest,
     # Libraries
@@ -258,8 +259,10 @@ mcp_server_logger.setLevel(logging.INFO)
 # HTTP header naming the open workflow a client's tool calls act on, by workflow id.
 WORKFLOW_ID_HEADER = "X-Griptape-Workflow-Id"
 
-# The workflow each MCP session opened or selected with its own EnsureWorkflowAndFlowRequest or
-# SetWorkflowContextRequest, by MCP session id. Read and written only on the engine loop.
+# The workflow each MCP session's calls act on when they send no header: the one the session's
+# latest call opened, by MCP session id. Sessions end without telling the server, so an entry goes
+# once its workflow has closed (see `_workflow_id_for_sender` and `_remember_session_workflow`).
+# Read and written only on the engine loop.
 _session_workflow_ids: dict[str, str] = {}
 
 
@@ -443,12 +446,13 @@ async def _handle_request_on_engine_loop(request_payload: RequestPayload, sender
     Must be scheduled onto the engine's event loop (see _dispatch_to_engine). The request goes
     through the same in-memory entry point the engine's own inbound path uses: it dispatches to the
     assigned manager and broadcasts the result so connected clients (e.g. the editor) still observe
-    the change. It acts on the workflow the sender names (see `_workflow_id_for_sender`). The
+    the change. Its envelope names the workflow the sender names (see `_workflow_id_for_sender`). The
     returned ResultPayload is wrapped back into an EventResult purely to reuse its wire serializer,
     producing the same dict shape the WebSocket transport delivered, which _trim_response already
     knows how to collapse.
     """
-    result_payload = await _handle_in_named_workflow(request_payload, _workflow_id_for_sender(sender))
+    result_context = ResultContext(open_workflow_id=_workflow_id_for_sender(sender))
+    result_payload = await GriptapeNodes.get_instance().ahandle_request(request_payload, result_context=result_context)
     _remember_session_workflow(sender, result_payload)
     if result_payload.succeeded():
         result_event: EventResultSuccess | EventResultFailure = EventResultSuccess(
@@ -459,54 +463,36 @@ async def _handle_request_on_engine_loop(request_payload: RequestPayload, sender
     return json.loads(converters.client.dumps_result(result_event).text)
 
 
-async def _handle_in_named_workflow(request_payload: RequestPayload, workflow_id: str | None) -> ResultPayload:
-    """Handle `request_payload` in the open workflow `workflow_id`, or with None, naming no workflow."""
-    engine = GriptapeNodes.get_instance()
-    if workflow_id is None:
-        return await engine.ahandle_request(request_payload)
-    workflow = engine.open_workflows.find(workflow_id)
-    if workflow is None:
-        details = (
-            f"Attempted to handle {type(request_payload).__name__} in workflow '{workflow_id}'. "
-            "Failed because that workflow isn't open in the engine. Open it, or name another workflow."
-        )
-        return WorkflowNotOpenResultFailure(result_details=details)
-    return await workflow.ahandle_request(request_payload)
-
-
 def _workflow_id_for_sender(sender: ToolCallSender) -> str | None:
-    """The workflow a tool call acts on: its header's, else the one its session opened, else none.
+    """The workflow a tool call acts on: its header's, else its session's, else none.
 
-    A session's workflow that has closed since is forgotten and counts as none.
+    A session's workflow that has closed is still named this once, so the call fails saying so and
+    listing the open workflows, then forgotten.
     """
     if sender.header_workflow_id is not None:
         return sender.header_workflow_id
     if sender.session_id is None:
         return None
     workflow_id = _session_workflow_ids.get(sender.session_id)
-    if workflow_id is None:
-        return None
-    if not GriptapeNodes.get_instance().open_workflows.is_open(workflow_id):
+    if workflow_id is not None and not GriptapeNodes.get_instance().open_workflows.is_open(workflow_id):
         del _session_workflow_ids[sender.session_id]
-        return None
     return workflow_id
 
 
 def _remember_session_workflow(sender: ToolCallSender, result: ResultPayload) -> None:
-    """Remember the workflow a session's own Ensure or SetWorkflowContext request opened or selected."""
+    """Make the workflow a headerless call opened, or found already open, its session's workflow.
+
+    Also forgets every session whose workflow has closed, since sessions end without telling the server.
+    """
     if sender.session_id is None or sender.header_workflow_id is not None:
         return
-    workflow_id = None
-    if isinstance(result, (EnsureWorkflowAndFlowResultSuccess, SetWorkflowContextSuccess)):
-        workflow_id = result.workflow_id
-    if workflow_id is None:
+    if not result.succeeded() or not isinstance(result, OpenedWorkflowResult) or result.open_workflow is None:
         return
-    # Sessions end without telling the server, so forget the ones whose workflow has closed.
     open_workflows = GriptapeNodes.get_instance().open_workflows
-    for session_id, remembered in list(_session_workflow_ids.items()):
-        if not open_workflows.is_open(remembered):
+    for session_id, workflow_id in list(_session_workflow_ids.items()):
+        if not open_workflows.is_open(workflow_id):
             del _session_workflow_ids[session_id]
-    _session_workflow_ids[sender.session_id] = workflow_id
+    _session_workflow_ids[sender.session_id] = result.open_workflow.workflow_id
 
 
 async def _dispatch_to_engine(

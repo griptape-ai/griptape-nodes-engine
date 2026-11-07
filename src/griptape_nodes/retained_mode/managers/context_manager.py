@@ -312,9 +312,7 @@ class ContextManager(EngineScoped):
 
     @handles(ListOpenWorkflowsRequest)
     def on_list_open_workflows_request(self, request: ListOpenWorkflowsRequest) -> ResultPayload:  # noqa: ARG002
-        open_workflows = [
-            self.engine.open_workflow_info(workflow) for workflow in self.engine.open_workflows.all_open()
-        ]
+        open_workflows = self.engine.open_workflow_infos()
         return ListOpenWorkflowsResultSuccess(
             open_workflows=open_workflows,
             engine_run_id=self.engine.engine_run_id,
