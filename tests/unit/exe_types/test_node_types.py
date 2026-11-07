@@ -329,15 +329,9 @@ class TestErrorProxyNode:
 
     def test_policy_denial_reads_as_warning(self) -> None:
         """A policy denial is recoverable, so it reads as a warning that surfaces the hook's reason."""
-        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
 
-        node = ErrorProxyNode(
-            name="proxy",
-            original_node_type="FancyNode",
-            original_library_name="fancy-lib",
-            failure_reason="Ask your admin to enable Labs nodes.",
-            denied_by_policy=True,
-        )
+        node = self._denied_proxy(CheckpointFailure(detail="Ask your admin to enable Labs nodes."))
 
         message = self._message(node)
         assert node.denied_by_policy is True
@@ -345,6 +339,18 @@ class TestErrorProxyNode:
         assert message.markdown is True
         assert "**Permission denied**" in message.value
         assert "Ask your admin to enable Labs nodes." in message.value
+
+    def test_denied_placeholder_and_run_error_give_the_same_restore_advice(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
+
+        node = self._denied_proxy(CheckpointFailure(detail="Labs nodes are off."))
+
+        errors = node.validate_before_node_run()
+
+        assert errors is not None
+        restore_advice = "reload this workflow and the placeholder will be automatically replaced"
+        assert restore_advice in self._message(node).value
+        assert restore_advice in str(errors[0])
 
     @staticmethod
     def _denied_proxy(*failures):  # noqa: ANN205
