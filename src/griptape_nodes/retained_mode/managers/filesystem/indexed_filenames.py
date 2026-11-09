@@ -218,7 +218,7 @@ class IndexedFilenames(EngineScoped):
         so both marker types are recognized uniformly.
 
         The bound/unbound distinction matters for *starting* the walk (see the
-        start-index logic in ``on_write_file_request``'s CREATE_NEW arm) but not for
+        start-index logic in ``FileWriter._collision_walk_start_index``) but not for
         *selecting* the slot: by the time we're in collision-fallback the first
         attempt has already failed via "file exists," and the user's intent for any
         padded slot is "give me a padded index here." Walking unbound padded slots
@@ -502,7 +502,7 @@ class IndexedFilenames(EngineScoped):
         could just as plausibly be a variable the user forgot to bind, and silently
         filling it with ``1`` would write data under a name the user never intended.
 
-        Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
+        Used by the seed step in ``FileWriter._resolve_write_target`` (CREATE_NEW only) — after a
         first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
         that gets ``1`` stuffed into it for the retry.
 

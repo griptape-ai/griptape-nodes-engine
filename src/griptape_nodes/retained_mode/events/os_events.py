@@ -1223,7 +1223,7 @@ class WriteTempFileRequest(RequestPayload):
     typical caller is an artifact provider that needs a real file on disk for
     a one-shot inspection (e.g. running ffprobe on the bytes to extract a
     codec) and will delete the file immediately afterward. Handled by
-    ``OSManager.on_write_temp_file_request``.
+    ``FileWriter.on_write_temp_file_request``.
 
     The SAVE_TEMP_FILE macro shipping in ``DEFAULT_PROJECT_TEMPLATE`` is
     ``{temp}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}``.
