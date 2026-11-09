@@ -10619,6 +10619,36 @@ situations:
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
     @pytest.mark.asyncio
+    async def test_missing_configured_project_file_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A project_file that names a missing file returns Failure, even when a workspace project exists."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        (tmp_path / WORKSPACE_PROJECT_FILE).write_text(self.VALID_PROJECT_YAML)
+        missing_project_path = tmp_path / "unmounted" / WORKSPACE_PROJECT_FILE
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return str(missing_project_path)
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultFailure)
+        assert str(missing_project_path) in str(result.result_details)
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
     async def test_resolvable_workspace_project_activates(self, pm: ProjectManager, tmp_path: Path) -> None:
         """A resolvable workspace project is activated and returns Success."""
         from griptape_nodes.retained_mode.events.project_events import (
