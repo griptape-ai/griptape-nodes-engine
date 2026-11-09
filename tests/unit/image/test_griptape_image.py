@@ -31,18 +31,18 @@ from griptape_nodes.image.containers import (
 )
 from griptape_nodes.image.exif import EXIF_PIXEL_X_DIMENSION_TAG, EXIF_PIXEL_Y_DIMENSION_TAG, tiff_metadata
 from griptape_nodes.image.formats import sniff_image_format
-from griptape_nodes.image.pipeline import Flatten, Orient, RoundCorners, Thumbnail, ToRGB, _ExifTranspose, plan_steps
+from griptape_nodes.image.pipeline import Flatten, Orient, RoundCorners, Thumbnail, ToRGB, _ExifTranspose, _plan_steps
 from griptape_nodes.image.png_text_chunks import (
     MAX_COMPRESSED_TEXT_BYTES,
     insert_text_chunks,
     png_chunk,
     read_text_chunks,
 )
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
-    PILRoundedPreviewGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.rounded_preview_generator import (
+    RoundedPreviewGenerator,
 )
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
-    PILThumbnailGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.thumbnail_generator import (
+    ThumbnailGenerator,
 )
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 from tests.unit.image.sample_images import (
@@ -377,22 +377,22 @@ class TestPixelDepth:
 
 class TestPlanSteps:
     def test_moves_orientation_after_thumbnail_and_swaps_bounds(self) -> None:
-        planned = plan_steps([_ExifTranspose(), ToRGB(), Thumbnail(100, 50)], _ROTATE_90_CLOCKWISE)
+        planned = _plan_steps([_ExifTranspose(), ToRGB(), Thumbnail(100, 50)], _ROTATE_90_CLOCKWISE)
 
         assert planned == [ToRGB(), Thumbnail(50, 100), Orient(_ROTATE_90_CLOCKWISE)]
 
     def test_applies_only_the_first_exif_transpose(self) -> None:
-        planned = plan_steps([_ExifTranspose(), ToRGB(), _ExifTranspose()], _ROTATE_90_CLOCKWISE)
+        planned = _plan_steps([_ExifTranspose(), ToRGB(), _ExifTranspose()], _ROTATE_90_CLOCKWISE)
 
         assert planned == [ToRGB(), Orient(_ROTATE_90_CLOCKWISE)]
 
     def test_keeps_orientation_before_steps_that_depend_on_it(self) -> None:
-        planned = plan_steps([_ExifTranspose(), RoundCorners(0.1), Flatten((0, 0, 0))], 3)
+        planned = _plan_steps([_ExifTranspose(), RoundCorners(0.1), Flatten((0, 0, 0))], 3)
 
         assert planned == [Orient(3), RoundCorners(0.1), Flatten((0, 0, 0))]
 
     def test_drops_an_upright_orientation(self) -> None:
-        assert plan_steps([_ExifTranspose(), Thumbnail(10, 10)], 1) == [Thumbnail(10, 10)]
+        assert _plan_steps([_ExifTranspose(), Thumbnail(10, 10)], 1) == [Thumbnail(10, 10)]
 
 
 class TestPipeline:
@@ -468,8 +468,7 @@ class TestPipeline:
     def test_thumbnail_fits_bounds_and_keeps_aspect_ratio(self) -> None:
         with (
             GriptapeImage.open(_png(400, 200)) as image,
-            GriptapeImagePipeline(image) as pipeline,
-            pipeline.thumbnail(100, 100).end() as small,
+            GriptapeImagePipeline(image).thumbnail(100, 100).end() as small,
         ):
             assert (small.width, small.height) == (100, 50)
 
@@ -500,8 +499,7 @@ class TestPipeline:
     def test_thumbnail_defaults_to_the_preview_size(self) -> None:
         with (
             GriptapeImage.open(_png(2048, 512)) as image,
-            GriptapeImagePipeline(image) as pipeline,
-            pipeline.thumbnail().end() as small,
+            GriptapeImagePipeline(image).thumbnail().end() as small,
         ):
             assert (small.width, small.height) == (1024, 256)
 
@@ -927,14 +925,14 @@ class TestDroppedMetadataWarning:
         self, caplog: pytest.LogCaptureFixture, tmp_path: Path
     ) -> None:
         source = _with_xmp(_with_exif(encode(solid(64, 32), "jpg", icc_profile=SRGB_PROFILE), _camera_exif()))
-        thumbnail_generator = PILThumbnailGenerator(
+        thumbnail_generator = ThumbnailGenerator(
             source_file_location=str(tmp_path / "source.jpg"),
             preview_format="webp",
             destination_preview_directory=str(tmp_path),
             destination_preview_file_name="thumbnail.webp",
             params={"max_width": 16, "max_height": 16},
         )
-        rounded_generator = PILRoundedPreviewGenerator(
+        rounded_generator = RoundedPreviewGenerator(
             source_file_location=str(tmp_path / "source.jpg"),
             preview_format="png",
             destination_preview_directory=str(tmp_path),

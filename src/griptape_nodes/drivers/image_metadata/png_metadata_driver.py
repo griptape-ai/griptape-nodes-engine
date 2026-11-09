@@ -31,7 +31,8 @@ class PngMetadataDriver(BaseImageMetadataDriver):
     def inject_metadata(self, image: GriptapeImage, metadata: dict[str, str]) -> bytes:
         """Inject metadata into PNG text chunks.
 
-        Writes the image's existing text chunks plus the new metadata, keeping its EXIF and color profile.
+        Writes the image's existing text chunks plus the new metadata. The rest of its metadata (EXIF) and its
+        color profile are kept.
         New metadata overwrites existing keys with same name.
 
         Args:
