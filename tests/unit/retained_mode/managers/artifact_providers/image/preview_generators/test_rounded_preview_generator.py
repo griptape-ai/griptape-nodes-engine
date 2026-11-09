@@ -1,4 +1,4 @@
-"""Tests for PILRoundedPreviewGenerator."""
+"""Tests for RoundedPreviewGenerator."""
 
 import tempfile
 from collections.abc import Generator
@@ -9,8 +9,8 @@ import pytest
 from pydantic import ValidationError
 
 from griptape_nodes.image import GriptapeImage
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
-    PILRoundedPreviewGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.rounded_preview_generator import (
+    RoundedPreviewGenerator,
 )
 from tests.unit.image.sample_images import BLUE, RED, encode, solid
 
@@ -54,13 +54,13 @@ def temp_output_dir() -> Generator[str, None, None]:
         yield tmpdir
 
 
-class TestPILRoundedPreviewGeneratorParameters:
+class TestRoundedPreviewGeneratorParameters:
     """Test parameter validation."""
 
     def test_invalid_max_width_negative(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that negative max_width raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -71,7 +71,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_max_width_zero(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that zero max_width raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -82,7 +82,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_max_width_too_large(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that max_width > 8192 raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -92,7 +92,7 @@ class TestPILRoundedPreviewGeneratorParameters:
 
     def test_max_width_string_coercion(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that string max_width is coerced to int (Pydantic feature)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -105,7 +105,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_max_height_negative(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that negative max_height raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -116,7 +116,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_max_height_zero(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that zero max_height raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -127,7 +127,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_max_height_too_large(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that max_height > 8192 raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -138,7 +138,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_corner_radius_percent_negative(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that negative corner_radius_percent raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -149,7 +149,7 @@ class TestPILRoundedPreviewGeneratorParameters:
     def test_invalid_corner_radius_percent_too_large(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that corner_radius_percent > 10 raises ValidationError."""
         with pytest.raises(ValidationError):
-            PILRoundedPreviewGenerator(
+            RoundedPreviewGenerator(
                 source_file_location=temp_test_image,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
@@ -159,7 +159,7 @@ class TestPILRoundedPreviewGeneratorParameters:
 
     def test_corner_radius_percent_string_coercion(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that string corner_radius_percent is coerced to float (Pydantic feature)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -171,7 +171,7 @@ class TestPILRoundedPreviewGeneratorParameters:
 
     def test_valid_parameters(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that valid parameters pass validation."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -184,16 +184,16 @@ class TestPILRoundedPreviewGeneratorParameters:
         assert generator.params.corner_radius_percent == 2.0  # noqa: PLR2004
 
 
-class TestPILRoundedPreviewGeneratorClassMethods:
+class TestRoundedPreviewGeneratorClassMethods:
     """Test class methods."""
 
     def test_get_friendly_name(self) -> None:
         """Test get_friendly_name returns correct name."""
-        assert PILRoundedPreviewGenerator.get_friendly_name() == "Rounded Image Preview Generation"
+        assert RoundedPreviewGenerator.get_friendly_name() == "Rounded Image Preview Generation"
 
     def test_get_supported_source_formats(self) -> None:
         """Test get_supported_source_formats returns correct set."""
-        formats = PILRoundedPreviewGenerator.get_supported_source_formats()
+        formats = RoundedPreviewGenerator.get_supported_source_formats()
         assert isinstance(formats, set)
         assert "png" in formats
         assert "jpg" in formats
@@ -202,7 +202,7 @@ class TestPILRoundedPreviewGeneratorClassMethods:
 
     def test_get_supported_preview_formats(self) -> None:
         """Test get_supported_preview_formats returns correct set."""
-        formats = PILRoundedPreviewGenerator.get_supported_preview_formats()
+        formats = RoundedPreviewGenerator.get_supported_preview_formats()
         assert isinstance(formats, set)
         assert "png" in formats
         assert "jpg" in formats
@@ -210,7 +210,7 @@ class TestPILRoundedPreviewGeneratorClassMethods:
 
     def test_get_parameters(self) -> None:
         """Test get_parameters returns correct Pydantic model class."""
-        params_model_class = PILRoundedPreviewGenerator.get_parameters()
+        params_model_class = RoundedPreviewGenerator.get_parameters()
         model_fields = params_model_class.model_fields
 
         assert len(model_fields) == 3  # noqa: PLR2004
@@ -224,13 +224,13 @@ class TestPILRoundedPreviewGeneratorClassMethods:
         assert model_fields["corner_radius_percent"].default == 2.0  # noqa: PLR2004
 
 
-class TestPILRoundedPreviewGeneratorGeneration:
+class TestRoundedPreviewGeneratorGeneration:
     """Test preview generation."""
 
     @pytest.mark.asyncio
     async def test_generate_basic_rounded_corners(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test generating preview with basic rounded corners."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -254,7 +254,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     @pytest.mark.asyncio
     async def test_generate_no_rounding(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test generating preview with corner_radius_percent = 0 (no rounding)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -271,7 +271,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     @pytest.mark.asyncio
     async def test_generate_large_corner_radius_percent(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test generating preview with maximum corner_radius_percent (should clamp to half dimension)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -288,7 +288,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     @pytest.mark.asyncio
     async def test_generate_transparent_png_input(self, temp_transparent_image: str, temp_output_dir: str) -> None:
         """Test generating preview from transparent PNG input."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_transparent_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -309,7 +309,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     @pytest.mark.asyncio
     async def test_generate_png_output(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test generating PNG output (keeps transparency)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -327,7 +327,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     @pytest.mark.asyncio
     async def test_generate_webp_output(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test generating WEBP output (keeps transparency)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="webp",
             destination_preview_directory=temp_output_dir,
@@ -346,7 +346,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     @pytest.mark.asyncio
     async def test_generate_jpeg_output(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test generating JPEG output (composites on white background)."""
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="jpg",
             destination_preview_directory=temp_output_dir,
@@ -366,7 +366,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
     async def test_aspect_ratio_preserved(self, temp_test_image: str, temp_output_dir: str) -> None:
         """Test that aspect ratio is preserved during resize."""
         # Original is 200x100 (2:1 aspect ratio)
-        generator = PILRoundedPreviewGenerator(
+        generator = RoundedPreviewGenerator(
             source_file_location=temp_test_image,
             preview_format="png",
             destination_preview_directory=temp_output_dir,
@@ -391,7 +391,7 @@ class TestPILRoundedPreviewGeneratorGeneration:
             tiny_path = f.name
 
         try:
-            generator = PILRoundedPreviewGenerator(
+            generator = RoundedPreviewGenerator(
                 source_file_location=tiny_path,
                 preview_format="png",
                 destination_preview_directory=temp_output_dir,
