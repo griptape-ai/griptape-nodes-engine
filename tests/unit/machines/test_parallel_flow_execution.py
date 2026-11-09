@@ -3,8 +3,9 @@
 # ruff: noqa: PLR2004
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -12,7 +13,8 @@ from griptape_nodes.common.directed_graph import DirectedGraph
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Connections, Direction
-from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState, TrackedParameterOutputValues
+from griptape_nodes.exe_types.workflow_node_errors import SubflowNodeFailedError
 from griptape_nodes.machines.control_flow import ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.fsm import WorkflowState
@@ -23,9 +25,11 @@ from griptape_nodes.machines.parallel_resolution import (
     ParallelResolutionContext,
     ParallelResolutionMachine,
 )
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -238,8 +242,6 @@ class TestFlowManagerDagBuilderIntegration:
     @pytest.mark.asyncio
     async def test_flow_manager_clears_dag_builder_on_cancel(self) -> None:
         """Test that FlowManager clears the DAG builder when canceling a flow."""
-        from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
-
         engine = MagicMock()
 
         runtime = WorkflowRuntime("workflow", MagicMock())
@@ -510,7 +512,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         else would ever move it, because the run finishes here.
         """
         context, node = self._context_with_real_node_mid_flight()
-        context.error_message = "boom"
+        context.record_error("boom")
 
         state = await ErrorState.on_update(context)
 
@@ -539,7 +541,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
     async def test_a_cancelled_run_also_gives_its_nodes_back(self) -> None:
         """Cancelling is not resolving either, and a clean cancel must not strand the node."""
         context, node = self._context_with_real_node_mid_flight()
-        context.error_message = None  # a user-initiated cancel, not an exception
+        context.failure = None  # a user-initiated cancel, not an exception
 
         state = await ErrorState.on_update(context)
 
@@ -633,7 +635,9 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert task not in context.task_to_node
         assert dag_node.node_state == NodeState.ERRORED
         assert context.workflow_state == WorkflowState.ERRORED
-        assert context.error_message == "Node 'n' encountered a problem: boom"
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.message == "Node 'n' encountered a problem: boom"
 
     @pytest.mark.asyncio
     async def test_errored_task_sends_the_node_error_in_parts(self) -> None:
@@ -680,7 +684,285 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert payload.error.message == "Key 'b' not found"
         assert payload.error.exception_type == "builtins.KeyError"
         # ExecuteNodeFailedError already names the node, so the run's message adds no second prefix.
-        assert context.error_message == flattened
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.message == flattened
+
+
+class TestContextRemembersTheFirstFailingNode:
+    """The context keeps the failing node and its details beside the flattened message."""
+
+    @pytest.fixture
+    def context(self) -> ParallelResolutionContext:
+        return ParallelResolutionContext(
+            "flow",
+            max_nodes_in_parallel=5,
+            dag_builder=DagBuilder(Connections()),
+            workflow=WorkflowRuntime("wf", MagicMock()),
+            is_isolated=True,
+        )
+
+    @pytest.fixture
+    def engine(self) -> Mock:
+        """A stub engine whose event manager accepts events."""
+        engine = Mock(spec=Engine)
+        engine.event_manager = Mock(spec=EventManager)
+        engine.event_manager.aput_event = AsyncMock(spec=EventManager.aput_event)
+        return engine
+
+    @pytest.fixture
+    def dag_builder(self) -> DagBuilder:
+        """A DAG with one node, `n`, whose task is running."""
+        node = MagicMock(spec=BaseNode)
+        node.name = "n"
+        node.lock = False
+        node.state = NodeResolutionState.RESOLVING
+        graph = DirectedGraph()
+        graph.add_node("n")
+        dag_builder = DagBuilder(Connections())
+        dag_builder.graphs["n"] = graph
+        dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
+        return dag_builder
+
+    @pytest.fixture
+    def run_failed_task(
+        self, engine: Mock, dag_builder: DagBuilder
+    ) -> Callable[[BaseException], Awaitable[ParallelResolutionContext]]:
+        """Return a function that fails node `n`'s task with the given exception and runs one update."""
+
+        async def run(failure: BaseException) -> ParallelResolutionContext:
+            context = ParallelResolutionContext(
+                "flow",
+                max_nodes_in_parallel=5,
+                dag_builder=dag_builder,
+                workflow=WorkflowRuntime("wf", engine),
+                is_isolated=True,
+                engine=engine,
+            )
+
+            async def _boom() -> None:
+                raise failure
+
+            task = asyncio.ensure_future(_boom())
+            await asyncio.sleep(0)
+            context.task_to_node[task] = dag_builder.node_to_reference["n"]
+            context.running_tasks_count = 1
+            await ExecuteDagState.on_update(context)
+            return context
+
+        return run
+
+    def test_starts_without_a_failure(self, context: ParallelResolutionContext) -> None:
+        assert context.failure is None
+
+    def test_record_error_keeps_message_node_details_and_exception(self, context: ParallelResolutionContext) -> None:
+        details = NodeErrorDetails(message="boom")
+        raised = ValueError("boom")
+
+        context.record_error("Node 'n' failed", node_name="n", details=details, exception=raised)
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.message == "Node 'n' failed"
+        assert recorded.node_name == "n"
+        assert recorded.details is details
+        assert recorded.exception is raised
+
+    def test_record_error_on_the_top_level_run_does_not_keep_the_exception(self) -> None:
+        """Nothing takes the top-level run's exception, so keeping it would hold its traceback frames."""
+        context = ParallelResolutionContext(
+            "flow",
+            max_nodes_in_parallel=5,
+            dag_builder=DagBuilder(Connections()),
+            workflow=WorkflowRuntime("wf", MagicMock()),
+            is_isolated=False,
+        )
+        details = NodeErrorDetails(message="boom")
+
+        context.record_error("Node 'n' failed", node_name="n", details=details, exception=ValueError("boom"))
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.node_name == "n"
+        assert recorded.details is details
+        assert recorded.exception is None
+
+    def test_record_error_without_a_node_clears_the_previous_node(self, context: ParallelResolutionContext) -> None:
+        context.record_error(
+            "first", node_name="n", details=NodeErrorDetails(message="boom"), exception=ValueError("boom")
+        )
+
+        context.record_error("second")
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.message == "second"
+        assert recorded.node_name is None
+        assert recorded.details is None
+        assert recorded.exception is None
+
+    def test_reset_clears_everything_recorded(self, context: ParallelResolutionContext) -> None:
+        context.record_error(
+            "Node 'n' failed", node_name="n", details=NodeErrorDetails(message="boom"), exception=ValueError("boom")
+        )
+
+        context.reset()
+
+        assert context.failure is None
+
+    @pytest.mark.asyncio
+    async def test_an_executor_failure_keeps_the_details_built_where_the_node_failed(
+        self, run_failed_task: Callable[[BaseException], Awaitable[ParallelResolutionContext]]
+    ) -> None:
+        """The details an ExecuteNodeFailedError carries are kept as they are, not rebuilt from its cause."""
+        details = NodeErrorDetails(message="Worker stopped unexpectedly", exception_type="builtins.KeyError")
+        failure = ExecuteNodeFailedError("flattened", details=details)
+        failure.__cause__ = KeyError("n: Key 'b' not found")
+
+        context = await run_failed_task(failure)
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.message == "flattened"
+        assert recorded.node_name == "n"
+        assert recorded.details is details
+        assert recorded.exception is failure.__cause__
+
+    @pytest.mark.asyncio
+    async def test_an_exception_that_is_not_an_executor_failure_has_details_built_from_it(
+        self, run_failed_task: Callable[[BaseException], Awaitable[ParallelResolutionContext]]
+    ) -> None:
+        context = await run_failed_task(RuntimeError("n: boom"))
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.message == "Node 'n' encountered a problem: n: boom"
+        assert recorded.node_name == "n"
+        assert recorded.details == NodeErrorDetails(message="boom", exception_type="builtins.RuntimeError")
+
+    @pytest.mark.asyncio
+    async def test_a_node_that_fails_to_receive_its_inputs_is_named_with_its_details(
+        self, engine: Mock, dag_builder: DagBuilder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failure while collecting inputs records the node and the details sent in the event."""
+        context = ParallelResolutionContext(
+            "flow",
+            max_nodes_in_parallel=5,
+            dag_builder=dag_builder,
+            workflow=WorkflowRuntime("wf", engine),
+            is_isolated=True,
+            engine=engine,
+        )
+        context.node_priority_queue.get_next_node = Mock(  # type: ignore[method-assign]
+            spec=context.node_priority_queue.get_next_node, side_effect=["n", None]
+        )
+        raised = KeyError("n: no such parameter")
+        monkeypatch.setattr(
+            ExecuteDagState,
+            "collect_values_from_upstream_nodes",
+            AsyncMock(spec=ExecuteDagState.collect_values_from_upstream_nodes, side_effect=raised),
+        )
+
+        await ExecuteDagState.on_update(context)
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.node_name == "n"
+        assert recorded.exception is raised
+        assert recorded.details == NodeErrorDetails(message="no such parameter", exception_type="builtins.KeyError")
+
+    @pytest.mark.asyncio
+    async def test_a_node_that_fails_validation_is_named_with_its_details(
+        self, engine: Mock, dag_builder: DagBuilder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A node that declines to run is named, with the details sent in the event, so its depth is counted."""
+        context = ParallelResolutionContext(
+            "flow",
+            max_nodes_in_parallel=5,
+            dag_builder=dag_builder,
+            workflow=WorkflowRuntime("wf", engine),
+            is_isolated=True,
+            engine=engine,
+        )
+        node = dag_builder.node_to_reference["n"].node_reference
+        node.parameter_output_values = Mock(spec=TrackedParameterOutputValues)
+        node.validate_before_node_run = Mock(  # type: ignore[method-assign]
+            spec=BaseNode.validate_before_node_run, return_value=[ValueError("n: bad input"), ValueError("worse input")]
+        )
+        context.node_priority_queue.get_next_node = Mock(  # type: ignore[method-assign]
+            spec=context.node_priority_queue.get_next_node, side_effect=["n", None]
+        )
+        monkeypatch.setattr(
+            ExecuteDagState,
+            "collect_values_from_upstream_nodes",
+            AsyncMock(spec=ExecuteDagState.collect_values_from_upstream_nodes),
+        )
+
+        await ExecuteDagState.on_update(context)
+
+        recorded = context.failure
+        assert recorded is not None
+        assert recorded.node_name == "n"
+        assert recorded.exception is None
+        assert recorded.details is not None
+        assert recorded.details.message == "bad input"
+        assert recorded.details.messages == ["bad input", "worse input"]
+
+
+class TestMachineReportsTheFailingNode:
+    """`take_subflow_failure` turns the recorded failure into what a Workflow node needs."""
+
+    def test_none_without_a_failing_node(self) -> None:
+        machine = ParallelResolutionMachine(
+            "flow", dag_builder=DagBuilder(Connections()), workflow=WorkflowRuntime("wf", MagicMock()), is_isolated=True
+        )
+        machine.context.record_error("no node behind this")
+
+        assert machine.take_subflow_failure() is None
+
+    def test_names_the_node_and_carries_its_details_and_exception(self) -> None:
+        machine = ParallelResolutionMachine(
+            "flow", dag_builder=DagBuilder(Connections()), workflow=WorkflowRuntime("wf", MagicMock()), is_isolated=True
+        )
+        details = NodeErrorDetails(message="boom", exception_type="builtins.ValueError")
+        raised = ValueError("boom")
+        machine.context.record_error("flattened", node_name="n", details=details, exception=raised)
+
+        failure = machine.take_subflow_failure()
+
+        assert isinstance(failure, SubflowNodeFailedError)
+        assert failure.node_name == "n"
+        assert failure.details is details
+        assert failure.__cause__ is raised
+
+    def test_a_node_that_failed_validation_has_details_and_no_cause(self) -> None:
+        machine = ParallelResolutionMachine(
+            "flow", dag_builder=DagBuilder(Connections()), workflow=WorkflowRuntime("wf", MagicMock()), is_isolated=True
+        )
+        details = NodeErrorDetails(message="bad input", messages=["bad input"])
+        machine.context.record_error("flattened", node_name="n", details=details)
+
+        failure = machine.take_subflow_failure()
+
+        assert isinstance(failure, SubflowNodeFailedError)
+        assert failure.details is details
+        assert failure.__cause__ is None
+
+    def test_reading_the_failure_lets_go_of_the_exception_but_keeps_the_details(self) -> None:
+        """A live exception holds its traceback frames, so it is not kept beyond the one read."""
+        machine = ParallelResolutionMachine(
+            "flow", dag_builder=DagBuilder(Connections()), workflow=WorkflowRuntime("wf", MagicMock()), is_isolated=True
+        )
+        details = NodeErrorDetails(message="boom")
+        machine.context.record_error("flattened", node_name="n", details=details, exception=ValueError("boom"))
+
+        machine.take_subflow_failure()
+
+        recorded = machine.context.failure
+        assert recorded is not None
+        assert recorded.exception is None
+        assert recorded.details is details
+        assert recorded.node_name == "n"
 
 
 class TestLockedNodeIsNeverQueuedOrExecuted:

@@ -186,7 +186,7 @@ class TestAFailureLetsRunningNodesFinish:
     async def test_a_second_failure_still_reaches_its_node(self, published: AsyncMock) -> None:  # noqa: ARG002
         machine, release, dag_builder = machine_running_one_node(max_nodes_in_parallel=5)
         context = machine.context
-        context.error_message = "Node 'first' encountered a problem: boom"
+        context.record_error("Node 'first' encountered a problem: boom")
         running = dag_builder.node_to_reference["running"]
         context.task_to_node.clear()
 

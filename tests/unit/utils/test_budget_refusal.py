@@ -16,6 +16,8 @@ import httpx2
 import openai
 import pytest
 
+from griptape_nodes.exe_types.workflow_node_errors import SubflowNodeFailedError
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.utils.budget_refusal import (
     BUDGET_EXCEEDED_CODE,
     BUDGET_HALT_PREFIX,
@@ -647,6 +649,14 @@ class TestFindingTheHaltUnderItsWrappers:
         error = BudgetExceededError("Budget stopped this run.", refusal)
 
         assert error.refusal is refusal
+
+    def test_the_walk_passes_through_a_subflow_failure(self) -> None:
+        halt = BudgetExceededError(f"{BUDGET_HALT_PREFIX} x", BudgetRefusal())
+        subflow_failure = SubflowNodeFailedError("Spender", NodeErrorDetails(message=str(halt)), halt)
+        loop_error = RuntimeError("the loop body failed")
+        loop_error.__cause__ = subflow_failure
+
+        assert halt_message(loop_error) == str(halt)
 
     def test_a_wrapped_ordinary_failure_is_left_alone(self) -> None:
         wrapped = RuntimeError("tool call failed: the file was missing")
