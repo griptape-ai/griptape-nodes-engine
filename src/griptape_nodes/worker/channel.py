@@ -272,6 +272,9 @@ class Channel:
     def _send_frame(self, frame: dict) -> None:
         raw = json.dumps(frame).encode("utf-8")
         with self._write_lock:
+            # The reader closes the handle a moment after close(); nothing may go out meanwhile.
+            if self._closing.is_set():
+                raise ChannelClosedError(_CLOSED_MSG)
             try:
                 self._connection.send_bytes(raw)
             except OSError as exc:
