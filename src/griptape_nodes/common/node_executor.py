@@ -50,6 +50,7 @@ from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.exe_types.workflow_node_errors import (
     NestedWorkflowNodeError,
     SubflowNodeFailedError,
+    is_recursion_refusal,
     next_failure_link,
 )
 from griptape_nodes.machines.dag_builder import DagBuilder
@@ -152,7 +153,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.exe_types.connections import Connections
@@ -193,6 +194,11 @@ class IterationFailure:
     exception: Exception | None = None
     """The failure the iteration's subflow reported, when it reported one."""
 
+    @property
+    def is_recursion_refusal(self) -> bool:
+        """Whether the iteration failed because a workflow was refused for nesting itself too deeply."""
+        return is_recursion_refusal(self.exception)
+
 
 @dataclass(frozen=True)
 class IterationOutcome:
@@ -209,6 +215,16 @@ class IterationOutcome:
     exception: Exception | None = None
     """The failure the iteration's subflow reported, when it reported one."""
 
+    @property
+    def is_recursion_refusal(self) -> bool:
+        """Whether the iteration failed because a workflow was refused for nesting itself too deeply."""
+        return is_recursion_refusal(self.exception)
+
+
+# Why a parallel iteration was cancelled before it finished.
+ITERATION_STOPPED_AFTER_RECURSION_REFUSAL_DETAIL = (
+    "Stopped because another iteration ran a workflow nested deeper than `max_workflow_recursion_depth` allows."
+)
 
 # How many distinct failure reasons a loop error message names before deferring to the log.
 MAX_REPORTED_ITERATION_FAILURES = 5
@@ -602,24 +618,42 @@ class NodeExecutor(EngineScoped):
         loop_name: str,
         total_iterations: int,
         iteration_failures: list[IterationFailure],
+        iterations_run: int | None = None,
     ) -> RuntimeError:
         """Build the error for a loop that lost iterations, chained from the failure that explains it.
 
         The chain lets a Workflow node around the loop report the failing node once
-        instead of embedding this loop's whole message in its own.
+        instead of embedding this loop's whole message in its own. A refusal for nesting
+        too deeply wins over an earlier ordinary failure, so the refusal still reaches
+        the levels above.
         """
         error = RuntimeError(
             NodeExecutor._format_loop_failure_message(
                 loop_name=loop_name,
                 total_iterations=total_iterations,
                 iteration_failures=iteration_failures,
+                iterations_run=iterations_run,
             )
         )
+        for iteration_failure in iteration_failures:
+            if iteration_failure.is_recursion_refusal:
+                error.__cause__ = iteration_failure.exception
+                return error
         for iteration_failure in iteration_failures:
             if iteration_failure.exception is not None:
                 error.__cause__ = iteration_failure.exception
                 break
         return error
+
+    @staticmethod
+    def _iterations_run_before_refusal(iteration_failures: list[IterationFailure]) -> int | None:
+        """How many iterations a sequential loop got through when it stopped on a refusal, else None."""
+        if not iteration_failures:
+            return None
+        last_failure = iteration_failures[-1]
+        if not last_failure.is_recursion_refusal:
+            return None
+        return last_failure.iteration_index + 1
 
     @staticmethod
     def _iteration_failure_exception(result: ResultPayload, reverse_node_mapping: dict[str, str]) -> Exception | None:
@@ -698,17 +732,28 @@ class NodeExecutor(EngineScoped):
 
     @staticmethod
     def _format_loop_failure_message(
-        loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]
+        loop_name: str,
+        total_iterations: int,
+        iteration_failures: list[IterationFailure],
+        iterations_run: int | None = None,
     ) -> str:
         """Compose the RuntimeError message for a loop that lost iterations.
 
-        This lands on the artist's node via the execution machine, so it leads with what was
-        attempted and how much was lost, then names the iterations and their reasons.
+        This lands on the artist's node via the execution machine, so it leads with what
+        was attempted and how much was lost, then names the iterations and their
+        reasons. ``iterations_run`` is given when the loop stopped early, so the
+        iterations it never started are not mistaken for ones that ran and passed.
         """
         summary = (
             f"Attempted to run all {total_iterations} iterations of loop '{loop_name}'. "
             f"Failed because {len(iteration_failures)} of them did not finish."
         )
+        if iterations_run is not None and iterations_run < total_iterations:
+            not_run = total_iterations - iterations_run
+            if not_run == 1:
+                summary += " The remaining iteration was not run."
+            else:
+                summary += f" The remaining {not_run} iterations were not run."
         detail_lines = NodeExecutor._format_iteration_failure_lines(
             iteration_failures, total_iterations=total_iterations
         )
@@ -817,6 +862,13 @@ class NodeExecutor(EngineScoped):
         """
         for serialized_node in package_result.serialized_flow_commands.serialized_node_commands:
             serialized_node.create_node_command.broadcast_result = False
+
+    @staticmethod
+    def _task_hit_recursion_refusal(task: asyncio.Future[IterationOutcome]) -> bool:
+        """Whether a finished iteration task failed on a refusal for nesting too deeply."""
+        if task.cancelled() or task.exception() is not None:
+            return False
+        return task.result().is_recursion_refusal
 
     async def _execute_and_apply_workflow(
         self,
@@ -1559,7 +1611,7 @@ class NodeExecutor(EngineScoped):
 
         return tuple(source_that_reached_end) == source
 
-    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
+    async def _execute_loop_iterations_sequentially(  # noqa: PLR0912, PLR0915, C901
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
@@ -1609,6 +1661,7 @@ class NodeExecutor(EngineScoped):
                 # Track for cleanup as soon as the flow exists (iteration index 0 is a placeholder;
                 # the single flow is reused across all iterations).
                 deserialized_flows.append((0, flow_name, node_name_mappings))
+                self._record_iteration_flow_owner(workflow, flow_name, end_loop_node.name)
 
                 # Pop the deserialized flow from context stack
                 if workflow_context.has_current_flow() and workflow_context.get_current_flow().name == flow_name:
@@ -1700,6 +1753,16 @@ class NodeExecutor(EngineScoped):
                         exception=self._iteration_failure_exception(start_subflow_result, reverse_node_mapping),
                     )
                     iteration_failures.append(iteration_failure)
+                    # A refusal for nesting too deeply happens again on every remaining
+                    # iteration, and each one re-runs the whole nested tree first, so
+                    # the loop stops here and reports it.
+                    if iteration_failure.is_recursion_refusal:
+                        logger.warning(
+                            "Stopping loop ending at '%s' after iteration %d: a workflow inside it is nested too deeply.",
+                            end_loop_node.name,
+                            iteration_index,
+                        )
+                        break
                 else:
                     successful_iterations.append(iteration_index)
 
@@ -1880,6 +1943,7 @@ class NodeExecutor(EngineScoped):
                 loop_name=end_node.name,
                 total_iterations=total_iterations,
                 iteration_failures=iteration_failures,
+                iterations_run=self._iterations_run_before_refusal(iteration_failures),
             )
         elif len(successful_iterations) < total_iterations:
             logger.debug(
@@ -2120,7 +2184,7 @@ class NodeExecutor(EngineScoped):
 
         # Deserialize the flow once for sequential re-execution
         flow_name, node_name_mappings, packaged_start_node_name = self._deserialize_while_flow(
-            workflow, package_result, start_node_mapping.node_name
+            workflow, package_result, start_node_mapping.node_name, node.name
         )
 
         # Build reverse mapping for event translation
@@ -2192,6 +2256,7 @@ class NodeExecutor(EngineScoped):
         workflow: WorkflowRuntime,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         start_node_name: str,
+        loop_node_name: str,
     ) -> tuple[str, dict[str, str], str]:
         """Deserialize a packaged while-loop flow and return execution context.
 
@@ -2199,6 +2264,7 @@ class NodeExecutor(EngineScoped):
             workflow: The workflow the nodes are in.
             package_result: The packaged flow result
             start_node_name: Original name of the start node
+            loop_node_name: Name of the while group node that runs the flow
 
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
@@ -2217,6 +2283,7 @@ class NodeExecutor(EngineScoped):
 
             flow_name = deserialize_result.flow_name
             node_name_mappings = deserialize_result.node_name_mappings
+            self._record_iteration_flow_owner(workflow, flow_name, loop_node_name)
 
             if workflow_context.has_current_flow() and workflow_context.get_current_flow().name == flow_name:
                 workflow_context.pop_flow()
@@ -2227,6 +2294,13 @@ class NodeExecutor(EngineScoped):
             raise TypeError(msg)
 
         return flow_name, node_name_mappings, packaged_start_node_name
+
+    def _record_iteration_flow_owner(
+        self, workflow: WorkflowRuntime, iteration_flow_name: str, loop_node_name: str
+    ) -> None:
+        """Note which flow holds the loop that runs an iteration flow, for the recursion-depth count."""
+        owner_flow_name = workflow.nodes.parent_flow_name(loop_node_name)
+        self.engine.flow_manager.record_iteration_flow_owner(workflow, iteration_flow_name, owner_flow_name)
 
     async def _run_while_loop_iterations(  # noqa: PLR0913
         self,
@@ -2285,6 +2359,16 @@ class NodeExecutor(EngineScoped):
                 start_subflow_result = await workflow.ahandle_request(start_subflow_request)
 
             execution_failed = isinstance(start_subflow_result, StartLocalSubflowResultFailure)
+
+            if execution_failed and is_recursion_refusal(start_subflow_result.exception):
+                # Retrying would be refused again after re-running the whole nested tree.
+                msg = (
+                    f"Attempted to run iteration {iteration + 1} of while group '{node.name}'. "
+                    f"Failed because {self._iteration_failure_detail(start_subflow_result)}"
+                )
+                raise RuntimeError(msg) from self._iteration_failure_exception(
+                    start_subflow_result, reverse_node_mapping
+                )
 
             if execution_failed:
                 logger.warning(
@@ -2922,6 +3006,7 @@ class NodeExecutor(EngineScoped):
                 loop_name=node.name,
                 total_iterations=total_iterations,
                 iteration_failures=iteration_failures,
+                iterations_run=self._iterations_run_before_refusal(iteration_failures),
             )
         elif len(successful_iterations) < total_iterations:
             logger.debug(
@@ -3664,6 +3749,7 @@ class NodeExecutor(EngineScoped):
                     deserialized_flows.append(
                         (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
                     )
+                    self._record_iteration_flow_owner(workflow, deserialize_result.flow_name, end_loop_node.name)
 
                     # Pop the deserialized flow from the context stack to prevent it from staying there
                     # Deserialization pushes the flow onto the stack, but we don't want iteration flows
@@ -3770,7 +3856,7 @@ class NodeExecutor(EngineScoped):
                     for iteration_index, flow_name, node_name_mappings in deserialized_flows
                 ]
                 try:
-                    iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                    iteration_task_results = await self._run_iteration_tasks_until_recursion_refusal(iteration_tasks)
                 except asyncio.CancelledError:
                     for task in iteration_tasks:
                         task.cancel()
@@ -3785,6 +3871,16 @@ class NodeExecutor(EngineScoped):
                 iteration_failures: list[IterationFailure] = []
 
                 for idx, result in enumerate(iteration_task_results):
+                    if isinstance(result, asyncio.CancelledError):
+                        # Only a sibling's refusal cancels an iteration here; the flow's
+                        # own cancellation raised above.
+                        failed_iteration_indices.append(idx)
+                        iteration_failures.append(
+                            IterationFailure(
+                                iteration_index=idx, detail=ITERATION_STOPPED_AFTER_RECURSION_REFUSAL_DETAIL
+                            )
+                        )
+                        continue
                     if isinstance(result, Exception):
                         # Exception doesn't include iteration_index, use enumerate index
                         failed_iteration_indices.append(idx)
@@ -3802,6 +3898,16 @@ class NodeExecutor(EngineScoped):
                                     exception=result.exception,
                                 )
                             )
+
+                # A refusal for nesting too deeply is not a partial result to carry on
+                # with: raising lets each level above cancel its own siblings and report
+                # the refusal, instead of re-running the tree.
+                if any(failure.is_recursion_refusal for failure in iteration_failures):
+                    raise self._loop_failure_error(
+                        loop_name=end_loop_node.name,
+                        total_iterations=total_iterations,
+                        iteration_failures=iteration_failures,
+                    )
 
                 if failed_iteration_indices:
                     logger.warning(
@@ -3852,6 +3958,25 @@ class NodeExecutor(EngineScoped):
                 # (success, raise, cancellation). deserialized_flows is complete because each flow is
                 # appended immediately after creation, inside this try.
                 await self._delete_iteration_flows(workflow, deserialized_flows, event_manager)
+
+    async def _run_iteration_tasks_until_recursion_refusal(
+        self, iteration_tasks: Sequence[asyncio.Future[IterationOutcome]]
+    ) -> list[IterationOutcome | BaseException]:
+        """Wait for every iteration task, cancelling the rest once one is refused for nesting too deeply.
+
+        Every iteration is already running, so this cannot stop a refusal's siblings
+        from starting, only from running on. Each cancelled task is awaited, so none is
+        still running when its flow is deleted. Results are in task order; a cancelled
+        task's result is its CancelledError.
+        """
+        pending = set(iteration_tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if any(self._task_hit_recursion_refusal(task) for task in done):
+                for task in pending:
+                    task.cancel()
+                break
+        return await asyncio.gather(*iteration_tasks, return_exceptions=True)
 
     async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,

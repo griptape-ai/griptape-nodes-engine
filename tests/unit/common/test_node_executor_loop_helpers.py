@@ -20,6 +20,7 @@ These tests cover small, near-pure helpers that decide loop control flow:
   keeps its place in the results as None.
 """
 
+import asyncio
 import logging
 from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
@@ -28,8 +29,10 @@ import pytest
 
 from griptape_nodes.common.loop_body_scope import LoopBodyScope
 from griptape_nodes.common.node_executor import (
+    ITERATION_STOPPED_AFTER_RECURSION_REFUSAL_DETAIL,
     IterationControlAction,
     IterationFailure,
+    IterationOutcome,
     NodeExecutor,
 )
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
@@ -40,6 +43,7 @@ from griptape_nodes.exe_types.param_components.progress_bar_component import Pro
 from griptape_nodes.exe_types.workflow_node_errors import (
     NestedWorkflowNodeError,
     SubflowNodeFailedError,
+    WorkflowRecursionLimitError,
 )
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
@@ -863,12 +867,40 @@ class TestLoopFailureError:
 
         assert error.__cause__ is first
 
+    def test_it_chains_from_a_refusal_over_an_earlier_ordinary_failure(self) -> None:
+        refusal = _refusal()
+        failures = [
+            IterationFailure(iteration_index=0, detail="ordinary", exception=ValueError("ordinary")),
+            IterationFailure(iteration_index=1, detail="refused", exception=refusal),
+        ]
+
+        error = NodeExecutor._loop_failure_error(loop_name="Loop", total_iterations=2, iteration_failures=failures)
+
+        assert error.__cause__ is refusal
+
     def test_it_has_no_cause_when_no_iteration_kept_an_exception(self) -> None:
         error = NodeExecutor._loop_failure_error(
             loop_name="Loop", total_iterations=2, iteration_failures=_make_iteration_failures(["a", "b"])
         )
 
         assert error.__cause__ is None
+
+
+class TestIterationsRunBeforeRefusal:
+    """A sequential loop that stops on a refusal knows how many iterations it got through."""
+
+    def test_counts_up_to_and_including_the_refused_iteration(self) -> None:
+        failures = [IterationFailure(iteration_index=1, detail="refused", exception=_refusal())]
+
+        assert NodeExecutor._iterations_run_before_refusal(failures) == 2  # noqa: PLR2004
+
+    def test_is_none_when_the_last_failure_is_ordinary(self) -> None:
+        failures = [IterationFailure(iteration_index=1, detail="ordinary", exception=ValueError("x"))]
+
+        assert NodeExecutor._iterations_run_before_refusal(failures) is None
+
+    def test_is_none_when_there_are_no_failures(self) -> None:
+        assert NodeExecutor._iterations_run_before_refusal([]) is None
 
 
 class TestFormatLoopFailureMessage:
@@ -909,6 +941,33 @@ class TestFormatLoopFailureMessage:
             loop_name="Trim Frames End", total_iterations=3, iteration_failures=[]
         )
         assert "\n" not in msg
+
+    def test_says_how_many_iterations_were_never_run(self) -> None:
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Loop",
+            total_iterations=3,
+            iteration_failures=_make_iteration_failures(["refused"]),
+            iterations_run=1,
+        )
+        assert "Failed because 1 of them did not finish. The remaining 2 iterations were not run." in msg
+
+    def test_says_it_in_the_singular_for_one_unrun_iteration(self) -> None:
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Loop",
+            total_iterations=2,
+            iteration_failures=_make_iteration_failures(["refused"]),
+            iterations_run=1,
+        )
+        assert "The remaining iteration was not run." in msg
+
+    def test_says_nothing_about_unrun_iterations_when_all_were_run(self) -> None:
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Loop",
+            total_iterations=2,
+            iteration_failures=_make_iteration_failures(["a", "b"]),
+            iterations_run=2,
+        )
+        assert "not run" not in msg
 
     def test_message_survives_str_of_result_details(self) -> None:
         """The collector stores str(result_details); both messages must reach the artist."""
@@ -1128,18 +1187,222 @@ class TestExtractIterationResultsFromSubprocess:
         assert results == {1: None}
 
 
+def _refusal() -> SubflowNodeFailedError:
+    nested = NestedWorkflowNodeError(
+        "Inner Workflow",
+        root_details=NodeErrorDetails(message="too deep"),
+        node_path=[],
+        cause=WorkflowRecursionLimitError("too deep"),
+    )
+    return SubflowNodeFailedError("Inner Workflow", NodeErrorDetails(message="wrapped"), nested)
+
+
+class TestIterationRecursionRefusal:
+    """An iteration that failed on a recursion refusal says so, however its failure was wrapped."""
+
+    def test_a_failed_iteration_chained_to_a_refusal(self) -> None:
+        failure = IterationFailure(iteration_index=0, detail="x", exception=_refusal())
+
+        assert failure.is_recursion_refusal
+
+    def test_an_ordinary_failed_iteration(self) -> None:
+        failure = IterationFailure(iteration_index=0, detail="x", exception=ValueError("boom"))
+
+        assert not failure.is_recursion_refusal
+
+    def test_a_failed_iteration_with_no_exception(self) -> None:
+        assert not IterationFailure(iteration_index=0, detail="x").is_recursion_refusal
+
+    def test_a_parallel_outcome_carrying_a_refusal(self) -> None:
+        outcome = IterationOutcome(iteration_index=1, succeeded=False, detail="x", exception=_refusal())
+
+        assert outcome.is_recursion_refusal
+
+    def test_a_successful_parallel_outcome(self) -> None:
+        assert not IterationOutcome(iteration_index=1, succeeded=True, detail="").is_recursion_refusal
+
+
+class TestRunIterationTasksUntilRecursionRefusal:
+    """Parallel iterations run to the end unless one is refused, which cancels the rest."""
+
+    @pytest.mark.asyncio
+    async def test_every_iteration_finishes_when_none_is_refused(self) -> None:
+        async def finish(index: int) -> IterationOutcome:
+            await asyncio.sleep(0)
+            return IterationOutcome(iteration_index=index, succeeded=True, detail="")
+
+        tasks = [asyncio.ensure_future(finish(index)) for index in range(3)]
+
+        results = await NodeExecutor(engine=Mock(spec=Engine))._run_iteration_tasks_until_recursion_refusal(tasks)
+
+        assert [result.iteration_index for result in results if isinstance(result, IterationOutcome)] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_does_not_stop_the_others(self) -> None:
+        async def fail() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", exception=ValueError("boom"))
+
+        async def finish_later() -> IterationOutcome:
+            await asyncio.sleep(0.01)
+            return IterationOutcome(iteration_index=1, succeeded=True, detail="")
+
+        tasks = [asyncio.ensure_future(fail()), asyncio.ensure_future(finish_later())]
+
+        results = await NodeExecutor(engine=Mock(spec=Engine))._run_iteration_tasks_until_recursion_refusal(tasks)
+
+        assert isinstance(results[1], IterationOutcome)
+        assert results[1].succeeded
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_cancels_the_iterations_still_running(self) -> None:
+        async def refused() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", exception=_refusal())
+
+        async def run_forever() -> IterationOutcome:
+            await asyncio.sleep(3600)
+            return IterationOutcome(iteration_index=1, succeeded=True, detail="")
+
+        tasks = [asyncio.ensure_future(refused()), asyncio.ensure_future(run_forever())]
+
+        results = await NodeExecutor(engine=Mock(spec=Engine))._run_iteration_tasks_until_recursion_refusal(tasks)
+
+        assert isinstance(results[0], IterationOutcome)
+        assert results[0].is_recursion_refusal
+        assert isinstance(results[1], asyncio.CancelledError)
+        assert tasks[1].cancelled()
+
+
+class TestTaskHitRecursionRefusal:
+    """A finished iteration task counts as a refusal only when it returned one."""
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_task_is_not_a_refusal(self) -> None:
+        async def run_forever() -> IterationOutcome:
+            await asyncio.sleep(3600)
+            return IterationOutcome(iteration_index=0, succeeded=True, detail="")
+
+        task = asyncio.ensure_future(run_forever())
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert not NodeExecutor._task_hit_recursion_refusal(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_raised_is_not_a_refusal(self) -> None:
+        async def fail() -> IterationOutcome:
+            msg = "boom"
+            raise ValueError(msg)
+
+        task = asyncio.ensure_future(fail())
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert not NodeExecutor._task_hit_recursion_refusal(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_returned_a_refusal_is_one(self) -> None:
+        async def refused() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", exception=_refusal())
+
+        task = asyncio.ensure_future(refused())
+        await asyncio.gather(task)
+
+        assert NodeExecutor._task_hit_recursion_refusal(task)
+
+
+class _StopAfterDeserializingError(RuntimeError):
+    """Raised by a test to end a run once the iteration flows have been created."""
+
+
 def _holding_workflow() -> Mock:
-    """A workflow for the loop helpers to run against."""
+    """A workflow whose loop nodes all sit in the flow `Holding_flow`."""
     workflow = Mock(spec=WorkflowRuntime)
     workflow.nodes = Mock(spec=WorkflowNodes)
+    workflow.nodes.parent_flow_name.return_value = "Holding_flow"
     workflow.context = Mock(spec=WorkflowContextStack)
     workflow.context.has_current_flow.return_value = False
     workflow.ahandle_request = AsyncMock(spec=WorkflowRuntime.ahandle_request)
     return workflow
 
 
+class TestIterationFlowOwner:
+    """Each iteration flow is recorded as owned by the flow that holds the loop, at every site that makes one."""
+
+    @pytest.fixture
+    def workflow(self) -> Mock:
+        return _holding_workflow()
+
+    @pytest.fixture
+    def executor(self) -> NodeExecutor:
+        engine = Mock(spec=Engine)
+        engine.node_manager = Mock(spec=NodeManager)
+        engine.flow_manager = Mock(spec=FlowManager)
+        engine.event_manager = Mock(spec=EventManager)
+        return NodeExecutor(engine=engine)
+
+    @pytest.fixture
+    def package_result(self) -> Mock:
+        """A package result whose dataclass fields are set explicitly, since a class spec does not list them."""
+        package_result = Mock(spec=PackageNodesAsSerializedFlowResultSuccess)
+        package_result.serialized_flow_commands = Mock(spec=SerializedFlowCommands)
+        return package_result
+
+    @pytest.fixture(autouse=True)
+    def quiet_package(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            NodeExecutor,
+            "_silence_packaged_node_creation_broadcasts",
+            Mock(spec=NodeExecutor._silence_packaged_node_creation_broadcasts),
+        )
+
+    def test_while_group_flow_is_owned_by_the_flow_holding_the_group(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        engine = cast("Mock", executor.engine)
+        workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
+            result_details="ok", flow_name="While_subflow_1", node_name_mappings={"Start": "Start_1"}
+        )
+
+        executor._deserialize_while_flow(workflow, package_result, "Start", "While")
+
+        workflow.nodes.parent_flow_name.assert_called_once_with("While")
+        engine.flow_manager.record_iteration_flow_owner.assert_called_once_with(
+            workflow, "While_subflow_1", "Holding_flow"
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_iteration_flows_are_owned_by_the_flow_holding_the_loop(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine = cast("Mock", executor.engine)
+        workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
+            result_details="ok", flow_name="Iteration_flow", node_name_mappings={}
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_node_parameter_mappings",
+            Mock(spec=executor.get_node_parameter_mappings, side_effect=_StopAfterDeserializingError),
+        )
+        monkeypatch.setattr(executor, "_delete_iteration_flows", AsyncMock(spec=executor._delete_iteration_flows))
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+
+        with pytest.raises(_StopAfterDeserializingError):
+            await executor._execute_loop_iterations_locally(
+                package_result=package_result,
+                total_iterations=PARALLEL_ITERATIONS,
+                parameter_values_per_iteration={},
+                end_loop_node=end_node,
+            )
+
+        workflow.nodes.parent_flow_name.assert_called_with("Loop")
+        engine.flow_manager.record_iteration_flow_owner.assert_called_with(workflow, "Iteration_flow", "Holding_flow")
+        assert engine.flow_manager.record_iteration_flow_owner.call_count == PARALLEL_ITERATIONS
+
+
 class TestExecuteLoopIterationsLocallyFailures:
-    """An all-at-once loop carries on with partial results when an iteration fails."""
+    """An all-at-once loop raises when an iteration was refused for nesting too deeply, and carries on otherwise."""
 
     @pytest.fixture
     def workflow(self) -> Mock:
@@ -1212,6 +1475,52 @@ class TestExecuteLoopIterationsLocallyFailures:
         )
 
     @pytest.mark.asyncio
+    async def test_a_refused_iteration_raises_an_error_chained_to_the_refusal(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        refusal = _refusal()
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed", exception=refusal
+        )
+
+        with pytest.raises(RuntimeError, match="Attempted to run all 2 iterations of loop 'Loop'") as raised:
+            await self._run(executor, workflow, package_result)
+
+        assert raised.value.__cause__ is refusal
+        cast("AsyncMock", executor._delete_iteration_flows).assert_awaited_once()
+
+    @pytest.mark.parametrize("refused_iteration", [0, 1])
+    @pytest.mark.asyncio
+    async def test_a_refused_iteration_names_the_original_node_not_its_own_iteration_copy(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock, refused_iteration: int
+    ) -> None:
+        workflow.handle_request.side_effect = [
+            DeserializeFlowFromCommandsResultSuccess(
+                result_details="ok", flow_name="Iteration_flow", node_name_mappings={"Start": "Start_1"}
+            ),
+            DeserializeFlowFromCommandsResultSuccess(
+                result_details="ok", flow_name="Iteration_flow", node_name_mappings={"Start": "Start_2"}
+            ),
+        ]
+        refusal = _refusal()
+        copy_failure = SubflowNodeFailedError(
+            f"Start_{refused_iteration + 1}", NodeErrorDetails(message="wrapped"), refusal.__cause__
+        )
+        outcomes: list[Any] = [
+            StartLocalSubflowResultSuccess(result_details="ok"),
+            StartLocalSubflowResultSuccess(result_details="ok"),
+        ]
+        outcomes[refused_iteration] = StartLocalSubflowResultFailure(result_details="failed", exception=copy_failure)
+        workflow.ahandle_request.side_effect = outcomes
+
+        with pytest.raises(RuntimeError, match="Attempted to run all 2 iterations of loop 'Loop'") as raised:
+            await self._run(executor, workflow, package_result)
+
+        cause = raised.value.__cause__
+        assert isinstance(cause, SubflowNodeFailedError)
+        assert cause.node_name == "Start"
+
+    @pytest.mark.asyncio
     async def test_an_ordinary_failure_still_returns_partial_results(
         self, executor: NodeExecutor, workflow: Mock, package_result: Mock
     ) -> None:
@@ -1224,9 +1533,27 @@ class TestExecuteLoopIterationsLocallyFailures:
         assert successful_iterations == []
         cast("AsyncMock", executor._delete_iteration_flows).assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_siblings_cancelled_by_a_refusal_are_reported_as_stopped(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        async def refuse_first_and_hang_second(_request: object) -> StartLocalSubflowResultFailure:
+            if workflow.ahandle_request.await_count == 1:
+                return StartLocalSubflowResultFailure(result_details="failed", exception=_refusal())
+            await asyncio.sleep(3600)
+            msg = "unreachable"
+            raise AssertionError(msg)
+
+        workflow.ahandle_request.side_effect = refuse_first_and_hang_second
+
+        with pytest.raises(RuntimeError, match="Attempted to run all 2 iterations of loop 'Loop'") as raised:
+            await self._run(executor, workflow, package_result)
+
+        assert ITERATION_STOPPED_AFTER_RECURSION_REFUSAL_DETAIL in str(raised.value)
+
 
 class TestExecuteLoopIterationsSequentially:
-    """A sequential loop reuses one iteration flow, names failures as the artist sees them, and carries on."""
+    """A sequential loop reuses one iteration flow, carries on after an ordinary failure and stops after a refusal."""
 
     SEQUENTIAL_ITERATIONS = 3
 
@@ -1328,6 +1655,22 @@ class TestExecuteLoopIterationsSequentially:
             assert exception.__cause__ is copy_failure.__cause__
 
     @pytest.mark.asyncio
+    async def test_the_reused_flow_is_owned_by_the_flow_holding_the_loop(
+        self, executor: NodeExecutor, engine: Mock, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultSuccess(result_details="ok")
+
+        _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+            executor, workflow, package_result
+        )
+
+        engine.flow_manager.record_iteration_flow_owner.assert_called_once_with(
+            workflow, "Iteration_flow", "Holding_flow"
+        )
+        assert successful_iterations == [0, 1, 2]
+        assert failures == []
+
+    @pytest.mark.asyncio
     async def test_an_ordinary_failure_is_recorded_and_the_loop_carries_on(
         self, executor: NodeExecutor, workflow: Mock, package_result: Mock
     ) -> None:
@@ -1342,10 +1685,109 @@ class TestExecuteLoopIterationsSequentially:
         assert workflow.ahandle_request.await_count == self.SEQUENTIAL_ITERATIONS
         assert successful_iterations == []
         assert [failure.iteration_index for failure in failures] == [0, 1, 2]
+        assert not any(failure.is_recursion_refusal for failure in failures)
+
+    @pytest.mark.asyncio
+    async def test_a_recursion_refusal_stops_the_loop_and_is_logged(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed", exception=_refusal()
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+                executor, workflow, package_result
+            )
+
+        assert workflow.ahandle_request.await_count == 1
+        assert successful_iterations == []
+        assert [failure.iteration_index for failure in failures] == [0]
+        assert failures[0].is_recursion_refusal
+        assert "Stopping loop ending at 'Loop' after iteration 0" in caplog.text
+
+
+class TestHandleSequentialIterativeGroupExecutionRefusal:
+    """A sequential group stopped by a refusal says how many iterations were never run."""
+
+    @pytest.mark.asyncio
+    async def test_the_error_reports_the_iterations_that_were_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        executor = NodeExecutor(engine=Mock(spec=Engine))
+        monkeypatch.setattr(
+            executor,
+            "_package_subflow_group_body",
+            AsyncMock(
+                spec=executor._package_subflow_group_body,
+                return_value=Mock(spec=PackageNodesAsSerializedFlowResultSuccess),
+            ),
+        )
+        monkeypatch.setattr(
+            executor,
+            "_get_merged_parameter_values_for_iterative_group",
+            Mock(spec=executor._get_merged_parameter_values_for_iterative_group, return_value={}),
+        )
+        refused = IterationFailure(iteration_index=0, detail="too deep", exception=_refusal())
+        monkeypatch.setattr(
+            executor,
+            "_execute_loop_iterations_sequentially",
+            AsyncMock(
+                spec=executor._execute_loop_iterations_sequentially,
+                return_value=({}, [], {}, 0, False, [refused]),
+            ),
+        )
+        group = Mock(spec=BaseIterativeNodeGroup)
+        group.name = "Group"
+        group._get_total_iterations.return_value = 3
+
+        with pytest.raises(RuntimeError, match="The remaining 2 iterations were not run"):
+            await executor._handle_sequential_iterative_group_execution(group, LOCAL_EXECUTION)
+
+
+class TestHandleSequentialLoopExecutionRefusal:
+    """A sequential loop stopped by a refusal says how many iterations were never run."""
+
+    @pytest.mark.asyncio
+    async def test_the_error_reports_the_iterations_that_were_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        executor = NodeExecutor(engine=Mock(spec=Engine))
+        package_result = Mock(spec=PackageNodesAsSerializedFlowResultSuccess)
+        package_result.packaged_node_names = []
+        monkeypatch.setattr(
+            executor,
+            "_package_loop_body",
+            AsyncMock(spec=executor._package_loop_body, return_value=(package_result, LOCAL_EXECUTION)),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_parameter_values_per_iteration",
+            Mock(spec=executor.get_parameter_values_per_iteration, return_value={}),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_resolved_upstream_values",
+            Mock(spec=executor.get_resolved_upstream_values, return_value={}),
+        )
+        refused = IterationFailure(iteration_index=0, detail="too deep", exception=_refusal())
+        monkeypatch.setattr(
+            executor,
+            "_execute_loop_iterations_sequentially",
+            AsyncMock(
+                spec=executor._execute_loop_iterations_sequentially,
+                return_value=({}, [], {}, 0, False, [refused]),
+            ),
+        )
+        start_node = Mock(spec=BaseIterativeStartNode)
+        start_node.name = "Start"
+        start_node._get_total_iterations.return_value = 3
+        start_node._progress_bar = Mock(spec=ProgressBarComponent)
+        end_node = Mock(spec=BaseIterativeEndNode)
+        end_node.name = "End"
+
+        with pytest.raises(RuntimeError, match="The remaining 2 iterations were not run"):
+            await executor._handle_sequential_loop_execution(start_node, end_node)
 
 
 class TestRunWhileLoopIterations:
-    """A while group keeps retrying a failed iteration until its iterations run out."""
+    """A while group keeps retrying a failed iteration, except one refused for nesting too deeply."""
 
     @pytest.fixture
     def executor(self, monkeypatch: pytest.MonkeyPatch) -> NodeExecutor:
@@ -1377,6 +1819,19 @@ class TestRunWhileLoopIterations:
             max_iterations=WHILE_TOTAL_ITERATIONS - 1,
             total_iterations=WHILE_TOTAL_ITERATIONS,
         )
+
+    @pytest.mark.asyncio
+    async def test_a_refused_iteration_ends_the_loop_with_an_error(
+        self, executor: NodeExecutor, workflow: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed", exception=_refusal()
+        )
+
+        with pytest.raises(RuntimeError, match="iteration 1 of while group 'While'"):
+            await self._run(executor, workflow)
+
+        assert workflow.ahandle_request.await_count == 1
 
     @pytest.mark.asyncio
     async def test_an_ordinary_failure_is_retried_until_iterations_run_out(

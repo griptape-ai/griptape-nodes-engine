@@ -26,11 +26,16 @@ from griptape_nodes.retained_mode.events.config_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import (
     DEFAULT_LIBRARIES_ROOT_ENV_VAR,
+    ENV_VAR_PREFIX,
     ConfigManager,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
-from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+from griptape_nodes.retained_mode.managers.settings import (
+    DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
+    LIBRARIES_TO_REGISTER_KEY,
+    REQUIRES_ENGINE_KEY,
+)
 from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
 
 
@@ -1154,6 +1159,48 @@ class TestConfigManager:
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
+class TestMaxWorkflowRecursionDepth:
+    """The recursion limit reads as the setting, and a bad value in a config file never resets the rest of the config."""
+
+    @pytest.fixture(autouse=True)
+    def no_config_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Hide every GTN_CONFIG_ variable, so only the config file under test sets the limit."""
+        for name in list(os.environ):
+            if name.startswith(ENV_VAR_PREFIX):
+                monkeypatch.delenv(name)
+        # ConfigManager() publishes this variable; setting it first has monkeypatch remove it afterwards.
+        monkeypatch.setenv(DEFAULT_LIBRARIES_ROOT_ENV_VAR, "")
+
+    @staticmethod
+    def _manager_with_workspace_config(workspace_dir: Path, config: dict[str, Any]) -> ConfigManager:
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps(config))
+        manager = ConfigManager()
+        manager.load_workspace_config(workspace_dir)
+        return manager
+
+    def test_default_is_ten(self) -> None:
+        assert ConfigManager().max_workflow_recursion_depth == DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH
+
+    def test_configured_value_is_read(self, tmp_path: Path) -> None:
+        manager = self._manager_with_workspace_config(tmp_path, {"max_workflow_recursion_depth": 3})
+
+        assert manager.max_workflow_recursion_depth == 3  # noqa: PLR2004
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(0, 1), ("abc", DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH), (2.5, DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH)],
+    )
+    def test_bad_value_in_config_file_is_replaced_without_resetting_other_settings(
+        self, tmp_path: Path, value: object, expected: int
+    ) -> None:
+        manager = self._manager_with_workspace_config(
+            tmp_path, {"max_workflow_recursion_depth": value, "max_nodes_in_parallel": 7}
+        )
+
+        assert manager.max_workflow_recursion_depth == expected
+        assert manager.get_config_value("max_nodes_in_parallel") == 7  # noqa: PLR2004
+
+
 class TestConfigManagerBlankValues:
     """A blank string means the layer holding it does not set that setting.
 
