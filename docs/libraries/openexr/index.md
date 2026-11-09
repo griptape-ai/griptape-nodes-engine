@@ -45,7 +45,8 @@ update, and troubleshooting help.
 
 ```text
 Read EXR → (image output)
-         ↘ part / channels → Display EXR Channel / Save EXR
+         ↘ part → Display EXR Part
+         ↘ channels → Get From List → Display EXR Channel / Save EXR
 ```
 
 1. Add a **Read EXR** node and point `path` at a `.exr` file or a frame pattern

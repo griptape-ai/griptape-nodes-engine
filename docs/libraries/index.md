@@ -17,7 +17,7 @@ isolation work, see the
 | [Standard Library](../nodes/overview.md)          | 284   | The default nodes — agents, text, images, video, audio, lists, dicts, JSON, execution flow, and more                   | None (installed by default)                               |
 | [Advanced Media Library](advanced_media/index.md) | 28    | Local media generation and manipulation — diffusion pipelines, image/video aux processing, LoRAs, face detection       | GPU recommended; Hugging Face account for model downloads |
 | [OpenColorIO](opencolorio/index.md)               | 2     | Professional color management using OCIO configs — the industry-standard system for film, VFX, and animation pipelines | An OCIO config (`$OCIO` or explicit path)                 |
-| [OpenEXR](openexr/index.md)                       | 7     | Read, inspect, display, and save OpenEXR files and frame sequences for VFX and HDR image workflows                     | None (optionally pairs with OpenColorIO)                  |
+| [OpenEXR](openexr/index.md)                       | 7     | Read, inspect, display, and save OpenEXR files and frame sequences for VFX and HDR image workflows                     | Engine 0.104.0+ (optionally pairs with OpenColorIO)       |
 | [Nuke](nuke/index.md)                             | 3     | Run `.nk` scripts headlessly from the canvas and publish workflows as versioned Nuke gizmos                            | A local Foundry Nuke installation and license             |
 | [Diffusers](diffusers/index.md)                   | 19    | Modular 🧨 Diffusers pipelines — build media generation workflows from individual, connectable diffusion stages        | GPU (CUDA or MPS)                                         |
 

@@ -9,7 +9,7 @@ Category: `EXR`
 - Covers the common case of `Load EXR → Display EXR Part` in one node: point it at a file and it renders the selected part and layer to a PNG.
 - Accepts a single `.exr` path, a frame pattern such as `render.####.exr`, or a connected `Sequence` (from **Scan Sequence**).
 - Renders one frame per run. To iterate a sequence, connect **For Loop Start**'s `index` to `frame`.
-- Also outputs the `EXRPartArtifact` and `EXRChannelArtifact` descriptors, so the float data can flow on to [Display EXR Channel](display_exr_channel.md) or [Save EXR](save_exr.md).
+- Also outputs the `EXRPartArtifact` and a list of `EXRChannelArtifact` descriptors. The part connects to [Display EXR Part](display_exr_part.md); [Display EXR Channel](display_exr_channel.md) and [Save EXR](save_exr.md) take individual channels, so pick each one out of `channels` with [Get From List](../../nodes/lists/get_from_list.md).
 - Same color management as [Display EXR Part](display_exr_part.md).
 - An **Open in external viewer** button opens the source EXR in a configured HDR viewer (see [Library settings](index.md#library-settings)).
 
@@ -17,7 +17,8 @@ Category: `EXR`
 
 ```text
 [Read EXR] → (image output)
-           ↘ part / channels → Display EXR Channel / Save EXR
+           ↘ part → Display EXR Part
+           ↘ channels → Get From List → Display EXR Channel / Save EXR
 ```
 
 ## Node preview

@@ -50,7 +50,7 @@ Scan Sequence → [Load EXR Sequence] → ForEach Start → Display EXR Part →
 ## Tips & pitfalls
 
 - **List position isn't the frame number.** Each artifact's `frame_number` field carries the real sequence frame number; with `skip`, dropped frames leave no gap in the list.
-- **The most common layout wins.** Frames are checked against the resolution and channel layout shared by most of the sequence, so an outlier such as a slate frame is the one dropped (or, with `fail`, the one reported). If no layout covers more than half the frames, the node fails.
+- **The most common layout wins.** Frames are checked against the resolution and channel layout shared by most of the successfully scanned frames, so an outlier such as a slate frame is the one dropped (or, with `fail`, the one reported). If no layout covers more than half the scanned frames, the node fails. Frames that fail to scan don't count toward that majority.
 - **Single part per run.** For multi-part frames, add one node per `part_index` you need.
 
 ## See also

@@ -14,7 +14,8 @@ Category: `EXR`
 ## Typical workflow position
 
 ```text
-Load EXR / Read EXR (channels) → [Display EXR Channel] → (image output)
+Load EXR (channel outputs) → [Display EXR Channel] → (image output)
+Read EXR (channels) → Get From List → [Display EXR Channel]
 ```
 
 ## Node preview
