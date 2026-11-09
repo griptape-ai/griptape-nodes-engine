@@ -857,7 +857,15 @@ class ActivateWorkspaceProjectRequest(RequestPayload):
     config/workspace/env layers first ensures LibraryManager loads libraries
     against the correct workspace (and enforces the project's engine_version and
     library pins) instead of the default workspace.
+
+    Args:
+        fail_if_project_file_missing: Fail when the `project_file` setting names a file
+            that does not exist, instead of falling back to the workspace default.
+
+    Results: ActivateWorkspaceProjectResultSuccess | ActivateWorkspaceProjectResultFailure
     """
+
+    fail_if_project_file_missing: bool = False
 
 
 @dataclass
