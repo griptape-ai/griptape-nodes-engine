@@ -145,7 +145,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
+    from collections.abc import Callable
 
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.exe_types.connections import Connections
@@ -514,18 +514,6 @@ class NodeExecutor(EngineScoped):
 
     def _put_execution_event(self, workflow: WorkflowRuntime, payload: ExecutionPayload) -> None:
         self.engine.event_manager.put_event(workflow.execution_event(payload))
-
-    @staticmethod
-    def _build_results_list(
-        total_iterations: int, successful_iterations: Collection[int], iteration_results: dict[int, Any]
-    ) -> list[Any]:
-        """Order collected iteration results by iteration, with None for each failed iteration.
-
-        A successful iteration with no result (skipped, or nothing wired to new_item_to_add) adds nothing.
-        """
-        failed_iteration_results = dict.fromkeys(set(range(total_iterations)) - set(successful_iterations))
-        collected_results = failed_iteration_results | iteration_results
-        return [collected_results[index] for index in sorted(collected_results)]
 
     @staticmethod
     def _outcome_after_return(node: BaseNode) -> NodeProcessOutcome:
@@ -1268,30 +1256,40 @@ class NodeExecutor(EngineScoped):
             end_node.name,
         )
 
-        # With no body there is no packaged flow to read results back from. The only thing an empty
-        # loop can collect is an item wired straight from the start node, read from the start node.
-        source_param_name = None
-        for conn in workflow.flows.connections.get_all_incoming_connections(end_node):
-            if conn.source_node is start_node and conn.target_parameter.name == "new_item_to_add":
-                source_param_name = conn.source_parameter.name
-                break
+        # Check if there are direct data connections from start to end
+        list_connections_request = ListConnectionsForNodeRequest(node_name=start_node.name)
+        list_connections_result = workflow.handle_request(list_connections_request)
+
+        connected_source_param = None
+        if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
+            for conn in list_connections_result.outgoing_connections:
+                if conn.target_node_name == end_node.name and conn.target_parameter_name == "new_item_to_add":
+                    connected_source_param = conn.source_parameter_name
+                    break
 
         logger.debug(
-            "Processing %d iterations for empty loop from '%s' to '%s' (item wired from start: %s)",
+            "Processing %d iterations for empty loop from '%s' to '%s' (connected param: %s)",
             total_iterations,
             start_node.name,
             end_node.name,
-            source_param_name,
+            connected_source_param,
         )
 
+        # Process iterations to collect results from direct connections
         end_node._results_list = []
-        if source_param_name is not None:
-            current_item_values = list(start_node._get_iteration_items())
-            index_values = start_node.get_all_iteration_values()
+        if connected_source_param:
             for iteration_index in range(total_iterations):
-                value = self._get_iteration_value_for_parameter(
-                    source_param_name, iteration_index, index_values, current_item_values
-                )
+                start_node._current_iteration_count = iteration_index
+
+                # Get the value based on which parameter is connected
+                if connected_source_param == "current_item":
+                    value = start_node._get_current_item_value()
+                elif connected_source_param == "index":
+                    value = start_node.get_current_index()
+                else:
+                    start_node._get_current_item_value()
+                    value = start_node.parameter_output_values.get(connected_source_param)
+
                 if value is not None:
                     end_node._results_list.append(value)
 
@@ -1945,9 +1943,11 @@ class NodeExecutor(EngineScoped):
             total_iterations - len(successful_iterations),
         )
 
-        # Step 6: Build results list in iteration order, with None for failed iterations. A
-        # successful iteration with no result (skipped, or nothing wired to new_item_to_add) adds nothing.
-        node._results_list = self._build_results_list(total_iterations, successful_iterations, iteration_results)
+        # Step 6: Build results list in iteration order. Failed iterations were recorded as None by
+        # the execution path; a skipped iteration, or one with nothing wired to new_item_to_add, adds nothing.
+        node._results_list = []
+        for iteration_index in sorted(iteration_results.keys()):
+            node._results_list.append(iteration_results[iteration_index])
 
         # Step 7: Output final results to the results parameter
         node._output_results_list()
@@ -4011,8 +4011,12 @@ class NodeExecutor(EngineScoped):
                 workflow, list_connections_result.incoming_connections, end_node_param_mappings
             )
 
-        # Extract iteration results from subprocess outputs
-        iteration_results = {}
+        # Extract iteration results from subprocess outputs. A failed iteration is recorded as None,
+        # as the local parallel path does, so the results list keeps its place.
+        iteration_results: dict[int, Any] = {}
+        for iteration_index, success, subprocess_result in iteration_outputs:
+            if not success or subprocess_result is None:
+                iteration_results[iteration_index] = None
         for iteration_index in successful_iterations:
             subprocess_result = iteration_subprocess_outputs[iteration_index]
             parameter_output_values = self._extract_parameter_output_values(subprocess_result)

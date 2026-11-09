@@ -16,6 +16,8 @@ These tests cover small, near-pure helpers that decide loop control flow:
   creations from reaching editors.
 * ``_passthrough_connections_between`` / ``_handle_empty_loop_body`` - an item wired straight
   from the loop's start node into the end node's ``new_item_to_add``.
+* ``_extract_iteration_results_from_subprocess`` - a failed isolated or publisher iteration
+  keeps its place in the results as None.
 """
 
 import logging
@@ -713,15 +715,22 @@ class TestHandleEmptyLoopBody:
 
     @staticmethod
     def _setup(source_param: str | None) -> tuple[NodeExecutor, MagicMock, MagicMock]:
-        """Loop pair whose end node's new_item_to_add is wired from the start node's source_param, or from a body node when None."""
+        """Loop pair whose end node's new_item_to_add is wired from the start node's source_param, or from nothing."""
         start_node, end_node = _make_loop_pair()
-        if source_param is None:
-            connection = _make_connection(MagicMock(), "result", end_node, "new_item_to_add")
-        else:
-            connection = _make_connection(start_node, source_param, end_node, "new_item_to_add")
-        workflow = start_node._require_workflow.return_value
-        workflow.flows.connections.get_all_incoming_connections.return_value = [connection]
-        return _make_executor(), start_node, end_node
+        start_node._get_current_item_value.side_effect = lambda: ["a", "b", "c"][start_node._current_iteration_count]
+        start_node.get_current_index.side_effect = lambda: start_node._current_iteration_count
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.outgoing_connections = []
+        if source_param is not None:
+            conn = MagicMock()
+            conn.target_node_name = end_node.name
+            conn.target_parameter_name = "new_item_to_add"
+            conn.source_parameter_name = source_param
+            connections_result.outgoing_connections = [conn]
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        start_node._require_workflow.return_value = _workflow_of(executor)
+        return executor, start_node, end_node
 
     @pytest.mark.asyncio
     async def test_collects_start_node_item_for_every_iteration(self) -> None:
@@ -750,17 +759,26 @@ class TestHandleEmptyLoopBody:
         end_node._output_results_list.assert_called_once()
 
 
-class TestBuildResultsList:
-    """Results are ordered by iteration, with None for failures and nothing for results-less successes."""
-
-    def test_orders_results_by_iteration(self) -> None:
-        results = NodeExecutor._build_results_list(3, [0, 1, 2], {2: "c", 0: "a", 1: "b"})
-        assert results == ["a", "b", "c"]
+class TestExtractIterationResultsFromSubprocess:
+    """A failed isolated or publisher iteration keeps its place in the results as None."""
 
     def test_failed_iterations_become_none(self) -> None:
-        results = NodeExecutor._build_results_list(3, [0, 2], {0: "a", 2: "c"})
-        assert results == ["a", None, "c"]
+        _, end_node = _make_loop_pair()
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.incoming_connections = []
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        iteration_outputs: list[tuple[int, bool, dict[str, Any] | None]] = [
+            (0, True, {}),
+            (1, False, None),
+            (2, True, {}),
+        ]
 
-    def test_successful_iteration_without_result_adds_nothing(self) -> None:
-        results = NodeExecutor._build_results_list(3, [0, 1, 2], {0: "a", 2: "c"})
-        assert results == ["a", "c"]
+        with patch.object(NodeExecutor, "_extract_parameter_output_values", return_value={}):
+            results, successful, _ = executor._extract_iteration_results_from_subprocess(
+                iteration_outputs, cast("Any", _make_package_result()), end_node
+            )
+
+        assert successful == [0, 2]
+        assert results == {1: None}
