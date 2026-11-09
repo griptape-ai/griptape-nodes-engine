@@ -205,7 +205,7 @@ class ImageArtifactProvider(BaseArtifactProvider):
             return data
 
         try:
-            return driver.inject_metadata(pil_image, metadata)
+            return driver.inject_metadata(data, pil_image, metadata)
         except Exception as e:
             logger.warning("Attempted to inject metadata into %s. Failed because: %s", file_name, e)
             return data
