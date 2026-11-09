@@ -801,12 +801,12 @@ class BaseNode(ABC):
           * Further mutating the value that would be assigned to the Parameter
           * Mutating other Parameters or state within the Node
 
-        If other Parameters are changed, the engine needs a list of which
-        ones have changed to cascade unresolved state.
-
         Args:
             parameter: the Parameter on this node that is about to be changed
-            value: the value intended to be set (this has already gone through any converters and validators on the Parameter).
+            value: the value intended to be set. A direct `set_parameter_value()` call has already run it through
+                the Parameter's converters and validators. A SetParameterValueRequest (a UI edit or a value pushed
+                over a connection) calls this hook first, on the value as requested, before any converters or
+                validators run.
                 For a ParameterList fed by a connection to the list itself, this is only what the connection
                 delivered, and the list's own items are not included. It isn't called when one of those items changes.
 
@@ -817,7 +817,7 @@ class BaseNode(ABC):
               * TransformedParameterValue(value=..., parameter_type=...) to specify both value and type
                 when transforming to a different type (e.g., string to artifact)
         """
-        # Default behavior is to do nothing to the supplied value, and indicate no other modified Parameters.
+        # Default behavior is to do nothing to the supplied value.
         return value
 
     def after_value_set(
@@ -830,16 +830,7 @@ class BaseNode(ABC):
         Custom nodes may elect to override the default behavior by implementing this function in their node code.
 
         This gives the node an opportunity to perform custom logic after a parameter is set. This may result in
-        changing other Parameters on the node. If other Parameters are changed, the engine needs a list of which
-        ones have changed to cascade unresolved state.
-
-        NOTE: Subclasses can override this method with either signature:
-        - def after_value_set(self, parameter, value) -> None:  (most common)
-        - def after_value_set(self, parameter, value, **kwargs) -> None:  (advanced)
-        The base implementation uses **kwargs for compatibility with both patterns.
-        The engine will try calling with 2 arguments first, then fall back to 3 if needed.
-        Pyright may show false positive "incompatible override" warnings for the 2-argument
-        version - this is expected and the code will work correctly at runtime.
+        changing other Parameters on the node.
 
         Args:
             parameter: the Parameter on this node that was just changed
@@ -850,7 +841,7 @@ class BaseNode(ABC):
         Returns:
             Nothing
         """
-        # Default behavior is to do nothing, and indicate no other modified Parameters.
+        # Default behavior is to do nothing.
         return None  # noqa: RET501
 
     def get_nodes_to_group_with(self) -> list[BaseNode]:
@@ -1198,8 +1189,7 @@ class BaseNode(ABC):
         a running Flow or forcing an upstream object to alter its assumptions.
 
         Changing a Parameter may trigger other Parameters within the Node
-        to be changed. If other Parameters are changed, the engine needs a list of which
-        ones have changed to cascade unresolved state.
+        to be changed.
 
         Args:
             param_name: the name of the Parameter on this node that is about to be changed
@@ -1207,11 +1197,6 @@ class BaseNode(ABC):
             emit_change: whether to emit a parameter lifecycle event, defaults to True
             initial_setup: Whether this value is being set as the initial setup on the node, defaults to False. When True, the value is not given to any before/after hooks.
             skip_before_value_set: Whether to skip the before_value_set hook, defaults to False. Used when before_value_set has already been called earlier in the flow.
-
-        Returns:
-            A set of parameter names within this node that were modified as a result
-            of this assignment. The Parameter this was called on does NOT need to be
-            part of the return.
         """
         parameter = self.get_parameter_by_name(param_name)
         if parameter is None:
@@ -1228,7 +1213,6 @@ class BaseNode(ABC):
         self._list_rows.check_row_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
 
         # Allow custom node logic to prepare and possibly mutate the value before it is actually set.
-        # Record any parameters modified for cascading.
         if not initial_setup:
             # A row's hooks run while it is being set, so they mustn't replace its list's rows.
             with self._list_rows.hooks_running(parameter.parent_container_name):
@@ -1240,7 +1224,7 @@ class BaseNode(ABC):
                 self.parameter_values[param_name] = final_value
                 self._also_record_as_result(parameter, final_value)
 
-                # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
+                # Allow custom node logic to respond after it's been set.
                 # A connected list's hook sees the list the node now reads, its rows' items included.
                 with self._reporting_state_set_by("after_value_set"):
                     self.after_value_set(

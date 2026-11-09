@@ -36,31 +36,32 @@ Load EXR (channels) → [Save EXR]
 
 | Name          | Type              | Notes                                                                                                                          |
 | ------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `output_file` | `str`             | Path to the written `.exr` file.                                                                                               |
 | `output_part` | `EXRPartArtifact` | Descriptor for the written part — connectable to [Display EXR Part](display_exr_part.md) or [Load EXR](load_exr.md) consumers. |
 
 ## Parameters
 
-| Name          | Type                                 | Default | Notes                                                                |
-| ------------- | ------------------------------------ | ------- | -------------------------------------------------------------------- |
-| `compression` | `ZIP \| ZIPS \| PIZ \| DWAA \| NONE` | `ZIP`   | Codec applied to the output file.                                    |
-| `pixel_type`  | `HALF \| FLOAT`                      | `HALF`  | `HALF` is 16-bit float (standard); `FLOAT` is 32-bit full precision. |
+| Name          | Type                                 | Default      | Notes                                                                |
+| ------------- | ------------------------------------ | ------------ | -------------------------------------------------------------------- |
+| `compression` | `ZIP \| ZIPS \| PIZ \| DWAA \| NONE` | `ZIP`        | Codec applied to the output file.                                    |
+| `pixel_type`  | `HALF \| FLOAT`                      | `HALF`       | `HALF` is 16-bit float (standard); `FLOAT` is 32-bit full precision. |
+| `output_file` | `str`                                | `output.exr` | File name to save to, resolved into the project's output location.   |
 
 ### Metadata *(collapsed by default)*
 
-| Name                 | Type    | Default | Notes                                            |
-| -------------------- | ------- | ------- | ------------------------------------------------ |
-| `part_name`          | `str`   | `""`    | Name for this EXR part.                          |
-| `pixel_aspect_ratio` | `float` | `1.0`   | Pixel width/height ratio.                        |
-| `owner`              | `str`   | `""`    | Asset owner.                                     |
-| `comments`           | `str`   | `""`    | Free-text comments.                              |
-| `capture_date`       | `str`   | `""`    | Capture date (e.g. `2025-01-01T12:00:00`).       |
-| `software`           | `str`   | `""`    | Authoring application name.                      |
-| `time_code`          | `str`   | `""`    | Editorial timecode (`HH:MM:SS:FF`).              |
-| `custom_attributes`  | `str`   | `""`    | Non-standard header attributes as a JSON object. |
+| Name                          | Type    | Default | Notes                                                                                                                                                                                                                                               |
+| ----------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `metadata_part_name`          | `str`   | `""`    | Name for this EXR part.                                                                                                                                                                                                                             |
+| `metadata_pixel_aspect_ratio` | `float` | `1.0`   | Pixel width/height ratio.                                                                                                                                                                                                                           |
+| `metadata_owner`              | `str`   | `""`    | Asset owner.                                                                                                                                                                                                                                        |
+| `metadata_comments`           | `str`   | `""`    | Free-text comments.                                                                                                                                                                                                                                 |
+| `metadata_capture_date`       | `str`   | `""`    | Capture date (e.g. `2025-01-01T12:00:00`).                                                                                                                                                                                                          |
+| `metadata_software`           | `str`   | `""`    | Authoring application name.                                                                                                                                                                                                                         |
+| `metadata_time_code`          | `str`   | `""`    | Editorial timecode (`HH:MM:SS:FF`).                                                                                                                                                                                                                 |
+| `metadata_custom`             | `json`  | `{}`    | Non-standard header attributes as a JSON object. Keys that duplicate a field above (as EXR attribute names, e.g. `owner`, `comments`) are dropped in that field's favor, even when the field is empty; writer-owned keys fail the node (see below). |
 
 ## Tips & pitfalls
 
+- **Custom attributes can't override the file structure.** `metadata_custom` fails the node if it sets a writer-owned key (`compression`, `type`, `channels`, `dataWindow`, `displayWindow`, `tiles`, `chunkCount`, `lineOrder`, `screenWindowCenter`, `screenWindowWidth`, `chromaticities`) or isn't a valid JSON object. Duplicated typed fields are named in the result details.
 - **Mode B wins.** If you meant to save `image_in` but a channel slot is still wired, the image is silently ignored — disconnect the channel slots.
 - **8-bit sources don't become HDR.** Mode A normalizes display-referred 8-bit data into [0.0, 1.0]; it does not recover highlights. Use Mode B with float channels for real HDR data.
 - **Pick `DWAA` for big beauty renders.** It's lossy but dramatically smaller; keep `ZIP`/`PIZ` for data passes (depth, normals) where exact values matter.
