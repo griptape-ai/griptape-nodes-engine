@@ -2043,8 +2043,7 @@ class NodeManager(EngineScoped):
             )
             raise _ConnectedDestinationError(msg)
 
-        incoming = workflow.flows.connections.get_incoming_connections_to_parameter(node, parameter)
-        sources = [connection.source_node for connection in incoming]
+        sources = self._sources_through_group_proxies(workflow, node, parameter)
         provider = next((source for source in sources if isinstance(source, provider_type)), None)
         if provider is None:
             return _ConnectedDestination(spec=None, details=f"No output settings are connected to {target}.")
@@ -2059,6 +2058,25 @@ class NodeManager(EngineScoped):
         return _ConnectedDestination(
             spec=destination.to_spec(), details=f"Read the destination '{provider_name}' supplies to {target}."
         )
+
+    def _sources_through_group_proxies(
+        self, workflow: WorkflowRuntime, node: BaseNode, parameter: Parameter
+    ) -> list[BaseNode]:
+        """The nodes feeding ``node.parameter``, looking through group proxy parameters.
+
+        A wire that crosses a group's boundary, into it or out of it, runs through a proxy parameter on the
+        group, so the source a node sees can be the group. Following what feeds that proxy finds the node
+        at the other end.
+        """
+        sources: list[BaseNode] = []
+        for connection in workflow.flows.connections.get_incoming_connections_to_parameter(node, parameter):
+            if isinstance(connection.source_node, SubflowNodeGroup):
+                sources.extend(
+                    self._sources_through_group_proxies(workflow, connection.source_node, connection.source_parameter)
+                )
+            else:
+                sources.append(connection.source_node)
+        return sources
 
     @handles(ListParametersOnNodeRequest)
     def on_list_parameters_on_node_request(
