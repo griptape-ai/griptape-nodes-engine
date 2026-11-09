@@ -39,6 +39,7 @@ Scan Sequence → [EXR Sequence to Preview] → (video output)
 | `tone_mapping`     | `sRGB \| rec709 \| rec1886 \| raw` | `sRGB`                                                       | Display transform when `color_mode` is `basic`. See [OpenColorIO integration](index.md#opencolorio-integration). Hidden in `ocio` mode. |
 | `format`           | `mp4 \| mov`                       | `mp4`                                                        | Output container.                                                                                                                       |
 | `processing_speed` | `fast \| balanced \| quality`      | `balanced`                                                   | Encoding speed vs. quality trade-off.                                                                                                   |
+| `output_file`      | `str`                              | `preview.mp4`                                                | File name to save to, resolved into the project's output location. The saved location is carried by `video`.                            |
 
 ### Advanced *(collapsed by default)*
 
@@ -48,12 +49,11 @@ Scan Sequence → [EXR Sequence to Preview] → (video output)
 
 ## Outputs
 
-| Name               | Type               | Notes                                            |
-| ------------------ | ------------------ | ------------------------------------------------ |
-| `video`            | `VideoUrlArtifact` | The encoded preview video.                       |
-| `frame_count`      | `int`              | Total number of frames in the sequence.          |
-| `frames_processed` | `int`              | Frames converted so far, updated during the run. |
-| `output_file`      | `str`              | Path to the saved video file.                    |
+| Name               | Type               | Notes                                                                         |
+| ------------------ | ------------------ | ----------------------------------------------------------------------------- |
+| `video`            | `VideoUrlArtifact` | The encoded preview video.                                                    |
+| `frame_count`      | `int`              | Total number of frames in the sequence.                                       |
+| `frames_processed` | `int`              | Frames finished so far, including failed conversions, updated during the run. |
 
 ## Tips & pitfalls
 

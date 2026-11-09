@@ -36,15 +36,15 @@ Load EXR (channels) → [Save EXR]
 
 | Name          | Type              | Notes                                                                                                                          |
 | ------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `output_file` | `str`             | Path to the written `.exr` file.                                                                                               |
 | `output_part` | `EXRPartArtifact` | Descriptor for the written part — connectable to [Display EXR Part](display_exr_part.md) or [Load EXR](load_exr.md) consumers. |
 
 ## Parameters
 
-| Name          | Type                                 | Default | Notes                                                                |
-| ------------- | ------------------------------------ | ------- | -------------------------------------------------------------------- |
-| `compression` | `ZIP \| ZIPS \| PIZ \| DWAA \| NONE` | `ZIP`   | Codec applied to the output file.                                    |
-| `pixel_type`  | `HALF \| FLOAT`                      | `HALF`  | `HALF` is 16-bit float (standard); `FLOAT` is 32-bit full precision. |
+| Name          | Type                                 | Default      | Notes                                                                |
+| ------------- | ------------------------------------ | ------------ | -------------------------------------------------------------------- |
+| `compression` | `ZIP \| ZIPS \| PIZ \| DWAA \| NONE` | `ZIP`        | Codec applied to the output file.                                    |
+| `pixel_type`  | `HALF \| FLOAT`                      | `HALF`       | `HALF` is 16-bit float (standard); `FLOAT` is 32-bit full precision. |
+| `output_file` | `str`                                | `output.exr` | File name to save to, resolved into the project's output location.   |
 
 ### Metadata *(collapsed by default)*
 

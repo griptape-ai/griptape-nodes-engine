@@ -36,6 +36,10 @@ Category: `EXR`
 
 ## Parameters
 
+| Name          | Type  | Default        | Notes                                                                                                                                                               |
+| ------------- | ----- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `output_file` | `str` | `read_exr.png` | File name to save to, resolved into the project's output location. For a sequence, the frame number is added to the name. The saved location is carried by `image`. |
+
 ### Color Management *(collapsed by default)*
 
 | Name                  | Type                               | Default                                                      | Notes                                                                                                                                   |
@@ -48,12 +52,11 @@ Category: `EXR`
 
 ## Outputs
 
-| Name          | Type                       | Notes                                                                        |
-| ------------- | -------------------------- | ---------------------------------------------------------------------------- |
-| `image`       | `ImageUrlArtifact`         | 8-bit PNG of the current frame, encoded with the selected display transform. |
-| `part`        | `EXRPartArtifact`          | Descriptor for the part that was read.                                       |
-| `channels`    | `list[EXRChannelArtifact]` | One descriptor per channel in the part that was read.                        |
-| `output_file` | `str`                      | Path to the saved PNG file.                                                  |
+| Name       | Type                       | Notes                                                                        |
+| ---------- | -------------------------- | ---------------------------------------------------------------------------- |
+| `image`    | `ImageUrlArtifact`         | 8-bit PNG of the current frame, encoded with the selected display transform. |
+| `part`     | `EXRPartArtifact`          | Descriptor for the part that was read.                                       |
+| `channels` | `list[EXRChannelArtifact]` | One descriptor per channel in the part that was read.                        |
 
 ### EXR Info *(collapsed by default)*
 

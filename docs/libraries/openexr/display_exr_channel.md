@@ -36,10 +36,9 @@ Read EXR (channels) → Get From List → [Display EXR Channel]
 
 ## Outputs
 
-| Name          | Type               | Notes                                                                                      |
-| ------------- | ------------------ | ------------------------------------------------------------------------------------------ |
-| `image`       | `ImageUrlArtifact` | 8-bit RGB or RGBA PNG, encoded with the selected display transform, for in-canvas display. |
-| `output_file` | `str`              | Path to the saved PNG file.                                                                |
+| Name    | Type               | Notes                                                                                      |
+| ------- | ------------------ | ------------------------------------------------------------------------------------------ |
+| `image` | `ImageUrlArtifact` | 8-bit RGB or RGBA PNG, encoded with the selected display transform, for in-canvas display. |
 
 ## Parameters
 
@@ -48,6 +47,7 @@ Read EXR (channels) → Get From List → [Display EXR Channel]
 | `color_mode`          | `basic \| ocio`                    | `ocio` if the OpenColorIO Library is installed, else `basic` | `basic` uses a local display transform; `ocio` uses the connected `OCIOColorParamsArtifact`.                                                |
 | `tone_mapping`        | `sRGB \| rec709 \| rec1886 \| raw` | `sRGB`                                                       | Display transform when `color_mode` is `basic`. See [OpenColorIO integration](index.md#opencolorio-integration). Hidden in `ocio` mode.     |
 | `embed_color_profile` | `bool`                             | `false`                                                      | Embed an ICC profile naming the display transform, so color-managed viewers show `rec709`/`rec1886`/`raw` correctly. Hidden in `ocio` mode. |
+| `output_file`         | `str`                              | `display_exr_channel.png`                                    | File name to save to, resolved into the project's output location. The saved location is carried by `image`.                                |
 
 ## Tips & pitfalls
 
