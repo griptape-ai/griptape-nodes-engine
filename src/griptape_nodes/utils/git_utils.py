@@ -1295,7 +1295,10 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         temp_path = Path(temp_dir)
 
         def run(args: list[str], error_msg: str) -> str:
-            return _run_git(args, error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
+            # Each fetch, including checkout's lazy blob fetch, otherwise spawns a
+            # housekeeping process for a repository that is about to be deleted.
+            no_housekeeping = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+            return _run_git([*no_housekeeping, *args], error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
 
         run(["init"], "Git init failed")
         run(["remote", "add", "origin", remote_url], "Git remote add failed")
@@ -1314,7 +1317,10 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         ]
         sparse_checkout_file.write_text("\n".join(patterns), encoding="utf-8")
 
-        run(["fetch", "--depth=1", "origin", ref], f"Git fetch failed for {ref}")
+        # Sparse checkout only limits the working tree; the fetch would still download every
+        # file in the commit. blob:none defers file contents, so checkout fetches just the
+        # library JSON. A server without filter support ignores it and sends everything.
+        run(["fetch", "--depth=1", "--filter=blob:none", "origin", ref], f"Git fetch failed for {ref}")
         run(["checkout", "FETCH_HEAD"], "Git checkout failed")
 
         library_json_path = find_file_in_directory(temp_path, "griptape[-_]nodes[-_]library.json")

@@ -20,7 +20,6 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
-    SetWorkflowContextRequest,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -115,15 +114,14 @@ _WORKFLOW_REQUESTS = {
     GetWorkflowShapeRequest,
 }
 # They use the tab's open workflow when there is one and work without it.
-_OPTIONAL_WORKFLOW_REQUESTS = {EnsureWorkflowAndFlowRequest, GetPublishOptionsRequest, GetWorkflowRunCommandRequest}
-# File runs and the context requests learn their workflow from the ambient binding until the entry
-# points bind the workflow they run in.
-_UNSCOPED_REQUESTS = {
-    RunWorkflowFromScratchRequest,
-    RunWorkflowWithCurrentStateRequest,
-    RunWorkflowFromRegistryRequest,
-    SetWorkflowContextRequest,
+_OPTIONAL_WORKFLOW_REQUESTS = {
+    EnsureWorkflowAndFlowRequest,
+    GetPublishOptionsRequest,
+    GetWorkflowRunCommandRequest,
     GetWorkflowContextRequest,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowFromRegistryRequest,
 }
 
 
@@ -236,15 +234,13 @@ class TestWorkflowManagerScopes:
             for request_type in handled_request_types(attr)
         }
 
-        assert len(scopes) > len(_WORKFLOW_REQUESTS) + len(_OPTIONAL_WORKFLOW_REQUESTS) + len(_UNSCOPED_REQUESTS)
+        assert len(scopes) > len(_WORKFLOW_REQUESTS) + len(_OPTIONAL_WORKFLOW_REQUESTS)
         for request_type, scope in scopes.items():
-            expected: RequestScope | None = RequestScope.HOST
+            expected = RequestScope.HOST
             if request_type in _WORKFLOW_REQUESTS:
                 expected = RequestScope.WORKFLOW
             if request_type in _OPTIONAL_WORKFLOW_REQUESTS:
                 expected = RequestScope.OPTIONAL_WORKFLOW
-            if request_type in _UNSCOPED_REQUESTS:
-                expected = None
             assert scope is expected, f"{request_type.__name__} is {scope}, expected {expected}"
 
 
@@ -476,8 +472,8 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         canvas = _create_flow(engine, importing, "importing_canvas")
         imported = _write_saved_workflow(engine, tmp_path.resolve() / "imported.py")
 
-        async def run_workflow(_relative_file_path: str, *, opens_workflow: bool) -> WorkflowExecutionResult:
-            assert not opens_workflow
+        async def run_workflow(_relative_file_path: str, workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
+            assert workflow is importing
             # A workflow file creates its flow under the flow it runs in, in the workflow it is bound to.
             created = engine.handle_request(CreateFlowRequest(parent_flow_name=canvas, flow_name="imported_flow"))
             assert isinstance(created, CreateFlowResultSuccess), created.result_details

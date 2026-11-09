@@ -1028,7 +1028,7 @@ class TestSerializeGroupWithChildren:
         node = _MinimalSubflowGroupNode(
             name="SG1", metadata={"library": library_name, "node_type": "_MinimalSubflowGroupNode"}
         )
-        engine.object_manager.add_object_by_name(node.name, node)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), node.name, node)
         engine.flow_manager.get_flow_by_name("serialization_flow").add_node(node)
 
         result = engine.node_manager.on_serialize_node_to_commands(

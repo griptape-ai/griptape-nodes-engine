@@ -67,10 +67,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers import event_manager as event_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
-from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope, scope_from_signature
+from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
-from griptape_nodes.retained_mode.unmigrated_requests import AMBIENT_UNTIL_MIGRATED, ONLY_OPEN_UNTIL_CLIENTS_NAME
+from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from tests.unit.host_workflow_reads import HostWorkflowRead
 
 if TYPE_CHECKING:
@@ -738,17 +738,17 @@ class TestHostWorkflowReads:
     def test_a_read_in_an_unscoped_request_a_host_handler_sends_is_not(
         self, engine: Engine, fail_on_host_workflow_reads: list[HostWorkflowRead]
     ) -> None:
-        """An unmigrated handler's reads are its own debt, not a dependence of the HOST handler that sent it."""
+        """An unscoped library handler's reads are its own, not a dependence of the HOST handler that sent it."""
         _open_workflow(engine)
 
-        def ambient_handler(request: _InnerProbeRequest) -> ResultPayload:  # noqa: ARG001
+        def library_handler(request: _InnerProbeRequest) -> ResultPayload:  # noqa: ARG001
             engine.current_workflow_or_none()
             return _ScopeProbeResult(result_details="ran")
 
         def host_handler(request: _ScopeProbeRequest) -> ResultPayload:  # noqa: ARG001
             return engine.handle_request(_InnerProbeRequest())
 
-        engine.event_manager.assign_manager_to_request_type(_InnerProbeRequest, ambient_handler, without_workflow=None)
+        engine.event_manager.assign_manager_to_request_type(_InnerProbeRequest, library_handler, without_workflow=None)
         engine.event_manager.assign_manager_to_request_type(_ScopeProbeRequest, host_handler)
 
         engine.handle_request(_ScopeProbeRequest())
@@ -771,41 +771,6 @@ class TestHostWorkflowReads:
         assert fail_on_host_workflow_reads == []
 
 
-class TestAmbientUntilMigrated:
-    """Each entry is a request type whose engine handler still reads the ambient workflow."""
-
-    @pytest.mark.parametrize("name", sorted(AMBIENT_UNTIL_MIGRATED))
-    def test_names_a_request_type(self, name: str) -> None:
-        request_type = PayloadRegistry.get_type(name)
-
-        assert request_type is not None
-        assert issubclass(request_type, RequestPayload)
-
-    @pytest.mark.parametrize("name", sorted(AMBIENT_UNTIL_MIGRATED))
-    def test_its_handler_takes_no_workflow(self, engine: Engine, name: str) -> None:
-        """A handler that takes a workflow is migrated, so its entry should be removed."""
-        request_type = PayloadRegistry.get_type(name)
-        assert request_type is not None
-        assert issubclass(request_type, RequestPayload)
-        handler = engine.event_manager.get_manager_for_request_type(request_type)
-        if handler is None:
-            pytest.skip(f"{name} is registered only in a worker.")
-
-        assert not isinstance(handler, ForwardingHandler)
-        assert scope_from_signature(handler) is None
-
-
-# Entry points that open, run into or report the open workflow from the ambient binding, so they stay in
-# `AMBIENT_UNTIL_MIGRATED`. They get a scope once entry points bind or close workflows by id.
-_ENTRY_POINTS_LEFT_UNSCOPED = {
-    "GetWorkflowContextRequest",
-    "RunWorkflowFromRegistryRequest",
-    "RunWorkflowFromScratchRequest",
-    "RunWorkflowWithCurrentStateRequest",
-    "SetWorkflowContextRequest",
-}
-
-
 class TestEveryEngineHandlerDeclaresAScope:
     """Library handlers registered at library load (`module_loading.py`) are not covered: none load here."""
 
@@ -818,10 +783,7 @@ class TestEveryEngineHandlerDeclaresAScope:
             if event_manager.get_scope_for_request_type(request_type) is None
         }
 
-        assert undeclared == _ENTRY_POINTS_LEFT_UNSCOPED
-
-    def test_only_the_entry_points_keep_the_ambient_workflow(self) -> None:
-        assert _ENTRY_POINTS_LEFT_UNSCOPED == AMBIENT_UNTIL_MIGRATED
+        assert undeclared == set()
 
     def test_every_broadcast_handler_a_worker_registers_declares_host_scope(self) -> None:
         event_manager = EventManager()

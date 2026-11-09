@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
 
 
-class PILThumbnailParameters(BaseGeneratorParameters):
+class ThumbnailParameters(BaseGeneratorParameters):
     """Parameters for thumbnail generation."""
 
     max_width: PositiveInt = Field(
@@ -52,7 +52,7 @@ class PILThumbnailParameters(BaseGeneratorParameters):
     )
 
 
-class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
+class ThumbnailGenerator(BaseArtifactPreviewGenerator):
     """Thumbnail generator with dimension constraints.
 
     Resizes images to fit within max_width x max_height while preserving aspect ratio.
@@ -92,7 +92,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
 
         # Validate and convert dict -> Pydantic model
         # Raises ValidationError if invalid
-        self.params = PILThumbnailParameters.model_validate(params)
+        self.params = ThumbnailParameters.model_validate(params)
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -112,7 +112,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
     @classmethod
     def get_parameters(cls) -> type[BaseGeneratorParameters]:
         """Get parameter model class."""
-        return PILThumbnailParameters
+        return ThumbnailParameters
 
     async def attempt_generate_preview(self) -> str:
         """Execute preview generation.
@@ -168,12 +168,14 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
                 f"Attempted to generate a thumbnail. Failed because {self.preview_format} is not a known image format."
             )
             raise TypeError(msg)
-        with GriptapeImage.open(image_data) as source, GriptapeImagePipeline(source) as pipeline:
+        with GriptapeImage.open(image_data) as source:
             # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
             # fit within the max dimensions, preserving aspect ratio
-            pipeline.exif_transpose().thumbnail(self.params.max_width, self.params.max_height)
-            with pipeline.end() as thumbnail:
-                # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
-                return thumbnail.encode(
-                    preview_format, metadata=ImageMetadata(icc_profile=thumbnail.metadata.icc_profile)
-                )
+            thumbnail = (
+                GriptapeImagePipeline(source)
+                .exif_transpose()
+                .thumbnail(self.params.max_width, self.params.max_height)
+                .end()
+            )
+        # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+        return thumbnail.encode(preview_format, metadata=ImageMetadata(icc_profile=thumbnail.metadata.icc_profile))

@@ -5,12 +5,19 @@ method returns a per-frame FileDestination. Situation-based macro routing determ
 directory layout; falls back to a sensible default when no situation is configured.
 """
 
+from __future__ import annotations
+
+import typing
+
 from griptape_nodes.common import macro_parser
 from griptape_nodes.common.project_templates import situation as situation_mod
-from griptape_nodes.exe_types import core_types, node_types
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import file_sequence, path_utils, situation_resolver
 from griptape_nodes.retained_mode.events import os_events, project_events
+
+if typing.TYPE_CHECKING:
+    from griptape_nodes.exe_types import core_types, node_types
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 _FALLBACK_SEQUENCE_MACRO = "{outputs}/{sub_dirs?:/}{file_name_base}_v{###}/{file_name_base}.####.{file_extension}"
 
@@ -93,6 +100,9 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
         Returns:
             FileSequenceDestination with a versioned MacroPath and baked-in policy.
 
+        Either way the destination writes in the node's workflow, so it can be built and used
+        from any thread.
+
         Raises:
             ValueError: If an upstream FileSequenceDestinationProvider is connected but returns None.
             FileSequenceError: If no available version index can be found.
@@ -108,12 +118,16 @@ class ProjectFileSequenceParameter(project_output_parameter.ProjectOutputParamet
         value = self._node.get_parameter_value(self._name)
         filename = value if isinstance(value, str) and value else self._default_value
 
-        return _build_sequence_destination_from_situation(filename, self._situation_name, **extra_vars)
+        return _build_sequence_destination_from_situation(
+            filename, self._situation_name, self._node.workflow, **extra_vars
+        )
 
 
 def _build_sequence_destination_from_situation(
     filename: str,
     situation: str,
+    workflow: WorkflowRuntime | None = None,
+    /,
     **extra_vars: str | int,
 ) -> file_sequence.FileSequenceDestination:
     """Build a FileSequenceDestination from a project situation template.
@@ -128,13 +142,15 @@ def _build_sequence_destination_from_situation(
     Args:
         filename: Filename or #### pattern (e.g., ``"render.exr"`` or ``"render_####.exr"``).
         situation: Situation name to look up in the current project.
+        workflow: The workflow to look the situation up and write in, or None for the caller's.
+            Positional-only so a macro variable named `workflow` stays in `extra_vars`.
         **extra_vars: Additional macro variables.
 
     Returns:
         FileSequenceDestination with a locked version index but unresolved element token.
     """
     resolved = situation_resolver.resolve_situation(
-        situation, _FALLBACK_SEQUENCE_MACRO, os_events.ExistingFilePolicy.OVERWRITE
+        situation, _FALLBACK_SEQUENCE_MACRO, os_events.ExistingFilePolicy.OVERWRITE, workflow=workflow
     )
     parts = path_utils.FilenameParts.from_filename(filename)
     variables: dict[str, str | int] = {
@@ -154,4 +170,5 @@ def _build_sequence_destination_from_situation(
         macro_path,
         existing_file_policy=frame_policy,
         create_parents=resolved.create_parents,
+        workflow=workflow,
     )

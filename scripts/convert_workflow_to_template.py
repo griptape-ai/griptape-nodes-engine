@@ -13,10 +13,11 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
-import OpenImageIO as oiio  # noqa: N813
 import tomlkit
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
+
+from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat, ResizeFilter
 
 console = Console()
 
@@ -160,68 +161,42 @@ def process_image(image_path: Path, output_path: Path) -> None:
             shutil.copy2(image_path, output_path)
             return
 
-        # Load image, apply its EXIF orientation, then convert to RGB or RGBA (what webp holds)
-        img = _to_rgb_or_rgba(oiio.ImageBufAlgo.reorient(_load_image(image_path)))
+        # Load image and apply its EXIF orientation
+        with (
+            GriptapeImage.open(image_path) as source,
+            GriptapeImagePipeline(source).exif_transpose().end() as img,
+        ):
+            # Resize to cover 512x512 while maintaining aspect ratio
+            # This is similar to CSS object-fit: cover
+            target_width, target_height = 512, 512
+            img_width = img.width
+            img_height = img.height
 
-        # Resize to cover 512x512 while maintaining aspect ratio
-        # This is similar to CSS object-fit: cover
-        target_width, target_height = 512, 512
-        img_width = img.spec().width
-        img_height = img.spec().height
+            # Calculate scaling factor to cover the target size
+            scale = max(target_width / img_width, target_height / img_height)
 
-        # Calculate scaling factor to cover the target size
-        scale = max(target_width / img_width, target_height / img_height)
+            # Calculate new dimensions
+            new_width = int(img_width * scale)
+            new_height = int(img_height * scale)
 
-        # Calculate new dimensions
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
+            # Resize, then crop from center to exact target size
+            left = (new_width - target_width) // 2
+            top = (new_height - target_height) // 2
+            pipeline = (
+                GriptapeImagePipeline(img)
+                .resize(new_width, new_height, ResizeFilter.LANCZOS)
+                .crop(left, top, left + target_width, top + target_height)
+            )
+            with pipeline.end() as img_cropped:
+                # Save as webp with quality=85; encoding converts to the RGB or RGBA webp holds
+                encoded = img_cropped.encode(ImageFormat.WEBP, quality=85)
 
-        # Resize image
-        img_resized = oiio.ImageBufAlgo.resize(
-            img, "lanczos3", roi=oiio.ROI(0, new_width, 0, new_height, 0, 1, 0, img.nchannels)
-        )
-
-        # Crop from center to exact target size
-        left = (new_width - target_width) // 2
-        top = (new_height - target_height) // 2
-        img_cropped = oiio.ImageBufAlgo.cut(
-            img_resized, oiio.ROI(left, left + target_width, top, top + target_height, 0, 1, 0, img.nchannels)
-        )
-
-        # Save as webp with quality=85
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        _save_webp(img_cropped, output_path, quality=85)
+        output_path.write_bytes(encoded)
 
     except Exception as err:
         msg = f"Failed to process image: {err}"
         raise ValueError(msg) from err
-
-
-def _load_image(image_path: Path) -> oiio.ImageBuf:
-    img = oiio.ImageBuf(str(image_path))
-    if not img.read(force=True):
-        msg = f"Attempted to load {image_path}. Failed because: {img.geterror()}"
-        raise ValueError(msg)
-    return img
-
-
-def _save_webp(img: oiio.ImageBuf, output_path: Path, *, quality: int) -> None:
-    img.specmod().attribute("compression", f"webp:{quality}")
-    if not img.write(str(output_path), "uint8", "webp"):
-        msg = f"Attempted to save {output_path}. Failed because: {img.geterror()}"
-        raise ValueError(msg)
-
-
-def _to_rgb_or_rgba(img: oiio.ImageBuf) -> oiio.ImageBuf:
-    """Return ``img`` as three-channel color, or four with alpha, expanding grayscale."""
-    channels = img.nchannels
-    if channels == 1:
-        return oiio.ImageBufAlgo.channels(img, (0, 0, 0), ("R", "G", "B"))
-    if channels == 2:  # noqa: PLR2004
-        return oiio.ImageBufAlgo.channels(img, (0, 0, 0, 1), ("R", "G", "B", "A"))
-    if channels > 4:  # noqa: PLR2004
-        return oiio.ImageBufAlgo.channels(img, (0, 1, 2, 3), ("R", "G", "B", "A"))
-    return img
 
 
 def generate_github_url(library_path: Path, thumbnail_filename: str) -> str:

@@ -155,14 +155,14 @@ class ObjectManager(EngineScoped):
     def generate_name_for_object(self, type_name: str, requested_name: str | None = None) -> str:
         return self._objects_or_empty().generate_name(type_name=type_name, requested_name=requested_name)
 
-    def add_object_by_name(self, name: str, obj: object) -> None:
-        """Edge method for code not handed a workflow; engine code calls `add_object_by_name_in`."""
-        self.add_object_by_name_in(self.engine.current_workflow(), name, obj)
-
     def add_object_by_name_in(self, workflow: WorkflowRuntime, name: str, obj: object) -> None:
         objects = workflow.objects
         objects.add(name, obj)
+        if isinstance(obj, ControlFlow):
+            obj._set_workflow(workflow)
         if isinstance(obj, BaseNode):
+            # The one place a node joins a workflow, so every node in `workflow.objects` knows it.
+            obj._set_workflow(workflow)
             # The workflow holding the node queues its changes, so they go when it closes.
             obj.set_change_listener(objects.note_queued_changes)
 
@@ -180,10 +180,6 @@ class ObjectManager(EngineScoped):
 
     def attempt_get_object_by_name_as_type[T](self, name: str, cast_type: type[T]) -> T | None:
         return self._objects_or_empty().get_as_type(name, cast_type)
-
-    def del_obj_by_name(self, name: str) -> None:
-        """Edge method for code not handed a workflow; engine code calls `del_obj_by_name_in`."""
-        self.del_obj_by_name_in(self.engine.current_workflow(), name)
 
     def del_obj_by_name_in(self, workflow: WorkflowRuntime, name: str) -> None:
         objects = workflow.objects

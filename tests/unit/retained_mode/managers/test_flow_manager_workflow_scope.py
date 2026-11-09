@@ -287,14 +287,6 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         ("edge_name", "explicit_name", "args"),
         [
             ("get_flow_by_name", "get_flow_by_name_in", ("canvas",)),
-            ("get_parent_flow", "get_parent_flow_in", ("canvas",)),
-            ("flow_state", "flow_state_in", ("flow",)),
-            ("get_start_node_queue", "get_start_node_queue_in", ()),
-            ("classify_nodes_for_dag", "classify_nodes_for_dag_in", (["node"],)),
-            ("get_connected_output_parameters", "get_connected_output_parameters_in", ("node", "param")),
-            ("has_connection", "has_connection_in", ("source", "source_param", "target", "target_param")),
-            ("get_start_node_from_node", "get_start_node_from_node_in", ("flow", "node")),
-            ("get_prev_node", "get_prev_node_in", ("flow", "node")),
         ],
     )
     def test_an_edge_method_hands_the_open_workflow_to_its_explicit_twin(
@@ -314,22 +306,12 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
         flow_manager = engine.flow_manager
 
         assert not flow_manager.check_for_existing_running_flow()
-        assert flow_manager.flow_state(MagicMock()) == ([], [], [])
         with pytest.raises(KeyError, match="doesn't exist"):
             flow_manager.get_flow_by_name("canvas")
 
     @pytest.mark.parametrize(
         "edge",
         [
-            lambda c: c.fm.get_connected_output_parameters(c.node, c.param),
-            lambda c: c.fm.has_connection(c.node, c.param, c.node, c.param),
-            lambda c: c.fm.get_start_node_from_node(c.flow, c.node),
-            lambda c: c.fm.get_prev_node(c.flow, c.node),
-            lambda c: c.fm.classify_nodes_for_dag([c.node]),
-            lambda c: c.fm.get_connected_input_from_node(c.flow, c.node),
-            lambda c: c.fm.get_connected_output_from_node(c.flow, c.node),
-            lambda c: c.fm.get_connected_input_parameters(c.flow, c.node, c.param),
-            lambda c: c.fm.get_connections_on_node(c.node),
             lambda c: c.fm.get_all_connected_nodes(c.node),
         ],
     )

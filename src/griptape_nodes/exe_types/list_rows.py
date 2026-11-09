@@ -293,7 +293,9 @@ class ListRows:
     def _connected_parameter_names(self, parameter_names: set[str]) -> set[str]:
         """Which of `parameter_names` have a connection in either direction."""
         node = self._node
-        result = node.engine.handle_request(ListConnectionsForNodeRequest(node_name=node.name, broadcast_result=False))
+        result = node._handle_request_in_workflow(
+            ListConnectionsForNodeRequest(node_name=node.name, broadcast_result=False)
+        )
         if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return set()
         connected = {connection.target_parameter_name for connection in result.incoming_connections}

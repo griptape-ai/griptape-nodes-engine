@@ -1,7 +1,6 @@
 import os
 import platform
 import subprocess
-import tempfile
 from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -76,24 +75,18 @@ WINDOWS_MAX_PATH = 260
 class TestWriteFileRequest:
     """Test WriteFileRequest with various scenarios."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_write_text_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_text_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully writing a text file."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Hello, World!")
 
         result = os_manager.engine.handle_request(request)
@@ -104,10 +97,10 @@ class TestWriteFileRequest:
         assert result.bytes_written > 0
         assert file_path.read_text() == "Hello, World!"
 
-    def test_write_binary_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_binary_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully writing a binary file."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.bin"
+        file_path = tmp_path / "test.bin"
         content = b"\x00\x01\x02\x03"
         request = WriteFileRequest(file_path=str(file_path), content=content)
 
@@ -119,10 +112,10 @@ class TestWriteFileRequest:
         assert result.bytes_written == len(content)
         assert file_path.read_bytes() == content
 
-    def test_write_file_append_mode(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_append_mode(self, engine: Engine, tmp_path: Path) -> None:
         """Test appending to an existing file."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("Initial content\n")
 
         request = WriteFileRequest(file_path=str(file_path), content="Appended content\n", append=True)
@@ -131,10 +124,10 @@ class TestWriteFileRequest:
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_text() == "Initial content\nAppended content\n"
 
-    def test_write_file_overwrite_policy(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_overwrite_policy(self, engine: Engine, tmp_path: Path) -> None:
         """Test overwriting an existing file with OVERWRITE policy."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("Old content")
 
         request = WriteFileRequest(
@@ -145,10 +138,10 @@ class TestWriteFileRequest:
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_text() == "New content"
 
-    def test_write_file_fail_policy(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_fail_policy(self, engine: Engine, tmp_path: Path) -> None:
         """Test FAIL policy when file exists."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("Existing content")
 
         request = WriteFileRequest(
@@ -162,10 +155,10 @@ class TestWriteFileRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "exists" in result.result_details.result_details[0].message.lower()
 
-    def test_write_file_create_parents_true(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_create_parents_true(self, engine: Engine, tmp_path: Path) -> None:
         """Test creating parent directories when create_parents=True."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "subdir" / "nested" / "test.txt"
+        file_path = tmp_path / "subdir" / "nested" / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
 
         result = os_manager.engine.handle_request(request)
@@ -174,10 +167,10 @@ class TestWriteFileRequest:
         assert file_path.exists()
         assert file_path.read_text() == "Content"
 
-    def test_write_file_create_parents_false(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_create_parents_false(self, engine: Engine, tmp_path: Path) -> None:
         """Test failure when parent directory missing and create_parents=False."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "nonexistent" / "test.txt"
+        file_path = tmp_path / "nonexistent" / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=False)
 
         result = os_manager.engine.handle_request(request)
@@ -185,11 +178,11 @@ class TestWriteFileRequest:
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
-    def test_write_file_invalid_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_invalid_path(self, engine: Engine, tmp_path: Path) -> None:
         """Test invalid path handling - attempting to write to a directory."""
         os_manager = engine.os_manager
         # Create a directory and try to write to it as if it were a file
-        dir_path = temp_dir / "test_directory"
+        dir_path = tmp_path / "test_directory"
         dir_path.mkdir()
 
         request = WriteFileRequest(file_path=str(dir_path), content="Content")
@@ -207,10 +200,10 @@ class TestWriteFileRequest:
         else:
             assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
 
-    def test_write_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test permission denied error."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
         with patch(
@@ -226,23 +219,17 @@ class TestWriteFileRequest:
 class TestReadFileRequest:
     """Test ReadFileRequest with failure_reason support."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_read_text_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_read_text_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully reading a text file."""
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("Test content")
 
         request = ReadFileRequest(file_path=str(file_path))
@@ -252,9 +239,9 @@ class TestReadFileRequest:
         assert result.content == "Test content"
         assert result.encoding == "utf-8"
 
-    def test_read_binary_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_read_binary_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully reading a binary file."""
-        file_path = temp_dir / "test.bin"
+        file_path = tmp_path / "test.bin"
         content = b"\x00\x01\x02\x03"
         file_path.write_bytes(content)
 
@@ -265,18 +252,18 @@ class TestReadFileRequest:
         # Binary files might be returned as base64 or bytes
         assert result.content is not None
 
-    def test_read_file_not_found(self, engine: Engine, temp_dir: Path) -> None:
+    def test_read_file_not_found(self, engine: Engine, tmp_path: Path) -> None:
         """Test reading non-existent file returns FILE_NOT_FOUND."""
-        request = ReadFileRequest(file_path=str(temp_dir / "nonexistent.txt"))
+        request = ReadFileRequest(file_path=str(tmp_path / "nonexistent.txt"))
 
         result = engine.handle_request(request)
 
         assert isinstance(result, ReadFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_read_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
+    def test_read_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test reading file without permission."""
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("Content")
 
         request = ReadFileRequest(file_path=str(file_path))
@@ -317,23 +304,17 @@ class TestReadFileRequestImagePreview:
         b"\x00\x00\x00\x00IEND\xaeB`\x82"
     )
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Point the workspace somewhere other than temp_dir so files aren't treated as already-served."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Point the workspace somewhere other than tmp_path so files aren't treated as already-served."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir / "workspace"
+        engine.config_manager.workspace_path = tmp_path / "workspace"
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_large_decodable_file_is_still_thumbnailed(self, engine: Engine, temp_dir: Path) -> None:
+    def test_large_decodable_file_is_still_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
         """A file over the size cap that decodes (e.g. a big JPEG) still gets a thumbnail."""
-        file_path = temp_dir / "huge.png"
+        file_path = tmp_path / "huge.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
         with patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(self._ONE_PIXEL_PNG) - 1):
@@ -344,14 +325,16 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result.content, str)
         assert result.content.startswith("data:image/webp;base64,")
 
-    def test_oversized_file_of_a_slow_format_is_not_decoded(self, engine: Engine, temp_dir: Path) -> None:
+    def test_oversized_file_of_a_slow_format_is_not_decoded(self, engine: Engine, tmp_path: Path) -> None:
         """A file over the size cap in a format slow to decode (EXR) gets no preview, without decoding."""
-        file_path = temp_dir / "huge.exr"
+        file_path = tmp_path / "huge.exr"
         content = encode(solid(4, 4, RED), "exr")
         file_path.write_bytes(content)
 
         with (
             patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(content) - 1),
+            # Windows has no MIME type for .exr; Linux reads one from /etc/mime.types
+            patch("mimetypes.guess_type", return_value=("image/aces", None)),
             patch(
                 "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes",
             ) as mock_create_preview,
@@ -363,9 +346,9 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == OSManager._NO_PREVIEW_DATA_URL
 
-    def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, temp_dir: Path) -> None:
+    def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, tmp_path: Path) -> None:
         """A file over the size cap that can't be decoded must never be base64-encoded whole."""
-        file_path = temp_dir / "huge.png"
+        file_path = tmp_path / "huge.png"
         content = b"\x89PNG\r\n\x1a\n" + b"not a real png, just needs to fail to decode"
         file_path.write_bytes(content)
 
@@ -384,9 +367,9 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == OSManager._NO_PREVIEW_DATA_URL
 
-    def test_decodable_format_is_thumbnailed(self, engine: Engine, temp_dir: Path) -> None:
+    def test_decodable_format_is_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
         """A format that decodes (PNG) gets its 200px WEBP thumbnail."""
-        file_path = temp_dir / "test.png"
+        file_path = tmp_path / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
         request = ReadFileRequest(file_path=str(file_path))
@@ -396,9 +379,9 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result.content, str)
         assert result.content.startswith("data:image/webp;base64,")
 
-    def test_undecodable_file_under_cap_returns_original_bytes(self, engine: Engine, temp_dir: Path) -> None:
+    def test_undecodable_file_under_cap_returns_original_bytes(self, engine: Engine, tmp_path: Path) -> None:
         """A file that can't be decoded, under the size cap, returns the raw bytes, never a hang."""
-        file_path = temp_dir / "test.exr"
+        file_path = tmp_path / "test.exr"
         content = b"not a real exr, just needs to never be decoded"
         file_path.write_bytes(content)
 
@@ -412,10 +395,10 @@ class TestReadFileRequestImagePreview:
         assert result.content.startswith("data:image/aces;base64,")
 
     def test_should_transform_image_content_to_thumbnail_false_skips_decoding(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Opting out of thumbnailing returns the raw bytes without ever decoding them."""
-        file_path = temp_dir / "test.png"
+        file_path = tmp_path / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
         with patch(
@@ -432,54 +415,48 @@ class TestReadFileRequestImagePreview:
 class TestCreateFileRequest:
     """Test CreateFileRequest with failure_reason support."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_create_empty_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_empty_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test creating an empty file."""
         os_manager = engine.os_manager
-        request = CreateFileRequest(path=str(temp_dir / "test.txt"), workspace_only=False)
+        request = CreateFileRequest(path=str(tmp_path / "test.txt"), workspace_only=False)
 
         result = os_manager.on_create_file_request(request)
 
         assert isinstance(result, CreateFileResultSuccess)
-        assert (temp_dir / "test.txt").exists()
+        assert (tmp_path / "test.txt").exists()
 
-    def test_create_file_with_content(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_file_with_content(self, engine: Engine, tmp_path: Path) -> None:
         """Test creating a file with initial content."""
         os_manager = engine.os_manager
-        request = CreateFileRequest(path=str(temp_dir / "test.txt"), content="Initial content", workspace_only=False)
+        request = CreateFileRequest(path=str(tmp_path / "test.txt"), content="Initial content", workspace_only=False)
 
         result = os_manager.on_create_file_request(request)
 
         assert isinstance(result, CreateFileResultSuccess)
-        assert (temp_dir / "test.txt").read_text() == "Initial content"
+        assert (tmp_path / "test.txt").read_text() == "Initial content"
 
-    def test_create_directory_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_directory_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test creating a directory."""
         os_manager = engine.os_manager
-        request = CreateFileRequest(path=str(temp_dir / "testdir"), is_directory=True, workspace_only=False)
+        request = CreateFileRequest(path=str(tmp_path / "testdir"), is_directory=True, workspace_only=False)
 
         result = os_manager.on_create_file_request(request)
 
         assert isinstance(result, CreateFileResultSuccess)
-        assert (temp_dir / "testdir").is_dir()
+        assert (tmp_path / "testdir").is_dir()
 
-    def test_create_file_already_exists(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_file_already_exists(self, engine: Engine, tmp_path: Path) -> None:
         """Test creating file that already exists returns success with warning."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("Existing")
 
         request = CreateFileRequest(path=str(file_path), workspace_only=False)
@@ -491,10 +468,10 @@ class TestCreateFileRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "exists" in result.result_details.result_details[0].message.lower()
 
-    def test_create_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test permission denied when creating file."""
         os_manager = engine.os_manager
-        request = CreateFileRequest(path=str(temp_dir / "test.txt"), workspace_only=False)
+        request = CreateFileRequest(path=str(tmp_path / "test.txt"), workspace_only=False)
 
         # CreateFile uses Path.touch() for empty files, not Path.open()
         with patch.object(Path, "touch", side_effect=PermissionError("Permission denied")):
@@ -507,25 +484,19 @@ class TestCreateFileRequest:
 class TestRenameFileRequest:
     """Test RenameFileRequest with failure_reason support."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_rename_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_rename_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully renaming a file."""
         os_manager = engine.os_manager
-        old_path = temp_dir / "old.txt"
-        new_path = temp_dir / "new.txt"
+        old_path = tmp_path / "old.txt"
+        new_path = tmp_path / "new.txt"
         old_path.write_text("Content")
 
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
@@ -536,11 +507,11 @@ class TestRenameFileRequest:
         assert new_path.exists()
         assert new_path.read_text() == "Content"
 
-    def test_rename_file_source_not_found(self, engine: Engine, temp_dir: Path) -> None:
+    def test_rename_file_source_not_found(self, engine: Engine, tmp_path: Path) -> None:
         """Test renaming non-existent file."""
         os_manager = engine.os_manager
         request = RenameFileRequest(
-            old_path=str(temp_dir / "nonexistent.txt"), new_path=str(temp_dir / "new.txt"), workspace_only=False
+            old_path=str(tmp_path / "nonexistent.txt"), new_path=str(tmp_path / "new.txt"), workspace_only=False
         )
 
         result = os_manager.on_rename_file_request(request)
@@ -548,11 +519,11 @@ class TestRenameFileRequest:
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_rename_file_destination_exists(self, engine: Engine, temp_dir: Path) -> None:
+    def test_rename_file_destination_exists(self, engine: Engine, tmp_path: Path) -> None:
         """Test renaming when destination already exists."""
         os_manager = engine.os_manager
-        old_path = temp_dir / "old.txt"
-        new_path = temp_dir / "new.txt"
+        old_path = tmp_path / "old.txt"
+        new_path = tmp_path / "new.txt"
         old_path.write_text("Old content")
         new_path.write_text("New content")
 
@@ -562,11 +533,11 @@ class TestRenameFileRequest:
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_rename_file_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
+    def test_rename_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test permission denied when renaming."""
         os_manager = engine.os_manager
-        old_path = temp_dir / "old.txt"
-        new_path = temp_dir / "new.txt"
+        old_path = tmp_path / "old.txt"
+        new_path = tmp_path / "new.txt"
         old_path.write_text("Content")
 
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
@@ -581,29 +552,23 @@ class TestRenameFileRequest:
 class TestListDirectoryRequest:
     """Test ListDirectoryRequest with failure_reason support."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_list_directory_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully listing a directory with sequence grouping disabled."""
         os_manager = engine.os_manager
         # Create some test files
-        (temp_dir / "file1.txt").write_text("Content 1")
-        (temp_dir / "file2.txt").write_text("Content 2")
-        (temp_dir / "subdir").mkdir()
+        (tmp_path / "file1.txt").write_text("Content 1")
+        (tmp_path / "file2.txt").write_text("Content 2")
+        (tmp_path / "subdir").mkdir()
 
-        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False)
+        request = ListDirectoryRequest(directory_path=str(tmp_path), workspace_only=False)
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultSuccess)
@@ -612,7 +577,7 @@ class TestListDirectoryRequest:
         assert names == {"file1.txt", "file2.txt", "subdir"}
         assert result.sequences == []
 
-    def test_bounds_clip_entire_sequence_files_stay_in_entries(self, engine: Engine, temp_dir: Path) -> None:
+    def test_bounds_clip_entire_sequence_files_stay_in_entries(self, engine: Engine, tmp_path: Path) -> None:
         """Files fully clipped by start_number/end_number remain in entries.
 
         Regression: consumed_filenames must not be updated before the active-range
@@ -620,11 +585,11 @@ class TestListDirectoryRequest:
         though no Sequence is returned for them.
         """
         os_manager = engine.os_manager
-        (temp_dir / "render.0001.exr").write_text("f1")
-        (temp_dir / "render.0002.exr").write_text("f2")
+        (tmp_path / "render.0001.exr").write_text("f1")
+        (tmp_path / "render.0002.exr").write_text("f2")
 
         request = ListDirectoryRequest(
-            directory_path=str(temp_dir),
+            directory_path=str(tmp_path),
             workspace_only=False,
             group_sequences=True,
             sequence_options=SequenceScanOptions(start_number=100),
@@ -637,7 +602,7 @@ class TestListDirectoryRequest:
         assert "render.0001.exr" in entry_names
         assert "render.0002.exr" in entry_names
 
-    def test_bounds_partial_clip_out_of_range_files_stay_in_entries(self, engine: Engine, temp_dir: Path) -> None:
+    def test_bounds_partial_clip_out_of_range_files_stay_in_entries(self, engine: Engine, tmp_path: Path) -> None:
         """Files outside the active range remain in entries even when a Sequence is returned.
 
         Regression: consumed_filenames was populated from the full bare_names set
@@ -647,10 +612,10 @@ class TestListDirectoryRequest:
         """
         os_manager = engine.os_manager
         for i in range(1, 6):
-            (temp_dir / f"render.{i:04d}.exr").write_text(f"f{i}")
+            (tmp_path / f"render.{i:04d}.exr").write_text(f"f{i}")
 
         request = ListDirectoryRequest(
-            directory_path=str(temp_dir),
+            directory_path=str(tmp_path),
             workspace_only=False,
             group_sequences=True,
             sequence_options=SequenceScanOptions(start_number=2),
@@ -665,16 +630,16 @@ class TestListDirectoryRequest:
         # Frame 1 is outside the active range — it must not be consumed
         assert "render.0001.exr" in entry_names
 
-    def test_list_directory_groups_sequences(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_groups_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """Test that numbered files are grouped into Sequence objects by default."""
         os_manager = engine.os_manager
-        (temp_dir / "render.0001.exr").write_text("frame 1")
-        (temp_dir / "render.0002.exr").write_text("frame 2")
-        (temp_dir / "render.0003.exr").write_text("frame 3")
-        (temp_dir / "readme.txt").write_text("notes")
-        (temp_dir / "subdir").mkdir()
+        (tmp_path / "render.0001.exr").write_text("frame 1")
+        (tmp_path / "render.0002.exr").write_text("frame 2")
+        (tmp_path / "render.0003.exr").write_text("frame 3")
+        (tmp_path / "readme.txt").write_text("notes")
+        (tmp_path / "subdir").mkdir()
 
-        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False, group_sequences=True)
+        request = ListDirectoryRequest(directory_path=str(tmp_path), workspace_only=False, group_sequences=True)
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultSuccess)
@@ -689,13 +654,13 @@ class TestListDirectoryRequest:
         assert seq.first == 1
         assert seq.last == 3  # noqa: PLR2004
 
-    def test_single_sequence_file_stays_in_entries(self, engine: Engine, temp_dir: Path) -> None:
+    def test_single_sequence_file_stays_in_entries(self, engine: Engine, tmp_path: Path) -> None:
         """A lone file that looks like a sequence pattern must not be grouped into a Sequence."""
         os_manager = engine.os_manager
-        (temp_dir / "render.0001.exr").write_text("frame 1")
-        (temp_dir / "readme.txt").write_text("notes")
+        (tmp_path / "render.0001.exr").write_text("frame 1")
+        (tmp_path / "readme.txt").write_text("notes")
 
-        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False, group_sequences=True)
+        request = ListDirectoryRequest(directory_path=str(tmp_path), workspace_only=False, group_sequences=True)
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultSuccess)
@@ -704,14 +669,14 @@ class TestListDirectoryRequest:
         assert "render.0001.exr" in entry_names
         assert "readme.txt" in entry_names
 
-    def test_list_directory_hidden_files(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_hidden_files(self, engine: Engine, tmp_path: Path) -> None:
         """Test listing directory with hidden files."""
         os_manager = engine.os_manager
-        (temp_dir / "visible.txt").write_text("Content")
-        (temp_dir / ".hidden").write_text("Hidden")
+        (tmp_path / "visible.txt").write_text("Content")
+        (tmp_path / ".hidden").write_text("Hidden")
 
         # Without show_hidden
-        request = ListDirectoryRequest(directory_path=str(temp_dir), show_hidden=False, workspace_only=False)
+        request = ListDirectoryRequest(directory_path=str(tmp_path), show_hidden=False, workspace_only=False)
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultSuccess)
@@ -719,26 +684,26 @@ class TestListDirectoryRequest:
         assert result.entries[0].name == "visible.txt"
 
         # With show_hidden
-        request = ListDirectoryRequest(directory_path=str(temp_dir), show_hidden=True, workspace_only=False)
+        request = ListDirectoryRequest(directory_path=str(tmp_path), show_hidden=True, workspace_only=False)
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultSuccess)
         assert len(result.entries) == 2  # noqa: PLR2004
 
-    def test_list_directory_not_found(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_not_found(self, engine: Engine, tmp_path: Path) -> None:
         """Test listing non-existent directory."""
         os_manager = engine.os_manager
-        request = ListDirectoryRequest(directory_path=str(temp_dir / "nonexistent"), workspace_only=False)
+        request = ListDirectoryRequest(directory_path=str(tmp_path / "nonexistent"), workspace_only=False)
 
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_list_directory_not_a_directory(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_not_a_directory(self, engine: Engine, tmp_path: Path) -> None:
         """Test listing a file instead of directory."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "file.txt"
+        file_path = tmp_path / "file.txt"
         file_path.write_text("Content")
 
         request = ListDirectoryRequest(directory_path=str(file_path), workspace_only=False)
@@ -747,10 +712,10 @@ class TestListDirectoryRequest:
         assert isinstance(result, ListDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_list_directory_permission_denied(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test permission denied when listing directory."""
         os_manager = engine.os_manager
-        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False)
+        request = ListDirectoryRequest(directory_path=str(tmp_path), workspace_only=False)
 
         # Mock os.scandir() instead of Path.iterdir() since we now use os.scandir() for better performance
         # os.scandir() is used as a context manager, so we need to make it raise PermissionError when called
@@ -763,19 +728,19 @@ class TestListDirectoryRequest:
         assert isinstance(result, ListDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
-    def test_list_directory_symlink_to_file_preserves_symlink_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_symlink_to_file_preserves_symlink_path(self, engine: Engine, tmp_path: Path) -> None:
         """Symlink-to-file entries return the symlink path, not the resolved target."""
         os_manager = engine.os_manager
-        target_file = temp_dir / "target.txt"
+        target_file = tmp_path / "target.txt"
         target_file.write_text("content")
-        symlink_file = temp_dir / "link.txt"
+        symlink_file = tmp_path / "link.txt"
         try:
             symlink_file.symlink_to(target_file)
         except OSError:
             pytest.skip("Symlink creation not supported (e.g. Windows without Developer Mode)")
 
         request = ListDirectoryRequest(
-            directory_path=str(temp_dir),
+            directory_path=str(tmp_path),
             workspace_only=False,
             include_absolute_path=True,
         )
@@ -788,20 +753,20 @@ class TestListDirectoryRequest:
         assert symlink_path.resolve() == target_file.resolve()
         assert str(symlink_path) == str(symlink_file.absolute())
 
-    def test_list_directory_symlink_to_directory_preserves_symlink_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_list_directory_symlink_to_directory_preserves_symlink_path(self, engine: Engine, tmp_path: Path) -> None:
         """Symlink-to-directory entries return the symlink path, not the resolved target."""
         os_manager = engine.os_manager
-        target_dir = temp_dir / "target_dir"
+        target_dir = tmp_path / "target_dir"
         target_dir.mkdir()
         (target_dir / "nested.txt").write_text("nested")
-        symlink_dir = temp_dir / "link_dir"
+        symlink_dir = tmp_path / "link_dir"
         try:
             symlink_dir.symlink_to(target_dir)
         except OSError:
             pytest.skip("Symlink creation not supported (e.g. Windows without Developer Mode)")
 
         request = ListDirectoryRequest(
-            directory_path=str(temp_dir),
+            directory_path=str(tmp_path),
             workspace_only=False,
             include_absolute_path=True,
         )
@@ -818,27 +783,22 @@ class TestListDirectoryRequest:
 class TestListDirectorySequencesRequest:
     """Test ListDirectorySequencesRequest — sequences-only result."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_returns_only_sequences(self, engine: Engine, temp_dir: Path) -> None:
+    def test_returns_only_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """Non-sequence files are absent from the result; sequences are present."""
         os_manager = engine.os_manager
-        (temp_dir / "render.0001.exr").write_text("f1")
-        (temp_dir / "render.0002.exr").write_text("f2")
-        (temp_dir / "readme.txt").write_text("notes")
-        (temp_dir / "subdir").mkdir()
+        (tmp_path / "render.0001.exr").write_text("f1")
+        (tmp_path / "render.0002.exr").write_text("f2")
+        (tmp_path / "readme.txt").write_text("notes")
+        (tmp_path / "subdir").mkdir()
 
-        request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
+        request = ListDirectorySequencesRequest(directory_path=str(tmp_path), workspace_only=False)
         result = os_manager.on_list_directory_sequences_request(request)
 
         assert isinstance(result, ListDirectorySequencesResultSuccess)
@@ -847,27 +807,27 @@ class TestListDirectorySequencesRequest:
         assert seq.first == 1
         assert seq.last == 2  # noqa: PLR2004
 
-    def test_empty_directory_returns_success_with_no_sequences(self, engine: Engine, temp_dir: Path) -> None:
+    def test_empty_directory_returns_success_with_no_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """A directory with no sequences returns an empty success, not a failure."""
         os_manager = engine.os_manager
-        (temp_dir / "readme.txt").write_text("notes")
+        (tmp_path / "readme.txt").write_text("notes")
 
-        request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
+        request = ListDirectorySequencesRequest(directory_path=str(tmp_path), workspace_only=False)
         result = os_manager.on_list_directory_sequences_request(request)
 
         assert isinstance(result, ListDirectorySequencesResultSuccess)
         assert result.sequences == []
 
-    def test_padding_filter_excludes_mismatched_sequences(self, engine: Engine, temp_dir: Path) -> None:
+    def test_padding_filter_excludes_mismatched_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """sequence_options.padding=4 keeps only #### sequences; ### sequences are excluded."""
         os_manager = engine.os_manager
-        (temp_dir / "hi.0001.exr").write_text("f1")  # 4-digit
-        (temp_dir / "hi.0002.exr").write_text("f2")
-        (temp_dir / "lo.001.exr").write_text("f1")  # 3-digit
-        (temp_dir / "lo.002.exr").write_text("f2")
+        (tmp_path / "hi.0001.exr").write_text("f1")  # 4-digit
+        (tmp_path / "hi.0002.exr").write_text("f2")
+        (tmp_path / "lo.001.exr").write_text("f1")  # 3-digit
+        (tmp_path / "lo.002.exr").write_text("f2")
 
         request = ListDirectorySequencesRequest(
-            directory_path=str(temp_dir),
+            directory_path=str(tmp_path),
             workspace_only=False,
             sequence_options=SequenceScanOptions(padding=4),
         )
@@ -877,10 +837,10 @@ class TestListDirectorySequencesRequest:
         assert len(result.sequences) == 1
         assert result.sequences[0].padding == 4  # noqa: PLR2004
 
-    def test_delegates_failure_from_inner_request(self, engine: Engine, temp_dir: Path) -> None:
+    def test_delegates_failure_from_inner_request(self, engine: Engine, tmp_path: Path) -> None:
         """A bad directory path surfaces as a failure result."""
         os_manager = engine.os_manager
-        request = ListDirectorySequencesRequest(directory_path=str(temp_dir / "nonexistent"), workspace_only=False)
+        request = ListDirectorySequencesRequest(directory_path=str(tmp_path / "nonexistent"), workspace_only=False)
         from griptape_nodes.retained_mode.events.os_events import ListDirectorySequencesResultFailure
 
         result = os_manager.on_list_directory_sequences_request(request)
@@ -892,15 +852,10 @@ class TestListDirectorySequencesRequest:
 class TestDeduceSequencesFromFileListRequest:
     """Test DeduceSequencesFromFileListRequest — no-I/O sequence detection."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
@@ -912,10 +867,10 @@ class TestDeduceSequencesFromFileListRequest:
             paths.append(str(p))
         return paths
 
-    def test_detects_sequence_from_absolute_paths(self, engine: Engine, temp_dir: Path) -> None:
+    def test_detects_sequence_from_absolute_paths(self, engine: Engine, tmp_path: Path) -> None:
         """A list of absolute file paths is grouped into a Sequence."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 2, 3])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
         result = os_manager.on_deduce_sequences_from_file_list_request(request)
@@ -955,11 +910,11 @@ class TestDeduceSequencesFromFileListRequest:
         assert seq.directory == ""
         assert not any(e.path.startswith("./") for e in seq.entries)
 
-    def test_non_sequence_names_do_not_produce_sequences(self, engine: Engine, temp_dir: Path) -> None:
+    def test_non_sequence_names_do_not_produce_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """Plain names without numeric tokens produce no sequences (callers filter directories)."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "frame", "exr", [1, 2])
-        paths.append(str(temp_dir / "subdir"))  # bare name with no sequence token
+        paths = self._write_frames(tmp_path, "frame", "exr", [1, 2])
+        paths.append(str(tmp_path / "subdir"))  # bare name with no sequence token
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
         result = os_manager.on_deduce_sequences_from_file_list_request(request)
@@ -967,11 +922,11 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 1  # subdir produces no sequence
 
-    def test_files_from_multiple_directories(self, engine: Engine, temp_dir: Path) -> None:
+    def test_files_from_multiple_directories(self, engine: Engine, tmp_path: Path) -> None:
         """Files from different parent directories are grouped independently."""
         os_manager = engine.os_manager
-        dir_a = temp_dir / "a"
-        dir_b = temp_dir / "b"
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
         dir_a.mkdir()
         dir_b.mkdir()
         paths_a = self._write_frames(dir_a, "render", "exr", [1, 2])
@@ -983,10 +938,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert len(result.sequences) == 2  # noqa: PLR2004
 
-    def test_no_sequence_files_returns_empty_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_no_sequence_files_returns_empty_success(self, engine: Engine, tmp_path: Path) -> None:
         """Files with no sequence tokens return success with an empty sequences list."""
         os_manager = engine.os_manager
-        p = temp_dir / "readme.txt"
+        p = tmp_path / "readme.txt"
         p.write_text("notes")
 
         request = DeduceSequencesFromFileListRequest(file_paths=[str(p)])
@@ -995,11 +950,11 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_padding_filter(self, engine: Engine, temp_dir: Path) -> None:
+    def test_padding_filter(self, engine: Engine, tmp_path: Path) -> None:
         """sequence_options.padding filters to only matching zero-fill width."""
         os_manager = engine.os_manager
-        paths_4 = self._write_frames(temp_dir, "hi", "exr", [1, 2])  # 4-digit
-        paths_3 = [str(temp_dir / f"lo.{n:03d}.exr") for n in [1, 2]]
+        paths_4 = self._write_frames(tmp_path, "hi", "exr", [1, 2])  # 4-digit
+        paths_3 = [str(tmp_path / f"lo.{n:03d}.exr") for n in [1, 2]]
         for p in paths_3:
             Path(p).write_text("f")
 
@@ -1013,10 +968,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert len(result.sequences) == 1
         assert result.sequences[0].padding == 4  # noqa: PLR2004
 
-    def test_frame_bounds(self, engine: Engine, temp_dir: Path) -> None:
+    def test_frame_bounds(self, engine: Engine, tmp_path: Path) -> None:
         """start_number / end_number clip the active range."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3, 4, 5])
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 2, 3, 4, 5])
 
         request = DeduceSequencesFromFileListRequest(
             file_paths=paths,
@@ -1035,7 +990,7 @@ class TestDeduceSequencesFromFileListRequest:
         assert seq.last == 4  # noqa: PLR2004
         assert [e.number for e in seq.entries] == [2, 3, 4]
 
-    def test_bounds_clip_entire_sequence_files_stay_in_entries(self, engine: Engine, temp_dir: Path) -> None:
+    def test_bounds_clip_entire_sequence_files_stay_in_entries(self, engine: Engine, tmp_path: Path) -> None:
         """Files whose sequence is fully clipped by bounds are NOT removed from the result.
 
         Regression: consumed_filenames must not be updated before the active-range
@@ -1043,7 +998,7 @@ class TestDeduceSequencesFromFileListRequest:
         discovered_last) are silently consumed and callers lose them.
         """
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 2, 3])
 
         # Ask for frames 100+, which clips the entire on-disk range out.
         request = DeduceSequencesFromFileListRequest(
@@ -1055,10 +1010,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_invalid_bounds_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
+    def test_invalid_bounds_returns_failure(self, engine: Engine, tmp_path: Path) -> None:
         """A negative start_number surfaces as INVALID_BOUNDS failure."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 2, 3])
 
         request = DeduceSequencesFromFileListRequest(
             file_paths=paths,
@@ -1069,10 +1024,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultFailure)
         assert result.failure_reason == SequenceScanFailureReason.INVALID_BOUNDS
 
-    def test_abort_policy_with_single_gap_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
+    def test_abort_policy_with_single_gap_returns_failure(self, engine: Engine, tmp_path: Path) -> None:
         """ABORT policy with exactly one gap returns ABORTED_AT_GAP with a single-gap message."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 3])  # gap at 2
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 3])  # gap at 2
 
         request = DeduceSequencesFromFileListRequest(
             file_paths=paths,
@@ -1085,10 +1040,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "gap at item 2" in result.result_details.result_details[0].message
 
-    def test_abort_policy_with_multiple_gaps_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
+    def test_abort_policy_with_multiple_gaps_returns_failure(self, engine: Engine, tmp_path: Path) -> None:
         """ABORT policy with multiple gaps lists all gap positions in the message."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5])  # gaps at 2, 4
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 3, 5])  # gaps at 2, 4
 
         request = DeduceSequencesFromFileListRequest(
             file_paths=paths,
@@ -1101,11 +1056,11 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "2 gaps" in result.result_details.result_details[0].message
 
-    def test_abort_policy_with_many_gaps_truncates_preview(self, engine: Engine, temp_dir: Path) -> None:
+    def test_abort_policy_with_many_gaps_truncates_preview(self, engine: Engine, tmp_path: Path) -> None:
         """ABORT with more gaps than ABORTED_AT_GAP_PREVIEW_COUNT appends a '+ N more' suffix."""
         os_manager = engine.os_manager
         # 6 gaps: missing 2, 4, 6, 8, 10, 12 — exceeds the preview count of 5
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5, 7, 9, 11, 13])
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 3, 5, 7, 9, 11, 13])
 
         request = DeduceSequencesFromFileListRequest(
             file_paths=paths,
@@ -1134,10 +1089,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert "boom" in result.result_details.result_details[0].message
 
-    def test_single_frame_sequence_not_returned(self, engine: Engine, temp_dir: Path) -> None:
+    def test_single_frame_sequence_not_returned(self, engine: Engine, tmp_path: Path) -> None:
         """A sequence with only one present frame is not included in the result."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1])
+        paths = self._write_frames(tmp_path, "render", "exr", [1])
 
         request = DeduceSequencesFromFileListRequest(file_paths=paths)
         result = os_manager.on_deduce_sequences_from_file_list_request(request)
@@ -1145,10 +1100,10 @@ class TestDeduceSequencesFromFileListRequest:
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
 
-    def test_reject_no_token_behavior_skips_token_less_sequences(self, engine: Engine, temp_dir: Path) -> None:
+    def test_reject_no_token_behavior_skips_token_less_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """NoTokenBehavior.REJECT causes token-less files to be silently skipped."""
         os_manager = engine.os_manager
-        paths = self._write_frames(temp_dir, "render", "exr", [1, 2])
+        paths = self._write_frames(tmp_path, "render", "exr", [1, 2])
 
         request = DeduceSequencesFromFileListRequest(
             file_paths=paths,
@@ -1285,24 +1240,18 @@ class TestTryResolveWindowsSpecialFolder:
 class TestExpandPath:
     """Test OSManager._expand_path integration."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Set workspace to temp_dir for tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Set workspace to tmp_path for tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
     def test_expand_path_relative_anchored_on_workspace(
         self,
         engine: Engine,
-        temp_dir: Path,  # noqa: ARG002
+        tmp_path: Path,  # noqa: ARG002
     ) -> None:
         """A path that is still relative after expansion is anchored on the workspace directory."""
         os_manager = engine.os_manager
@@ -1310,18 +1259,18 @@ class TestExpandPath:
         expected = engine.config_manager.workspace_path / "subdir"
         assert result == expected
 
-    def test_expand_path_expands_vars_and_tilde(self, engine: Engine, temp_dir: Path) -> None:
+    def test_expand_path_expands_vars_and_tilde(self, engine: Engine, tmp_path: Path) -> None:
         """Expandvars and expanduser are applied when not a Windows special folder."""
         os_manager = engine.os_manager
         # Use a path that won't match Windows special folder logic on this platform
-        result = os_manager._expand_path(str(temp_dir))
-        assert result == temp_dir or result.resolve() == temp_dir.resolve()
+        result = os_manager._expand_path(str(tmp_path))
+        assert result == tmp_path or result.resolve() == tmp_path.resolve()
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific special folder test")
     def test_expand_path_windows_special_folder_mocked(
         self,
         engine: Engine,
-        temp_dir: Path,  # noqa: ARG002
+        tmp_path: Path,  # noqa: ARG002
     ) -> None:
         """On Windows, special folder is resolved via Shell API when path is ~/Downloads."""
         os_manager = engine.os_manager
@@ -1335,7 +1284,7 @@ class TestExpandPath:
     def test_expand_path_non_windows_uses_expanduser(
         self,
         engine: Engine,
-        temp_dir: Path,  # noqa: ARG002
+        tmp_path: Path,  # noqa: ARG002
     ) -> None:
         """On non-Windows, ~/path uses expanduser (no special folder logic)."""
         if platform.system() == "Windows":
@@ -1351,17 +1300,11 @@ class TestResolveFilePath:
 
     UNSET_VAR_NAME = "GRIPTAPE_UNSET_VAR_FOR_TEST"
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Set workspace to temp_dir for tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Set workspace to tmp_path for tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
@@ -1399,11 +1342,13 @@ class TestResolveFilePath:
         assert result == resolve_path_safely(Path.home() / "Downloads")
         assert not result.is_relative_to(workspace_path)
 
-    def test_absolute_path_not_anchored_on_workspace(self, engine: Engine, tmp_path: Path) -> None:
+    def test_absolute_path_not_anchored_on_workspace(
+        self, engine: Engine, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
         """An absolute path is returned unchanged rather than being joined onto the workspace."""
         os_manager = engine.os_manager
         workspace_path = engine.config_manager.workspace_path
-        absolute_path = resolve_path_safely(tmp_path / "elsewhere" / "file.txt")
+        absolute_path = resolve_path_safely(tmp_path_factory.mktemp("elsewhere") / "file.txt")
         result = os_manager._resolve_file_path(str(absolute_path))
         assert result == absolute_path
         assert not result.is_relative_to(workspace_path)
@@ -1412,36 +1357,30 @@ class TestResolveFilePath:
 class TestWindowsLongPathHandling:
     r"""Test Windows long path handling with \\?\ prefix."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
-    def long_path(self, temp_dir: Path) -> Path:
+    def long_path(self, tmp_path: Path) -> Path:
         """Create a path longer than 260 characters."""
         # Create a path component that when repeated will exceed 260 chars
         long_component = "a" * 50
-        path_parts = [temp_dir] + [long_component] * 6  # Will exceed 260 chars
+        path_parts = [tmp_path] + [long_component] * 6  # Will exceed 260 chars
         return Path(*path_parts)
 
-    def test_normalize_path_short_path(self, engine: Engine, temp_dir: Path) -> None:  # noqa: ARG002
+    def test_normalize_path_short_path(self, engine: Engine, tmp_path: Path) -> None:  # noqa: ARG002
         r"""Short paths get the \\?\ prefix on Windows, none elsewhere.
 
         The prefix is applied unconditionally on Windows (not gated on length):
         prefixing a short root is what lets a recursive copy carry the prefix
         down to deep leaf paths that individually exceed MAX_PATH.
         """
-        short_path = temp_dir / "short.txt"
+        short_path = tmp_path / "short.txt"
         result = normalize_path_for_platform(short_path)
 
         if platform.system() == "Windows":
@@ -1466,11 +1405,11 @@ class TestWindowsLongPathHandling:
         # On non-Windows, no prefix should be added
         assert not result.startswith("\\\\?\\")
 
-    def test_write_file_with_long_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_write_file_with_long_path(self, engine: Engine, tmp_path: Path) -> None:
         """Test writing file with long path works correctly."""
         os_manager = engine.os_manager
         # Create a moderately long path (not exceeding OS limits)
-        subdir = temp_dir / ("a" * 30) / ("b" * 30) / ("c" * 30)
+        subdir = tmp_path / ("a" * 30) / ("b" * 30) / ("c" * 30)
         file_path = subdir / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
@@ -1486,25 +1425,19 @@ class TestWindowsLongPathHandling:
 class TestDeleteFileRequest:
     """Test DeleteFileRequest with various scenarios."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
     @pytest.mark.asyncio
-    async def test_delete_file_success(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully deleting a file."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
         request = DeleteFileRequest(path=str(file_path), workspace_only=False)
 
@@ -1519,10 +1452,10 @@ class TestDeleteFileRequest:
         assert not file_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_empty_directory(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_empty_directory(self, engine: Engine, tmp_path: Path) -> None:
         """Test deleting an empty directory."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         request = DeleteFileRequest(path=str(dir_path), workspace_only=False)
 
@@ -1535,10 +1468,10 @@ class TestDeleteFileRequest:
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_directory_with_contents(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_directory_with_contents(self, engine: Engine, tmp_path: Path) -> None:
         """Test deleting a directory with contents."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
         (dir_path / "file2.txt").write_text("content2")
@@ -1562,11 +1495,11 @@ class TestDeleteFileRequest:
 
     @pytest.mark.asyncio
     async def test_delete_directory_without_collect_returns_only_top_level(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test that deleting a directory without collect_deleted_paths returns only the top-level path."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
         subdir = dir_path / "subdir"
@@ -1583,10 +1516,10 @@ class TestDeleteFileRequest:
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_nonexistent_file_fails(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_nonexistent_file_fails(self, engine: Engine, tmp_path: Path) -> None:
         """Test that deleting a nonexistent file fails."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "nonexistent.txt"
+        file_path = tmp_path / "nonexistent.txt"
         request = DeleteFileRequest(path=str(file_path), workspace_only=False)
 
         result = await os_manager.on_delete_file_request(request)
@@ -1606,10 +1539,10 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
     @pytest.mark.asyncio
-    async def test_delete_with_permission_error(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_with_permission_error(self, engine: Engine, tmp_path: Path) -> None:
         """Test that permission errors are properly handled."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
         with patch.object(anyio.Path, "unlink", AsyncMock(side_effect=PermissionError("Access denied"))):
@@ -1624,10 +1557,10 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_permanently_delete(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_file_behavior_permanently_delete(self, engine: Engine, tmp_path: Path) -> None:
         """Test default PERMANENTLY_DELETE behavior for files."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
         request = DeleteFileRequest(
             path=str(file_path),
@@ -1642,10 +1575,10 @@ class TestDeleteFileRequest:
         assert not file_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_directory_behavior_permanently_delete(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_directory_behavior_permanently_delete(self, engine: Engine, tmp_path: Path) -> None:
         """Test default PERMANENTLY_DELETE behavior for directories."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
         request = DeleteFileRequest(
@@ -1662,10 +1595,10 @@ class TestDeleteFileRequest:
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_recycle_bin_only_success(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_file_behavior_recycle_bin_only_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior successfully sends file to recycle bin."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
         with patch("griptape_nodes.retained_mode.managers.os_manager.send2trash") as mock_send2trash:
@@ -1684,10 +1617,10 @@ class TestDeleteFileRequest:
         mock_send2trash.send2trash.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_directory_behavior_recycle_bin_only_success(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_directory_behavior_recycle_bin_only_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior successfully sends directory to recycle bin."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
 
@@ -1708,10 +1641,10 @@ class TestDeleteFileRequest:
         mock_send2trash.send2trash.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_recycle_bin_only_failure(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_file_behavior_recycle_bin_only_failure(self, engine: Engine, tmp_path: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior returns failure when recycle bin unavailable."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
         with patch("griptape_nodes.retained_mode.managers.os_manager.send2trash") as mock_send2trash:
@@ -1729,10 +1662,10 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
 
     @pytest.mark.asyncio
-    async def test_delete_directory_behavior_recycle_bin_only_failure(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_directory_behavior_recycle_bin_only_failure(self, engine: Engine, tmp_path: Path) -> None:
         """Test RECYCLE_BIN_ONLY behavior returns failure for directories when I/O error occurs."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
 
@@ -1751,10 +1684,10 @@ class TestDeleteFileRequest:
         assert result.failure_reason == FileIOFailureReason.IO_ERROR
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_prefer_recycle_bin_uses_trash(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_file_behavior_prefer_recycle_bin_uses_trash(self, engine: Engine, tmp_path: Path) -> None:
         """Test PREFER_RECYCLE_BIN behavior uses recycle bin when available."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
         with patch("griptape_nodes.retained_mode.managers.os_manager.send2trash") as mock_send2trash:
@@ -1774,11 +1707,11 @@ class TestDeleteFileRequest:
 
     @pytest.mark.asyncio
     async def test_delete_directory_behavior_prefer_recycle_bin_uses_trash(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test PREFER_RECYCLE_BIN behavior uses recycle bin for directories when available."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
 
@@ -1799,10 +1732,10 @@ class TestDeleteFileRequest:
         mock_send2trash.send2trash.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_file_behavior_prefer_recycle_bin_falls_back(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_file_behavior_prefer_recycle_bin_falls_back(self, engine: Engine, tmp_path: Path) -> None:
         """Test PREFER_RECYCLE_BIN behavior falls back to permanent deletion when trash fails."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
         with patch("griptape_nodes.retained_mode.managers.os_manager.send2trash") as mock_send2trash:
@@ -1824,11 +1757,11 @@ class TestDeleteFileRequest:
 
     @pytest.mark.asyncio
     async def test_delete_directory_behavior_prefer_recycle_bin_falls_back(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test PREFER_RECYCLE_BIN behavior falls back to permanent deletion for directories when trash fails."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         (dir_path / "file1.txt").write_text("content1")
 
@@ -1851,10 +1784,10 @@ class TestDeleteFileRequest:
         assert isinstance(result.result_details, ResultDetails)
 
     @pytest.mark.asyncio
-    async def test_delete_outcome_default_is_sent_to_recycle_bin(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_delete_outcome_default_is_sent_to_recycle_bin(self, engine: Engine, tmp_path: Path) -> None:
         """Test that default deletion (no behavior specified) reports SENT_TO_RECYCLE_BIN outcome."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
         request = DeleteFileRequest(path=str(file_path), workspace_only=False)
 
@@ -1867,24 +1800,18 @@ class TestDeleteFileRequest:
 class TestGetFileInfoRequest:
     """Test GetFileInfoRequest with various scenarios."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_get_file_info_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_get_file_info_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully getting file info."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
         request = GetFileInfoRequest(path=str(file_path), workspace_only=False)
 
@@ -1897,10 +1824,10 @@ class TestGetFileInfoRequest:
         assert result.file_entry.size > 0
         assert result.file_entry.mime_type is not None
 
-    def test_get_directory_info_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_get_directory_info_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully getting directory info."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "testdir"
+        dir_path = tmp_path / "testdir"
         dir_path.mkdir()
         request = GetFileInfoRequest(path=str(dir_path), workspace_only=False)
 
@@ -1912,10 +1839,10 @@ class TestGetFileInfoRequest:
         assert result.file_entry.name == "testdir"
         assert result.file_entry.mime_type is None
 
-    def test_get_file_info_nonexistent_returns_none(self, engine: Engine, temp_dir: Path) -> None:
+    def test_get_file_info_nonexistent_returns_none(self, engine: Engine, tmp_path: Path) -> None:
         """Test that getting info for nonexistent path returns success with file_entry=None."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "nonexistent.txt"
+        file_path = tmp_path / "nonexistent.txt"
         request = GetFileInfoRequest(path=str(file_path), workspace_only=False)
 
         result = os_manager.on_get_file_info_request(request)
@@ -1952,24 +1879,18 @@ class TestFileIOFailureReasons:
 class TestCreateNewFilePolicy:
     """Test CREATE_NEW file policy with auto-incrementing filenames."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_first_file(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_first_file(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW policy creates file with requested name if available."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         request = WriteFileRequest(
             file_path=str(file_path),
             content="First file",
@@ -1980,14 +1901,14 @@ class TestCreateNewFilePolicy:
 
         assert isinstance(result, WriteFileResultSuccess)
         # First file should use requested name (test.txt) since it's available
-        expected_path = temp_dir / "test.txt"
+        expected_path = tmp_path / "test.txt"
         assert Path(result.final_file_path).resolve() == expected_path.resolve()
         assert expected_path.read_text() == "First file"
 
-    def test_create_new_increments_suffix(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_increments_suffix(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW policy increments suffix for subsequent files."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "output.txt"
+        file_path = tmp_path / "output.txt"
 
         # Create first file (gets output.txt since it's available)
         request1 = WriteFileRequest(
@@ -1997,7 +1918,7 @@ class TestCreateNewFilePolicy:
         )
         result1 = os_manager.engine.handle_request(request1)
         assert isinstance(result1, WriteFileResultSuccess)
-        assert (temp_dir / "output.txt").exists()
+        assert (tmp_path / "output.txt").exists()
 
         # Create second file (gets output_1.txt since output.txt now exists)
         request2 = WriteFileRequest(
@@ -2007,7 +1928,7 @@ class TestCreateNewFilePolicy:
         )
         result2 = os_manager.engine.handle_request(request2)
         assert isinstance(result2, WriteFileResultSuccess)
-        assert (temp_dir / "output_1.txt").exists()
+        assert (tmp_path / "output_1.txt").exists()
 
         # Create third file (gets output_2.txt)
         request3 = WriteFileRequest(
@@ -2017,17 +1938,17 @@ class TestCreateNewFilePolicy:
         )
         result3 = os_manager.engine.handle_request(request3)
         assert isinstance(result3, WriteFileResultSuccess)
-        assert (temp_dir / "output_2.txt").exists()
+        assert (tmp_path / "output_2.txt").exists()
 
-    def test_create_new_fills_gaps(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_fills_gaps(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW policy fills gaps in sequence."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "render.png"
+        file_path = tmp_path / "render.png"
 
         # Create render.png and files with gaps manually
-        (temp_dir / "render.png").write_text("Original")
-        (temp_dir / "render_1.png").write_text("File 1")
-        (temp_dir / "render_5.png").write_text("File 5")
+        (tmp_path / "render.png").write_text("Original")
+        (tmp_path / "render_1.png").write_text("File 1")
+        (tmp_path / "render_5.png").write_text("File 5")
 
         # CREATE_NEW should fill gap at _2
         request = WriteFileRequest(
@@ -2037,11 +1958,11 @@ class TestCreateNewFilePolicy:
         )
         result = os_manager.engine.handle_request(request)
         assert isinstance(result, WriteFileResultSuccess)
-        expected_path = temp_dir / "render_2.png"
+        expected_path = tmp_path / "render_2.png"
         assert Path(result.final_file_path).resolve() == expected_path.resolve()
 
     def test_create_new_with_fully_resolved_macro_should_use_suffix_injection(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test CREATE_NEW policy with fully-resolved MacroPath falls back to suffix injection.
 
@@ -2055,12 +1976,12 @@ class TestCreateNewFilePolicy:
         os_manager = engine.os_manager
 
         # Create first file manually
-        first_file = temp_dir / "render.png"
+        first_file = tmp_path / "render.png"
         first_file.write_text("Original")
 
         # Use MacroPath with all variables resolved (no index variable)
         macro_path = MacroPath(
-            parsed_macro=ParsedMacro(f"{temp_dir}/render.png"),
+            parsed_macro=ParsedMacro(f"{tmp_path}/render.png"),
             variables={},  # No variables to resolve
         )
 
@@ -2076,7 +1997,7 @@ class TestCreateNewFilePolicy:
         # EXPECTED: Should succeed and create render_1.png
         # ACTUAL: Currently fails with WriteFileResultFailure
         assert isinstance(result, WriteFileResultSuccess)
-        expected_path = temp_dir / "render_1.png"
+        expected_path = tmp_path / "render_1.png"
         assert Path(result.final_file_path).resolve() == expected_path.resolve()
         assert expected_path.read_text() == "Second file"
 
@@ -2090,30 +2011,25 @@ class TestDiskSpaceProbe:
     so the reported numbers reflect the mount the write will land on.
     """
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    def test_check_available_disk_space_nonexistent_target_probes_ancestor(self, temp_dir: Path) -> None:
+    def test_check_available_disk_space_nonexistent_target_probes_ancestor(self, tmp_path: Path) -> None:
         """A yet-to-be-created target resolves to an existing ancestor rather than raising."""
-        nonexistent_target = temp_dir / "not_yet" / "deeper" / "file.bin"
+        nonexistent_target = tmp_path / "not_yet" / "deeper" / "file.bin"
 
         # required_gb=0 means any amount of free space satisfies; the point of
         # this test is that the call returns True rather than False-on-OSError.
         assert OSManager.check_available_disk_space(nonexistent_target, required_gb=0) is True
 
-    def test_check_available_disk_space_returns_false_when_insufficient(self, temp_dir: Path) -> None:
+    def test_check_available_disk_space_returns_false_when_insufficient(self, tmp_path: Path) -> None:
         """Probing succeeds; a wildly oversized requirement still returns False."""
-        nonexistent_target = temp_dir / "not_yet" / "file.bin"
+        nonexistent_target = tmp_path / "not_yet" / "file.bin"
 
         # Require more space than any realistic filesystem has, so the probe
         # succeeds but the free-space check fails.
         assert OSManager.check_available_disk_space(nonexistent_target, required_gb=10**9) is False
 
-    def test_format_disk_space_error_nonexistent_target_probes_ancestor(self, temp_dir: Path) -> None:
+    def test_format_disk_space_error_nonexistent_target_probes_ancestor(self, tmp_path: Path) -> None:
         """Error formatter must report numbers rather than the manual-check fallback."""
-        nonexistent_target = temp_dir / "not_yet" / "deeper" / "file.bin"
+        nonexistent_target = tmp_path / "not_yet" / "deeper" / "file.bin"
 
         message = OSManager.format_disk_space_error(nonexistent_target)
 
@@ -2126,68 +2042,63 @@ class TestDiskSpaceProbe:
 class TestGetDirectorySizeGb:
     """_get_directory_size_gb totals every file in the directory tree."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    def test_nested_tree_totals_every_level(self, temp_dir: Path) -> None:
+    def test_nested_tree_totals_every_level(self, tmp_path: Path) -> None:
         """Files at the root and in subdirectories all count toward the total."""
         # Distinct sizes per level, so a dropped level changes the total rather
         # than cancelling out against another file's bytes.
-        (temp_dir / "root.bin").write_bytes(b"x" * 100)
-        nested = temp_dir / "sub"
+        (tmp_path / "root.bin").write_bytes(b"x" * 100)
+        nested = tmp_path / "sub"
         nested.mkdir()
         (nested / "nested.bin").write_bytes(b"x" * 2000)
         deeper = nested / "deeper"
         deeper.mkdir()
         (deeper / "deeper.bin").write_bytes(b"x" * 30000)
 
-        size_gb = OSManager._get_directory_size_gb(temp_dir)
+        size_gb = OSManager._get_directory_size_gb(tmp_path)
 
         # Byte sums over a power-of-two divisor are exact in float64, so this
         # compares equal without an approx tolerance.
         assert size_gb == (100 + 2000 + 30000) / (1024**3)
 
-    def test_same_filename_at_two_levels_counts_both(self, temp_dir: Path) -> None:
+    def test_same_filename_at_two_levels_counts_both(self, tmp_path: Path) -> None:
         """A nested file sharing a root file's name is counted as itself, not the root file."""
-        (temp_dir / "same.bin").write_bytes(b"x" * 100)
-        nested = temp_dir / "sub"
+        (tmp_path / "same.bin").write_bytes(b"x" * 100)
+        nested = tmp_path / "sub"
         nested.mkdir()
         (nested / "same.bin").write_bytes(b"x" * 5000)
 
-        size_gb = OSManager._get_directory_size_gb(temp_dir)
+        size_gb = OSManager._get_directory_size_gb(tmp_path)
 
         # Double-counting the root file would yield 200 bytes, not 5100.
         assert size_gb == (100 + 5000) / (1024**3)
 
-    def test_flat_directory_totals_its_files(self, temp_dir: Path) -> None:
+    def test_flat_directory_totals_its_files(self, tmp_path: Path) -> None:
         """Files in a flat directory are totalled."""
-        (temp_dir / "a.bin").write_bytes(b"x" * 1000)
-        (temp_dir / "b.bin").write_bytes(b"x" * 2000)
+        (tmp_path / "a.bin").write_bytes(b"x" * 1000)
+        (tmp_path / "b.bin").write_bytes(b"x" * 2000)
 
-        size_gb = OSManager._get_directory_size_gb(temp_dir)
+        size_gb = OSManager._get_directory_size_gb(tmp_path)
 
         assert size_gb == 3000 / (1024**3)
 
-    def test_empty_directory_is_zero(self, temp_dir: Path) -> None:
+    def test_empty_directory_is_zero(self, tmp_path: Path) -> None:
         """An existing but empty directory totals nothing."""
-        assert OSManager._get_directory_size_gb(temp_dir) == 0.0
+        assert OSManager._get_directory_size_gb(tmp_path) == 0.0
 
-    def test_missing_directory_is_zero(self, temp_dir: Path) -> None:
+    def test_missing_directory_is_zero(self, tmp_path: Path) -> None:
         """A path that does not exist returns 0.0 rather than raising."""
-        assert OSManager._get_directory_size_gb(temp_dir / "not_here") == 0.0
+        assert OSManager._get_directory_size_gb(tmp_path / "not_here") == 0.0
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
-    def test_symlinked_files_are_excluded(self, temp_dir: Path) -> None:
+    def test_symlinked_files_are_excluded(self, tmp_path: Path) -> None:
         """Symlinks are skipped so their target's bytes are not counted twice."""
-        real = temp_dir / "real.bin"
+        real = tmp_path / "real.bin"
         real.write_bytes(b"x" * 4096)
-        nested = temp_dir / "sub"
+        nested = tmp_path / "sub"
         nested.mkdir()
         (nested / "link.bin").symlink_to(real)
 
-        size_gb = OSManager._get_directory_size_gb(temp_dir)
+        size_gb = OSManager._get_directory_size_gb(tmp_path)
 
         # Only the real file counts; the symlink in the subdirectory does not.
         assert size_gb == 4096 / (1024**3)
@@ -2196,22 +2107,17 @@ class TestGetDirectorySizeGb:
 class TestGetNextUnusedFilenameRequest:
     """Test GetNextUnusedFilenameRequest preview behavior."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_base_filename_available_returns_unindexed_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_base_filename_available_returns_unindexed_path(self, engine: Engine, tmp_path: Path) -> None:
         """When the base filename is free, preview returns that path and no index."""
         os_manager = engine.os_manager
-        requested_path = temp_dir / "render.png"
+        requested_path = tmp_path / "render.png"
 
         result = os_manager.on_get_next_unused_filename_request(
             GetNextUnusedFilenameRequest(file_path=str(requested_path))
@@ -2222,23 +2128,23 @@ class TestGetNextUnusedFilenameRequest:
         assert result.index_used is None
         assert not requested_path.exists()
 
-    def test_existing_base_filename_returns_indexed_candidate(self, engine: Engine, temp_dir: Path) -> None:
+    def test_existing_base_filename_returns_indexed_candidate(self, engine: Engine, tmp_path: Path) -> None:
         """When base exists, preview switches to indexed naming."""
         os_manager = engine.os_manager
-        (temp_dir / "render.png").write_text("base")
+        (tmp_path / "render.png").write_text("base")
 
         result = os_manager.on_get_next_unused_filename_request(
-            GetNextUnusedFilenameRequest(file_path=str(temp_dir / "render.png"))
+            GetNextUnusedFilenameRequest(file_path=str(tmp_path / "render.png"))
         )
 
         assert isinstance(result, GetNextUnusedFilenameResultSuccess)
         assert result.index_used == 1
-        assert Path(result.available_filename).resolve() == (temp_dir / "render_1.png").resolve()
+        assert Path(result.available_filename).resolve() == (tmp_path / "render_1.png").resolve()
 
-    def test_macro_without_unresolved_index_fails(self, engine: Engine, temp_dir: Path) -> None:
+    def test_macro_without_unresolved_index_fails(self, engine: Engine, tmp_path: Path) -> None:
         """Macro path without an unresolved index variable cannot be auto-incremented."""
         os_manager = engine.os_manager
-        macro_path = MacroPath(parsed_macro=ParsedMacro(f"{temp_dir}/render.png"), variables={})
+        macro_path = MacroPath(parsed_macro=ParsedMacro(f"{tmp_path}/render.png"), variables={})
 
         result = os_manager.on_get_next_unused_filename_request(GetNextUnusedFilenameRequest(file_path=macro_path))
 
@@ -2275,26 +2181,21 @@ class TestGetNextUnusedFilenameRequest:
 class TestGetNextVersionIndexRequest:
     """Test GetNextVersionIndexRequest index-preview behavior."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_required_index_returns_one_when_no_matches(self, engine: Engine, temp_dir: Path) -> None:
+    def test_required_index_returns_one_when_no_matches(self, engine: Engine, tmp_path: Path) -> None:
         """Required index templates start at index 1 when nothing exists yet."""
         os_manager = engine.os_manager
 
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
                 parsed_macro=ParsedMacro("{outputs}/render_v{_index:03}"),
-                variables={"outputs": str(temp_dir)},
+                variables={"outputs": str(tmp_path)},
             )
         )
         result = os_manager.on_get_next_version_index_request(request)
@@ -2302,14 +2203,14 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultSuccess)
         assert result.index == 1
 
-    def test_optional_index_is_rejected_as_invalid_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_optional_index_is_rejected_as_invalid_path(self, engine: Engine, tmp_path: Path) -> None:
         """Optional index templates currently fail because no required unresolved index exists."""
         os_manager = engine.os_manager
 
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
                 parsed_macro=ParsedMacro("{outputs}/render{_index?:_}.png"),
-                variables={"outputs": str(temp_dir)},
+                variables={"outputs": str(tmp_path)},
             )
         )
         result = os_manager.on_get_next_version_index_request(request)
@@ -2317,13 +2218,13 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_missing_unresolved_index_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
+    def test_missing_unresolved_index_returns_failure(self, engine: Engine, tmp_path: Path) -> None:
         """Requests without an unresolved {_index} variable should fail as invalid path input."""
         os_manager = engine.os_manager
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
                 parsed_macro=ParsedMacro("{outputs}/render.png"),
-                variables={"outputs": str(temp_dir)},
+                variables={"outputs": str(tmp_path)},
             )
         )
 
@@ -2332,7 +2233,7 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_sequence_slot_scan_skips_non_numeric_siblings(self, engine: Engine, temp_dir: Path) -> None:
+    def test_sequence_slot_scan_skips_non_numeric_siblings(self, engine: Engine, tmp_path: Path) -> None:
         """Regression: scanning a `{###}` macro with a non-numeric sibling must not crash.
 
         `SequenceFormat` slots use a permissive `*` glob, so `render_vfinal.png`
@@ -2342,15 +2243,15 @@ class TestGetNextVersionIndexRequest:
         The scan now catches that error and treats non-parseable matches as
         non-matches, so the numeric siblings still drive the next-index result.
         """
-        (temp_dir / "render_v001.png").touch()
-        (temp_dir / "render_v002.png").touch()
-        (temp_dir / "render_vfinal.png").touch()  # non-numeric sibling — the crash trigger
+        (tmp_path / "render_v001.png").touch()
+        (tmp_path / "render_v002.png").touch()
+        (tmp_path / "render_vfinal.png").touch()  # non-numeric sibling — the crash trigger
 
         os_manager = engine.os_manager
         request = GetNextVersionIndexRequest(
             macro_path=MacroPath(
                 parsed_macro=ParsedMacro("{outputs}/render_v{###}.png"),
-                variables={"outputs": str(temp_dir)},
+                variables={"outputs": str(tmp_path)},
             )
         )
         result = os_manager.on_get_next_version_index_request(request)
@@ -2358,14 +2259,14 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultSuccess)
         assert result.index == 3  # noqa: PLR2004
 
-    def test_project_directory_left_for_the_project_to_resolve(self, engine: Engine, temp_dir: Path) -> None:
+    def test_project_directory_left_for_the_project_to_resolve(self, engine: Engine, tmp_path: Path) -> None:
         """Regression: `{outputs}` supplied by the project, not the caller, must not count as a second slot.
 
         DirectoryDestination and build_versioned_sequence_destination pass project macros
         without binding `{outputs}`. The scan used to see `outputs` and `_index` both
         unresolved and fail with "requires at most one unresolved variable".
         """
-        outputs_dir = temp_dir / "outputs"
+        outputs_dir = tmp_path / "outputs"
         (outputs_dir / "renders_v001").mkdir(parents=True)
         (outputs_dir / "renders_v002").mkdir()
 
@@ -2383,22 +2284,17 @@ class TestGetNextVersionIndexRequest:
 class TestMakeDirectoryRequest:
     """Test MakeDirectoryRequest handler."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_directory_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_directory_success(self, engine: Engine, tmp_path: Path) -> None:
         """Creating a directory that does not yet exist returns success with already_existed=False."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "new_dir"
+        dir_path = tmp_path / "new_dir"
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path)))
 
@@ -2407,10 +2303,10 @@ class TestMakeDirectoryRequest:
         assert not result.already_existed
         assert Path(result.created_path).resolve() == dir_path.resolve()
 
-    def test_directory_already_exists_exist_ok_true(self, engine: Engine, temp_dir: Path) -> None:
+    def test_directory_already_exists_exist_ok_true(self, engine: Engine, tmp_path: Path) -> None:
         """When the directory already exists and exist_ok=True, returns success with already_existed=True."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "existing_dir"
+        dir_path = tmp_path / "existing_dir"
         dir_path.mkdir()
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), exist_ok=True))
@@ -2418,10 +2314,10 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultSuccess)
         assert result.already_existed
 
-    def test_directory_already_exists_exist_ok_false(self, engine: Engine, temp_dir: Path) -> None:
+    def test_directory_already_exists_exist_ok_false(self, engine: Engine, tmp_path: Path) -> None:
         """When the directory already exists and exist_ok=False, returns POLICY_NO_OVERWRITE failure."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "existing_dir"
+        dir_path = tmp_path / "existing_dir"
         dir_path.mkdir()
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), exist_ok=False))
@@ -2429,10 +2325,10 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
 
-    def test_file_at_path_returns_invalid_path(self, engine: Engine, temp_dir: Path) -> None:
+    def test_file_at_path_returns_invalid_path(self, engine: Engine, tmp_path: Path) -> None:
         """When a file already exists at the requested path, returns INVALID_PATH failure."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "not_a_dir.txt"
+        file_path = tmp_path / "not_a_dir.txt"
         file_path.write_text("content")
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(file_path)))
@@ -2440,40 +2336,40 @@ class TestMakeDirectoryRequest:
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_create_parents_true(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_parents_true(self, engine: Engine, tmp_path: Path) -> None:
         """With create_parents=True, missing intermediate directories are created."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "a" / "b" / "c"
+        dir_path = tmp_path / "a" / "b" / "c"
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), create_parents=True))
 
         assert isinstance(result, MakeDirectoryResultSuccess)
         assert dir_path.is_dir()
 
-    def test_create_parents_false_missing_parent(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_parents_false_missing_parent(self, engine: Engine, tmp_path: Path) -> None:
         """With create_parents=False and a missing parent, returns POLICY_NO_CREATE_PARENT_DIRS failure."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "missing_parent" / "child"
+        dir_path = tmp_path / "missing_parent" / "child"
 
         result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), create_parents=False))
 
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
-    def test_invalid_path_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
+    def test_invalid_path_returns_failure(self, engine: Engine, tmp_path: Path) -> None:
         """A path that cannot be resolved returns INVALID_PATH before any filesystem operation."""
         os_manager = engine.os_manager
 
         with patch.object(OSManager, "_resolve_file_path", side_effect=ValueError("bad path")):
-            result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(temp_dir / "any")))
+            result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(tmp_path / "any")))
 
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_permission_denied_returns_failure(self, engine: Engine, temp_dir: Path) -> None:
+    def test_permission_denied_returns_failure(self, engine: Engine, tmp_path: Path) -> None:
         """A PermissionError from mkdir is surfaced as a PERMISSION_DENIED failure."""
         os_manager = engine.os_manager
-        dir_path = temp_dir / "protected_dir"
+        dir_path = tmp_path / "protected_dir"
 
         with patch.object(Path, "mkdir", side_effect=PermissionError("Permission denied")):
             result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path)))
@@ -2485,17 +2381,11 @@ class TestMakeDirectoryRequest:
 class TestCopyFile:
     """Tests for OSManager._copy_file, covering the SMB EPERM regression (issue #5109)."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    def test_copy_file_copies_contents(self, engine: Engine, temp_dir: Path) -> None:
+    def test_copy_file_copies_contents(self, engine: Engine, tmp_path: Path) -> None:
         """A basic copy replicates contents and returns the byte count."""
         os_manager = engine.os_manager
-        src = temp_dir / "src.txt"
-        dst = temp_dir / "dst.txt"
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
         content = "hello, world"
         src.write_text(content)
 
@@ -2504,7 +2394,7 @@ class TestCopyFile:
         assert dst.read_text() == content
         assert bytes_copied == len(content.encode())
 
-    def test_copy_file_ignores_eperm_from_metadata(self, engine: Engine, temp_dir: Path) -> None:
+    def test_copy_file_ignores_eperm_from_metadata(self, engine: Engine, tmp_path: Path) -> None:
         """An EPERM from the metadata step (e.g. chflags SF_ARCHIVED on an SMB mount) must not fail the copy.
 
         Regression test for issue #5109: shutil.copy2 propagates the EPERM that chflags raises when
@@ -2512,8 +2402,8 @@ class TestCopyFile:
         _copy_file copies contents first and then best-effort the metadata, swallowing the EPERM.
         """
         os_manager = engine.os_manager
-        src = temp_dir / "src.txt"
-        dst = temp_dir / "dst.txt"
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
         content = "contents survive metadata failure"
         src.write_text(content)
 
@@ -2556,11 +2446,10 @@ class TestLaunchExternalViewerRequest:
     _POPEN = "griptape_nodes.retained_mode.managers.os_manager.subprocess.Popen"
 
     @pytest.fixture
-    def image_file(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "render.exr"
-            path.write_bytes(b"exr")
-            yield path
+    def image_file(self, tmp_path: Path) -> Path:
+        path = tmp_path / "render.exr"
+        path.write_bytes(b"exr")
+        return path
 
     @pytest.fixture
     def set_viewer(self, engine: Engine) -> Generator[MagicMock, None, None]:

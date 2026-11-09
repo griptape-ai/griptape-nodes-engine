@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.107.0"
+version = "0.108.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.16"
@@ -45,24 +45,8 @@ dependencies = [
   "cattrs>=26.1.0",
   "attrs>=25.4.0",
   "fileseq>=3.2.0",
-  # Floor at 2.29.0: that release ("Support FastMCP 4 and MCP SDK v2 in `MCPToolset` alongside
-  # FastMCP 3", pydantic/pydantic-ai#6738) is the first where the `[mcp]` extra's `fastmcp-slim`
-  # floor supports the mcp 2.x module layout our own `mcp>=2.0,<3` pin (above) resolves to.
-  # Below this, `pydantic_ai/mcp.py` imports symbols (e.g. `mcp.shared.context.RequestContext`)
-  # that mcp 2.x moved/renamed, so `agent_manager` fails to import at construction time.
-  # PR #5449 raised the `mcp` ceiling without checking this; PR #5493 papered over the fallout
-  # for pydantic-ai-skills but left this one. Lift no lower than this floor.
-  "pydantic-ai-slim[mcp,openai]>=2.29.0",
-  # Floor at 2.0: agents/pydantic_ai/runner.py builds a SkillsCapability with the 2.x
-  # arguments (`scripts`, `include`) that replaced 1.x's `exclude_tools`/`auto_reload`.
-  # Ceiling below 3.0 so the next major cannot silently break the sidebar agent at
-  # construction time the way 2.0.0 did (see issue 5491).
-  "pydantic-ai-skills>=2.0,<3",
-  # Ceiling below 0.52: from 0.52 harness reads skills from a workspace on each run, and
-  # pydantic-ai-skills 2.1 answers that with `LocalWorkspaceBackend`, which raises on Windows.
-  # Lift once pydantic-ai-skills reads skills without a POSIX-only backend and the runner
-  # validates skills at run time (see issue 5881).
-  "pydantic-ai-harness>=0.28,<0.52",
+  "pydantic-ai-slim[mcp,openai]>=2.58",
+  "pydantic-ai-harness[skills]>=0.58",
 ]
 
 [project.optional-dependencies]
@@ -87,6 +71,9 @@ docs = [
   "mkdocs-material>=9.6.9",
   "mkdocs>=1.5.2",
   "mkdocstrings[python]>=0.29.1",
+  # 1.x depends on `griffe`, which shares the `griffe` package directory with `griffelib`
+  # (pulled in by pydantic-ai-slim). Installing both corrupts it.
+  "mkdocstrings-python>=2.0",
   "mkdocs-llmstxt>=0.5.0",
   "mkdocs-redirects>=1.2.2,<1.2.4",
   "pymdown-extensions>=10.17",
@@ -243,6 +230,8 @@ default.extend-ignore-re = [
 [tool.typos.default.extend-words]
 # HALD CLUT is a Color Lookup Table technique named after its inventor
 HALD = "HALD"
+# The editor's name for its 3D file type, reused as a `FileFormat` kind
+threed = "threed"
 
 [tool.pyright]
 venvPath = "."

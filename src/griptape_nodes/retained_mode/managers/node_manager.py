@@ -2218,8 +2218,8 @@ class NodeManager(EngineScoped):
     def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
         """Remove a parameter from a node of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -2806,8 +2806,8 @@ class NodeManager(EngineScoped):
     def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
         """Set a parameter value on a node of the open workflow, outside dispatch.
 
-        Edge method for code that calls the handler directly and is not handed a workflow (engine,
-        `exe_types` and node library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
+        Edge method for code that calls the handler directly and is not handed a workflow (node
+        library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -3936,7 +3936,7 @@ class NodeManager(EngineScoped):
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
         # registration, keeping both sides in sync. The id is what
-        # cancel_worker_execution dispatches as CancelExecuteNodeRequest.target_request_id.
+        # cancel_worker_execution_in dispatches as CancelExecuteNodeRequest.target_request_id.
         if not request.request_id:
             request.request_id = str(uuid4())
         target_request_id = request.request_id
@@ -3982,8 +3982,8 @@ class NodeManager(EngineScoped):
             return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
         return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
 
-    async def cancel_worker_execution(self, node_name: str) -> None:
-        """Dispatch CancelExecuteNodeRequest to the worker running node_name.
+    async def cancel_worker_execution_in(self, workflow: WorkflowRuntime, node_name: str) -> None:
+        """Dispatch CancelExecuteNodeRequest to the worker running `workflow`'s node `node_name`.
 
         No-op when the node is not currently routed to a worker (either because
         it runs locally or because no ExecuteNodeRequest is in flight). The
@@ -3992,13 +3992,8 @@ class NodeManager(EngineScoped):
         cooperative cancellation is signalled via task.cancel() on the
         orchestrator's own route_to_worker await, which unblocks here as soon
         as the cancel event has been put on the wire.
-
-        Edge method for code not handed a workflow.
         """
-        nodes = self._current_nodes_or_none()
-        if nodes is None:
-            return
-        entry = nodes.orch_worker_requests.get(node_name)
+        entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry

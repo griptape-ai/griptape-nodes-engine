@@ -298,7 +298,7 @@ class TestSerializeNodeWithoutLibraryMetadata:
         node.metadata.pop("library", None)
         assert "library" not in node.metadata
 
-        engine.object_manager.add_object_by_name(node.name, node)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), node.name, node)
 
         result = engine.node_manager.on_serialize_node_to_commands(
             SerializeNodeToCommandsRequest(node_name=node.name), engine.current_workflow()
@@ -430,7 +430,7 @@ class TestGetParameterValueOutputPriority:
 
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
-        obj_mgr.add_object_by_name("test_node", mock_node)
+        obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="result", node_name="test_node")
@@ -461,7 +461,7 @@ class TestGetParameterValueOutputPriority:
 
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
-        obj_mgr.add_object_by_name("test_node", mock_node)
+        obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="a", node_name="test_node")
@@ -492,7 +492,7 @@ class TestGetParameterValueOutputPriority:
 
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
-        obj_mgr.add_object_by_name("test_node", mock_node)
+        obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="x", node_name="test_node")
@@ -503,7 +503,7 @@ class TestGetParameterValueOutputPriority:
 
 
 class TestNodeManagerCancelExecuteNode:
-    """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution dispatch."""
+    """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution_in dispatch."""
 
     @pytest.mark.asyncio
     async def test_handler_no_inflight_returns_success(self, engine: Engine) -> None:
@@ -568,12 +568,13 @@ class TestNodeManagerCancelExecuteNode:
 
     @pytest.mark.asyncio
     async def test_cancel_worker_execution_noop_when_not_tracked(self, engine: Engine) -> None:
-        """cancel_worker_execution is a no-op when the node isn't routed to a worker."""
-        node_manager = engine.node_manager
+        """cancel_worker_execution_in is a no-op when the node isn't routed to a worker."""
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
 
         # Should not raise; there is no entry for "ghost_node" and
         # WorkerManager.forward_event_to_worker should not be invoked.
-        await node_manager.cancel_worker_execution("ghost_node")
+        await engine.node_manager.cancel_worker_execution_in(workflow, "ghost_node")
 
 
 class TestDeserializeNodeFromCommandsRetargetsElementCommands:

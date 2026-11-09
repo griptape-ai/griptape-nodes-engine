@@ -16,8 +16,8 @@ from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
 
-HANDLE_REQUEST_PATH = "griptape_nodes.files.project_file.GriptapeNodes.handle_request"
-CONFIG_MANAGER_PATH = "griptape_nodes.files.file.GriptapeNodes.ConfigManager"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.handle_request"
+CONFIG_MANAGER_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.ConfigManager"
 
 
 @pytest.fixture

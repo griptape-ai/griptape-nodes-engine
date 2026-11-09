@@ -7,7 +7,7 @@ from griptape_nodes.exe_types.param_components import project_file_sequence_para
 from griptape_nodes.files import file_sequence
 from griptape_nodes.retained_mode.events import os_events, project_events
 
-HANDLE_REQUEST_PATH = "griptape_nodes.files.project_file.GriptapeNodes.handle_request"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.handle_request"
 BUILD_VERSIONED_PATH = "griptape_nodes.files.file_sequence.build_versioned_sequence_destination"
 
 _POLICY_MAP = {

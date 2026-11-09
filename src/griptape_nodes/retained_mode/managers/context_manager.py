@@ -159,9 +159,10 @@ class ContextManager(EngineScoped):
 
     @handles(SetWorkflowContextRequest)
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
-        # As of today, we only allow a single Workflow context at a time. This may change in the future.
-        if self.has_current_workflow():
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{self.get_current_workflow_name()}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
+        blocking = self.engine.open_workflows.workflow_blocking_open()
+        if blocking is not None:
+            blocking_name = self.engine.workflow_registry.get(blocking.workflow_id).name
+            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{blocking_name}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
             return SetWorkflowContextFailure(result_details=msg)
 
         # Normalized here rather than at read time so `workflow_dir` never has to care whether
@@ -218,22 +219,27 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
-        resolved_name = self.push_workflow(workflow_name, working_directory=working_directory)
+        opened = self.open_workflow(workflow_name, working_directory=working_directory)
+        resolved_name = self.engine.workflow_registry.get(opened.workflow_id).name
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(
-            workflow_name=resolved_name, workflow_id=self.get_current_workflow_id(), result_details=msg
+            workflow_name=resolved_name, workflow_id=opened.workflow_id, result_details=msg
         )
 
     @handles(GetWorkflowContextRequest)
-    def on_get_workflow_context_request(self, request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG002
+    def on_get_workflow_context_request(
+        self,
+        request: GetWorkflowContextRequest,  # noqa: ARG002
+        workflow: WorkflowRuntime | None = None,
+    ) -> ResultPayload:
         workflow_name = None
         workflow_id = None
         is_saved = None
-        if self.has_current_workflow():
-            workflow = self.get_current_workflow()
-            workflow_name = workflow.name
-            workflow_id = workflow.workflow_id
-            is_saved = workflow.is_saved
+        if workflow is not None:
+            entry = self.engine.workflow_registry.get(workflow.workflow_id)
+            workflow_name = entry.name
+            workflow_id = entry.workflow_id
+            is_saved = entry.is_saved
         return GetWorkflowContextSuccess(
             workflow_name=workflow_name,
             workflow_id=workflow_id,
@@ -620,58 +626,6 @@ class ContextManager(EngineScoped):
         """
         return self.get_current_workflow().name
 
-    def get_current_workflow_file_path(self) -> str | None:
-        """Get the absolute path of the current Workflow's file, if it has one.
-
-        Read from the workflow's registry entry, which saves, renames and moves keep current.
-
-        Returns:
-            The absolute file path, or None for an unsaved workflow.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        absolute_path = self.get_current_workflow().absolute_path
-        if absolute_path is None:
-            return None
-        return str(absolute_path)
-
-    def get_current_workflow_working_directory(self) -> str | None:
-        """Get the folder the current Workflow belongs to, if one was supplied.
-
-        This is the folder a workflow was created in before it had a file of its own -- the
-        folder the caller was browsing at the time. It is a DIRECTORY, whereas
-        `get_current_workflow_file_path` returns a FILE whose parent is the directory.
-
-        Only meaningful while the workflow is unsaved: `workflow_dir` prefers the file path
-        whenever there is one, so this stops mattering the moment the workflow is saved. It is
-        deliberately not cleared on save -- the file path simply wins.
-
-        Returns:
-            The absolute directory path, or None when no folder was supplied.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        return self.get_current_workflow().working_directory
-
-    def move_current_workflow_onto(self, workflow_id: str) -> None:
-        """Make the registry entry `workflow_id` the current Workflow, keeping the open flows.
-
-        For the one case where an open workflow becomes a different registry entry: saving an
-        open library workflow writes a copy, and the editor keeps working in the copy.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        current = self._current_or_none()
-        if current is None:
-            msg = "No active Workflow context"
-            raise self.NoActiveWorkflowError(msg)
-
-        # The open workflow's runtime follows it, so a request naming the copy's id reaches it.
-        self.engine.open_workflows.move(current, workflow_id)
-
     def get_current_flow(self) -> ControlFlow:
         """Get the current Flow object.
 
@@ -737,7 +691,18 @@ class ContextManager(EngineScoped):
         file_path: str | None = None,
         working_directory: str | None = None,
     ) -> str:
-        """Open a workflow as the Workflow context, through `Engine.open_workflow`.
+        """Open a workflow as the Workflow context, and return its name. See `open_workflow`."""
+        opened = self.open_workflow(workflow_name, file_path=file_path, working_directory=working_directory)
+        return self.engine.workflow_registry.get(opened.workflow_id).name
+
+    def open_workflow(
+        self,
+        workflow_name: str | None = None,
+        *,
+        file_path: str | None = None,
+        working_directory: str | None = None,
+    ) -> WorkflowRuntime:
+        """Open a workflow as the Workflow context, through `Engine.open_workflow`, and return its runtime.
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
@@ -759,7 +724,7 @@ class ContextManager(EngineScoped):
                 reaches here.
 
         Returns:
-            The name of the Workflow that was entered.
+            The runtime of the Workflow that was entered.
 
         Raises:
             ValueError: If neither or both of workflow_name and file_path are provided.
@@ -797,7 +762,7 @@ class ContextManager(EngineScoped):
             # Outside a request nothing is bound: the work acts on the only open workflow, so no
             # binding is left behind in a context a later close does not reach.
             self.engine.enter_opened_workflow(opened)
-        return workflow.name
+        return opened
 
     def _find_or_register_open_file(self, file_path: str) -> Workflow:
         """The registry entry for a workflow file being opened, registered unlisted when there is none.

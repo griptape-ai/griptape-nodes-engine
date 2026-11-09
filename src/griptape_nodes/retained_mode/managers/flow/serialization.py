@@ -1306,15 +1306,14 @@ class FlowSerialization(EngineScoped):
 
         # Closed once read: a failure reading the commands can keep this frame, and the open file,
         # alive until garbage collection, and Windows won't delete or replace an open file.
-        try:
-            metadata = image.metadata.text
-        except ValueError as e:
-            return ExtractFlowCommandsFromImageMetadataResultFailure(
-                result_details=f"Failed to read the image's metadata: {e}",
-                file_path=file_url_or_path,
-            )
-        finally:
-            image.close()
+        with image:
+            try:
+                metadata = image.metadata.text
+            except ValueError as e:
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details=f"Failed to read the image's metadata: {e}",
+                    file_path=file_url_or_path,
+                )
 
         # An image without embedded flow commands is a valid state, not an error.
         if not metadata:

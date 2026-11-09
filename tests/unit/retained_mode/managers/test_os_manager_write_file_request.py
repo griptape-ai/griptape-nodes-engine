@@ -552,7 +552,7 @@ class TestMetadataInjection:
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_lookup.assert_called_once_with("image.png")
-        provider.collect_metadata_for_write.assert_called_once_with("image.png")
+        provider.collect_metadata_for_write.assert_called_once_with("image.png", engine.current_workflow())
         provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
 
     def test_metadata_is_collected_for_the_open_workflow_when_the_request_names_none(
@@ -562,8 +562,8 @@ class TestMetadataInjection:
         workflow = engine.current_workflow()
         seen = []
 
-        def collect(file_name: str) -> dict[str, str]:  # noqa: ARG001
-            seen.append(engine.current_workflow_or_none())
+        def collect(_file_name: str, collected_for: object) -> dict[str, str]:
+            seen.append(collected_for)
             return {}
 
         provider = MagicMock()

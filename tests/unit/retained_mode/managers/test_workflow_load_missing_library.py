@@ -908,14 +908,13 @@ class TestConcurrentLoadsDoNotCrossContaminate:
 
         async def load_both() -> tuple[Any, Any]:
             return await asyncio.gather(  # type: ignore[return-value]
-                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path, opens_workflow=False),
-                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path, opens_workflow=False),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path, workflow=running),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path, workflow=running),
             )
 
-        # The loads run inside a run of the open workflow, as a WorkflowNode's do, so both build into it.
-        reopened.context_manager.push_workflow(workflow_name="running")
-        with reopened.bind_workflow(reopened.current_workflow()):
-            host_result, sibling_result = asyncio.run(load_both())
+        # The loads build into one open workflow, as a WorkflowNode's do.
+        running = reopened.context_manager.open_workflow(workflow_name="running")
+        host_result, sibling_result = asyncio.run(load_both())
 
         # The host's own problem came from its subflow, and it has to survive the sibling load
         # running alongside it -- otherwise the host reports GOOD over placeholder nodes.
@@ -1086,7 +1085,7 @@ class TestRefusedSubflowIsNotOrphaned:
         # request path is unavailable and _load_subflow needs the parent-flow mapping to resolve.
         node = self._node_class_for(tmp_path / relative_path)(name="Wrapper")
         reopened.flow_manager.get_flow_by_name(host_flow.flow_name).add_node(node)
-        reopened.object_manager.add_object_by_name(node.name, node)
+        reopened.object_manager.add_object_by_name_in(reopened.current_workflow(), node.name, node)
         reopened.current_workflow().nodes.name_to_parent_flow_name[node.name] = host_flow.flow_name
 
         flows_before = set(reopened.object_manager.get_filtered_subset(type=ControlFlow))

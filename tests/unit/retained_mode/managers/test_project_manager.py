@@ -61,8 +61,16 @@ _PEER_WORKFLOW_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 _OTHER_PEER_WORKFLOW_ID = "1f2e3d4c5b6a79808f9e8d7c6b5a4f3e"
 
 
+def _file_path(context_manager: ContextManager) -> str | None:
+    """The current workflow's file path, or None while it is unsaved."""
+    absolute_path = context_manager.get_current_workflow().absolute_path
+    if absolute_path is None:
+        return None
+    return str(absolute_path)
+
+
 _HANDED_WORKFLOW_ID = "0000000000000000000000000000a001"
-_HANDED_WORKFLOW = WorkflowRuntime(_HANDED_WORKFLOW_ID, dispatcher=MagicMock())
+_HANDED_WORKFLOW = WorkflowRuntime(_HANDED_WORKFLOW_ID, engine=MagicMock())
 
 
 def _engine_with_nothing_open(project_manager: ProjectManager) -> MagicMock:
@@ -92,7 +100,7 @@ def _hand_workflow(
     entry.name = name
     engine = _engine_with_nothing_open(project_manager)
     engine.workflow_registry.get.side_effect = {_HANDED_WORKFLOW_ID: entry}.__getitem__
-    return WorkflowRuntime(_HANDED_WORKFLOW_ID, dispatcher=MagicMock())
+    return WorkflowRuntime(_HANDED_WORKFLOW_ID, engine=MagicMock())
 
 
 def _stub_config_for_listing(mock_config: Mock, *, global_workspace: str = "/global/ws") -> None:
@@ -388,8 +396,6 @@ class TestProjectManagerMacroHandlers:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "My Cool Workflow"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager._engine = MagicMock()
         project_manager._engine.only_open_workflow_or_none.return_value = None
         project_manager._engine.context_manager = mock_context_manager
@@ -829,8 +835,8 @@ class TestProjectManagerBuiltinVariables:
             context_manager, _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, str(tmp_path / "shots")
         ):
             assert context_manager.get_current_workflow_name() == f"unsaved:{_PEER_WORKFLOW_ID}"
-            assert context_manager.get_current_workflow_file_path() is None
-            assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
+            assert _file_path(context_manager) is None
+            assert context_manager.get_current_workflow().working_directory == str(tmp_path / "shots")
 
     def test_adopting_follows_the_orchestrator_saving_its_workflow(self, tmp_path: Path) -> None:
         """An orchestrator that first saved the workflow since the last node moves this engine's entry, same id."""
@@ -841,7 +847,7 @@ class TestProjectManagerBuiltinVariables:
         with self._running_in(context_manager, _PEER_WORKFLOW_ID, "saved", str(workflow_file), None):
             assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
             assert context_manager.get_current_workflow_name() == "saved"
-            assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+            assert _file_path(context_manager) == str(workflow_file)
 
     def test_adopting_takes_the_orchestrators_id_for_a_file_known_here_under_another(self, tmp_path: Path) -> None:
         """The orchestrator's id is the authority: this engine's stale entry for the file is replaced, not used."""
@@ -884,7 +890,7 @@ class TestProjectManagerBuiltinVariables:
 
         with self._running_in(context_manager, _PEER_WORKFLOW_ID, "b", str(workflow_file), None):
             assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
-            assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+            assert _file_path(context_manager) == str(workflow_file)
 
         assert registry.find_by_id(local.workflow_id) is None
 
@@ -895,8 +901,8 @@ class TestProjectManagerBuiltinVariables:
 
         with self._running_in(context_manager, _PEER_WORKFLOW_ID, "moved_away", str(missing), None):
             assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
-            assert context_manager.get_current_workflow_file_path() is None
-            assert context_manager.get_current_workflow_working_directory() == str(tmp_path / "shots")
+            assert _file_path(context_manager) is None
+            assert context_manager.get_current_workflow().working_directory == str(tmp_path / "shots")
 
     def test_a_sweep_closes_the_runtimes_and_drops_the_entries_made_for_them(self, tmp_path: Path) -> None:
         """A long-lived worker does not keep an entry for every orchestrator workflow it ever ran a node for."""
@@ -959,7 +965,7 @@ class TestProjectManagerBuiltinVariables:
             assert context_manager.has_current_workflow() is True
             assert context_manager.has_current_flow() is False
             assert context_manager.get_current_workflow_name() == "w"
-            assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+            assert _file_path(context_manager) == str(workflow_file)
 
     def test_each_orchestrator_workflow_keeps_one_runtime(self, tmp_path: Path) -> None:
         """Adopting the same workflow again returns its runtime; another workflow gets its own."""
@@ -992,39 +998,25 @@ class TestProjectManagerBuiltinVariables:
         with pytest.raises(context_manager.OrchestratorWorkflowError, match="no workflow was open"):
             context_manager.adopt_orchestrator_workflow(None, None, None, None)
 
-    def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
-        self,
-        project_manager_with_template: ProjectManager,
-    ) -> None:
-        """Nothing to lend, so the peer must drop any mirror it holds and degrade identically."""
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.only_open_workflow_or_none.return_value = None
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        assert project_manager_with_template.workflow_context_for_dispatch().name is None
-
-    def test_dispatch_snapshot_carries_the_whole_context(
+    def test_dispatch_snapshot_carries_the_whole_context_of_the_workflow_it_is_handed(
         self,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """Raw context, not a resolved path: derived values are then computed by the peer."""
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_id.return_value = "show_id"
-        mock_context_manager.get_current_workflow_name.return_value = "my_show"
-        mock_context_manager.get_current_workflow_file_path.return_value = "/shows/my_show/my_show.py"
-        mock_context_manager.get_current_workflow_working_directory.return_value = "/shows/my_show"
+        entry = MagicMock(
+            workflow_id="show_id", working_directory="/shows/my_show", absolute_path=Path("/shows/my_show/my_show.py")
+        )
+        entry.name = "my_show"
         project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.only_open_workflow_or_none.return_value = None
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        project_manager_with_template._engine.workflow_registry.get.return_value = entry
+        workflow = WorkflowRuntime("show_id", MagicMock())
 
-        snapshot = project_manager_with_template.workflow_context_for_dispatch()
+        snapshot = project_manager_with_template.workflow_context_for_dispatch(workflow)
 
+        project_manager_with_template._engine.workflow_registry.get.assert_called_once_with("show_id")
         assert snapshot.workflow_id == "show_id"
         assert snapshot.name == "my_show"
-        assert snapshot.file_path == "/shows/my_show/my_show.py"
+        assert snapshot.file_path == str(Path("/shows/my_show/my_show.py"))
         assert snapshot.working_directory == "/shows/my_show"
 
     def test_builtin_workflow_dir_resolves_correctly(
@@ -13621,8 +13613,6 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "unsaved:abc"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
         pm._engine = MagicMock()
         pm._engine.only_open_workflow_or_none.return_value = None
         pm._engine.context_manager = mock_context_manager
@@ -13662,7 +13652,7 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         cast("MagicMock", pm._engine).workflow_registry.get.return_value = registered_unsaved
         with patch.object(ProjectManager, "_get_builtin_variable_value", counting_get_builtin):
             project_info = pm._successfully_loaded_project_templates[cast("str", pm._current_project_id)]
-            return pm._resolve_workflow_dir(project_info, WorkflowRuntime("unsaved-workflow", dispatcher=MagicMock()))
+            return pm._resolve_workflow_dir(project_info, WorkflowRuntime("unsaved-workflow", engine=MagicMock()))
 
     def test_default_macro_answers_the_workspace_root(self) -> None:
         """The shipped `{workspace_dir}/{sub_dirs?:/}...` macro puts a workflow at the root."""

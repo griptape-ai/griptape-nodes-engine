@@ -23,11 +23,7 @@ def _image(pixels: np.ndarray) -> GriptapeImage:
 
 def _edited(pixels: np.ndarray, edit: object) -> np.ndarray:
     """Run ``edit`` (a function of the pipeline) over ``pixels`` and return the result's pixels."""
-    with (
-        _image(pixels) as image,
-        GriptapeImagePipeline(image) as pipeline,
-        edit(pipeline).end() as result,  # type: ignore[operator]
-    ):
+    with _image(pixels) as image, edit(GriptapeImagePipeline(image)).end() as result:  # type: ignore[operator]
         return result.to_array()
 
 

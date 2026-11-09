@@ -85,7 +85,7 @@ def _make(node_type: str, name: str) -> BaseNode:
     )
     if not current_engine().context_manager.has_current_workflow():
         current_engine().context_manager.push_workflow(workflow_name=f"wf_{name}")
-    current_engine().object_manager.add_object_by_name(name, node)
+    current_engine().object_manager.add_object_by_name_in(current_engine().current_workflow(), name, node)
     return node
 
 

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+    from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -115,6 +116,14 @@ from griptape_nodes.retained_mode.managers.workflow_manager import (
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.workflow_context import empty_workflow_registry
+
+
+def _file_path(context_manager: "ContextManager") -> str | None:
+    """The current workflow's file path, or None while it is unsaved."""
+    absolute_path = context_manager.get_current_workflow().absolute_path
+    if absolute_path is None:
+        return None
+    return str(absolute_path)
 
 
 def _valid_workflow_source(name: str, libraries: list[str] | None = None) -> str:
@@ -821,9 +830,7 @@ class TestWorkflowManager:
 
                     assert isinstance(result, MoveWorkflowResultSuccess)
                     assert context_manager.get_current_workflow_name() == "subdir/my_workflow"
-                    assert context_manager.get_current_workflow_file_path() == str(
-                        workspace / "subdir" / "my_workflow.py"
-                    )
+                    assert _file_path(context_manager) == str(workspace / "subdir" / "my_workflow.py")
                 finally:
                     context_manager.pop_workflow()
         finally:
@@ -938,7 +945,7 @@ class TestWorkflowManager:
                 # ...and it now carries the location it gained by being saved. `workflow_dir`
                 # prefers this over a registry lookup, and the lookup is what goes stale on the
                 # next project switch.
-                assert context_manager.get_current_workflow_file_path() == str(saved_full_path)
+                assert _file_path(context_manager) == str(saved_full_path)
             finally:
                 engine.config_manager.workspace_path = original_workspace
                 if context_manager.has_current_workflow():
@@ -3533,7 +3540,7 @@ class TestRunWorkflowWithCurrentStateRequest:
         open_workflow.context.push_flow(open_flow)
 
         result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
-            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
         )
 
         assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
@@ -3545,17 +3552,17 @@ class TestRunWorkflowWithCurrentStateRequest:
     async def test_allows_a_workflow_context_with_no_open_flow(
         self,
         engine: Engine,
-        open_workflow: WorkflowRuntime,  # noqa: ARG002
+        open_workflow: WorkflowRuntime,
         run_workflow: AsyncMock,
         get_complete_file_path: Mock,  # noqa: ARG002
         anyio_path: Mock,  # noqa: ARG002
     ) -> None:
         await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
-            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
         )
 
-        # It builds into the open workflow rather than opening the file as another.
-        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, opens_workflow=False)
+        # It builds into the workflow it is handed rather than opening the file as another.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, workflow=open_workflow)
 
     @pytest.mark.asyncio
     async def test_opens_the_file_when_no_workflow_is_open(
@@ -3569,7 +3576,7 @@ class TestRunWorkflowWithCurrentStateRequest:
             RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
         )
 
-        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, opens_workflow=True)
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE, workflow=None)
 
 
 class TestWorkflowsLoadingGate:
@@ -6324,15 +6331,15 @@ class TestNodeLibraryDelegates:
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
-        run_mock.assert_awaited_once_with("flow.py", opens_workflow=True)
+        run_mock.assert_awaited_once_with("flow.py", None)
 
     def test_run_workflow_builds_into_the_open_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        engine.context_manager.push_workflow(workflow_name="open")
+        opened = engine.context_manager.open_workflow(workflow_name="open")
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
-        run_mock.assert_awaited_once_with("flow.py", opens_workflow=False)
+        run_mock.assert_awaited_once_with("flow.py", opened)
 
     def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager

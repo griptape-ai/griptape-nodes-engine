@@ -10,7 +10,6 @@ from griptape_nodes.image.exif import TRANSPOSING_ORIENTATIONS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from types import TracebackType
 
     import numpy as np
 
@@ -343,37 +342,31 @@ _ORIENTATION_INDEPENDENT = (ToRGB, ToRGBA, ToGray, ToUint8, Brightness, Contrast
 
 
 class GriptapeImagePipeline:
-    """Transforms queued against an image, run by ``end``.
+    """Apply a series of image processing steps without changing the source image.
+
+    Queue steps by chaining calls, then call ``end`` to run them and get a new image:
+
+        with GriptapeImage.open(data) as source:
+            preview = (
+                GriptapeImagePipeline(source)
+                .exif_transpose()
+                .thumbnail(512, 512)
+                .round_corners(0.02)
+                .end()
+            )
+            encoded = preview.encode(ImageFormat.WEBP)
+
+    The new image carries the source's metadata, updated to describe the new pixels: an EXIF
+    transpose resets the Orientation tag, and steps that resize update the EXIF pixel dimensions.
 
     Steps run in the order queued, except that an EXIF transpose ahead of a ``thumbnail`` runs
     after it, on the smaller image, with the bounds swapped for a 90 degree turn. The output is
     the same; the rotation costs a fraction as much.
-
-        with GriptapeImage.open(data) as source:
-            pipeline = GriptapeImagePipeline(source)
-            pipeline.exif_transpose().thumbnail(512, 512).round_corners(0.02)
-            with pipeline.end() as preview:
-                encoded = preview.encode(ImageFormat.WEBP)
-
-    The source image is left as it was; ``end`` returns a new image for the caller to close. It
-    carries the source's metadata, updated to describe the new pixels: an EXIF transpose resets
-    the Orientation tag, and steps that resize update the EXIF pixel dimensions.
     """
 
     def __init__(self, image: GriptapeImage) -> None:
         self._image = image
         self._steps: list[PipelineStep | _ExifTranspose] = []
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        self._steps.clear()
 
     def exif_transpose(self) -> Self:
         """Rotate and flip the image as its EXIF orientation tag says to display it."""
@@ -554,7 +547,7 @@ class GriptapeImagePipeline:
 
     def end(self) -> GriptapeImage:
         """Run the queued steps and return the resulting image. The queue is emptied."""
-        steps = plan_steps(self._steps, self._orientation())
+        steps = _plan_steps(self._steps, self._orientation())
         self._steps.clear()
         return self._image._run_pipeline(steps)
 
@@ -572,7 +565,7 @@ class _ExifTranspose:
     """Queued by ``exif_transpose``; becomes an ``Orient`` once the source's orientation is read."""
 
 
-def plan_steps(steps: list[PipelineStep | _ExifTranspose], orientation: int) -> list[PipelineStep]:
+def _plan_steps(steps: list[PipelineStep | _ExifTranspose], orientation: int) -> list[PipelineStep]:
     """Resolve the first EXIF transpose to ``orientation`` and move it past a following thumbnail."""
     planned: list[PipelineStep] = []
     pending: Orient | None = None

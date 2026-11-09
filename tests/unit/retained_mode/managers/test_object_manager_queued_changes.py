@@ -28,7 +28,7 @@ class TestQueuedChanges:
     def test_a_registered_node_is_queued_when_an_element_changes(self) -> None:
         object_manager = _object_manager_with_an_open_workflow()
         node, parameter = _node_with_parameter("A")
-        object_manager.add_object_by_name("A", node)
+        object_manager.add_object_by_name_in(object_manager.engine.current_workflow(), "A", node)
 
         parameter.track_change("tooltip", "Changed")
 
@@ -40,17 +40,17 @@ class TestQueuedChanges:
         node, parameter = _node_with_parameter("A")
 
         parameter.track_change("tooltip", "Changed")
-        object_manager.add_object_by_name("A", node)
+        object_manager.add_object_by_name_in(object_manager.engine.current_workflow(), "A", node)
 
         assert object_manager.take_nodes_with_queued_changes() == [node]
 
     def test_a_deleted_node_is_not_queued(self) -> None:
         object_manager = _object_manager_with_an_open_workflow()
         node, parameter = _node_with_parameter("A")
-        object_manager.add_object_by_name("A", node)
+        object_manager.add_object_by_name_in(object_manager.engine.current_workflow(), "A", node)
         parameter.track_change("tooltip", "Changed")
 
-        object_manager.del_obj_by_name("A")
+        object_manager.del_obj_by_name_in(object_manager.engine.current_workflow(), "A")
         parameter.track_change("tooltip", "Changed again")
 
         assert object_manager.take_nodes_with_queued_changes() == []
@@ -61,7 +61,7 @@ class TestQueuedChanges:
         other = Parameter(name="other", tooltip="Other", type="str")
         node.add_parameter(other)
         node._tracked_parameters.clear()
-        object_manager.add_object_by_name("A", node)
+        object_manager.add_object_by_name_in(object_manager.engine.current_workflow(), "A", node)
 
         parameter.track_change("tooltip", "Changed")
         other.track_change("tooltip", "Changed")
@@ -72,8 +72,8 @@ class TestQueuedChanges:
         object_manager = _object_manager_with_an_open_workflow()
         first, first_parameter = _node_with_parameter("A")
         second, second_parameter = _node_with_parameter("B")
-        object_manager.add_object_by_name("A", first)
-        object_manager.add_object_by_name("B", second)
+        object_manager.add_object_by_name_in(object_manager.engine.current_workflow(), "A", first)
+        object_manager.add_object_by_name_in(object_manager.engine.current_workflow(), "B", second)
 
         first_parameter.track_change("tooltip", "Changed")
         second_parameter.track_change("tooltip", "Changed")

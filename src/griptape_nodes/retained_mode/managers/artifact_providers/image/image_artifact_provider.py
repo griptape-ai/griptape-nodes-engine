@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         BaseArtifactPreviewGenerator,
     )
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -108,11 +109,11 @@ class ImageArtifactProvider(BaseArtifactProvider):
     def get_default_preview_generators(cls) -> list[type[BaseArtifactPreviewGenerator]]:
         """Get default preview generator classes."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILRoundedPreviewGenerator,
-            PILThumbnailGenerator,
+            RoundedPreviewGenerator,
+            ThumbnailGenerator,
         )
 
-        return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
+        return [ThumbnailGenerator, RoundedPreviewGenerator]
 
     @classmethod
     def detect_format(cls, data: bytes) -> str | None:
@@ -127,13 +128,13 @@ class ImageArtifactProvider(BaseArtifactProvider):
         """
         return {"png"}
 
-    def collect_metadata_for_write(self, file_name: str) -> dict[str, str]:
+    def collect_metadata_for_write(self, file_name: str, workflow: WorkflowRuntime | None) -> dict[str, str]:
         ext = Path(file_name).suffix.lstrip(".").lower()
         if ext not in self.get_metadata_formats():
             return {}
 
         try:
-            return collect_workflow_metadata(self.engine)
+            return collect_workflow_metadata(self.engine, workflow)
         except Exception as e:
             logger.warning("Attempted to collect workflow metadata for %s. Failed because: %s", file_name, e)
             return {}

@@ -1,4 +1,4 @@
-"""Pixel operations behind ``GriptapeImagePipeline`` steps, on OpenImageIO buffers.
+"""Pixel operations on OpenImageIO buffers, behind ``GriptapeImagePipeline`` steps and encoding.
 
 Buffers hold unassociated alpha, last: gray (Y), gray and alpha (Y, A), RGB, or RGBA. Operations
 that filter or composite premultiply first, so the color of transparent pixels doesn't bleed into
@@ -8,7 +8,7 @@ their neighbors, and return a buffer of the source's pixel type.
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import OpenImageIO as oiio  # noqa: N813
@@ -22,19 +22,30 @@ from griptape_nodes.image.pipeline import (
     DrawLine,
     DrawRectangle,
     DrawText,
+    Flatten,
     Pad,
     ResizeFilter,
     Rotate,
+    RoundCorners,
     Saturation,
     TextAlign,
+    Thumbnail,
 )
+from griptape_nodes.image.pixel_type import PixelType
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 GRAYSCALE_CHANNELS = 1
 GRAYSCALE_ALPHA_CHANNELS = 2
 RGB_CHANNELS = 3
 RGBA_CHANNELS = 4
+_ALPHA = 3
 
-_UNASSOCIATED_ALPHA = "oiio:UnassociatedAlpha"
+# Keeps alpha as stored in the file. OpenImageIO otherwise premultiplies on read and divides it
+# back out on write, which rounds 8-bit color under partial alpha.
+UNASSOCIATED_ALPHA = "oiio:UnassociatedAlpha"
+
 _CHANNEL_NAMES = {
     GRAYSCALE_CHANNELS: ("Y",),
     GRAYSCALE_ALPHA_CHANNELS: ("Y", "A"),
@@ -69,6 +80,14 @@ _EPSILON = 1e-9
 
 # Alpha below which a filtered pixel counts as empty: under half an 8-bit step
 _VISIBLE_ALPHA = 0.5 / 255
+
+# Shrink factor from which a thumbnail uses a box filter, about 4x faster than the tent filter. On
+# photographic content they differ by about 1/255; detail near the pixel scale (fine stripes,
+# halftone) can alias by tens of levels, which previews accept.
+_BOX_FILTER_MIN_SHRINK = 3
+
+# Below this, the sRGB transfer function is linear
+_SRGB_LINEAR_LIMIT = 0.0031308
 
 _FULL_TURN = 360
 _QUARTER_TURN = 90
@@ -190,19 +209,33 @@ def _name_channels(buf: oiio.ImageBuf) -> None:
         buf.specmod().alpha_channel = channels - 1
     else:
         buf.specmod().alpha_channel = -1
-    buf.specmod().attribute(_UNASSOCIATED_ALPHA, 1)
+    buf.specmod().attribute(UNASSOCIATED_ALPHA, 1)
 
 
-def is_integer(buf: oiio.ImageBuf) -> bool:
-    """Whether ``buf`` stores integer pixels, which clamp to their range."""
-    return str(buf.spec().format) not in ("half", "float", "double")
+def is_float(buf: oiio.ImageBuf) -> bool:
+    """Whether ``buf``'s pixels are floating point."""
+    return str(buf.spec().format) in ("half", "float", "double")
 
 
 def _clipped(pixels: np.ndarray, buf: oiio.ImageBuf) -> np.ndarray:
     """Clip float pixels to 0-1 when they'll be stored in ``buf``'s integer type; float types keep the full range."""
-    if is_integer(buf):
-        return np.clip(pixels, 0.0, 1.0)
-    return pixels
+    if is_float(buf):
+        return pixels
+    return np.clip(pixels, 0.0, 1.0)
+
+
+def applied(buf: oiio.ImageBuf, function: Callable[[np.ndarray], np.ndarray]) -> oiio.ImageBuf:
+    """Run ``function`` on the pixels as a NumPy array in their own type and wrap what it returns.
+
+    Raises:
+        ValueError: If the function doesn't return an array an image can hold
+    """
+    result = function(native_pixels(buf))
+    if not isinstance(result, np.ndarray):
+        msg = f"Attempted to apply a function to an image's pixels. Failed because it returned {type(result).__name__}, not an array."
+        raise ValueError(msg)  # noqa: TRY004 - the function's result, not this call's argument
+    PixelType.from_numpy(result.dtype)
+    return buffer_from_pixels(result)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +272,20 @@ def to_gray(buf: oiio.ImageBuf) -> oiio.ImageBuf:
     else:
         gray = (pixels[:, :, :RGB_CHANNELS] @ _LUMA)[:, :, np.newaxis]
     return buffer_from_float(gray, buf.spec().format)
+
+
+def to_uint8(buf: oiio.ImageBuf, *, holds_display_values: bool) -> oiio.ImageBuf:
+    """Return 8 bits per channel. Scene-linear float pixels get the sRGB curve first, as they do when encoded for display.
+
+    Args:
+        buf: The pixels
+        holds_display_values: Whether float pixels already hold display values, so they're only rescaled
+    """
+    if str(buf.spec().format) == "uint8":
+        return buf.copy()
+    if is_float(buf) and not holds_display_values:
+        buf = display_referred(buf)
+    return checked(buf.copy(oiio.UINT8))
 
 
 def _rgba_float(buf: oiio.ImageBuf) -> np.ndarray:
@@ -363,6 +410,53 @@ def _placed(canvas_shape: tuple[int, ...], layer_shape: tuple[int, ...], left: i
     )
 
 
+def rounded(buf: oiio.ImageBuf, step: RoundCorners) -> oiio.ImageBuf:
+    """Return RGBA with the alpha transparent outside a rectangle with rounded corners."""
+    rgba = to_rgba(buf)
+    spec = rgba.spec()
+    radius = step.radius_pixels(spec.width, spec.height)
+    if radius <= 0:
+        return rgba
+
+    pixels = rgba.get_pixels(spec.format)
+    if not isinstance(pixels, np.ndarray):
+        msg = f"Attempted to round an image's corners. Failed because OpenImageIO could not read its pixels: {rgba.geterror()}"
+        raise ValueError(msg)  # noqa: TRY004 - a failed read, not a wrong argument type
+    coverage = _rounded_rectangle_coverage(spec.width, spec.height, radius)
+    alpha_max = max_value(pixels.dtype)
+    pixels[:, :, _ALPHA] = (coverage * alpha_max).astype(pixels.dtype)
+    # An ImageBuf straight over the NumPy array, no file involved
+    return oiio.ImageBuf(pixels)
+
+
+def _rounded_rectangle_coverage(width: int, height: int, radius: int) -> np.ndarray:
+    """Return per-pixel coverage (0-1) of a ``width`` x ``height`` rectangle with rounded corners."""
+    ys, xs = np.mgrid[0:height, 0:width].astype(np.float64)
+    # Distance from each pixel to the nearest point of the rectangle inset by radius
+    nearest_x = np.clip(xs, radius, width - 1 - radius)
+    nearest_y = np.clip(ys, radius, height - 1 - radius)
+    distance = np.hypot(xs - nearest_x, ys - nearest_y)
+    return np.clip(radius + 0.5 - distance, 0.0, 1.0)
+
+
+def flattened(buf: oiio.ImageBuf, step: Flatten) -> oiio.ImageBuf:
+    """Return RGB composited over ``step``'s opaque background, in ``buf``'s pixel type."""
+    rgba = to_rgba(buf)
+    spec = rgba.spec()
+    foreground = oiio.ImageBufAlgo.premult(rgba)
+    red, green, blue = step.background
+    canvas = oiio.ImageBufAlgo.fill(
+        (red / 255.0, green / 255.0, blue / 255.0, 1.0),
+        oiio.ROI(0, spec.width, 0, spec.height, 0, 1, 0, RGBA_CHANNELS),
+    )
+    composited = checked(oiio.ImageBufAlgo.over(foreground, canvas))
+    rgb = checked(oiio.ImageBufAlgo.channels(composited, (0, 1, 2), ("R", "G", "B")))
+    # over computes in float; return to the source's pixel type
+    out = oiio.ImageBuf(oiio.ImageSpec(spec.width, spec.height, RGB_CHANNELS, spec.format))
+    out.copy_pixels(rgb)
+    return out
+
+
 def composited(buf: oiio.ImageBuf, overlay: oiio.ImageBuf, step: Composite) -> oiio.ImageBuf:
     """Draw ``overlay`` over ``buf`` as ``step`` says, in float, then store it in ``buf``'s pixel type."""
     base = _rgba_float(buf)
@@ -401,6 +495,54 @@ def with_alpha(buf: oiio.ImageBuf, alpha: oiio.ImageBuf | float) -> oiio.ImageBu
 
 # ---------------------------------------------------------------------------
 # Geometry
+
+
+def thumbnail(buf: oiio.ImageBuf, step: Thumbnail) -> oiio.ImageBuf:
+    """Shrink ``buf`` to fit ``step``'s bounds, keeping the aspect ratio. Never enlarges."""
+    spec = buf.spec()
+    scale = min(step.max_width / spec.width, step.max_height / spec.height)
+    if scale >= 1:
+        return buf.copy()
+    width = max(1, round(spec.width * scale))
+    height = max(1, round(spec.height * scale))
+    roi = oiio.ROI(0, width, 0, height, 0, 1, 0, buf.nchannels)
+    has_alpha = alpha_channel(buf) is not None
+    # Filtering unassociated color would bleed the color of transparent pixels into the edges
+    source = buf
+    if has_alpha:
+        source = oiio.ImageBufAlgo.premult(buf)
+    # resize widens the filter by the shrink factor, so a tent filter antialiases. Lanczos3
+    # takes about 8x longer on a 4000x3000 source.
+    filter_name = "triangle"
+    if scale * _BOX_FILTER_MIN_SHRINK <= 1:
+        filter_name = "box"
+    resized = checked(oiio.ImageBufAlgo.resize(source, filter_name, roi=roi))
+    if has_alpha:
+        resized = checked(oiio.ImageBufAlgo.unpremult(resized))
+    return resized
+
+
+def oriented(buf: oiio.ImageBuf, orientation: int) -> oiio.ImageBuf:  # noqa: PLR0911
+    """Rotate and flip ``buf`` for an EXIF orientation value (2-8).
+
+    Explicit transforms rather than ``ImageBufAlgo.reorient``, which reads the orientation from
+    the buffer's own metadata.
+    """
+    if orientation == 2:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.flop(buf))
+    if orientation == 3:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.rotate180(buf))
+    if orientation == 4:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.flip(buf))
+    if orientation == 5:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.transpose(buf))
+    if orientation == 6:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.rotate90(buf))
+    if orientation == 7:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.rotate180(checked(oiio.ImageBufAlgo.transpose(buf))))
+    if orientation == 8:  # noqa: PLR2004
+        return checked(oiio.ImageBufAlgo.rotate270(buf))
+    return buf.copy()
 
 
 def resized(buf: oiio.ImageBuf, width: int, height: int, resize_filter: ResizeFilter) -> oiio.ImageBuf:
@@ -620,6 +762,51 @@ def _rotation_matrix(radians: float, center: _Point, target: _Point) -> tuple[fl
 
 # ---------------------------------------------------------------------------
 # Color
+
+
+def display_referred(buf: oiio.ImageBuf) -> oiio.ImageBuf:
+    """Return scene-linear float pixels with the sRGB transfer function applied to color, clipped to 0-1.
+
+    Raises:
+        ValueError: If OpenImageIO cannot read the pixels
+    """
+    pixels = buf.get_pixels(oiio.FLOAT)
+    if not isinstance(pixels, np.ndarray):
+        msg = f"Attempted to prepare float pixels for display. Failed because OpenImageIO could not read them: {buf.geterror()}"
+        raise ValueError(msg)  # noqa: TRY004 - a failed read, not a wrong argument type
+    linear = np.clip(pixels, 0.0, 1.0)
+    encoded = np.where(linear <= _SRGB_LINEAR_LIMIT, linear * 12.92, 1.055 * np.power(linear, 1 / 2.4) - 0.055).astype(
+        np.float32
+    )
+    source_spec = buf.spec()
+    alpha = alpha_channel(buf)
+    if alpha is not None:
+        encoded[:, :, alpha] = linear[:, :, alpha]
+    out = oiio.ImageBuf(np.ascontiguousarray(encoded))
+    out.specmod().channelnames = source_spec.channelnames
+    out.specmod().alpha_channel = source_spec.alpha_channel
+    return out
+
+
+def scene_linear(buf: oiio.ImageBuf) -> oiio.ImageBuf:
+    """Return display (sRGB) pixels as scene-linear float, the inverse of ``display_referred``, alpha unchanged.
+
+    Raises:
+        ValueError: If OpenImageIO cannot read the pixels
+    """
+    pixels = float_pixels(buf)
+    encoded = np.clip(pixels, 0.0, 1.0)
+    linear = np.where(
+        encoded <= _SRGB_LINEAR_LIMIT * 12.92, encoded / 12.92, np.power((encoded + 0.055) / 1.055, 2.4)
+    ).astype(np.float32)
+    source_spec = buf.spec()
+    alpha = alpha_channel(buf)
+    if alpha is not None:
+        linear[:, :, alpha] = pixels[:, :, alpha]
+    out = oiio.ImageBuf(np.ascontiguousarray(linear))
+    out.specmod().channelnames = source_spec.channelnames
+    out.specmod().alpha_channel = source_spec.alpha_channel
+    return out
 
 
 def enhanced(buf: oiio.ImageBuf, step: Brightness | Contrast | Saturation) -> oiio.ImageBuf:

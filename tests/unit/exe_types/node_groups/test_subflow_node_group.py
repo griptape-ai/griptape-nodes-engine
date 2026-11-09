@@ -17,6 +17,7 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
 from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LEGACY_PRIVATE_EXECUTION, LOCAL_EXECUTION
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
@@ -33,19 +34,13 @@ class TestSubflowNodeGroupCreateSubflow:
     ) -> None:
         """The group records the flow name it got back, not the (colliding) name it requested."""
         group = _MiniSubflowGroup(name="G")
+        # In a workflow with no flow on its context stack, so the request names no parent flow.
+        group._set_workflow(WorkflowRuntime("wf", engine))
 
         # Simulate the engine deduplicating the requested "G_subflow" (already taken) to "G_subflow_1".
         deduped_result = CreateFlowResultSuccess(flow_name="G_subflow_1", result_details="created")
         mock_handle = create_autospec(engine.handle_request, return_value=deduped_result)
         monkeypatch.setattr(engine, "handle_request", mock_handle)
-
-        # _create_subflow reads the current flow only to parent the request; keep it off engine state.
-        context_manager = engine.context_manager
-        monkeypatch.setattr(
-            context_manager,
-            "get_current_flow",
-            create_autospec(context_manager.get_current_flow, return_value=None),
-        )
 
         group._create_subflow()
 
@@ -295,19 +290,22 @@ class TestProxySerializable:
     """
 
     @pytest.fixture
-    def group(
-        self,
-        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
-    ) -> _MiniSubflowGroup:
-        return _MiniSubflowGroup(name="G")
+    def workflow(self, engine: Engine) -> WorkflowRuntime:
+        return WorkflowRuntime("wf", engine)
 
     @pytest.fixture
-    def connections(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+    def group(self, workflow: WorkflowRuntime) -> _MiniSubflowGroup:
+        group = _MiniSubflowGroup(name="G")
+        group._set_workflow(workflow)
+        return group
+
+    @pytest.fixture
+    def connections(self, workflow: WorkflowRuntime) -> Mock:
         """Connections on the proxy, which each test fills in."""
         connections = Mock()
         connections.get_incoming_connections_to_parameter.return_value = []
         connections.get_outgoing_connections_from_parameter.return_value = []
-        monkeypatch.setattr(engine.flow_manager, "get_connections", lambda: connections)
+        workflow.flows.connections = connections
         return connections
 
     @staticmethod
