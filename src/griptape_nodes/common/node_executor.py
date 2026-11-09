@@ -26,6 +26,7 @@ from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
+    IterativeNodeParam,
 )
 from griptape_nodes.exe_types.core_types import ParameterList, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups import (
@@ -1215,7 +1216,9 @@ class NodeExecutor(EngineScoped):
             # Neither loop node is packaged, so a wire straight from start to end (current_item into
             # new_item_to_add) has no packaged endpoint. Carried StartFlow -> EndFlow, it is set per
             # iteration and read back like a body node's output.
-            passthrough_connections=self._passthrough_connections_between(connections, start_node, end_node),
+            passthrough_connections=self._passthrough_connections_between(
+                connections, start_node, end_node, IterativeNodeParam.NEW_ITEM_TO_ADD.value
+            ),
         )
 
         package_result = workflow.handle_request(request)
@@ -2573,7 +2576,9 @@ class NodeExecutor(EngineScoped):
             # into one of its own inputs (current_item into new_item_to_add) has no packaged
             # endpoint. Carried StartFlow -> EndFlow, it is set per iteration and read back like a
             # child's output.
-            passthrough_connections=self._passthrough_connections_between(workflow.flows.connections, node, node),
+            passthrough_connections=self._passthrough_connections_between(
+                workflow.flows.connections, node, node, IterativeNodeParam.NEW_ITEM_TO_ADD.value
+            ),
         )
 
         package_result = workflow.handle_request(request)
@@ -3235,17 +3240,17 @@ class NodeExecutor(EngineScoped):
 
     @staticmethod
     def _passthrough_connections_between(
-        connections: Connections, source_node: BaseNode, target_node: BaseNode
+        connections: Connections, source_node: BaseNode, target_node: BaseNode, target_parameter_name: str
     ) -> list[PassthroughConnection]:
-        """The data connections from source_node to target_node, as passthroughs for the packager.
+        """The connections from source_node into target_node's target_parameter_name, as packager passthroughs.
 
-        Both nodes stay outside the package, so the packager would never see these connections.
+        Both nodes stay outside the package, so the packager would never see these connections. Only
+        the named parameter is carried: the loop nodes are also joined by a hidden tether that holds
+        no value, and it must not become a packaged parameter.
         """
         passthroughs = []
         for conn in connections.get_all_outgoing_connections(source_node):
-            if conn.target_node is not target_node:
-                continue
-            if conn.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+            if conn.target_node is not target_node or conn.target_parameter.name != target_parameter_name:
                 continue
             passthroughs.append(
                 PassthroughConnection(

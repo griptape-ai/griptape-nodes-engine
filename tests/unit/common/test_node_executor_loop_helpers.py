@@ -26,7 +26,6 @@ import pytest
 
 from griptape_nodes.common.node_executor import IterationControlAction, IterationFailure, NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
-from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -671,7 +670,9 @@ class TestPassthroughConnectionsBetween:
             _make_connection(start_node, "current_item", body, "text"),
         ]
 
-        passthroughs = NodeExecutor._passthrough_connections_between(connections, start_node, end_node)
+        passthroughs = NodeExecutor._passthrough_connections_between(
+            connections, start_node, end_node, "new_item_to_add"
+        )
 
         assert passthroughs == [
             PassthroughConnection(
@@ -682,14 +683,15 @@ class TestPassthroughConnectionsBetween:
             )
         ]
 
-    def test_skips_control_wires(self) -> None:
+    def test_skips_the_tether_and_control_wires(self) -> None:
         start_node, end_node = _make_loop_pair()
-        control = _make_connection(start_node, "exec_out", end_node, "add_item")
-        control.source_parameter.output_type = ParameterTypeBuiltin.CONTROL_TYPE.value
         connections = MagicMock()
-        connections.get_all_outgoing_connections.return_value = [control]
+        connections.get_all_outgoing_connections.return_value = [
+            _make_connection(start_node, "loop", end_node, "from_start"),
+            _make_connection(start_node, "exec_out", end_node, "add_item"),
+        ]
 
-        assert NodeExecutor._passthrough_connections_between(connections, start_node, end_node) == []
+        assert NodeExecutor._passthrough_connections_between(connections, start_node, end_node, "new_item_to_add") == []
 
     def test_same_node_returns_its_self_wires(self) -> None:
         group = MagicMock()
@@ -701,7 +703,7 @@ class TestPassthroughConnectionsBetween:
             _make_connection(group, "current_item", child, "text"),
         ]
 
-        passthroughs = NodeExecutor._passthrough_connections_between(connections, group, group)
+        passthroughs = NodeExecutor._passthrough_connections_between(connections, group, group, "new_item_to_add")
 
         assert [(p.source_parameter_name, p.target_node_name) for p in passthroughs] == [("current_item", "Group")]
 
