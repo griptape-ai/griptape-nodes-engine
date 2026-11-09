@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import TYPE_CHECKING, ClassVar, Self, assert_never
+
+import numpy as np
 
 from griptape_nodes.image.containers import (
     is_complete,
@@ -36,18 +38,62 @@ from griptape_nodes.image.image_io import (
     temporary_path,
 )
 from griptape_nodes.image.metadata import ImageMetadata
-from griptape_nodes.image.operations import (
+from griptape_nodes.image.operations.buffers import (
     GRAYSCALE_ALPHA_CHANNELS,
     GRAYSCALE_CHANNELS,
     RGBA_CHANNELS,
-    flattened,
-    oriented,
-    rounded,
-    thumbnail,
-    to_rgb,
-    to_rgba,
+    applied,
+    buffer_from_pixels,
+    is_float,
+    native_pixels,
 )
-from griptape_nodes.image.pipeline import Flatten, Orient, PipelineStep, Thumbnail, ToRGB, ToRGBA
+from griptape_nodes.image.operations.channels import new_image, to_gray, to_rgb, to_rgba, to_uint8
+from griptape_nodes.image.operations.color import display_referred, enhanced, inverted, scene_linear
+from griptape_nodes.image.operations.compositing import composited, flattened, rounded, with_alpha
+from griptape_nodes.image.operations.drawing import with_line, with_rectangle, with_text
+from griptape_nodes.image.operations.filters import blurred, dilated, edges, eroded
+from griptape_nodes.image.operations.geometry import (
+    cropped,
+    flipped_horizontal,
+    flipped_vertical,
+    oriented,
+    padded,
+    resized,
+    rotated,
+    thumbnail,
+)
+from griptape_nodes.image.pipeline import (
+    Apply,
+    Brightness,
+    Color,
+    Composite,
+    Contrast,
+    Crop,
+    Dilate,
+    DrawLine,
+    DrawRectangle,
+    DrawText,
+    Erode,
+    FindEdges,
+    Flatten,
+    FlipHorizontal,
+    FlipVertical,
+    GaussianBlur,
+    Invert,
+    Orient,
+    Pad,
+    PipelineStep,
+    Resize,
+    Rotate,
+    RoundCorners,
+    Saturation,
+    SetAlpha,
+    Thumbnail,
+    ToGray,
+    ToRGB,
+    ToRGBA,
+    ToUint8,
+)
 from griptape_nodes.image.pixel_type import PixelType
 from griptape_nodes.image.png_text_chunks import read_text_chunks
 
@@ -222,12 +268,21 @@ class GriptapeImage:
         self._extra_kinds = None
         self._header = None
 
+    def to_array(self) -> np.ndarray:
+        """Return a height x width x channels NumPy copy of the pixels, in their own type, alpha unassociated and last.
+
+        Raises:
+            ValueError: If the image was closed or can't be decoded
+        """
+        return native_pixels(self._decoded())
+
     def encode(
         self,
         image_format: ImageFormat,
         *,
         quality: int | None = None,
         optimize: bool = False,
+        lossless: bool = False,
         metadata: ImageMetadata | None = None,
     ) -> bytes:
         """Encode the image.
@@ -248,6 +303,8 @@ class GriptapeImage:
             image_format: Target format
             quality: Lossy quality 1-100 for JPEG/WEBP; None uses the format's default
             optimize: Spend extra time for a smaller file where the format supports it
+            lossless: Store WEBP without loss, ignoring ``quality``. The other formats ``encode``
+                writes are lossless already, except JPEG, which can't be.
             metadata: Metadata to write. None writes the image's own; ``ImageMetadata()`` writes none.
                 PNG holds all of it; JPEG, WEBP, and TIFF hold EXIF and the color profile; BMP,
                 GIF, TGA, and EXR hold none.
@@ -260,6 +317,9 @@ class GriptapeImage:
         """
         if image_format not in ENCODE_EXTENSIONS:
             msg = f"Attempted to save an image as {image_format}. Failed because that format can't be written."
+            raise ValueError(msg)
+        if lossless and image_format == ImageFormat.JPEG:
+            msg = "Attempted to save an image as lossless JPEG. Failed because JPEG is always lossy."
             raise ValueError(msg)
 
         source = self._source
@@ -274,6 +334,7 @@ class GriptapeImage:
         if (
             source is not None
             and writes_some
+            and not lossless
             and self._can_splice(source, image_format, quality, requested, optimize=optimize)
         ):
             encoded = source
@@ -288,6 +349,7 @@ class GriptapeImage:
                 dropped,
                 optimize=optimize,
                 holds_display_values=self._holds_display_values(),
+                lossless=lossless,
             )
             if own_metadata or requested.exif or requested.text:
                 dropped.extend(self._extra_metadata_kinds())
@@ -379,21 +441,86 @@ class GriptapeImage:
             return self._apply_step(None)
         return current
 
-    def _apply_step(self, step: PipelineStep | None) -> GriptapeImage:  # noqa: PLR0911
+    def _apply_step(self, step: PipelineStep | None) -> GriptapeImage:
         """Return a new image with ``step`` applied, or an unchanged copy for None."""
-        if step is None:
-            return self._derive(self._decoded().copy(), step)
-        if isinstance(step, Flatten):
-            return self._derive(flattened(self._decoded(), step), step)
-        if isinstance(step, Thumbnail):
-            return self._derive(thumbnail(self._decoded(), step), step)
-        if isinstance(step, Orient):
-            return self._derive(oriented(self._decoded(), step.orientation), step)
-        if isinstance(step, ToRGB):
-            return self._derive(to_rgb(self._decoded()), step)
-        if isinstance(step, ToRGBA):
-            return self._derive(to_rgba(self._decoded()), step)
-        return self._derive(rounded(self._decoded(), step), step)
+        return self._derive(self._step_pixels(step), step)
+
+    def _step_pixels(self, step: PipelineStep | None) -> oiio.ImageBuf:  # noqa: C901, PLR0911, PLR0912
+        """Return the pixels ``step`` makes from this image's."""
+        buf = self._decoded()
+        match step:
+            case None:
+                return buf.copy()
+            case Thumbnail():
+                return thumbnail(buf, step)
+            case Orient():
+                return oriented(buf, step.orientation)
+            case ToRGB():
+                return to_rgb(buf)
+            case ToRGBA():
+                return to_rgba(buf)
+            case RoundCorners():
+                return rounded(buf, step)
+            case Flatten():
+                return flattened(buf, step)
+            case Resize():
+                return resized(buf, step.width, step.height, step.resize_filter)
+            case Crop():
+                return cropped(buf, step)
+            case Rotate():
+                return rotated(buf, step)
+            case FlipHorizontal():
+                return flipped_horizontal(buf)
+            case FlipVertical():
+                return flipped_vertical(buf)
+            case Pad():
+                return padded(buf, step)
+            case ToGray():
+                return to_gray(buf)
+            case ToUint8():
+                return to_uint8(buf, holds_display_values=self._holds_display_values())
+            case Brightness() | Contrast() | Saturation():
+                return enhanced(buf, step)
+            case Invert():
+                return inverted(buf)
+            case GaussianBlur():
+                return blurred(buf, step.radius)
+            case Dilate():
+                return dilated(buf, step.size)
+            case Erode():
+                return eroded(buf, step.size)
+            case FindEdges():
+                return edges(buf)
+            case Composite():
+                return composited(buf, self._encoded_like_self(step.overlay), step)
+            case SetAlpha():
+                alpha = step.alpha
+                if isinstance(alpha, GriptapeImage):
+                    return with_alpha(buf, alpha._decoded())
+                return with_alpha(buf, alpha)
+            case DrawText():
+                return with_text(buf, step)
+            case DrawRectangle():
+                return with_rectangle(buf, step)
+            case DrawLine():
+                return with_line(buf, step)
+            case Apply():
+                return applied(buf, step.function)
+            case _:
+                assert_never(step)
+
+    def _encodes_display(self) -> bool:
+        """Whether the pixels hold display values: integer pixels always do, float ones may be scene-linear."""
+        return not is_float(self._decoded()) or self._holds_display_values()
+
+    def _encoded_like_self(self, other: GriptapeImage) -> oiio.ImageBuf:
+        """Return ``other``'s pixels with the same encoding as this image's, so the two can be mixed."""
+        buf = other._decoded()
+        if self._encodes_display() == other._encodes_display():
+            return buf
+        if self._encodes_display():
+            return display_referred(buf)
+        return scene_linear(buf)
 
     def _derive(self, buf: oiio.ImageBuf, step: PipelineStep | None) -> GriptapeImage:
         """Wrap a step's output, with this image's metadata updated to describe it."""
@@ -411,6 +538,8 @@ class GriptapeImage:
         exif = metadata.exif
         if exif is not None:
             _describe_pixels(exif, buf.spec(), oriented=isinstance(step, Orient))
+        # Float pixels a step computed from integer ones hold the same display values, scaled to 0-1
+        display_encoded = self._holds_display_values() or not is_float(self._decoded())
         return type(self)(
             source=None,
             source_path=None,
@@ -418,7 +547,7 @@ class GriptapeImage:
             image_format=self._format,
             metadata=replace(metadata, exif=exif, icc_profile=icc_profile),
             extra_metadata_kinds=self._extra_metadata_kinds(),
-            display_encoded=self._holds_display_values(),
+            display_encoded=display_encoded,
         )
 
     def _spec(self) -> oiio.ImageSpec:
@@ -501,6 +630,42 @@ class GriptapeImage:
         if image.format is None:
             image._format = ImageFormat.from_name(image._read_header().file_format_name)
         return image
+
+    @classmethod
+    def from_array(cls, pixels: np.ndarray, metadata: ImageMetadata | None = None) -> GriptapeImage:
+        """Make an image from a height x width (x channels) NumPy array.
+
+        One channel is gray, two gray and alpha, three RGB, four RGBA, with unassociated alpha.
+        Integer types use their full range; float pixels are 0-1 and, as with EXR, taken as
+        scene-linear unless ``metadata`` carries a color profile. The array is copied. The image
+        has no format until it's encoded.
+
+        Raises:
+            ValueError: If the array's shape or type isn't one an image can have
+        """
+        PixelType.from_numpy(pixels.dtype)
+        buf = buffer_from_pixels(np.array(pixels))
+        if metadata is None:
+            metadata = ImageMetadata()
+        return cls(
+            source=None, source_path=None, buf=buf, image_format=None, metadata=metadata, extra_metadata_kinds=[]
+        )
+
+    @classmethod
+    def new(cls, width: int, height: int, color: Color = (0, 0, 0)) -> GriptapeImage:
+        """Make an 8-bit image of one color: gray, gray and alpha, RGB, or RGBA, as many channels as ``color`` has.
+
+        Raises:
+            ValueError: If the size isn't positive or the color doesn't have 1-4 values
+        """
+        return cls(
+            source=None,
+            source_path=None,
+            buf=new_image(width, height, color),
+            image_format=None,
+            metadata=ImageMetadata(),
+            extra_metadata_kinds=[],
+        )
 
 
 def _container_exif(source: bytes, image_format: ImageFormat) -> Exif | None:

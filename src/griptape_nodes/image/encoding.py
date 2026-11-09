@@ -16,15 +16,17 @@ from griptape_nodes.image.containers import (
 )
 from griptape_nodes.image.exif import replace_tiff_exif
 from griptape_nodes.image.formats import ImageFormat
-from griptape_nodes.image.image_io import ICC_PROFILE, UNASSOCIATED_ALPHA, temporary_path, write_file
-from griptape_nodes.image.operations import (
+from griptape_nodes.image.image_io import ICC_PROFILE, temporary_path, write_file
+from griptape_nodes.image.operations.buffers import (
     GRAYSCALE_ALPHA_CHANNELS,
+    GRAYSCALE_CHANNELS,
     RGB_CHANNELS,
     RGBA_CHANNELS,
-    display_referred,
+    UNASSOCIATED_ALPHA,
     is_float,
-    to_rgba,
 )
+from griptape_nodes.image.operations.channels import to_rgb, to_rgba
+from griptape_nodes.image.operations.color import display_referred
 from griptape_nodes.image.png_text_chunks import insert_text_chunks
 
 if TYPE_CHECKING:
@@ -46,6 +48,9 @@ ENCODE_EXTENSIONS = {
 _TEXT_FORMATS = frozenset({ImageFormat.PNG})
 _EXIF_FORMATS = frozenset({ImageFormat.JPEG, ImageFormat.PNG, ImageFormat.WEBP, ImageFormat.TIFF})
 _ICC_FORMATS = frozenset({ImageFormat.JPEG, ImageFormat.PNG, ImageFormat.WEBP, ImageFormat.TIFF})
+
+# Formats whose OpenImageIO writers refuse one-channel gray
+_COLOR_ONLY_FORMATS = frozenset({ImageFormat.WEBP, ImageFormat.GIF})
 
 # Formats that store float pixels as they are; the rest get display values
 _FLOAT_FORMATS = frozenset({ImageFormat.EXR, ImageFormat.TIFF})
@@ -94,6 +99,7 @@ def reencoded(  # noqa: PLR0913
     *,
     optimize: bool,
     holds_display_values: bool,
+    lossless: bool,
 ) -> bytes:
     """Encode ``buf`` with ``requested``'s color profile, then write the rest of it into the container.
 
@@ -108,6 +114,7 @@ def reencoded(  # noqa: PLR0913
         optimize: Spend extra time for a smaller file where the format supports it
         holds_display_values: Whether float pixels already hold display values, so a format that
             stores display values takes them as they are
+        lossless: Store WEBP without loss, ignoring ``quality``
 
     Returns:
         The encoded file bytes
@@ -118,9 +125,11 @@ def reencoded(  # noqa: PLR0913
     if buf.nchannels == GRAYSCALE_ALPHA_CHANNELS and image_format != ImageFormat.PNG:
         # PNG is the only format here that holds gray with alpha
         buf = to_rgba(buf)
+    elif buf.nchannels == GRAYSCALE_CHANNELS and image_format in _COLOR_ONLY_FORMATS:
+        buf = to_rgb(buf)
     if is_float(buf) and image_format not in _FLOAT_FORMATS and not holds_display_values:
         buf = display_referred(buf)
-    spec = _output_spec(buf, image_format, quality, optimize=optimize)
+    spec = _output_spec(buf, image_format, quality, optimize=optimize, lossless=lossless)
     icc_profile = None
     if requested.icc_profile is not None and image_format in _ICC_FORMATS:
         icc_profile = requested.icc_profile
@@ -215,7 +224,7 @@ def _tiff_with_exif(encoded: bytes, exif: Exif, dropped: list[str]) -> bytes:
 
 
 def _output_spec(
-    buf: oiio.ImageBuf, image_format: ImageFormat, quality: int | None, *, optimize: bool
+    buf: oiio.ImageBuf, image_format: ImageFormat, quality: int | None, *, optimize: bool, lossless: bool
 ) -> oiio.ImageSpec:
     """Return a spec for writing ``buf`` with no metadata, so only the metadata ``reencoded`` is given gets written."""
     source_spec = buf.spec()
@@ -226,6 +235,8 @@ def _output_spec(
         quality = _DEFAULT_QUALITY.get(image_format)
     if image_format == ImageFormat.JPEG and quality is not None:
         spec.attribute("compression", f"jpeg:{quality}")
+    elif image_format == ImageFormat.WEBP and lossless:
+        spec.attribute("compression", "lossless")
     elif image_format == ImageFormat.WEBP and quality is not None:
         spec.attribute("compression", f"webp:{quality}")
         # libwebp's fastest method. Higher ones search harder for a smaller file, and dominate

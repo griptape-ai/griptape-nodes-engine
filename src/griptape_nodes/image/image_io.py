@@ -5,15 +5,14 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import OpenImageIO as oiio  # noqa: N813
 
-from griptape_nodes.image.operations import GRAYSCALE_ALPHA_CHANNELS, alpha_channel, checked
+from griptape_nodes.image.operations.buffers import GRAYSCALE_ALPHA_CHANNELS, UNASSOCIATED_ALPHA, alpha_channel, checked
 
-# Keeps alpha as stored in the file. OpenImageIO otherwise premultiplies on read and divides it
-# back out on write, which rounds 8-bit color under partial alpha.
-UNASSOCIATED_ALPHA = "oiio:UnassociatedAlpha"
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 ICC_PROFILE = "ICCProfile"
 
@@ -79,11 +78,22 @@ def read_file(path: Path) -> Decoded:
     if buf.nchannels == GRAYSCALE_ALPHA_CHANNELS:
         buf.specmod().channelnames = ("Y", "A")
         buf.specmod().alpha_channel = 1
+    elif buf.spec().alpha_channel >= buf.nchannels:
+        # The GIF reader names an alpha channel past the last one, so premultiplying reads the next
+        # pixel's red as alpha. The channel named "A" is the alpha.
+        buf.specmod().alpha_channel = _named_alpha_channel(buf.spec().channelnames)
     # Formats that store associated alpha (EXR, some TIFF) ignore the config; unassociate them so
     # every buffer held is unassociated
     if alpha_channel(buf) is not None and buf.spec().get_int_attribute(UNASSOCIATED_ALPHA, 0) != 1:
         buf = checked(oiio.ImageBufAlgo.unpremult(buf))
     return Decoded(buf, file_format_name)
+
+
+def _named_alpha_channel(channel_names: Sequence[str]) -> int:
+    """Return the index of the channel named "A", or -1 for none."""
+    if "A" not in channel_names:
+        return -1
+    return list(channel_names).index("A")
 
 
 def spec_icc_profile(spec: oiio.ImageSpec) -> bytes | None:
