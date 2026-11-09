@@ -1061,7 +1061,7 @@ def canonicalize_to_posix(path: str | Path) -> str:
     convention. Concrete cases in the tree:
 
     - Reverse-matching a filesystem path against a macro template (see
-      ``IndexedFilenames.extract_index_from_filename``) — templates use
+      ``IndexedFilenames._extract_index_from_filename``) — templates use
       ``/`` but ``Path.glob()`` output uses ``\`` on Windows.
     - Constructing URL-shaped strings from filesystem paths.
     - Deriving registry / cache keys from paths so the same file gets one

@@ -2146,7 +2146,7 @@ class TestGetNextUnusedFilenameRequest:
         # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
         sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
         sequence_partial = partial_resolve(sequence_macro.template, sequence_macro.segments, {}, secrets_manager)
-        sequence_glob = os_manager.indexed_filenames.build_glob_pattern_from_partially_resolved(
+        sequence_glob = os_manager.indexed_filenames._build_glob_pattern_from_partially_resolved(
             sequence_partial.segments, "_index"
         )
         assert sequence_glob == "/anywhere/render_v*.png"
@@ -2154,7 +2154,7 @@ class TestGetNextUnusedFilenameRequest:
         # `NumericPaddingFormat` (legacy): fixed-width `???` (one `?` per digit).
         legacy_macro = ParsedMacro("/anywhere/render_v{_index:03}.png")
         legacy_partial = partial_resolve(legacy_macro.template, legacy_macro.segments, {}, secrets_manager)
-        legacy_glob = os_manager.indexed_filenames.build_glob_pattern_from_partially_resolved(
+        legacy_glob = os_manager.indexed_filenames._build_glob_pattern_from_partially_resolved(
             legacy_partial.segments, "_index"
         )
         assert legacy_glob == "/anywhere/render_v???.png"

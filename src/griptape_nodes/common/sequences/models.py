@@ -87,9 +87,9 @@ class SequenceScanOptions:
 
 # Truncate the inline preview of gap numbers in MissingItemError's __str__
 # after this many entries — the full list lives on `numbers` for callers
-# that need it. Matches the threshold used in
-# `FileSequences.on_scan_sequences_request`'s `result_details` summary so the
-# exception text and the handler's user-facing string truncate at the same point.
+# that need it. Must match `ABORTED_AT_GAP_PREVIEW_COUNT` in
+# `retained_mode/managers/filesystem/sequences.py`, which `describe_missing_items()`
+# uses for the handlers' `result_details`, so both truncate at the same point.
 _GAP_PREVIEW_COUNT = 5
 
 

@@ -1507,7 +1507,7 @@ class TestCreateNewMacroIndexSeed:
         """A `{###}` sequence-slot macro auto-allocates v001/v002/v003 just like the legacy `{_index:03}` form.
 
         Drives the production write path through the new explicit syntax. The
-        parser emits a ``SequenceFormat`` slot which ``has_sequence_slot_marker``
+        parser emits a ``SequenceFormat`` slot which ``_has_sequence_slot_marker``
         recognizes through the seed gate and the collision-walk gate — so the
         ``{###}`` macro produces the same v001/v002/v003 sequence as the legacy
         ``{_index:03}`` form would. (The glob-builder's ``SequenceFormat`` →
@@ -1560,7 +1560,7 @@ class TestCreateNewMacroIndexSeed:
         a CREATE_NEW save and assert: (a) the new file lands at the literal name, and (b) the
         index allocated reflects only files whose name actually matches the literal template,
         not the false-positive. If this fails the fix lives in
-        ``build_glob_pattern_from_partially_resolved`` (or its caller) and tracks under a
+        ``_build_glob_pattern_from_partially_resolved`` (or its caller) and tracks under a
         follow-up issue — see the plan file.
         """
         # Bracket class would match any single char in the class — `renderx_v001.png` would
@@ -2050,7 +2050,7 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
 
         On Windows: ``Path.glob()`` returns absolute ``WindowsPath`` objects whose ``str()``
         uses backslashes. The macro template uses forward slashes. Without a clean
-        round-trip in ``extract_index_from_filename``, indices won't extract and the scan
+        round-trip in ``_extract_index_from_filename``, indices won't extract and the scan
         returns 1 every call — the same failure mode that broke the prior Windows CI run.
         """
         outputs_dir = temp_dir / "outputs"
