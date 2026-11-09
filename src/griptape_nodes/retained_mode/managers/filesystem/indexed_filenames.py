@@ -502,7 +502,7 @@ class IndexedFilenames(EngineScoped):
         could just as plausibly be a variable the user forgot to bind, and silently
         filling it with ``1`` would write data under a name the user never intended.
 
-        Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
+        Used by the seed step in ``FileWriter._resolve_write_target`` (CREATE_NEW only) — after a
         first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
         that gets ``1`` stuffed into it for the retry.
 
