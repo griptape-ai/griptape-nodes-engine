@@ -126,7 +126,12 @@ class GriptapeImagePipeline:
         return self
 
     def end(self) -> GriptapeImage:
-        """Run the queued steps and return the resulting image. The queue is emptied."""
+        """Run the queued steps and return the resulting image. The queue is emptied.
+
+        CPU-bound and blocking, and decodes the source if nothing has yet. From a coroutine, run the
+        open, ``end`` and encode together in one ``griptape_nodes.utils.async_utils.to_thread`` call,
+        as the preview generators do.
+        """
         steps = _plan_steps(self._steps, self._orientation())
         self._steps.clear()
         return self._image._run_pipeline(steps)
