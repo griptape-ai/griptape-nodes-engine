@@ -16,10 +16,12 @@ from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterContainer,
+    ParameterList,
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
 )
+from griptape_nodes.exe_types.elements.parameter_types import accepts_incoming_type
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup, SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import (
@@ -1063,6 +1065,19 @@ class FlowManager(EngineScoped):
         # Validate that the data type from the source is allowed by the target.
         if not target_param.is_incoming_type_allowed(source_param.output_type):
             details = f'Connection failed on type mismatch "{source_node_name}.{request.source_parameter_name}" type({source_param.output_type}) to "{target_node_name}.{request.target_parameter_name}" types({target_param.input_types}) '
+            if (
+                isinstance(target_param, ParameterList)
+                and accepts_incoming_type(target_param.row_input_types, source_param.output_type)
+                and not self._parameter_list_is_full(target_param)
+            ):
+                details = (
+                    f"{details.rstrip()}. "
+                    f'"{request.target_parameter_name}" holds a list, so a single item goes into a slot. '
+                    f'Add a slot with AddParameterToNodeRequest(node_name="{target_node_name}", '
+                    f'parent_container_name="{request.target_parameter_name}"), then connect to the '
+                    "parameter_name it returns. A source whose output is already a list connects to "
+                    f'"{request.target_parameter_name}" directly.'
+                )
             return CreateConnectionResultFailure(result_details=details)
 
         # Ask each node involved to bless this union.
@@ -2488,6 +2503,13 @@ class FlowManager(EngineScoped):
         run = flows.run_in_progress
         if run is not None and run.state is RunState.CANCELLED:
             raise RuntimeError(_CANCELLED_BEFORE_STARTING)
+
+    @staticmethod
+    def _parameter_list_is_full(parameter_list: ParameterList) -> bool:
+        """Whether `parameter_list` has reached its `max_items`, so another slot would be refused."""
+        if parameter_list.max_items is None:
+            return False
+        return len(parameter_list) >= parameter_list.max_items
 
     @staticmethod
     def _of_run(result: ResultPayload, run_id: str | None) -> ResultPayload:
