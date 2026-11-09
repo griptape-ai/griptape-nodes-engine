@@ -272,6 +272,7 @@ class TestReading:
             (encode(solid(6, 4, (128, 255)), "png"), (6, 4, 2, PixelType.UINT8)),
             (encode(np.zeros((4, 6, 3), dtype=np.float16), "exr"), (6, 4, 3, PixelType.HALF)),
         ],
+        ids=["jpg", "png-uint16", "png-palette", "png-gray-alpha", "exr-half"],
     )
     def test_reads_the_header_without_decoding(self, source: bytes, expected: tuple) -> None:
         with GriptapeImage.open(source) as image:
