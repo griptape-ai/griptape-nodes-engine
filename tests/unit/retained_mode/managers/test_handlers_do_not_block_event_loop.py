@@ -30,11 +30,11 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
-    PILRoundedPreviewGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.rounded_preview_generator import (
+    RoundedPreviewGenerator,
 )
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
-    PILThumbnailGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.thumbnail_generator import (
+    ThumbnailGenerator,
 )
 from tests.unit.image.sample_images import BLUE, RED, encode, size_of, solid
 
@@ -370,8 +370,8 @@ class TestPreviewGenerators:
     @pytest.mark.parametrize(
         ("generator_type", "render_method"),
         [
-            (PILThumbnailGenerator, "_render_thumbnail"),
-            (PILRoundedPreviewGenerator, "_render_rounded_preview"),
+            (ThumbnailGenerator, "_render_thumbnail"),
+            (RoundedPreviewGenerator, "_render_rounded_preview"),
         ],
         ids=["thumbnail", "rounded"],
     )
@@ -402,7 +402,7 @@ class TestPreviewGenerators:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
+        "generator_type", [ThumbnailGenerator, RoundedPreviewGenerator], ids=["thumbnail", "rounded"]
     )
     @pytest.mark.parametrize("color", [BLUE, (*BLUE, 255)], ids=["RGB", "RGBA"])
     async def test_preview_is_still_rendered_from_the_source_image(
@@ -420,7 +420,7 @@ class TestPreviewGenerators:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
+        "generator_type", [ThumbnailGenerator, RoundedPreviewGenerator], ids=["thumbnail", "rounded"]
     )
     async def test_preview_write_failure_raises(
         self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator_type: type

@@ -1,13 +1,13 @@
 """Image preview generators."""
 
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
-    PILRoundedPreviewGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.rounded_preview_generator import (
+    RoundedPreviewGenerator,
 )
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
-    PILThumbnailGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.thumbnail_generator import (
+    ThumbnailGenerator,
 )
 
 __all__ = [
-    "PILRoundedPreviewGenerator",
-    "PILThumbnailGenerator",
+    "RoundedPreviewGenerator",
+    "ThumbnailGenerator",
 ]
