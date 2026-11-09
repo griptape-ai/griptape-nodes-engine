@@ -20,6 +20,10 @@ from rich.prompt import Confirm, Prompt
 
 console = Console()
 
+GRAYSCALE_CHANNELS = 1
+GRAYSCALE_ALPHA_CHANNELS = 2
+RGBA_CHANNELS = 4
+
 
 def extract_metadata_block(file_path: Path) -> tuple[str, str]:
     """Extract metadata block and remaining content from workflow file.
@@ -177,16 +181,14 @@ def process_image(image_path: Path, output_path: Path) -> None:
         new_height = int(img_height * scale)
 
         # Resize image
-        img_resized = oiio.ImageBufAlgo.resize(
-            img, "lanczos3", roi=oiio.ROI(0, new_width, 0, new_height, 0, 1, 0, img.nchannels)
-        )
+        resized_roi = oiio.ROI(0, new_width, 0, new_height, 0, 1, 0, img.nchannels)
+        img_resized = oiio.ImageBufAlgo.resize(img, "lanczos3", roi=resized_roi)
 
         # Crop from center to exact target size
         left = (new_width - target_width) // 2
         top = (new_height - target_height) // 2
-        img_cropped = oiio.ImageBufAlgo.cut(
-            img_resized, oiio.ROI(left, left + target_width, top, top + target_height, 0, 1, 0, img.nchannels)
-        )
+        cropped_roi = oiio.ROI(left, left + target_width, top, top + target_height, 0, 1, 0, img.nchannels)
+        img_cropped = oiio.ImageBufAlgo.cut(img_resized, cropped_roi)
 
         # Save as webp with quality=85
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,11 +217,11 @@ def _save_webp(img: oiio.ImageBuf, output_path: Path, *, quality: int) -> None:
 def _to_rgb_or_rgba(img: oiio.ImageBuf) -> oiio.ImageBuf:
     """Return ``img`` as three-channel color, or four with alpha, expanding grayscale."""
     channels = img.nchannels
-    if channels == 1:
+    if channels == GRAYSCALE_CHANNELS:
         return oiio.ImageBufAlgo.channels(img, (0, 0, 0), ("R", "G", "B"))
-    if channels == 2:  # noqa: PLR2004
+    if channels == GRAYSCALE_ALPHA_CHANNELS:
         return oiio.ImageBufAlgo.channels(img, (0, 0, 0, 1), ("R", "G", "B", "A"))
-    if channels > 4:  # noqa: PLR2004
+    if channels > RGBA_CHANNELS:
         return oiio.ImageBufAlgo.channels(img, (0, 1, 2, 3), ("R", "G", "B", "A"))
     return img
 

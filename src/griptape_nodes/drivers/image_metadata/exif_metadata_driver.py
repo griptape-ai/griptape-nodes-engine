@@ -57,10 +57,10 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             Image bytes with metadata injected
 
         Raises:
-            Exception: On EXIF save errors
+            ValueError: If the image's format doesn't hold EXIF, or it can't be encoded
         """
-        if image.format is None:
-            msg = "Attempted to add EXIF metadata to an image. Failed because the image format is unknown."
+        if image.format is None or image.format not in self.get_supported_formats():
+            msg = f"Attempted to add EXIF metadata to an image. Failed because {image.format or 'an unknown format'} doesn't hold EXIF."
             raise ValueError(msg)
 
         # Get existing EXIF data to preserve it

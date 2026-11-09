@@ -123,25 +123,23 @@ def _render_preview_data_url(
     if target is None:
         msg = f"Attempted to create an image preview. Failed because {image_format} is not a known image format."
         raise ValueError(msg)
-    with GriptapeImagePipeline(source) as pipeline:
-        # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-        pipeline.exif_transpose()
-        # Convert to RGB if necessary (for WebP/JPEG output)
-        if (
-            target in _LOSSY_FORMATS
-            and source.format not in _NO_ALPHA_FORMATS
-            and source.color_space in _CONVERT_TO_RGB_FOR_LOSSY
-        ):
-            pipeline.to_rgb()
-        pipeline.thumbnail(max_width, max_height)
-        with pipeline.end() as preview:
-            # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
-            preview_bytes = preview.encode(
-                target,
-                quality=quality,
-                optimize=True,
-                metadata=ImageMetadata(icc_profile=preview.metadata.icc_profile),
-            )
+    # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
+    pipeline = GriptapeImagePipeline(source).exif_transpose()
+    # Convert to RGB if necessary (for WebP/JPEG output)
+    if (
+        target in _LOSSY_FORMATS
+        and source.format not in _NO_ALPHA_FORMATS
+        and source.color_space in _CONVERT_TO_RGB_FOR_LOSSY
+    ):
+        pipeline.to_rgb()
+    preview = pipeline.thumbnail(max_width, max_height).end()
+    # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+    preview_bytes = preview.encode(
+        target,
+        quality=quality,
+        optimize=True,
+        metadata=ImageMetadata(icc_profile=preview.metadata.icc_profile),
+    )
 
     base64_data = base64.b64encode(preview_bytes).decode("utf-8")
     mime_type = f"image/{image_format.lower()}"

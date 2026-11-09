@@ -45,7 +45,8 @@ class TestPngMetadataDriver:
 
         assert b"zTXt" not in _chunk_types(png)
         assert b"tEXt" in _chunk_types(png)
-        assert PngMetadataDriver().extract_metadata(GriptapeImage.open(png)) == {"gtn_huge": huge_text}
+        extracted = PngMetadataDriver().extract_metadata(GriptapeImage.open(png))
+        assert extracted == {"gtn_huge": huge_text}
 
     def test_text_under_the_decompress_limit_is_compressed(self) -> None:
         large_text = "a" * (MAX_COMPRESSED_TEXT_BYTES - 1)
@@ -53,4 +54,5 @@ class TestPngMetadataDriver:
         png = PngMetadataDriver().inject_metadata(_blank_png(), {"gtn_large": large_text})
 
         assert b"zTXt" in _chunk_types(png)
-        assert PngMetadataDriver().extract_metadata(GriptapeImage.open(png)) == {"gtn_large": large_text}
+        extracted = PngMetadataDriver().extract_metadata(GriptapeImage.open(png))
+        assert extracted == {"gtn_large": large_text}
