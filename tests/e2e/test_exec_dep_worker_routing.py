@@ -17,6 +17,7 @@ execution dependencies is untouched by any of it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import sys
@@ -28,10 +29,16 @@ import pytest
 from griptape_nodes.exe_types.local_objects import is_reference
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultSuccess,
     NodeMetadata,
+    StartFlowRequest,
+    StartFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
@@ -387,6 +394,51 @@ class TestUnshippableOutputIsKept:
         entry = worker.engine.resource_manager.entry_for(sent["key"])
         assert entry is not None
         assert entry.value.marker == "live-session-marker"
+
+    @pytest.mark.asyncio
+    async def test_worker_copy_receives_a_serializable_false_input(self, tmp_path: Path) -> None:
+        """A consumer's serializable=False input reaches its worker copy, which a save would leave out."""
+        _register(
+            tmp_path,
+            fixture_dir=NONSERIALIZABLE_FIXTURE,
+            node_file="nonserializable_nodes.py",
+            name="Guardrail Library",
+        )
+        engine = current_engine()
+        engine.context_manager.push_workflow(workflow_name="handoff_wf")
+        flow_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="handoff_flow", set_as_new_context=False)
+        )
+        assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+        for node_type, node_name in (("ProducerNode", "Producer"), ("ConsumerNode", "Consumer")):
+            create_result = engine.handle_request(
+                CreateNodeRequest(
+                    node_type=node_type,
+                    specific_library_name="Guardrail Library",
+                    node_name=node_name,
+                    override_parent_flow_name=flow_result.flow_name,
+                )
+            )
+            assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        connect_result = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Producer",
+                source_parameter_name="session",
+                target_node_name="Consumer",
+                target_parameter_name="session",
+            )
+        )
+        assert isinstance(connect_result, CreateConnectionResultSuccess), connect_result
+
+        engine.event_manager.initialize_queue(asyncio.Queue())
+        with simulated_worker(engine, "Guardrail Library"), engine.context_manager.flow(flow_result.flow_name):
+            run_result = await engine.ahandle_request(
+                StartFlowRequest(flow_name=flow_result.flow_name, flow_node_name="Consumer")
+            )
+
+        assert isinstance(run_result, StartFlowResultSuccess), run_result.result_details
+        consumer = engine.node_manager.get_node_by_name("Consumer")
+        assert consumer.parameter_output_values.get("marker") == "live-session-marker"
 
 
 class TestManagerAccessDuringWorkerExecution:
