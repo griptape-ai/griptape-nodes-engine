@@ -162,34 +162,34 @@ def process_image(image_path: Path, output_path: Path) -> None:
             return
 
         # Load image and apply its EXIF orientation
-        with (
-            GriptapeImage.open(image_path) as source,
-            GriptapeImagePipeline(source).exif_transpose().end() as img,
-        ):
-            # Resize to cover 512x512 while maintaining aspect ratio
-            # This is similar to CSS object-fit: cover
-            target_width, target_height = 512, 512
-            img_width = img.width
-            img_height = img.height
+        with GriptapeImage.open(image_path) as source:
+            img = GriptapeImagePipeline(source).exif_transpose().end()
 
-            # Calculate scaling factor to cover the target size
-            scale = max(target_width / img_width, target_height / img_height)
+        # Resize to cover 512x512 while maintaining aspect ratio
+        # This is similar to CSS object-fit: cover
+        target_width, target_height = 512, 512
+        img_width = img.width
+        img_height = img.height
 
-            # Calculate new dimensions
-            new_width = int(img_width * scale)
-            new_height = int(img_height * scale)
+        # Calculate scaling factor to cover the target size
+        scale = max(target_width / img_width, target_height / img_height)
 
-            # Resize, then crop from center to exact target size
-            left = (new_width - target_width) // 2
-            top = (new_height - target_height) // 2
-            pipeline = (
-                GriptapeImagePipeline(img)
-                .resize(new_width, new_height, ResizeFilter.LANCZOS)
-                .crop(left, top, left + target_width, top + target_height)
-            )
-            with pipeline.end() as img_cropped:
-                # Save as webp with quality=85; encoding converts to the RGB or RGBA webp holds
-                encoded = img_cropped.encode(ImageFormat.WEBP, quality=85)
+        # Calculate new dimensions
+        new_width = int(img_width * scale)
+        new_height = int(img_height * scale)
+
+        # Resize, then crop from center to exact target size
+        left = (new_width - target_width) // 2
+        top = (new_height - target_height) // 2
+        img_cropped = (
+            GriptapeImagePipeline(img)
+            .resize(new_width, new_height, ResizeFilter.LANCZOS)
+            .crop(left, top, left + target_width, top + target_height)
+            .end()
+        )
+
+        # Save as webp with quality=85; encoding converts to the RGB or RGBA webp holds
+        encoded = img_cropped.encode(ImageFormat.WEBP, quality=85)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(encoded)
