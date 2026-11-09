@@ -1,4 +1,4 @@
-"""Pixel operations behind ``GriptapeImagePipeline`` steps, on OpenImageIO buffers.
+"""Pixel operations on OpenImageIO buffers, behind ``GriptapeImagePipeline`` steps and encoding.
 
 Buffers hold unassociated alpha, last: gray (Y), gray and alpha (Y, A), RGB, or RGBA.
 """
