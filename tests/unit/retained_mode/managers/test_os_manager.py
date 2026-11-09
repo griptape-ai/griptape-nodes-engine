@@ -333,6 +333,8 @@ class TestReadFileRequestImagePreview:
 
         with (
             patch.object(OSManager, "_MAX_PREVIEWABLE_IMAGE_BYTES", len(content) - 1),
+            # Windows has no MIME type for .exr; Linux reads one from /etc/mime.types
+            patch("mimetypes.guess_type", return_value=("image/aces", None)),
             patch(
                 "griptape_nodes.retained_mode.managers.os_manager.create_image_preview_from_bytes",
             ) as mock_create_preview,
