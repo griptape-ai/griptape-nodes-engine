@@ -17,17 +17,16 @@ from griptape_nodes.image.containers import (
 from griptape_nodes.image.exif import replace_tiff_exif
 from griptape_nodes.image.formats import ImageFormat
 from griptape_nodes.image.image_io import ICC_PROFILE, temporary_path, write_file
-from griptape_nodes.image.operations import (
+from griptape_nodes.image.operations.buffers import (
     GRAYSCALE_ALPHA_CHANNELS,
     GRAYSCALE_CHANNELS,
     RGB_CHANNELS,
     RGBA_CHANNELS,
     UNASSOCIATED_ALPHA,
-    display_referred,
     is_float,
-    to_rgb,
-    to_rgba,
 )
+from griptape_nodes.image.operations.channels import to_rgb, to_rgba
+from griptape_nodes.image.operations.color import display_referred
 from griptape_nodes.image.png_text_chunks import insert_text_chunks
 
 if TYPE_CHECKING:

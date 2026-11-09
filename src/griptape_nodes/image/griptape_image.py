@@ -38,42 +38,29 @@ from griptape_nodes.image.image_io import (
     temporary_path,
 )
 from griptape_nodes.image.metadata import ImageMetadata
-from griptape_nodes.image.operations import (
+from griptape_nodes.image.operations.buffers import (
     GRAYSCALE_ALPHA_CHANNELS,
     GRAYSCALE_CHANNELS,
     RGBA_CHANNELS,
     applied,
-    blurred,
     buffer_from_pixels,
-    composited,
-    cropped,
-    dilated,
-    display_referred,
-    edges,
-    enhanced,
-    eroded,
-    flattened,
-    flipped_horizontal,
-    flipped_vertical,
-    inverted,
     is_float,
     native_pixels,
-    new_image,
+)
+from griptape_nodes.image.operations.channels import new_image, to_gray, to_rgb, to_rgba, to_uint8
+from griptape_nodes.image.operations.color import display_referred, enhanced, inverted, scene_linear
+from griptape_nodes.image.operations.compositing import composited, flattened, rounded, with_alpha
+from griptape_nodes.image.operations.drawing import with_line, with_rectangle, with_text
+from griptape_nodes.image.operations.filters import blurred, dilated, edges, eroded
+from griptape_nodes.image.operations.geometry import (
+    cropped,
+    flipped_horizontal,
+    flipped_vertical,
     oriented,
     padded,
     resized,
     rotated,
-    rounded,
-    scene_linear,
     thumbnail,
-    to_gray,
-    to_rgb,
-    to_rgba,
-    to_uint8,
-    with_alpha,
-    with_line,
-    with_rectangle,
-    with_text,
 )
 from griptape_nodes.image.pipeline import (
     Apply,

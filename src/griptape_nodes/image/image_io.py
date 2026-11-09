@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import OpenImageIO as oiio  # noqa: N813
 
-from griptape_nodes.image.operations import GRAYSCALE_ALPHA_CHANNELS, UNASSOCIATED_ALPHA, alpha_channel, checked
+from griptape_nodes.image.operations.buffers import GRAYSCALE_ALPHA_CHANNELS, UNASSOCIATED_ALPHA, alpha_channel, checked
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
