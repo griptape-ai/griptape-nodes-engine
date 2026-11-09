@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
 
 
-class PILRoundedParameters(BaseGeneratorParameters):
+class RoundedParameters(BaseGeneratorParameters):
     """Parameters for rounded preview generation."""
 
     max_width: PositiveInt = Field(
@@ -60,7 +60,7 @@ class PILRoundedParameters(BaseGeneratorParameters):
     )
 
 
-class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
+class RoundedPreviewGenerator(BaseArtifactPreviewGenerator):
     """Generate image previews with rounded corners and transparent backgrounds.
 
     Creates thumbnails with rounded corners. Corners are transparent
@@ -101,7 +101,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
 
         # Validate and convert dict -> Pydantic model
         # Raises ValidationError if invalid
-        self.params = PILRoundedParameters.model_validate(params)
+        self.params = RoundedParameters.model_validate(params)
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -133,7 +133,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
     @classmethod
     def get_parameters(cls) -> type[BaseGeneratorParameters]:
         """Get parameter model class."""
-        return PILRoundedParameters
+        return RoundedParameters
 
     async def attempt_generate_preview(self) -> str:
         """Attempt to generate preview file with rounded corners.
@@ -192,14 +192,18 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
         if preview_format is None:
             msg = f"Attempted to generate a rounded preview. Failed because {self.preview_format} is not a known image format."
             raise TypeError(msg)
-        with GriptapeImage.open(image_data) as source, GriptapeImagePipeline(source) as pipeline:
+        with GriptapeImage.open(image_data) as source:
             # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
             # fit within the max dimensions, preserving aspect ratio
-            pipeline.exif_transpose().thumbnail(self.params.max_width, self.params.max_height)
-            pipeline.round_corners(self.params.corner_radius_percent / 100.0)
+            pipeline = (
+                GriptapeImagePipeline(source)
+                .exif_transpose()
+                .thumbnail(self.params.max_width, self.params.max_height)
+                .round_corners(self.params.corner_radius_percent / 100.0)
+            )
             if preview_format == ImageFormat.JPEG:
                 # JPEG doesn't support transparency - composite onto white background
                 pipeline.flatten((255, 255, 255))
-            with pipeline.end() as preview:
-                # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
-                return preview.encode(preview_format, metadata=ImageMetadata(icc_profile=preview.metadata.icc_profile))
+            preview = pipeline.end()
+        # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+        return preview.encode(preview_format, metadata=ImageMetadata(icc_profile=preview.metadata.icc_profile))

@@ -109,11 +109,11 @@ class ImageArtifactProvider(BaseArtifactProvider):
     def get_default_preview_generators(cls) -> list[type[BaseArtifactPreviewGenerator]]:
         """Get default preview generator classes."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILRoundedPreviewGenerator,
-            PILThumbnailGenerator,
+            RoundedPreviewGenerator,
+            ThumbnailGenerator,
         )
 
-        return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
+        return [ThumbnailGenerator, RoundedPreviewGenerator]
 
     @classmethod
     def detect_format(cls, data: bytes) -> str | None:
