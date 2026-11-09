@@ -2035,14 +2035,15 @@ class NodeManager(EngineScoped):
                 f"Failed because no node named '{node_name}' exists."
             )
             raise _ConnectedDestinationError(msg)
-        if node.get_parameter_by_name(parameter_name) is None:
+        parameter = node.get_parameter_by_name(parameter_name)
+        if parameter is None:
             msg = (
                 f"Attempted to read the output settings connected to {target}. "
                 f"Failed because '{node_name}' has no parameter named '{parameter_name}'."
             )
             raise _ConnectedDestinationError(msg)
 
-        sources = self._sources_through_group_proxies(workflow, node_name, parameter_name)
+        sources = self._sources_through_group_proxies(workflow, node, parameter)
         provider = next((source for source in sources if isinstance(source, provider_type)), None)
         if provider is None:
             return _ConnectedDestination(spec=None, details=f"No output settings are connected to {target}.")
@@ -2059,23 +2060,19 @@ class NodeManager(EngineScoped):
         )
 
     def _sources_through_group_proxies(
-        self, workflow: WorkflowRuntime, node_name: str, parameter_name: str
+        self, workflow: WorkflowRuntime, node: BaseNode, parameter: Parameter
     ) -> list[BaseNode]:
-        """The nodes feeding ``node_name.parameter_name``, looking through group proxy parameters.
+        """The nodes feeding ``node.parameter``, looking through group proxy parameters.
 
         A wire that crosses a group's boundary, into it or out of it, runs through a proxy parameter on the
         group, so the source a node sees can be the group. Following what feeds that proxy finds the node
         at the other end.
         """
-        connection_mgr = workflow.flows.connections
         sources: list[BaseNode] = []
-        for connection_id in connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, []):
-            connection = connection_mgr.connections[connection_id]
+        for connection in workflow.flows.connections.get_incoming_connections_to_parameter(node, parameter):
             if isinstance(connection.source_node, SubflowNodeGroup):
                 sources.extend(
-                    self._sources_through_group_proxies(
-                        workflow, connection.source_node.name, connection.source_parameter.name
-                    )
+                    self._sources_through_group_proxies(workflow, connection.source_node, connection.source_parameter)
                 )
             else:
                 sources.append(connection.source_node)

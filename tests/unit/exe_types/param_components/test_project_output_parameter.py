@@ -74,6 +74,13 @@ class TestGetUpstreamDestination:
 
         _mock_node(param)._handle_request_in_workflow.assert_called_once_with(_request(param))
 
+    def test_a_node_in_no_workflow_has_no_settings_node_and_sends_nothing(self) -> None:
+        param = _make_param(None)
+        _mock_node(param).workflow = None
+
+        assert _get(param) is None
+        _mock_node(param)._handle_request_in_workflow.assert_not_called()
+
     def test_returns_none_when_no_settings_node_is_connected(self) -> None:
         param = _make_param(
             destination_events.GetConnectedDirectoryDestinationResultSuccess(destination=None, result_details="ok")

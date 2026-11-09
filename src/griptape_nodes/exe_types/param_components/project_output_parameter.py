@@ -157,6 +157,9 @@ class ProjectOutputParameter(abc.ABC):
             ValueError: If the request fails, including when a connected settings node has no
                 destination set.
         """
+        # A node in no workflow has no connections, so no settings node can be wired to it.
+        if self._node.workflow is None:
+            return None
         result = self._node._handle_request_in_workflow(request)
         if not result.succeeded():
             raise ValueError(str(result.result_details))
