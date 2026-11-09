@@ -14,6 +14,14 @@ if typing.TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.exe_types import node_types
+    from griptape_nodes.retained_mode.events import base_events
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+class _ConnectedDestinationResult[SpecT](typing.Protocol):
+    """The success result every ``GetConnected...DestinationRequest`` returns."""
+
+    destination: SpecT | None
 
 
 class ProjectOutputParameter(abc.ABC):
@@ -125,55 +133,45 @@ class ProjectOutputParameter(abc.ABC):
         self._node.set_parameter_value(self._name, self._default_value)
         self._node.publish_update_to_parameter(self._name, self._default_value)
 
-    def _get_upstream_destination[ProviderT, DestinationT](
+    def _get_upstream_destination[SpecT, DestinationT](
         self,
-        provider_type: type[ProviderT],
-        get_destination: Callable[[ProviderT], DestinationT | None],
-        destination_type_name: str,
+        request: base_events.RequestPayload,
+        success_type: type[_ConnectedDestinationResult[SpecT]],
+        from_spec: Callable[[SpecT, WorkflowRuntime | None], DestinationT],
     ) -> DestinationT | None:
-        """Return the destination from the first connected upstream node that implements ``provider_type``.
+        """Return the destination a settings node connected to this parameter supplies.
 
-        Returns None if no connected node implements the provider protocol. The provider builds
-        the destination with the node's workflow bound.
+        The request is answered where the settings node lives, so this gives the same answer
+        in-process and in a worker. The destination is rebuilt in the node's workflow, so it can
+        be used from any thread.
 
         Args:
-            provider_type: ``runtime_checkable`` Protocol the upstream node must satisfy
-                (e.g. ``FileDestinationProvider``).
-            get_destination: Reads the destination off a matching provider.
-            destination_type_name: Human-readable type name used in error messages
-                (e.g. ``'FileDestination'``).
+            request: A ``GetConnected...DestinationRequest`` naming this node and parameter.
+            success_type: The success result that request returns.
+            from_spec: Rebuilds the destination in a workflow from the result's plain-data form.
+
+        Returns:
+            The destination, or None when no settings node is connected.
 
         Raises:
-            ValueError: If a connected provider returns None.
+            ValueError: If the request fails, including when a connected settings node has no
+                destination set.
         """
-        result = self._node._handle_request_in_workflow(
-            connection_events.ListConnectionsForNodeRequest(node_name=self._node.name)
-        )
-        if not isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
+        # A node in no workflow has no connections, so no settings node can be wired to it.
+        if self._node.workflow is None:
             return None
-
-        workflow = self._node._require_workflow()
-        for conn in result.incoming_connections:
-            if conn.target_parameter_name != self._name:
-                continue
-            source_node = workflow.objects.get(conn.source_node_name)
-            if not isinstance(source_node, provider_type):
-                continue
-            # Library code reaches the engine through the facade, which acts as the caller is
-            # bound. Binding the node's workflow lets a provider such as `FileOutputSettings`
-            # build a destination for it from a plain thread or a thread pool.
-            with self._node.engine.bind_workflow(workflow):
-                destination = get_destination(source_node)
-            if destination is None:
-                msg = (
-                    f"Attempted to build {destination_type_name} for {self._node.name}.{self._name}. "
-                    f"Failed because upstream node '{conn.source_node_name}' provides a "
-                    f"{destination_type_name} but returned None (likely missing a filename or path)."
-                )
-                raise ValueError(msg)
-            return destination
-
-        return None
+        result = self._node._handle_request_in_workflow(request)
+        if not result.succeeded():
+            raise ValueError(str(result.result_details))
+        if not isinstance(result, success_type):
+            msg = (
+                f"Attempted to read the output settings connected to '{self._node.name}.{self._name}'. "
+                f"Failed because {type(request).__name__} returned {type(result).__name__}."
+            )
+            raise TypeError(msg)
+        if result.destination is None:
+            return None
+        return from_spec(result.destination, self._node.workflow)
 
     def _on_configure_button_clicked(
         self,
