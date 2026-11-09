@@ -3107,7 +3107,7 @@ async def _sent_by[R](sender: RequestSender, handler: Callable[[Any], Awaitable[
         _active_request_sender.reset(token)
 
 
-def _register_session(worker_manager: WorkerManager, **overrides: object) -> object:
+def _register_session(worker_manager: WorkerManager, *, sender: RequestSender = _ARTIST, **overrides: object) -> object:
     fields: dict[str, object] = {
         "schema_version": DISTRIBUTED_EXECUTION_SCHEMA_VERSION,
         "engine_version": engine_version,
@@ -3115,7 +3115,7 @@ def _register_session(worker_manager: WorkerManager, **overrides: object) -> obj
         "static_server_base_url": "http://workstation:8124",
     }
     fields.update(overrides)
-    token = _active_request_sender.set(_ARTIST)
+    token = _active_request_sender.set(sender)
     try:
         return worker_manager.handle_offer_session_for_workers_request(
             worker_events.OfferSessionForWorkersRequest(**fields)  # type: ignore[arg-type]
@@ -3415,6 +3415,115 @@ class TestServingAnotherEnginesSession:
 
         assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
         assert worker_manager._hosted_workers == {}
+
+    @pytest.mark.asyncio
+    async def test_a_start_naming_an_id_already_hosted_for_another_session_is_refused(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """A second session choosing the same worker ID must not overwrite who the first one is hosted for."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+        await _host(worker_manager)
+        other_artist = RequestSender(engine_id="other-artist-engine", session_id="other-sess")
+        _register_session(worker_manager, sender=other_artist)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(
+                other_artist, worker_manager.handle_start_worker_for_engine_request, _start_for_artist()
+            )
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "w1" in str(result.result_details)
+        assert "already in use" in str(result.result_details)
+        spawn.assert_not_awaited()
+        assert worker_manager._hosted_workers["w1"].session_id == _ARTIST_SESSION
+
+    @pytest.mark.asyncio
+    async def test_a_start_naming_a_registered_worker_s_id_is_refused(self, worker_manager: WorkerManager) -> None:
+        """A local worker already running under that ID must not be mistaken for one hosted for a session."""
+        await worker_manager.handle_register_worker_request(
+            worker_events.RegisterWorkerRequest(worker_engine_id="w1", engine_version=engine_version)
+        )
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "already in use" in str(result.result_details)
+        spawn.assert_not_awaited()
+        assert worker_manager._hosted_workers == {}
+
+    @pytest.mark.asyncio
+    async def test_a_start_naming_a_pending_remote_start_s_id_is_refused(self, worker_manager: WorkerManager) -> None:
+        """An ID this engine already asked another engine to start under must not be reused for a session it hosts."""
+        links = _host_engine(worker_manager)
+        await _start_on_host_engine(worker_manager)
+        worker_engine_id = _started_worker_id(links)
+        _register_session(worker_manager)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(
+                _ARTIST,
+                worker_manager.handle_start_worker_for_engine_request,
+                _start_for_artist(worker_engine_id=worker_engine_id),
+            )
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "already in use" in str(result.result_details)
+        spawn.assert_not_awaited()
+        assert worker_manager._hosted_workers == {}
+
+    @pytest.mark.asyncio
+    async def test_a_start_naming_this_engine_s_own_id_is_refused(self, worker_manager: WorkerManager) -> None:
+        """This engine's own ID must never be handed to a worker, or the worker could be mistaken for it."""
+        _host_engine(worker_manager)
+        _register_session(worker_manager)
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            result = await _sent_by(
+                _ARTIST,
+                worker_manager.handle_start_worker_for_engine_request,
+                _start_for_artist(worker_engine_id=_ENGINE),
+            )
+
+        assert isinstance(result, worker_events.StartWorkerForEngineResultFailure)
+        assert "already in use" in str(result.result_details)
+        spawn.assert_not_awaited()
+        assert worker_manager._hosted_workers == {}
+
+    @pytest.mark.asyncio
+    async def test_a_refused_duplicate_leaves_the_first_hosted_worker_s_stop_working(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        links = _host_engine(worker_manager)
+        _register_session(worker_manager)
+        exits = asyncio.Event()
+        proc = await _host(worker_manager, exits=exits)
+        other_artist = RequestSender(engine_id="other-artist-engine", session_id="other-sess")
+        _register_session(worker_manager, sender=other_artist)
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
+            duplicate = await _sent_by(
+                other_artist, worker_manager.handle_start_worker_for_engine_request, _start_for_artist()
+            )
+        assert isinstance(duplicate, worker_events.StartWorkerForEngineResultFailure)
+        spawn.assert_not_awaited()
+
+        with patch.object(
+            worker_manager, "_terminate_via_spawn_loop", new=AsyncMock(side_effect=lambda *_args: exits.set())
+        ) as terminate:
+            result = await _sent_by(
+                _ARTIST,
+                worker_manager.handle_stop_worker_for_engine_request,
+                worker_events.StopWorkerForEngineRequest(worker_engine_id="w1"),
+            )
+        await asyncio.gather(*worker_manager._exit_watchers)
+
+        assert isinstance(result, worker_events.StopWorkerForEngineResultSuccess)
+        terminate.assert_awaited_once_with(f"{_ARTIST_SESSION}/{_LIBRARY}", proc)
+        (report,) = links.sent_of(worker_events.ReportWorkerExitedRequest)
+        assert cast("worker_events.ReportWorkerExitedRequest", report).reason == "stopped"
 
     @pytest.mark.asyncio
     async def test_a_worker_that_exits_on_its_own_is_reported_exited_with_its_code(
