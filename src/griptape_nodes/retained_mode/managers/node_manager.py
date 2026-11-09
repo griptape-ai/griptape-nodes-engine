@@ -2035,16 +2035,16 @@ class NodeManager(EngineScoped):
                 f"Failed because no node named '{node_name}' exists."
             )
             raise _ConnectedDestinationError(msg)
-        if node.get_parameter_by_name(parameter_name) is None:
+        parameter = node.get_parameter_by_name(parameter_name)
+        if parameter is None:
             msg = (
                 f"Attempted to read the output settings connected to {target}. "
                 f"Failed because '{node_name}' has no parameter named '{parameter_name}'."
             )
             raise _ConnectedDestinationError(msg)
 
-        connection_mgr = workflow.flows.connections
-        connection_ids = connection_mgr.incoming_index.get(node_name, {}).get(parameter_name, [])
-        sources = [connection_mgr.connections[connection_id].source_node for connection_id in connection_ids]
+        incoming = workflow.flows.connections.get_incoming_connections_to_parameter(node, parameter)
+        sources = [connection.source_node for connection in incoming]
         provider = next((source for source in sources if isinstance(source, provider_type)), None)
         if provider is None:
             return _ConnectedDestination(spec=None, details=f"No output settings are connected to {target}.")
