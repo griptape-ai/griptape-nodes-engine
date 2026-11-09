@@ -1,111 +1,107 @@
 """Tests for the private parent<->worker channel transport in `griptape_nodes.worker.channel`.
 
-Most tests connect two `Channel`s in this process over a real `Listener`/`Client` pair: the
-transport is a real socket (or named pipe on Windows), only the two processes are faked away.
-One test spawns a real child process to prove the environment-variable handshake end to end.
+Most tests connect two `AsyncChannel`s in this process over a real loopback TCP pair: the
+transport is real, only the two processes are faked away. One test spawns a real child process
+through a wrapper command (standing in for `worker.command_prefix`) to prove the environment-
+variable handshake, the token, and a worker's own synchronous `WorkerLink` usage end to end.
 
-No sleeps for synchronization anywhere: every wait is on an `Event`, a `Future`, or a frame that
-has to have already been processed because of the channel's own ordering guarantee.
+No sleeps for synchronization anywhere: every wait is on an `asyncio.Event`, a request/response
+round trip, or `asyncio.gather` over the outstanding tasks -- never a fixed delay.
 """
 
 from __future__ import annotations
 
 import ast
-import json
-import socket
-import stat
+import asyncio
+import os
+import shutil
+import struct
 import sys
 import threading
-import time
-from multiprocessing import AuthenticationError, Process, Queue
-from multiprocessing.connection import Client
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pytest
 
+from griptape_nodes.utils.async_utils import call_function
 from griptape_nodes.worker import channel as channel_module
 from griptape_nodes.worker.channel import (
-    AcceptCancelledError,
-    Channel,
+    AsyncChannel,
     ChannelClosedError,
-    ChannelListener,
+    ChannelRequestError,
     GateDecision,
-    connect_from_environment,
+    WorkerLink,
+    connect_to_parent,
+    listen_for_worker,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from multiprocessing.queues import Queue as ProcessQueue
+
+CHILD_SCRIPT = str(Path(__file__).parent / "worker_channel_child.py")
+WRAPPER = ["cmd", "/c"] if sys.platform == "win32" else [shutil.which("env") or "/usr/bin/env"]
 
 # Generous enough that a loaded CI box does not flake; every wait below is also event-driven,
 # so these are ceilings, not the expected wait time.
 REQUEST_TIMEOUT_S = 5.0
 ACCEPT_TIMEOUT_S = 5.0
 SHORT_TIMEOUT_S = 0.3
-_PRIVATE_DIR_MODE = 0o700
 
 
 class _ConnectedPair(NamedTuple):
-    parent: Channel
-    child: Channel
+    parent: AsyncChannel
+    child: AsyncChannel
+
+
+async def _connected_pair() -> _ConnectedPair:
+    """Connect two AsyncChannels in this process over a real loopback TCP pair."""
+    pending = await listen_for_worker()
+    child_task = asyncio.ensure_future(connect_to_parent(pending.child_environment))
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    child_channel = await child_task
+    return _ConnectedPair(parent_channel, child_channel)
+
+
+async def _echo_body(body: dict) -> dict:
+    return dict(body)
+
+
+async def _empty_response(_body: dict) -> dict:
+    return {}
 
 
 class _Recorder:
-    """Captures one `Channel`'s callbacks in call order, for assertions without sleeping."""
+    """Captures one `AsyncChannel`'s callbacks in call order, for assertions without sleeping."""
 
-    def __init__(self, on_request: Callable[[dict], dict] | None = None) -> None:
-        self._on_request_impl = on_request if on_request is not None else dict
-        self._lock = threading.Lock()
+    def __init__(self, on_request: Callable[[dict], Any] | None = None) -> None:
+        self._on_request_impl = on_request if on_request is not None else _echo_body
         self.requests_seen: list[dict] = []
         self.notifications: list[dict] = []
-        self.closed = threading.Event()
+        self.closed = asyncio.Event()
         self.closed_count = 0
 
-    def on_request(self, body: dict) -> dict:
-        with self._lock:
-            self.requests_seen.append(body)
-        return self._on_request_impl(body)
+    async def on_request(self, body: dict) -> dict:
+        self.requests_seen.append(body)
+        return await call_function(self._on_request_impl, body)
 
     def on_notification(self, body: dict) -> None:
-        with self._lock:
-            self.notifications.append(body)
+        self.notifications.append(body)
 
     def on_closed(self) -> None:
-        with self._lock:
-            self.closed_count += 1
+        self.closed_count += 1
         self.closed.set()
 
 
-def _connected_pair() -> _ConnectedPair:
-    """Connect two Channels over a real Listener/Client pair. Neither is started yet."""
-    listener = ChannelListener()
-    accepted: list[Channel] = []
-
-    def _accept() -> None:
-        accepted.append(listener.accept(ACCEPT_TIMEOUT_S))
-
-    thread = threading.Thread(target=_accept)
-    thread.start()
-    child = connect_from_environment(listener.child_environment())
-    thread.join(ACCEPT_TIMEOUT_S)
-    listener.close()
-    return _ConnectedPair(accepted[0], child)
+async def _drain_other_tasks() -> None:
+    """Wait for every other currently-outstanding task to finish. No sleep, no polling."""
+    others = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    await asyncio.gather(*others, return_exceptions=True)
 
 
-def _child_round_trip(environ: dict[str, str], result_queue: ProcessQueue) -> None:
-    """Run in a real child process: connect, send one request, report what came back."""
-    worker_channel = connect_from_environment(environ)
-    worker_channel.start(on_request=lambda _body: {}, on_notification=lambda _body: None, on_closed=lambda: None)
-    try:
-        result_queue.put(worker_channel.request({"ping": "from-child"}, timeout_s=ACCEPT_TIMEOUT_S))
-    finally:
-        worker_channel.close()
-
-
-def test_round_trip_request_result_both_directions() -> None:
-    """Either side can call `request()` on the other and get back its `on_request` result."""
-    pair = _connected_pair()
+@pytest.mark.asyncio
+async def test_round_trip_request_result_both_directions() -> None:
+    """Either side can call request() on the other and get back its on_request result."""
+    pair = await _connected_pair()
     rec_parent = _Recorder(on_request=lambda body: {"sum": body["x"] + body["y"]})
     rec_child = _Recorder(on_request=lambda body: {"echo": body})
     pair.parent.start(
@@ -115,20 +111,21 @@ def test_round_trip_request_result_both_directions() -> None:
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
-        assert pair.parent.request({"ping": True}, timeout_s=REQUEST_TIMEOUT_S) == {"echo": {"ping": True}}
-        assert pair.child.request({"x": 1, "y": 2}, timeout_s=REQUEST_TIMEOUT_S) == {"sum": 3}
+        assert await pair.parent.request({"ping": True}, timeout_s=REQUEST_TIMEOUT_S) == {"echo": {"ping": True}}
+        assert await pair.child.request({"x": 1, "y": 2}, timeout_s=REQUEST_TIMEOUT_S) == {"sum": 3}
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_notifications_delivered_in_order_before_a_later_result() -> None:
+@pytest.mark.asyncio
+async def test_notifications_delivered_in_order_before_a_later_result() -> None:
     """A result is never observed before notifications the peer sent ahead of it."""
-    pair = _connected_pair()
+    pair = await _connected_pair()
     rec_parent = _Recorder()
     notify_count = 5
 
-    def parent_on_request(_body: dict) -> dict:
+    async def parent_on_request(_body: dict) -> dict:
         for seq in range(notify_count):
             pair.parent.notify({"seq": seq})
         return {"done": True}
@@ -141,37 +138,35 @@ def test_notifications_delivered_in_order_before_a_later_result() -> None:
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
-        result = pair.child.request({}, timeout_s=REQUEST_TIMEOUT_S)
+        result = await pair.child.request({}, timeout_s=REQUEST_TIMEOUT_S)
         assert result == {"done": True}
-        # By the time the result above is observed, the dispatch thread must already have
-        # processed every notification that was sent ahead of it, in order.
         assert rec_child.notifications == [{"seq": seq} for seq in range(notify_count)]
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_gate_allows_and_runs_before_on_request() -> None:
+@pytest.mark.asyncio
+async def test_gate_allows_and_runs_before_on_request() -> None:
     """A gate that allows a request runs first, and on_request still sees the dispatched body."""
-    pair = _connected_pair()
+    pair = await _connected_pair()
     call_order: list[str] = []
 
     def gate(body: dict) -> GateDecision:
         call_order.append("gate")
         return GateDecision(dispatch=body, reply=None)
 
-    def parent_on_request(body: dict) -> dict:
+    async def parent_on_request(body: dict) -> dict:
         call_order.append("on_request")
         return {"got": body}
 
-    pair.parent.set_request_gate(gate)
-    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=lambda: None)
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None, gate=gate)
     rec_child = _Recorder()
     pair.child.start(
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
-        result = pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        result = await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
         assert result == {"got": {"x": 1}}
         assert call_order == ["gate", "on_request"]
     finally:
@@ -179,26 +174,26 @@ def test_gate_allows_and_runs_before_on_request() -> None:
         pair.child.close()
 
 
-def test_gate_denies_without_calling_on_request() -> None:
-    """A gate that denies a request sends its reply itself; on_request is never called."""
-    pair = _connected_pair()
+@pytest.mark.asyncio
+async def test_gate_denies_without_calling_on_request() -> None:
+    """A gate that denies a request sends its reply itself, as a normal body; on_request never runs."""
+    pair = await _connected_pair()
     on_request_calls: list[dict] = []
 
     def gate(_body: dict) -> GateDecision:
         return GateDecision(dispatch=None, reply={"denied": True})
 
-    def parent_on_request(body: dict) -> dict:
+    async def parent_on_request(body: dict) -> dict:
         on_request_calls.append(body)
         return {}
 
-    pair.parent.set_request_gate(gate)
-    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=lambda: None)
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None, gate=gate)
     rec_child = _Recorder()
     pair.child.start(
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
-        result = pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        result = await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
         assert result == {"denied": True}
         assert on_request_calls == []
     finally:
@@ -206,9 +201,10 @@ def test_gate_denies_without_calling_on_request() -> None:
         pair.child.close()
 
 
-def test_gate_that_raises_closes_the_channel_instead_of_killing_the_dispatch_thread() -> None:
+@pytest.mark.asyncio
+async def test_gate_that_raises_closes_the_channel() -> None:
     """A gate exception is fail-closed: the channel closes, on_request never runs, on_closed fires once."""
-    pair = _connected_pair()
+    pair = await _connected_pair()
     rec_parent = _Recorder()
     on_request_calls: list[dict] = []
 
@@ -216,34 +212,34 @@ def test_gate_that_raises_closes_the_channel_instead_of_killing_the_dispatch_thr
         msg = "gate exploded"
         raise RuntimeError(msg)
 
-    def parent_on_request(body: dict) -> dict:
+    async def parent_on_request(body: dict) -> dict:
         on_request_calls.append(body)
         return {}
 
-    pair.parent.set_request_gate(gate)
-    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=rec_parent.on_closed)
+    pair.parent.start(
+        on_request=parent_on_request, on_notification=lambda _b: None, on_closed=rec_parent.on_closed, gate=gate
+    )
     rec_child = _Recorder()
     pair.child.start(
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
-        # The pending future for this very request lives on the child's side, so the channel
-        # closing (triggered by the gate raising on the parent) is what fails it.
         with pytest.raises(ChannelClosedError):
-            pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
         assert on_request_calls == []
-        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
         assert rec_parent.closed_count == 1
-        assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
+        await asyncio.wait_for(rec_child.closed.wait(), REQUEST_TIMEOUT_S)
         assert rec_child.closed_count == 1
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_on_notification_that_raises_closes_the_channel() -> None:
+@pytest.mark.asyncio
+async def test_on_notification_that_raises_closes_the_channel() -> None:
     """An on_notification exception is fail-closed: the channel closes and on_closed fires once."""
-    pair = _connected_pair()
+    pair = await _connected_pair()
     rec_parent = _Recorder()
 
     def parent_on_notification(_body: dict) -> None:
@@ -251,7 +247,7 @@ def test_on_notification_that_raises_closes_the_channel() -> None:
         raise RuntimeError(msg)
 
     pair.parent.start(
-        on_request=lambda _body: {}, on_notification=parent_on_notification, on_closed=rec_parent.on_closed
+        on_request=rec_parent.on_request, on_notification=parent_on_notification, on_closed=rec_parent.on_closed
     )
     rec_child = _Recorder()
     pair.child.start(
@@ -259,400 +255,477 @@ def test_on_notification_that_raises_closes_the_channel() -> None:
     )
     try:
         pair.child.notify({"hello": True})
-        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
         assert rec_parent.closed_count == 1
-        assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
+        await asyncio.wait_for(rec_child.closed.wait(), REQUEST_TIMEOUT_S)
         assert rec_child.closed_count == 1
-        # The channel is closed now: a fresh request from the peer fails rather than hanging.
         with pytest.raises(ChannelClosedError):
-            pair.child.request({}, timeout_s=SHORT_TIMEOUT_S)
+            await pair.child.request({}, timeout_s=SHORT_TIMEOUT_S)
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_gate_denial_with_no_reply_closes_the_channel() -> None:
+@pytest.mark.asyncio
+async def test_gate_denial_with_no_reply_closes_the_channel() -> None:
     """A gate that denies without a reply is a contract violation: fail-closed, not a bad frame."""
-    pair = _connected_pair()
+    pair = await _connected_pair()
     rec_parent = _Recorder()
     on_request_calls: list[dict] = []
 
     def gate(_body: dict) -> GateDecision:
         return GateDecision(dispatch=None, reply=None)
 
-    def parent_on_request(body: dict) -> dict:
+    async def parent_on_request(body: dict) -> dict:
         on_request_calls.append(body)
         return {}
 
-    pair.parent.set_request_gate(gate)
-    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=rec_parent.on_closed)
+    pair.parent.start(
+        on_request=parent_on_request, on_notification=lambda _b: None, on_closed=rec_parent.on_closed, gate=gate
+    )
     rec_child = _Recorder()
     pair.child.start(
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
     try:
         with pytest.raises(ChannelClosedError):
-            pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
         assert on_request_calls == []
-        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
         assert rec_parent.closed_count == 1
-        assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
-        assert rec_child.closed_count == 1
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_wrong_authkey_is_rejected_without_crashing_the_listener() -> None:
-    """A bad authkey attempt is rejected; the listener keeps waiting for a valid connection."""
-    listener = ChannelListener()
-    accepted: list[Channel] = []
+@pytest.mark.asyncio
+async def test_on_request_raising_answers_with_a_channel_request_error() -> None:
+    """on_request raising answers with an error frame; the requester sees ChannelRequestError, not a body."""
+    pair = await _connected_pair()
 
-    def _accept() -> None:
-        accepted.append(listener.accept(ACCEPT_TIMEOUT_S))
+    async def parent_on_request(_body: dict) -> dict:
+        msg = "boom"
+        raise ValueError(msg)
 
-    thread = threading.Thread(target=_accept)
-    thread.start()
-    channel_from_valid_client: Channel | None = None
-    try:
-        with pytest.raises(AuthenticationError):
-            Client(listener.address, family=channel_module._FAMILY, authkey=b"\x00" * 32)
-        channel_from_valid_client = connect_from_environment(listener.child_environment())
-        thread.join(ACCEPT_TIMEOUT_S)
-        assert len(accepted) == 1
-    finally:
-        if accepted:
-            accepted[0].close()
-        if channel_from_valid_client is not None:
-            channel_from_valid_client.close()
-
-
-def test_accept_timeout_raises_and_stops_listening() -> None:
-    """accept() raises TimeoutError with no connection, and the listener stops listening."""
-    listener = ChannelListener()
-    try:
-        with pytest.raises(TimeoutError):
-            listener.accept(SHORT_TIMEOUT_S)
-        # The exact failure (FileNotFoundError, ConnectionRefusedError, ...) is platform-specific;
-        # what matters here is that nothing can connect any more.
-        with pytest.raises(OSError):  # noqa: PT011
-            connect_from_environment(listener.child_environment())
-    finally:
-        listener.close()
-
-
-def _raw_peer_socket() -> socket.socket:
-    """A bare AF_UNIX socket, bypassing Client()'s authkey handshake entirely."""
-    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-
-def _connect_despite_backlog_race(listener: ChannelListener, deadline_s: float) -> Channel:
-    """Retry a connect that loses the race against the listener's backlog of 1.
-
-    A peer that closes before the server calls accept() still occupies that one backlog slot
-    until the server's accept() call drains it; a connect attempt in that narrow window is
-    refused outright rather than queued. Retrying is correct here: it is the client side of a
-    transient, well-understood OS condition, not a channel bug.
-    """
-    deadline = time.monotonic() + deadline_s
-    while True:
-        try:
-            return connect_from_environment(listener.child_environment())
-        except ConnectionRefusedError:
-            if time.monotonic() >= deadline:
-                raise
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="raw AF_UNIX socket needed to control the handshake bytes")
-def test_accept_recovers_from_a_peer_that_reads_the_challenge_then_hangs_up() -> None:
-    """deliver_challenge raising EOFError rejects just that peer; a real worker connects after."""
-    listener = ChannelListener()
-    accepted: list[Channel] = []
-
-    def _accept() -> None:
-        accepted.append(listener.accept(ACCEPT_TIMEOUT_S))
-
-    thread = threading.Thread(target=_accept)
-    thread.start()
-    real_worker: Channel | None = None
-    try:
-        bad_peer = _raw_peer_socket()
-        bad_peer.connect(listener.address)
-        bad_peer.recv(4096)  # drain the challenge, then abandon it without answering
-        bad_peer.close()
-
-        real_worker = connect_from_environment(listener.child_environment())
-        thread.join(ACCEPT_TIMEOUT_S)
-        assert len(accepted) == 1
-    finally:
-        if accepted:
-            accepted[0].close()
-        if real_worker is not None:
-            real_worker.close()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="raw AF_UNIX socket needed to control the handshake bytes")
-def test_accept_recovers_from_a_peer_that_closes_right_after_connecting() -> None:
-    """A peer that disconnects before even reading the challenge is rejected, not fatal to accept()."""
-    listener = ChannelListener()
-    accepted: list[Channel] = []
-
-    def _accept() -> None:
-        accepted.append(listener.accept(ACCEPT_TIMEOUT_S))
-
-    thread = threading.Thread(target=_accept)
-    thread.start()
-    real_worker: Channel | None = None
-    try:
-        bad_peer = _raw_peer_socket()
-        bad_peer.connect(listener.address)
-        bad_peer.close()
-
-        real_worker = _connect_despite_backlog_race(listener, ACCEPT_TIMEOUT_S)
-        thread.join(ACCEPT_TIMEOUT_S)
-        assert len(accepted) == 1
-    finally:
-        if accepted:
-            accepted[0].close()
-        if real_worker is not None:
-            real_worker.close()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="raw AF_UNIX socket needed to hold a silent connection open")
-def test_accept_does_not_stall_past_its_deadline_for_a_silent_peer() -> None:
-    """A peer that connects and never answers the challenge cannot block accept() past its timeout."""
-    listener = ChannelListener()
-    silent_peer = _raw_peer_socket()
-    try:
-        silent_peer.connect(listener.address)
-        start = time.monotonic()
-        with pytest.raises(TimeoutError):
-            listener.accept(SHORT_TIMEOUT_S)
-        elapsed = time.monotonic() - start
-        assert elapsed < SHORT_TIMEOUT_S + channel_module._UNBLOCK_GRACE_S + 2.0
-    finally:
-        silent_peer.close()
-        listener.close()
-
-
-def test_cancel_accept_from_another_thread_returns_promptly() -> None:
-    """cancel_accept() ends a concurrent accept() with AcceptCancelledError, not a timeout."""
-    listener = ChannelListener()
-    outcome: dict[str, Any] = {}
-    done = threading.Event()
-
-    def _accept() -> None:
-        try:
-            outcome["channel"] = listener.accept(ACCEPT_TIMEOUT_S)
-        except Exception as exc:
-            outcome["error"] = exc
-        finally:
-            done.set()
-
-    thread = threading.Thread(target=_accept)
-    thread.start()
-    start = time.monotonic()
-    listener.cancel_accept()
-    assert done.wait(ACCEPT_TIMEOUT_S)
-    elapsed = time.monotonic() - start
-    thread.join(ACCEPT_TIMEOUT_S)
-
-    assert isinstance(outcome.get("error"), AcceptCancelledError)
-    assert elapsed < channel_module._UNBLOCK_GRACE_S + 2.0
-
-
-def test_close_from_the_peer_fails_pending_requests_and_calls_on_closed_once() -> None:
-    """When the peer closes, a pending request fails and on_closed fires exactly once."""
-    pair = _connected_pair()
-    rec_parent = _Recorder()
-    request_received = threading.Event()
-    release_child_handler = threading.Event()
-
-    def child_on_request(_body: dict) -> dict:
-        request_received.set()
-        release_child_handler.wait(REQUEST_TIMEOUT_S)
-        return {}
-
-    pair.parent.start(
-        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
-    )
-    pair.child.start(on_request=child_on_request, on_notification=lambda _body: None, on_closed=lambda: None)
-
-    result_holder: dict[str, Any] = {}
-    done = threading.Event()
-
-    def do_request() -> None:
-        try:
-            result_holder["result"] = pair.parent.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
-        except ChannelClosedError as exc:
-            result_holder["error"] = exc
-        finally:
-            done.set()
-
-    requester = threading.Thread(target=do_request)
-    requester.start()
-    assert request_received.wait(REQUEST_TIMEOUT_S)
-    # The request has definitely reached the child and is pending on the parent's side now.
-    pair.child.close()
-    assert done.wait(REQUEST_TIMEOUT_S)
-    requester.join(REQUEST_TIMEOUT_S)
-
-    assert isinstance(result_holder.get("error"), ChannelClosedError)
-    assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
-    assert rec_parent.closed_count == 1
-    pair.parent.close()
-    # Let the child's still-running handler thread return instead of waiting out its timeout.
-    release_child_handler.set()
-
-
-def test_close_calls_on_closed_on_the_closing_side_too() -> None:
-    """close() ends the channel on both the closing side and the peer, each exactly once."""
-    pair = _connected_pair()
-    rec_parent = _Recorder()
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
     rec_child = _Recorder()
-    pair.parent.start(
-        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
-    )
     pair.child.start(
         on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
     )
-
-    pair.parent.close()
-
-    assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
-    assert rec_parent.closed_count == 1
-    assert rec_child.closed.wait(REQUEST_TIMEOUT_S)
-    assert rec_child.closed_count == 1
-
-
-def test_request_from_the_dispatch_thread_raises_runtime_error() -> None:
-    """Calling request() from inside on_notification -- the dispatch thread -- raises RuntimeError."""
-    pair = _connected_pair()
-    captured: list[BaseException] = []
-
-    def parent_on_notification(_body: dict) -> None:
-        try:
-            pair.parent.request({}, timeout_s=SHORT_TIMEOUT_S)
-        except RuntimeError as exc:
-            captured.append(exc)
-
-    pair.parent.start(on_request=lambda _body: {}, on_notification=parent_on_notification, on_closed=lambda: None)
-    pair.child.start(on_request=lambda _body: {}, on_notification=lambda _body: None, on_closed=lambda: None)
     try:
-        pair.child.notify({"hello": True})
-        # The notification and this request cross the wire in that order, and the parent's one
-        # dispatch thread handles frames in arrival order, so this result is not observed until
-        # the notification above -- and the nested request() attempt inside it -- has returned.
-        pair.child.request({}, timeout_s=REQUEST_TIMEOUT_S)
-        assert len(captured) == 1
-        assert isinstance(captured[0], RuntimeError)
+        with pytest.raises(ChannelRequestError) as exc_info:
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        assert exc_info.value.error_type == "ValueError"
+        assert exc_info.value.message == "boom"
+        # The channel itself stays open: only this one request failed, not the whole channel.
+        with pytest.raises(ChannelRequestError):
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_request_from_the_reader_thread_raises_runtime_error() -> None:
-    """Pins the reader-thread half of the guard directly: no callback ever runs on that thread."""
-    pair = _connected_pair()
-    pair.parent.start(on_request=lambda _body: {}, on_notification=lambda _body: None, on_closed=lambda: None)
-    pair.child.start(on_request=lambda _body: {}, on_notification=lambda _body: None, on_closed=lambda: None)
+@pytest.mark.asyncio
+async def test_unencodable_handler_result_answers_with_a_channel_request_error() -> None:
+    """A handler result that will not encode as JSON answers with an error frame, not a hang."""
+    pair = await _connected_pair()
+
+    async def parent_on_request(_body: dict) -> dict:
+        return {"bad": object()}
+
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
     try:
-        # `_assert_not_on_channel_thread` treats the reader and dispatch threads the same way;
-        # the dispatch-thread branch is covered live above, so this pins the reader-thread one
-        # by pointing the check at the thread actually running this test.
-        pair.parent._reader_thread = threading.current_thread()
-        with pytest.raises(RuntimeError):
-            pair.parent.request({}, timeout_s=SHORT_TIMEOUT_S)
+        with pytest.raises(ChannelRequestError) as exc_info:
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        assert exc_info.value.error_type == "TypeError"
+        # The channel stays open and still answers a normal request afterward.
+        assert await pair.parent.request({"y": 1}, timeout_s=REQUEST_TIMEOUT_S) == {"y": 1}
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_nested_request_from_an_on_request_thread() -> None:
-    """An on_request handler may itself call request() back to the peer without deadlocking."""
-    pair = _connected_pair()
+@pytest.mark.asyncio
+async def test_unencodable_outgoing_body_raises_to_the_caller_without_sending() -> None:
+    """A request/notification body that will not encode raises to the caller; nothing goes out."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        with pytest.raises(TypeError):
+            await pair.child.request({"bad": object()}, timeout_s=REQUEST_TIMEOUT_S)
+        with pytest.raises(TypeError):
+            pair.child.notify({"bad": object()})
+        # Neither attempt reached the wire: a normal request still round-trips afterward, and the
+        # notification ordering guarantee confirms no stray notify from above arrived either.
+        pair.child.notify({"ok": True})
+        result = await pair.child.request({}, timeout_s=REQUEST_TIMEOUT_S)
+        assert result == {}
+        assert rec_parent.notifications == [{"ok": True}]
+    finally:
+        pair.parent.close()
+        pair.child.close()
 
-    def parent_on_request(body: dict) -> dict:
-        nested_result = pair.parent.request({"nested": True}, timeout_s=REQUEST_TIMEOUT_S)
+
+@pytest.mark.asyncio
+async def test_answering_a_request_after_close_raises_no_unhandled_task_exception() -> None:
+    """on_request's reply racing close() must not surface as 'Task exception was never retrieved'."""
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        pair = await _connected_pair()
+        reached_handler = asyncio.Event()
+        release_handler = asyncio.Event()
+
+        async def parent_on_request(_body: dict) -> dict:
+            reached_handler.set()
+            await release_handler.wait()
+            return {}
+
+        rec_child = _Recorder()
+        pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+        pair.child.start(
+            on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+        )
+
+        request_task = asyncio.ensure_future(pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S))
+        await asyncio.wait_for(reached_handler.wait(), REQUEST_TIMEOUT_S)
+        pair.parent.close()
+        pair.child.close()
+        with pytest.raises(ChannelClosedError):
+            await request_task
+        release_handler.set()
+        await _drain_other_tasks()
+        assert unhandled == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_nested_request_from_an_on_request_task() -> None:
+    """An on_request handler may itself await request() back to the peer without deadlocking."""
+    pair = await _connected_pair()
+
+    async def parent_on_request(body: dict) -> dict:
+        nested_result = await pair.parent.request({"nested": True}, timeout_s=REQUEST_TIMEOUT_S)
         return {"outer": body, "nested_result": nested_result}
 
-    def child_on_request(body: dict) -> dict:
+    async def child_on_request(body: dict) -> dict:
         return {"inner": body}
 
-    pair.parent.start(on_request=parent_on_request, on_notification=lambda _body: None, on_closed=lambda: None)
-    pair.child.start(on_request=child_on_request, on_notification=lambda _body: None, on_closed=lambda: None)
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+    pair.child.start(on_request=child_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
     try:
-        result = pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        result = await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
         assert result == {"outer": {"x": 1}, "nested_result": {"inner": {"nested": True}}}
     finally:
         pair.parent.close()
         pair.child.close()
 
 
+@pytest.mark.asyncio
+async def test_request_timeout_removes_its_pending_entry() -> None:
+    """A timed-out request raises TimeoutError and does not leave its future behind."""
+    pair = await _connected_pair()
+    never_answer = asyncio.Event()
+
+    async def parent_on_request(_body: dict) -> dict:
+        await never_answer.wait()
+        return {}
+
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            await pair.child.request({"x": 1}, timeout_s=SHORT_TIMEOUT_S)
+        assert pair.child._pending == {}
+    finally:
+        never_answer.set()
+        pair.parent.close()
+        pair.child.close()
+
+
+@pytest.mark.asyncio
+async def test_close_from_the_peer_fails_pending_requests_and_calls_on_closed_once() -> None:
+    """When the peer closes, a pending request fails and on_closed fires exactly once."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    request_received = asyncio.Event()
+    release_child_handler = asyncio.Event()
+
+    async def child_on_request(_body: dict) -> dict:
+        request_received.set()
+        await release_child_handler.wait()
+        return {}
+
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    pair.child.start(on_request=child_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+
+    request_task = asyncio.ensure_future(pair.parent.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S))
+    try:
+        await asyncio.wait_for(request_received.wait(), REQUEST_TIMEOUT_S)
+        # The request has definitely reached the child and is pending on the parent's side now.
+        pair.child.close()
+        with pytest.raises(ChannelClosedError):
+            await request_task
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
+        assert rec_parent.closed_count == 1
+    finally:
+        release_child_handler.set()
+        pair.parent.close()
+
+
+@pytest.mark.asyncio
+async def test_close_calls_on_closed_on_the_closing_side_too() -> None:
+    """close() ends the channel on both the closing side and the peer, each exactly once."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    rec_child = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+
+    pair.parent.close()
+
+    await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
+    assert rec_parent.closed_count == 1
+    await asyncio.wait_for(rec_child.closed.wait(), REQUEST_TIMEOUT_S)
+    assert rec_child.closed_count == 1
+
+
 @pytest.mark.parametrize(
     "raw",
     [
-        b"not json",
-        json.dumps([1, 2, 3]).encode("utf-8"),
-        json.dumps({"frame": "mystery", "id": "x", "body": {}}).encode("utf-8"),
-        json.dumps({"frame": "request", "body": {}}).encode("utf-8"),
-        json.dumps({"frame": "notification"}).encode("utf-8"),
+        b"\xff\xff\xff\xff not json",
+        struct.pack(">I", 7) + b"not son",
+        struct.pack(">I", 7) + b"[1,2,3",
+        channel_module._encode_frame({"frame": "mystery", "id": "x", "body": {}}),
+        channel_module._encode_frame({"frame": "request", "id": "x"}),
+        channel_module._encode_frame({"frame": "notification"}),
+        channel_module._encode_frame({"frame": "result", "id": "x"}),
+        channel_module._encode_frame(
+            {"frame": "result", "id": "x", "body": {}, "error": {"type": "E", "message": "m"}}
+        ),
+        channel_module._encode_frame({"frame": "result", "id": "x", "error": {"type": "E"}}),
     ],
 )
-def test_malformed_frame_closes_the_channel(raw: bytes) -> None:
-    """A frame that is not valid UTF-8 JSON, not an object, or an unknown type closes the channel."""
-    pair = _connected_pair()
+@pytest.mark.asyncio
+async def test_malformed_frame_closes_the_channel(raw: bytes) -> None:
+    """A frame that is not valid JSON, not an object, or has the wrong shape closes the channel."""
+    pair = await _connected_pair()
     rec_parent = _Recorder()
     pair.parent.start(
         on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
     )
     try:
-        pair.child._connection.send_bytes(raw)
-        assert rec_parent.closed.wait(REQUEST_TIMEOUT_S)
+        pair.child._writer.write(raw)
+        await pair.child._writer.drain()
+        # Close so a truncated length prefix hits EOF promptly instead of waiting for bytes that
+        # are never coming; a complete frame has already been fully read by the time this lands.
+        pair.child.close()
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
         with pytest.raises(ChannelClosedError):
-            pair.parent.request({}, timeout_s=SHORT_TIMEOUT_S)
+            await pair.parent.request({}, timeout_s=SHORT_TIMEOUT_S)
     finally:
         pair.parent.close()
         pair.child.close()
 
 
-def test_channel_module_never_calls_send_or_recv_directly() -> None:
-    """`Connection.send`/`.recv` pickle their argument; only `send_bytes`/`recv_bytes` are safe."""
+def test_channel_module_never_uses_pickle() -> None:
+    """Frames are JSON only; nothing in this module's code may import or reference pickle."""
     source = Path(channel_module.__file__).read_text()
     tree = ast.parse(source)
-    banned = [node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr in ("send", "recv")]
-    assert banned == []
+    imported_names = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+        if "pickle" in alias.name
+    }
+    referenced_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and "pickle" in node.id}
+    assert imported_names == set()
+    assert referenced_names == set()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX private-directory semantics are POSIX-only")
-def test_listener_directory_is_private_and_removed_by_close() -> None:
-    """The socket's directory is mode 0700 and close() removes it."""
-    listener = ChannelListener()
-    directory = Path(listener.address).parent
-    assert directory.is_dir()
-    assert stat.S_IMODE(directory.stat().st_mode) == _PRIVATE_DIR_MODE
-    listener.close()
-    assert not directory.exists()
+@pytest.mark.asyncio
+async def test_accept_times_out_cleanly_when_nobody_connects() -> None:
+    """accept() raises TimeoutError, promptly, when nothing ever connects."""
+    pending = await listen_for_worker()
+    with pytest.raises(TimeoutError):
+        await pending.accept(SHORT_TIMEOUT_S)
 
 
-def test_cross_process_round_trip() -> None:
-    """The environment-variable handshake works end to end against a real child process."""
-    listener = ChannelListener()
-    result_queue: ProcessQueue = Queue()
-    process = Process(target=_child_round_trip, args=(listener.child_environment(), result_queue))
-    process.start()
-    parent_channel: Channel | None = None
+@pytest.mark.asyncio
+async def test_bad_and_silent_peers_do_not_block_a_real_worker() -> None:
+    """A silent peer, a wrong token, and garbage bytes are each rejected without affecting accept()."""
+    pending = await listen_for_worker()
+    host, port_str = pending.child_environment[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    port = int(port_str)
+
+    _silent_reader, silent_writer = await asyncio.open_connection(host, port)  # connects, sends nothing
+    _wrong_reader, wrong_writer = await asyncio.open_connection(host, port)
+    wrong_writer.write(channel_module._encode_frame({"token": "0" * 64}))
+    _garbage_reader, garbage_writer = await asyncio.open_connection(host, port)
+    garbage_writer.write(b"\xff\xff\xff\xff not json")
+
+    child = await connect_to_parent(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    rec_parent = _Recorder()
+    parent_channel.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
     try:
-        parent_channel = listener.accept(ACCEPT_TIMEOUT_S)
-        rec_parent = _Recorder(on_request=lambda body: {"pong": body["ping"]})
-        parent_channel.start(
-            on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
-        )
-        assert result_queue.get(timeout=ACCEPT_TIMEOUT_S) == {"pong": "from-child"}
+        assert await child.request({"op": "echo"}, timeout_s=REQUEST_TIMEOUT_S) == {"op": "echo"}
     finally:
-        process.join(ACCEPT_TIMEOUT_S)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-        if parent_channel is not None:
-            parent_channel.close()
+        parent_channel.close()
+        child.close()
+        silent_writer.close()
+        wrong_writer.close()
+        garbage_writer.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_link_request_from_the_io_thread_raises_runtime_error() -> None:
+    """WorkerLink.request() called from an on_request handler (the I/O thread) raises RuntimeError."""
+    pending = await listen_for_worker()
+    link = WorkerLink(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    rec_parent = _Recorder()
+    parent_channel.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    captured: list[BaseException] = []
+
+    async def worker_on_request(_body: dict) -> dict:
+        try:
+            link.request({}, timeout_s=SHORT_TIMEOUT_S)
+        except RuntimeError as exc:
+            captured.append(exc)
+        return {}
+
+    link.start(on_request=worker_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+    try:
+        result = await parent_channel.request({}, timeout_s=REQUEST_TIMEOUT_S)
+        assert result == {}
+        assert len(captured) == 1
+        assert isinstance(captured[0], RuntimeError)
+    finally:
+        link.close()
+        parent_channel.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_link_sync_request_from_inside_a_running_loop_on_another_thread() -> None:
+    """A blocking link.request() call made from inside another thread's own asyncio.run() must not deadlock."""
+    pending = await listen_for_worker()
+    link = WorkerLink(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    rec_parent = _Recorder(on_request=lambda body: {"sum": body["x"] + body["y"]})
+    parent_channel.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    link.start(on_request=_empty_response, on_notification=lambda _b: None, on_closed=lambda: None)
+
+    result_holder: dict[str, Any] = {}
+
+    async def main_loop_work() -> None:
+        result_holder["result"] = link.request({"x": 2, "y": 3}, timeout_s=REQUEST_TIMEOUT_S)
+
+    def run_on_another_thread() -> None:
+        asyncio.run(main_loop_work())
+
+    other_thread = threading.Thread(target=run_on_another_thread)
+    other_thread.start()
+    # A plain thread.join() here would block this test's own event loop, which parent_channel's
+    # read loop needs to run on in order to answer the request this thread is waiting on.
+    await asyncio.to_thread(other_thread.join, REQUEST_TIMEOUT_S)
+    try:
+        assert not other_thread.is_alive()
+        assert result_holder.get("result") == {"sum": 5}
+    finally:
+        link.close()
+        parent_channel.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_round_trip_through_a_wrapper() -> None:
+    """The environment-variable/token handshake works end to end against a real child process."""
+    pending = await listen_for_worker()
+    env = {**os.environ, **pending.child_environment}
+    process = await asyncio.create_subprocess_exec(*WRAPPER, sys.executable, CHILD_SCRIPT, env=env)
+    try:
+        channel = await pending.accept(ACCEPT_TIMEOUT_S)
+        notes: list[dict] = []
+        enough_notes = asyncio.Event()
+        expected_note_count = 3  # 2 from notify_then_answer, 1 from the worker's own sync request
+
+        def on_notification(note: dict) -> None:
+            notes.append(note)
+            if len(notes) >= expected_note_count:
+                enough_notes.set()
+
+        async def on_request(body: dict) -> dict:
+            return {"sum": body["x"] + body["y"]}
+
+        channel.start(on_request=on_request, on_notification=on_notification, on_closed=lambda: None)
+        assert await channel.request({"op": "echo", "v": 1}, timeout_s=REQUEST_TIMEOUT_S) == {
+            "echo": {"op": "echo", "v": 1}
+        }
+        assert await channel.request({"op": "notify_then_answer"}, timeout_s=REQUEST_TIMEOUT_S) == {"answered": True}
+        await asyncio.wait_for(enough_notes.wait(), REQUEST_TIMEOUT_S)
+        assert [n for n in notes if "event" in n] == [{"event": 1}, {"event": 2}]
+        # The worker's own main loop drives this through WorkerLink.request() -- a synchronous
+        # call made from inside its running event loop -- which must not have deadlocked.
+        assert [n for n in notes if "sum_reply" in n] == [{"sum_reply": {"sum": 5}}]
+        channel.close()
+        assert await asyncio.wait_for(process.wait(), REQUEST_TIMEOUT_S) == 0
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_a_killed_worker_process_closes_the_channel_and_fails_what_waits() -> None:
+    """Killing the worker process (not the wrapper) ends the channel; a pending request fails."""
+    pending = await listen_for_worker()
+    env = {**os.environ, **pending.child_environment}
+    # Unwrapped: killing a wrapper such as cmd.exe would not kill the worker process it started.
+    process = await asyncio.create_subprocess_exec(sys.executable, CHILD_SCRIPT, env=env)
+    try:
+        channel = await pending.accept(ACCEPT_TIMEOUT_S)
+        closed = asyncio.Event()
+        channel.start(on_request=_echo_body, on_notification=lambda _b: None, on_closed=closed.set)
+        waiting = asyncio.ensure_future(channel.request({"op": "hang"}, timeout_s=None))
+        process.kill()
+        await asyncio.wait_for(closed.wait(), REQUEST_TIMEOUT_S)
+        with pytest.raises(ChannelClosedError):
+            await waiting
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()

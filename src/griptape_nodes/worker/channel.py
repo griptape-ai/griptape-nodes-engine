@@ -1,49 +1,51 @@
 """A private, authenticated byte channel between a parent process and one worker.
 
-The parent creates a `ChannelListener`, hands the worker its address and authkey through
-environment variables (`child_environment`), and `accept()`s the worker's single connection.
-The worker calls `connect_from_environment` to get its end. Both ends then share the same
-`Channel` API: `request`/`request_async` for a call that waits for a reply, `notify` for a
-one-way message, and a single gated dispatch point for incoming requests.
+Transport is loopback TCP (127.0.0.1) over asyncio, not a Unix socket or named pipe: a worker is
+often started through another program (`worker.command_prefix` wraps it in a shell, `cmd /c`, or
+similar), which only carries the environment forward, not file descriptors or handles. Loopback
+TCP needs nothing but an address and a secret, and `asyncio.start_server`/`open_connection` are
+public, cross-platform asyncio, unlike named pipes on Windows.
 
-Frame bodies are opaque dicts; this module only moves them, in order, and never pickles them.
+The parent calls `listen_for_worker()`, hands the worker its address and token through
+environment variables (`PendingWorker.child_environment`), and `accept()`s the worker's single
+connection. The worker calls `connect_to_parent` to get its end. Both ends then share the same
+`AsyncChannel` API: `request`/`request_async` for a call that waits for a reply, `notify` for a
+one-way message, and a single gated dispatch point for incoming requests. `WorkerLink` runs an
+`AsyncChannel` on its own I/O loop thread so a worker's synchronous code can call it without
+deadlocking.
+
+Loopback is reachable by any process on the same machine, so the worker's first frame carries a
+per-connection token, compared with `hmac.compare_digest`; anything else closes that connection
+without touching the real one. Frame bodies are opaque dicts; this module only moves them, in
+order, as JSON, never pickle.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import functools
+import hmac
 import json
 import logging
 import secrets
-import shutil
-import sys
-import tempfile
+import struct
 import threading
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
-from multiprocessing import AuthenticationError
-from multiprocessing.connection import Client, Connection, Listener
-from pathlib import Path
-from queue import Queue
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from griptape_nodes.utils.async_utils import call_function
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Coroutine, Mapping
 
 logger = logging.getLogger("griptape_nodes")
 
 CHANNEL_ADDRESS_ENV = "GTN_WORKER_CHANNEL_ADDRESS"
-CHANNEL_AUTHKEY_ENV = "GTN_WORKER_CHANNEL_AUTHKEY"
+CHANNEL_TOKEN_ENV = "GTN_WORKER_CHANNEL_TOKEN"  # noqa: S105 - a secret's env var name, not a secret
 
-_WINDOWS = sys.platform.startswith("win")
-_FAMILY = "AF_PIPE" if _WINDOWS else "AF_UNIX"
+_HANDSHAKE_TIMEOUT_S = 5.0
+_HEADER = struct.Struct(">I")
 _FRAME_TYPES = ("request", "result", "notification")
-# How long accept() waits, after connecting a throwaway client to free a thread parked in
-# accept(), before stopping the listener regardless of whether that connect ever landed.
-_UNBLOCK_GRACE_S = 0.5
-# How often the reader checks whether this end is closing while no frame arrives.
-_READ_POLL_S = 0.05
 _CLOSED_MSG = "The worker channel is closed."
 
 
@@ -51,227 +53,135 @@ class ChannelClosedError(Exception):
     """Raised for a request in flight, or a new request or notification, once the channel ends."""
 
 
-class AcceptCancelledError(Exception):
-    """Raised by `accept()` when `cancel_accept()` ends it instead of a connection or a timeout."""
+class ChannelRequestError(Exception):
+    """Raised by `request`/`request_async` when the peer's `on_request` handler itself failed.
+
+    Carries the failure as data (`error_type`, `message`), not a re-raised peer exception: the
+    peer's exception class may not exist, or may mean something else, on this side of the wire.
+    """
+
+    def __init__(self, error_type: str, message: str) -> None:
+        super().__init__(f"{error_type}: {message}")
+        self.error_type = error_type
+        self.message = message
 
 
 class GateDecision(NamedTuple):
-    """What `Channel`'s dispatch thread should do with one incoming request frame."""
+    """What `AsyncChannel`'s read loop should do with one incoming request frame."""
 
     dispatch: dict | None
     reply: dict | None
 
 
-class ChannelListener:
-    """Parent side of a channel: binds one address and accepts exactly one worker connection."""
-
-    def __init__(self) -> None:
-        self._authkey = secrets.token_bytes(32)
-        self._directory: str | None = None
-        if _WINDOWS:
-            self._address = rf"\\.\pipe\gtn-worker-{uuid.uuid4().hex}"
-        else:
-            # /tmp, not tempfile.gettempdir(): macOS's per-user temp dir is long enough that
-            # appending a socket filename blows the ~104 byte AF_UNIX path limit.
-            self._directory = tempfile.mkdtemp(dir="/tmp", prefix="gtn-")
-            Path(self._directory).chmod(0o700)
-            self._address = str(Path(self._directory) / "s")
-        self._listener = Listener(self._address, family=_FAMILY, authkey=self._authkey)
-        self._accept_outcome = threading.Event()
-        self._accept_connection: Connection | None = None
-        self._cancelled = threading.Event()
-        self._stopping = threading.Event()
-
-    @property
-    def address(self) -> str:
-        """The address a worker connects to (a socket path, or a named pipe on Windows)."""
-        return self._address
-
-    def child_environment(self) -> dict[str, str]:
-        """Environment variables that let `connect_from_environment` reach this listener."""
-        return {
-            CHANNEL_ADDRESS_ENV: self._address,
-            CHANNEL_AUTHKEY_ENV: self._authkey.hex(),
-        }
-
-    def accept(self, timeout_s: float) -> Channel:
-        """Block for one worker connection, then stop listening regardless of the outcome.
-
-        Raises `TimeoutError` if nothing connects in time, or `AcceptCancelledError` if
-        `cancel_accept()` ends this call first.
-        """
-        if self._cancelled.is_set():
-            self._stop_listening()
-            msg = "Accept was cancelled."
-            raise AcceptCancelledError(msg)
-        threading.Thread(target=self._accept_loop, name="gtn-channel-accept", daemon=True).start()
-        accepted_in_time = self._accept_outcome.wait(timeout_s)
-        if not accepted_in_time:
-            self._unblock_accept()
-        self._stop_listening()
-
-        connection = self._accept_connection
-        if connection is not None and accepted_in_time and not self._cancelled.is_set():
-            return Channel(connection)
-        if connection is not None:
-            # Landed only after we gave up waiting for it: our own unblock client, a worker that
-            # arrived too late, or one that lost the race against cancel_accept(). Reject it.
-            connection.close()
-        if self._cancelled.is_set():
-            msg = "Accept was cancelled."
-            raise AcceptCancelledError(msg)
-        msg = f"No worker connected to channel {self._address} within {timeout_s}s."
-        raise TimeoutError(msg)
-
-    def cancel_accept(self) -> None:
-        """Unblock a concurrent `accept()` from another thread; it raises `AcceptCancelledError`."""
-        self._cancelled.set()
-        self._unblock_accept()
-
-    def close(self) -> None:
-        """Stop listening and, on POSIX, remove the private directory. Safe to call more than once."""
-        self._stop_listening()
-        if self._directory is not None:
-            shutil.rmtree(self._directory, ignore_errors=True)
-
-    def _accept_loop(self) -> None:
-        """Accept connections until one survives its handshake, or the listener stops on purpose.
-
-        Any handshake failure (wrong authkey, a peer that hangs up mid-handshake) rejects just
-        that one peer and keeps accepting: it is never reason enough to give up on the real
-        worker. Only an explicit stop (timeout, cancel_accept(), or close()) ends the loop.
-        """
-        while True:
-            try:
-                connection = self._listener.accept()
-            except (AuthenticationError, EOFError, OSError) as exc:
-                if self._stopping.is_set():
-                    self._accept_outcome.set()
-                    return
-                logger.error(
-                    "Worker channel at %s rejected a connection attempt: %s: %s",
-                    self._address,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-            self._accept_connection = connection
-            self._accept_outcome.set()
-            return
-
-    def _unblock_accept(self) -> None:
-        """Free a thread parked in accept(), then stop listening regardless of the outcome.
-
-        Connect first, close second: closing a Windows named pipe while a thread waits on it can
-        crash the process. The connect itself runs in its own thread so a peer that connects
-        during the handshake and never responds cannot block this past the grace period either.
-        """
-        threading.Thread(target=self._connect_throwaway_client, name="gtn-channel-unblock", daemon=True).start()
-        self._accept_outcome.wait(_UNBLOCK_GRACE_S)
-        self._stop_listening()
-
-    def _connect_throwaway_client(self) -> None:
-        with contextlib.suppress(OSError, AuthenticationError, EOFError):
-            throwaway = Client(self._address, family=_FAMILY, authkey=self._authkey)
-            throwaway.close()
-
-    def _stop_listening(self) -> None:
-        self._stopping.set()
-        with contextlib.suppress(OSError):
-            self._listener.close()
+def _encode_frame(frame: dict) -> bytes:
+    raw = json.dumps(frame).encode("utf-8")
+    return _HEADER.pack(len(raw)) + raw
 
 
-def connect_from_environment(environ: Mapping[str, str]) -> Channel:
-    """Worker side: connect to the `ChannelListener` named by `environ`."""
-    address = environ[CHANNEL_ADDRESS_ENV]
-    authkey = bytes.fromhex(environ[CHANNEL_AUTHKEY_ENV])
-    connection = Client(address, family=_FAMILY, authkey=authkey)
-    return Channel(connection)
+async def _read_json_frame(reader: asyncio.StreamReader) -> dict:
+    """Read one length-prefixed UTF-8 JSON object. Raises on EOF, a bad length, or malformed JSON."""
+    header = await reader.readexactly(_HEADER.size)
+    (length,) = _HEADER.unpack(header)
+    raw = await reader.readexactly(length)
+    frame = json.loads(raw.decode("utf-8"))
+    if not isinstance(frame, dict):
+        msg = "frame is not a JSON object"
+        raise ValueError(msg)  # noqa: TRY004 - ValueError so every malformed-frame condition is caught uniformly
+    return frame
 
 
-class _PendingSend(NamedTuple):
-    """A request frame that has been sent and is waiting on its result."""
-
-    request_id: str
-    future: Future[dict]
+def _is_valid_error_shape(error: object) -> bool:
+    return isinstance(error, dict) and isinstance(error.get("type"), str) and isinstance(error.get("message"), str)
 
 
-class Channel:
-    """Either end of a connected channel.
+def _validate_result_frame(frame: dict) -> None:
+    has_body = isinstance(frame.get("body"), dict)
+    has_error = _is_valid_error_shape(frame.get("error"))
+    if has_body == has_error:  # neither, or both: exactly one is required
+        msg = "result frame must have exactly one of body or error"
+        raise ValueError(msg)
 
-    `send_bytes`/`recv_bytes` only: this class never calls `Connection.send`/`.recv`, which
-    pickle their argument, so unpickling an attacker-controlled frame would run arbitrary code.
-    """
 
-    def __init__(self, connection: Connection) -> None:
-        self._connection = connection
-        self._write_lock = threading.Lock()
-        self._pending_lock = threading.Lock()
-        self._pending_requests: dict[str, Future[dict]] = {}
-        self._frame_queue: Queue[dict | None] = Queue()
-        self._closed = threading.Event()
-        self._closing = threading.Event()
-        self._started = False
+def _validate_channel_frame(frame: dict) -> None:
+    """Raise ValueError unless `frame` has the shape of a request/result/notification frame."""
+    frame_type = frame.get("frame")
+    if frame_type not in _FRAME_TYPES:
+        msg = "frame has an unrecognized type"
+        raise ValueError(msg)
+    if frame_type != "notification" and not isinstance(frame.get("id"), str):
+        msg = "request or result frame has no id"
+        raise ValueError(msg)
+    if frame_type == "result":
+        _validate_result_frame(frame)
+        return
+    if not isinstance(frame.get("body"), dict):
+        msg = "frame has no body"
+        raise ValueError(msg)  # noqa: TRY004 - ValueError so every malformed-frame condition is caught uniformly
+
+
+async def _default_on_request(_body: dict) -> dict:
+    msg = "AsyncChannel.start() was never called."
+    raise RuntimeError(msg)
+
+
+def _default_on_notification(_body: dict) -> None:
+    msg = "AsyncChannel.start() was never called."
+    raise RuntimeError(msg)
+
+
+def _default_on_closed() -> None:
+    msg = "AsyncChannel.start() was never called."
+    raise RuntimeError(msg)
+
+
+class AsyncChannel:
+    """Either end of a connected channel. Every method runs on the loop that owns its streams."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._pending: dict[str, asyncio.Future[dict]] = {}
+        self._closed = False
         self._gate: Callable[[dict], GateDecision] | None = None
-        # Real callbacks arrive through start(), which the reader and dispatch threads cannot
-        # outrun: both are spawned by start() itself, after these are assigned for real.
-        self._on_request: Callable[[dict], dict] = lambda _body: {}
-        self._on_notification: Callable[[dict], None] = lambda _body: None
-        self._on_closed: Callable[[], None] = lambda: None
-        self._executor = ThreadPoolExecutor(thread_name_prefix="gtn-channel-request")
-        self._reader_thread: threading.Thread | None = None
-        self._dispatch_thread: threading.Thread | None = None
+        # Real callbacks arrive through start(), which the read loop cannot outrun: start() sets
+        # these before spawning it.
+        self._on_request: Callable[[dict], Awaitable[dict]] = _default_on_request
+        self._on_notification: Callable[[dict], None] = _default_on_notification
+        self._on_closed: Callable[[], None] = _default_on_closed
+        self._tasks: set[asyncio.Task] = set()
 
     def start(
         self,
         *,
-        on_request: Callable[[dict], dict],
+        on_request: Callable[[dict], Awaitable[dict]],
         on_notification: Callable[[dict], None],
         on_closed: Callable[[], None],
+        gate: Callable[[dict], GateDecision] | None = None,
     ) -> None:
-        """Start the reader and ordered-dispatch threads. Call at most once."""
-        if self._started:
-            msg = "Channel.start() was already called."
-            raise RuntimeError(msg)
-        self._started = True
+        """Start the read loop. Call on the loop that owns this channel's streams."""
         self._on_request = on_request
         self._on_notification = on_notification
         self._on_closed = on_closed
-        self._reader_thread = threading.Thread(target=self._read_loop, name="gtn-channel-reader", daemon=True)
-        self._dispatch_thread = threading.Thread(target=self._dispatch_loop, name="gtn-channel-dispatch", daemon=True)
-        self._reader_thread.start()
-        self._dispatch_thread.start()
-
-    def set_request_gate(self, gate: Callable[[dict], GateDecision]) -> None:
-        """Install the gate `_dispatch_request` consults before ever calling `on_request`. Call before `start()`."""
-        if self._started:
-            msg = "Channel.set_request_gate() must be called before start()."
-            raise RuntimeError(msg)
         self._gate = gate
+        self._spawn(self._read_loop())
 
-    def request(self, body: dict, timeout_s: float | None) -> dict:
-        """Send a request and block the calling thread for its result.
+    async def request(self, body: dict, timeout_s: float | None) -> dict:
+        """Send a request and await its result.
 
-        Raises `RuntimeError` if called from this channel's own reader or dispatch thread,
-        since those threads are what deliver the result; calling from there would deadlock.
+        Raises `ChannelRequestError` if the peer's `on_request` handler failed, or
+        `ChannelClosedError` once the channel has ended.
         """
-        self._assert_not_on_channel_thread()
-        pending = self._send_request_frame(body)
+        if self._closed:
+            raise ChannelClosedError(_CLOSED_MSG)
+        request_id = uuid.uuid4().hex
+        future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
         try:
-            return pending.future.result(timeout=timeout_s)
-        except TimeoutError:
-            self._forget_pending(pending.request_id)
-            raise
-
-    async def request_async(self, body: dict, timeout_s: float | None) -> dict:
-        """Send a request and await its result without blocking the event loop."""
-        self._assert_not_on_channel_thread()
-        pending = self._send_request_frame(body)
-        try:
-            return await asyncio.wait_for(asyncio.wrap_future(pending.future), timeout=timeout_s)
-        except TimeoutError:
-            self._forget_pending(pending.request_id)
-            raise
+            self._send_frame({"frame": "request", "id": request_id, "body": body})
+            await self._writer.drain()
+            return await asyncio.wait_for(future, timeout_s)
+        finally:
+            self._pending.pop(request_id, None)
 
     def notify(self, body: dict) -> None:
         """Send a one-way notification. Raises `ChannelClosedError` once the channel has ended."""
@@ -279,109 +189,52 @@ class Channel:
 
     def close(self) -> None:
         """End this side of the channel, which the peer observes as EOF. Idempotent."""
-        self._closed.set()
-        self._request_close()
-
-    def _assert_not_on_channel_thread(self) -> None:
-        current = threading.current_thread()
-        if current is self._reader_thread or current is self._dispatch_thread:
-            msg = "Channel.request()/request_async() cannot be called from the channel's reader or dispatch thread."
-            raise RuntimeError(msg)
-
-    def _send_request_frame(self, body: dict) -> _PendingSend:
-        future: Future[dict] = Future()
-        request_id = uuid.uuid4().hex
-        with self._pending_lock:
-            if self._closed.is_set():
-                raise ChannelClosedError(_CLOSED_MSG)
-            self._pending_requests[request_id] = future
-        try:
-            self._send_frame({"frame": "request", "id": request_id, "body": body})
-        except ChannelClosedError:
-            self._forget_pending(request_id)
-            raise
-        return _PendingSend(request_id, future)
-
-    def _forget_pending(self, request_id: str) -> Future[dict] | None:
-        with self._pending_lock:
-            return self._pending_requests.pop(request_id, None)
+        self._writer.close()
 
     def _send_frame(self, frame: dict) -> None:
-        raw = json.dumps(frame).encode("utf-8")
-        with self._write_lock:
-            # The reader closes the handle a moment after close(); nothing may go out meanwhile.
-            if self._closing.is_set():
-                raise ChannelClosedError(_CLOSED_MSG)
-            try:
-                self._connection.send_bytes(raw)
-            except OSError as exc:
-                raise ChannelClosedError(_CLOSED_MSG) from exc
+        if self._closed or self._writer.is_closing():
+            raise ChannelClosedError(_CLOSED_MSG)
+        self._writer.write(_encode_frame(frame))
 
-    def _send_result(self, request_id: str, body: dict) -> None:
-        self._send_frame({"frame": "result", "id": request_id, "body": body})
+    def _answer(self, request_id: str, *, body: dict | None = None, error: dict | None = None) -> None:
+        """Best-effort send of one result frame.
 
-    def _request_close(self) -> None:
-        """Have the connection closed by the thread that may be blocked on it.
-
-        Only the reader closes a started channel's connection: closing a Windows pipe while another
-        thread waits on it can crash the process.
+        A channel that is already closed means the peer gave up on this request on its own
+        side already; there is nothing left to report, so this does not raise.
         """
-        self._closing.set()
-        if self._reader_thread is None:
-            self._close_connection()
-
-    def _close_connection(self) -> None:
-        # Under the write lock, so no send is in progress on the handle being closed.
-        with self._write_lock, contextlib.suppress(OSError):
-            self._connection.close()
-
-    def _read_loop(self) -> None:
-        """Only reads frames onto the queue. Never runs a callback or waits on anything else."""
-        while not self._closing.is_set():
-            try:
-                if not self._connection.poll(_READ_POLL_S):
-                    continue
-                raw = self._connection.recv_bytes()
-            except (EOFError, OSError):
-                break
-            frame = self._parse_frame(raw)
-            if frame is None:
-                break
-            self._frame_queue.put(frame)
-        self._close_connection()
-        self._frame_queue.put(None)
-
-    def _parse_frame(self, raw: bytes) -> dict | None:
+        if self._closed:
+            return
+        frame: dict = {"frame": "result", "id": request_id}
+        if error is not None:
+            frame["error"] = error
+        else:
+            frame["body"] = body
         try:
-            frame = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            logger.error("Worker channel received a frame that was not valid UTF-8 JSON; closing the channel.")
-            return None
-        if not isinstance(frame, dict) or frame.get("frame") not in _FRAME_TYPES:
-            logger.error("Worker channel received a frame with an unrecognized shape; closing the channel.")
-            return None
-        if not isinstance(frame.get("body"), dict):
-            logger.error("Worker channel received a frame with no body; closing the channel.")
-            return None
-        if frame["frame"] != "notification" and not isinstance(frame.get("id"), str):
-            logger.error("Worker channel received a request or result frame with no id; closing the channel.")
-            return None
-        return frame
+            self._send_frame(frame)
+        except ChannelClosedError:
+            # Closing raced the check above; the peer already gave up on this request too.
+            logger.debug("Worker channel could not answer request %s: the channel closed first.", request_id)
 
-    def _dispatch_loop(self) -> None:
-        """The single thread that applies frames in arrival order: notify inline, resolve inline, gate requests."""
-        while True:
-            frame = self._frame_queue.get()
-            if frame is None:
-                self._finish_closing()
-                return
-            try:
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _read_loop(self) -> None:
+        """Applies frames in arrival order. The only path that can end this side on its own."""
+        try:
+            while True:
+                frame = await _read_json_frame(self._reader)
+                _validate_channel_frame(frame)
                 self._dispatch_frame(frame)
-            # gate/on_notification are caller-supplied; a failure there must close the channel, not kill this thread.
-            except Exception as exc:
-                logger.error("Worker channel dispatch raised %s: %s; closing the channel.", type(exc).__name__, exc)
-                self._finish_closing()
-                return
+        except (asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
+            logger.error("Worker channel closed: %s: %s", type(exc).__name__, exc)
+        except (
+            Exception
+        ) as exc:  # the gate and on_notification are caller-supplied; a failure must close, not crash this loop
+            logger.error("Worker channel dispatch raised %s: %s; closing the channel.", type(exc).__name__, exc)
+        finally:
+            self._finish_closing()
 
     def _dispatch_frame(self, frame: dict) -> None:
         frame_type = frame["frame"]
@@ -389,49 +242,162 @@ class Channel:
             self._on_notification(frame["body"])
             return
         if frame_type == "result":
-            self._resolve_pending(frame["id"], frame["body"])
+            self._resolve_pending(frame)
             return
-        self._dispatch_request(frame)
+        self._dispatch_request(frame["id"], frame["body"])
 
-    def _dispatch_request(self, frame: dict) -> None:
-        """The single point that may call `on_request`: a gate, if set, runs before it on every frame."""
-        request_id = frame["id"]
-        body = frame["body"]
+    def _dispatch_request(self, request_id: str, body: dict) -> None:
+        """The single point that may call `on_request`: the gate, if set, always runs first."""
         if self._gate is None:
-            self._executor.submit(self._run_request, request_id, body)
+            self._spawn(self._run_request(request_id, body))
             return
         decision = self._gate(body)
         if decision.dispatch is None:
             if decision.reply is None:
                 msg = "GateDecision denied a request without a reply to send back."
                 raise RuntimeError(msg)
-            with contextlib.suppress(ChannelClosedError):
-                self._send_result(request_id, decision.reply)
+            self._answer(request_id, body=decision.reply)
             return
-        self._executor.submit(self._run_request, request_id, decision.dispatch)
+        self._spawn(self._run_request(request_id, decision.dispatch))
 
-    def _run_request(self, request_id: str, body: dict) -> None:
+    async def _run_request(self, request_id: str, body: dict) -> None:
         try:
-            result_body = self._on_request(body)
-        except Exception as exc:  # on_request is caller-supplied; its failures still need a result frame sent back
-            logger.error("Worker channel request handler raised %s: %s", type(exc).__name__, exc)
-            result_body = {"error": str(exc)}
-        with contextlib.suppress(ChannelClosedError):
-            self._send_result(request_id, result_body)
+            result_body = await call_function(self._on_request, body)
+            self._answer(request_id, body=result_body)
+        except (
+            Exception
+        ) as exc:  # on_request is caller-supplied, and its result may not encode either; answer regardless
+            logger.error("Worker channel could not answer a request: %s: %s", type(exc).__name__, exc)
+            self._answer(request_id, error={"type": type(exc).__name__, "message": str(exc)})
 
-    def _resolve_pending(self, request_id: str, body: dict) -> None:
-        future = self._forget_pending(request_id)
-        if future is not None and not future.done():
-            future.set_result(body)
+    def _resolve_pending(self, frame: dict) -> None:
+        future = self._pending.pop(frame["id"], None)
+        if future is None or future.done():
+            return
+        error = frame.get("error")
+        if error is not None:
+            future.set_exception(ChannelRequestError(error["type"], error["message"]))
+            return
+        future.set_result(frame["body"])
 
     def _finish_closing(self) -> None:
-        self._request_close()
-        with self._pending_lock:
-            self._closed.set()
-            pending_futures = list(self._pending_requests.values())
-            self._pending_requests.clear()
-        for future in pending_futures:
+        if self._closed:
+            return
+        self._closed = True
+        self._writer.close()
+        for future in self._pending.values():
             if not future.done():
                 future.set_exception(ChannelClosedError(_CLOSED_MSG))
-        self._executor.shutdown(wait=False)
+        self._pending.clear()
         self._on_closed()
+
+
+class PendingWorker:
+    """Parent side: a one-shot loopback server waiting for one worker with the right token."""
+
+    def __init__(self, server: asyncio.Server, token: str, connected: asyncio.Future[AsyncChannel]) -> None:
+        self._server = server
+        self._token = token
+        self._connected = connected
+
+    @property
+    def child_environment(self) -> dict[str, str]:
+        """Environment variables that let `connect_to_parent` reach this server."""
+        host, port = self._server.sockets[0].getsockname()[:2]
+        return {CHANNEL_ADDRESS_ENV: f"{host}:{port}", CHANNEL_TOKEN_ENV: self._token}
+
+    async def accept(self, timeout_s: float) -> AsyncChannel:
+        """Block for the one worker connection, then stop listening regardless of the outcome."""
+        try:
+            return await asyncio.wait_for(asyncio.shield(self._connected), timeout_s)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Stop listening. Idempotent; safe even if `accept()` was never awaited."""
+        self._server.close()
+        if not self._connected.done():
+            self._connected.cancel()
+
+
+async def listen_for_worker() -> PendingWorker:
+    """Parent side: bind a loopback port and wait for one worker that offers the right token."""
+    token = secrets.token_hex(32)
+    connected: asyncio.Future[AsyncChannel] = asyncio.get_running_loop().create_future()
+
+    async def _on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            hello = await asyncio.wait_for(_read_json_frame(reader), _HANDSHAKE_TIMEOUT_S)
+        except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
+            logger.error("Worker channel handshake rejected a connection: %s: %s", type(exc).__name__, exc)
+            writer.close()
+            return
+        offered = hello.get("token")
+        if connected.done():
+            logger.error("Worker channel handshake rejected a connection: a worker already connected.")
+            writer.close()
+            return
+        if not isinstance(offered, str) or not hmac.compare_digest(offered, token):
+            logger.error("Worker channel handshake rejected a connection: wrong token.")
+            writer.close()
+            return
+        connected.set_result(AsyncChannel(reader, writer))
+
+    server = await asyncio.start_server(_on_connect, host="127.0.0.1", port=0)
+    return PendingWorker(server, token, connected)
+
+
+async def connect_to_parent(environ: Mapping[str, str]) -> AsyncChannel:
+    """Worker side: connect to the parent named by `environ` and send the handshake token."""
+    host, port = environ[CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    reader, writer = await asyncio.open_connection(host, int(port))
+    writer.write(_encode_frame({"token": environ[CHANNEL_TOKEN_ENV]}))
+    return AsyncChannel(reader, writer)
+
+
+class WorkerLink:
+    """Worker side: the channel on its own I/O loop thread, with a blocking API for sync callers."""
+
+    def __init__(self, environ: Mapping[str, str]) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, name="gtn-worker-io", daemon=True)
+        self._thread.start()
+        self.channel: AsyncChannel = asyncio.run_coroutine_threadsafe(connect_to_parent(environ), self._loop).result()
+
+    def start(
+        self,
+        *,
+        on_request: Callable[[dict], Awaitable[dict]],
+        on_notification: Callable[[dict], None],
+        on_closed: Callable[[], None],
+        gate: Callable[[dict], GateDecision] | None = None,
+    ) -> None:
+        """Start the channel's read loop on the I/O thread. Callbacks run on that thread."""
+        bound_start = functools.partial(
+            self.channel.start, on_request=on_request, on_notification=on_notification, on_closed=on_closed, gate=gate
+        )
+        self._loop.call_soon_threadsafe(bound_start)
+
+    def request(self, body: dict, timeout_s: float | None) -> dict:
+        """Block the calling thread for a reply.
+
+        Raises `RuntimeError` if called from the channel's own I/O thread, since that thread is
+        what would deliver the result; calling from there would deadlock.
+        """
+        if threading.current_thread() is self._thread:
+            msg = "WorkerLink.request() cannot be called from the channel's own I/O thread: it would deadlock."
+            raise RuntimeError(msg)
+        return asyncio.run_coroutine_threadsafe(self.channel.request(body, timeout_s), self._loop).result()
+
+    async def request_async(self, body: dict, timeout_s: float | None) -> dict:
+        """Await a reply from another event loop without blocking it."""
+        future = asyncio.run_coroutine_threadsafe(self.channel.request(body, timeout_s), self._loop)
+        return await asyncio.wrap_future(future)
+
+    def notify(self, body: dict) -> None:
+        """Send a one-way notification. Thread-safe; never blocks, even from the I/O thread itself."""
+        self._loop.call_soon_threadsafe(self.channel.notify, body)
+
+    def close(self) -> None:
+        """End this side of the channel, which the peer observes as EOF. Idempotent."""
+        self._loop.call_soon_threadsafe(self.channel.close)
