@@ -14,6 +14,7 @@ import pytest
 
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
 from griptape_nodes.exe_types.core_types import NodeError, NodeErrorLink
+from griptape_nodes.exe_types.workflow_node_errors import NestedWorkflowNodeError
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
@@ -424,6 +425,29 @@ class TestNodeErrorAttachments:
 
         assert details.fields == {}
         assert details.response is None
+
+
+class TestNestedWorkflowNodeFailure:
+    def test_reports_the_failing_nodes_exception_type_but_not_its_validation_messages(self) -> None:
+        root = NodeErrorDetails(
+            message="bad input", exception_type="builtins.KeyError", messages=["bad input", "worse input"]
+        )
+        nested = NestedWorkflowNodeError("Outer", root_details=root, node_path=["Inner"])
+
+        details = build_node_error_details("Outer", nested)
+
+        assert details.exception_type == "builtins.KeyError"
+        assert details.messages is None
+        assert details.message == nested.args[0]
+        assert details.fields == {NestedWorkflowNodeError.PATH_FIELD: "Inner"}
+
+    def test_root_without_an_exception_type_or_messages_reports_none(self) -> None:
+        nested = NestedWorkflowNodeError("Outer", root_details=NodeErrorDetails(message="refused"), node_path=["Inner"])
+
+        details = build_node_error_details("Outer", nested)
+
+        assert details.exception_type is None
+        assert details.messages is None
 
 
 class TestEventWireForm:
