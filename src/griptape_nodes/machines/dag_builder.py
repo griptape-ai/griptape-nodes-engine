@@ -89,6 +89,15 @@ class DagBuilder:
         # Data sinks (no control wires, no outgoing connections) a run has put off seeding until
         # its control graphs have finished; see ExecuteDagState._seed_deferred_data_sinks.
         self.deferred_data_sinks: list[BaseNode] = []
+        # Names of the nodes this run's control walk will reach and that have not run yet. The seeder
+        # fills it before any root is added; ExecuteDagState.handle_done_nodes drops a node once it
+        # has run. A node here will produce new outputs this run however it is marked now, so the
+        # upstream data walk treats it as a dependency even while it still reads RESOLVED from the
+        # last run. Nothing else about its state is touched: an untaken branch keeps what it has.
+        # Per run, like the rest of the builder: `clear` empties it, so a node the run never reached
+        # (an untaken branch, or anything below a cancel or failure) is not re-run by a later
+        # single-node resolution that walks this builder without reseeding.
+        self.rerun_nodes: set[str] = set()
 
     def _get_nodes_to_exclude_for_iterative_end(self, node: BaseNode, connections: Connections) -> set[str]:
         """Get nodes to exclude when collecting dependencies for BaseIterativeEndNode.
@@ -188,14 +197,15 @@ class DagBuilder:
 
         return added_nodes
 
-    @staticmethod
     def _upstream_dependency(
-        node: BaseNode, param: Parameter, nodes_to_exclude: set[str], connections: Connections
+        self, node: BaseNode, param: Parameter, nodes_to_exclude: set[str], connections: Connections
     ) -> BaseNode | None:
-        """Return the unresolved node feeding `param` by data that this DAG must run first, if any.
+        """Return the node feeding `param` by data that this DAG must run first, if any.
 
         Control parameters carry no data. A node in `nodes_to_exclude` (a loop End's body) runs
-        inside the packaged loop, not here. A RESOLVED node already holds its value.
+        inside the packaged loop, not here. A RESOLVED node already holds its value, unless this
+        run's control walk is about to reach it again (`rerun_nodes`), in which case the value it
+        holds is last run's and the reader has to wait for the new one.
         """
         if param.type == ParameterTypeBuiltin.CONTROL_TYPE:
             return None
@@ -205,6 +215,8 @@ class DagBuilder:
         upstream_node, _ = upstream_connection
         if upstream_node.name in nodes_to_exclude:
             return None
+        if upstream_node.name in self.rerun_nodes:
+            return upstream_node
         if upstream_node.state == NodeResolutionState.RESOLVED:
             return None
         return upstream_node
@@ -236,6 +248,7 @@ class DagBuilder:
         self.graph_to_nodes.clear()
         self.start_node_candidates.clear()
         self.deferred_data_sinks.clear()
+        self.rerun_nodes.clear()
 
     def _has_active_control_path_to_node(self, node: DagNode, connections: Connections) -> bool:
         """Check if any active graph has a control path that can reach the target node.

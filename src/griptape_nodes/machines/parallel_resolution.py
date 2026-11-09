@@ -222,6 +222,10 @@ class ExecuteDagState(State):
         # It has new outputs now, so if something upstream runs again later in this run, the
         # stale-marking walk must be allowed to reach it a second time.
         context.unresolved_this_run.discard(current_node.name)
+        # It has run this time, so the value it holds from here on is this run's: a walk that reaches
+        # it later in the run (control arriving at a node below it) may take that value as it is.
+        if context.dag_builder is not None:
+            context.dag_builder.rerun_nodes.discard(current_node.name)
 
         # Check if node was already resolved (shouldn't happen)
         if current_node.state == NodeResolutionState.RESOLVED and not current_node.lock:
