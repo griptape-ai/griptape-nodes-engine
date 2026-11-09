@@ -1153,11 +1153,17 @@ class FlowSerialization(EngineScoped):
                 continue
             created_connection_keys.add(connection_key)
 
+            # Made as a saved workflow file makes them: with initial_setup, so the connection pushes
+            # nothing into its target. The saved values set afterwards are then the first values the
+            # rebuilt nodes see, under initial_setup, as on a load. A live push here would hand a node
+            # its first value as an edit instead, and a node whose structure derives from that value
+            # would rebuild it as for an edit, before the saved structure and values are in place.
             create_connection_request = CreateConnectionRequest(
                 source_node_name=source_node_name,
                 source_parameter_name=indirect_connection.source_parameter_name,
                 target_node_name=target_node_name,
                 target_parameter_name=indirect_connection.target_parameter_name,
+                initial_setup=True,
             )
             create_connection_result = workflow.handle_request(create_connection_request)
             if create_connection_result.failed():
@@ -1227,8 +1233,14 @@ class FlowSerialization(EngineScoped):
             node: The node the value belongs to
             unique_parameter_uuid_to_values: The pool the value UUID resolves against
 
+        A value the node refuses on an input one of the rebuilt connections feeds is logged and skipped
+        rather than failing the load: the connection replaces it before the node runs, and the value was
+        accepted where it was saved. A node whose hard slider was narrowed after its value was set holds
+        exactly such a value (issue #5889).
+
         Raises:
-            FlowDeserializationError: If the value is missing from the pool, or could not be set
+            FlowDeserializationError: If the value is missing from the pool, or could not be set on an
+                input nothing feeds
         """
         parameter_name = indirect_set_value_command.set_parameter_value_command.parameter_name
         unique_value_uuid = indirect_set_value_command.unique_value_uuid
@@ -1243,12 +1255,22 @@ class FlowSerialization(EngineScoped):
         # Update the parameter value command to have the correct name.
         indirect_set_value_command.set_parameter_value_command.node_name = node.name
         set_parameter_value_result = workflow.handle_request(indirect_set_value_command.set_parameter_value_command)
-        if set_parameter_value_result.failed():
-            msg = (
-                f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
-                f"{set_parameter_value_result.result_details}"
+        if not set_parameter_value_result.failed():
+            return
+        if parameter_name in workflow.flows.connections.incoming_index.get(node.name, {}):
+            logger.warning(
+                "Attempted to restore the value of parameter '%s' on node '%s'. Skipped, its connection supplies "
+                "the value before the node runs: %s",
+                parameter_name,
+                node.name,
+                set_parameter_value_result.result_details,
             )
-            raise FlowDeserializationError(msg)
+            return
+        msg = (
+            f"Failed while restoring the saved value of '{node.name}.{parameter_name}'. "
+            f"{set_parameter_value_result.result_details}"
+        )
+        raise FlowDeserializationError(msg)
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
