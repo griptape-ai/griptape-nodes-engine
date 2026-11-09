@@ -59,7 +59,7 @@ _DEFAULT_QUALITY = {ImageFormat.JPEG: 75, ImageFormat.WEBP: 80}
 _PNG_DROPPED_CHUNKS = frozenset({b"sRGB", b"gAMA", b"cHRM"})
 
 # Text chunks, dropped from a source PNG whose metadata is rewritten in place, so only the text
-# it's given ends up in the output, as when it re-encodes
+# ``GriptapeImage.encode`` is given ends up in the output, as when it re-encodes
 _PNG_TEXT_CHUNKS = frozenset({b"tEXt", b"zTXt", b"iTXt"})
 
 # Bytes 16-20 of an ICC profile name the color space it describes
@@ -217,7 +217,7 @@ def _tiff_with_exif(encoded: bytes, exif: Exif, dropped: list[str]) -> bytes:
 def _output_spec(
     buf: oiio.ImageBuf, image_format: ImageFormat, quality: int | None, *, optimize: bool
 ) -> oiio.ImageSpec:
-    """Return a spec for writing ``buf`` with no metadata, so only what it's given gets written."""
+    """Return a spec for writing ``buf`` with no metadata, so only the metadata ``reencoded`` is given gets written."""
     source_spec = buf.spec()
     spec = oiio.ImageSpec(source_spec.width, source_spec.height, buf.nchannels, source_spec.format)
     spec.channelnames = source_spec.channelnames
