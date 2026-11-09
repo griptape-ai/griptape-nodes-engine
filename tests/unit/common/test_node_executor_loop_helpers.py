@@ -14,8 +14,8 @@ These tests cover small, near-pure helpers that decide loop control flow:
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
   creations from reaching editors.
-* ``_get_start_node_item_values`` / ``_extract_iteration_results_from_subprocess`` - collect
-  an item wired straight from the loop's start node into the end node's ``new_item_to_add``.
+* ``_passthrough_connections_between`` / ``_handle_empty_loop_body`` - an item wired straight
+  from the loop's start node into the end node's ``new_item_to_add``.
 """
 
 import logging
@@ -26,9 +26,14 @@ import pytest
 
 from griptape_nodes.common.node_executor import IterationControlAction, IterationFailure, NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
+from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
-from griptape_nodes.retained_mode.events.flow_events import OriginalNodeParameter, PackagedNodeParameterMapping
+from griptape_nodes.retained_mode.events.flow_events import (
+    OriginalNodeParameter,
+    PackagedNodeParameterMapping,
+    PassthroughConnection,
+)
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     ListConnectionsForNodeResultSuccess,
@@ -630,124 +635,95 @@ class TestSilencePackagedNodeCreationBroadcasts:
         assert package_result.serialized_flow_commands.serialized_node_commands == []
 
 
-def _make_start_wired_end_node(source_param: str) -> tuple[MagicMock, list[MagicMock]]:
-    """Mock legacy end node whose new_item_to_add is wired from its start node's ``source_param``."""
+def _make_connection(source_node: MagicMock, source_param: str, target_node: MagicMock, target_param: str) -> MagicMock:
+    conn = MagicMock()
+    conn.source_node = source_node
+    conn.source_parameter.name = source_param
+    conn.source_parameter.output_type = "str"
+    conn.target_node = target_node
+    conn.target_parameter.name = target_param
+    return conn
+
+
+def _make_loop_pair() -> tuple[MagicMock, MagicMock]:
+    """Mock legacy start/end nodes iterating three items."""
     start_node = MagicMock()
     start_node.name = "LoopStart"
     start_node._get_iteration_items.return_value = ["a", "b", "c"]
-    start_node.get_all_iteration_values.return_value = [10, 20, 30]
+    start_node.get_all_iteration_values.return_value = [0, 1, 2]
+    start_node._get_total_iterations.return_value = 3
     end_node = MagicMock(spec=BaseIterativeEndNode)
     end_node.name = "LoopEnd"
     end_node.start_node = start_node
-    conn = MagicMock()
-    conn.target_parameter_name = "new_item_to_add"
-    conn.source_node_name = "LoopStart"
-    conn.source_parameter_name = source_param
-    return end_node, [conn]
+    return start_node, end_node
 
 
-class TestGetStartNodeItemValues:
-    """An item wired from the unpackaged start node takes each iteration's start node value."""
+class TestPassthroughConnectionsBetween:
+    """Data wires from one unpackaged node to another become packager passthroughs."""
 
-    def test_returns_current_item_per_iteration(self) -> None:
-        end_node, connections = _make_start_wired_end_node("current_item")
-        values = _make_executor()._get_start_node_item_values(end_node, connections, [0, 2])
-        assert values == {0: "a", 2: "c"}
-
-    def test_returns_loop_values_for_index(self) -> None:
-        end_node, connections = _make_start_wired_end_node("index")
-        values = _make_executor()._get_start_node_item_values(end_node, connections, [0, 1, 2])
-        assert values == {0: 10, 1: 20, 2: 30}
-
-    def test_returns_none_when_item_comes_from_a_body_node(self) -> None:
-        end_node, connections = _make_start_wired_end_node("current_item")
-        connections[0].source_node_name = "Body"
-        assert _make_executor()._get_start_node_item_values(end_node, connections, [0]) is None
-
-    def test_returns_none_for_group_end_node(self) -> None:
-        _, connections = _make_start_wired_end_node("current_item")
-        group = MagicMock(spec=BaseIterativeNodeGroup)
-        assert _make_executor()._get_start_node_item_values(group, connections, [0]) is None
-
-
-class TestExtractIterationResultsFromSubprocessStartNodeItem:
-    """Isolated and publisher loops collect a start-node item for each successful iteration only."""
-
-    def test_collects_start_node_item_for_successful_iterations(self) -> None:
-        end_node, connections = _make_start_wired_end_node("current_item")
-        executor = _make_executor()
-        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
-        connections_result.incoming_connections = connections
-        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
-        end_node._require_workflow.return_value = _workflow_of(executor)
-        iteration_outputs: list[tuple[int, bool, dict[str, Any] | None]] = [
-            (0, True, {}),
-            (1, False, None),
-            (2, True, {}),
+    def test_returns_data_wires_between_the_two_nodes(self) -> None:
+        start_node, end_node = _make_loop_pair()
+        body = MagicMock()
+        body.name = "Body"
+        connections = MagicMock()
+        connections.get_all_outgoing_connections.return_value = [
+            _make_connection(start_node, "current_item", end_node, "new_item_to_add"),
+            _make_connection(start_node, "current_item", body, "text"),
         ]
 
-        with patch.object(NodeExecutor, "_extract_parameter_output_values", return_value={}):
-            results, successful, _ = executor._extract_iteration_results_from_subprocess(
-                iteration_outputs, cast("Any", _make_package_result()), end_node
+        passthroughs = NodeExecutor._passthrough_connections_between(connections, start_node, end_node)
+
+        assert passthroughs == [
+            PassthroughConnection(
+                source_node_name="LoopStart",
+                source_parameter_name="current_item",
+                target_node_name="LoopEnd",
+                target_parameter_name="new_item_to_add",
             )
+        ]
 
-        assert successful == [0, 2]
-        assert results == {0: "a", 2: "c"}
+    def test_skips_control_wires(self) -> None:
+        start_node, end_node = _make_loop_pair()
+        control = _make_connection(start_node, "exec_out", end_node, "add_item")
+        control.source_parameter.output_type = ParameterTypeBuiltin.CONTROL_TYPE.value
+        connections = MagicMock()
+        connections.get_all_outgoing_connections.return_value = [control]
 
+        assert NodeExecutor._passthrough_connections_between(connections, start_node, end_node) == []
 
-class TestGetParameterValuesFromIterationsStartNodeItem:
-    """A start-node item is read from the start node, skipping iterations whose body failed."""
+    def test_same_node_returns_its_self_wires(self) -> None:
+        group = MagicMock()
+        group.name = "Group"
+        child = MagicMock()
+        connections = MagicMock()
+        connections.get_all_outgoing_connections.return_value = [
+            _make_connection(group, "current_item", group, "new_item_to_add"),
+            _make_connection(group, "current_item", child, "text"),
+        ]
 
-    def _run(self, failed_iteration_indices: set[int] | None) -> dict[int, Any]:
-        end_node, connections = _make_start_wired_end_node("current_item")
-        executor = _make_executor()
-        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
-        connections_result.incoming_connections = connections
-        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
-        end_node._require_workflow.return_value = _workflow_of(executor)
-        deserialized_flows = [(0, "flow_0", {}), (1, "flow_1", {}), (2, "flow_2", {})]
+        passthroughs = NodeExecutor._passthrough_connections_between(connections, group, group)
 
-        kwargs: dict[str, Any] = {}
-        if failed_iteration_indices is not None:
-            kwargs["failed_iteration_indices"] = failed_iteration_indices
-        return executor.get_parameter_values_from_iterations(
-            end_loop_node=end_node,
-            deserialized_flows=deserialized_flows,
-            package_flow_result_success=cast("Any", _make_package_result()),
-            **kwargs,
-        )
-
-    def test_collects_item_for_every_iteration_by_default(self) -> None:
-        assert self._run(None) == {0: "a", 1: "b", 2: "c"}
-
-    def test_skips_failed_iterations(self) -> None:
-        assert self._run({1}) == {0: "a", 2: "c"}
+        assert [(p.source_parameter_name, p.target_node_name) for p in passthroughs] == [("current_item", "Group")]
 
 
 class TestHandleEmptyLoopBody:
     """An empty loop body collects only an item wired straight from the start node."""
 
     @staticmethod
-    def _setup(
-        connections: list[MagicMock], *, list_succeeds: bool = True
-    ) -> tuple[NodeExecutor, MagicMock, MagicMock]:
-        end_node, _ = _make_start_wired_end_node("current_item")
-        start_node = end_node.start_node
-        start_node._get_total_iterations.return_value = 3
-        executor = _make_executor()
-        if list_succeeds:
-            result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
-            result.incoming_connections = connections
+    def _setup(source_param: str | None) -> tuple[NodeExecutor, MagicMock, MagicMock]:
+        """Loop pair whose end node's new_item_to_add is wired from the start node's source_param, or from a body node when None."""
+        start_node, end_node = _make_loop_pair()
+        if source_param is None:
+            connection = _make_connection(MagicMock(), "result", end_node, "new_item_to_add")
         else:
-            result = MagicMock()
-        cast("MagicMock", executor.engine).handle_request.return_value = result
-        start_node._require_workflow.return_value = _workflow_of(executor)
-        return executor, start_node, end_node
+            connection = _make_connection(start_node, source_param, end_node, "new_item_to_add")
+        workflow = start_node._require_workflow.return_value
+        workflow.flows.connections.get_all_incoming_connections.return_value = [connection]
+        return _make_executor(), start_node, end_node
 
     @pytest.mark.asyncio
     async def test_collects_start_node_item_for_every_iteration(self) -> None:
-        _, connections = _make_start_wired_end_node("current_item")
-        executor, start_node, end_node = self._setup(connections)
+        executor, start_node, end_node = self._setup("current_item")
 
         await executor._handle_empty_loop_body(start_node, end_node)
 
@@ -755,19 +731,16 @@ class TestHandleEmptyLoopBody:
         end_node._output_results_list.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_collects_nothing_when_item_is_not_wired_from_start(self) -> None:
-        _, connections = _make_start_wired_end_node("current_item")
-        connections[0].source_node_name = "Body"
-        executor, start_node, end_node = self._setup(connections)
+    async def test_collects_index_values(self) -> None:
+        executor, start_node, end_node = self._setup("index")
 
         await executor._handle_empty_loop_body(start_node, end_node)
 
-        assert end_node._results_list == []
-        end_node._output_results_list.assert_called_once()
+        assert end_node._results_list == [0, 1, 2]
 
     @pytest.mark.asyncio
-    async def test_collects_nothing_when_connections_cannot_be_listed(self) -> None:
-        executor, start_node, end_node = self._setup([], list_succeeds=False)
+    async def test_collects_nothing_when_item_is_not_wired_from_start(self) -> None:
+        executor, start_node, end_node = self._setup(None)
 
         await executor._handle_empty_loop_body(start_node, end_node)
 

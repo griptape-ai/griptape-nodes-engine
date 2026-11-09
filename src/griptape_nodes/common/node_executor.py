@@ -98,6 +98,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackagedNodeParameterMapping,
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
+    PassthroughConnection,
 )
 from griptape_nodes.retained_mode.events.node_error_details import (
     NodeErrorDetails,
@@ -143,9 +144,10 @@ from griptape_nodes.retained_mode.managers.event_manager import (
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable
+    from collections.abc import Callable, Collection
 
     from griptape_nodes.common.directed_graph import DirectedGraph
+    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -1210,6 +1212,10 @@ class NodeExecutor(EngineScoped):
             entry_control_parameter_name=entry_control_parameter_name,
             output_parameter_prefix=f"{end_node.name.replace(' ', '_')}_loop_",
             node_group_name=node_group_name,
+            # Neither loop node is packaged, so a wire straight from start to end (current_item into
+            # new_item_to_add) has no packaged endpoint. Carried StartFlow -> EndFlow, it is set per
+            # iteration and read back like a body node's output.
+            passthrough_connections=self._passthrough_connections_between(connections, start_node, end_node),
         )
 
         package_result = workflow.handle_request(request)
@@ -1259,27 +1265,32 @@ class NodeExecutor(EngineScoped):
             end_node.name,
         )
 
-        # An item wired straight from start to end is the only thing an empty body can collect
-        list_connections_request = ListConnectionsForNodeRequest(node_name=end_node.name)
-        list_connections_result = workflow.handle_request(list_connections_request)
-
-        start_node_item_values = None
-        if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-            start_node_item_values = self._get_start_node_item_values(
-                end_node, list_connections_result.incoming_connections, range(total_iterations)
-            )
+        # With no body there is no packaged flow to read results back from. The only thing an empty
+        # loop can collect is an item wired straight from the start node, read from the start node.
+        source_param_name = None
+        for conn in workflow.flows.connections.get_all_incoming_connections(end_node):
+            if conn.source_node is start_node and conn.target_parameter.name == "new_item_to_add":
+                source_param_name = conn.source_parameter.name
+                break
 
         logger.debug(
             "Processing %d iterations for empty loop from '%s' to '%s' (item wired from start: %s)",
             total_iterations,
             start_node.name,
             end_node.name,
-            start_node_item_values is not None,
+            source_param_name,
         )
 
         end_node._results_list = []
-        if start_node_item_values:
-            end_node._results_list = [start_node_item_values[index] for index in sorted(start_node_item_values)]
+        if source_param_name is not None:
+            current_item_values = list(start_node._get_iteration_items())
+            index_values = start_node.get_all_iteration_values()
+            for iteration_index in range(total_iterations):
+                value = self._get_iteration_value_for_parameter(
+                    source_param_name, iteration_index, index_values, current_item_values
+                )
+                if value is not None:
+                    end_node._results_list.append(value)
 
         end_node._output_results_list()
 
@@ -1563,9 +1574,7 @@ class NodeExecutor(EngineScoped):
                     )
                     start_subflow_result = await workflow.ahandle_request(start_subflow_request)
 
-                failed_iteration_indices: tuple[int, ...] = ()
                 if not isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
-                    failed_iteration_indices = (iteration_index,)
                     logger.warning(
                         "Sequential iteration %d failed for loop ending at '%s'. Will attempt to extract partial results. Error: %s",
                         iteration_index,
@@ -1608,7 +1617,6 @@ class NodeExecutor(EngineScoped):
                         end_loop_node=end_loop_node,
                         deserialized_flows=single_flow_ref,
                         package_flow_result_success=package_result,
-                        failed_iteration_indices=failed_iteration_indices,
                     )
                     iteration_results.update(single_iteration_results)
                     break_occurred = True
@@ -1622,7 +1630,6 @@ class NodeExecutor(EngineScoped):
                     end_loop_node=end_loop_node,
                     deserialized_flows=single_flow_ref,
                     package_flow_result_success=package_result,
-                    failed_iteration_indices=failed_iteration_indices,
                 )
                 iteration_results.update(single_iteration_results)
 
@@ -2562,6 +2569,11 @@ class NodeExecutor(EngineScoped):
             entry_control_node_name=entry_control_node_name,
             entry_control_parameter_name=entry_control_parameter_name,
             node_group_name=node.name,
+            # The group is not packaged with its children, so a wire from one of its own outputs
+            # into one of its own inputs (current_item into new_item_to_add) has no packaged
+            # endpoint. Carried StartFlow -> EndFlow, it is set per iteration and read back like a
+            # child's output.
+            passthrough_connections=self._passthrough_connections_between(workflow.flows.connections, node, node),
         )
 
         package_result = workflow.handle_request(request)
@@ -3221,49 +3233,29 @@ class NodeExecutor(EngineScoped):
 
         return None
 
-    def _get_start_node_item_values(
-        self,
-        end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
-        incoming_connections: list,
-        iteration_indices: Iterable[int],
-    ) -> dict[int, Any] | None:
-        """Get new_item_to_add's per-iteration values when it is wired straight from the loop's start node.
+    @staticmethod
+    def _passthrough_connections_between(
+        connections: Connections, source_node: BaseNode, target_node: BaseNode
+    ) -> list[PassthroughConnection]:
+        """The data connections from source_node to target_node, as passthroughs for the packager.
 
-        The start node is not packaged, so such an item has no EndFlow parameter to read back.
-        Each iteration's value is the one its StartFlow node was given.
-
-        Args:
-            end_loop_node: The End Loop Node
-            incoming_connections: List of incoming connections to end_loop_node
-            iteration_indices: The iterations to collect a value for
-
-        Returns:
-            Dict mapping iteration_index -> value, or None if new_item_to_add is not wired from the start node
+        Both nodes stay outside the package, so the packager would never see these connections.
         """
-        if not isinstance(end_loop_node, BaseIterativeEndNode) or end_loop_node.start_node is None:
-            return None
-        start_node = end_loop_node.start_node
-        source_param_name = next(
-            (
-                conn.source_parameter_name
-                for conn in incoming_connections
-                if conn.target_parameter_name == "new_item_to_add" and conn.source_node_name == start_node.name
-            ),
-            None,
-        )
-        if source_param_name is None:
-            return None
-
-        current_item_values = list(start_node._get_iteration_items())
-        index_values = start_node.get_all_iteration_values()
-        iteration_results = {}
-        for iteration_index in iteration_indices:
-            value = self._get_iteration_value_for_parameter(
-                source_param_name, iteration_index, index_values, current_item_values
+        passthroughs = []
+        for conn in connections.get_all_outgoing_connections(source_node):
+            if conn.target_node is not target_node:
+                continue
+            if conn.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+                continue
+            passthroughs.append(
+                PassthroughConnection(
+                    source_node_name=source_node.name,
+                    source_parameter_name=conn.source_parameter.name,
+                    target_node_name=target_node.name,
+                    target_parameter_name=conn.target_parameter.name,
+                )
             )
-            if value is not None:
-                iteration_results[iteration_index] = value
-        return iteration_results
+        return passthroughs
 
     def get_node_parameter_mappings(
         self, package_result: PackageNodesAsSerializedFlowResultSuccess, start_or_end: str
@@ -3298,7 +3290,6 @@ class NodeExecutor(EngineScoped):
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
         deserialized_flows: list[tuple[int, str, dict[str, str]]],
         package_flow_result_success: PackageNodesAsSerializedFlowResultSuccess,
-        failed_iteration_indices: Collection[int] = (),
     ) -> dict[int, Any]:
         """Extract parameter values from each iteration's EndFlow node.
 
@@ -3311,8 +3302,6 @@ class NodeExecutor(EngineScoped):
             end_loop_node: The End Loop Node (NOT packaged, just used for reference)
             deserialized_flows: List of (iteration_index, flow_name, node_name_mappings)
             package_flow_result_success: PackageNodesAsSerializedFlowResultSuccess containing parameter_name_mappings
-            failed_iteration_indices: Iterations whose body failed. An item wired from the start node is
-                not collected for them.
 
         Returns:
             Dict mapping iteration_index -> value for that iteration
@@ -3326,14 +3315,6 @@ class NodeExecutor(EngineScoped):
             raise RuntimeError(msg)  # noqa: TRY004
 
         incoming_connections = list_connections_result.incoming_connections
-
-        start_node_item_values = self._get_start_node_item_values(
-            end_loop_node,
-            incoming_connections,
-            (index for index, _, _ in deserialized_flows if index not in failed_iteration_indices),
-        )
-        if start_node_item_values is not None:
-            return start_node_item_values
 
         # Step 2: Get End node's parameter mappings (index 1 = EndFlow node)
 
@@ -3726,7 +3707,6 @@ class NodeExecutor(EngineScoped):
                         flow_ref for flow_ref in deserialized_flows if flow_ref[0] not in skipped_iteration_indices
                     ],
                     package_flow_result_success=package_result,
-                    failed_iteration_indices=set(failed_iteration_indices),
                 )
 
                 # Add None values for failed iterations that didn't produce any results
@@ -4021,18 +4001,13 @@ class NodeExecutor(EngineScoped):
         list_connections_result = workflow.handle_request(list_connections_request)
 
         endflow_param_name = None
-        start_node_item_values = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
-            start_node_item_values = self._get_start_node_item_values(
-                end_loop_node, list_connections_result.incoming_connections, successful_iterations
-            )
             endflow_param_name = self._find_endflow_param_for_end_loop_node(
                 workflow, list_connections_result.incoming_connections, end_node_param_mappings
             )
 
-        # Extract iteration results from subprocess outputs. An item wired from the start node has
-        # no EndFlow parameter, so endflow_param_name is None for it and the loop adds nothing.
-        iteration_results = start_node_item_values or {}
+        # Extract iteration results from subprocess outputs
+        iteration_results = {}
         for iteration_index in successful_iterations:
             subprocess_result = iteration_subprocess_outputs[iteration_index]
             parameter_output_values = self._extract_parameter_output_values(subprocess_result)

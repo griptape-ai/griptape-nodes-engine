@@ -233,6 +233,13 @@ class FlowPackaging(EngineScoped):
 
         end_node_packaging_result = end_node_result.packaging_result
 
+        # Step 10b: Carry connections with both ends outside the package from start node to end node
+        passthrough_failure = self._add_passthrough_connections(
+            workflow, request=request, start_node_result=start_node_result, end_node_result=end_node_result
+        )
+        if passthrough_failure is not None:
+            return passthrough_failure
+
         # If no entry control node specified, connect start directly to end
         if not request.entry_control_node_name and not request.entry_control_parameter_name:
             start_to_end_control_connection = SerializedFlowCommands.IndirectConnectionSerialization(
@@ -1010,6 +1017,93 @@ class FlowPackaging(EngineScoped):
             target_parameter_name=sanitized_param_name,
         )
         package_to_end_connections.append(package_to_end_connection)
+
+    def _add_passthrough_connections(
+        self,
+        workflow: WorkflowRuntime,
+        request: PackageNodesAsSerializedFlowRequest,
+        start_node_result: PackagingStartNodeResult,
+        end_node_result: MultiNodeEndNodeResult,
+    ) -> PackageNodesAsSerializedFlowResultFailure | None:
+        """Add a start node parameter, an end node parameter and a connection between them per passthrough.
+
+        A passthrough connection has neither end inside the package, so the connection analysis never
+        sees it. The start node gets a parameter mapped to the connection's target, the end node one
+        mapped to its source, and the value flows from one to the other inside the packaged flow. The
+        value is read back through the end node mapping like any other outgoing boundary connection.
+
+        Returns:
+            A failure result if a source node or parameter is missing, else None.
+        """
+        start_node_name = start_node_result.start_node_name
+        start_node_uuid = start_node_result.start_node_commands.node_uuid
+        end_node_name = end_node_result.end_node_name
+        end_node_uuid = end_node_result.packaging_result.end_node_commands.node_uuid
+        for passthrough in request.passthrough_connections:
+            try:
+                source_node = self.engine.node_manager.get_node_by_name_in(workflow, passthrough.source_node_name)
+            except ValueError as err:
+                details = f"Attempted to package nodes as serialized flow. Failed because source node '{passthrough.source_node_name}' of a passthrough connection could not be found. Error: {err}."
+                return PackageNodesAsSerializedFlowResultFailure(result_details=details)
+            source_param = source_node.get_parameter_by_name(passthrough.source_parameter_name)
+            if source_param is None:
+                details = f"Attempted to package nodes as serialized flow. Failed because source parameter '{passthrough.source_parameter_name}' on node '{passthrough.source_node_name}' of a passthrough connection could not be found."
+                return PackageNodesAsSerializedFlowResultFailure(result_details=details)
+
+            start_param_name = self._generate_sanitized_parameter_name(
+                prefix=request.output_parameter_prefix,
+                node_name=passthrough.target_node_name,
+                parameter_name=passthrough.target_parameter_name,
+            )
+            end_param_name = self._generate_sanitized_parameter_name(
+                prefix=request.output_parameter_prefix,
+                node_name=passthrough.source_node_name,
+                parameter_name=passthrough.source_parameter_name,
+            )
+            start_node_result.parameter_name_mappings[start_param_name] = OriginalNodeParameter(
+                node_name=passthrough.target_node_name, parameter_name=passthrough.target_parameter_name
+            )
+            end_node_result.parameter_name_mappings[end_param_name] = OriginalNodeParameter(
+                node_name=passthrough.source_node_name, parameter_name=passthrough.source_parameter_name
+            )
+
+            param_shape_info = extract_parameter_shape_info(source_param, include_control_params=True)
+            if param_shape_info is not None:
+                start_node_result.input_shape_data.setdefault(start_node_name, {})[start_param_name] = param_shape_info
+                end_node_result.packaging_result.output_shape_data.setdefault(end_node_name, {})[end_param_name] = (
+                    param_shape_info
+                )
+
+            start_node_result.start_node_commands.element_modification_commands.append(
+                AddParameterToNodeRequest(
+                    node_name=start_node_name,
+                    parameter_name=start_param_name,
+                    type=source_param.output_type,
+                    default_value=encodable_default(source_param.default_value, source_node.name, source_param.name),
+                    tooltip=f"Parameter {passthrough.target_parameter_name} from node {passthrough.target_node_name}, carried through the packaged flow",
+                    initial_setup=True,
+                )
+            )
+            end_node_result.packaging_result.end_node_commands.element_modification_commands.append(
+                AddParameterToNodeRequest(
+                    node_name=end_node_name,
+                    parameter_name=end_param_name,
+                    input_types=["any"],
+                    output_type=source_param.output_type,
+                    default_value=None,
+                    tooltip=f"Parameter {passthrough.source_parameter_name} from node {passthrough.source_node_name}, carried through the packaged flow",
+                    initial_setup=True,
+                )
+            )
+            start_node_result.start_to_package_connections.append(
+                SerializedFlowCommands.IndirectConnectionSerialization(
+                    source_node_uuid=start_node_uuid,
+                    source_parameter_name=start_param_name,
+                    target_node_uuid=end_node_uuid,
+                    target_parameter_name=end_param_name,
+                )
+            )
+        return None
 
     def _create_multi_node_start_node_with_connections(  # noqa: PLR0913, PLR0917
         self,
