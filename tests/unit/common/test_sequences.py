@@ -6,7 +6,7 @@ The intended entry point is the bus request, not the underlying
 
 Filesystem listings are stubbed by patching `engine.handle_request` so the
 inner `ListDirectoryRequest` returns canned filenames; this leaves the real
-`OSManager.on_scan_sequences_request` handler in place to exercise the full
+`FileSequences.on_scan_sequences_request` handler in place to exercise the full
 async dispatch path.
 """
 
