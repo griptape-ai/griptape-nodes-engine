@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from asyncio_thread_runner import ThreadRunner
@@ -20,7 +20,10 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterList, Parame
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
+from griptape_nodes.exe_types.workflow_node_errors import SubflowNodeFailedError
+from griptape_nodes.machines.control_flow import ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagNodeCategories
+from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -42,6 +45,8 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartFlowRequest,
     StartFlowResultFailure,
     StartFlowResultSuccess,
+    StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
@@ -55,6 +60,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
@@ -62,7 +68,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
-from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
+from griptape_nodes.retained_mode.managers import flow_manager as flow_manager_module
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager, StartFlowFromNodeSpec, StartFlowSpec
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
 from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
@@ -460,6 +467,85 @@ class TestStartFlowFailureMessage:
 
         assert isinstance(result, StartFlowFromNodeResultFailure)
         assert str(result.result_details) == "Attempted to run flow 'f'. Failed due to: boom"
+
+
+class TestStartLocalSubflowFailure:
+    """A failed subflow hands back the exception of the node that failed in it."""
+
+    @pytest.fixture
+    def resolution_machine(self) -> Mock:
+        machine = Mock(spec=ParallelResolutionMachine)
+        machine.is_errored.return_value = True
+        machine.get_error_message.return_value = "Node 'n' encountered a problem: boom"
+        return machine
+
+    @pytest.fixture
+    def subflow_failure(self) -> SubflowNodeFailedError:
+        raised = ValueError("boom")
+        return SubflowNodeFailedError("n", NodeErrorDetails(message="boom"), raised)
+
+    @pytest.fixture
+    def workflow(self) -> Mock:
+        workflow = Mock(spec=WorkflowRuntime)
+        workflow.flows = WorkflowFlows()
+        return workflow
+
+    @pytest.fixture
+    def flow_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch, resolution_machine: Mock) -> FlowManager:
+        flow_manager = engine.flow_manager
+        validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
+        start_node = Mock(spec=BaseNode)
+        start_node.name = "start"
+        subflow_machine = Mock(spec=ControlFlowMachine)
+        subflow_machine.start_flow = AsyncMock(spec=ControlFlowMachine.start_flow)
+        subflow_machine.resolution_machine = resolution_machine
+        monkeypatch.setattr(flow_manager, "get_flow_by_name_in", Mock(spec=flow_manager.get_flow_by_name_in))
+        monkeypatch.setattr(
+            flow_manager, "_flow_is_running", Mock(spec=flow_manager._flow_is_running, return_value=True)
+        )
+        validate_start_node = Mock(spec=flow_manager._validate_and_get_start_node, return_value=start_node)
+        monkeypatch.setattr(flow_manager, "_validate_and_get_start_node", validate_start_node)
+        monkeypatch.setattr(
+            flow_manager,
+            "on_validate_flow_dependencies_request",
+            AsyncMock(spec=flow_manager.on_validate_flow_dependencies_request, return_value=validated),
+        )
+        monkeypatch.setattr(
+            flow_manager_module, "ControlFlowMachine", Mock(spec=ControlFlowMachine, return_value=subflow_machine)
+        )
+        return flow_manager
+
+    @pytest.mark.asyncio
+    async def test_failure_carries_the_failing_nodes_exception(
+        self,
+        flow_manager: FlowManager,
+        workflow: Mock,
+        resolution_machine: Mock,
+        subflow_failure: SubflowNodeFailedError,
+    ) -> None:
+        resolution_machine.take_error_exception.return_value = subflow_failure
+
+        result = await flow_manager.on_start_local_subflow_request_in_workflow(
+            StartLocalSubflowRequest(flow_name="f"), workflow
+        )
+
+        assert isinstance(result, StartLocalSubflowResultFailure)
+        assert result.exception is subflow_failure
+        assert str(result.result_details) == "Node 'n' encountered a problem: boom"
+
+    @pytest.mark.asyncio
+    async def test_failure_without_a_failing_node_has_no_exception(
+        self, flow_manager: FlowManager, workflow: Mock, resolution_machine: Mock
+    ) -> None:
+        resolution_machine.take_error_exception.return_value = None
+
+        result = await flow_manager.on_start_local_subflow_request_in_workflow(
+            StartLocalSubflowRequest(flow_name="f"), workflow
+        )
+
+        assert isinstance(result, StartLocalSubflowResultFailure)
+        assert result.exception is None
+        assert str(result.result_details) == "Node 'n' encountered a problem: boom"
 
 
 class TestListNodesInFlowRequest:

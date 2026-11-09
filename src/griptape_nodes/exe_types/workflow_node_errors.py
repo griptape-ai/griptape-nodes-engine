@@ -1,0 +1,99 @@
+"""Exceptions that carry a failure up through the Workflow nodes that run it.
+
+``SubflowNodeFailedError`` names the node that failed inside a subflow and what it
+raised. ``NestedWorkflowNodeError`` is what a Workflow node raises for it, so each level
+of nesting adds one step to a path instead of wrapping the message again.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from griptape_nodes.exe_types.node_error import NodeError
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
+
+
+class SubflowNodeFailedError(RuntimeError):
+    """The first node to fail inside a subflow, the details of its failure, and the exception behind it."""
+
+    def __init__(self, node_name: str, details: NodeErrorDetails, cause: BaseException | None) -> None:
+        super().__init__(details.message)
+        self.node_name = node_name
+        self.details = details
+        self.cause = cause
+
+
+class NestedWorkflowNodeError(NodeError):
+    """A node inside a Workflow node failed, however many Workflow nodes down it sits.
+
+    Carries the failing node's own details once, plus the names of the nodes from this
+    Workflow node down to the failing one. ``workflow_depth`` counts the Workflow nodes
+    below this one that contain the failing node; groups and loops on the path are not
+    counted.
+    """
+
+    PATH_FIELD = "Failed node path"
+    PATH_SEPARATOR = " \u203a "
+    # A path longer than this is shown with its middle left out, so the field stays
+    # readable.
+    MAX_PATH_ENTRIES_SHOWN = 6
+    PATH_ENTRIES_KEPT_AT_EACH_END = 2
+
+    def __init__(
+        self,
+        workflow_node_name: str,
+        *,
+        root_details: NodeErrorDetails,
+        node_path: list[str],
+        root_cause: BaseException | None = None,
+        workflow_depth: int = 0,
+    ) -> None:
+        fields: dict[str, str | int | float | bool] = dict(root_details.fields)
+        fields[self.PATH_FIELD] = self._format_path(node_path)
+        super().__init__(
+            self._build_message(workflow_node_name, root_details.message, node_path, workflow_depth),
+            fields=fields,
+            response=root_details.response,
+            links=list(root_details.links),
+        )
+        self.workflow_node_name = workflow_node_name
+        self.root_details = root_details
+        self.node_path = node_path
+        self.root_cause = root_cause
+        self.workflow_depth = workflow_depth
+
+    @classmethod
+    def _format_path(cls, node_path: list[str]) -> str:
+        if len(node_path) <= cls.MAX_PATH_ENTRIES_SHOWN:
+            return cls.PATH_SEPARATOR.join(node_path)
+        kept = cls.PATH_ENTRIES_KEPT_AT_EACH_END
+        left_out = len(node_path) - 2 * kept
+        shown = [*node_path[:kept], f"\u2026 ({left_out} more)", *node_path[-kept:]]
+        return cls.PATH_SEPARATOR.join(shown)
+
+    @staticmethod
+    def _build_message(workflow_node_name: str, root_message: str, node_path: list[str], workflow_depth: int) -> str:
+        failed_node = node_path[-1]
+        if workflow_depth == 0:
+            where = f"node '{failed_node}' inside it failed"
+        elif workflow_depth == 1:
+            where = f"node '{failed_node}', inside a nested Workflow node, failed"
+        else:
+            where = f"node '{failed_node}', inside {workflow_depth} nested Workflow nodes, failed"
+        return (
+            f"Attempted to run the workflow behind node '{workflow_node_name}'. Failed because {where}: {root_message}"
+        )
+
+
+def next_failure_link(cause: BaseException | None) -> SubflowNodeFailedError | NestedWorkflowNodeError | None:
+    """Find the next subflow failure on a cause chain, or None when the chain ends at a plain exception."""
+    seen: set[int] = set()
+    current = cause
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SubflowNodeFailedError | NestedWorkflowNodeError):
+            return current
+        current = current.__cause__
+    return None

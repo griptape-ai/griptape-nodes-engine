@@ -1955,7 +1955,10 @@ class FlowManager(EngineScoped):
         if subflow_machine.resolution_machine.is_errored():
             error_message = subflow_machine.resolution_machine.get_error_message()
             # Pass through the error message directly without wrapping
-            return StartLocalSubflowResultFailure(result_details=error_message or "Subflow errored during execution")
+            return StartLocalSubflowResultFailure(
+                result_details=error_message or "Subflow errored during execution",
+                exception=subflow_machine.resolution_machine.take_error_exception(),
+            )
 
         return StartLocalSubflowResultSuccess(result_details=f"Successfully executed local subflow '{flow_name}'")
 
