@@ -169,6 +169,21 @@ class TestEnterActivatesProject:
         assert order == [ActivateWorkspaceProjectRequest.__name__, AppInitializationComplete.__name__]
 
     @pytest.mark.asyncio
+    async def test_activation_fails_if_project_file_missing(self) -> None:
+        """The executor asks for a missing project_file to fail rather than fall back to the workspace project."""
+        activated = ActivateWorkspaceProjectResultSuccess(result_details="Activated workspace project: p")
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(return_value=activated)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            await self._executor().__aenter__()
+
+        request = mock_gn.ahandle_request.call_args.args[0]
+        assert isinstance(request, ActivateWorkspaceProjectRequest)
+        assert request.fail_if_project_file_missing is True
+
+    @pytest.mark.asyncio
     async def test_configured_project_that_fails_to_activate_fails_the_run(self) -> None:
         """A configured project that is denied or broken raises instead of falling back to system defaults."""
         denied = ActivateWorkspaceProjectResultFailure(

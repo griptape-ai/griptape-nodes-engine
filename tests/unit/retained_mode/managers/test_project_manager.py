@@ -10618,23 +10618,16 @@ situations:
         assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
-    @pytest.mark.asyncio
-    async def test_missing_configured_project_file_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
-        """A project_file that names a missing file returns Failure, even when a workspace project exists."""
-        from griptape_nodes.retained_mode.events.project_events import (
-            ActivateWorkspaceProjectRequest,
-            ActivateWorkspaceProjectResultFailure,
-        )
-        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+    def _configure_project_file(self, pm: ProjectManager, tmp_path: Path, project_file: Path) -> None:
+        """Set up system defaults and a workspace project, with `project_file` pointing at `project_file`."""
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
 
         self._setup_system_defaults(pm, str(tmp_path))
-
         (tmp_path / WORKSPACE_PROJECT_FILE).write_text(self.VALID_PROJECT_YAML)
-        missing_project_path = tmp_path / "unmounted" / WORKSPACE_PROJECT_FILE
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
-                return str(missing_project_path)
+                return str(project_file)
             if "project_workspaces" in key:
                 return {}
             return str(tmp_path)
@@ -10642,11 +10635,59 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+    async def _activate(self, pm: ProjectManager, *, fail_if_project_file_missing: bool) -> object:
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+            mock_file_cls.return_value = mock_file_instance
+
+            request = ActivateWorkspaceProjectRequest(fail_if_project_file_missing=fail_if_project_file_missing)
+            return await pm.on_activate_workspace_project_request(request)
+
+    @pytest.mark.asyncio
+    async def test_missing_project_file_fails_when_requested(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """With the flag, a project_file naming a missing file fails instead of using the workspace project."""
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectResultFailure
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        missing_project_path = tmp_path / "unmounted" / "griptape-nodes-project.yml"
+        self._configure_project_file(pm, tmp_path, missing_project_path)
+
+        result = await self._activate(pm, fail_if_project_file_missing=True)
 
         assert isinstance(result, ActivateWorkspaceProjectResultFailure)
         assert str(missing_project_path) in str(result.result_details)
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_missing_project_file_falls_back_by_default(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """Without the flag, a project_file naming a missing file falls back to the workspace project."""
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectResultSuccess
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._configure_project_file(pm, tmp_path, tmp_path / "unmounted" / WORKSPACE_PROJECT_FILE)
+
+        result = await self._activate(pm, fail_if_project_file_missing=False)
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == str(tmp_path / WORKSPACE_PROJECT_FILE)
+
+    @pytest.mark.asyncio
+    async def test_existing_project_file_activates_when_flag_set(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """With the flag, a project_file naming an existing file is activated."""
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectResultSuccess
+
+        configured_project_path = tmp_path / "configured" / "griptape-nodes-project.yml"
+        configured_project_path.parent.mkdir()
+        configured_project_path.write_text(self.VALID_PROJECT_YAML)
+        self._configure_project_file(pm, tmp_path, configured_project_path)
+
+        result = await self._activate(pm, fail_if_project_file_missing=True)
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == str(configured_project_path)
 
     @pytest.mark.asyncio
     async def test_resolvable_workspace_project_activates(self, pm: ProjectManager, tmp_path: Path) -> None:

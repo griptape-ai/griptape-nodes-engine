@@ -81,13 +81,11 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         GriptapeNodes.EventManager().initialize_queue()
 
         # Activate the project BEFORE broadcasting AppInitializationComplete: the
-        # user-specified one, else the one the config names (project_file, else the
-        # workspace griptape-nodes-project.yml). At this point
-        # ProjectManager._initialization_complete is still False, so the project switch
-        # skips the heavy library reload that would otherwise clear the flow/nodes
-        # already created at module import time. Activating the configured project here,
-        # rather than leaving it to AppInitializationComplete, makes a configured project
-        # that fails to activate fail the run instead of falling back to system defaults.
+        # user-specified one, else the configured one, so a configured project that
+        # can't be activated fails the run instead of falling back to system defaults.
+        # At this point ProjectManager._initialization_complete is still False, so the
+        # project switch skips the heavy library reload that would otherwise clear the
+        # flow/nodes already created at module import time.
         if self._project_file_path is not None:
             await self._load_project(self._project_file_path)
         else:
@@ -160,12 +158,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         logger.info("Loaded and activated project template from %s", project_file_path)
 
     async def _activate_workspace_project(self) -> None:
-        """Activate the project the config names, failing if it is named but cannot be activated.
-
-        With no configured project the request succeeds without changing anything, and the
-        run stays on system defaults.
-        """
-        result = await GriptapeNodes.ahandle_request(ActivateWorkspaceProjectRequest())
+        """Activate the configured project, raising LocalExecutorError if it cannot be activated."""
+        result = await GriptapeNodes.ahandle_request(ActivateWorkspaceProjectRequest(fail_if_project_file_missing=True))
         if result.failed():
             msg = (
                 "Attempted to activate the configured project before running the workflow. "

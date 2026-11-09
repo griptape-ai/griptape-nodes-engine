@@ -4403,7 +4403,7 @@ class ProjectManager(EngineScoped):
 
     @handles(ActivateWorkspaceProjectRequest)
     async def on_activate_workspace_project_request(
-        self, _request: ActivateWorkspaceProjectRequest
+        self, request: ActivateWorkspaceProjectRequest
     ) -> ActivateWorkspaceProjectResultSuccess | ActivateWorkspaceProjectResultFailure:
         """Resolve and activate the workspace project before initialization completes.
 
@@ -4419,19 +4419,18 @@ class ProjectManager(EngineScoped):
         reload (LibraryManager performs the correctly-scoped load on init). A boot
         with no workspace project is a no-op success; a project that resolves but
         fails to load or activate is a failure (the detail comes from
-        `_load_workspace_project`). A `project_file` setting that names a file that does
-        not exist is also a failure, rather than falling through to the workspace default
-        or system defaults, so a caller never ends up on a project other than the one
-        configured. The engine_version gate is intentionally deferred to
-        LibraryManager at boot (soft-log); this handler reports load/activation failure
-        only, not gate failure.
+        `_load_workspace_project`). With `fail_if_project_file_missing`, a `project_file`
+        that names a missing file is also a failure. The engine_version gate is
+        intentionally deferred to LibraryManager at boot (soft-log); this handler
+        reports load/activation failure only, not gate failure.
         """
-        missing_project_path = self._missing_configured_project_file_path()
-        if missing_project_path is not None:
-            return ActivateWorkspaceProjectResultFailure(
-                result_details=f"Attempted to activate configured project at '{missing_project_path}'. "
-                "Failed because the project_file config setting points to a file that does not exist",
-            )
+        if request.fail_if_project_file_missing:
+            missing_project_path = self._missing_configured_project_file_path()
+            if missing_project_path is not None:
+                return ActivateWorkspaceProjectResultFailure(
+                    result_details=f"Attempted to activate configured project at '{missing_project_path}'. "
+                    "Failed because the project_file config setting points to a file that does not exist",
+                )
 
         workspace_project_path = self._resolve_project_file_path()
         if workspace_project_path is None:
@@ -5346,10 +5345,7 @@ class ProjectManager(EngineScoped):
         logger.debug("System defaults loaded successfully")
 
     def _missing_configured_project_file_path(self) -> Path | None:
-        """Return the `project_file` config path when it names a file that does not exist, else None.
-
-        None also covers an unset `project_file` and the SYSTEM_DEFAULTS_KEY sentinel.
-        """
+        """Return the `project_file` config path if it names a file that does not exist, else None."""
         project_file_value = self._config_manager.get_config_value("project_file")
         if project_file_value is None or project_file_value == SYSTEM_DEFAULTS_KEY:
             return None
