@@ -94,7 +94,7 @@ class BaseArtifactPreviewGenerator(EngineScoped, ABC):
             Pydantic model class (subclass of BaseGeneratorParameters)
 
         Example:
-            return PILThumbnailParameters
+            return ThumbnailParameters
         """
         ...
 
