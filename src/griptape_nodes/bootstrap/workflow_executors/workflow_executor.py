@@ -71,8 +71,11 @@ class WorkflowExecutor:
         parser.add_argument(
             "--storage-backend",
             choices=[StorageBackend.LOCAL.value, StorageBackend.GTC.value],
-            default=StorageBackend.LOCAL.value,
-            help="Storage backend to use: 'local' for local filesystem or 'gtc' for Griptape Cloud",
+            default=None,
+            help=(
+                "Storage backend to use for this run: 'local' for local filesystem or 'gtc' for Griptape Cloud. "
+                "Defaults to the configured storage backend."
+            ),
         )
 
     @classmethod
@@ -115,6 +118,6 @@ class WorkflowExecutor:
         with their own entries.
         """
         return {
-            "storage_backend": StorageBackend(args.storage_backend),
+            "storage_backend": StorageBackend(args.storage_backend) if args.storage_backend is not None else None,
             "project_file_path": Path(args.project_file_path) if args.project_file_path is not None else None,
         }
