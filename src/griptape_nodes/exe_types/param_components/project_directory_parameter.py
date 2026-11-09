@@ -6,14 +6,15 @@ DirectoryDestination. Falls back to a sensible default when no situation is conf
 
 from __future__ import annotations
 
+import pathlib
 import typing
 
 from griptape_nodes.common import macro_parser
 from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import directory as directory_mod
-from griptape_nodes.files import situation_resolver
-from griptape_nodes.retained_mode.events import destination_events, project_events
+from griptape_nodes.files import path_utils, situation_resolver
+from griptape_nodes.retained_mode.events import destination_events, os_events, project_events
 from griptape_nodes.traits import file_system_picker
 
 if typing.TYPE_CHECKING:
@@ -137,7 +138,9 @@ def _build_directory_destination_from_situation(
     """Build a DirectoryDestination from a project situation template.
 
     Args:
-        dirname: Directory name to use as the ``dir_name`` macro variable.
+        dirname: Directory name to use as the ``dir_name`` macro variable. An absolute path,
+            ``~`` path, or ``file://`` address is used as the destination directly, bypassing
+            the situation.
         situation: Situation name to look up in the current project.
         workflow: The workflow to look the situation up and create the directory in, or None
             for the caller's. Positional-only so a macro variable named `workflow` stays in
@@ -146,7 +149,22 @@ def _build_directory_destination_from_situation(
 
     Returns:
         DirectoryDestination with a MacroPath and baked-in creation policy.
+
+    Raises:
+        ValueError: If ``dirname`` is a web address, another address that cannot be saved to,
+            or a ``~`` path whose home folder cannot be found. ``~name`` is a plain name.
     """
+    explicit_path = _explicit_directory_path(dirname)
+    if explicit_path is not None:
+        # The user named the destination, so use it as given rather than nesting it inside the
+        # situation's directory. It is not versioned: the user chose this exact location.
+        return directory_mod.DirectoryDestination(
+            explicit_path,
+            existing_dir_policy=os_events.ExistingFilePolicy.OVERWRITE,
+            create_parents=True,
+            workflow=workflow,
+        )
+
     resolved = situation_resolver.resolve_situation(situation, _FALLBACK_DIRECTORY_MACRO, workflow=workflow)
     variables: dict[str, str | int] = {
         "dir_name": dirname,
@@ -159,3 +177,53 @@ def _build_directory_destination_from_situation(
         create_parents=resolved.create_parents,
         workflow=workflow,
     )
+
+
+def _explicit_directory_path(dirname: str) -> str | None:
+    """Return the local path `dirname` names, or None when it is a plain directory name.
+
+    Absolute paths, `~` paths, and `file://` addresses name a location. Any other address, and
+    a drive path from another operating system, cannot be saved to and raise.
+
+    Raises:
+        ValueError: If `dirname` is an address, drive path, or `~` path that names no location on
+            this computer.
+    """
+    local_path_from_uri = path_utils.parse_file_uri(dirname)
+    if local_path_from_uri is not None:
+        if (
+            pathlib.PureWindowsPath(local_path_from_uri).is_absolute()
+            and not pathlib.Path(local_path_from_uri).is_absolute()
+        ):
+            msg = (
+                f"Attempted to save to directory '{dirname}'. Failed because that address does not name a "
+                f"location on this computer. A path from another operating system, such as a 'C:' drive "
+                f"on macOS or Linux, has no equivalent here."
+            )
+            raise ValueError(msg)
+        return local_path_from_uri
+
+    if path_utils.is_url(dirname):
+        msg = (
+            f"Attempted to save to directory '{dirname}'. Failed because that address points somewhere this "
+            f"computer cannot save to. Enter a directory name, a folder path, or a 'file://' address "
+            f"naming a folder on this machine."
+        )
+        raise ValueError(msg)
+
+    # Only `~` and `~/` expand. Expanding `~name` is inconsistent across operating systems: POSIX
+    # fails for an unknown user while Windows swaps the name into the profile's parent folder.
+    if dirname != "~" and not dirname.startswith(("~/", "~\\")):
+        expanded = pathlib.Path(dirname)
+    else:
+        try:
+            expanded = pathlib.Path(dirname).expanduser()
+        except RuntimeError as e:
+            msg = (
+                f"Attempted to save to directory '{dirname}'. Failed because the home folder it starts with "
+                f"could not be found on this computer. Use a full folder path instead."
+            )
+            raise ValueError(msg) from e
+    if expanded.is_absolute():
+        return str(expanded)
+    return None

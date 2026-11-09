@@ -96,8 +96,14 @@ Two separate problems stack here:
 Give every additional engine **its own identity and its own ports**:
 
 ```bash
-GTN_ENGINE_ID=second-engine STATIC_SERVER_PORT=9000 GTN_MCP_SERVER_PORT=9928 gtn engine
+GTN_ENGINE_ID=second-engine \
+GTN_CONFIG_TRANSPORTS__WEBSOCKET_DIRECT__PORT=18126 \
+STATIC_SERVER_PORT=9000 \
+GTN_MCP_SERVER_PORT=9928 \
+gtn engine
 ```
+
+Every port must differ from the other engine's. See [Transports](guides/transports.md#settings) for the other transport settings.
 
 If you never intended to run more than one engine, find and stop the extra one using the steps in the [media section above](#images-or-videos-arent-showing-in-the-editor).
 
