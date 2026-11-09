@@ -44,6 +44,9 @@ CHANNEL_ADDRESS_ENV = "GTN_WORKER_CHANNEL_ADDRESS"
 CHANNEL_TOKEN_ENV = "GTN_WORKER_CHANNEL_TOKEN"  # noqa: S105 - a secret's env var name, not a secret
 
 _HANDSHAKE_TIMEOUT_S = 5.0
+# The hello frame is ~80 bytes (one token). An unauthenticated peer must not be able to make the
+# parent buffer an attacker-chosen amount of memory before the token is even checked.
+_HELLO_MAX_LENGTH = 4096
 _HEADER = struct.Struct(">I")
 _FRAME_TYPES = ("request", "result", "notification")
 _CLOSED_MSG = "The worker channel is closed."
@@ -78,10 +81,18 @@ def _encode_frame(frame: dict) -> bytes:
     return _HEADER.pack(len(raw)) + raw
 
 
-async def _read_json_frame(reader: asyncio.StreamReader) -> dict:
-    """Read one length-prefixed UTF-8 JSON object. Raises on EOF, a bad length, or malformed JSON."""
+async def _read_json_frame(reader: asyncio.StreamReader, *, max_length: int | None = None) -> dict:
+    """Read one length-prefixed UTF-8 JSON object. Raises on EOF, a bad length, or malformed JSON.
+
+    `readexactly` buffers the declared length before anything can be checked; `max_length` rejects
+    an oversized declared length before reading the body at all, which the pre-auth handshake uses
+    since the peer offering it has not been authenticated yet.
+    """
     header = await reader.readexactly(_HEADER.size)
     (length,) = _HEADER.unpack(header)
+    if max_length is not None and length > max_length:
+        msg = "frame exceeds the maximum allowed size"
+        raise ValueError(msg)
     raw = await reader.readexactly(length)
     frame = json.loads(raw.decode("utf-8"))
     if not isinstance(frame, dict):
@@ -192,9 +203,22 @@ class AsyncChannel:
         self._writer.close()
 
     def _send_frame(self, frame: dict) -> None:
+        self._write_encoded(self._prepare_frame(frame))
+
+    def _prepare_frame(self, frame: dict) -> bytes:
+        """Encode a frame, raising `ChannelClosedError` if already closed. Safe from any thread.
+
+        `WorkerLink.notify` calls this from the caller's own thread, ahead of scheduling the
+        write, so `ChannelClosedError` and an unencodable body's `TypeError` reach that caller
+        directly instead of only reaching asyncio's default exception logging.
+        """
         if self._closed or self._writer.is_closing():
             raise ChannelClosedError(_CLOSED_MSG)
-        self._writer.write(_encode_frame(frame))
+        return _encode_frame(frame)
+
+    def _write_encoded(self, encoded: bytes) -> None:
+        """Write bytes already produced by `_prepare_frame`. Must run on the owning loop."""
+        self._writer.write(encoded)
 
     def _answer(self, request_id: str, *, body: dict | None = None, error: dict | None = None) -> None:
         """Best-effort send of one result frame.
@@ -227,7 +251,13 @@ class AsyncChannel:
                 frame = await _read_json_frame(self._reader)
                 _validate_channel_frame(frame)
                 self._dispatch_frame(frame)
-        except (asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
+        except asyncio.IncompleteReadError as exc:
+            if exc.partial:
+                # EOF mid-frame: the peer dropped, rather than closing cleanly between frames.
+                logger.error("Worker channel closed: %s: %s", type(exc).__name__, exc)
+            else:
+                logger.debug("Worker channel closed.")
+        except (ConnectionError, ValueError, UnicodeDecodeError) as exc:
             logger.error("Worker channel closed: %s: %s", type(exc).__name__, exc)
         except (
             Exception
@@ -256,6 +286,18 @@ class AsyncChannel:
             if decision.reply is None:
                 msg = "GateDecision denied a request without a reply to send back."
                 raise RuntimeError(msg)
+            if not isinstance(decision.reply, dict):
+                # A bad gate reply fails only this one request, same as a bad on_request result:
+                # the gate itself is not at fault for the shape of the body it was handed to send.
+                logger.error("Worker channel gate reply was %s, not a dict.", type(decision.reply).__name__)
+                self._answer(
+                    request_id,
+                    error={
+                        "type": "TypeError",
+                        "message": f"gate reply is {type(decision.reply).__name__}, not a dict",
+                    },
+                )
+                return
             self._answer(request_id, body=decision.reply)
             return
         self._spawn(self._run_request(request_id, decision.dispatch))
@@ -263,10 +305,13 @@ class AsyncChannel:
     async def _run_request(self, request_id: str, body: dict) -> None:
         try:
             result_body = await call_function(self._on_request, body)
+            if not isinstance(result_body, dict):
+                msg = f"on_request returned {type(result_body).__name__}, not a dict"
+                raise TypeError(msg)  # noqa: TRY301 - caught immediately below, same as on_request raising directly
             self._answer(request_id, body=result_body)
         except (
             Exception
-        ) as exc:  # on_request is caller-supplied, and its result may not encode either; answer regardless
+        ) as exc:  # on_request is caller-supplied, and its result may not be a dict or encode either; answer regardless
             logger.error("Worker channel could not answer a request: %s: %s", type(exc).__name__, exc)
             self._answer(request_id, error={"type": type(exc).__name__, "message": str(exc)})
 
@@ -327,7 +372,7 @@ async def listen_for_worker() -> PendingWorker:
 
     async def _on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            hello = await asyncio.wait_for(_read_json_frame(reader), _HANDSHAKE_TIMEOUT_S)
+            hello = await asyncio.wait_for(_read_json_frame(reader, max_length=_HELLO_MAX_LENGTH), _HANDSHAKE_TIMEOUT_S)
         except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
             logger.error("Worker channel handshake rejected a connection: %s: %s", type(exc).__name__, exc)
             writer.close()
@@ -395,8 +440,14 @@ class WorkerLink:
         return await asyncio.wrap_future(future)
 
     def notify(self, body: dict) -> None:
-        """Send a one-way notification. Thread-safe; never blocks, even from the I/O thread itself."""
-        self._loop.call_soon_threadsafe(self.channel.notify, body)
+        """Send a one-way notification. Thread-safe; never blocks, even from the I/O thread itself.
+
+        Raises `ChannelClosedError` once the channel has ended, or `TypeError` if `body` cannot
+        be encoded as JSON: both checked on the calling thread, before the write is scheduled,
+        so the caller sees them directly rather than only asyncio's default exception logging.
+        """
+        encoded = self.channel._prepare_frame({"frame": "notification", "body": body})
+        self._loop.call_soon_threadsafe(self.channel._write_encoded, encoded)
 
     def close(self) -> None:
         """End this side of the channel, which the peer observes as EOF. Idempotent."""

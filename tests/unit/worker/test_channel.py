@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import os
 import shutil
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -299,6 +301,31 @@ async def test_gate_denial_with_no_reply_closes_the_channel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_gate_reply_that_is_not_a_dict_answers_with_a_channel_request_error() -> None:
+    """A non-dict gate reply fails only that one request with an error frame, not the whole channel."""
+    pair = await _connected_pair()
+
+    def gate(_body: dict) -> GateDecision:
+        return GateDecision(dispatch=None, reply=["not", "a", "dict"])  # pyright: ignore[reportArgumentType]
+
+    pair.parent.start(on_request=_empty_response, on_notification=lambda _b: None, on_closed=lambda: None, gate=gate)
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        with pytest.raises(ChannelRequestError) as exc_info:
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        assert exc_info.value.error_type == "TypeError"
+        # The channel stays open: only this one request failed, not the whole channel.
+        with pytest.raises(ChannelRequestError):
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+    finally:
+        pair.parent.close()
+        pair.child.close()
+
+
+@pytest.mark.asyncio
 async def test_on_request_raising_answers_with_a_channel_request_error() -> None:
     """on_request raising answers with an error frame; the requester sees ChannelRequestError, not a body."""
     pair = await _connected_pair()
@@ -343,6 +370,30 @@ async def test_unencodable_handler_result_answers_with_a_channel_request_error()
             await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
         assert exc_info.value.error_type == "TypeError"
         # The channel stays open and still answers a normal request afterward.
+        assert await pair.parent.request({"y": 1}, timeout_s=REQUEST_TIMEOUT_S) == {"y": 1}
+    finally:
+        pair.parent.close()
+        pair.child.close()
+
+
+@pytest.mark.asyncio
+async def test_on_request_returning_a_non_dict_answers_with_a_channel_request_error() -> None:
+    """on_request returning None (or anything but a dict) answers with an error, not a malformed body."""
+    pair = await _connected_pair()
+
+    async def parent_on_request(_body: dict) -> dict:
+        return None  # type: ignore[return-value]  # the point of the test: on_request forgot to return
+
+    pair.parent.start(on_request=parent_on_request, on_notification=lambda _b: None, on_closed=lambda: None)
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        with pytest.raises(ChannelRequestError) as exc_info:
+            await pair.child.request({"x": 1}, timeout_s=REQUEST_TIMEOUT_S)
+        assert exc_info.value.error_type == "TypeError"
+        # The channel stays open: only this one request failed, not the whole channel.
         assert await pair.parent.request({"y": 1}, timeout_s=REQUEST_TIMEOUT_S) == {"y": 1}
     finally:
         pair.parent.close()
@@ -513,6 +564,24 @@ async def test_close_calls_on_closed_on_the_closing_side_too() -> None:
     assert rec_child.closed_count == 1
 
 
+@pytest.mark.asyncio
+async def test_clean_close_does_not_log_at_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A peer closing cleanly between frames is a normal close, not an error worth logging."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    rec_child = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+        pair.child.close()
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -576,6 +645,40 @@ async def test_accept_times_out_cleanly_when_nobody_connects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oversized_handshake_frame_is_rejected_without_reading_the_body() -> None:
+    """A declared hello length over the cap is rejected from the header alone, before any body."""
+    pending = await listen_for_worker()
+    host, port_str = pending.child_environment[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    port = int(port_str)
+
+    _reader, bad_writer = await asyncio.open_connection(host, port)
+    oversized_length = channel_module._HELLO_MAX_LENGTH + 1
+    bad_writer.write(struct.pack(">I", oversized_length))
+    # Deliberately never sends the (huge, declared) body: rejection must not wait for it.
+
+    start = time.monotonic()
+    child = await connect_to_parent(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    elapsed = time.monotonic() - start
+    # Reading the declared-oversized body would have blocked for the full accept() timeout.
+    assert elapsed < ACCEPT_TIMEOUT_S / 2
+    rec_parent = _Recorder()
+    parent_channel.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        assert await child.request({"op": "echo"}, timeout_s=REQUEST_TIMEOUT_S) == {"op": "echo"}
+    finally:
+        parent_channel.close()
+        child.close()
+        bad_writer.close()
+
+
+@pytest.mark.asyncio
 async def test_bad_and_silent_peers_do_not_block_a_real_worker() -> None:
     """A silent peer, a wrong token, and garbage bytes are each rejected without affecting accept()."""
     pending = await listen_for_worker()
@@ -633,6 +736,51 @@ async def test_worker_link_request_from_the_io_thread_raises_runtime_error() -> 
         assert result == {}
         assert len(captured) == 1
         assert isinstance(captured[0], RuntimeError)
+    finally:
+        link.close()
+        parent_channel.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_link_notify_after_close_raises_channel_closed_error() -> None:
+    """WorkerLink.notify() after the channel ends raises to the caller, not just asyncio's log."""
+    pending = await listen_for_worker()
+    link = WorkerLink(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    # The worker's own on_closed, not the parent's: it only fires after link.channel's _closed
+    # flag is actually set, on the I/O thread link.notify() needs to see it from.
+    worker_closed = threading.Event()
+    link.start(on_request=_empty_response, on_notification=lambda _b: None, on_closed=worker_closed.set)
+    parent_channel.start(on_request=_empty_response, on_notification=lambda _b: None, on_closed=lambda: None)
+
+    parent_channel.close()
+    await asyncio.to_thread(worker_closed.wait, REQUEST_TIMEOUT_S)
+
+    # Called from this test's own thread, which is not the WorkerLink's I/O thread.
+    with pytest.raises(ChannelClosedError):
+        link.notify({"x": 1})
+
+
+@pytest.mark.asyncio
+async def test_worker_link_notify_with_unencodable_body_raises_type_error() -> None:
+    """WorkerLink.notify() with a body that will not encode raises to the caller, nothing is sent."""
+    pending = await listen_for_worker()
+    link = WorkerLink(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    link.start(on_request=_empty_response, on_notification=lambda _b: None, on_closed=lambda: None)
+    notified = asyncio.Event()
+
+    def on_notification(note: dict) -> None:
+        if note == {"ok": True}:
+            notified.set()
+
+    parent_channel.start(on_request=_empty_response, on_notification=on_notification, on_closed=lambda: None)
+    try:
+        # Called from this test's own thread, which is not the WorkerLink's I/O thread.
+        with pytest.raises(TypeError):
+            link.notify({"bad": object()})
+        link.notify({"ok": True})
+        await asyncio.wait_for(notified.wait(), REQUEST_TIMEOUT_S)
     finally:
         link.close()
         parent_channel.close()
