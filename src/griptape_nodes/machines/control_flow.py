@@ -319,9 +319,6 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             msg = "DAG builder is not initialized."
             raise ValueError(msg)
 
-        # Build with the first node (it should already be the proxy if it's part of a group)
-        dag_builder.add_node_with_dependencies(start_node, start_node.name)
-
         flow_manager = self._context.engine.flow_manager
         node_manager = self._context.engine.node_manager
         flows = self._context.flows
@@ -391,20 +388,33 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         from the control path above it is seeded now and runs alongside everything else.
         """
         start_nodes = [start_node]
+        for node in (*categories.start_nodes, *categories.control_nodes):
+            if node not in start_nodes:
+                start_nodes.append(node)
         connections = dag_builder.connections
 
-        # PASS 1: control/start entries build the control-flow graphs.
-        for node in (*categories.start_nodes, *categories.control_nodes):
+        # Everything this run's control walk will reach. Told to the builder before any root is
+        # added, so the upstream data walk waits for these nodes' new outputs instead of taking the
+        # value a node still RESOLVED from the last run is holding. States are not touched here.
+        will_rerun: set[str] = set()
+        for entry_node in start_nodes:
+            will_rerun.update(DagBuilder.collect_nodes_in_forward_control_path(entry_node, None, connections))
+        dag_builder.rerun_nodes = will_rerun
+
+        # PASS 1: control/start entries build the control-flow graphs, the node the run was started
+        # from first.
+        for node in start_nodes:
             node.state = NodeResolutionState.UNRESOLVED
-            if node.name not in dag_builder.node_to_reference:
+            existing_reference = dag_builder.node_to_reference.get(node.name)
+            if existing_reference is None:
                 dag_builder.add_node_with_dependencies(node, node.name)
-                if node not in start_nodes:
-                    start_nodes.append(node)
+            else:
+                # An earlier entry's upstream data walk already adopted this node, but it has no
+                # incoming control and so holds its own control token: it must still advance control.
+                existing_reference.data_dependency_only = False
 
         # Everything this run's control walk will re-run, and every data node fed by any of it.
-        may_be_stale: set[str] = set()
-        for entry_node in start_nodes:
-            may_be_stale.update(DagBuilder.collect_nodes_in_forward_control_path(entry_node, None, connections))
+        may_be_stale: set[str] = set(will_rerun)
         visited: set[str] = set()
         for name in list(may_be_stale):
             may_be_stale.update(connections.collect_downstream_data_nodes(get_node(name), visited))

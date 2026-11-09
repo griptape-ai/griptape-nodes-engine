@@ -1,6 +1,6 @@
 """End-to-end coverage for how the DAG scheduler seeds graphs around data-only nodes.
 
-Two shapes are exercised:
+These shapes are exercised:
 
 - A straight control chain with a *loose* data sink hanging off the middle node. The sink
   has no control connections, so it is seeded into its own graph, and that graph's upstream
@@ -10,6 +10,11 @@ Two shapes are exercised:
   Only one output is taken at runtime, so the downstream node must still run exactly once.
 - A loose sink reading a loop's collected results, which adopts the loop's end node before
   the loop hands that same end node the control token on its way out.
+- Two independent control entry points where one feeds the other's data, so seeding the first
+  adopts the second as a data dependency before the second is seeded as an entry of its own.
+- The same flows run a second time. Every node is still RESOLVED from the first run when seeding
+  starts, and the upstream data walk skips a RESOLVED feeder as one that already holds its value,
+  so the reader must still be made to wait for a feeder that control is about to run again.
 """
 
 from __future__ import annotations
@@ -235,3 +240,94 @@ async def test_loose_sink_on_loop_results(
     assert states["After"] == NodeResolutionState.RESOLVED, "control advance out of the loop was dropped"
     if with_loose_sink:
         assert states["Sink"] == NodeResolutionState.RESOLVED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feeder_first", [False, True])
+async def test_entry_point_feeding_another_entry_point(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    feeder_first: bool,  # noqa: FBT001
+) -> None:
+    """An entry point that feeds another entry point's data must still advance its own control.
+
+    ``E1 -> S1`` and ``E2 -> S2`` are independent control chains, and ``E2`` also feeds ``E1``.
+    Whichever entry is seeded first, ``E2`` must end up a root and hand control to ``S2``, even
+    when ``E1``'s upstream data walk adopted it first.
+    """
+    flow = loose_sink_flow
+    names = ("E2", "S2", "E1", "S1") if feeder_first else ("E1", "S1", "E2", "S2")
+    for name in names:
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "S1", "exec_in")
+    connect("E2", "exec_out", "S2", "exec_in")
+    connect("E2", "result", "E1", "text")
+
+    states = await _run(engine, flow)
+
+    assert states["E1"] == NodeResolutionState.RESOLVED
+    assert states["E2"] == NodeResolutionState.RESOLVED
+    assert states["S1"] == NodeResolutionState.RESOLVED
+    assert states["S2"] == NodeResolutionState.RESOLVED, "control advance out of the adopted entry point was dropped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feeder_first", [False, True])
+async def test_rerun_waits_for_entry_point_feeder(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    feeder_first: bool,  # noqa: FBT001
+) -> None:
+    """On a re-run, a reader still waits for the entry point that feeds it.
+
+    Same shape as ``test_entry_point_feeding_another_entry_point``, run twice. On the second run
+    ``E2`` is still RESOLVED from the first when ``E1`` is seeded, so the upstream walk would skip
+    it and ``E1`` would run beside it on the previous run's value. ``E2`` then finishing unresolves
+    ``E1`` again, which is how the defect shows in the final states.
+    """
+    flow = loose_sink_flow
+    names = ("E2", "S2", "E1", "S1") if feeder_first else ("E1", "S1", "E2", "S2")
+    for name in names:
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "S1", "exec_in")
+    connect("E2", "exec_out", "S2", "exec_in")
+    connect("E2", "result", "E1", "text")
+
+    await _run(engine, flow)
+    states = await _run(engine, flow)
+
+    assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
+        "the reader ran before its feeder on the second run"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rerun_waits_for_mid_chain_feeder(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+) -> None:
+    """On a re-run, a reader waits for a feeder in the middle of another control chain.
+
+    ``E2 -> C -> S2`` and ``E1 -> S1``, with ``C`` feeding ``E1``. ``C`` is not an entry point, so
+    only the forward control walk from ``E2`` knows it will run again this time.
+    """
+    flow = loose_sink_flow
+    for name in ("E1", "S1", "E2", "C", "S2"):
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "S1", "exec_in")
+    connect("E2", "exec_out", "C", "exec_in")
+    connect("C", "exec_out", "S2", "exec_in")
+    connect("C", "result", "E1", "text")
+
+    await _run(engine, flow)
+    states = await _run(engine, flow)
+
+    assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
+        "the reader ran before its mid-chain feeder on the second run"
+    )

@@ -5,8 +5,10 @@
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from griptape_nodes.exe_types.connections import Connections
-from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, DagNodeCategories, NodeState
 
 
@@ -144,6 +146,39 @@ class TestDagBuilder:
         assert default_graph.in_degree("downstream_node") == 1
         assert default_graph.in_degree("upstream_node") == 0
 
+    @pytest.mark.parametrize("will_rerun", [False, True])
+    def test_add_node_with_dependencies_resolved_upstream_waits_only_if_it_reruns(self, will_rerun: bool) -> None:  # noqa: FBT001
+        """A RESOLVED upstream node is skipped as already holding its value, unless this run will run it again."""
+        upstream_node = MagicMock(spec=BaseNode)
+        upstream_node.name = "upstream_node"
+        upstream_node.parameters = []
+        upstream_node.state = NodeResolutionState.RESOLVED
+
+        downstream_node = MagicMock(spec=BaseNode)
+        downstream_node.name = "downstream_node"
+        downstream_node.state = NodeResolutionState.RESOLVED
+        mock_param = MagicMock()
+        mock_param.type = "str"
+        downstream_node.parameters = [mock_param]
+
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.side_effect = [(upstream_node, MagicMock()), None]
+        dag_builder = DagBuilder(mock_connections)
+        if will_rerun:
+            dag_builder.rerun_nodes = {"upstream_node"}
+
+        added_nodes = dag_builder.add_node_with_dependencies(downstream_node)
+
+        default_graph = dag_builder.graphs["default"]
+        if will_rerun:
+            assert upstream_node in added_nodes
+            assert default_graph.in_degree("downstream_node") == 1
+        else:
+            assert added_nodes == [downstream_node]
+            assert default_graph.in_degree("downstream_node") == 0
+        # The walk only reads the node's state; it never writes it.
+        assert upstream_node.state == NodeResolutionState.RESOLVED
+
     def test_add_node_with_dependencies_existing_upstream_node(self) -> None:
         """Test adding a node when upstream dependency already exists in DAG."""
         # Create mock nodes
@@ -249,6 +284,7 @@ class TestDagBuilder:
 
         dag_builder.add_node(mock_node1)
         dag_builder.add_node(mock_node2)
+        dag_builder.rerun_nodes = {"node1", "node2"}
 
         # Verify nodes were added
         default_graph = dag_builder.graphs.get("default")
@@ -259,7 +295,8 @@ class TestDagBuilder:
         # Clear the DAG builder
         dag_builder.clear()
 
-        # Verify everything is cleared
+        # Verify everything is cleared, including the per-run set of nodes still to run
+        assert dag_builder.rerun_nodes == set()
         assert len(dag_builder.graphs) == 0
         assert dag_builder.node_to_reference == {}
 
