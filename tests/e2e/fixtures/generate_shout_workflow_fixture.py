@@ -3,15 +3,23 @@
 Produces `shout_workflow.py` (Start Flow -> Shout -> End Flow) and workflows that wrap a
 Workflow node between Start Flow and End Flow:
 
+- `recursive_workflow.py` (runs itself)
+ -`cycle_a_workflow.py` and `cycle_b_workflow.py` (each runs the other),
 - `nested_workflow.py` (runs `shout_workflow.py`).
 - `fail_workflow.py` (runs a node that always fails), `nested_fail_workflow.py` (runs
   `fail_workflow.py`) and `deeply_nested_fail_workflow.py` (runs `nested_fail_workflow.py`):
-  a failure one, two and three Workflow nodes down.
-- `countdown_fail_workflow.py` runs itself only on one branch of a Countdown node, so its
-  nesting stops, and runs a node that always fails where it stops.
-- `countdown_fail_worker_workflow.py` is the same with the failing node from another library.
-- `countdown_loop_workflow.py` does the same, but its nested Workflow node sits inside a
-  for-each loop group.
+  a failure one, two and three Workflow nodes down, with no recursion in it.
+- `countdown_workflow.py` runs itself only on one branch of a Countdown node, so its
+  recursion stops.
+- `countdown_fail_workflow.py` does the same but runs a node that always fails where
+  the recursion stops.
+- `countdown_group_workflow.py` and `countdown_loop_workflow.py` do the same too, but
+  their recursing Workflow node sits inside a group and inside a for-each loop group.
+  The loop one fails where its countdown ends.
+- `recursive_loop_workflow.py` has a for-each loop group whose body runs this same
+  workflow every iteration, with no branch to stop it.
+- `recursive_loop_parallel_workflow.py` is the same with the loop set to run its
+  iterations all at once.
 
 Run with `uv run python tests/e2e/fixtures/generate_shout_workflow_fixture.py` from the repo root when
 the workflow file format changes.
@@ -71,6 +79,7 @@ SHOUT_WORKFLOW_PATH = LIBRARY_DIR / "shout_workflow.py"
 WORKFLOW_NODE_PREFIX = "Inner Workflow"
 START_NODE_NAME = "Start Flow"
 END_NODE_NAME = "End Flow"
+GROUP_NODE_NAME = "Group"
 
 
 class NodeSpec(NamedTuple):
@@ -129,6 +138,27 @@ SHOUT = _wrapping_target(
     middle_node_name="Shout",
     middle_output_param="shouted",
 )
+RECURSIVE = _wrapping_target(
+    stem="recursive_workflow",
+    description="Contains a Workflow node that runs this same workflow.",
+    middle_node_type="RecursiveWorkflow",
+    middle_node_name=WORKFLOW_NODE_PREFIX,
+    middle_output_param="result",
+)
+CYCLE_A = _wrapping_target(
+    stem="cycle_a_workflow",
+    description="Contains a Workflow node that runs cycle B, which runs this workflow again.",
+    middle_node_type="CycleBWorkflow",
+    middle_node_name=WORKFLOW_NODE_PREFIX,
+    middle_output_param="result",
+)
+CYCLE_B = _wrapping_target(
+    stem="cycle_b_workflow",
+    description="Contains a Workflow node that runs cycle A, which runs this workflow again.",
+    middle_node_type="CycleAWorkflow",
+    middle_node_name=WORKFLOW_NODE_PREFIX,
+    middle_output_param="result",
+)
 NESTED = _wrapping_target(
     stem="nested_workflow",
     description="Contains a Workflow node that runs the shout workflow.",
@@ -164,9 +194,28 @@ DEEPLY_NESTED_FAIL = _wrapping_target(
     middle_node_name=WORKFLOW_NODE_PREFIX,
     middle_output_param="result",
 )
-# Counts text down one character per level, nesting itself on the Then branch of a Countdown node and
-# running a node that always fails on the Else branch. The inner Workflow node's `result` stays
-# unconnected so the End Flow does not depend on it.
+# The inner Workflow node's `result` stays unconnected so the End Flow does not depend on it and the
+# recursion only happens on the Then branch.
+COUNTDOWN = WorkflowTarget(
+    stem="countdown_workflow",
+    description="Counts text down one character per level and runs this workflow again while text is left.",
+    nodes=[
+        NodeSpec("TextStartNode", START_NODE_NAME),
+        NodeSpec("CountdownNode", "Countdown"),
+        NodeSpec("CountdownWorkflow", WORKFLOW_NODE_PREFIX),
+        NodeSpec("TextEndNode", END_NODE_NAME),
+    ],
+    connections=[
+        ConnectionSpec(START_NODE_NAME, "exec_out", "Countdown", "exec_in"),
+        ConnectionSpec(START_NODE_NAME, "text", "Countdown", "text"),
+        ConnectionSpec("Countdown", "Then", WORKFLOW_NODE_PREFIX, "exec_in"),
+        ConnectionSpec("Countdown", "rest", WORKFLOW_NODE_PREFIX, "text"),
+        ConnectionSpec(WORKFLOW_NODE_PREFIX, "exec_out", END_NODE_NAME, "exec_in"),
+        ConnectionSpec("Countdown", "Else", END_NODE_NAME, "exec_in"),
+        ConnectionSpec("Countdown", "rest", END_NODE_NAME, "result"),
+    ],
+)
+# Like COUNTDOWN, but the branch that stops the recursion runs a node that always fails.
 COUNTDOWN_FAIL = WorkflowTarget(
     stem="countdown_fail_workflow",
     description="Counts text down one character per level, then fails where the countdown ends.",
@@ -201,8 +250,29 @@ COUNTDOWN_FAIL_WORKER = WorkflowTarget(
     ],
     connections=COUNTDOWN_FAIL.connections,
 )
+# Like COUNTDOWN, but the recursing Workflow node is the only member of a group.
+COUNTDOWN_GROUP = WorkflowTarget(
+    stem="countdown_group_workflow",
+    description="Counts text down one character per level and runs this workflow again, inside a group.",
+    nodes=[
+        NodeSpec("TextStartNode", START_NODE_NAME),
+        NodeSpec("CountdownNode", "Countdown"),
+        NodeSpec("FixtureGroupNode", GROUP_NODE_NAME),
+        NodeSpec("CountdownGroupWorkflow", WORKFLOW_NODE_PREFIX, parent_group=GROUP_NODE_NAME),
+        NodeSpec("TextEndNode", END_NODE_NAME),
+    ],
+    connections=[
+        ConnectionSpec(START_NODE_NAME, "exec_out", "Countdown", "exec_in"),
+        ConnectionSpec(START_NODE_NAME, "text", "Countdown", "text"),
+        ConnectionSpec("Countdown", "Then", WORKFLOW_NODE_PREFIX, "exec_in"),
+        ConnectionSpec("Countdown", "rest", WORKFLOW_NODE_PREFIX, "text"),
+        ConnectionSpec(WORKFLOW_NODE_PREFIX, "exec_out", END_NODE_NAME, "exec_in"),
+        ConnectionSpec("Countdown", "Else", END_NODE_NAME, "exec_in"),
+        ConnectionSpec("Countdown", "rest", END_NODE_NAME, "result"),
+    ],
+)
 LOOP_NODE_NAME = "Loop"
-# Like COUNTDOWN_FAIL, but the nested Workflow node is the body of a for-each loop group.
+# Like COUNTDOWN_FAIL, but the recursing Workflow node is the body of a for-each loop group.
 COUNTDOWN_LOOP = WorkflowTarget(
     stem="countdown_loop_workflow",
     description="Counts text down one character per level inside a loop, then fails where the countdown ends.",
@@ -227,26 +297,76 @@ COUNTDOWN_LOOP = WorkflowTarget(
         ConnectionSpec("Countdown", "rest", END_NODE_NAME, "result"),
     ],
 )
+# The loop body runs this same workflow on every iteration, with no branch that stops it.
+RECURSIVE_LOOP = WorkflowTarget(
+    stem="recursive_loop_workflow",
+    description="Runs this workflow again on every iteration of a loop, with nothing to stop it.",
+    nodes=[
+        NodeSpec("TextStartNode", START_NODE_NAME),
+        NodeSpec("ProbeForEachGroupNode", LOOP_NODE_NAME, library_name=LOOP_LIBRARY_NAME),
+        NodeSpec("RecursiveLoopWorkflow", WORKFLOW_NODE_PREFIX, parent_group=LOOP_NODE_NAME),
+        NodeSpec("TextEndNode", END_NODE_NAME),
+    ],
+    connections=[
+        ConnectionSpec(START_NODE_NAME, "exec_out", LOOP_NODE_NAME, "exec_in"),
+        ConnectionSpec(START_NODE_NAME, "text", WORKFLOW_NODE_PREFIX, "text"),
+        ConnectionSpec(LOOP_NODE_NAME, "on_each", WORKFLOW_NODE_PREFIX, "exec_in"),
+        ConnectionSpec(WORKFLOW_NODE_PREFIX, "exec_out", LOOP_NODE_NAME, "loop_complete"),
+        ConnectionSpec(LOOP_NODE_NAME, "exec_out", END_NODE_NAME, "exec_in"),
+        ConnectionSpec(START_NODE_NAME, "text", END_NODE_NAME, "result"),
+    ],
+)
+# Like RECURSIVE_LOOP, but the loop runs its iterations all at once.
+RECURSIVE_LOOP_PARALLEL = WorkflowTarget(
+    stem="recursive_loop_parallel_workflow",
+    description="Runs this workflow again on every iteration of an all-at-once loop, with nothing to stop it.",
+    nodes=[
+        NodeSpec("TextStartNode", START_NODE_NAME),
+        NodeSpec(
+            "ProbeForEachGroupNode",
+            LOOP_NODE_NAME,
+            library_name=LOOP_LIBRARY_NAME,
+            parameter_values={"execution_mode": "Run Group Items All at Once"},
+        ),
+        NodeSpec("RecursiveLoopParallelWorkflow", WORKFLOW_NODE_PREFIX, parent_group=LOOP_NODE_NAME),
+        NodeSpec("TextEndNode", END_NODE_NAME),
+    ],
+    connections=RECURSIVE_LOOP.connections,
+)
 # Generated in this order: nested runs shout, so shout comes first.
 TARGETS = [
     SHOUT,
+    RECURSIVE,
+    CYCLE_A,
+    CYCLE_B,
     NESTED,
     FAIL,
     NESTED_FAIL,
     DEEPLY_NESTED_FAIL,
+    COUNTDOWN,
     COUNTDOWN_FAIL,
     COUNTDOWN_FAIL_WORKER,
+    COUNTDOWN_GROUP,
     COUNTDOWN_LOOP,
+    RECURSIVE_LOOP,
+    RECURSIVE_LOOP_PARALLEL,
 ]
 # Workflow node types registered against placeholder files so the real files can reference them.
 EXTRA_WORKFLOW_NODES = {
+    "RecursiveWorkflow": RECURSIVE.stem,
+    "CycleAWorkflow": CYCLE_A.stem,
+    "CycleBWorkflow": CYCLE_B.stem,
     "NestedWorkflow": NESTED.stem,
     "FailWorkflow": FAIL.stem,
     "NestedFailWorkflow": NESTED_FAIL.stem,
     "DeeplyNestedFailWorkflow": DEEPLY_NESTED_FAIL.stem,
+    "CountdownWorkflow": COUNTDOWN.stem,
     "CountdownFailWorkflow": COUNTDOWN_FAIL.stem,
     "CountdownFailWorkerWorkflow": COUNTDOWN_FAIL_WORKER.stem,
+    "CountdownGroupWorkflow": COUNTDOWN_GROUP.stem,
     "CountdownLoopWorkflow": COUNTDOWN_LOOP.stem,
+    "RecursiveLoopWorkflow": RECURSIVE_LOOP.stem,
+    "RecursiveLoopParallelWorkflow": RECURSIVE_LOOP_PARALLEL.stem,
 }
 
 
@@ -312,8 +432,8 @@ def _materialize_library(target_dir: Path) -> Path:
     has the same Start Flow `text` -> End Flow `result` shape as the real files, so the
     types can register before the real files exist. Those placeholders are copied from
     the committed `shout_workflow.py` before shout is regenerated, so if shout's surface
-    (its Start/End parameters) ever changes, run the script twice for the nested
-    fixtures to pick up the new shape.
+    (its Start/End parameters) ever changes, run the script twice for the recursive,
+    cycle, and nested fixtures to pick up the new shape.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     schema = json.loads(LIBRARY_JSON.read_text())
