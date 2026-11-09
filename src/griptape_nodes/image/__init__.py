@@ -14,7 +14,7 @@ from griptape_nodes.image.metadata import (
     ExifRational,
     ImageMetadata,
 )
-from griptape_nodes.image.operations import TextSize, text_size
+from griptape_nodes.image.operations.drawing import TextSize, text_size
 from griptape_nodes.image.pipeline import DEFAULT_THUMBNAIL_SIZE, Color, GriptapeImagePipeline, ResizeFilter, TextAlign
 from griptape_nodes.image.pixel_type import PixelType
 
