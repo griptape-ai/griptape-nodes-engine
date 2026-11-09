@@ -1,0 +1,56 @@
+{
+  "name": "Griptape Nodes Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library for packaging a group fed by output settings from outside",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "StartFlow",
+      "file_path": "output_settings_packaging_nodes.py",
+      "metadata": {"category": "test", "description": "Entry node for a packaged flow", "display_name": "Start Flow"}
+    },
+    {
+      "class_name": "EndFlow",
+      "file_path": "output_settings_packaging_nodes.py",
+      "metadata": {"category": "test", "description": "Exit node for a packaged flow", "display_name": "End Flow"}
+    },
+    {
+      "class_name": "GroupNode",
+      "file_path": "output_settings_packaging_nodes.py",
+      "metadata": {"category": "test", "description": "A node group", "display_name": "Group"}
+    },
+    {
+      "class_name": "SettingsNode",
+      "file_path": "output_settings_packaging_nodes.py",
+      "metadata": {"category": "test", "description": "Supplies a file destination", "display_name": "Settings"}
+    },
+    {
+      "class_name": "SaverNode",
+      "file_path": "output_settings_packaging_nodes.py",
+      "metadata": {"category": "test", "description": "Saves where its settings say", "display_name": "Saver"}
+    },
+    {
+      "class_name": "PlainNode",
+      "file_path": "output_settings_packaging_nodes.py",
+      "metadata": {"category": "test", "description": "Feeds an ordinary value", "display_name": "Plain"}
+    }
+  ]
+}

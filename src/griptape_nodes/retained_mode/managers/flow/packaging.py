@@ -14,6 +14,9 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeDependencies,
 )
+from griptape_nodes.files.directory import DirectoryDestinationProvider
+from griptape_nodes.files.file import FileDestinationProvider
+from griptape_nodes.files.file_sequence import FileSequenceDestinationProvider
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -69,6 +72,24 @@ class ConnectionAnalysis(NamedTuple):
     incoming_control_connections: list[IncomingConnection]
     outgoing_data_connections: list[OutgoingConnection]
     outgoing_control_connections: list[OutgoingConnection]
+
+
+class DestinationProviderSource(NamedTuple):
+    """The destination provider at the far end of a connection into the package, and the parameter it feeds from."""
+
+    node: BaseNode
+    parameter: Parameter
+
+
+class CarriedDestinationProviders(NamedTuple):
+    """Copies of destination providers that feed the package from outside, wired straight to the nodes they feed."""
+
+    serialized_nodes: list[SerializedNodeCommands]
+    set_parameter_value_commands: dict[
+        SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
+    ]
+    connections: list[SerializedFlowCommands.IndirectConnectionSerialization]
+    external_connections: dict[str, ConnectionAnalysis]
 
 
 class PackageNodeInfo(NamedTuple):
@@ -195,6 +216,24 @@ class FlowPackaging(EngineScoped):
         node_connections_dict = self._analyze_multi_node_external_connections(workflow, package_nodes=nodes_to_package)
         if isinstance(node_connections_dict, PackageNodesAsSerializedFlowResultFailure):
             return node_connections_dict
+
+        # Step 7b: Carry in copies of destination providers (such as File Output Settings) that feed the package
+        # from outside. A packaged flow can run where the original isn't, and the node it feeds finds its
+        # destination by following its connection to a provider, so the provider has to be in the flow.
+        carried = self._carry_destination_providers(
+            workflow,
+            external_connections_dict=node_connections_dict,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            node_name_to_uuid=node_name_to_uuid,
+        )
+        if isinstance(carried, PackageNodesAsSerializedFlowResultFailure):
+            return carried
+        # Node groups must stay last in the serialized nodes, so the copies go first.
+        serialized_package_nodes = [*carried.serialized_nodes, *serialized_package_nodes]
+        packaged_nodes_set_parameter_value_commands.update(carried.set_parameter_value_commands)
+        packaged_nodes_internal_connections.extend(carried.connections)
+        node_connections_dict = carried.external_connections
 
         # Step 8: Retrieve SubflowNodeGroup if node_group_name was provided
         node_group_node: SubflowNodeGroup | None = None
@@ -492,6 +531,106 @@ class FlowPackaging(EngineScoped):
         internal_connections.extend(connections_result)
         serialized_node_commands.extend(serialized_node_group_commands)
         return serialized_node_commands
+
+    def _carry_destination_providers(
+        self,
+        workflow: WorkflowRuntime,
+        *,
+        external_connections_dict: dict[str, ConnectionAnalysis],
+        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
+        serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        node_name_to_uuid: dict[str, SerializedNodeCommands.NodeUUID],  # OUTPUT: copies are added
+    ) -> CarriedDestinationProviders | PackageNodesAsSerializedFlowResultFailure:
+        """Copy each destination provider feeding the package from outside, and wire the copy straight in.
+
+        The copy is frozen with the provider's current values and is not a packaged node: it gets no
+        Start or End connections, so a run's results are never written back onto the original. The
+        connection it replaces no longer becomes a Start node input.
+        """
+        serialized_nodes: list[SerializedNodeCommands] = []
+        set_parameter_value_commands: dict[
+            SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
+        ] = {}
+        connections: list[SerializedFlowCommands.IndirectConnectionSerialization] = []
+        remaining_external_connections: dict[str, ConnectionAnalysis] = {}
+
+        for target_node_name, connection_analysis in external_connections_dict.items():
+            kept_incoming_data_connections: list[IncomingConnection] = []
+            for incoming_conn in connection_analysis.incoming_data_connections:
+                provider_source = self._destination_provider_feeding(workflow, incoming_conn)
+                if provider_source is None:
+                    kept_incoming_data_connections.append(incoming_conn)
+                    continue
+
+                provider_name = provider_source.node.name
+                if provider_name not in node_name_to_uuid:
+                    serialize_result = self.engine.node_manager.on_serialize_node_to_commands(
+                        SerializeNodeToCommandsRequest(
+                            node_name=provider_name,
+                            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+                            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+                            values_supplied_by_connections=set(),
+                        ),
+                        workflow,
+                    )
+                    if not isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
+                        return PackageNodesAsSerializedFlowResultFailure(
+                            result_details=(
+                                f"Attempted to package nodes as serialized flow. Failed to copy '{provider_name}', "
+                                f"which sets where '{target_node_name}' saves: {serialize_result.result_details}"
+                            )
+                        )
+                    copy_uuid = serialize_result.serialized_node_commands.node_uuid
+                    node_name_to_uuid[provider_name] = copy_uuid
+                    serialized_nodes.append(serialize_result.serialized_node_commands)
+                    if serialize_result.set_parameter_value_commands:
+                        set_parameter_value_commands[copy_uuid] = serialize_result.set_parameter_value_commands
+
+                connections.append(
+                    SerializedFlowCommands.IndirectConnectionSerialization(
+                        source_node_uuid=node_name_to_uuid[provider_name],
+                        source_parameter_name=provider_source.parameter.name,
+                        target_node_uuid=node_name_to_uuid[target_node_name],
+                        target_parameter_name=incoming_conn.target_parameter_name,
+                    )
+                )
+
+            remaining_external_connections[target_node_name] = connection_analysis._replace(
+                incoming_data_connections=kept_incoming_data_connections
+            )
+
+        return CarriedDestinationProviders(
+            serialized_nodes=serialized_nodes,
+            set_parameter_value_commands=set_parameter_value_commands,
+            connections=connections,
+            external_connections=remaining_external_connections,
+        )
+
+    def _destination_provider_feeding(
+        self, workflow: WorkflowRuntime, incoming_conn: IncomingConnection
+    ) -> DestinationProviderSource | None:
+        """The destination provider at the far end of `incoming_conn`, looking through group proxy parameters.
+
+        A wire that crosses a group's boundary runs through a proxy parameter on the group, so the source a
+        packaged node sees can be the group. Following what feeds that proxy finds the node at the other end.
+        """
+        source = workflow.objects.get_as_type(incoming_conn.source_node_name, BaseNode)
+        if source is None:
+            return None
+        parameter = source.get_parameter_by_name(incoming_conn.source_parameter_name)
+        if parameter is None:
+            return None
+        while isinstance(source, SubflowNodeGroup):
+            feeding = workflow.flows.connections.get_incoming_connections_to_parameter(source, parameter)
+            if not feeding:
+                return None
+            source = feeding[0].source_node
+            parameter = feeding[0].source_parameter
+        if not isinstance(
+            source, (FileDestinationProvider, DirectoryDestinationProvider, FileSequenceDestinationProvider)
+        ):
+            return None
+        return DestinationProviderSource(node=source, parameter=parameter)
 
     def _package_parameters_fed_by_connections(self, workflow: WorkflowRuntime, node: BaseNode) -> set[str]:
         """Names of the node's parameters whose values the packaged flow's connections will supply.
