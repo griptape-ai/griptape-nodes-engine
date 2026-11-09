@@ -42,6 +42,8 @@ _FRAME_TYPES = ("request", "result", "notification")
 # How long to give Listener.close() to unblock a thread parked in accept() before falling back
 # to connecting a throwaway client to force it to return.
 _UNBLOCK_GRACE_S = 0.5
+# How often the reader checks whether this end is closing while no frame arrives.
+_READ_POLL_S = 0.05
 _CLOSED_MSG = "The worker channel is closed."
 
 
@@ -127,14 +129,14 @@ class ChannelListener:
             shutil.rmtree(self._directory, ignore_errors=True)
 
     def _force_unblock_accept(self, done: threading.Event) -> None:
-        self._stop_listening()
-        if done.wait(_UNBLOCK_GRACE_S):
-            return
-        # Closing the listener should already have raised inside accept(). Where it does not
-        # (observed as a risk on Windows named pipes), connect to unblock it ourselves.
+        # Connect rather than close: closing a Windows named pipe while accept() waits on it can
+        # crash the process.
         with contextlib.suppress(OSError, AuthenticationError):
             throwaway = Client(self._address, family=_FAMILY, authkey=self._authkey)
             throwaway.close()
+        if done.wait(_UNBLOCK_GRACE_S):
+            return
+        self._stop_listening()
         done.wait()
 
     def _stop_listening(self) -> None:
@@ -171,6 +173,7 @@ class Channel:
         self._pending_requests: dict[str, Future[dict]] = {}
         self._frame_queue: Queue[dict | None] = Queue()
         self._closed = threading.Event()
+        self._closing = threading.Event()
         self._started = False
         self._gate: Callable[[dict], GateDecision] | None = None
         # Real callbacks arrive through start(), which the reader and dispatch threads cannot
@@ -240,8 +243,7 @@ class Channel:
     def close(self) -> None:
         """End this side of the channel, which the peer observes as EOF. Idempotent."""
         self._closed.set()
-        with contextlib.suppress(OSError):
-            self._connection.close()
+        self._request_close()
 
     def _assert_not_on_channel_thread(self) -> None:
         current = threading.current_thread()
@@ -278,21 +280,36 @@ class Channel:
     def _send_result(self, request_id: str, body: dict) -> None:
         self._send_frame({"frame": "result", "id": request_id, "body": body})
 
+    def _request_close(self) -> None:
+        """Have the connection closed by the thread that may be blocked on it.
+
+        Only the reader closes a started channel's connection: closing a Windows pipe while another
+        thread waits on it can crash the process.
+        """
+        self._closing.set()
+        if self._reader_thread is None:
+            self._close_connection()
+
+    def _close_connection(self) -> None:
+        # Under the write lock, so no send is in progress on the handle being closed.
+        with self._write_lock, contextlib.suppress(OSError):
+            self._connection.close()
+
     def _read_loop(self) -> None:
         """Only reads frames onto the queue. Never runs a callback or waits on anything else."""
-        while True:
+        while not self._closing.is_set():
             try:
+                if not self._connection.poll(_READ_POLL_S):
+                    continue
                 raw = self._connection.recv_bytes()
             except (EOFError, OSError):
-                self._frame_queue.put(None)
-                return
+                break
             frame = self._parse_frame(raw)
             if frame is None:
-                with contextlib.suppress(OSError):
-                    self._connection.close()
-                self._frame_queue.put(None)
-                return
+                break
             self._frame_queue.put(frame)
+        self._close_connection()
+        self._frame_queue.put(None)
 
     def _parse_frame(self, raw: bytes) -> dict | None:
         try:
@@ -323,8 +340,6 @@ class Channel:
             # gate/on_notification are caller-supplied; a failure there must close the channel, not kill this thread.
             except Exception as exc:
                 logger.error("Worker channel dispatch raised %s: %s; closing the channel.", type(exc).__name__, exc)
-                with contextlib.suppress(OSError):
-                    self._connection.close()
                 self._finish_closing()
                 return
 
@@ -370,8 +385,7 @@ class Channel:
             future.set_result(body)
 
     def _finish_closing(self) -> None:
-        with contextlib.suppress(OSError):
-            self._connection.close()
+        self._request_close()
         with self._pending_lock:
             self._closed.set()
             pending_futures = list(self._pending_requests.values())
