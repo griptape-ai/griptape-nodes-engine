@@ -127,6 +127,19 @@ class _WriteTarget(NamedTuple):
     path_display: str
 
 
+@dataclass(frozen=True)
+class _CreateNewWrite:
+    """A CREATE_NEW write whose target is resolved and whose content is ready."""
+
+    request: WriteFileRequest
+    workflow: "WorkflowRuntime | None"
+    file_path: Path
+    path_display: str
+    content: str | bytes
+    # Non-None only when the on-disk suffix was rewritten to match the sniffed format.
+    swapped_ext: str | None
+
+
 class _IndexWalk(NamedTuple):
     """How the CREATE_NEW walk steps through candidate names."""
 
@@ -149,32 +162,6 @@ class FileWriter(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         event_manager.register_request_handlers(self)
-
-    def _handle_parent_directory_failure(
-        self,
-        parent_failure_reason: FileIOFailureReason,
-        candidate_path: Path,
-    ) -> WriteFileResultFailure:
-        """Create failure result for parent directory errors.
-
-        Args:
-            parent_failure_reason: The failure reason from _ensure_parent_directory_ready
-            candidate_path: The file path that failed
-
-        Returns:
-            WriteFileResultFailure with appropriate error message
-        """
-        match parent_failure_reason:
-            case FileIOFailureReason.PERMISSION_DENIED:
-                msg = f"Attempted to write to file '{candidate_path}'. Failed due to permission denied creating parent directory {candidate_path.parent}"
-            case FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS:
-                msg = f"Attempted to write to file '{candidate_path}'. Failed due to the parent directory not existing, and a policy was specified to NOT create parent directories: {candidate_path.parent}"
-            case _:
-                msg = f"Attempted to write to file '{candidate_path}'. Failed due to error creating parent directory {candidate_path.parent}"
-        return WriteFileResultFailure(
-            failure_reason=parent_failure_reason,
-            result_details=msg,
-        )
 
     @handles(WriteFileRequest)
     async def on_write_file_request(
@@ -251,20 +238,21 @@ class FileWriter(EngineScoped):
 
         if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
             written = await self._write_create_new(
-                request,
-                workflow,
-                file_path=file_path,
-                path_display=path_display,
-                content=content,
-                swapped_ext=swapped_ext,
+                _CreateNewWrite(
+                    request=request,
+                    workflow=workflow,
+                    file_path=file_path,
+                    path_display=path_display,
+                    content=content,
+                    swapped_ext=swapped_ext,
+                )
             )
         else:
             written = await self._write_in_place(request, file_path, content)
         if isinstance(written, WriteFileResultFailure):
             return written
 
-        if request.file_metadata is not None:
-            self._write_sidecar(request, written.file_path, swapped_ext, workflow)
+        self._write_sidecar(request, written.file_path, swapped_ext, workflow)
 
         if written.used_indexed_fallback:
             msg = f"File written to indexed path: {written.file_path} (original path '{path_display}' already existed)"
@@ -276,6 +264,36 @@ class FileWriter(EngineScoped):
             final_file_path=str(written.file_path),
             bytes_written=written.bytes_written,
             result_details=result_details,
+        )
+
+    @handles(WriteTempFileRequest)
+    def on_write_temp_file_request(
+        self, request: WriteTempFileRequest, workflow: "WorkflowRuntime | None" = None
+    ) -> ResultPayload:
+        """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path, resolved for `workflow`.
+
+        Distinct from ``on_write_file_request``: callers do not choose the
+        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. Thin
+        wrapper around ``_stage_bytes_at_temp``; the shared helper is what the
+        internal codec-vet path calls without re-entering ``handle_request``.
+
+        The handler does NOT synthesize any variable bindings on the caller's
+        behalf. Callers are responsible for supplying enough variables to
+        fully resolve the macro (unresolved required slots surface as a
+        Failure); if a caller wants collision-safe filenames they must include
+        a uuid or similar in ``variables["file_name_base"]``.
+        """
+        try:
+            outcome = self._stage_bytes_at_temp(request.content, request.variables, workflow)
+        except StagingFailedError as exc:
+            return WriteTempFileResultFailure(
+                failure_reason=exc.failure_reason,
+                result_details=str(exc),
+            )
+        return WriteTempFileResultSuccess(
+            staged_path=outcome.staged_path,
+            bytes_written=outcome.bytes_written,
+            result_details=f"Temp file written at {outcome.staged_path}",
         )
 
     def _write_sidecar(
@@ -463,24 +481,15 @@ class FileWriter(EngineScoped):
             raise RuntimeError(msg)
         return _WrittenFile(file_path=file_path, bytes_written=result.bytes_written, used_indexed_fallback=False)
 
-    async def _write_create_new(  # noqa: PLR0913
-        self,
-        request: WriteFileRequest,
-        workflow: "WorkflowRuntime | None",
-        *,
-        file_path: Path,
-        path_display: str,
-        content: str | bytes,
-        swapped_ext: str | None,
-    ) -> "_WrittenFile | WriteFileResultFailure":
+    async def _write_create_new(self, write: _CreateNewWrite) -> "_WrittenFile | WriteFileResultFailure":
         """Write for the CREATE_NEW policy: try `file_path`, then the next free indexed name."""
         result = await to_thread(
             self._attempt_file_write,
-            normalized_path=Path(normalize_path_for_platform(file_path)),
-            content=content,
-            encoding=request.encoding,
+            normalized_path=Path(normalize_path_for_platform(write.file_path)),
+            content=write.content,
+            encoding=write.request.encoding,
             mode="x",
-            file_path_display=file_path,
+            file_path_display=write.file_path,
             fail_if_file_exists=False,  # Fall back to indexed
             fail_if_file_locked=False,  # Fall back to indexed
         )
@@ -491,27 +500,13 @@ class FileWriter(EngineScoped):
                 result_details=result.error_message,  # type: ignore[arg-type]
             )
         if result.bytes_written is not None:
-            return _WrittenFile(file_path=file_path, bytes_written=result.bytes_written, used_indexed_fallback=False)
+            return _WrittenFile(
+                file_path=write.file_path, bytes_written=result.bytes_written, used_indexed_fallback=False
+            )
         # The file exists or is locked, so walk forward to the next free name.
-        return await self._write_next_free_index(
-            request,
-            workflow,
-            file_path=file_path,
-            path_display=path_display,
-            content=content,
-            swapped_ext=swapped_ext,
-        )
+        return await self._write_next_free_index(write)
 
-    async def _write_next_free_index(  # noqa: PLR0913
-        self,
-        request: WriteFileRequest,
-        workflow: "WorkflowRuntime | None",
-        *,
-        file_path: Path,
-        path_display: str,
-        content: str | bytes,
-        swapped_ext: str | None,
-    ) -> "_WrittenFile | WriteFileResultFailure":
+    async def _write_next_free_index(self, write: _CreateNewWrite) -> "_WrittenFile | WriteFileResultFailure":
         """Write to the first free indexed candidate after `file_path` was taken.
 
         Two ways to discover the index variable to walk:
@@ -524,26 +519,19 @@ class FileWriter(EngineScoped):
            This handles plain string paths (`output.png` → `output_1.png`). For seeded MacroPaths it would lose padding (`v003 → v003_1`),
            which is why path 1 catches them first.
         """
-        walk = self._plan_index_walk(request, file_path, path_display)
+        walk = self._plan_index_walk(write.request, write.file_path, write.path_display)
         if isinstance(walk, WriteFileResultFailure):
             return walk
         for idx in range(walk.start_index, walk.start_index + MAX_INDEXED_CANDIDATES):
-            candidate_path = self._prepare_indexed_candidate(
-                request,
-                workflow,
-                walk,
-                idx=idx,
-                path_display=path_display,
-                swapped_ext=swapped_ext,
-            )
+            candidate_path = self._prepare_indexed_candidate(write, walk, idx=idx)
             if isinstance(candidate_path, WriteFileResultFailure):
                 return candidate_path
 
             result = await to_thread(
                 self._attempt_file_write,
                 normalized_path=Path(normalize_path_for_platform(candidate_path)),
-                content=content,
-                encoding=request.encoding,
+                content=write.content,
+                encoding=write.request.encoding,
                 mode="x",
                 file_path_display=candidate_path,
                 fail_if_file_exists=False,  # Try next candidate
@@ -560,29 +548,22 @@ class FileWriter(EngineScoped):
                     file_path=candidate_path, bytes_written=result.bytes_written, used_indexed_fallback=True
                 )
 
-        msg = f"Attempted to write to file '{path_display}'. Failed due to could not find available filename after trying {MAX_INDEXED_CANDIDATES} candidates"
+        msg = f"Attempted to write to file '{write.path_display}'. Failed due to could not find available filename after trying {MAX_INDEXED_CANDIDATES} candidates"
         return WriteFileResultFailure(
             failure_reason=FileIOFailureReason.IO_ERROR,
             result_details=msg,
         )
 
-    def _prepare_indexed_candidate(  # noqa: PLR0913
-        self,
-        request: WriteFileRequest,
-        workflow: "WorkflowRuntime | None",
-        walk: "_IndexWalk",
-        *,
-        idx: int,
-        path_display: str,
-        swapped_ext: str | None,
+    def _prepare_indexed_candidate(
+        self, write: _CreateNewWrite, walk: _IndexWalk, *, idx: int
     ) -> "Path | WriteFileResultFailure":
         """Resolve the candidate at `idx` to a path whose parent directory is ready."""
         index_vars = {**walk.macro_path.variables, walk.index_variable.info.name: idx}
         candidate_str = self._resolve_indexed_candidate(
             MacroPath(parsed_macro=walk.macro_path.parsed_macro, variables=index_vars),
-            workflow,
+            write.workflow,
             idx=idx,
-            path_display=path_display,
+            path_display=write.path_display,
             walking_original=walk.walking_original,
         )
         if isinstance(candidate_str, WriteFileResultFailure):
@@ -600,17 +581,43 @@ class FileWriter(EngineScoped):
         # (non-None only when a genuine swap happened) rather than the raw sniff:
         # alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) leave the on-disk suffix at the
         # caller's request, and the walked candidate must follow suit.
-        if swapped_ext is not None:
-            candidate_path = candidate_path.with_suffix(f".{swapped_ext}")
+        if write.swapped_ext is not None:
+            candidate_path = candidate_path.with_suffix(f".{write.swapped_ext}")
 
         parent_failure_reason = self._ensure_parent_directory_ready(
             candidate_path,
-            create_parents=request.create_parents,
+            create_parents=write.request.create_parents,
         )
         if parent_failure_reason is not None:
             return self._handle_parent_directory_failure(parent_failure_reason, candidate_path)
 
         return candidate_path
+
+    def _handle_parent_directory_failure(
+        self,
+        parent_failure_reason: FileIOFailureReason,
+        candidate_path: Path,
+    ) -> WriteFileResultFailure:
+        """Create failure result for parent directory errors.
+
+        Args:
+            parent_failure_reason: The failure reason from _ensure_parent_directory_ready
+            candidate_path: The file path that failed
+
+        Returns:
+            WriteFileResultFailure with appropriate error message
+        """
+        match parent_failure_reason:
+            case FileIOFailureReason.PERMISSION_DENIED:
+                msg = f"Attempted to write to file '{candidate_path}'. Failed due to permission denied creating parent directory {candidate_path.parent}"
+            case FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS:
+                msg = f"Attempted to write to file '{candidate_path}'. Failed due to the parent directory not existing, and a policy was specified to NOT create parent directories: {candidate_path.parent}"
+            case _:
+                msg = f"Attempted to write to file '{candidate_path}'. Failed due to error creating parent directory {candidate_path.parent}"
+        return WriteFileResultFailure(
+            failure_reason=parent_failure_reason,
+            result_details=msg,
+        )
 
     def _plan_index_walk(
         self, request: WriteFileRequest, file_path: Path, path_display: str
@@ -706,36 +713,6 @@ class FileWriter(EngineScoped):
                 failure_reason=FileIOFailureReason.IO_ERROR,
                 result_details=msg,
             )
-
-    @handles(WriteTempFileRequest)
-    def on_write_temp_file_request(
-        self, request: WriteTempFileRequest, workflow: "WorkflowRuntime | None" = None
-    ) -> ResultPayload:
-        """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path, resolved for `workflow`.
-
-        Distinct from ``on_write_file_request``: callers do not choose the
-        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. Thin
-        wrapper around ``_stage_bytes_at_temp``; the shared helper is what the
-        internal codec-vet path calls without re-entering ``handle_request``.
-
-        The handler does NOT synthesize any variable bindings on the caller's
-        behalf. Callers are responsible for supplying enough variables to
-        fully resolve the macro (unresolved required slots surface as a
-        Failure); if a caller wants collision-safe filenames they must include
-        a uuid or similar in ``variables["file_name_base"]``.
-        """
-        try:
-            outcome = self._stage_bytes_at_temp(request.content, request.variables, workflow)
-        except StagingFailedError as exc:
-            return WriteTempFileResultFailure(
-                failure_reason=exc.failure_reason,
-                result_details=str(exc),
-            )
-        return WriteTempFileResultSuccess(
-            staged_path=outcome.staged_path,
-            bytes_written=outcome.bytes_written,
-            result_details=f"Temp file written at {outcome.staged_path}",
-        )
 
     def _stage_bytes_at_temp(
         self, content: bytes, variables: MacroVariables, workflow: "WorkflowRuntime | None"

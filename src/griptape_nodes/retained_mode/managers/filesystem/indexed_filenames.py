@@ -218,7 +218,7 @@ class IndexedFilenames(EngineScoped):
         so both marker types are recognized uniformly.
 
         The bound/unbound distinction matters for *starting* the walk (see the
-        start-index logic in ``on_write_file_request``'s CREATE_NEW arm) but not for
+        start-index logic in ``FileWriter._collision_walk_start_index``) but not for
         *selecting* the slot: by the time we're in collision-fallback the first
         attempt has already failed via "file exists," and the user's intent for any
         padded slot is "give me a padded index here." Walking unbound padded slots
