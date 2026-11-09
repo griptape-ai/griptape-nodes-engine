@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import ast
 import json
-import multiprocessing
+import socket
 import stat
 import sys
 import threading
-from multiprocessing import AuthenticationError
+import time
+from multiprocessing import AuthenticationError, Process, Queue
 from multiprocessing.connection import Client
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -25,6 +26,7 @@ import pytest
 
 from griptape_nodes.worker import channel as channel_module
 from griptape_nodes.worker.channel import (
+    AcceptCancelledError,
     Channel,
     ChannelClosedError,
     ChannelListener,
@@ -339,6 +341,126 @@ def test_accept_timeout_raises_and_stops_listening() -> None:
         listener.close()
 
 
+def _raw_peer_socket() -> socket.socket:
+    """A bare AF_UNIX socket, bypassing Client()'s authkey handshake entirely."""
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+
+def _connect_despite_backlog_race(listener: ChannelListener, deadline_s: float) -> Channel:
+    """Retry a connect that loses the race against the listener's backlog of 1.
+
+    A peer that closes before the server calls accept() still occupies that one backlog slot
+    until the server's accept() call drains it; a connect attempt in that narrow window is
+    refused outright rather than queued. Retrying is correct here: it is the client side of a
+    transient, well-understood OS condition, not a channel bug.
+    """
+    deadline = time.monotonic() + deadline_s
+    while True:
+        try:
+            return connect_from_environment(listener.child_environment())
+        except ConnectionRefusedError:
+            if time.monotonic() >= deadline:
+                raise
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="raw AF_UNIX socket needed to control the handshake bytes")
+def test_accept_recovers_from_a_peer_that_reads_the_challenge_then_hangs_up() -> None:
+    """deliver_challenge raising EOFError rejects just that peer; a real worker connects after."""
+    listener = ChannelListener()
+    accepted: list[Channel] = []
+
+    def _accept() -> None:
+        accepted.append(listener.accept(ACCEPT_TIMEOUT_S))
+
+    thread = threading.Thread(target=_accept)
+    thread.start()
+    real_worker: Channel | None = None
+    try:
+        bad_peer = _raw_peer_socket()
+        bad_peer.connect(listener.address)
+        bad_peer.recv(4096)  # drain the challenge, then abandon it without answering
+        bad_peer.close()
+
+        real_worker = connect_from_environment(listener.child_environment())
+        thread.join(ACCEPT_TIMEOUT_S)
+        assert len(accepted) == 1
+    finally:
+        if accepted:
+            accepted[0].close()
+        if real_worker is not None:
+            real_worker.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="raw AF_UNIX socket needed to control the handshake bytes")
+def test_accept_recovers_from_a_peer_that_closes_right_after_connecting() -> None:
+    """A peer that disconnects before even reading the challenge is rejected, not fatal to accept()."""
+    listener = ChannelListener()
+    accepted: list[Channel] = []
+
+    def _accept() -> None:
+        accepted.append(listener.accept(ACCEPT_TIMEOUT_S))
+
+    thread = threading.Thread(target=_accept)
+    thread.start()
+    real_worker: Channel | None = None
+    try:
+        bad_peer = _raw_peer_socket()
+        bad_peer.connect(listener.address)
+        bad_peer.close()
+
+        real_worker = _connect_despite_backlog_race(listener, ACCEPT_TIMEOUT_S)
+        thread.join(ACCEPT_TIMEOUT_S)
+        assert len(accepted) == 1
+    finally:
+        if accepted:
+            accepted[0].close()
+        if real_worker is not None:
+            real_worker.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="raw AF_UNIX socket needed to hold a silent connection open")
+def test_accept_does_not_stall_past_its_deadline_for_a_silent_peer() -> None:
+    """A peer that connects and never answers the challenge cannot block accept() past its timeout."""
+    listener = ChannelListener()
+    silent_peer = _raw_peer_socket()
+    try:
+        silent_peer.connect(listener.address)
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            listener.accept(SHORT_TIMEOUT_S)
+        elapsed = time.monotonic() - start
+        assert elapsed < SHORT_TIMEOUT_S + channel_module._UNBLOCK_GRACE_S + 2.0
+    finally:
+        silent_peer.close()
+        listener.close()
+
+
+def test_cancel_accept_from_another_thread_returns_promptly() -> None:
+    """cancel_accept() ends a concurrent accept() with AcceptCancelledError, not a timeout."""
+    listener = ChannelListener()
+    outcome: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _accept() -> None:
+        try:
+            outcome["channel"] = listener.accept(ACCEPT_TIMEOUT_S)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_accept)
+    thread.start()
+    start = time.monotonic()
+    listener.cancel_accept()
+    assert done.wait(ACCEPT_TIMEOUT_S)
+    elapsed = time.monotonic() - start
+    thread.join(ACCEPT_TIMEOUT_S)
+
+    assert isinstance(outcome.get("error"), AcceptCancelledError)
+    assert elapsed < channel_module._UNBLOCK_GRACE_S + 2.0
+
+
 def test_close_from_the_peer_fails_pending_requests_and_calls_on_closed_once() -> None:
     """When the peer closes, a pending request fails and on_closed fires exactly once."""
     pair = _connected_pair()
@@ -516,8 +638,8 @@ def test_listener_directory_is_private_and_removed_by_close() -> None:
 def test_cross_process_round_trip() -> None:
     """The environment-variable handshake works end to end against a real child process."""
     listener = ChannelListener()
-    result_queue: ProcessQueue = multiprocessing.Queue()
-    process = multiprocessing.Process(target=_child_round_trip, args=(listener.child_environment(), result_queue))
+    result_queue: ProcessQueue = Queue()
+    process = Process(target=_child_round_trip, args=(listener.child_environment(), result_queue))
     process.start()
     parent_channel: Channel | None = None
     try:

@@ -39,8 +39,8 @@ CHANNEL_AUTHKEY_ENV = "GTN_WORKER_CHANNEL_AUTHKEY"
 _WINDOWS = sys.platform.startswith("win")
 _FAMILY = "AF_PIPE" if _WINDOWS else "AF_UNIX"
 _FRAME_TYPES = ("request", "result", "notification")
-# How long to give Listener.close() to unblock a thread parked in accept() before falling back
-# to connecting a throwaway client to force it to return.
+# How long accept() waits, after connecting a throwaway client to free a thread parked in
+# accept(), before stopping the listener regardless of whether that connect ever landed.
 _UNBLOCK_GRACE_S = 0.5
 # How often the reader checks whether this end is closing while no frame arrives.
 _READ_POLL_S = 0.05
@@ -49,6 +49,10 @@ _CLOSED_MSG = "The worker channel is closed."
 
 class ChannelClosedError(Exception):
     """Raised for a request in flight, or a new request or notification, once the channel ends."""
+
+
+class AcceptCancelledError(Exception):
+    """Raised by `accept()` when `cancel_accept()` ends it instead of a connection or a timeout."""
 
 
 class GateDecision(NamedTuple):
@@ -73,6 +77,10 @@ class ChannelListener:
             Path(self._directory).chmod(0o700)
             self._address = str(Path(self._directory) / "s")
         self._listener = Listener(self._address, family=_FAMILY, authkey=self._authkey)
+        self._accept_outcome = threading.Event()
+        self._accept_connection: Connection | None = None
+        self._cancelled = threading.Event()
+        self._stopping = threading.Event()
 
     @property
     def address(self) -> str:
@@ -87,40 +95,38 @@ class ChannelListener:
         }
 
     def accept(self, timeout_s: float) -> Channel:
-        """Block for one worker connection, then stop listening regardless of the outcome."""
-        connection_holder: list[Connection] = []
-        done = threading.Event()
+        """Block for one worker connection, then stop listening regardless of the outcome.
 
-        def _accept() -> None:
-            while True:
-                try:
-                    connection = self._listener.accept()
-                except AuthenticationError:
-                    logger.error("Worker channel at %s rejected a connection: wrong authkey.", self._address)
-                    continue
-                except OSError:
-                    done.set()
-                    return
-                connection_holder.append(connection)
-                done.set()
-                return
-
-        thread = threading.Thread(target=_accept, name="gtn-channel-accept", daemon=True)
-        thread.start()
-        accepted_in_time = done.wait(timeout_s)
+        Raises `TimeoutError` if nothing connects in time, or `AcceptCancelledError` if
+        `cancel_accept()` ends this call first.
+        """
+        if self._cancelled.is_set():
+            self._stop_listening()
+            msg = "Accept was cancelled."
+            raise AcceptCancelledError(msg)
+        threading.Thread(target=self._accept_loop, name="gtn-channel-accept", daemon=True).start()
+        accepted_in_time = self._accept_outcome.wait(timeout_s)
         if not accepted_in_time:
-            self._force_unblock_accept(done)
-        thread.join()
+            self._unblock_accept()
         self._stop_listening()
 
-        if accepted_in_time and connection_holder:
-            return Channel(connection_holder[0])
-        if connection_holder:
-            # A connection landed only after we gave up waiting for it: it is our own
-            # unblocking client below, or a worker that arrived too late. Either way, reject it.
-            connection_holder[0].close()
+        connection = self._accept_connection
+        if connection is not None and accepted_in_time and not self._cancelled.is_set():
+            return Channel(connection)
+        if connection is not None:
+            # Landed only after we gave up waiting for it: our own unblock client, a worker that
+            # arrived too late, or one that lost the race against cancel_accept(). Reject it.
+            connection.close()
+        if self._cancelled.is_set():
+            msg = "Accept was cancelled."
+            raise AcceptCancelledError(msg)
         msg = f"No worker connected to channel {self._address} within {timeout_s}s."
         raise TimeoutError(msg)
+
+    def cancel_accept(self) -> None:
+        """Unblock a concurrent `accept()` from another thread; it raises `AcceptCancelledError`."""
+        self._cancelled.set()
+        self._unblock_accept()
 
     def close(self) -> None:
         """Stop listening and, on POSIX, remove the private directory. Safe to call more than once."""
@@ -128,18 +134,49 @@ class ChannelListener:
         if self._directory is not None:
             shutil.rmtree(self._directory, ignore_errors=True)
 
-    def _force_unblock_accept(self, done: threading.Event) -> None:
-        # Connect rather than close: closing a Windows named pipe while accept() waits on it can
-        # crash the process.
-        with contextlib.suppress(OSError, AuthenticationError):
+    def _accept_loop(self) -> None:
+        """Accept connections until one survives its handshake, or the listener stops on purpose.
+
+        Any handshake failure (wrong authkey, a peer that hangs up mid-handshake) rejects just
+        that one peer and keeps accepting: it is never reason enough to give up on the real
+        worker. Only an explicit stop (timeout, cancel_accept(), or close()) ends the loop.
+        """
+        while True:
+            try:
+                connection = self._listener.accept()
+            except (AuthenticationError, EOFError, OSError) as exc:
+                if self._stopping.is_set():
+                    self._accept_outcome.set()
+                    return
+                logger.error(
+                    "Worker channel at %s rejected a connection attempt: %s: %s",
+                    self._address,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            self._accept_connection = connection
+            self._accept_outcome.set()
+            return
+
+    def _unblock_accept(self) -> None:
+        """Free a thread parked in accept(), then stop listening regardless of the outcome.
+
+        Connect first, close second: closing a Windows named pipe while a thread waits on it can
+        crash the process. The connect itself runs in its own thread so a peer that connects
+        during the handshake and never responds cannot block this past the grace period either.
+        """
+        threading.Thread(target=self._connect_throwaway_client, name="gtn-channel-unblock", daemon=True).start()
+        self._accept_outcome.wait(_UNBLOCK_GRACE_S)
+        self._stop_listening()
+
+    def _connect_throwaway_client(self) -> None:
+        with contextlib.suppress(OSError, AuthenticationError, EOFError):
             throwaway = Client(self._address, family=_FAMILY, authkey=self._authkey)
             throwaway.close()
-        if done.wait(_UNBLOCK_GRACE_S):
-            return
-        self._stop_listening()
-        done.wait()
 
     def _stop_listening(self) -> None:
+        self._stopping.set()
         with contextlib.suppress(OSError):
             self._listener.close()
 
