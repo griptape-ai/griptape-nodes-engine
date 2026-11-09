@@ -81,8 +81,9 @@ def _connect(engine: Engine, source_node: str, source_param: str, target_node: s
     )
 
 
-def _group(engine: Engine, member_names: list[str]) -> None:
-    result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=member_names, node_group_name=GROUP))
+def _group(engine: Engine, flow_name: str, member_names: list[str]) -> None:
+    with engine.context_manager.flow(flow_name):
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=member_names, node_group_name=GROUP))
     assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
 
 
@@ -147,7 +148,7 @@ def _package(engine: Engine, flow_name: str) -> PackageNodesAsSerializedFlowResu
 
 class TestASettingsNodeOutsideTheGroup:
     def test_travels_with_the_package_wired_straight_to_the_saver(self, engine: Engine, flow_name: str) -> None:
-        _group(engine, [SAVER])
+        _group(engine, flow_name, [SAVER])
 
         result = _package(engine, flow_name)
         commands = result.serialized_flow_commands
@@ -158,7 +159,7 @@ class TestASettingsNodeOutsideTheGroup:
         assert OriginalNodeParameter(SAVER, "output") not in _start_inputs(result)
 
     def test_keeps_its_settings(self, engine: Engine, flow_name: str) -> None:
-        _group(engine, [SAVER])
+        _group(engine, flow_name, [SAVER])
 
         commands = _package(engine, flow_name).serialized_flow_commands
 
@@ -174,7 +175,7 @@ class TestASettingsNodeOutsideTheGroup:
 
     def test_is_a_copy_not_a_packaged_node(self, engine: Engine, flow_name: str) -> None:
         """Nothing from the run is written back onto the original settings node."""
-        _group(engine, [SAVER])
+        _group(engine, flow_name, [SAVER])
 
         result = _package(engine, flow_name)
 
@@ -183,7 +184,7 @@ class TestASettingsNodeOutsideTheGroup:
         assert all(output.node_name != SETTINGS for output in end_outputs)
 
     def test_an_ordinary_input_still_comes_through_the_start_node(self, engine: Engine, flow_name: str) -> None:
-        _group(engine, [SAVER])
+        _group(engine, flow_name, [SAVER])
 
         result = _package(engine, flow_name)
 
@@ -194,7 +195,7 @@ class TestASettingsNodeOutsideTheGroup:
 
 class TestASettingsNodeInsideTheGroup:
     def test_is_packaged_as_a_member_and_not_copied_again(self, engine: Engine, flow_name: str) -> None:
-        _group(engine, [SAVER, SETTINGS])
+        _group(engine, flow_name, [SAVER, SETTINGS])
 
         with engine.context_manager.flow(flow_name):
             result = engine.handle_request(
