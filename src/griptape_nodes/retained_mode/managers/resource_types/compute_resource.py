@@ -1,13 +1,17 @@
 import logging
+import shutil
+import subprocess
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from griptape_nodes.files import os_utils
 from griptape_nodes.retained_mode.managers.resource_components.capability_field import (
     CapabilityField,
     validate_capabilities,
 )
 from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
+from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, current_architecture
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import Requirements
@@ -80,3 +84,58 @@ class ComputeResourceType(ResourceType):
             return None
 
         return compatible_instances[0]
+
+
+def detect_compute_capabilities() -> dict[str, Any]:
+    """Describe this machine's compute backends."""
+    return {"compute": detect_compute_backends()}
+
+
+def detect_compute_backends() -> list[str]:
+    """Detect available compute backends: always 'cpu', plus 'cuda' or 'mps' if available."""
+    backends: list[str] = [ComputeBackend.CPU]
+    if _is_cuda_available():
+        backends.append(ComputeBackend.CUDA)
+    if _is_mps_available():
+        backends.append(ComputeBackend.MPS)
+
+    logger.debug("Detected compute backends: %s", backends)
+    return backends
+
+
+def _is_cuda_available() -> bool:
+    """Check if CUDA is available by detecting the NVIDIA driver.
+
+    Uses nvidia-smi, which is lightweight and doesn't require torch.
+    """
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        return False
+    try:
+        result = subprocess.run(  # noqa: S603
+            [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    logger.debug("CUDA detected via nvidia-smi: %s", result.stdout.strip().split("\n")[0])
+    return True
+
+
+def _is_mps_available() -> bool:
+    """Check if MPS (Metal Performance Shaders) is available.
+
+    MPS requires macOS 12.3+ on Apple Silicon. Every arm64 Mac can run 12.3+, so an arm64 Mac
+    counts as having MPS.
+    """
+    if not os_utils.is_mac():
+        return False
+    if current_architecture() not in (Architecture.ARM64, Architecture.AARCH64):
+        return False
+    logger.debug("MPS detected: Apple Silicon Mac")
+    return True

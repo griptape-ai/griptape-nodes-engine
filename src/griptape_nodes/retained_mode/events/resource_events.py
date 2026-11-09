@@ -302,8 +302,8 @@ class GetExecutionDeviceRequest(RequestPayload):
     to call `torch.cuda.is_available()`, which drags an execution-time dependency into whatever
     process asks the question -- including the one that only edits.
 
-    The engine already knows: OSManager detects the machine's backends without torch (nvidia-smi
-    for CUDA, a platform check for MPS) and registers them as a compute resource.
+    The engine already knows: ResourceManager detects the machine's backends at startup without
+    torch (nvidia-smi for CUDA, a platform check for MPS) and registers them as a compute resource.
 
     Args:
         preferred: Optional device to use if the machine has it, e.g. a user or config pin. When
