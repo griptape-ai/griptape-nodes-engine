@@ -137,14 +137,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             raise LocalExecutorError(msg) from e
 
     def _set_storage_backend(self, storage_backend: StorageBackend) -> None:
-        """Use `storage_backend` for this process without writing it to the user's config.
+        """Apply `storage_backend` to this process via its env var, without writing the user's config.
 
-        Sets the setting's GTN_CONFIG_ environment variable, the highest-priority config
-        layer, so it wins over the config files and library workers spawned by this
-        process inherit it. The engine picks its storage driver once, when it is built,
-        so this only takes effect if no engine exists yet. When one does, the variable is
-        left alone: setting it would leave the running engine and the workers it spawns
-        on different backends.
+        Must run before the engine is built, since the engine picks its storage driver then.
         """
         if has_current_engine():
             logger.warning(
