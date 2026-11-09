@@ -1,0 +1,4 @@
+ignore:
+  # Run only by the e2e tests, from a copy of each library made in a temp folder, so coverage
+  # never maps those lines back to these files.
+  - "src/griptape_nodes/testing/libraries/**"

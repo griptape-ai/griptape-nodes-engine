@@ -15,6 +15,7 @@ from griptape_nodes.exe_types.node_loading import node_loading
 from griptape_nodes.retained_mode.events import (
     connection_events,
     context_events,
+    destination_events,
     execution_events,
     flow_events,
     node_events,
@@ -47,6 +48,9 @@ GRAPH_MODULES = (connection_events, flow_events, variable_events)
 
 GRAPH_REQUESTS_ELSEWHERE = (
     context_events.EnsureWorkflowAndFlowRequest,
+    destination_events.GetConnectedDirectoryDestinationRequest,
+    destination_events.GetConnectedFileDestinationRequest,
+    destination_events.GetConnectedFileSequenceDestinationRequest,
     execution_events.CancelAllRunsRequest,
     execution_events.CancelFlowRequest,
     execution_events.CancelRunRequest,

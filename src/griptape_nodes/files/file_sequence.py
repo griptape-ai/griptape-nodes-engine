@@ -23,7 +23,7 @@ from griptape_nodes.common.sequences import scan as sequences_scan
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import file as file_mod
 from griptape_nodes.files import project_file, workflow_requests
-from griptape_nodes.retained_mode.events import os_events, project_events
+from griptape_nodes.retained_mode.events import destination_events, os_events, project_events
 
 if typing.TYPE_CHECKING:
     import collections.abc
@@ -345,6 +345,17 @@ class FileSequenceDestination:
             workflow=self._workflow,
         )
 
+    def to_spec(self) -> destination_events.FileSequenceDestinationSpec:
+        """Return this destination as plain data that can be sent to another process.
+
+        Entries already written are not carried: the rebuilt destination starts with none.
+        """
+        return destination_events.FileSequenceDestinationSpec(
+            macro_path=self._macro_path,
+            existing_file_policy=self._existing_file_policy,
+            create_parents=self._create_parents,
+        )
+
     def _resolve_fseq(self) -> fileseq_filesequence.FileSequence:
         """Resolve the macro path to a fileseq FileSequence, caching the result."""
         if self._fseq is None:
@@ -375,6 +386,18 @@ class FileSequenceDestination:
         """Record that an entry was written to expose the FileSequence descriptor."""
         if self._written_sequence is None:
             self._written_sequence = FileSequence(self._macro_path, workflow=self._workflow)
+
+    @classmethod
+    def from_spec(
+        cls, spec: destination_events.FileSequenceDestinationSpec, workflow: WorkflowRuntime | None = None
+    ) -> FileSequenceDestination:
+        """Rebuild a destination from ``to_spec`` output, writing in ``workflow`` (see ``__init__``)."""
+        return cls(
+            spec.macro_path,
+            existing_file_policy=spec.existing_file_policy,
+            create_parents=spec.create_parents,
+            workflow=workflow,
+        )
 
 
 def build_versioned_sequence_destination(
@@ -441,7 +464,11 @@ def build_versioned_sequence_destination(
 
 @typing.runtime_checkable
 class FileSequenceDestinationProvider(typing.Protocol):
-    """Protocol for nodes that provide a FileSequenceDestination without serializing it over the wire."""
+    """Protocol for nodes that provide a FileSequenceDestination to a connected output parameter.
+
+    The engine reads the property where the node lives and sends the destination as plain data, so
+    a node running in a worker receives it too.
+    """
 
     @property
     def file_sequence_destination(self) -> FileSequenceDestination | None:
