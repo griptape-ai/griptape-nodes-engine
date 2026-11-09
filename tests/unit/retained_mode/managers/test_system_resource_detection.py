@@ -11,17 +11,20 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from griptape_nodes.retained_mode.events.resource_events import ListRegisteredResourceTypesRequest
+from griptape_nodes.retained_mode.events.resource_events import (
+    ListRegisteredResourceTypesRequest,
+    ListRegisteredResourceTypesResultSuccess,
+    ListResourceInstancesByTypeRequest,
+    ListResourceInstancesByTypeResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.resource_types import compute_resource, os_resource
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import (
     ComputeBackend,
-    ComputeInstance,
     detect_compute_backends,
 )
-from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUInstance, detect_cpu_capabilities
+from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import detect_cpu_capabilities
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import (
     Architecture,
-    OSInstance,
     current_architecture,
     current_platform_version,
 )
@@ -142,9 +145,13 @@ class TestDetectComputeBackends:
 
 class TestResourceManagerRegistersSystemResources:
     def test_registers_one_instance_per_system_resource(self, engine: Engine) -> None:
-        result = engine.handle_request(ListRegisteredResourceTypesRequest())
-        assert set(result.resource_type_names) >= {"OSResourceType", "CPUResourceType", "ComputeResourceType"}  # type: ignore[attr-defined]
+        system_types = ("OSResourceType", "CPUResourceType", "ComputeResourceType")
 
-        instance_types = [type(instance) for instance in engine.resource_manager._capability_instances.values()]
-        for instance_type in (OSInstance, CPUInstance, ComputeInstance):
-            assert instance_types.count(instance_type) == 1
+        types_result = engine.handle_request(ListRegisteredResourceTypesRequest())
+        assert isinstance(types_result, ListRegisteredResourceTypesResultSuccess)
+        assert set(types_result.resource_type_names) >= set(system_types)
+
+        for resource_type_name in system_types:
+            result = engine.handle_request(ListResourceInstancesByTypeRequest(resource_type_name=resource_type_name))
+            assert isinstance(result, ListResourceInstancesByTypeResultSuccess)
+            assert len(result.instance_ids) == 1
