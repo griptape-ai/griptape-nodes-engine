@@ -23,8 +23,8 @@ def _image(pixels: np.ndarray) -> GriptapeImage:
 
 def _edited(pixels: np.ndarray, edit: object) -> np.ndarray:
     """Run ``edit`` (a function of the pipeline) over ``pixels`` and return the result's pixels."""
-    with _image(pixels) as image, edit(GriptapeImagePipeline(image)).end() as result:  # type: ignore[operator]
-        return result.to_array()
+    with _image(pixels) as image:
+        return edit(GriptapeImagePipeline(image)).end().to_array()  # type: ignore[operator]
 
 
 class TestArrays:
@@ -361,10 +361,8 @@ class TestApply:
 class TestMetadataCarriesThrough:
     def test_text_and_profile_survive_edits(self) -> None:
         metadata = ImageMetadata(text={"gtn_workflow_name": "demo"}, icc_profile=SRGB_PROFILE)
-        with (
-            GriptapeImage.from_array(solid(20, 10, RED), metadata) as image,
-            GriptapeImagePipeline(image).resize(10, 5).rotate(90, expand=True).brightness(1.1).end() as result,
-        ):
+        with GriptapeImage.from_array(solid(20, 10, RED), metadata) as image:
+            result = GriptapeImagePipeline(image).resize(10, 5).rotate(90, expand=True).brightness(1.1).end()
             assert result.metadata.text == {"gtn_workflow_name": "demo"}
             assert result.metadata.icc_profile == SRGB_PROFILE
             with GriptapeImage.open(result.encode(ImageFormat.PNG)) as reread:
