@@ -211,7 +211,8 @@ class ContextManager(EngineScoped):
     ) -> OpenedWorkflow:
         """Open the workflow a request names, as `opening_requested_workflow` does, with its top-level flow when `create_flow` is set.
 
-        A flow that can't be created closes the workflow again (see `Engine.opening_workflow`).
+        Clients hear of a workflow this opens once it has that flow. A flow that can't be created
+        closes the workflow again (see `Engine.opening_workflow`).
 
         Raises:
             OpenRefusedError: As `opening_requested_workflow` raises, or the flow could not be created.
@@ -242,10 +243,10 @@ class ContextManager(EngineScoped):
         that only shape a new open (`display_name`, `working_directory`) are neither applied nor
         checked. Every refusal comes before anything is registered or opened.
 
-        A block that raises, or calls `OpenedWorkflow.abandon`, closes a workflow this opens again
-        (see `Engine.opening_workflow`). A library-provided workflow is never open, so naming one
-        always opens a new unsaved copy of it (see `open_workflow`), into which
-        `open_and_build_workflow` builds the library's file.
+        Clients hear of a workflow this opens once the block ends. A block that raises, or calls
+        `OpenedWorkflow.abandon`, closes it again (see `Engine.opening_workflow`). A
+        library-provided workflow is never open, so naming one always opens a new unsaved copy of it
+        (see `open_workflow`), into which `open_and_build_workflow` builds the library's file.
 
         Args:
             workflow_id: Id of a registered workflow.
@@ -1188,7 +1189,7 @@ class OpenedWorkflow:
     opening: OpeningWorkflow | None = None
 
     def abandon(self) -> None:
-        """Close the workflow once the block ends, as a build that failed does. Leaves one already open as it is."""
+        """Close the workflow once the block ends, instead of telling clients of it. Leaves one already open as it is."""
         if self.opening is not None:
             self.opening.abandon()
 

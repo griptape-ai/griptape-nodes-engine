@@ -115,9 +115,14 @@ Results then arrive as messages whose `type` is `success_result` or `failure_res
 
 While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each one has an `open_workflow_id` naming the open workflow it belongs to, like a result's, so you can tell which tab it is for when node names repeat across workflows. It is `null` for events that belong to no workflow, such as publishing progress.
 
+The engine also tells every connection when a workflow opens or closes, whichever connection, script or library opened or closed it:
+
+- `WorkflowOpenedEvent` carries it in `open_workflow`, as `ListOpenWorkflowsRequest` lists it. A loaded workflow is announced once built; until then only `ListOpenWorkflowsRequest` and the heartbeat list it, and a failed build closes it without a `WorkflowClosedEvent`.
+- `WorkflowClosedEvent` names the closed workflow in `workflow_id`. A close, a clear, a library reload and a project switch all send it, one for each workflow they close. When a request closes the open workflow before opening another, the closed event comes first. Saving never opens or closes a workflow.
+
 ### Open workflows
 
-A client with a tab for each workflow uses three requests:
+A client with a tab for each workflow uses three requests and the two events above:
 
 - `ListOpenWorkflowsRequest` returns `engine_run_id` and the open workflows in `open_workflows`, each with its `workflow_id`, `name`, `workflow_file_path`, `is_saved` and `has_active_flow`. Send it on connect to find your tab's workflow. `workflow_file_path` is `null`, and `is_saved` false, exactly while the workflow is unsaved.
 - `OpenWorkflowRequest` opens a workflow for a tab. Name it by `workflow_id` or by `workflow_name`, or name neither to start a new unsaved workflow. Set `create_flow` to give a new workflow the top-level flow it needs before it can be saved. A saved workflow opens with its file built into it. A workflow that's already open comes back as it is, with `already_open` set, so you don't need to check first. One that another request is still opening comes back once its file has built, or fails with `OpenWorkflowResultFailure` if the build fails. It never closes a workflow: while another workflow is open and only one can be, it fails with `AnotherWorkflowOpenResultFailure`, whose `blocking_workflow` names the open one. An id or name the engine doesn't know fails with `WorkflowNotFoundResultFailure`. For an unsaved workflow, that means it was closed, which discards it, or lost when the engine restarted.
