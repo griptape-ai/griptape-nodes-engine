@@ -96,20 +96,33 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self,
         name: str,
         metadata: dict[Any, Any] | None = None,
+        control_in: ControlParameterInput | None = None,
+        control_out: ControlParameterOutput | None = None,
     ) -> None:
+        """Build the group with one entry port and one exit port.
+
+        Args:
+            name: The node name.
+            metadata: Saved node metadata, if rebuilding from a workflow.
+            control_in: The entry port. Defaults to a plain ``exec_in`` ("Flow In"). A subclass whose
+                entry means something more specific passes its own labelled port, as ControlNode's
+                ``input_control_name`` does, rather than adding a second pair.
+            control_out: The exit port. Defaults to a plain ``exec_out`` ("Flow Out").
+        """
         super().__init__(name, metadata)
         self._repair_side_parameter_metadata()
-        # One entry port and one exit port, under the names every other control node uses. A subclass
-        # whose entry and exit mean something more specific relabels these (as SuccessFailureNode does
-        # with "Succeeded") rather than adding a pair of its own.
-        self.control_in = ControlParameterInput(
-            tooltip="Wire the previous node's control output here to run this group after it.",
-        )
+        if control_in is None:
+            control_in = ControlParameterInput(
+                tooltip="Wire the previous node's control output here to run this group after it.",
+            )
+        if control_out is None:
+            control_out = ControlParameterOutput(
+                tooltip="Fires once the group has finished. Wire the next node's control input here.",
+            )
+        self.control_in = control_in
         self.add_parameter(self.control_in)
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.control_in.name)
-        self.control_out = ControlParameterOutput(
-            tooltip="Fires once the group has finished. Wire the next node's control input here.",
-        )
+        self.control_out = control_out
         self.add_parameter(self.control_out)
         self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.control_out.name)
         self.execution_environment = Parameter(

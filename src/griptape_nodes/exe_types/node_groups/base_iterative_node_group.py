@@ -68,19 +68,23 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         name: str,
         metadata: dict[Any, Any] | None = None,
     ) -> None:
-        super().__init__(name, metadata)
-
-        # The group's one control pair is the loop's entry and exit; label it for what it means here.
-        # Until #6250 the loop added a second pair under these names beside the base's "Flow In" /
-        # "Flow Out", and only this pair was ever read, so a chain wired through "Flow Out" stalled.
-        self.exec_in = self.control_in
-        self.exec_in.tooltip = "Wire the previous node's control output here to start the loop."
-        self.exec_in.display_name = "Start Loop"
-        self.exec_out = self.control_out
-        self.exec_out.tooltip = (
-            "Fires once after every iteration has finished. Wire the next node's control input here."
+        # The group's one control pair is the loop's entry and exit, labelled for what it means here.
+        # Until #6250 the loop added a second pair beside the base's "Flow In" / "Flow Out", and only
+        # the loop's pair was ever read, so a chain wired through "Flow Out" stalled.
+        super().__init__(
+            name,
+            metadata,
+            control_in=ControlParameterInput(
+                tooltip="Wire the previous node's control output here to start the loop.",
+                display_name="Start Loop",
+            ),
+            control_out=ControlParameterOutput(
+                tooltip="Fires once after every iteration has finished. Wire the next node's control input here.",
+                display_name="On Complete",
+            ),
         )
-        self.exec_out.display_name = "On Complete"
+        self.exec_in = self.control_in
+        self.exec_out = self.control_out
 
         # Per-iteration control output — pairs visually with exec_in on the LEFT rail.
         # Connect this to the first body node to make that node each iteration's entry point.
