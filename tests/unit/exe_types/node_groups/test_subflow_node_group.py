@@ -112,6 +112,18 @@ class TestRegisterSideParameter:
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
         assert len(group.metadata[RIGHT_PARAMETERS_KEY]) == len(expected_right)
 
+    def test_base_pair_keeps_its_names(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        """Plain groups keep group_exec_in / group_exec_out: a saved proxy named exec_out must not collide."""
+        group = _MiniSubflowGroup(name="fresh")
+
+        assert group.control_in.name == "group_exec_in"
+        assert group.control_out.name == "group_exec_out"
+        assert group.get_parameter_by_name("exec_in") is None
+        assert group.get_parameter_by_name("exec_out") is None
+
     def test_restored_group_keeps_saved_proxy_ports(
         self,
         engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction

@@ -16,9 +16,23 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     LEFT_PARAMETERS_KEY,
     RIGHT_PARAMETERS_KEY,
 )
+from griptape_nodes.exe_types.node_types import ControlNode
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+)
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
+
+
+class _Step(ControlNode):
+    """A control node with the plain exec_in / exec_out pair, to sit on either side of a loop."""
+
+    def process(self) -> None:
+        pass
 
 
 class MockIterativeGroup(BaseIterativeNodeGroup):
@@ -100,15 +114,110 @@ class TestBaseIterativeNodeGroupControlPorts:
         assert result is iterative_group.exec_out
 
 
+class TestBaseIterativeNodeGroupSingleControlPair:
+    """A loop group shows one way in and one way out: Start Loop and On Complete (#6250).
+
+    The base pair (group_exec_in / group_exec_out, drawn as Flow In / Flow Out) used to sit beside the
+    loop's own pair, and nothing told the artist which to wire. Only the loop's pair ever advanced the
+    chain, so a workflow wired through Flow Out stopped at the loop.
+    """
+
+    def test_the_loop_pair_is_the_group_pair(self, iterative_group: MockIterativeGroup) -> None:
+        """Start Loop and On Complete are the base class's control_in / control_out, relabelled."""
+        assert iterative_group.exec_in is iterative_group.control_in
+        assert iterative_group.exec_out is iterative_group.control_out
+
+    def test_exactly_one_entry_control_port(self, iterative_group: MockIterativeGroup) -> None:
+        """The only way into the loop from upstream is Start Loop; the body re-enters through its own ports."""
+        entry_ports = [
+            param.name
+            for param in iterative_group.parameters
+            if param.element_type == ControlParameterInput.__name__
+            and param.name not in {"loop_complete", "skip_iteration", "break_loop"}
+        ]
+        assert entry_ports == ["exec_in"]
+
+    def test_exactly_one_exit_control_port(self, iterative_group: MockIterativeGroup) -> None:
+        """The only way on from the loop is On Complete; On Each fires into the body, not downstream."""
+        exit_ports = [
+            param.name
+            for param in iterative_group.parameters
+            if param.element_type == ControlParameterOutput.__name__ and param.name != "on_each"
+        ]
+        assert exit_ports == ["exec_out"]
+
+    def test_exec_out_display_name(self, iterative_group: MockIterativeGroup) -> None:
+        assert iterative_group.exec_out.ui_options.get("display_name") == "On Complete"
+
+
+class TestBaseIterativeNodeGroupLegacyControlPortNames:
+    """Workflows saved while the loop still carried Flow In / Flow Out keep loading and running."""
+
+    def test_legacy_names_resolve_to_the_loop_ports(self, iterative_group: MockIterativeGroup) -> None:
+        assert iterative_group.get_parameter_by_name("group_exec_in") is iterative_group.exec_in
+        assert iterative_group.get_parameter_by_name("group_exec_out") is iterative_group.exec_out
+        assert iterative_group.get_parameter_by_name("not_a_port") is None
+
+    def test_saved_rails_drop_the_legacy_names(self, iterative_group: MockIterativeGroup) -> None:
+        """Rail metadata saved by an older engine lists the retired pair; the rebuilt group leaves it out."""
+        saved = copy.deepcopy(iterative_group.metadata)
+        saved[LEFT_PARAMETERS_KEY] = ["exec_in", "group_exec_in", "on_each", "index"]
+        saved[RIGHT_PARAMETERS_KEY] = ["exec_out", "group_exec_out", *saved[RIGHT_PARAMETERS_KEY][1:]]
+
+        restored = MockIterativeGroup(name="restored", metadata=saved)
+
+        assert set(restored.metadata[LEFT_PARAMETERS_KEY]) == set(iterative_group.metadata[LEFT_PARAMETERS_KEY])
+        assert set(restored.metadata[RIGHT_PARAMETERS_KEY]) == set(iterative_group.metadata[RIGHT_PARAMETERS_KEY])
+
+    def test_connection_saved_against_legacy_names_lands_on_the_loop_ports(self, engine: Engine) -> None:
+        """A saved workflow's CreateConnectionRequest naming group_exec_in / group_exec_out wires the loop's pair."""
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.context_manager.push_workflow("legacy_loop_ports_wf")
+        result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
+        assert isinstance(result, CreateFlowResultSuccess)
+        workflow = engine.current_workflow()
+        before, loop, after = _Step(name="before"), MockIterativeGroup(name="loop"), _Step(name="after")
+        for node in (before, loop, after):
+            engine.flow_manager.get_flow_by_name_in(workflow, result.flow_name).add_node(node)
+            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+            workflow.nodes.name_to_parent_flow_name[node.name] = result.flow_name
+        try:
+            into = engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name="before",
+                    source_parameter_name="exec_out",
+                    target_node_name="loop",
+                    target_parameter_name="group_exec_in",
+                )
+            )
+            out_of = engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name="loop",
+                    source_parameter_name="group_exec_out",
+                    target_node_name="after",
+                    target_parameter_name="exec_in",
+                )
+            )
+            assert isinstance(into, CreateConnectionResultSuccess), into.result_details
+            assert isinstance(out_of, CreateConnectionResultSuccess), out_of.result_details
+
+            connections = engine.flow_manager.get_connections()
+            incoming = connections.get_incoming_connections_to_parameter(loop, loop.exec_in)
+            assert [conn.source_node.name for conn in incoming] == ["before"]
+            outgoing = connections.get_outgoing_connections_from_parameter(loop, loop.exec_out)
+            assert [conn.target_node.name for conn in outgoing] == ["after"]
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
 class TestBaseIterativeNodeGroupRails:
     """The rail metadata names which of the group's parameters the editor draws down each side."""
 
     def test_fresh_group_names_each_rail_parameter_once(self, iterative_group: MockIterativeGroup) -> None:
         """The rails are membership sets, so this pins which names are there and that none repeats."""
-        expected_left = {"exec_in", "group_exec_in", "on_each", "index"}
+        expected_left = {"exec_in", "on_each", "index"}
         expected_right = {
             "exec_out",
-            "group_exec_out",
             "loop_complete",
             "new_item_to_add",
             "skip_iteration",

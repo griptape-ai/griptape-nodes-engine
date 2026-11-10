@@ -30,6 +30,14 @@ EXECUTION_MODE_VALUE_LOOKUP = {
 }
 
 
+# Saved connections may still name a loop group's entry and exit by the base class's port names.
+# Each resolves to the loop port that carries that wire now.
+LEGACY_CONTROL_PORT_NAMES = {
+    "group_exec_in": "exec_in",
+    "group_exec_out": "exec_out",
+}
+
+
 class IterationControlParam(StrEnum):
     """Parameter names for iteration control on iterative node groups."""
 
@@ -68,39 +76,40 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         name: str,
         metadata: dict[Any, Any] | None = None,
     ) -> None:
-        super().__init__(name, metadata)
-
-        # Top-level control flow ports — wires this group into a control chain
-        self.exec_in = ControlParameterInput(
-            tooltip="Start the loop",
-            name="exec_in",
+        # The group's one control pair is the loop's entry and exit; label it for what it means here.
+        super().__init__(
+            name,
+            metadata,
+            control_in=ControlParameterInput(
+                tooltip="Wire the previous node's control output here to start the loop.",
+                display_name="Start Loop",
+            ),
+            control_out=ControlParameterOutput(
+                tooltip="Fires once after every iteration has finished. Wire the next node's control input here.",
+                display_name="On Complete",
+            ),
         )
-        self.exec_in.ui_options = {"display_name": "Start Loop"}
-        self.add_parameter(self.exec_in)
-        # No ordering needed here: the renderer pins control ports to the top of a rail by parameter
-        # type, and the rail list is an unordered membership set (see LEFT_PARAMETERS_KEY).
-        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.exec_in.name)
+        self.exec_in = self.control_in
+        self.exec_out = self.control_out
+        # A workflow saved while the loop still carried the base pair lists those names on its rails.
+        for metadata_key in (LEFT_PARAMETERS_KEY, RIGHT_PARAMETERS_KEY):
+            side_parameters: list[str] | None = self.metadata.get(metadata_key)
+            if side_parameters is None:
+                continue
+            side_parameters[:] = [name for name in side_parameters if name not in LEGACY_CONTROL_PORT_NAMES]
 
         # Per-iteration control output — pairs visually with exec_in on the LEFT rail.
         # Connect this to the first body node to make that node each iteration's entry point.
         # If unconnected, executor falls back to implicit child-discovery.
         self.on_each = ControlParameterOutput(
-            tooltip="Fired at the start of each iteration. Connect to the first node in the loop body.",
+            tooltip="Fires at the start of each iteration. Connect to the first node inside the loop body.",
             name="on_each",
         )
         self.on_each.ui_options = {"display_name": "On Each"}
         self.add_parameter(self.on_each)
+        # No ordering needed here: the renderer pins control ports to the top of a rail by parameter
+        # type, and the rail list is an unordered membership set (see LEFT_PARAMETERS_KEY).
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.on_each.name)
-
-        self.exec_out = ControlParameterOutput(
-            tooltip="Fired after all iterations complete",
-            name="exec_out",
-        )
-        self.exec_out.ui_options = {"display_name": "On Complete"}
-        self.add_parameter(self.exec_out)
-        # As with exec_in, exec_out reaches the top of the right rail by being a control port, not by
-        # its position in this list.
-        self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.exec_out.name)
 
         # Initialize iteration state
         self._items = []
@@ -195,6 +204,12 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         ):
             self._register_side_parameter(RIGHT_PARAMETERS_KEY, parameter_name)
 
+    def get_parameter_by_name(self, param_name: str) -> Parameter | None:
+        # Connections in a workflow saved while the loop carried the base pair name group_exec_in /
+        # group_exec_out. Answer with the loop port that replaced each so those workflows load and run;
+        # the connection is recorded against the Parameter, so the next save writes the current name.
+        return super().get_parameter_by_name(LEGACY_CONTROL_PORT_NAMES.get(param_name, param_name))
+
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Handle parameter value changes."""
         super().after_value_set(parameter, value)
@@ -215,8 +230,8 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 self.hide_parameter_by_name(self.break_loop.name)
 
     def get_next_control_output(self) -> Parameter | None:
-        # Without this override the base returns None and the DAG executor stops at the group
-        # after all iterations complete, never advancing to whatever is wired downstream of exec_out.
+        # Say which port the chain continues from once every iteration has finished, rather than
+        # leaning on the base's first-control-output scan and the order ports happen to be added in.
         return self.exec_out
 
     @abstractmethod
