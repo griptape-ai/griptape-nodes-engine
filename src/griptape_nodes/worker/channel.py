@@ -93,7 +93,12 @@ async def _read_json_frame(reader: asyncio.StreamReader, *, max_length: int | No
     if max_length is not None and length > max_length:
         msg = "frame exceeds the maximum allowed size"
         raise ValueError(msg)
-    raw = await reader.readexactly(length)
+    try:
+        raw = await reader.readexactly(length)
+    except asyncio.IncompleteReadError as exc:
+        # Raised as malformed, not as the EOF a reader takes for a clean close: the header promised a body.
+        msg = f"frame ended after {len(exc.partial)} of its {length} bytes"
+        raise ValueError(msg) from exc
     frame = json.loads(raw.decode("utf-8"))
     if not isinstance(frame, dict):
         msg = "frame is not a JSON object"
@@ -253,7 +258,7 @@ class AsyncChannel:
                 self._dispatch_frame(frame)
         except asyncio.IncompleteReadError as exc:
             if exc.partial:
-                # EOF mid-frame: the peer dropped, rather than closing cleanly between frames.
+                # EOF partway through a length header: the peer dropped, rather than closing cleanly between frames.
                 logger.error("Worker channel closed: %s: %s", type(exc).__name__, exc)
             else:
                 logger.debug("Worker channel closed.")
@@ -382,7 +387,8 @@ async def listen_for_worker() -> PendingWorker:
             logger.error("Worker channel handshake rejected a connection: a worker already connected.")
             writer.close()
             return
-        if not isinstance(offered, str) or not hmac.compare_digest(offered, token):
+        # Compared as bytes: `compare_digest` raises on a str that is not ASCII, which a peer can send.
+        if not isinstance(offered, str) or not hmac.compare_digest(offered.encode("utf-8"), token.encode("utf-8")):
             logger.error("Worker channel handshake rejected a connection: wrong token.")
             writer.close()
             return

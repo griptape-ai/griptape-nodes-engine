@@ -580,6 +580,29 @@ async def test_clean_close_does_not_log_at_error(caplog: pytest.LogCaptureFixtur
         pair.child.close()
         await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
     assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+    assert any(
+        record.levelno == logging.DEBUG and record.getMessage() == "Worker channel closed." for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_eof_after_a_full_header_is_a_truncated_frame_logged_at_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A header promises a body, so EOF before any of it is a dropped peer, not a clean close."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+        pair.child._writer.write(struct.pack(">I", 10))
+        await pair.child._writer.drain()
+        pair.child.close()
+        await asyncio.wait_for(rec_parent.closed.wait(), REQUEST_TIMEOUT_S)
+    assert any(
+        record.levelno == logging.ERROR and "frame ended after 0 of its 10 bytes" in record.getMessage()
+        for record in caplog.records
+    )
+    pair.parent.close()
 
 
 @pytest.mark.parametrize(
@@ -676,6 +699,41 @@ async def test_oversized_handshake_frame_is_rejected_without_reading_the_body() 
         parent_channel.close()
         child.close()
         bad_writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_non_ascii_token_is_rejected_without_an_unhandled_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A token that is not ASCII is a wrong token: the connection closes, and a real worker still connects."""
+    unhandled: list[dict] = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: unhandled.append(context))
+    pending = await listen_for_worker()
+    host, port_str = pending.child_environment[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    bad_reader, bad_writer = await asyncio.open_connection(host, int(port_str))
+
+    with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+        bad_writer.write(channel_module._encode_frame({"token": "\u00e9" * 64}))
+        await bad_writer.drain()
+        assert await asyncio.wait_for(bad_reader.read(), REQUEST_TIMEOUT_S) == b""
+        child = await connect_to_parent(pending.child_environment)
+        parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    rec_parent = _Recorder()
+    parent_channel.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        assert await child.request({"op": "echo"}, timeout_s=REQUEST_TIMEOUT_S) == {"op": "echo"}
+    finally:
+        parent_channel.close()
+        child.close()
+        bad_writer.close()
+        asyncio.get_running_loop().set_exception_handler(None)
+
+    assert unhandled == []
+    assert any("wrong token" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
