@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -62,7 +61,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeModuleImportProblem,
 )
-from griptape_nodes.retained_mode.managers.library.node_type_specs import NodeTypeSpecCache, trim_parameters
+from griptape_nodes.retained_mode.managers.library.node_type_specs import trim_parameters
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
@@ -81,7 +80,6 @@ logger = logging.getLogger("griptape_nodes")
 class LibraryCatalog(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        self._node_type_specs = NodeTypeSpecCache()
         event_manager.register_request_handlers(self)
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
@@ -353,18 +351,7 @@ class LibraryCatalog(EngineScoped):
         if isinstance(resolved, _NodeTypeLookupFailure):
             return DescribeNodeTypeResultFailure(result_details=resolved.details)
 
-        # A request that leaves something out is for planning, so it is served from the cache. One
-        # with everything included is read fresh, for dropdowns built from the machine it runs on.
-        includes_everything = (
-            request.include_metadata
-            and request.include_tooltips
-            and request.include_ui_options
-            and request.include_exec_pins
-        )
-        if includes_everything:
-            parameters = self._fresh_parameters(resolved)
-        else:
-            parameters = self._cached_parameters(resolved)
+        parameters = self._describe_parameters(resolved)
         if isinstance(parameters, _ParameterProbeFailure):
             return self._described_without_parameters(resolved, parameters, include_metadata=request.include_metadata)
 
@@ -375,15 +362,13 @@ class LibraryCatalog(EngineScoped):
             parameters,
             include_tooltips=request.include_tooltips,
             include_ui_options=request.include_ui_options,
-            include_exec_pins=request.include_exec_pins,
         )
         details = f"Successfully described node type '{request.node_type}' in Library '{resolved.library_name}'."
         return DescribeNodeTypeResultSuccess(
             library=resolved.library_name,
             node_type=request.node_type,
             metadata=metadata,
-            parameters=trimmed.parameters,
-            exec_pins=trimmed.exec_pins,
+            parameters=trimmed,
             result_details=details,
         )
 
@@ -560,51 +545,12 @@ class LibraryCatalog(EngineScoped):
             ),
         )
 
-    def _fresh_parameters(self, resolved: _ResolvedNodeType) -> list[ParameterDescription] | _ParameterProbeFailure:
-        """A node type's parameter descriptions, read from a new probe instance."""
+    def _describe_parameters(self, resolved: _ResolvedNodeType) -> list[ParameterDescription] | _ParameterProbeFailure:
+        """A node type's parameter descriptions, read from a throwaway instance."""
         probe = self._probe_parameters(resolved)
         if isinstance(probe, _ParameterProbeFailure):
             return probe
         return [ParameterDescription.from_parameter(param) for param in probe]
-
-    def _cached_parameters(self, resolved: _ResolvedNodeType) -> list[ParameterDescription] | _ParameterProbeFailure:
-        """A node type's parameter descriptions, from the cache when it holds them.
-
-        Returns a copy, so a caller changing a description (a default value, say) cannot change
-        what later requests receive.
-        """
-        parameters = self._node_type_specs.get(resolved.library_name, resolved.node_type)
-        if parameters is None:
-            built = self._build_cached_parameters(resolved)
-            if isinstance(built, _ParameterProbeFailure):
-                return built
-            parameters = built
-        return copy.deepcopy(parameters)
-
-    def _build_cached_parameters(
-        self, resolved: _ResolvedNodeType
-    ) -> list[ParameterDescription] | _ParameterProbeFailure:
-        """Probe a node type, describe its parameters, and keep the descriptions in the cache.
-
-        Failures are not cached: the cause (a missing dependency, a failed network call, a missing
-        API key) may be fixed without any library reloading.
-        """
-        # Read before probing: descriptions built across a registration change are not kept.
-        generation = LibraryRegistry.get_generation()
-        probe = self._probe_parameters(resolved)
-        if isinstance(probe, _ParameterProbeFailure):
-            return probe
-
-        # Reading a parameter runs library code (trait ui_options, for one), and cached descriptions
-        # are copied out on every request, so a default that cannot be copied has to fail here, as a warning.
-        try:
-            parameters = copy.deepcopy([ParameterDescription.from_parameter(param) for param in probe])
-        except Exception as err:
-            read_error = f"{type(err).__name__}: {err}"
-            return _ParameterProbeFailure(describe_warning=f"Parameter read failed because: {read_error}")
-
-        self._node_type_specs.put(resolved.library_name, resolved.node_type, parameters, generation=generation)
-        return parameters
 
     def _resolve_node_type(
         self, node_type: str, library_name: str | None
