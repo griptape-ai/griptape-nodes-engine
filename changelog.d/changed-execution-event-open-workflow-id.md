@@ -1,5 +1,5 @@
-- **Breaking:** Execution and progress events name their workflow in `open_workflow_id`, as results
-  do, instead of `workflow_id`. Clients that read `workflow_id` from an `ExecutionEvent` or
+- **Breaking:** Execution and progress events now name their workflow in `open_workflow_id`, as
+  results do, instead of `workflow_id`. Clients that read `workflow_id` from an `ExecutionEvent` or
   `ProgressEvent` must read `open_workflow_id`. An event a node library builds without it names the
   workflow the library's code is running in.
   See [MIGRATION.md](MIGRATION.md#execution-events-name-their-workflow-in-open_workflow_id).
