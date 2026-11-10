@@ -11,7 +11,7 @@ from pathlib import Path
 
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ProgressEvent
-from griptape_nodes.retained_mode.events.execution_events import GriptapeEvent
+from griptape_nodes.retained_mode.events.execution_events import GriptapeEvent, progress_to_execution_event
 
 GOLDEN_PATH = Path(__file__).parent / "data" / "execution_event_golden.json"
 
@@ -28,17 +28,10 @@ def test_progress_event_fields_match_the_golden() -> None:
 
 
 def test_an_execution_event_serializes_to_the_golden() -> None:
-    """A progress event converted the way the app converts it reaches the wire as the golden."""
+    """A progress event converted the way the engine converts it reaches the wire as the golden."""
     progress = ProgressEvent(**_golden()["ProgressEvent"])
-    event = ExecutionEvent(
-        payload=GriptapeEvent(
-            node_name=progress.node_name,
-            parameter_name=progress.parameter_name,
-            type=type(progress).__name__,
-            value=progress.value,
-        ),
-        open_workflow_id=progress.open_workflow_id,
-    )
+
+    event = progress_to_execution_event(progress)
 
     assert json.loads(converters.engine.dumps(event)) == _golden()["ExecutionEvent"]
 
