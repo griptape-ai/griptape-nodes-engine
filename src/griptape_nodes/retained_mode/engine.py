@@ -836,8 +836,9 @@ class Engine:
 
         Cancels its run and resets its run state, deletes its flows (and with them their nodes)
         through the normal delete path, then forgets its runtime, which takes its context stack and
-        queued UI changes with it, and releases the held objects this process kept for it. The
-        workers hold their own: this is sync, so telling them is scheduled on the engine loop
+        queued UI changes with it, forgets an unsaved workflow's registry entry, and releases the
+        held objects this process kept for it. The workers hold their own: this is sync, so telling
+        them is scheduled on the engine loop
         (`WorkerManager.schedule_local_object_teardown`). `aclose_workflow` awaits it instead.
 
         The flows are deleted while the workflow is still open, because deleting one enters its
@@ -936,6 +937,11 @@ class Engine:
             )
             raise OpenWorkflowError(msg)
         self._open_workflows.close(workflow)
+
+        # An unsaved workflow's graph lived only in the runtime just closed, so there is nothing left to reopen.
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.is_saved:
+            self._workflow_registry.remove(workflow.workflow_id)
 
         # Every key referring to a held object kept for it lived on a node just deleted, so each entry
         # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.

@@ -3,6 +3,5 @@
   request, as `ListOpenWorkflowsRequest` lists it.
   `RunWorkflowWithCurrentStateResultSuccess` and `EnsureWorkflowAndFlowResultSuccess` carry it
   too, whether they used the open workflow the envelope named or opened a new one. After a save, it
-  tells whether the open workflow moved onto the copy, which a save of a Griptape-provided workflow
-  does.
+  tells whether the open workflow is the file saved or the save wrote a copy.
   [#6199](https://github.com/griptape-ai/griptape-nodes-engine/issues/6199)
