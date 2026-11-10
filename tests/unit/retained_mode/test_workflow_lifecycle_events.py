@@ -63,7 +63,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
-from griptape_nodes.servers.mcp import _handle_in_named_workflow
+from griptape_nodes.servers.mcp import ToolCallSender, _handle_request_on_engine_loop
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -414,17 +414,18 @@ class TestClosing:
         # An unsaved workflow's entry goes with it, after the result and event above were built.
         assert engine.workflow_registry.find_by_id(workflow.workflow_id) is None
 
-    def test_an_mcp_close_with_no_envelope_announces_the_workflow_it_closed(
-        self, engine: Engine, queue: asyncio.Queue
-    ) -> None:
+    def test_an_mcp_close_announces_the_workflow_it_closed(self, engine: Engine, queue: asyncio.Queue) -> None:
         workflow = _open_new_workflow(engine, "closing")
         _drain(queue)
 
         result = asyncio.run(
-            _handle_in_named_workflow(CloseWorkflowRequest(workflow_id=workflow.workflow_id), workflow.workflow_id)
+            _handle_request_on_engine_loop(
+                CloseWorkflowRequest(workflow_id=workflow.workflow_id),
+                ToolCallSender(header_workflow_id=workflow.workflow_id),
+            )
         )
 
-        assert result.succeeded(), result.result_details
+        assert result["result_type"] == "CloseWorkflowResultSuccess", result
         events = _drain(queue)
         assert _lifecycle_events(events) == [WorkflowClosedEvent(workflow_id=workflow.workflow_id)]
         close_results = _result_events_for(events, CloseWorkflowRequest)

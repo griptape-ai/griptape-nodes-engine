@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
-    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
@@ -580,16 +580,20 @@ class Engine:
         else:
             return result_event.result
 
-    async def ahandle_request(self, request: RequestPayload) -> ResultPayload:
+    async def ahandle_request(
+        self, request: RequestPayload, *, result_context: ResultContext | None = None
+    ) -> ResultPayload:
         """Asynchronous request handler.
 
         Args:
             request: The request payload to handle.
+            result_context: The request envelope's fields, such as the `open_workflow_id` it runs
+                in (see `EventManager.ahandle_request`).
         """
         event_mgr = self._event_manager
 
         try:
-            result_event = await event_mgr.ahandle_request(request=request)
+            result_event = await event_mgr.ahandle_request(request=request, result_context=result_context)
             # Only queue result event if broadcasting is enabled and not suppressed
             if request.broadcast_result and not event_mgr.should_suppress_event(result_event):
                 await event_mgr.aput_event(GriptapeNodeEvent(wrapped_event=result_event))

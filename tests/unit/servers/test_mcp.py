@@ -744,14 +744,15 @@ class TestToolCallWorkflow:
         assert "canvas" not in first.flows.name_to_parent_name
 
     @pytest.mark.asyncio
-    async def test_a_header_naming_a_workflow_that_is_not_open_fails(
-        self,
-        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    async def test_a_header_naming_a_workflow_that_is_not_open_fails_and_lists_the_open_ones(
+        self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
         result = await call_tool(_http_context({"X-Griptape-Workflow-Id": "0" * 32}), _create_flow_call("canvas"))
 
         assert not _payload(result)["ok"]
         assert "isn't open" in result.content[0].text  # type: ignore[union-attr]
+        listed = [info["workflow_id"] for info in _payload(result)["open_workflows"]]
+        assert listed == [workflow.workflow_id for workflow in two_open]
 
     @pytest.mark.asyncio
     async def test_the_header_names_the_workflow_of_every_request_in_a_batch(
@@ -792,6 +793,61 @@ class TestToolCallWorkflow:
         assert "canvas" in third.flows.name_to_parent_name
 
     @pytest.mark.asyncio
+    async def test_a_session_acts_on_the_workflow_open_workflow_request_opened(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+
+        opened = await call_tool(
+            session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"display_name": "third"})
+        )
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        assert _payload(opened)["ok"], opened
+        third = engine.open_workflows.all_open()[-1]
+        assert third not in two_open
+        assert _payload(opened)["open_workflow"]["workflow_id"] == third.workflow_id
+        assert _payload(result)["ok"], result
+        assert "canvas" in third.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_a_session_acts_on_an_open_workflow_it_opens_again(
+        self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """Opening a workflow that's already open changes nothing but makes it the session's."""
+        first, second = two_open
+        session = _http_context({"mcp-session-id": "session-a"})
+
+        opened = await call_tool(
+            session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"workflow_id": second.workflow_id})
+        )
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        assert _payload(opened)["already_open"], opened
+        assert _payload(result)["ok"], result
+        assert "canvas" in second.flows.name_to_parent_name
+        assert "canvas" not in first.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_a_failed_open_leaves_the_sessions_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        _, second = two_open
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(
+            session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"workflow_id": second.workflow_id})
+        )
+
+        failed = await call_tool(
+            session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"workflow_id": "0" * 32})
+        )
+        await call_tool(session, _create_flow_call("canvas"))
+
+        assert not _payload(failed)["ok"]
+        assert len(engine.open_workflows.all_open()) == len(two_open)
+        assert "canvas" in second.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
     async def test_sessions_that_opened_different_workflows_do_not_cross(
         self,
         engine: Engine,
@@ -811,19 +867,204 @@ class TestToolCallWorkflow:
         assert set(workflow_b.flows.name_to_parent_name) == {"canvas_b"}
 
     @pytest.mark.asyncio
-    async def test_a_session_forgets_its_workflow_once_it_closes(
+    async def test_a_session_whose_workflow_closed_fails_saying_so_until_it_opens_another(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
+        first, _ = two_open
         session = _http_context({"mcp-session-id": "session-a"})
         await call_tool(session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
         third = engine.open_workflows.all_open()[-1]
         engine.close_workflow(third)
 
+        results = [await call_tool(session, _create_flow_call(name)) for name in ("canvas", "again")]
+        await call_tool(
+            session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"workflow_id": first.workflow_id})
+        )
+        reopened = await call_tool(session, _create_flow_call("after"))
+
+        # Each call fails for the closed workflow, and lists the open ones to pick from.
+        for result in results:
+            assert not _payload(result)["ok"]
+            assert third.workflow_id in _payload(result)["details"]
+            listed = [info["workflow_id"] for info in _payload(result)["open_workflows"]]
+            assert listed == [workflow.workflow_id for workflow in two_open]
+        assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
+        assert _payload(reopened)["ok"], reopened
+        assert "after" in first.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("close_sends_header", [False, True])
+    async def test_a_session_that_closed_its_own_workflow_can_ensure_a_new_one(
+        self, engine: Engine, *, close_sends_header: bool
+    ) -> None:
+        session_headers = {"mcp-session-id": "session-a"}
+        session = _http_context(session_headers)
+        await call_tool(session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"display_name": "own"}))
+        own = engine.open_workflows.all_open()[-1]
+        close_headers = dict(session_headers)
+        if close_sends_header:
+            close_headers["X-Griptape-Workflow-Id"] = own.workflow_id
+
+        closed = await call_tool(
+            _http_context(close_headers),
+            CallToolRequestParams(name="CloseWorkflowRequest", arguments={"workflow_id": own.workflow_id}),
+        )
+        ensured = await call_tool(session, CallToolRequestParams(name="EnsureWorkflowAndFlowRequest", arguments={}))
+
+        assert _payload(closed)["ok"], closed
+        assert own.closed
+        assert _payload(ensured)["ok"], ensured
+        assert _payload(ensured)["open_workflow"]["workflow_id"] != own.workflow_id
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_cleared_all_state_can_ensure_a_new_workflow(self, engine: Engine) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"display_name": "own"}))
+        own = engine.open_workflows.all_open()[-1]
+
+        cleared = await call_tool(
+            session,
+            CallToolRequestParams(name="ClearAllObjectStateRequest", arguments={"i_know_what_im_doing": True}),
+        )
+        ensured = await call_tool(session, CallToolRequestParams(name="EnsureWorkflowAndFlowRequest", arguments={}))
+
+        assert _payload(cleared)["ok"], cleared
+        assert own.closed
+        assert _payload(ensured)["ok"], ensured
+        assert _payload(ensured)["open_workflow"]["workflow_id"] != own.workflow_id
+
+    @pytest.mark.asyncio
+    async def test_another_sessions_close_fails_the_session_whose_workflow_it_closed(self, engine: Engine) -> None:
+        session_a = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session_a, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"display_name": "own"}))
+        own = engine.open_workflows.all_open()[-1]
+
+        closed = await call_tool(
+            _http_context({"mcp-session-id": "session-b"}),
+            CallToolRequestParams(name="CloseWorkflowRequest", arguments={"workflow_id": own.workflow_id}),
+        )
+        ensured = await call_tool(session_a, CallToolRequestParams(name="EnsureWorkflowAndFlowRequest", arguments={}))
+
+        assert _payload(closed)["ok"], closed
+        assert not _payload(ensured)["ok"]
+        assert own.workflow_id in _payload(ensured)["details"]
+        assert engine.open_workflows.all_open() == []
+
+    @pytest.mark.asyncio
+    async def test_another_sessions_open_leaves_a_closed_sessions_workflow(
+        self,
+        engine: Engine,
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    ) -> None:
+        session_a = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session_a, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        closed = engine.open_workflows.all_open()[-1]
+        engine.close_workflow(closed)
+        await call_tool(
+            _http_context({"mcp-session-id": "session-b"}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+
+        result = await call_tool(session_a, _create_flow_call("canvas"))
+
+        assert not _payload(result)["ok"]
+        assert closed.workflow_id in _payload(result)["details"]
+
+    @pytest.mark.asyncio
+    async def test_a_host_call_leaves_a_closed_sessions_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        closed = engine.open_workflows.all_open()[-1]
+        engine.close_workflow(closed)
+
+        listed = await call_tool(session, CallToolRequestParams(name="ListOpenWorkflowsRequest", arguments={}))
         result = await call_tool(session, _create_flow_call("canvas"))
 
-        # With the session's workflow gone the call names none, and two are still open.
+        assert _payload(listed)["ok"], listed
         assert not _payload(result)["ok"]
+        assert closed.workflow_id in _payload(result)["details"]
         assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
+
+    @pytest.mark.asyncio
+    async def test_every_request_in_a_batch_fails_for_a_closed_sessions_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session, CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}))
+        closed = engine.open_workflows.all_open()[-1]
+        engine.close_workflow(closed)
+        batch = CallToolRequestParams(
+            name=EVENT_REQUEST_BATCH_TOOL_NAME,
+            arguments={
+                "requests": [
+                    {"request_type": "CreateFlowRequest", "request": {"parent_flow_name": None, "flow_name": name}}
+                    for name in ("one", "two", "three")
+                ]
+            },
+        )
+
+        result = await call_tool(session, batch)
+
+        for entry in _payload(result):
+            assert not entry["ok"]
+            assert closed.workflow_id in entry["details"]
+        assert all(not {"one", "two", "three"} & set(workflow.flows.name_to_parent_name) for workflow in two_open)
+
+    @pytest.mark.asyncio
+    async def test_only_the_most_recently_used_sessions_keep_their_workflow(
+        self,
+        engine: Engine,  # noqa: ARG002
+        two_open: tuple[WorkflowRuntime, WorkflowRuntime],
+    ) -> None:
+        """Sessions end without telling the server, so the least recently used are forgotten."""
+        first, _ = two_open
+        open_first = CallToolRequestParams(name="OpenWorkflowRequest", arguments={"workflow_id": first.workflow_id})
+
+        with patch.object(mcp_module, "_MAX_SESSION_WORKFLOWS", 2):
+            await call_tool(_http_context({"mcp-session-id": "oldest"}), open_first)
+            await call_tool(_http_context({"mcp-session-id": "used"}), open_first)
+            await call_tool(_http_context({"mcp-session-id": "oldest"}), _create_flow_call("canvas"))
+            await call_tool(_http_context({"mcp-session-id": "newest"}), open_first)
+
+        assert list(mcp_module._session_workflow_ids) == ["oldest", "newest"]
+
+    @pytest.mark.asyncio
+    async def test_a_header_naming_a_closed_workflow_does_not_stop_a_close_naming_its_workflow(
+        self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        """A close names its workflow in the body and ignores the header, as every host request does."""
+        first, _ = two_open
+        stale = "0" * 32
+
+        result = await call_tool(
+            _http_context({"X-Griptape-Workflow-Id": stale}),
+            CallToolRequestParams(name="CloseWorkflowRequest", arguments={"workflow_id": stale}),
+        )
+        closed = await call_tool(
+            _http_context({"X-Griptape-Workflow-Id": stale}),
+            CallToolRequestParams(name="CloseWorkflowRequest", arguments={"workflow_id": first.workflow_id}),
+        )
+
+        assert _payload(result)["ok"], result
+        assert _payload(result)["already_closed"]
+        assert _payload(closed)["ok"], closed
+        assert first.closed
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_sends_a_header_keeps_no_workflow_of_its_own(
+        self, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        first, _ = two_open
+
+        opened = await call_tool(
+            _http_context({"mcp-session-id": "session-a", "X-Griptape-Workflow-Id": first.workflow_id}),
+            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
+        )
+
+        assert _payload(opened)["ok"], opened
+        assert mcp_module._session_workflow_ids == {}
 
     @pytest.mark.asyncio
     async def test_a_header_keeps_reaching_its_workflow_after_a_save_as_continues_in_the_copy(
@@ -871,23 +1112,3 @@ class TestToolCallWorkflow:
         assert _payload(result)["ok"], result
         assert "canvas" in first.flows.name_to_parent_name
         assert "canvas" not in third.flows.name_to_parent_name
-
-    @pytest.mark.asyncio
-    async def test_remembering_a_session_forgets_sessions_whose_workflow_closed(
-        self,
-        engine: Engine,
-        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
-    ) -> None:
-        """Sessions end without telling the server, so their entries go once their workflow closes."""
-        await call_tool(
-            _http_context({"mcp-session-id": "ended"}),
-            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
-        )
-        engine.close_workflow(engine.open_workflows.all_open()[-1])
-
-        await call_tool(
-            _http_context({"mcp-session-id": "live"}),
-            CallToolRequestParams(name="SetWorkflowContextRequest", arguments={}),
-        )
-
-        assert set(mcp_module._session_workflow_ids) == {"live"}
