@@ -508,7 +508,11 @@ def _forget_session_workflow_the_session_closed(
     if not isinstance(request, (CloseWorkflowRequest, ClearAllObjectStateRequest)) or not result.succeeded():
         return
     workflow_id = _session_workflow_ids.get(sender.session_id)
-    if workflow_id is None or GriptapeNodes.get_instance().open_workflows.is_open(workflow_id):
+    if workflow_id is None:
+        return
+    if isinstance(request, CloseWorkflowRequest) and request.workflow_id != workflow_id:
+        return
+    if GriptapeNodes.get_instance().open_workflows.is_open(workflow_id):
         return
     del _session_workflow_ids[sender.session_id]
 

@@ -942,6 +942,22 @@ class TestToolCallWorkflow:
         assert engine.open_workflows.all_open() == []
 
     @pytest.mark.asyncio
+    async def test_a_sessions_close_of_another_workflow_keeps_its_closed_workflow(self, engine: Engine) -> None:
+        session = _http_context({"mcp-session-id": "session-a"})
+        await call_tool(session, CallToolRequestParams(name="OpenWorkflowRequest", arguments={"display_name": "own"}))
+        own = engine.open_workflows.all_open()[-1]
+        engine.close_workflow(own)
+
+        closed = await call_tool(
+            session, CallToolRequestParams(name="CloseWorkflowRequest", arguments={"workflow_id": "some-other-id"})
+        )
+        ensured = await call_tool(session, CallToolRequestParams(name="EnsureWorkflowAndFlowRequest", arguments={}))
+
+        assert _payload(closed)["ok"], closed
+        assert not _payload(ensured)["ok"]
+        assert own.workflow_id in _payload(ensured)["details"]
+
+    @pytest.mark.asyncio
     async def test_another_sessions_open_leaves_a_closed_sessions_workflow(
         self,
         engine: Engine,
