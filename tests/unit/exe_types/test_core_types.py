@@ -133,6 +133,7 @@ class TestBaseNodeElement:
                             "private": False,
                             "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
+                            "deprecation": None,
                             "ui_options": {},
                             "parent_container_name": None,
                             "parent_element_name": None,
@@ -232,6 +233,7 @@ class TestBaseNodeElement:
                             "private": False,
                             "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
+                            "deprecation": None,
                             "ui_options": {},
                             "parent_container_name": None,
                             "parent_element_name": None,
@@ -331,6 +333,7 @@ class TestBaseNodeElement:
                             "private": False,
                             "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
+                            "deprecation": None,
                             "ui_options": {},
                             "parent_container_name": None,
                             "parent_element_name": None,
@@ -517,6 +520,29 @@ class TestParameter:
         param_false_dict = param_false.to_dict()
         assert "settable" in param_false_dict
         assert param_false_dict["settable"] is False
+
+    def test_to_dict_reports_no_deprecation_by_default(self) -> None:
+        param = Parameter(name="test", input_types=["str"], type="str", output_type="str", tooltip="test")
+
+        assert param.deprecation is None
+        assert param.to_dict()["deprecation"] is None
+
+    def test_to_dict_reports_deprecation_passed_to_constructor(self) -> None:
+        param = Parameter(
+            name="image",
+            input_types=["ImageArtifact"],
+            type="ImageArtifact",
+            tooltip="Image to describe",
+            deprecation="Use 'images' instead.",
+        )
+
+        assert param.to_dict()["deprecation"] == "Use 'images' instead."
+
+    def test_to_dict_reports_deprecation_set_after_construction(self) -> None:
+        param = ParameterList(name="items", input_types=["str"], type="str", tooltip="test")
+        param.deprecation = "Use 'entries' instead."
+
+        assert param.to_dict()["deprecation"] == "Use 'entries' instead."
 
 
 def _make_param(name: str = "test_param", **kwargs) -> Parameter:

@@ -2504,6 +2504,16 @@ class _DescribeNodeTypeProbe(BaseNode):
         )
         self.add_parameter(images)
 
+        image = Parameter(
+            name="image",
+            type="ImageArtifact",
+            input_types=["ImageArtifact"],
+            tooltip="Image to describe",
+            allowed_modes={ParameterMode.INPUT},
+            deprecation="Use 'images' instead.",
+        )
+        self.add_parameter(image)
+
 
 class _RaisingProbe(BaseNode):
     """Stand-in for node types whose __init__ performs failing I/O (auth, network, disk)."""
@@ -2689,6 +2699,20 @@ class TestDescribeNodeTypeRequest:
         prompt = by_name["prompt"]
         assert prompt.element_type == "Parameter"
         assert prompt.max_items is None
+
+    def test_reports_which_parameters_are_deprecated(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        self._register_probe_library()
+
+        result = library_manager.catalog.describe_node_type_request(
+            DescribeNodeTypeRequest(node_type=_DescribeNodeTypeProbe.__name__, library=self._LIBRARY_NAME),
+        )
+
+        assert isinstance(result, DescribeNodeTypeResultSuccess)
+        by_name = {param.name: param for param in result.parameters}
+        assert by_name["image"].deprecation == "Use 'images' instead."
+        assert by_name["images"].deprecation is None
+        assert by_name["prompt"].deprecation is None
 
     def test_resolves_library_when_node_type_is_unambiguous(self, engine: Engine) -> None:
         library_manager = engine.library_manager
