@@ -1,0 +1,14 @@
+{
+  "name": "Output Check Demo",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape",
+    "description": "Demonstrates a library that warns when a node output contains a flagged term.",
+    "library_version": "0.1.0",
+    "engine_version": "0.97.0",
+    "tags": ["demo", "execution-events"]
+  },
+  "categories": [],
+  "advanced_library_path": "advanced_library.py",
+  "nodes": []
+}
