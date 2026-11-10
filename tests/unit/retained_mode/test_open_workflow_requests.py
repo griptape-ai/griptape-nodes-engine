@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
+    InvalidWorkingDirectoryResultFailure,
     ListOpenWorkflowsRequest,
     ListOpenWorkflowsResultSuccess,
     OpenWorkflowRequest,
@@ -286,6 +287,28 @@ class TestOpenWorkflowAlreadyOpen:
 
 
 class TestOpenWorkflowRefused:
+    def test_a_working_directory_that_names_a_file_is_refused_by_its_own_failure(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Its own type, so a client retries without the folder only for this failure."""
+        not_a_folder = tmp_path / "file.txt"
+        not_a_folder.write_text("x")
+
+        result = _send(engine, OpenWorkflowRequest(display_name="draft", working_directory=str(not_a_folder))).result
+
+        assert isinstance(result, InvalidWorkingDirectoryResultFailure)
+        assert "is a file, not a folder" in str(result.result_details)
+        assert engine.open_workflows.all_open() == []
+
+    def test_without_the_working_directory_the_retry_opens(self, engine: Engine, tmp_path: Path) -> None:
+        not_a_folder = tmp_path / "file.txt"
+        not_a_folder.write_text("x")
+        _send(engine, OpenWorkflowRequest(display_name="draft", working_directory=str(not_a_folder)))
+
+        result = _send(engine, OpenWorkflowRequest(display_name="draft")).result
+
+        assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
+
     def test_an_id_no_workflow_has_is_not_found(self, engine: Engine) -> None:
         missing_id = uuid.uuid4().hex
 

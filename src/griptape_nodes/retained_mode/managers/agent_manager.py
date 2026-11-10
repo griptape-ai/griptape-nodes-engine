@@ -937,7 +937,9 @@ class AgentManager(EngineScoped):
             if workflow is not None:
                 event_manager.put_event(workflow.execution_event(payload))
                 return
-            event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+            event_manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=None))
+            )
 
         library_toolsets = self._library_toolsets(library_mcp_server_names, workflow)
         # Nothing may sit between this and the `async with` that releases

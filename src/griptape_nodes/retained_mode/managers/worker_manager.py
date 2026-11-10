@@ -55,6 +55,12 @@ from griptape_nodes.retained_mode.managers.settings import (
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+from griptape_nodes.retained_mode.topics import (
+    REQUEST_TOPIC,
+    audience_topic,
+    engine_request_topic,
+    session_request_topic,
+)
 from griptape_nodes.serialization.values import untag
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
@@ -2491,7 +2497,7 @@ class WorkerManager(EngineScoped):
 
         topics: list[str] = []
         if engine_id:
-            topics.append(f"engines/{engine_id}/request")
+            topics.append(engine_request_topic(engine_id))
 
         if is_worker:
             # Subscribe ONLY to this worker's dedicated per-worker request topic.
@@ -2500,9 +2506,9 @@ class WorkerManager(EngineScoped):
                 topics.append(f"sessions/{session_id}/workers/{engine_id}/request")
         else:
             # Orchestrator handles all broadcast requests from the MCP server and the GUI.
-            topics.append("request")
+            topics.append(REQUEST_TOPIC)
             if session_id:
-                topics.append(f"sessions/{session_id}/request")
+                topics.append(session_request_topic(session_id))
 
         return topics
 
@@ -2876,12 +2882,14 @@ class WorkerManager(EngineScoped):
             logger.exception("Could not broadcast %s to workers", type(event.request).__name__)
 
     async def relay_worker_result(self, payload: dict) -> None:
-        """Relay an unmatched worker result to the GUI session response topic.
+        """Relay an unmatched worker result to the clients following its workflow, or to the session.
 
         Called for worker result messages not claimed by RequestClient
         (heartbeats and any results without a pending request).
         The orchestrator always mediates between workers and the GUI; workers never
-        publish directly to the session response topic.
+        publish their results to clients directly. A result whose `open_workflow_id` names a
+        workflow goes out on that workflow's topic, any other on the session topic (see
+        `griptape_nodes.retained_mode.topics.audience_topic`).
         """
         # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
         result_event_type = payload.get("result_type", "")
@@ -2901,22 +2909,17 @@ class WorkerManager(EngineScoped):
             logger.debug("Heartbeat received from worker %s", worker_engine_id)
             return  # Internal health check — do not forward to GUI
 
-        # 1 engine = 1 session — the orchestrator's session response topic is always the right target.
-        session_response_topic = self._determine_response_topic()
+        # 1 engine = 1 session, so the orchestrator's session holds every client following the workflow.
+        open_workflow_id = payload.get("open_workflow_id")
+        if not isinstance(open_workflow_id, str):
+            open_workflow_id = None
+        relay_topic = audience_topic(self.engine.get_engine_id(), self.engine.get_session_id(), open_workflow_id)
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"
-        payload["response_topic"] = session_response_topic
-        logger.debug("Relaying %s to %s", payload.get("event_type"), session_response_topic)
+        # Names the topic it goes out on: a client drops a result whose `response_topic` is another topic
+        # it takes, as a copy of a reply it already has.
+        payload["response_topic"] = relay_topic
+        logger.debug("Relaying %s to %s", payload.get("event_type"), relay_topic)
         # Untags the JSON rather than reading the result back, since its payload class may live in a
         # library only the worker has loaded. Only values carry tags, but a plain field holding its own
         # "$type" key would lose it here.
-        await self._tx.send_message(dest_socket, json.dumps(untag(payload)), session_response_topic)
-
-    def _determine_response_topic(self) -> str:
-        """Determine the response topic based on current session and engine IDs."""
-        session_id = self.engine.get_session_id()
-        if session_id:
-            return f"sessions/{session_id}/response"
-        engine_id = self.engine.get_engine_id()
-        if engine_id:
-            return f"engines/{engine_id}/response"
-        return "response"
+        await self._tx.send_message(dest_socket, json.dumps(untag(payload)), relay_topic)

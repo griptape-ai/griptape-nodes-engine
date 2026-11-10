@@ -89,6 +89,9 @@ class ContextManager(EngineScoped):
     class RequestedWorkflowNotFoundError(OpenRefusedError):
         """An open named an id or name that no registered workflow has."""
 
+    class InvalidWorkingDirectoryError(OpenRefusedError):
+        """An open's `working_directory` can't be the folder of a new workflow, because it names a file."""
+
     class WorkflowContext:
         """A context manager for a Workflow."""
 
@@ -261,8 +264,9 @@ class ContextManager(EngineScoped):
                 SetWorkflowContextRequest describes.
 
         Raises:
-            OpenRefusedError: The workflow was named more than one way, `working_directory` names
-                a file, or `file_path` could not be registered.
+            OpenRefusedError: The workflow was named more than one way, or `file_path` could not be
+                registered.
+            InvalidWorkingDirectoryError: `working_directory` names a file.
             RequestedWorkflowNotFoundError: No registered workflow has `workflow_id` or `workflow_name`.
         """
         named = [name for name in (workflow_id, workflow_name, file_path) if name is not None]
@@ -1088,7 +1092,7 @@ class ContextManager(EngineScoped):
         """`working_directory` made absolute against the workspace, or None.
 
         Raises:
-            OpenRefusedError: It names an existing file.
+            InvalidWorkingDirectoryError: It names an existing file.
         """
         if working_directory is None:
             return None
@@ -1105,7 +1109,7 @@ class ContextManager(EngineScoped):
                 f"Attempted to set the folder for a new Workflow to '{working_directory}'. "
                 f"Failed because that path is a file, not a folder."
             )
-            raise self.OpenRefusedError(msg)
+            raise self.InvalidWorkingDirectoryError(msg)
         return normalized
 
     def _register_requested_workflow(self, file_path: str | None, display_name: str | None) -> Workflow:

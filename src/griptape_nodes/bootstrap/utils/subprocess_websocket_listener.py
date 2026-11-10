@@ -13,6 +13,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin
+from griptape_nodes.retained_mode.topics import session_response_topic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,7 +59,7 @@ class SubprocessWebSocketListenerMixin(SubprocessWebSocketBaseMixin):
             msg = "WebSocket client failed to initialize"
             raise RuntimeError(msg)
 
-        topic = f"sessions/{self._session_id}/response"
+        topic = session_response_topic(self._session_id)
         await self._ws_client.subscribe(topic)
 
         self._create_websocket_task(self._ws_listen_loop())

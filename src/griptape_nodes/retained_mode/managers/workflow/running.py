@@ -18,6 +18,7 @@ from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.context_events import (
+    InvalidWorkingDirectoryResultFailure,
     OpenWorkflowRequest,
     OpenWorkflowResultFailure,
     OpenWorkflowResultSuccess,
@@ -364,6 +365,8 @@ class WorkflowRunner(EngineScoped):
                 )
             except ContextManager.RequestedWorkflowNotFoundError as err:
                 return WorkflowNotFoundResultFailure(result_details=str(err))
+            except ContextManager.InvalidWorkingDirectoryError as err:
+                return InvalidWorkingDirectoryResultFailure(result_details=str(err))
             except ContextManager.OpenRefusedError as err:
                 return OpenWorkflowResultFailure(result_details=str(err))
 
