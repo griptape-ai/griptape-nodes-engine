@@ -716,7 +716,7 @@ BLOCKED_TERMS_BY_PARAMETER = {
 Run a workflow whose **Agent** node has `CONFIDENTIAL` in its prompt. The engine log gets a warning
 such as `Agent_1 contains blocked term 'CONFIDENTIAL'. Cancelled flow ControlFlow_1: CancelFlowResultSuccess`, and the flow shows as cancelled in the editor.
 
-Two things in this example are easy to get wrong:
+Three things in this example are easy to get wrong:
 
 - **The cancel runs on the engine's event loop.** The synchronous
     `GriptapeNodes.handle_request` runs the handler on a temporary loop, and the cancel then
@@ -732,8 +732,10 @@ Two things in this example are easy to get wrong:
     before the next node starts.
 - **Nodes inside a loop body are not covered.** The check reads the canvas node, which holds
     the values from before the loop started. If a **ForEach** feeds each item into an
-    **Agent**'s `prompt`, an item containing the term does not cancel the run. Put the check
-    before the loop, on the list that feeds it, or use a node that raises inside the loop.
+    **Agent**'s `prompt`, an item containing the term does not cancel the run. The example
+    does not look inside lists either, so it cannot check the list that feeds the loop. To
+    stop a blocked item in a loop, put a node that raises an error when its text contains the
+    term inside the loop, in front of the **Agent**.
 
 ### Example: a library that checks node outputs
 
