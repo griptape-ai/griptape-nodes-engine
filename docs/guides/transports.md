@@ -134,7 +134,7 @@ Workflow ids last only until the engine restarts. The `engine_run_id` that `List
 Older requests open and close workflows too:
 
 - `SetWorkflowContextRequest` and `RunWorkflowFromRegistryRequest` open their workflow beside the open ones. Without a clean slate, `RunWorkflowFromRegistryRequest` fails while its workflow is open.
-- `RunWorkflowFromScratchRequest`, and `RunWorkflowFromRegistryRequest` with a clean slate, start their workflow over: they close it, or its open Griptape-provided copy, first. Other open workflows stay open.
+- `RunWorkflowFromScratchRequest`, and `RunWorkflowFromRegistryRequest` with a clean slate, start their workflow over: they close it first if it's open. For a Griptape-provided workflow they close the copy the last clean slate run of it opened, never a copy a tab opened. Other open workflows stay open.
 - `ClearAllObjectStateRequest` closes every open workflow.
 - `RunWorkflowWithCurrentStateRequest` builds into the workflow `open_workflow_id` names, and opens the file as a new workflow when it is left out and none is open.
 

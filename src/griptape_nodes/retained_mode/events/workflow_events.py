@@ -44,7 +44,8 @@ class RunWorkflowFromScratchRequest(RequestPayload):
     running workflows in clean environments, batch processing workflows.
 
     Ignores the envelope's `open_workflow_id`. Closes the file's workflow first if it is open, or for
-    a Griptape-provided workflow its open copy. Other open workflows stay open.
+    a Griptape-provided workflow the copy the last such run opened. Other open workflows, including
+    copies a tab opened, stay open.
 
     Args:
         file_path: Path to the workflow file to load and execute.
@@ -147,8 +148,9 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     Args:
         workflow_name: Name of the workflow in the registry to execute
         run_with_clean_slate: Whether to start the workflow over (default: True): close it first if it
-            is open, or for a Griptape-provided workflow its open copy. Other open workflows stay
-            open. With False, the request fails while the workflow is open.
+            is open, or for a Griptape-provided workflow the copy the last clean slate run opened.
+            Other open workflows, including copies a tab opened, stay open. With False, the request
+            fails while the workflow is open.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, the workflow already open without a clean slate, execution error)
     """
