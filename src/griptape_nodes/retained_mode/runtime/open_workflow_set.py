@@ -18,6 +18,18 @@ class NoOpenWorkflowError(OpenWorkflowError):
     """Work that needs the open workflow found none open."""
 
 
+class WorkflowsPartlyEmptiedError(OpenWorkflowError):
+    """A workflow could not be emptied, so emptying every open workflow stopped there.
+
+    Args:
+        emptied: The workflows emptied before it. It and the ones after it were not emptied whole.
+    """
+
+    def __init__(self, message: str, emptied: list[WorkflowRuntime]) -> None:
+        super().__init__(message)
+        self.emptied = emptied
+
+
 class OpenWorkflowSet:
     """The runtimes of the workflows the engine has open, by workflow id.
 

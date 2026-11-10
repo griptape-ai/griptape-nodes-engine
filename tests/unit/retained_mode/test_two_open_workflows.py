@@ -76,7 +76,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultFailure,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenResultFailure
+from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure, WorkflowNotOpenResultFailure
 from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
     ReloadAllLibrariesRequest,
@@ -137,6 +137,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
@@ -1457,6 +1458,57 @@ class TestALibraryReloadRebuildsEachWorkflow:
         running = await _send_async(engine, GetIsFlowRunningRequest(flow_name="canvas"), a)
         assert isinstance(running, GetIsFlowRunningResultSuccess)
         assert not running.is_running
+
+    @pytest.mark.usefixtures("libraries_unchanged")
+    def test_a_workflow_that_cant_be_cleared_leaves_the_ones_after_it_as_they_were(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        _make_node(engine, a, "_ValueNode", "first")
+        _make_node(engine, b, "_ValueNode", "other")
+        a_before = set(a.objects.get_filtered_subset())
+        b_before = set(b.objects.get_filtered_subset())
+        empty_workflow = engine._empty_workflow
+
+        def refuse_a(workflow: WorkflowRuntime) -> None:
+            if workflow is a:
+                msg = "cannot clear"
+                raise OpenWorkflowError(msg)
+            empty_workflow(workflow)
+
+        with patch.object(engine, "_empty_workflow", refuse_a):
+            result = _send(engine, ReloadAllLibrariesRequest(), None)
+
+        assert isinstance(result, ReloadAllLibrariesResultFailure)
+        assert "could not be cleared first" in str(result.result_details)
+        # Neither is rebuilt on top of what it still holds, which would nest a copy of its graph.
+        assert set(a.objects.get_filtered_subset()) == a_before
+        assert set(b.objects.get_filtered_subset()) == b_before
+
+    def test_a_client_request_during_the_reload_is_turned_away(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, _b = two_open
+        _make_node(engine, a, "_ValueNode", "kept")
+        during: list[ResultPayload] = []
+
+        async def reload_while_a_client_sends(_self: LibraryManager) -> ResultPayload:
+            during.append(
+                await _send_async(
+                    engine,
+                    CreateNodeRequest(node_type="_ValueNode", node_name="late", override_parent_flow_name="canvas"),
+                    a,
+                )
+            )
+            return ReloadAllLibrariesResultSuccess(result_details="reloaded nothing")
+
+        with patch.object(LibraryManager, "_reload_libraries_with_workflows_empty", reload_while_a_client_sends):
+            result = _send(engine, ReloadAllLibrariesRequest(), None)
+
+        assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
+        assert isinstance(during[0], GenericResultFailure)
+        assert "reloading its libraries" in str(during[0].result_details)
+        assert _nodes_in(engine, a) == ["kept"]
 
     @pytest.mark.usefixtures("libraries_unchanged")
     def test_a_workflow_that_cant_be_serialized_refuses_the_reload_and_changes_nothing(

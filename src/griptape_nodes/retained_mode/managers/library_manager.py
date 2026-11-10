@@ -82,7 +82,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
+from griptape_nodes.retained_mode.runtime.open_workflow_set import WorkflowsPartlyEmptiedError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -584,27 +584,32 @@ class LibraryManager(EngineScoped):
         Every node built from the old modules has to go, so each open workflow is serialized as a
         save would, emptied while it stays open under its id, and rebuilt once the libraries are
         back. Serialized values are plain data, so the rebuilt ones come from the reloaded modules.
-        A workflow that can't be serialized refuses the reload before anything changes.
+        A workflow that can't be serialized refuses the reload before anything changes. Until the
+        rebuild, client requests naming one of these workflows are turned away.
         """
-        try:
-            snapshots = await self._snapshot_open_workflows()
-        except self.ReloadRefusedError as err:
-            return ReloadAllLibrariesResultFailure(result_details=str(err))
+        with self.engine.rebuilding_workflows(self.engine.open_workflows.all_open()):
+            try:
+                snapshots = await self._snapshot_open_workflows()
+            except self.ReloadRefusedError as err:
+                return ReloadAllLibrariesResultFailure(result_details=str(err))
 
-        try:
-            await self.engine.aempty_all_workflows()
-        except OpenWorkflowError as err:
-            rebuild_failures = await self._rebuild_workflows(snapshots)
-            details = f"Attempted to reload all libraries. Failed because a workflow could not be cleared first: {err}"
-            return ReloadAllLibrariesResultFailure(
-                result_details=self._with_rebuild_failures(details, rebuild_failures)
-            )
-        self.engine.event_manager.clear_event_suppression()
+            try:
+                emptied = await self.engine.aempty_all_workflows()
+            except WorkflowsPartlyEmptiedError as err:
+                rebuild_failures = await self._rebuild_workflows(snapshots, err.emptied)
+                details = (
+                    f"Attempted to reload all libraries. Failed because a workflow could not be cleared first, "
+                    f"and keeps what was left of it: {err}"
+                )
+                return ReloadAllLibrariesResultFailure(
+                    result_details=self._with_rebuild_failures(details, rebuild_failures)
+                )
+            self.engine.event_manager.clear_event_suppression()
 
-        try:
-            result = await self._reload_libraries_with_workflows_empty()
-        finally:
-            rebuild_failures = await self._rebuild_workflows(snapshots)
+            try:
+                result = await self._reload_libraries_with_workflows_empty()
+            finally:
+                rebuild_failures = await self._rebuild_workflows(snapshots, emptied)
         # Signal readiness once the workflows hold their nodes again, so the app re-renders the
         # library status table against the reloaded set and the editor reads rebuilt workflows.
         # is_initial_start=False so the app refreshes the table without re-showing the startup banner.
@@ -646,14 +651,23 @@ class LibraryManager(EngineScoped):
             )
         return snapshots
 
-    async def _rebuild_workflows(self, snapshots: list[WorkflowSnapshot]) -> list[str]:
-        """Rebuild each emptied workflow from its snapshot, returning why each that failed did."""
+    async def _rebuild_workflows(self, snapshots: list[WorkflowSnapshot], emptied: list[WorkflowRuntime]) -> list[str]:
+        """Rebuild each workflow in `emptied` from its snapshot, returning why each that failed did.
+
+        A workflow not emptied still holds what it held. One that holds something again was changed
+        during the reload, and rebuilding on top of it would nest or duplicate its graph.
+        """
         failures = []
         for snapshot in snapshots:
-            if snapshot.commands is None:
+            if snapshot.commands is None or snapshot.workflow not in emptied:
                 continue
             # A workflow closed since it was emptied has nothing to rebuild into.
             if self.engine.open_workflows.find(snapshot.workflow.workflow_id) is not snapshot.workflow:
+                continue
+            if snapshot.workflow.context.has_current_flow() or len(snapshot.workflow.objects) > 0:
+                failures.append(
+                    f"workflow '{snapshot.display_name}' was not rebuilt because it was changed during the reload"
+                )
                 continue
             # The workflow holds what it held before, so its clients see no unsaved change.
             with self.engine.workflow_manager.squelch_workflow_altered():

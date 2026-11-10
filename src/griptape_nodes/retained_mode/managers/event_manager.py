@@ -1591,7 +1591,8 @@ class EventManager(EngineScoped):
         """The open workflow an envelope id names.
 
         Raises:
-            _RequestWorkflowError: No open workflow has that id, answered with `WorkflowNotOpenResultFailure`.
+            _RequestWorkflowError: No open workflow has that id, answered with `WorkflowNotOpenResultFailure`,
+                or a library reload is rebuilding it (`Engine.rebuilding_workflows`).
         """
         # Looked up once: a workflow closing between a check and a second lookup would otherwise
         # fail the request after it was admitted.
@@ -1602,6 +1603,13 @@ class EventManager(EngineScoped):
                 "Failed because that workflow isn't open in the engine anymore. Reopen the workflow and try again."
             )
             raise _RequestWorkflowError(self._workflow_not_open_failure(msg))
+        if self.engine.is_rebuilding(workflow):
+            msg = (
+                f"Attempted to handle {type(request).__name__} in workflow '{open_workflow_id}'. "
+                "Failed because the engine is reloading its libraries and rebuilding that workflow. "
+                "Try again once the reload finishes."
+            )
+            raise _RequestWorkflowError(GenericResultFailure(result_details=msg))
         return workflow
 
     def _caller_workflow(self, request: RequestPayload) -> WorkflowRuntime | NoWorkflow | None:

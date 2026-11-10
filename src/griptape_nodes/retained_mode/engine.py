@@ -63,6 +63,7 @@ from griptape_nodes.retained_mode.runtime.open_workflow_set import (
     NoOpenWorkflowError,
     OpenWorkflowError,
     OpenWorkflowSet,
+    WorkflowsPartlyEmptiedError,
 )
 from griptape_nodes.retained_mode.runtime.read_observer import observe_read_without_workflow
 from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkflowSet
@@ -268,6 +269,8 @@ class Engine:
         # Each open workflow still being built, which clients have not been told of, set once its
         # build ends. See `opening_workflow`.
         self._opening_workflows: dict[WorkflowRuntime, asyncio.Event] = {}
+        # Open workflows a library reload has snapshotted and will rebuild (`rebuilding_workflows`).
+        self._rebuilding_workflows: set[WorkflowRuntime] = set()
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
         self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
@@ -801,6 +804,23 @@ class Engine:
             raise
         self._finish_opening(opening.workflow, keep=not opening.abandoned)
 
+    @contextmanager
+    def rebuilding_workflows(self, workflows: list[WorkflowRuntime]) -> Iterator[None]:
+        """Turn away client requests naming any of `workflows` until the block ends (`is_rebuilding`).
+
+        For a library reload, which empties each workflow and rebuilds it from a snapshot: a client
+        request handled in between would change a workflow the rebuild expects to find empty.
+        """
+        self._rebuilding_workflows.update(workflows)
+        try:
+            yield
+        finally:
+            self._rebuilding_workflows.difference_update(workflows)
+
+    def is_rebuilding(self, workflow: WorkflowRuntime) -> bool:
+        """Whether a `rebuilding_workflows` block holds `workflow`."""
+        return workflow in self._rebuilding_workflows
+
     def is_opening(self, workflow: WorkflowRuntime) -> bool:
         """Whether an `opening_workflow` block is still building `workflow`."""
         return workflow in self._opening_workflows
@@ -882,25 +902,36 @@ class Engine:
         finally:
             await self._worker_manager.broadcast_local_object_teardown(None)
 
-    async def aempty_all_workflows(self) -> None:
+    async def aempty_all_workflows(self) -> list[WorkflowRuntime]:
         """Delete everything every open workflow holds while keeping each one open under its id.
 
         Like `aclose_all_workflows`, but each workflow stays open, keeps its registry entry, and is
         not announced as closed, so its clients keep it. A library reload uses this to drop every
         node built from the old modules and then rebuild each workflow into the same runtime.
 
+        Returns:
+            The workflows emptied.
+
         Raises:
-            OpenWorkflowError: A workflow could not be emptied. It and the ones after it keep what they hold.
+            WorkflowsPartlyEmptiedError: A workflow could not be emptied. It may have lost part of
+                what it held, and the ones after it keep what they hold. The error lists the
+                workflows emptied before it.
         """
+        emptied: list[WorkflowRuntime] = []
         try:
             for workflow in self._open_workflows.all_open():
                 await self._cancel_workflow_runs(workflow)
-                self._empty_workflow(workflow)
+                try:
+                    self._empty_workflow(workflow)
+                except OpenWorkflowError as err:
+                    raise WorkflowsPartlyEmptiedError(str(err), emptied) from err
+                emptied.append(workflow)
             dropped = self._resource_manager.drop_all_local_objects()
             if dropped:
                 logger.debug("Released %d held object(s) kept for no workflow while emptying every workflow.", dropped)
         finally:
             await self._worker_manager.broadcast_local_object_teardown(None)
+        return emptied
 
     def clear_current_workflow_data(self) -> None:
         """Close the current workflow (see `close_workflow`).
