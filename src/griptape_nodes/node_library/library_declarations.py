@@ -23,8 +23,9 @@ import re
 from collections import defaultdict
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple
+from urllib.parse import quote
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -102,6 +103,12 @@ class LifecycleStageLibraryProperty(BaseModel):
 # and node-level properties below.
 _DOCUMENTATION_URL_PATTERN = re.compile(r"^https?://")
 
+# The only placeholders `DocumentationLibraryProperty.url_template` may use. Checked by
+# attempting the substitution at declaration-parse time, so an author's typo (e.g.
+# `{nod}`) fails library load with a clear message instead of resolving silently wrong
+# for every node.
+_DOCUMENTATION_TEMPLATE_TOKENS = {"category": "", "node": ""}
+
 
 def _validate_documentation_url(url: str) -> str:
     if not _DOCUMENTATION_URL_PATTERN.match(url):
@@ -110,21 +117,53 @@ def _validate_documentation_url(url: str) -> str:
     return url
 
 
+def _validate_documentation_template(template: str) -> str:
+    if not _DOCUMENTATION_URL_PATTERN.match(template):
+        msg = f"Documentation url_template '{template}' is not valid. It must start with 'http://' or 'https://'."
+        raise ValueError(msg)
+    try:
+        template.format(**_DOCUMENTATION_TEMPLATE_TOKENS)
+    except (KeyError, IndexError) as e:
+        msg = (
+            f"Documentation url_template '{template}' uses a placeholder other than "
+            f"{sorted(_DOCUMENTATION_TEMPLATE_TOKENS)}."
+        )
+        raise ValueError(msg) from e
+    return template
+
+
 class DocumentationLibraryProperty(BaseModel):
     """A documentation link for the library as a whole.
 
-    Node-level `documentation` (see `DocumentationNodeProperty`) overrides this for an
-    individual node, the same way `lifecycle_stage` does. Consumers resolve that
-    inheritance at display time; this model stores only what the author wrote.
+    Exactly one of `url` (one literal link shared by every node) or `url_template`
+    (interpolated per node) must be set. `url_template` exists because a library's
+    nodes number in the hundreds; hand-writing a per-node override for each one
+    is impractical, so a library with an organized docs site can give every node
+    its own page from a single declaration, e.g.
+    `"https://docs.example.com/nodes/{category}/{node}/"`. Supported placeholders
+    are `{category}` (the node's declared `category`) and `{node}` (its class
+    name); both are URL-escaped before substitution.
+
+    Node-level `documentation` (see `DocumentationNodeProperty`) overrides this for
+    an individual node with a literal url, the same way `lifecycle_stage` does.
+    Consumers resolve that inheritance at display time; this model stores only
+    what the author wrote.
     """
 
     type: Literal["documentation"] = "documentation"
-    url: str
+    url: str | None = None
+    url_template: str | None = None
 
-    @field_validator("url")
-    @classmethod
-    def _url_is_http_or_https(cls, v: str) -> str:
-        return _validate_documentation_url(v)
+    @model_validator(mode="after")
+    def _exactly_one_of_url_or_template(self) -> DocumentationLibraryProperty:
+        if (self.url is None) == (self.url_template is None):
+            msg = "Documentation declaration must set exactly one of 'url' or 'url_template', not both or neither."
+            raise ValueError(msg)
+        if self.url is not None:
+            _validate_documentation_url(self.url)
+        elif self.url_template is not None:
+            _validate_documentation_template(self.url_template)
+        return self
 
 
 class WorkerModeCompatibility(BaseModel):
@@ -382,12 +421,19 @@ NodeDeclaration = Annotated[
 def resolve_node_documentation_url(
     node_declarations: Sequence[NodeDeclaration],
     library_declarations: Sequence[LibraryDeclaration],
+    *,
+    node_type: str,
+    node_category: str,
 ) -> str | None:
     """Resolve a node's effective documentation url: its own override, else the library's.
 
     Mirrors how `lifecycle_stage` inherits from the library when a node declares no
-    override of its own (see `LifecycleStageNodeProperty`). Returns `None` when neither
-    the node nor the library declares a `documentation` url.
+    override of its own (see `LifecycleStageNodeProperty`). A node-level override is
+    always a literal `url`. A library-level declaration contributes either its literal
+    `url` or its `url_template` interpolated with this node's `node_category` and
+    `node_type` (URL-escaped, so a category/class name with reserved characters can't
+    break out of the templated path segment). Returns `None` when neither the node nor
+    the library declares `documentation`.
     """
     node_url = next(
         (declaration.url for declaration in node_declarations if isinstance(declaration, DocumentationNodeProperty)),
@@ -395,14 +441,19 @@ def resolve_node_documentation_url(
     )
     if node_url is not None:
         return node_url
-    return next(
-        (
-            declaration.url
-            for declaration in library_declarations
-            if isinstance(declaration, DocumentationLibraryProperty)
-        ),
+    library_declaration = next(
+        (declaration for declaration in library_declarations if isinstance(declaration, DocumentationLibraryProperty)),
         None,
     )
+    if library_declaration is None:
+        return None
+    if library_declaration.url is not None:
+        return library_declaration.url
+    # `_exactly_one_of_url_or_template` guarantees url_template is set whenever url is not.
+    url_template = library_declaration.url_template
+    if url_template is None:
+        return None
+    return url_template.format(category=quote(node_category, safe=""), node=quote(node_type, safe=""))
 
 
 def _iter_referenced_models(

@@ -804,10 +804,11 @@ class Library:
         `<LifecycleStage.BETA: 'BETA'>`), which is not valid Python.
 
         Also resolves the node's effective `documentation` url -- its own override when
-        declared, else the library's -- into a single `documentation` declaration. The
-        editor reads one `documentation` value per node rather than merging the node's
-        and library's declaration lists itself, the same contract `lifecycle_stage`
-        resolution follows for the authorization-checkpoint path.
+        declared, else the library's literal url or its url_template interpolated for
+        this node -- into a single `documentation` declaration. The editor reads one
+        `documentation` value per node rather than merging the node's and library's
+        declaration lists (or interpolating a template) itself, the same contract
+        `lifecycle_stage` resolution follows for the authorization-checkpoint path.
         """
         library_node_metadata_model = self._node_metadata.get(node_type)
         if library_node_metadata_model is None:
@@ -816,6 +817,8 @@ class Library:
         documentation_url = resolve_node_documentation_url(
             library_node_metadata_model.declarations,
             self._library_data.metadata.declarations,
+            node_type=node_type,
+            node_category=library_node_metadata_model.category,
         )
         declarations = [d for d in dumped["declarations"] if d.get("type") != "documentation"]
         if documentation_url is not None:

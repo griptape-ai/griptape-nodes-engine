@@ -3067,6 +3067,42 @@ class TestLibraryNodeMetadataDocumentationResolution:
             {"type": "documentation", "url": "https://docs.example.com/node"},
         ]
 
+    def test_node_inherits_library_level_documentation_template(self) -> None:
+        """A url_template is interpolated per node, not hand-written per node.
+
+        Covers the practical case: a library with hundreds of nodes gives every
+        one of them a distinct docs page from a single library-level declaration.
+        """
+        self._register_probe_library(
+            NodeMetadata(category="test", description="probe", display_name="Probe"),
+            library_declarations=[
+                DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")
+            ],
+        )
+
+        declarations = self._create_and_get_declarations("probe-6")
+
+        assert declarations == [
+            {"type": "documentation", "url": f"https://docs.example.com/nodes/test/{_LifecycleProbe.__name__}/"}
+        ]
+
+    def test_node_level_documentation_overrides_library_level_template(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(
+                category="test",
+                description="probe",
+                display_name="Probe",
+                declarations=[DocumentationNodeProperty(url="https://docs.example.com/node-specific")],
+            ),
+            library_declarations=[
+                DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")
+            ],
+        )
+
+        declarations = self._create_and_get_declarations("probe-7")
+
+        assert declarations == [{"type": "documentation", "url": "https://docs.example.com/node-specific"}]
+
 
 class TestLibraryManagerEngineVersionCheck:
     """`_check_engine_version` gates activation on the merged engine_version config key."""

@@ -203,17 +203,28 @@ Semantics:
 
 #### `documentation`
 
-A link to where a library's or a node's documentation lives (for example, a page on `docs.griptapenodes.com`). `url` must start with `http://` or `https://`; anything else fails library validation.
+A link to where a library's or a node's documentation lives (for example, a page on `docs.griptapenodes.com`).
 
-| Field | Meaning                                           |
-| ----- | ------------------------------------------------- |
-| `url` | Where the documentation for this library/node is. |
+| Field          | Meaning                                                                          |
+| -------------- | -------------------------------------------------------------------------------- |
+| `url`          | One literal documentation link. Library-level or node-level.                     |
+| `url_template` | A link template the engine interpolates per node. Library-level only; see below. |
+
+A library-level declaration sets exactly one of `url` or `url_template` — setting both, or neither, fails library validation. A node-level declaration only ever sets `url`: it names one specific node, so there is nothing to template. Either field must start with `http://` or `https://`; anything else fails library validation.
 
 ```jsonc
 { "type": "documentation", "url": "https://docs.griptapenodes.com/libraries/my_library" }
 ```
 
 Semantics follow `lifecycle_stage`: **node-level absence means "inherit the library's documentation link."** A node-level `documentation` declaration overrides the library's. A library or node with neither declares no documentation link, and the editor shows no documentation affordance for it.
+
+**`url_template` for libraries with many nodes.** Hand-writing a node-level override for every node in a library that ships hundreds of them isn't practical. `url_template` lets one library-level declaration give every node its own page:
+
+```jsonc
+{ "type": "documentation", "url_template": "https://docs.griptapenodes.com/nodes/{category}/{node}/" }
+```
+
+The engine interpolates `{category}` (the node's declared `category`) and `{node}` (its class name) when a node has no `documentation` override of its own, URL-escaping each before substitution. A template may use either placeholder, both, or neither; any other placeholder fails library validation. A node can still override the templated link with its own literal `url`.
 
 #### `model_catalog`
 
