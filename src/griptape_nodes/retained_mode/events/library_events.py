@@ -1382,6 +1382,325 @@ class ResetLibraryResultFailure(ResultPayloadFailure):
 
 
 @dataclass
+class EnvironmentManagedBlocker:
+    """`library.provisioned_by` is 'environment', so the environment owns this library."""
+
+    kind: str = "environment_managed"
+
+
+@dataclass
+class SandboxLibraryBlocker:
+    """The sandbox library is a workspace folder rather than an install."""
+
+    kind: str = "sandbox_library"
+
+
+@dataclass
+class UnsafePathBlocker:
+    """The resolved target is a filesystem root, a drive, a share, or holds `.`/`..` segments.
+
+    Args:
+        path: The path that was refused, so the editor can name it.
+    """
+
+    path: str
+    kind: str = "unsafe_path"
+
+
+@dataclass
+class NotFoundBlocker:
+    """No library of this name and manifest path is known to this engine."""
+
+    kind: str = "not_found"
+
+
+# Why an uninstall cannot proceed at all, as a discriminated union on `kind`.
+#
+# Structured rather than a sentence: the editor owns the wording, so copy can be localized and
+# reworded without an engine release, and can read differently in a dialog than in a toast. Each
+# variant carries the specifics the editor cannot work out for itself.
+#
+# Spelled as a union of the concrete variants rather than a shared base class on purpose. A field
+# TYPED as a marker base serializes as the base: cattrs builds its hook from the declared type, so
+# a plain base passes the object through unconverted and a dataclass base emits `{}`. Either way
+# the editor would not receive the `kind` it switches on.
+UninstallBlocker = EnvironmentManagedBlocker | SandboxLibraryBlocker | UnsafePathBlocker | NotFoundBlocker
+
+
+@dataclass
+class DownloadEntryRemaining:
+    """A `libraries_to_download` git URL re-clones the folder on the next start.
+
+    Args:
+        git_url: The entry's git source, so the editor can name what to remove.
+    """
+
+    git_url: str
+    kind: str = "download_entry"
+
+
+@dataclass
+class SharedDirectoryEntryRemaining:
+    """A directory entry registers this library and others, so it was left in place.
+
+    Args:
+        entry_path: Verbatim config text of the directory entry.
+        library_names: The other libraries that entry still registers, which removing it would
+            un-register too.
+    """
+
+    entry_path: str
+    library_names: list[str] = field(default_factory=list)
+    kind: str = "shared_directory_entry"
+
+
+@dataclass
+class ShadowedConfigRemaining:
+    """The removal landed in the user config, but a higher-priority layer still supplies the entry.
+
+    `set_config_value` only ever writes the user layer, and `libraries_to_register` /
+    `libraries_to_download` are lists, which a higher layer REPLACES wholesale rather than
+    merging. So a library a project, workspace, or environment layer declares survives the
+    user-layer write, and the engine would load it again from a folder this uninstall deleted.
+    Reported so the editor sends the user to the layer that actually owns the entry.
+
+    Args:
+        layer: Which layer still supplies it: "project", "workspace", or "environment".
+    """
+
+    layer: str
+    kind: str = "shadowed_config"
+
+
+@dataclass
+class UnmatchedEntryRemaining:
+    """Nothing in the config matched the manifest, so its registration lives somewhere else."""
+
+    kind: str = "unmatched_entry"
+
+
+# What still registers the library after an otherwise successful uninstall, as a discriminated
+# union on `kind`. The engine loads it again on its next start unless the user acts, so the editor
+# warns instead of reporting a clean uninstall. A union of concrete variants for the same
+# serialization reason as `UninstallBlocker`.
+RemainingRegistration = (
+    DownloadEntryRemaining | SharedDirectoryEntryRemaining | ShadowedConfigRemaining | UnmatchedEntryRemaining
+)
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewUninstallLibraryRequest(RequestPayload):
+    """Resolve what uninstalling a library would do, without touching disk or config.
+
+    Use when: the editor wants to show the user the folder that would be deleted and any
+    libraries that would go with it, before they confirm. Runs the identical resolution
+    `UninstallLibraryRequest` uses, so the two cannot disagree about which folder is in
+    play -- the editor shows this result and the real uninstall must delete the same folder.
+
+    Args:
+        library_name: Name of the library to resolve.
+        library_path: The manifest path of the copy to resolve, from the engine's own
+            `LoadMetadataForAllLibrariesRequest` response, echoed back. Required: it is what says
+            WHICH copy is meant when two are installed under the same name, and a nullable
+            discriminator is one the engine could never rely on.
+
+    Results: PreviewUninstallLibraryResultSuccess | PreviewUninstallLibraryResultFailure
+    """
+
+    library_name: str
+    library_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewUninstallLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The uninstall resolution for this library, computed without any mutation.
+
+    Args:
+        library_name: Echo of the requested library name.
+        library_path: The manifest path this resolution is about.
+        resolution_fingerprint: A hash of the facts this resolution was computed from. The
+            editor passes it back on `UninstallLibraryRequest`, which re-resolves and refuses a
+            stale one. Sharing a resolution path stops preview and uninstall deriving different
+            answers from the SAME state; this stops them acting on DIFFERENT state, which is a
+            separate window the dialog holds open for as long as the user takes to read it.
+            Opaque to the editor; its contents may change without notice.
+        install_directory: Absolute, fully resolved path to the folder an uninstall would
+            delete. None when there is nothing on disk to delete (an already-missing directory
+            resolves successfully with this set to None).
+        registered_path: Verbatim config text of the `libraries_to_register` or
+            `libraries_to_download` entry that registered this copy. None when nothing in
+            config names it (e.g. the sandbox library).
+        registered_in: Which config array `registered_path` came from: "register" for
+            `libraries_to_register`, "download" for `libraries_to_download`, or None when
+            `registered_path` is None.
+        collateral_library_names: Other libraries whose manifest lives under
+            `install_directory`, including ones whose manifest failed to parse. These are
+            deleted along with the primary library and have no load-time visibility of their
+            own, so the editor cannot otherwise warn about them.
+        blocked_by: Why this library cannot be uninstalled from the UI, or None when it can
+            proceed. The editor renders its own sentence per `kind` and offers no confirmation.
+        remaining_registrations: What will still register this library after an otherwise
+            successful uninstall. The editor renders its own sentence per `kind` and warns
+            instead of reporting a clean uninstall. Empty when nothing would remain.
+
+    Results: PreviewUninstallLibraryResultFailure
+    """
+
+    library_name: str
+    library_path: str
+    resolution_fingerprint: str
+    install_directory: str | None
+    registered_path: str | None
+    registered_in: str | None
+    collateral_library_names: list[str] = field(default_factory=list)
+    blocked_by: UninstallBlocker | None = None
+    remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewUninstallLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Uninstall preview failed. Common causes: no library with that name and path was found."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UninstallLibraryRequest(RequestPayload):
+    r"""Remove a library's config entry, unload it from the registry, and delete its folder.
+
+    Runs the same target resolution `PreviewUninstallLibraryRequest` reports, then applies it in
+    the order the resolution is least to most reversible: config entry removed first, then the
+    registry unload, then the directory delete. Each step is harder to undo than the last, so a
+    failure partway through stops before the irreversible step rather than after it -- the state
+    this is built to avoid is a config entry pointing at a directory that has already been
+    deleted, which the engine then fails to load on its next start with no way back.
+
+    The resolution is re-run here and checked against `resolution_fingerprint`. A mismatch fails
+    with `failure_reason` "stale_resolution" and changes nothing, so a library installed, moved,
+    or re-registered while the confirmation sat open cannot be acted on against what the user
+    was actually shown.
+
+    The deleted directory goes to the recycle bin where the platform supports one, so the
+    uninstall is recoverable; a studio-managed engine where a recycle bin would reach outside
+    the sandbox falls back to a permanent delete and the result says so.
+
+    An already-missing install directory is treated as success: the goal (no install of this
+    library on disk) is already met, which also covers a user who deleted the folder by hand
+    before using this request.
+
+    Refuses via `blocked_by`, rather than deleting anything, when: the environment provides this
+    engine's libraries (`ResetLibraryRequest` rule); the library is the sandbox library; or
+    `install_directory` would resolve to a filesystem root, a drive root, a UNC share, or a path
+    containing `.`/`..` segments -- a hand-typed `libraries_to_register` entry produces these
+    easily, and Win32 trims trailing dots and spaces from path components, so `C:\libs\Nuke\..`
+    (which Win32 treats as the parent) is refused by the same check.
+
+    Concurrent uninstalls are serialized: two in flight would otherwise both read the same config
+    array, and the second write would restore the entry the first one just removed.
+
+    Use when: an artist wants to remove a node library from the UI as a troubleshooting step --
+    so reinstalling from a clean state does not require finding the library's folder in a file
+    explorer and deleting it by hand.
+
+    Args:
+        library_name: Name of the library to uninstall.
+        library_path: The manifest path of the copy to uninstall, from the engine's own
+            `LoadMetadataForAllLibrariesRequest` response, echoed back. Required, as on the
+            preview.
+        resolution_fingerprint: The `resolution_fingerprint` from the preview the user confirmed.
+
+    Results: UninstallLibraryResultSuccess | UninstallLibraryResultFailure
+    """
+
+    library_name: str
+    library_path: str
+    resolution_fingerprint: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UninstallLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """The library was uninstalled, or as much of it as this step order allows.
+
+    Carries the same resolution fields as `PreviewUninstallLibraryResultSuccess` (so the editor
+    can show what happened without a second round trip) plus what actually happened.
+
+    Args:
+        library_name: Echo of the requested library name.
+        library_path: The manifest path this uninstall was about.
+        resolution_fingerprint: The fingerprint of the resolution this uninstall acted on, which
+            matched the one the request carried.
+        install_directory: Absolute, fully resolved path to the folder that was deleted (or
+            already absent). None when there was nothing on disk to delete.
+        registered_path: Verbatim config text of the entry that registered this copy, before
+            removal. None when nothing in config named it.
+        registered_in: Which config array `registered_path` came from ("register" or
+            "download"), or None.
+        collateral_library_names: Other libraries whose manifest lived under
+            `install_directory` and were deleted with it, including ones whose manifest failed
+            to parse.
+        blocked_by: Always None on a success; present so the success and preview payloads have
+            the same shape for the editor.
+        remaining_registrations: What still registers this library after this otherwise
+            successful uninstall (a shared directory entry left alone because removing it would
+            un-register siblings, a download entry that re-clones, or a higher config layer the
+            engine cannot write). The editor warns rather than reporting a clean uninstall.
+        unloaded: Whether the library was unloaded from the in-memory registry. False when it
+            was never loaded (e.g. it already failed to load).
+        config_entry_removed: Whether a `libraries_to_register` or `libraries_to_download`
+            entry was removed from the user config. False when nothing in config named this
+            copy, and when the entry was deliberately left in place (a shared directory entry).
+        directory_deleted: Whether `install_directory` was removed from disk (or already
+            absent). False when it was deliberately left alone because a shared directory entry
+            in `remaining_registrations` still registers it, or when a directory existed but the
+            delete step was never reached because an earlier step failed -- which fails the
+            request outright instead of returning this as a partial success.
+        restart_required: True when this engine has already imported this library's Python
+            modules, so its config entry and files are removed but the engine keeps running on
+            the code already in memory until restarted.
+
+    Results: UninstallLibraryResultFailure
+    """
+
+    library_name: str
+    library_path: str
+    resolution_fingerprint: str
+    install_directory: str | None
+    registered_path: str | None
+    registered_in: str | None
+    collateral_library_names: list[str] = field(default_factory=list)
+    blocked_by: UninstallBlocker | None = None
+    remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
+    unloaded: bool = False
+    config_entry_removed: bool = False
+    directory_deleted: bool = False
+    restart_required: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class UninstallLibraryResultFailure(ResultPayloadFailure):
+    """Uninstall failed.
+
+    Common causes: the library was not found, it is blocked (environment-managed, sandbox,
+    unsafe path), the resolution went stale while the confirmation was open, or a step after the
+    config entry was removed raised.
+
+    Args:
+        failure_reason: A stable slug naming which step failed, for callers that branch on it
+            instead of parsing `result_details`: "not_found", "blocked", "stale_resolution",
+            "config_write_failed", "unload_failed", or "directory_delete_failed".
+        blocked_by: Set when `failure_reason` is "blocked", carrying the same structured verdict
+            the preview reports so the editor renders one sentence for both paths.
+    """
+
+    failure_reason: str | None = None
+    blocked_by: UninstallBlocker | None = None
+
+
+@dataclass
 @PayloadRegistry.register
 class SyncLibrariesRequest(RequestPayload):
     """Sync all libraries to latest versions and ensure dependencies are installed.

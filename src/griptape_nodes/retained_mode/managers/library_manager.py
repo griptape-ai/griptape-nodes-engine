@@ -69,6 +69,7 @@ from griptape_nodes.retained_mode.managers.library.sandbox import (
     LibrarySandbox,
 )
 from griptape_nodes.retained_mode.managers.library.sync import LibrarySync
+from griptape_nodes.retained_mode.managers.library.uninstall import LibraryUninstall
 from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
@@ -159,6 +160,7 @@ class LibraryManager(EngineScoped):
         self.discovery = LibraryDiscovery(event_manager, engine=engine)
         self.managed_environment = LibraryManagedEnvironment(engine)
         self.reset = LibraryReset(event_manager, engine=engine)
+        self.uninstall = LibraryUninstall(event_manager, engine=engine)
         event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
