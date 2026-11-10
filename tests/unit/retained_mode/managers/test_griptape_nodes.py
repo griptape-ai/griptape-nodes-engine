@@ -312,6 +312,41 @@ class TestFacadeCallersBoundToNothing:
         assert flow.name == "second_canvas"
         assert entered_in is second
 
+    def test_a_manager_fetched_while_bound_reads_the_only_open_workflow_from_a_raw_thread(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+        created = only.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+        with engine.bind_workflow(only):
+            stored = GriptapeNodes.ContextManager()
+        flow_names: list[str] = []
+
+        thread = threading.Thread(
+            target=lambda: contextvars.Context().run(lambda: flow_names.append(stored.get_current_flow().name))
+        )
+        thread.start()
+        thread.join(timeout=10)
+
+        assert flow_names == ["canvas"]
+
+    def test_pushing_a_workflow_opens_it_while_exactly_one_is_open(self, engine: Engine) -> None:
+        first = _open(engine, "first")
+
+        GriptapeNodes.ContextManager().push_workflow(workflow_name="second")
+
+        assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
+        assert engine.current_workflow() is not first
+
+    def test_a_workflow_block_opens_its_workflow_while_exactly_one_is_open(self, engine: Engine) -> None:
+        first = _open(engine, "first")
+
+        with GriptapeNodes.ContextManager().workflow("second"):
+            inside = engine.current_workflow()
+            assert inside is not None
+            inside_name = engine.workflow_registry.get(inside.workflow_id).metadata.name
+
+        assert inside is not first
+        assert inside_name == "second"
+
     def test_a_stored_manager_finds_no_workflow_once_a_second_opens(self, engine: Engine) -> None:
         first = _open(engine, "first")
         stored = GriptapeNodes.ContextManager()
