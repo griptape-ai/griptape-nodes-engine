@@ -139,8 +139,8 @@ class CloseWorkflowRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class CloseWorkflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """The workflow is closed.
+class CloseWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The workflow is closed. A close leaves nothing unsaved, so it never marks a workflow changed.
 
     Args:
         workflow_id: Id of the workflow the request named.

@@ -623,6 +623,7 @@ class TestCloseOneWhileTheOtherRuns:
         assert isinstance(result, CloseWorkflowResultSuccess), result.result_details
         assert result.workflow_id == b.workflow_id
         assert not result.already_closed
+        assert not result.altered_workflow_state
         assert engine.open_workflows.all_open() == [a]
         assert a.objects.has("survivor")
 
@@ -647,6 +648,7 @@ class TestCloseOneWhileTheOtherRuns:
         assert isinstance(result, CloseWorkflowResultSuccess), result.result_details
         assert result.workflow_id == b.workflow_id
         assert result.already_closed
+        assert not result.altered_workflow_state
         assert engine.open_workflows.all_open() == [a]
 
 
