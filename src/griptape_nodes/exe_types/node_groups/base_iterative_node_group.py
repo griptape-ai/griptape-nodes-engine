@@ -30,6 +30,14 @@ EXECUTION_MODE_VALUE_LOOKUP = {
 }
 
 
+# The base pair, group_exec_in / group_exec_out, that loop groups carried beside Start Loop / On
+# Complete until #6250. Maps each to the loop port that stands in for it.
+LEGACY_CONTROL_PORT_NAMES = {
+    "group_exec_in": "exec_in",
+    "group_exec_out": "exec_out",
+}
+
+
 class IterationControlParam(StrEnum):
     """Parameter names for iteration control on iterative node groups."""
 
@@ -68,9 +76,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         name: str,
         metadata: dict[Any, Any] | None = None,
     ) -> None:
-        # The group's one control pair is the loop's entry and exit, labelled for what it means here.
-        # Until #6250 the loop added a second pair beside the base's "Flow In" / "Flow Out", and only
-        # the loop's pair was ever read, so a chain wired through "Flow Out" stalled.
+        # The group's one control pair is the loop's entry and exit; label it for what it means here.
         super().__init__(
             name,
             metadata,
@@ -85,6 +91,12 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         )
         self.exec_in = self.control_in
         self.exec_out = self.control_out
+        # A workflow saved while the loop still carried the base pair lists those names on its rails.
+        for metadata_key in (LEFT_PARAMETERS_KEY, RIGHT_PARAMETERS_KEY):
+            side_parameters: list[str] | None = self.metadata.get(metadata_key)
+            if side_parameters is None:
+                continue
+            side_parameters[:] = [name for name in side_parameters if name not in LEGACY_CONTROL_PORT_NAMES]
 
         # Per-iteration control output — pairs visually with exec_in on the LEFT rail.
         # Connect this to the first body node to make that node each iteration's entry point.
@@ -191,6 +203,12 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             self.results.name,
         ):
             self._register_side_parameter(RIGHT_PARAMETERS_KEY, parameter_name)
+
+    def get_parameter_by_name(self, param_name: str) -> Parameter | None:
+        # Connections in a workflow saved while the loop carried the base pair name group_exec_in /
+        # group_exec_out. Answer with the loop port that replaced each so those workflows load and run;
+        # the connection is recorded against the Parameter, so the next save writes the current name.
+        return super().get_parameter_by_name(LEGACY_CONTROL_PORT_NAMES.get(param_name, param_name))
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Handle parameter value changes."""

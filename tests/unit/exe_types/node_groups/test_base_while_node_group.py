@@ -32,8 +32,8 @@ class TestBaseWhileNodeGroupRails:
 
     def test_fresh_group_names_each_rail_parameter_once(self, while_group: MockWhileGroup) -> None:
         """The rails are membership sets, so this pins which names are there and that none repeats."""
-        expected_left = {"exec_in", "iteration"}
-        expected_right = {"exec_out", "done", "continue_loop", "total_iterations"}
+        expected_left = {"group_exec_in", "iteration"}
+        expected_right = {"group_exec_out", "done", "continue_loop", "total_iterations"}
         assert set(while_group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(while_group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(while_group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right

@@ -117,9 +117,9 @@ class TestBaseIterativeNodeGroupControlPorts:
 class TestBaseIterativeNodeGroupSingleControlPair:
     """A loop group shows one way in and one way out: Start Loop and On Complete (#6250).
 
-    The group's own pair used to be named group_exec_in / group_exec_out and drawn as Flow In / Flow
-    Out beside a second pair the loop added, and nothing told the artist which to wire. Only the
-    loop's pair ever advanced the chain, so a workflow wired through Flow Out stopped at the loop.
+    The base pair (group_exec_in / group_exec_out, drawn as Flow In / Flow Out) used to sit beside the
+    loop's own pair, and nothing told the artist which to wire. Only the loop's pair ever advanced the
+    chain, so a workflow wired through Flow Out stopped at the loop.
     """
 
     def test_the_loop_pair_is_the_group_pair(self, iterative_group: MockIterativeGroup) -> None:
@@ -152,6 +152,11 @@ class TestBaseIterativeNodeGroupSingleControlPair:
 
 class TestBaseIterativeNodeGroupLegacyControlPortNames:
     """Workflows saved while the loop still carried Flow In / Flow Out keep loading and running."""
+
+    def test_legacy_names_resolve_to_the_loop_ports(self, iterative_group: MockIterativeGroup) -> None:
+        assert iterative_group.get_parameter_by_name("group_exec_in") is iterative_group.exec_in
+        assert iterative_group.get_parameter_by_name("group_exec_out") is iterative_group.exec_out
+        assert iterative_group.get_parameter_by_name("not_a_port") is None
 
     def test_saved_rails_drop_the_legacy_names(self, iterative_group: MockIterativeGroup) -> None:
         """Rail metadata saved by an older engine lists the retired pair; the rebuilt group leaves it out."""
