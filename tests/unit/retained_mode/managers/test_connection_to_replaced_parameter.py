@@ -35,6 +35,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     DeleteNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -110,7 +111,7 @@ def _connect_first_into_target(engine: Engine) -> BaseNode:
     )
     library = LibraryRegistry.generate_new_library(schema)
     library.register_new_node_type(_ValueNode, NodeMetadata(category="test", description="d", display_name="Value"))
-    engine.context_manager.push_workflow(workflow_name="replaced_parameter_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="replaced_parameter_wf"))
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     for name in ("first", "second", "target"):

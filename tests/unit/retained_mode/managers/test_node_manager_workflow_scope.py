@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -115,7 +116,7 @@ def value_library(engine: Engine) -> Iterator[None]:
 
 
 def _open_workflow(engine: Engine) -> WorkflowRuntime:
-    engine.context_manager.push_workflow(workflow_name="open")
+    bind(engine.context_manager.open_workflow(workflow_name="open"))
     return engine.current_workflow()
 
 

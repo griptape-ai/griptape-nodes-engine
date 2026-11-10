@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -9,12 +12,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind, StrictModeSeverity
-from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 @dataclass(kw_only=True)
@@ -208,3 +215,73 @@ class TestStateReadBypassingRequests:
 
         assert config_manager is engine.config_manager
         assert scope.violations == []
+
+
+def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
+    return engine.open_workflow(engine.workflow_registry.register_unsaved(display_name, listed=False).workflow_id)
+
+
+def _create_canvas() -> ResultPayload:
+    return GriptapeNodes.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+
+
+class TestFacadeCallersBoundToNothing:
+    """Saved workflow files and node library threads can't name a workflow, so the facade acts on the only open one."""
+
+    def test_a_request_acts_on_the_only_open_workflow(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+
+        result = _create_canvas()
+
+        assert isinstance(result, CreateFlowResultSuccess), result.result_details
+        assert "canvas" in only.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_an_awaited_request_acts_on_the_only_open_workflow(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+
+        result = await GriptapeNodes.ahandle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+
+        assert isinstance(result, CreateFlowResultSuccess), result.result_details
+        assert "canvas" in only.flows.name_to_parent_name
+
+    def test_a_request_from_a_raw_thread_acts_on_the_only_open_workflow(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+        results: list[ResultPayload] = []
+
+        thread = threading.Thread(target=lambda: results.append(contextvars.Context().run(_create_canvas)))
+        thread.start()
+        thread.join(timeout=10)
+
+        assert isinstance(results[0], CreateFlowResultSuccess), results[0].result_details
+        assert "canvas" in only.flows.name_to_parent_name
+
+    def test_a_request_fails_while_several_are_open(self, engine: Engine) -> None:
+        first = _open(engine, "first")
+        second = _open(engine, "second")
+
+        result = _create_canvas()
+
+        assert isinstance(result, WorkflowNotNamedResultFailure)
+        assert not first.flows.name_to_parent_name
+        assert not second.flows.name_to_parent_name
+
+    def test_a_caller_bound_to_a_workflow_keeps_it(self, engine: Engine) -> None:
+        first = _open(engine, "first")
+        second = _open(engine, "second")
+
+        with engine.bind_workflow(second):
+            result = _create_canvas()
+
+        assert isinstance(result, CreateFlowResultSuccess), result.result_details
+        assert "canvas" in second.flows.name_to_parent_name
+        assert not first.flows.name_to_parent_name
+
+    def test_a_caller_bound_to_no_workflow_keeps_none(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            result = asyncio.run(GriptapeNodes.ahandle_request(CreateFlowRequest(parent_flow_name=None)))
+
+        assert isinstance(result, WorkflowNotNamedResultFailure)
+        assert not only.flows.name_to_parent_name

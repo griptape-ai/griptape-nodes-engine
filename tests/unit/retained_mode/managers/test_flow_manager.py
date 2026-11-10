@@ -69,6 +69,7 @@ from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.commands import encode_commands
+from tests.workflow_context import bind, open_and_bind, unbind
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -156,7 +157,7 @@ def _image_with_flow_commands_text(text: str) -> str:
 @pytest.fixture
 def empty_flow_commands(engine: Engine) -> SerializedFlowCommands:
     """Commands for a flow with nothing in it."""
-    engine.context_manager.push_workflow(workflow_name="image_metadata_workflow")
+    bind(engine.context_manager.open_workflow(workflow_name="image_metadata_workflow"))
     create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=False))
     assert isinstance(create_result, CreateFlowResultSuccess)
     serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=create_result.flow_name))
@@ -178,7 +179,7 @@ def _a_workflow(engine: Engine) -> WorkflowRuntime:
     """The open workflow, opening one when none is, for handlers called directly with the workflow they act on."""
     workflow = engine.current_workflow_or_none()
     if workflow is None:
-        engine.context_manager.push_workflow(workflow_name="extracting")
+        bind(engine.context_manager.open_workflow(workflow_name="extracting"))
         workflow = engine.current_workflow()
     return workflow
 
@@ -220,6 +221,7 @@ class TestExtractFlowCommandsFromImageMetadata:
 
     def test_deserializing_needs_a_workflow_to_load_into(self, engine: Engine, image_with_flow_commands: str) -> None:
         engine.context_manager.pop_workflow()
+        unbind()
         request = ExtractFlowCommandsFromImageMetadataRequest(
             file_url_or_path=image_with_flow_commands, deserialize=True
         )
@@ -300,7 +302,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
             ).ClearAllObjectStateRequest(i_know_what_im_doing=True)
         )
 
-        engine.context_manager.push_workflow("no_flow_wf")
+        bind(engine.context_manager.open_workflow("no_flow_wf"))
         assert not engine.context_manager.has_current_flow()
 
         result = await flow_manager.on_start_flow_request(StartFlowRequest(), engine.current_workflow())
@@ -324,7 +326,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         # Bootstrap manually via push_workflow + CreateFlowRequest so this test does not
         # depend on any sibling MCP-bootstrap PR landing first.
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
         create_flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_in_ctx", set_as_new_context=True)
         )
@@ -354,7 +356,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         flow_manager = engine.flow_manager
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-        engine.context_manager.push_workflow("no_node_wf")
+        bind(engine.context_manager.open_workflow("no_node_wf"))
         assert not engine.context_manager.has_current_node()
 
         result = await flow_manager.on_start_flow_from_node_request(
@@ -378,7 +380,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         flow_manager = engine.flow_manager
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         # A run waits in its workflow's line, so one has to be open.
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
 
         # Stand in a current node so the handler can fall back to it. The node itself only
         # needs to expose `.name`; we short-circuit object lookup below.
@@ -409,7 +411,7 @@ class TestStartFlowFailureMessage:
 
     @pytest.fixture
     def ready_flow_manager(self, engine: Engine) -> Generator[Any, None, None]:
-        engine.context_manager.push_workflow(workflow_name="f_workflow")
+        bind(engine.context_manager.open_workflow(workflow_name="f_workflow"))
         flow_manager = engine.flow_manager
         validated = ValidateFlowDependenciesResultSuccess(validation_succeeded=True, exceptions=[], result_details="ok")
         with (
@@ -479,7 +481,7 @@ class TestListNodesInFlowRequest:
         from griptape_nodes.retained_mode.managers.flow_manager import ControlFlow
 
         flow_manager = engine.flow_manager
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
         workflow = engine.current_workflow()
         with patch.object(
             workflow.objects,
@@ -577,7 +579,7 @@ class TestAutoLayoutFlowRequest:
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
         self._cleanup(engine)
-        engine.context_manager.push_workflow(workflow)
+        bind(engine.context_manager.open_workflow(workflow))
         result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name=flow, set_as_new_context=True)
         )
@@ -624,7 +626,7 @@ class TestAutoLayoutFlowRequest:
         )
 
         self._cleanup(engine)
-        engine.context_manager.push_workflow("no_flow_wf")
+        bind(engine.context_manager.open_workflow("no_flow_wf"))
         flow_manager = engine.flow_manager
 
         result = await flow_manager.on_auto_layout_flow_request(AutoLayoutFlowRequest(), engine.current_workflow())
@@ -807,7 +809,7 @@ class TestClassifyNodesForDag:
     def _classify(engine: Engine, nodes: list, connections: Connections) -> DagNodeCategories:
         from unittest.mock import patch
 
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
         workflow = engine.current_workflow()
         with patch.object(workflow.flows, "connections", connections):
             return engine.flow_manager.classify_nodes_for_dag_in(workflow, nodes)
@@ -913,7 +915,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_transient_child_flow_is_not_serialized(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("transient_wf")
+        bind(engine.context_manager.open_workflow("transient_wf"))
 
         parent = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
@@ -952,7 +954,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
         from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
         from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 
-        engine.context_manager.push_workflow("transient_conn_wf")
+        bind(engine.context_manager.open_workflow("transient_conn_wf"))
         parent = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
         )
@@ -1009,7 +1011,7 @@ class TestDeleteIterationFlows:
     async def test_deletes_all_tracked_flows(self, engine: Engine) -> None:
         from griptape_nodes.common.node_executor import NodeExecutor
 
-        engine.context_manager.push_workflow("cleanup_wf")
+        bind(engine.context_manager.open_workflow("cleanup_wf"))
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True))
 
         object_manager = engine.object_manager
@@ -1043,7 +1045,7 @@ class TestReparentFlow:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_moves_flow_under_new_parent(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("reparent_wf")
+        bind(engine.context_manager.open_workflow("reparent_wf"))
         top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
         assert isinstance(top, CreateFlowResultSuccess)
         outer = engine.handle_request(
@@ -1064,7 +1066,7 @@ class TestReparentFlow:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_rejects_unknown_flows(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("reparent_unknown_wf")
+        bind(engine.context_manager.open_workflow("reparent_unknown_wf"))
         real = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="real", set_as_new_context=False)
         )
@@ -1078,7 +1080,7 @@ class TestReparentFlow:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_rejects_making_a_flow_its_own_parent(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("reparent_self_wf")
+        bind(engine.context_manager.open_workflow("reparent_self_wf"))
         solo = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="solo", set_as_new_context=False)
         )
@@ -1090,7 +1092,7 @@ class TestReparentFlow:
     @pytest.mark.usefixtures("clean_object_state")
     def test_rejects_moving_a_flow_inside_its_own_descendant(self, engine: Engine) -> None:
         """That move would detach the branch and leave the ancestor walk with no way out."""
-        engine.context_manager.push_workflow("reparent_cycle_wf")
+        bind(engine.context_manager.open_workflow("reparent_cycle_wf"))
         outer = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="outer", set_as_new_context=False)
         )
@@ -1115,7 +1117,7 @@ class TestReparentFlow:
 def open_workflow(engine: Engine) -> Generator[None, None, None]:
     """Open a workflow for a run test: a run waits in, starts and ends in its workflow's line."""
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    engine.context_manager.push_workflow("runs_wf")
+    bind(engine.context_manager.open_workflow("runs_wf"))
     try:
         yield
     finally:
@@ -1483,7 +1485,7 @@ class TestRunSpecs:
 
     @pytest.mark.asyncio
     async def test_a_flow_run_whose_flow_is_gone_fails(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
         spec = StartFlowSpec(
             request=StartFlowRequest(flow_name="gone"), workflow=engine.current_workflow(), flow_name="gone"
         )
@@ -1495,7 +1497,7 @@ class TestRunSpecs:
 
     @pytest.mark.asyncio
     async def test_a_run_from_a_node_that_is_gone_fails(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
         spec = StartFlowFromNodeSpec(
             request=StartFlowFromNodeRequest(node_name="gone"),
             workflow=engine.current_workflow(),
@@ -1510,7 +1512,7 @@ class TestRunSpecs:
 
     @pytest.mark.asyncio
     async def test_a_node_run_whose_node_is_gone_fails(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("wf")
+        bind(engine.context_manager.open_workflow("wf"))
         spec = ResolveNodeSpec(
             request=ResolveNodeRequest(node_name="gone"),
             workflow=engine.current_workflow(),
@@ -1870,7 +1872,7 @@ class TestConnectingToParameterList:
     @pytest.fixture
     def flow_name(self, engine: Engine) -> Generator[str, None, None]:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        engine.context_manager.push_workflow("param_list_wf")
+        open_and_bind(engine, "param_list_wf")
         result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
         assert isinstance(result, CreateFlowResultSuccess)
         workflow = engine.current_workflow()

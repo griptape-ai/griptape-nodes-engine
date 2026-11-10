@@ -18,7 +18,7 @@ import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape, read_workflow_metadata
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import RequestSender, ResultDetails
 from griptape_nodes.retained_mode.events.context_events import (
     CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowResultFailure,
     DeleteWorkflowResultSuccess,
     GetPublishOptionsRequest,
+    GetPublishOptionsResultFailure,
     GetPublishOptionsResultSuccess,
     GetVariableSubstitutionEnabledRequest,
     GetWorkflowInfoRequest,
@@ -103,6 +104,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetWorkflowMetadataResultSuccess,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers import event_manager as event_manager_module
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.library.common import RegisteredEventHandler
@@ -146,14 +148,14 @@ _WORKFLOW_REQUESTS = {
     GetVariableSubstitutionEnabledRequest,
     SetVariableSubstitutionEnabledRequest,
     PublishWorkflowRequest,
+    GetPublishOptionsRequest,
     GetWorkflowShapeRequest,
+    GetWorkflowContextRequest,
 }
 # They use the tab's open workflow when there is one and work without it.
 _OPTIONAL_WORKFLOW_REQUESTS = {
     EnsureWorkflowAndFlowRequest,
-    GetPublishOptionsRequest,
     GetWorkflowRunCommandRequest,
-    GetWorkflowContextRequest,
     RunWorkflowWithCurrentStateRequest,
 }
 
@@ -871,7 +873,7 @@ def _publisher(handler: Any, get_publish_options: Any = None) -> RegisteredEvent
 
 
 class TestPublishOptions:
-    def test_the_callback_reads_the_only_open_workflow_when_the_request_names_none(self, engine: Engine) -> None:
+    def test_the_callback_reads_the_workflow_the_request_names(self, engine: Engine) -> None:
         """Publishers read the open graph for their saved settings."""
         workflow = _open(engine, "open")
         seen: list[WorkflowRuntime | None] = []
@@ -885,7 +887,7 @@ class TestPublishOptions:
             "get_registered_event_handlers",
             return_value={"lib": _publisher(MagicMock(), get_publish_options)},
         ):
-            result = engine.handle_request(GetPublishOptionsRequest(workflow_name="open", publisher_name="lib"))
+            result = workflow.handle_request(GetPublishOptionsRequest(workflow_name="open", publisher_name="lib"))
 
         assert isinstance(result, GetPublishOptionsResultSuccess), result.result_details
         assert seen == [workflow]
@@ -984,6 +986,26 @@ class TestRequestsAboutOneMoreWorkflowTakeAnId:
 
         assert isinstance(result, GetPublishOptionsResultSuccess), result.result_details
         assert seen_names == [_name(engine, tab)]
+
+    @pytest.mark.parametrize("address_by", ["id", "name"])
+    def test_publish_options_for_another_open_workflow_are_refused(self, engine: Engine, address_by: str) -> None:
+        tab = _open(engine, "tab")
+        other = _open(engine, "other")
+        get_publish_options = MagicMock()
+        request = GetPublishOptionsRequest(workflow_id=other.workflow_id, publisher_name="lib")
+        if address_by == "name":
+            request = GetPublishOptionsRequest(workflow_name=_name(engine, other), publisher_name="lib")
+
+        with patch.object(
+            engine.library_manager,
+            "get_registered_event_handlers",
+            return_value={"lib": _publisher(MagicMock(), get_publish_options)},
+        ):
+            result = _send(engine, request, tab)
+
+        assert isinstance(result, GetPublishOptionsResultFailure)
+        assert "isn't the workflow open in this tab" in str(result.result_details)
+        get_publish_options.assert_not_called()
 
     def test_a_workflow_shape_names_the_workflow_its_id_names(self, engine: Engine, tmp_path: Path) -> None:
         tab = _open(engine, "tab")
@@ -1115,10 +1137,12 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert result.workflow_id == target.workflow_id
         assert result.created_workflow is False
         assert result.created_flow is True
+        assert result.open_workflow is not None
+        assert result.open_workflow.workflow_id == target.workflow_id
         assert target.context.get_current_flow().name == result.flow_name
         assert tab.flows.name_to_parent_name == {}
 
-    def test_ensure_naming_no_workflow_reuses_the_only_open_one(self, engine: Engine) -> None:
+    def test_ensure_naming_no_workflow_adopts_the_only_open_one(self, engine: Engine) -> None:
         tab = _open(engine, "tab")
 
         result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
@@ -1126,6 +1150,25 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
         assert result.workflow_id == tab.workflow_id
         assert result.created_workflow is False
+        # Reported as opened, so an MCP session keeps it.
+        assert result.open_workflow is not None
+        assert result.open_workflow.workflow_id == tab.workflow_id
+
+    def test_ensure_from_another_engine_naming_no_workflow_never_adopts_the_open_one(self, engine: Engine) -> None:
+        tab = _open(engine, "tab")
+
+        token = event_manager_module._active_request_sender.set(RequestSender(engine_id="peer"))
+        try:
+            result = engine.context_manager.on_ensure_workflow_and_flow_request(
+                EnsureWorkflowAndFlowRequest(flow_name="canvas"), workflow=None
+            )
+        finally:
+            event_manager_module._active_request_sender.reset(token)
+
+        assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
+        assert result.workflow_id != tab.workflow_id
+        assert result.created_workflow is True
+        assert tab.flows.name_to_parent_name == {}
 
     def test_ensure_naming_no_workflow_while_several_are_open_fails(self, engine: Engine) -> None:
         tab = _open(engine, "tab")
@@ -1134,7 +1177,8 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
 
         assert isinstance(result, WorkflowNotNamedResultFailure)
-        assert "did not name one" in str(result.result_details)
+        assert [info.workflow_id for info in result.open_workflows] == [tab.workflow_id, beside.workflow_id]
+        assert "names no workflow and 2 are open" in str(result.result_details)
         assert engine.open_workflows.all_open() == [tab, beside]
 
     def test_run_command_naming_nothing_answers_for_the_workflow_it_is_handed(

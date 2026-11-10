@@ -464,7 +464,12 @@ class WorkflowRunner(EngineScoped):
     async def on_get_workflow_run_command_request(  # noqa: C901, PLR0911, PLR0912
         self, request: GetWorkflowRunCommandRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
-        """The command line that runs the saved workflow or file the request names, else the open `workflow`."""
+        """The command line that runs the saved workflow or file the request names, else the open `workflow`.
+
+        OPTIONAL_WORKFLOW rather than HOST: it reads a saved file, never live state, so it works with
+        no workflow when the body names its target. A named `workflow` only fills in a body that names
+        none, with its own saved file, which `RetainedMode.get_workflow_run_command()` relies on.
+        """
         workflow_name = request.workflow_name
         workflow_id = request.workflow_id
         file_path = request.file_path

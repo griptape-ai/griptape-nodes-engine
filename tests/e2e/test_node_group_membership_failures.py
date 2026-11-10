@@ -39,6 +39,7 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -59,7 +60,7 @@ def library_name(tmp_path: Path, materialize_library: Callable[..., Path], engin
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
-    engine.context_manager.push_workflow(workflow_name="membership_failure_workflow")
+    bind(engine.context_manager.open_workflow(workflow_name="membership_failure_workflow"))
     return register_result.library_name
 
 

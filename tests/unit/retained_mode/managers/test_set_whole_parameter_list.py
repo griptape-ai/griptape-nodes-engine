@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultFailure,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import bind
 
 
 def _reject_bad(_parameter: Parameter, value: object) -> None:
@@ -83,7 +84,7 @@ class _Source(BaseNode):
 @pytest.fixture
 def flow_name(engine: Engine) -> str:
     """A flow to hang the nodes off, inside an active workflow."""
-    engine.context_manager.push_workflow("wf")
+    bind(engine.context_manager.open_workflow("wf"))
     result = engine.handle_request(CreateFlowRequest(parent_flow_name=None))
     assert isinstance(result, CreateFlowResultSuccess)
     return result.flow_name

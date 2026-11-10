@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -63,7 +64,7 @@ def flow(tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    engine.context_manager.push_workflow(workflow_name="loop_branch_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="loop_branch_wf"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name=FLOW_NAME, set_as_new_context=False)
     )

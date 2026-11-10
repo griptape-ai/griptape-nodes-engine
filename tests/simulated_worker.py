@@ -29,13 +29,13 @@ from griptape_nodes.app.worker_routing import register_remote_handlers
 from griptape_nodes.retained_mode.engine import Engine, engine_scope
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventResultFailure, EventResultSuccess
+from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Iterator
 
     from griptape_nodes.retained_mode.events.base_events import EventRequest, RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
-    from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 
 _WORKER_ID = ("simulated-worker", "sessions/test/workers/simulated-worker/request")
 
@@ -78,9 +78,12 @@ class SimulatedWorker:
         request: RequestPayload,
         result_context: ResultContext,
     ) -> EventResultSuccess | EventResultFailure:
-        """Stands in for the worker's `EventManager.forward_to_orchestrator`."""
+        """Stands in for the worker's `EventManager.forward_to_orchestrator`, naming the workflow it does on the envelope."""
         self.forwarded.append(request)
-        result = await _in_own_context(_handled_by(self.orchestrator, through_the_wire(request)))
+        open_workflow_id = self.engine.event_manager._bound_worker_workflow_id()
+        result = await _in_own_context(
+            _handled_by(self.orchestrator, through_the_wire(request), open_workflow_id=open_workflow_id)
+        )
         event_type = EventResultSuccess if result.succeeded() else EventResultFailure
         return event_type(
             request=request,
@@ -140,9 +143,9 @@ def sent_from_open_workflow(request: ExecuteNodeRequest, orchestrator: Engine) -
     return request
 
 
-async def _handled_by(engine: Engine, request: RequestPayload) -> ResultPayload:
+async def _handled_by(engine: Engine, request: RequestPayload, *, open_workflow_id: str | None = None) -> ResultPayload:
     with engine_scope(engine):
-        return await engine.ahandle_request(request)
+        return await engine.ahandle_request(request, result_context=ResultContext(open_workflow_id=open_workflow_id))
 
 
 async def _in_own_context[T](coroutine: Coroutine[Any, Any, T]) -> T:

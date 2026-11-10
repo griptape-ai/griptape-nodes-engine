@@ -86,8 +86,8 @@ progress; the next waiting run then starts.
 
 A script can see the run in progress and the runs waiting behind it with
 `ListRunsRequest`, withdraw a waiting run with `CancelRunRequest`, which
-takes the run's id from that list, and cancel everything with
-`CancelAllRunsRequest`. The result of a run request also names its run, in
+takes the run's id from that list, and cancel all of the workflow's runs
+with `CancelAllRunsRequest`. The result of a run request also names its run, in
 `run_id`.
 
 ## Stopping a run
