@@ -143,23 +143,30 @@ def _check_manager_access_during_execution(manager_name: str, request_hint: str)
 
 
 # ContextManager methods that return a context manager to enter, whose blocks run in the workflow too.
-_CONTEXT_MANAGER_BLOCKS = frozenset({"workflow", "flow", "node", "element"})
+_CONTEXT_MANAGER_BLOCKS = frozenset({"flow", "node", "element"})
+# ContextManager methods that open a workflow. They run unbound: workflows don't nest, so binding
+# the only open workflow around them would refuse the open whenever exactly one is open.
+_CONTEXT_MANAGER_OPENS = frozenset({"push_workflow", "open_workflow", "workflow"})
 
 
 class _ManagerForUnboundCaller:
-    """A manager the facade hands a caller bound to nothing.
+    """A manager the facade hands out.
 
     Each attribute read and method call, and each block its `entered_methods` open, runs bound to
     the workflow the facade's requests act on at that moment
     (`GriptapeNodes.only_open_workflow_for_unbound_caller`), not when the manager was fetched. A
     caller bound by then follows its binding instead, so a stored manager acts where its caller does.
+    `unbound_methods` run as the caller is bound, without the facade's choice.
     """
 
-    def __init__(self, manager: object, entered_methods: frozenset[str]) -> None:
+    def __init__(self, manager: object, entered_methods: frozenset[str], unbound_methods: frozenset[str]) -> None:
         self._manager = manager
         self._entered_methods = entered_methods
+        self._unbound_methods = unbound_methods
 
     def __getattr__(self, name: str) -> Any:
+        if name in self._unbound_methods:
+            return getattr(self._manager, name)
         with _bound_as_the_facade_acts():
             attribute = getattr(self._manager, name)
         if inspect.iscoroutinefunction(attribute):
@@ -222,11 +229,14 @@ def _bound_to(workflow: WorkflowRuntime | None) -> AbstractContextManager[None]:
     return current_engine().bind_workflow(workflow)
 
 
-def _for_caller[M](manager: M, entered_methods: frozenset[str] = frozenset()) -> M:
-    """`manager`, wrapped for a caller bound to nothing so each call decides its workflow (see `_ManagerForUnboundCaller`)."""
-    if bound_workflow.get() is not None:
-        return manager
-    return cast("M", _ManagerForUnboundCaller(manager, entered_methods))
+def _for_caller[M](
+    manager: M, entered_methods: frozenset[str] = frozenset(), unbound_methods: frozenset[str] = frozenset()
+) -> M:
+    """`manager`, wrapped so each call decides its workflow (see `_ManagerForUnboundCaller`).
+
+    Wrapped even for a bound caller: a stored manager can later be called from a thread bound to nothing.
+    """
+    return cast("M", _ManagerForUnboundCaller(manager, entered_methods, unbound_methods))
 
 
 class GriptapeNodes(metaclass=_EngineRootMeta):
@@ -343,7 +353,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
         _check_manager_access_during_execution(
             "ContextManager", "GetCurrentProjectRequest(...) for the project; flow context belongs to the orchestrator"
         )
-        return _for_caller(current_engine().context_manager, _CONTEXT_MANAGER_BLOCKS)
+        return _for_caller(current_engine().context_manager, _CONTEXT_MANAGER_BLOCKS, _CONTEXT_MANAGER_OPENS)
 
     @classmethod
     def WorkflowManager(cls) -> WorkflowManager:
