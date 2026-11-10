@@ -37,7 +37,7 @@ class TestSendEvent:
     def test_sends_a_serializable_execution_event(self) -> None:
         publisher = LocalSessionWorkflowPublisher.__new__(LocalSessionWorkflowPublisher)
         publisher.send_event = MagicMock()
-        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything="a plain string"))
+        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything="a plain string"), open_workflow_id=None)
 
         publisher._send_event("execution_event", event)
 
@@ -49,7 +49,7 @@ class TestSendEvent:
     def test_skips_an_unsendable_execution_event_without_raising(self) -> None:
         publisher = LocalSessionWorkflowPublisher.__new__(LocalSessionWorkflowPublisher)
         publisher.send_event = MagicMock()
-        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything=_NoJsonForm()))
+        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything=_NoJsonForm()), open_workflow_id=None)
 
         publisher._send_event("execution_event", event)
 

@@ -1,6 +1,5 @@
-- `OpenWorkflowRequest` opens a workflow by `workflow_id` or `workflow_name`, or a new unsaved one
-  when it names neither, and builds a saved workflow's file into it. A workflow that is already
-  open comes back as it is, with `already_open` set. It never closes a workflow, and fails with
-  `WorkflowNotFoundResultFailure` for an id or name the engine doesn't know, such as an unsaved
-  workflow that was closed or lost to a restart. MCP clients get it as a tool.
+- `OpenWorkflowRequest`, also an MCP tool, opens a workflow by `workflow_id` or `workflow_name`, or a
+  new unsaved one, and returns a workflow that is already open with `already_open` set. It opens the
+  workflow beside the open ones and never closes one.
   [#6221](https://github.com/griptape-ai/griptape-nodes-engine/issues/6221)
+  [#6241](https://github.com/griptape-ai/griptape-nodes-engine/issues/6241)

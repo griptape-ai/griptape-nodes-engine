@@ -258,7 +258,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             )
             _raise_load_error(msg)
 
-        # The load acted on the workflow it opened only for its own request; the rest of the run
+        # The load opened its workflow but left this run bound to none, and the rest of the run
         # reads that workflow's flow and nodes.
         if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.open_workflow is not None:
             bind_unbound_caller(GriptapeNodes.get_instance().open_workflows.get(result.open_workflow.workflow_id))

@@ -28,7 +28,8 @@ _ALLOWED_SITES = {
     ("retained_mode/events/execution_events.py", "progress_to_execution_event"): True,
     # A chat about no workflow names none.
     ("retained_mode/managers/agent_manager.py", "emit"): False,
-    # Publishing progress is about the engine, not a workflow.
+    # Publishing progress names the workflow being published, which `EventManager.put_event` fills
+    # in from the binding, as it does for the progress a publisher library builds.
     ("retained_mode/publishing/workflow_packager.py", "emit_progress"): False,
     # A subprocess run that failed may have failed before it had a workflow, so its cancel names none.
     ("bootstrap/workflow_executors/local_session_workflow_executor.py", "arun"): False,

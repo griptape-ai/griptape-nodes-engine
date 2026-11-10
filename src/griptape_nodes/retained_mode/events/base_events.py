@@ -469,7 +469,8 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """An event from running a flow. `open_workflow_id` names the open workflow it belongs to, None for a host event.
 
-    It matches a result envelope's `open_workflow_id`, so a client routes both by one field.
+    It matches a result envelope's `open_workflow_id`, so a client routes both by one field. Left
+    out, `EventManager` fills it in with the bound workflow when the event is queued.
 
     Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
     for an event a node reports about itself, naming the workflow it joined. Both go through
