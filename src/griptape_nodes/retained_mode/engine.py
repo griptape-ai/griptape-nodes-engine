@@ -807,6 +807,10 @@ class Engine:
             raise
         self._finish_opening(opening.workflow, keep=not opening.abandoned)
 
+    def is_opening(self, workflow: WorkflowRuntime) -> bool:
+        """Whether an `opening_workflow` block is still building `workflow`."""
+        return workflow in self._opening_workflows
+
     async def wait_for_opening(self, workflow: WorkflowRuntime) -> None:
         """Wait until the `opening_workflow` block building `workflow` ends, if one is under way."""
         build_ended = self._opening_workflows.get(workflow)

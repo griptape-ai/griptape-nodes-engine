@@ -208,9 +208,7 @@ class WorkflowRunner(EngineScoped):
         return built.execution_result
 
     @handles(RunWorkflowFromScratchRequest)
-    async def on_run_workflow_from_scratch_request(  # noqa: PLR0911
-        self, request: RunWorkflowFromScratchRequest
-    ) -> ResultPayload:
+    async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         """Close the open workflow while only one may be open, then open the file as a workflow."""
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with self.engine.workflow_manager.squelch_workflow_altered():
@@ -227,29 +225,17 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # By the path a standalone run opens it with (`push_workflow(file_path=__file__)`), so
-            # both find the same registry entry.
-            try:
-                built = await self.open_and_build_workflow(file_path=str(complete_file_path))
-            except ContextManager.OpenRefusedError as err:
-                return RunWorkflowFromScratchResultFailure(result_details=str(err))
-            if built.already_open:
-                details = f"Attempted to run workflow file '{complete_file_path}'. Failed because it is already open."
-                return RunWorkflowFromScratchResultFailure(result_details=details)
-            execution_result = built.execution_result
-            if execution_result is None:
-                details = (
-                    f"Attempted to run workflow file '{complete_file_path}'. Failed because it opened without its file."
-                )
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+            # Opens by the absolute path, as a standalone run does (`push_workflow(file_path=__file__)`),
+            # so both find the same registry entry.
+            execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=None)
             if not execution_result.execution_successful:
                 return RunWorkflowFromScratchResultFailure(
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
                 )
             return RunWorkflowFromScratchResultSuccess(
                 status=execution_result.status,
-                workflow_id=built.workflow_id,
-                open_workflow=self._open_workflow_info(built.workflow_id),
+                workflow_id=execution_result.workflow_id,
+                open_workflow=self._open_workflow_info(execution_result.workflow_id),
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
 
