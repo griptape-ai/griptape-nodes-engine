@@ -44,6 +44,11 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
     ListRegisteredLibrariesResultFailure,
 )
+from griptape_nodes.retained_mode.events.os_events import (
+    DeleteFileRequest,
+    DeleteFileResultFailure,
+    FileIOFailureReason,
+)
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
     BranchWorkflowResultFailure,
@@ -387,7 +392,7 @@ class TestWorkflowManager:
         mock_workflow.metadata = mock_metadata
         mock_workflow.metadata_is_placeholder = False
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow):
+        with patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow):
             result = workflow_manager.catalog.on_get_workflow_metadata_request(request)
 
         assert isinstance(result, GetWorkflowMetadataResultSuccess)
@@ -474,7 +479,7 @@ class TestWorkflowManager:
         existing_content = "# /// script\n# [tool]\n# ///\nprint('body')\n"
 
         with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow),
             patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "is_file", return_value=True),
             patch.object(anyio.Path, "read_text", AsyncMock(return_value=existing_content)),
@@ -692,7 +697,7 @@ class TestWorkflowManager:
         mock_workflow.file_path = "my_workflow.py"
 
         with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow),
             patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "exists", return_value=False),
         ):
@@ -709,7 +714,7 @@ class TestWorkflowManager:
         mock_workflow.file_path = "my_workflow.py"
 
         with (
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow),
             patch.object(engine.workflow_registry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "mkdir"),
@@ -1120,40 +1125,40 @@ class TestWorkflowManager:
         *,
         request_kwargs: dict[str, Any] | None = None,
     ) -> dict:
-        """Drive on_rename_workflow_request with mocked save/delete, capturing the SaveWorkflowRequest.
+        """Drive on_rename_workflow_request for an open workflow with a mocked save, capturing the SaveWorkflowRequest.
 
         ``request_kwargs`` is merged into the RenameWorkflowRequest constructor so individual tests can
         exercise display_name_behavior / display_name without changing the shared scenario tuple.
         """
         from griptape_nodes.retained_mode.events.workflow_events import (
-            DeleteWorkflowResultSuccess,
             RenameWorkflowRequest,
             RenameWorkflowResultSuccess,
             SaveWorkflowRequest,
             SaveWorkflowResultSuccess,
         )
 
+        engine = workflow_manager.engine
         mock_source = MagicMock()
         mock_source.file_path = scenario.source_file_path
+        # No file to delete afterwards: these tests are about what the save is asked for.
+        mock_source.absolute_path = None
         mock_source.metadata.name = scenario.source_display_name
         captured: dict[str, object] = {}
 
-        async def fake_ahandle_request(req: object) -> object:
-            if isinstance(req, SaveWorkflowRequest):
-                captured["save_file_name"] = req.file_name
-                captured["save_display_name"] = req.display_name
-                return SaveWorkflowResultSuccess(
-                    file_path=scenario.save_file_path,
-                    workflow_name=scenario.save_workflow_name,
-                    result_details="ok",
-                )
-            return DeleteWorkflowResultSuccess(result_details="ok")
+        async def fake_save(_workflow: WorkflowRuntime, req: SaveWorkflowRequest, **_: Any) -> object:
+            captured["save_file_name"] = req.file_name
+            captured["save_display_name"] = req.display_name
+            return SaveWorkflowResultSuccess(
+                file_path=scenario.save_file_path,
+                workflow_name=scenario.save_workflow_name,
+                result_details="ok",
+            )
 
         with (
-            patch.object(workflow_manager.engine.workflow_registry, "has_workflow_with_name", return_value=True),
-            patch.object(workflow_manager.engine.workflow_registry, "get_workflow_by_name", return_value=mock_source),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_source),
+            patch.object(engine.open_workflows, "find", return_value=WorkflowRuntime("renamed", engine)),
+            patch.object(workflow_manager.saver, "save_open_workflow", side_effect=fake_save),
             patch.object(workflow_manager, "persist_external_workflow_registration") as mock_persist,
-            patch.object(workflow_manager.engine, "ahandle_request", side_effect=fake_ahandle_request),
         ):
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
@@ -1161,8 +1166,7 @@ class TestWorkflowManager:
                         workflow_name=scenario.workflow_name,
                         requested_name=scenario.requested_name,
                         **(request_kwargs or {}),
-                    ),
-                    WorkflowRuntime("renamed", workflow_manager.engine),
+                    )
                 )
             )
 
@@ -1344,7 +1348,10 @@ class TestWorkflowManager:
             msg = f"Save/delete must not run when display_name is used with non-OVERRIDE; got {type(req).__name__}"
             raise AssertionError(msg)
 
-        with patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request):
+        with (
+            patch.object(engine.workflow_registry, "resolve_address", return_value=MagicMock()),
+            patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
                     RenameWorkflowRequest(
@@ -1352,8 +1359,7 @@ class TestWorkflowManager:
                         requested_name="my_workflow_renamed",
                         display_name_behavior=RenameDisplayNameBehavior[non_override_behavior],
                         display_name="Silently Ignored",
-                    ),
-                    WorkflowRuntime("renamed", workflow_manager.engine),
+                    )
                 )
             )
 
@@ -1379,7 +1385,10 @@ class TestWorkflowManager:
             msg = f"Save/delete must not run when OVERRIDE has no display_name; got {type(req).__name__}"
             raise AssertionError(msg)
 
-        with patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request):
+        with (
+            patch.object(engine.workflow_registry, "resolve_address", return_value=MagicMock()),
+            patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
                     RenameWorkflowRequest(
@@ -1387,8 +1396,7 @@ class TestWorkflowManager:
                         requested_name="my_workflow_renamed",
                         display_name_behavior=RenameDisplayNameBehavior.OVERRIDE,
                         display_name=empty_display_name,
-                    ),
-                    WorkflowRuntime("renamed", workflow_manager.engine),
+                    )
                 )
             )
 
@@ -1421,16 +1429,16 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "my_workflow_renamed"
 
-    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_missing(self, engine: Engine) -> None:
-        """PRESERVE_EXISTING with an unregistered source workflow falls back to the requested name.
+    @pytest.mark.parametrize("failing_cleanup", ["file", "config"])
+    def test_rename_reports_a_failed_cleanup_of_the_old_file_as_a_warning(
+        self, engine: Engine, failing_cleanup: str
+    ) -> None:
+        """A rename whose old file or config entry can't be removed afterwards still succeeds, and says what is left.
 
-        Save-As-style path: caller asks to rename a workflow that isn't in the registry (e.g. the
-        entry was already deleted, or this is a first-save-as flow). We can't preserve a name we
-        don't have, so we hand the requested name through to SaveWorkflowRequest — better than
-        letting the save chain fall further and derive from the file stem.
+        The workflow already lives in its new file, so reporting a failure would tell the caller
+        the rename did not happen.
         """
         from griptape_nodes.retained_mode.events.workflow_events import (
-            RenameDisplayNameBehavior,
             RenameWorkflowRequest,
             RenameWorkflowResultSuccess,
             SaveWorkflowRequest,
@@ -1438,90 +1446,50 @@ class TestWorkflowManager:
         )
 
         workflow_manager = engine.workflow_manager
-        captured: dict[str, object] = {}
-
-        async def fake_ahandle_request(req: object) -> object:
-            if isinstance(req, SaveWorkflowRequest):
-                captured["save_display_name"] = req.display_name
-                return SaveWorkflowResultSuccess(
-                    file_path="/workspace/never_registered_renamed.py",
-                    workflow_name="never_registered_renamed",
-                    result_details="ok",
-                )
-            msg = f"Unexpected request in save-as fallback test: {type(req).__name__}"
-            raise AssertionError(msg)
-
-        with (
-            # Force the source lookup to miss — no registry entry to preserve from.
-            patch.object(engine.workflow_registry, "has_workflow_with_name", return_value=False),
-            patch.object(workflow_manager, "persist_external_workflow_registration"),
-            patch.object(workflow_manager.engine, "ahandle_request", side_effect=fake_ahandle_request),
-        ):
-            result = asyncio.run(
-                workflow_manager.file_operations.on_rename_workflow_request(
-                    RenameWorkflowRequest(
-                        workflow_name="never_registered",
-                        requested_name="never_registered_renamed",
-                        display_name_behavior=RenameDisplayNameBehavior.PRESERVE_EXISTING,
-                    ),
-                    WorkflowRuntime("renamed", workflow_manager.engine),
-                )
-            )
-
-        assert isinstance(result, RenameWorkflowResultSuccess)
-        assert captured["save_display_name"] == "never_registered_renamed"
-
-    def test_rename_surfaces_delete_failure_from_bookkeeping(self, engine: Engine) -> None:
-        """When the post-save delete of the old registry entry fails, rename surfaces RenameWorkflowResultFailure.
-
-        Save succeeds, but the follow-up DeleteWorkflowRequest for the old key comes back as
-        DeleteWorkflowResultFailure. The bookkeeping helper must translate that into a rename
-        failure so the caller doesn't see a bogus success while the registry is half-migrated.
-        """
-        from griptape_nodes.retained_mode.events.workflow_events import (
-            DeleteWorkflowRequest,
-            DeleteWorkflowResultFailure,
-            RenameWorkflowRequest,
-            RenameWorkflowResultFailure,
-            SaveWorkflowRequest,
-            SaveWorkflowResultSuccess,
-        )
-
-        workflow_manager = engine.workflow_manager
         mock_source = MagicMock()
+        mock_source.name = "old"
         mock_source.file_path = "old.py"
+        mock_source.absolute_path = Path("/workspace/old.py")
         mock_source.metadata.name = "Old Display"
 
+        async def fake_save(_workflow: WorkflowRuntime, _req: SaveWorkflowRequest, **_: Any) -> object:
+            mock_source.name = "new"
+            mock_source.absolute_path = Path("/workspace/new.py")
+            return SaveWorkflowResultSuccess(file_path="/workspace/new.py", workflow_name="new", result_details="ok")
+
         async def fake_ahandle_request(req: object) -> object:
-            if isinstance(req, SaveWorkflowRequest):
-                return SaveWorkflowResultSuccess(
-                    file_path="/workspace/new.py",
-                    workflow_name="new",
-                    result_details="ok",
+            if isinstance(req, DeleteFileRequest) and failing_cleanup == "file":
+                return DeleteFileResultFailure(
+                    failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details="file locked"
                 )
-            if isinstance(req, DeleteWorkflowRequest):
-                return DeleteWorkflowResultFailure(result_details="registry locked")
-            msg = f"Unexpected request in delete-failure test: {type(req).__name__}"
+            if isinstance(req, DeleteFileRequest):
+                # Anything but a failure counts as deleted.
+                return MagicMock()
+            msg = f"Unexpected request in cleanup-failure test: {type(req).__name__}"
             raise AssertionError(msg)
 
         with (
-            patch.object(engine.workflow_registry, "has_workflow_with_name", return_value=True),
-            patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_source),
+            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_source),
+            patch.object(engine.open_workflows, "find", return_value=WorkflowRuntime("renamed", engine)),
+            patch.object(workflow_manager.saver, "save_open_workflow", side_effect=fake_save),
             patch.object(workflow_manager, "persist_external_workflow_registration"),
+            patch.object(engine.config_manager, "delete_user_workflow", return_value=failing_cleanup != "config"),
             patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
         ):
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
-                    RenameWorkflowRequest(workflow_name="old", requested_name="new"),
-                    WorkflowRuntime("renamed", workflow_manager.engine),
+                    RenameWorkflowRequest(workflow_name="old", requested_name="new")
                 )
             )
 
-        assert isinstance(result, RenameWorkflowResultFailure)
-        # Match the quoted-name form the failure message renders so the assertions
-        # don't pass on incidental substrings ("renew", "olden", ...).
-        assert "'old'" in str(result.result_details)
-        assert "'new'" in str(result.result_details)
+        assert isinstance(result, RenameWorkflowResultSuccess), result.result_details
+        assert isinstance(result.result_details, ResultDetails)
+        warnings = [detail for detail in result.result_details.result_details if detail.level == logging.WARNING]
+        assert len(warnings) == 1
+        if failing_cleanup == "file":
+            assert str(Path("/workspace/old.py")) in warnings[0].message
+        else:
+            assert "'old.py'" in warnings[0].message
 
     def test_resolve_named_save_path_absolute_skips_sub_dirs(self, engine: Engine) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""
@@ -2437,7 +2405,7 @@ class TestWorkflowManager:
         )
         workflow_manager._workflow_file_path_to_info[info_key] = wf_info
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", return_value=mock_workflow):
+        with patch.object(engine.workflow_registry, "resolve_address", return_value=mock_workflow):
             result = workflow_manager.catalog.on_get_workflow_info_request(request)
 
         assert isinstance(result, GetWorkflowInfoResultSuccess)
@@ -6054,7 +6022,6 @@ class TestSaveWorkflowOverwriteProtection:
         whether to offer "replace it?"; without it the dialog can't fire and the
         user just sees a generic error.
         """
-        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
         from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultFailure
 
         with empty_workflow_registry(engine):

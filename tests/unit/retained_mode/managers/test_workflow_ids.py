@@ -992,7 +992,7 @@ class TestOpenAndSaveResultsReportTheOpenWorkflow:
 
 
 class TestHostResultsNameNoWorkflow:
-    """A move or delete runs in no workflow, so its result's envelope names none, even for the open workflow."""
+    """A rename, move or delete runs in no workflow, so its result's envelope names none, even for the open workflow."""
 
     def test_a_move_of_the_open_workflow_names_none(self, project_engine: Engine) -> None:
         workflow_id = _open_new_workflow(project_engine, "moved")
@@ -1001,6 +1001,20 @@ class TestHostResultsNameNoWorkflow:
         result_event = asyncio.run(
             project_engine.event_manager.ahandle_request(
                 MoveWorkflowRequest(workflow_name=saved.workflow_name, target_directory="elsewhere"),
+                result_context=ResultContext(open_workflow_id=workflow_id),
+            )
+        )
+
+        assert result_event.succeeded(), result_event.result.result_details
+        assert result_event.open_workflow_id is None
+
+    def test_a_rename_of_the_open_workflow_names_none(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "renamed")
+        saved = _save(project_engine)
+
+        result_event = asyncio.run(
+            project_engine.event_manager.ahandle_request(
+                RenameWorkflowRequest(workflow_name=saved.workflow_name, requested_name="renamed_again"),
                 result_context=ResultContext(open_workflow_id=workflow_id),
             )
         )
