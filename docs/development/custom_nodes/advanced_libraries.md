@@ -733,9 +733,8 @@ Three things in this example are easy to get wrong:
 - **Nodes inside a loop body are not covered.** The check reads the canvas node, which holds
     the values from before the loop started. If a **ForEach** feeds each item into an
     **Agent**'s `prompt`, an item containing the term does not cancel the run. The example
-    does not look inside lists either, so it cannot check the list that feeds the loop. To
-    stop a blocked item in a loop, put a node that raises an error when its text contains the
-    term inside the loop, in front of the **Agent**.
+    does not look inside lists either, so it cannot check the list that feeds the loop. This
+    is a current limitation: a library cannot yet check or stop the items of a loop.
 
 ### Example: a library that checks node outputs
 
