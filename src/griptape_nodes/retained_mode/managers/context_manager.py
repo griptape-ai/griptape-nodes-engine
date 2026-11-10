@@ -1024,8 +1024,19 @@ class ContextManager(EngineScoped):
         )
 
     def _ensure_flow(self, request: EnsureWorkflowAndFlowRequest, workflow: WorkflowRuntime) -> ResultPayload:
-        """Give the open `workflow` a top-level flow if it has none, for an Ensure request."""
+        """Give the open `workflow` a top-level flow if it has none, for an Ensure request.
+
+        Refuses a workflow another request is still building: its file creates the top-level flow,
+        and a flow created first would become that flow's parent.
+        """
         workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+        if self.engine.is_opening(workflow):
+            return EnsureWorkflowAndFlowResultFailure(
+                result_details=(
+                    f"Attempted to ensure a workflow + flow context in workflow '{workflow_name}'. "
+                    "Failed because another request is still opening it. Try again once it has opened."
+                )
+            )
         created_flow = False
         if workflow.context.has_current_flow():
             flow_name = workflow.context.get_current_flow().name
