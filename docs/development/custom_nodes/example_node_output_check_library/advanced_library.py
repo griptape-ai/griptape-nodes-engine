@@ -41,7 +41,9 @@ ANY_PARAMETER = "*"
 class OutputCheckLibrary(AdvancedNodeLibrary):
     def get_execution_event_listeners(self) -> list[tuple[type, Callable]]:
         # NodeFinishProcessEvent is sent once for every run that sent a NodeStartProcessEvent,
-        # after the node's work is over, including the nodes inside groups and loops.
+        # after the node's work is over. For a node inside a loop body the event names the canvas
+        # node, and that node only gets the last iteration's outputs once the whole loop is done.
+        # Reading it by name is only right for nodes outside loops.
         return [(NodeFinishProcessEvent, self._on_finish)]
 
     def _on_finish(self, event: NodeFinishProcessEvent) -> None:

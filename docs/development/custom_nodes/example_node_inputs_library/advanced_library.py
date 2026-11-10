@@ -44,8 +44,10 @@ class NodeInputsLibrary(AdvancedNodeLibrary):
         self._writer = ThreadPoolExecutor(max_workers=1)
 
     def get_execution_event_listeners(self) -> list[tuple[type, Callable]]:
-        # NodeStartProcessEvent is sent once for every node the engine runs, including the nodes
-        # inside groups and loops, just before the node does any work.
+        # NodeStartProcessEvent is sent once for every node the engine runs, just before the node
+        # does any work. For a node inside a loop body the event names the canvas node, and that
+        # node holds the values from before the loop started, not the ones the current iteration
+        # is using. Reading it by name is only right for nodes outside loops.
         return [(NodeStartProcessEvent, self._on_start)]
 
     def before_library_unregistered(self, library_data: LibrarySchema, library: Library) -> None:  # noqa: ARG002

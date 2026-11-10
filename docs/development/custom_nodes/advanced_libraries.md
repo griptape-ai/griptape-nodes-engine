@@ -673,6 +673,10 @@ Things to know about the output:
 - **Values are what the node holds when it starts.** A prompt typed on the node and a
     prompt wired in from an upstream node both appear as text, because the engine has
     already resolved the wire.
+- **Nodes inside a loop body are not covered.** A loop runs its body as copies of the
+    canvas nodes. The event names the canvas node, which still holds the values from before
+    the loop started. A node in a loop therefore logs the same values on every iteration, not
+    the item that iteration is using. Nodes outside loops are logged correctly.
 - **Long text is cut.** Text over 500 characters is shortened, and the line says how long
     the original was. Change `MAX_VALUE_CHARS` to adjust.
 - **Objects show only their type.** An image, an audio clip, or a driver appears as its type
@@ -726,6 +730,10 @@ Two things in this example are easy to get wrong:
     provider. If a blocked prompt must never be sent, put a node in front of the model node
     that raises an error when the text contains the term. A node that raises stops the run
     before the next node starts.
+- **Nodes inside a loop body are not covered.** The check reads the canvas node, which holds
+    the values from before the loop started. If a **ForEach** feeds each item into an
+    **Agent**'s `prompt`, an item containing the term does not cancel the run. Put the check
+    before the loop, on the list that feeds it, or use a node that raises inside the loop.
 
 ### Example: a library that checks node outputs
 
@@ -764,3 +772,6 @@ Things to know about this example:
 - **The text stays out of the log.** The warning names the node, the parameter and the term.
     Add the text if you need it, and remember that outputs can be as sensitive as prompts.
 - **Only text is checked.** An image or other object is skipped.
+- **Nodes inside a loop body are not covered.** The event names the canvas node, which only
+    receives the last iteration's outputs once the whole loop has finished. During the loop
+    the check reads stale outputs.
