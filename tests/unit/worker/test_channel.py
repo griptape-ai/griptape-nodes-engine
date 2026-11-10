@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -507,6 +508,25 @@ async def test_request_timeout_removes_its_pending_entry() -> None:
         assert pair.child._pending == {}
     finally:
         never_answer.set()
+        pair.parent.close()
+        pair.child.close()
+
+
+@pytest.mark.asyncio
+async def test_a_reset_while_draining_a_request_raises_channel_closed_error() -> None:
+    """A peer that dies between the write and the drain fails the request as a closed channel."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    pair.child.start(on_request=_echo_body, on_notification=lambda _b: None, on_closed=lambda: None)
+    pair.child._writer.drain = AsyncMock(side_effect=ConnectionResetError("reset by peer"))  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ChannelClosedError):
+            await pair.child.request({"x": 1}, timeout_s=SHORT_TIMEOUT_S)
+        assert pair.child._pending == {}
+    finally:
         pair.parent.close()
         pair.child.close()
 

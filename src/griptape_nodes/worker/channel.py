@@ -194,7 +194,11 @@ class AsyncChannel:
         self._pending[request_id] = future
         try:
             self._send_frame({"frame": "request", "id": request_id, "body": body})
-            await self._writer.drain()
+            try:
+                await self._writer.drain()
+            except ConnectionError as e:
+                # The peer went away between the write and the drain.
+                raise ChannelClosedError(_CLOSED_MSG) from e
             return await asyncio.wait_for(future, timeout_s)
         finally:
             self._pending.pop(request_id, None)
