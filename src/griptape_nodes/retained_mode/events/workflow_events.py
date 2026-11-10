@@ -42,11 +42,11 @@ class RunWorkflowFromScratchRequest(RequestPayload):
     Use when: Loading and executing saved workflows, testing workflows from files,
     running workflows in clean environments, batch processing workflows.
 
-    Ignores the envelope's `open_workflow_id`.
+    Ignores the envelope's `open_workflow_id`. Closes the open workflow first while only one may be
+    open.
 
     Args:
-        file_path: Path to the workflow file to load and execute. The request closes the open
-            workflow first while only one may be open.
+        file_path: Path to the workflow file to load and execute.
 
     Results: RunWorkflowFromScratchResultSuccess | RunWorkflowFromScratchResultFailure (file not found, load error)
     """
