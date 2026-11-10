@@ -115,11 +115,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 name="group_exec_out",
                 tooltip="Fires once the group has finished. Wire the next node's control input here.",
             )
-        # Each port also stands in for a member's control wire that crosses the boundary (see
-        # _create_proxy_parameter_for_connection), so like any proxy it carries the external leg on
-        # one side and the internal leg on the other.
-        control_in.allowed_modes = control_in.allowed_modes | {ParameterMode.OUTPUT}
-        control_out.allowed_modes = control_out.allowed_modes | {ParameterMode.INPUT}
         self.control_in = control_in
         self.add_parameter(self.control_in)
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.control_in.name)
@@ -335,11 +330,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 continue
             side_parameters[:] = dict.fromkeys(side_parameters)
 
-    def get_next_control_output(self) -> Parameter | None:
-        # The exit port, stated outright: control_in also allows OUTPUT for its internal leg, so the
-        # base's first-control-output scan would hand back the entry port.
-        return self.control_out
-
     def _register_side_parameter(self, metadata_key: str, parameter_name: str) -> None:
         """Record that a parameter belongs on the group's left or right rail.
 
@@ -395,9 +385,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         Returns:
             The newly created proxy parameter
         """
-        # A control wire crossing the boundary is carried by the group's own entry or exit port: the
-        # executor continues from control_out after the group runs, so a separate proxy would leave
-        # whatever is wired downstream unreached, and it would draw as a second Flow In / Flow Out.
+        # A control wire crossing the boundary moves onto the group's own entry or exit port: the
+        # executor enters the group through control_in and continues from control_out, so a separate
+        # proxy would leave whatever is wired downstream unreached, and it would draw as a second
+        # Flow In / Flow Out. The wire then belongs to the group (see create_connections_for_proxy).
         if isinstance(original_param, ControlParameter):
             return self.control_in if is_incoming else self.control_out
 
@@ -500,14 +491,17 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             target_node_name=old_connection.target_node.name,
             is_node_group_internal=is_incoming,
         )
+        # The group's own control port only gets the outer leg: a group is entered and left as a whole,
+        # so there is no per-member inner leg to carry, and the wire stays with the group on ungroup.
+        if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
+            self._handle_request_in_workflow(create_first_connection if is_incoming else create_second_connection)
+            return
         # Store the mapping from proxy parameter to original node/parameter
         # only increment by 1, even though we're making two connections.
-        # The group's own control ports are not proxies to be removed once their last wire goes.
-        if proxy_parameter.user_defined:
-            if proxy_parameter.name not in self._proxy_param_to_connections:
-                self._proxy_param_to_connections[proxy_parameter.name] = 2
-            else:
-                self._proxy_param_to_connections[proxy_parameter.name] += 2
+        if proxy_parameter.name not in self._proxy_param_to_connections:
+            self._proxy_param_to_connections[proxy_parameter.name] = 2
+        else:
+            self._proxy_param_to_connections[proxy_parameter.name] += 2
         self._handle_request_in_workflow(create_first_connection)
         self._handle_request_in_workflow(create_second_connection)
 
@@ -1301,13 +1295,16 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             is_node_group_internal=is_incoming,
         )
 
-        # Track connections for cleanup. The group's own control ports are not proxies to be removed
-        # once their last wire goes.
-        if proxy_parameter.user_defined:
-            if proxy_parameter.name not in self._proxy_param_to_connections:
-                self._proxy_param_to_connections[proxy_parameter.name] = 2
-            else:
-                self._proxy_param_to_connections[proxy_parameter.name] += 2
+        # The group's own control port only gets the outer leg: a group is entered and left as a whole,
+        # so there is no per-member inner leg to carry, and the wire stays with the group on ungroup.
+        if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
+            self._handle_request_in_workflow(create_first_connection if is_incoming else create_second_connection)
+            return
+        # Track connections for cleanup
+        if proxy_parameter.name not in self._proxy_param_to_connections:
+            self._proxy_param_to_connections[proxy_parameter.name] = 2
+        else:
+            self._proxy_param_to_connections[proxy_parameter.name] += 2
 
         self._handle_request_in_workflow(create_first_connection)
         self._handle_request_in_workflow(create_second_connection)

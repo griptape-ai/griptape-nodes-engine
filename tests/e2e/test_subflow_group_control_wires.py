@@ -24,6 +24,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    AddNodesToNodeGroupRequest,
+    AddNodesToNodeGroupResultSuccess,
     CreateNodeRequest,
     CreateNodeResultSuccess,
     RemoveNodeFromNodeGroupRequest,
@@ -107,18 +109,14 @@ def _build_grouped_chain(engine: Engine) -> None:
 
 @pytest.mark.skipif(not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(), reason="subflow fixture library missing")
 class TestGroupingAControlChain:
-    def test_control_wires_land_on_the_groups_own_ports(self, engine: Engine, flow: str) -> None:
-        """No proxy is minted for a control wire; the group's own pair carries both legs."""
+    def test_control_wires_move_onto_the_groups_own_ports(self, engine: Engine, flow: str) -> None:
+        """No proxy is minted and no inner leg is kept: the wires now belong to the group."""
         _ = flow
         _build_grouped_chain(engine)
 
         assert _control_ports(engine, "G") == ["group_exec_in", "group_exec_out"]
-        assert _edges(engine, "G") == {
-            "Up.exec_out->G.group_exec_in",
-            "G.group_exec_in->Child.exec_in",
-            "Child.exec_out->G.group_exec_out",
-            "G.group_exec_out->Down.exec_in",
-        }
+        assert _edges(engine, "G") == {"Up.exec_out->G.group_exec_in", "G.group_exec_out->Down.exec_in"}
+        assert not {e for e in _edges(engine, "Child") if "exec_" in e}
 
     @pytest.mark.asyncio
     async def test_the_node_after_the_group_runs(self, engine: Engine, flow: str) -> None:
@@ -131,12 +129,25 @@ class TestGroupingAControlChain:
         assert engine.node_manager.get_node_by_name("Child").state == NodeResolutionState.RESOLVED
         assert engine.node_manager.get_node_by_name("Down").state == NodeResolutionState.RESOLVED
 
-    def test_ungrouping_restores_the_chain_and_keeps_the_ports(self, engine: Engine, flow: str) -> None:
+    def test_ungrouping_leaves_the_control_wires_with_the_group(self, engine: Engine, flow: str) -> None:
+        """A group is entered and left as a whole, so its wires are its own; the member leaves unwired."""
         _ = flow
         _build_grouped_chain(engine)
 
         result = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Child"], node_group_name="G"))
         assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess), result
 
-        assert {"Up.exec_out->Child.exec_in", "Child.exec_out->Down.exec_in"} <= _edges(engine, "Child")
+        assert _edges(engine, "G") == {"Up.exec_out->G.group_exec_in", "G.group_exec_out->Down.exec_in"}
+        assert not {e for e in _edges(engine, "Child") if "exec_" in e}
+        assert _control_ports(engine, "G") == ["group_exec_in", "group_exec_out"]
+
+    def test_grouping_the_node_the_exit_port_feeds_drops_that_wire(self, engine: Engine, flow: str) -> None:
+        """A group's exit cannot point into its own member, so that wire goes when the node joins."""
+        _ = flow
+        _build_grouped_chain(engine)
+
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Down"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        assert _edges(engine, "G") == {"Up.exec_out->G.group_exec_in"}
         assert _control_ports(engine, "G") == ["group_exec_in", "group_exec_out"]
