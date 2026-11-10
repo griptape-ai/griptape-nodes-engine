@@ -6,9 +6,12 @@ from unittest import mock
 import pytest
 
 from griptape_nodes.common.project_templates import situation
+from griptape_nodes.exe_types.core_types import ParameterGroup
 from griptape_nodes.exe_types.param_components import project_directory_parameter
+from griptape_nodes.exe_types.param_components.project_directory_parameter import ProjectDirectoryParameter
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
+from tests.unit.exe_types.mocks import MockNode
 
 HANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.handle_request"
 
@@ -216,3 +219,43 @@ class TestBuildDirectoryDestinationFromSituation:
             )
 
         assert isinstance(dest, directory_mod.DirectoryDestination)
+
+
+class TestAddParameterGrouping:
+    """Tests that add_parameter() respects a group constructed around it."""
+
+    def test_built_inside_a_group_lands_in_that_group(self) -> None:
+        node = MockNode(name="Saver")
+
+        with ParameterGroup(name="dir_settings") as group:
+            param = ProjectDirectoryParameter(node, "output_dir", default_dirname="renders")
+            param.add_parameter()
+        node.add_node_element(group)
+
+        parameter = node.get_parameter_by_name("output_dir")
+        assert parameter is not None
+        assert parameter.parent_element_name == "dir_settings"
+        assert parameter in group.children
+
+    def test_built_inside_a_group_is_settable_and_gettable(self) -> None:
+        node = MockNode(name="Saver")
+
+        with ParameterGroup(name="dir_settings") as group:
+            param = ProjectDirectoryParameter(node, "output_dir", default_dirname="renders")
+            param.add_parameter()
+        node.add_node_element(group)
+
+        node.set_parameter_value("output_dir", "frames")
+
+        assert node.get_parameter_value("output_dir") == "frames"
+
+    def test_built_outside_a_group_lands_at_root_as_before(self) -> None:
+        node = MockNode(name="Saver")
+
+        param = ProjectDirectoryParameter(node, "output_dir", default_dirname="renders")
+        param.add_parameter()
+
+        parameter = node.get_parameter_by_name("output_dir")
+        assert parameter is not None
+        assert parameter.parent_element_name is None
+        assert parameter in node.root_ui_element.children

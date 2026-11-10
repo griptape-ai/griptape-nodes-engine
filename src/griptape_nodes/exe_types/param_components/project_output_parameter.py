@@ -122,7 +122,11 @@ class ProjectOutputParameter(abc.ABC):
         )
         parameter.on_incoming_connection_removed.append(self._reset_to_default)
 
-        self._node.add_parameter(parameter)
+        # Built inside a `with ParameterGroup(...)` block, the parameter is already in that group,
+        # which isn't on the node yet; add_parameter() can't find the group and would move the
+        # parameter to the root. The caller's add_node_element(group) registers it instead.
+        if parameter.parent_element_name is None:
+            self._node.add_parameter(parameter)
 
     def _reset_to_default(
         self,

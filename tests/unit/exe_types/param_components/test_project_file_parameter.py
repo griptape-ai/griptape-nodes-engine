@@ -6,11 +6,13 @@ from unittest import mock
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.exe_types.core_types import ParameterGroup
 from griptape_nodes.exe_types.param_components.project_file_parameter import ProjectFileParameter
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events import destination_events
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from tests.unit.exe_types.mocks import MockNode
 
 _SPEC = destination_events.FileDestinationSpec(
     file_path=MacroPath(ParsedMacro("{outputs}/{name}.png"), {"name": "render"}),
@@ -61,3 +63,43 @@ class TestBuildFileFromConnectedSettings:
 
         with pytest.raises(ValueError, match="has no destination set"):
             param.build_file()
+
+
+class TestAddParameterGrouping:
+    """Tests that add_parameter() respects a group constructed around it."""
+
+    def test_built_inside_a_group_lands_in_that_group(self) -> None:
+        node = MockNode(name="Saver")
+
+        with ParameterGroup(name="file_settings") as group:
+            param = ProjectFileParameter(node, "output_file", default_filename="default.png")
+            param.add_parameter()
+        node.add_node_element(group)
+
+        parameter = node.get_parameter_by_name("output_file")
+        assert parameter is not None
+        assert parameter.parent_element_name == "file_settings"
+        assert parameter in group.children
+
+    def test_built_inside_a_group_is_settable_and_gettable(self) -> None:
+        node = MockNode(name="Saver")
+
+        with ParameterGroup(name="file_settings") as group:
+            param = ProjectFileParameter(node, "output_file", default_filename="default.png")
+            param.add_parameter()
+        node.add_node_element(group)
+
+        node.set_parameter_value("output_file", "render.png")
+
+        assert node.get_parameter_value("output_file") == "render.png"
+
+    def test_built_outside_a_group_lands_at_root_as_before(self) -> None:
+        node = MockNode(name="Saver")
+
+        param = ProjectFileParameter(node, "output_file", default_filename="default.png")
+        param.add_parameter()
+
+        parameter = node.get_parameter_by_name("output_file")
+        assert parameter is not None
+        assert parameter.parent_element_name is None
+        assert parameter in node.root_ui_element.children
