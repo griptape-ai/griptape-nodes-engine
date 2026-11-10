@@ -153,8 +153,7 @@ def _register(engine: Engine, calls: _Calls, scope: RequestScope, request_type: 
 
 
 def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntime:
-    engine.context_manager.push_workflow(workflow_name=display_name)
-    return engine.open_workflows.get(engine.context_manager.get_current_workflow_id())
+    return engine.context_manager.open_workflow(workflow_name=display_name)
 
 
 def _open_two(engine: Engine) -> list[WorkflowRuntime]:

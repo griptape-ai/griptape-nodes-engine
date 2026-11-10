@@ -3,5 +3,5 @@
   `CancelAllRunsRequest`, `ListRunsRequest` and `GetWorkflowContextRequest`, fail with
   `WorkflowNotNamedResultFailure` instead of answering as if the workflow were empty. The editor,
   `gtn request`, saved workflow files, `EnsureWorkflowAndFlowRequest` and the `GriptapeNodes`
-  classmethods still use the only open workflow.
+  classmethods still use the only open workflow; a `GriptapeNodes()` instance does not.
   [#6235](https://github.com/griptape-ai/griptape-nodes-engine/issues/6235)
