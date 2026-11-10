@@ -2641,6 +2641,7 @@ class TestDescribeNodeTypeRequest:
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         assert result.library == self._LIBRARY_NAME
         assert result.node_type == _DescribeNodeTypeProbe.__name__
+        assert result.metadata is not None
         assert result.metadata.display_name == "Probe"
 
         by_name = {param.name: param for param in result.parameters}
@@ -2744,6 +2745,7 @@ class TestDescribeNodeTypeRequest:
 
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         # Library-level metadata still surfaces so callers can at least show the node.
+        assert result.metadata is not None
         assert result.metadata.display_name == "Raising Probe"
         # Parameters are empty because the probe failed before they could be declared.
         assert result.parameters == []
