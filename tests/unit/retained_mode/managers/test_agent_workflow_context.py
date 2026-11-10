@@ -37,7 +37,6 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _render_node_types,
     _WorkflowContext,
 )
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -240,7 +239,6 @@ class TestWorkflowContext:
     async def test_the_handed_workflow_is_described_not_another_open_one(
         self, engine: Engine, chat_manager: AgentManager
     ) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         described = engine.open_workflow(engine.workflow_registry.register_unsaved("described").workflow_id)
         engine.open_workflow(engine.workflow_registry.register_unsaved("beside").workflow_id)
         flow = described.handle_request(

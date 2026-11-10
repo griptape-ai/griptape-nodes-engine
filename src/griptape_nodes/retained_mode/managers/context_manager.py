@@ -84,13 +84,6 @@ class ContextManager(EngineScoped):
     class RequestedWorkflowNotFoundError(OpenRefusedError):
         """An open named an id or name that no registered workflow has."""
 
-    class AnotherWorkflowOpenError(OpenRefusedError):
-        """An open was refused because another workflow is open and only one may be."""
-
-        def __init__(self, message: str, open_workflow: WorkflowRuntime) -> None:
-            super().__init__(message)
-            self.open_workflow = open_workflow
-
     class WorkflowContext:
         """A context manager for a Workflow."""
 
@@ -260,13 +253,11 @@ class ContextManager(EngineScoped):
             OpenRefusedError: The workflow was named more than one way, `working_directory` names
                 a file, or `file_path` could not be registered.
             RequestedWorkflowNotFoundError: No registered workflow has `workflow_id` or `workflow_name`.
-            AnotherWorkflowOpenError: Another workflow is open and only one may be.
         """
         named = [name for name in (workflow_id, workflow_name, file_path) if name is not None]
         if len(named) > 1:
             msg = "Attempted to open a workflow. Failed because the request named it more than one way. Give its id or its name, not both."
             raise self.OpenRefusedError(msg)
-        registry = self.engine.workflow_registry
         entry = self._find_requested_workflow(workflow_id, workflow_name, file_path)
         if entry is not None:
             already_open = self.engine.open_workflows.find(entry.workflow_id)
@@ -275,18 +266,6 @@ class ContextManager(EngineScoped):
                 return
 
         normalized_directory = self._normalize_working_directory(working_directory)
-
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if blocking is not None:
-            label = file_path or display_name or "Untitled"
-            if entry is not None:
-                label = entry.name
-            msg = (
-                f"Attempted to open workflow '{label}'. Failed because workflow "
-                f"'{registry.get(blocking.workflow_id).name}' is open and only one workflow can be open at a time. "
-                "Close it first."
-            )
-            raise self.AnotherWorkflowOpenError(msg, blocking)
 
         if entry is None:
             entry = self._register_requested_workflow(file_path, display_name)
@@ -749,8 +728,8 @@ class ContextManager(EngineScoped):
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
-        workflow is refused, and so is a push the open workflows have no room for. Opening binds
-        nothing: work that builds into the opened workflow binds it (`Engine.bind_workflow`).
+        workflow is refused. Opening binds nothing: work that builds into the opened workflow binds
+        it (`Engine.bind_workflow`).
 
         A library-provided workflow opens as a new unsaved copy of itself
         (`register_unsaved_copy`), so every open, a script's own included, leaves the library's
@@ -775,8 +754,7 @@ class ContextManager(EngineScoped):
 
         Raises:
             ValueError: If neither or both of workflow_name and file_path are provided.
-            WorkflowAlreadyOpenError: If the current work is bound to a live workflow, or another
-                workflow is open and only one may be.
+            WorkflowAlreadyOpenError: If the current work is bound to a live workflow.
         """
         entry = self._entry_to_open(workflow_name, file_path=file_path, working_directory=working_directory)
         return self.engine.open_workflow(entry.workflow_id)
@@ -795,8 +773,6 @@ class ContextManager(EngineScoped):
             msg = "Provide either workflow_name or file_path, not both."
             raise ValueError(msg)
         blocking = self.engine.bound_live_workflow_or_none()
-        if blocking is None:
-            blocking = self.engine.open_workflows.workflow_blocking_open()
         if blocking is not None:
             msg = (
                 f"Attempted to open workflow '{workflow_name or file_path}'. Failed because workflow "

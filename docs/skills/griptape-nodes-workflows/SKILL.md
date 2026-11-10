@@ -9,7 +9,7 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Only ONE can be active at a time. Reset with `ClearAllObjectStateRequest`.
+- **Workflow**: Top-level namespace. Several can be open at once. `ClearAllObjectStateRequest` closes them all.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
@@ -408,11 +408,11 @@ The slot name is engine-generated and only known after the add returns, so the
 an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
 `parameter_name`, then batch the connects/sets in the next.
 
-### Only one workflow in context at a time
+### Several workflows can be open
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` first — this wipes
-EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today.
+`SetWorkflowContextRequest` opens a workflow beside the ones already open.
+`ClearAllObjectStateRequest(i_know_what_im_doing=True)` closes every workflow, other
+clients' included.
 
 ### Agents cannot be interrupted mid-run
 

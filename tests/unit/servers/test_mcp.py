@@ -16,7 +16,6 @@ from starlette.requests import Request
 
 from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
@@ -706,7 +705,7 @@ class TestToolCallWorkflow:
 
     @pytest.fixture
     def two_open(self, engine: Engine) -> tuple[WorkflowRuntime, WorkflowRuntime]:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+
         opened = []
         for name in ("first", "second"):
             entry = engine.workflow_registry.register_unsaved(name, listed=False)

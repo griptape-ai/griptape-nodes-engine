@@ -27,7 +27,6 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.events.workflow_events import DeleteWorkflowRequest
 from griptape_nodes.retained_mode.managers.resource_manager import LocalObjectEntry
 from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 _SECOND_READ_TIMEOUT_SECONDS = 0.25
 
@@ -494,7 +493,6 @@ class TestWorkflowStateClearReleasesObjects:
         assert manager.drop_all_local_objects() == 0
 
     def test_closing_one_of_two_open_workflows_releases_only_its_objects(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         manager = engine.resource_manager
         released: list[str] = []
         registry = engine.workflow_registry

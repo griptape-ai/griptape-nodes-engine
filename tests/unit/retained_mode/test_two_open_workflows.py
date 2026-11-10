@@ -1,9 +1,8 @@
 """Two workflows open in one engine at once, driven through dispatch with envelope workflow ids.
 
-Not a feature test: the engine opens one workflow at a time. Each test drives the foundation with a
-second workflow open next to the first (`OpenWorkflowSet(engine, allow_several_open=True)`, a test seam), to
-check that each workflow's state and teardown stay its own. A gap later work closes is a strict xfail
-with the gap as its reason.
+Each test opens a second workflow next to the first, to check that each workflow's state and
+teardown stay its own. A gap later work closes is a strict
+xfail with the gap as its reason.
 """
 
 from __future__ import annotations
@@ -130,7 +129,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotNamedError, bound_workflow
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
@@ -261,11 +259,6 @@ def spike_library() -> Iterator[None]:
         LibraryRegistry._clear()
 
 
-def _allow_several_open(engine: Engine) -> None:
-    """Swap in an open set that lets a second workflow open next to the first (the spike's one switch)."""
-    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
-
-
 def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
     """Open a new unsaved workflow next to whatever is open, as an editor tab would."""
     workflow = engine.workflow_registry.register_unsaved(display_name, listed=False)
@@ -338,9 +331,11 @@ async def _start_parked_run(engine: Engine, workflow: WorkflowRuntime, node: str
 
 
 @pytest.fixture
-def two_open(engine: Engine, spike_library: None) -> tuple[WorkflowRuntime, WorkflowRuntime]:  # noqa: ARG001
+def two_open(
+    engine: Engine,
+    spike_library: None,  # noqa: ARG001
+) -> tuple[WorkflowRuntime, WorkflowRuntime]:
     """Workflows A and B open at once, each with a top-level flow named "canvas"."""
-    _allow_several_open(engine)
     a = _open(engine, "A")
     b = _open(engine, "B")
     _make_canvas(engine, a)
@@ -1225,7 +1220,7 @@ def _use_default_project(engine: Engine, workspace: Path) -> None:
 
 @pytest.fixture
 def saved_workflow_name(engine: Engine, spike_library: None, tmp_path: Path) -> Iterator[str]:  # noqa: ARG001
-    """A saved workflow file in a fresh workspace, saved and closed while only one workflow could be open."""
+    """A saved workflow file in a fresh workspace, saved and closed before the test opens any workflow."""
     workspace = tmp_path.resolve() / "workspace"
     workspace.mkdir()
     _use_default_project(engine, workspace)
@@ -1247,7 +1242,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
         """A load that names no workflow to replace must not close any tab's workflow."""
-        _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
         request: RequestPayload = RunWorkflowFromRegistryRequest(
@@ -1270,7 +1264,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
         """A tab whose workflow closed can still open another; opens never read the envelope."""
-        _allow_several_open(engine)
         a = _open(engine, "A")
         closed = _open(engine, "closed")
         _send(engine, CloseWorkflowRequest(workflow_id=closed.workflow_id), None)
@@ -1291,7 +1284,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
     def test_loading_a_workflow_that_is_already_open_fails_with_a_registry_failure(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
-        _allow_several_open(engine)
         a = _open(engine, "A")
 
         async def load_unbound() -> ResultPayload:
@@ -1312,7 +1304,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert a in open_before
 
     def test_loading_a_saved_file_into_a_new_tab_leaves_a_alone(self, engine: Engine, saved_workflow_name: str) -> None:
-        _allow_several_open(engine)
         a = _open(engine, "A")
         _make_canvas(engine, a)
 
@@ -1337,7 +1328,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
     ) -> None:
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
         assert file_path is not None
-        _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
         _make_canvas(engine, a)
@@ -1356,7 +1346,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         """Post-dispatch hooks act on the workflow the file opened, not one already open."""
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
         assert file_path is not None
-        _allow_several_open(engine)
         _open(engine, "A")
         _open(engine, "B")
         bound_in_hook: list[object] = []
@@ -1379,7 +1368,6 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
     ) -> None:
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
         assert file_path is not None
-        _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
         _make_canvas(engine, a)
