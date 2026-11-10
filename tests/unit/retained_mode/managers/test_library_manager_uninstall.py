@@ -373,18 +373,46 @@ class TestDirectoryEntryWithSiblings:
         result = await _uninstall_after_preview(engine, "Library A", manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
-        expected_collateral_count = 2  # Library B + the broken manifest's path
-        assert "Library B" in result.collateral_library_names
-        assert len(result.collateral_library_names) == expected_collateral_count
-        # A shared entry is left in config, and its directory is NOT deleted: removing either
-        # would un-register the siblings still living under it.
+        # Only Library A's own folder goes. The scan root, its config entry, and the siblings
+        # living in their own folders under it are all left alone.
+        assert result.directory_deleted is True
+        assert not await anyio.Path(libs_root / "lib_a").exists()
+        assert await anyio.Path(libs_root / "lib_b").exists()
+        assert await anyio.Path(libs_root / "lib_c").exists()
+        assert result.collateral_library_names == []
         assert result.config_entry_removed is False
-        assert result.directory_deleted is False
-        assert await anyio.Path(libs_root).exists()
         assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == [str(libs_root)]
         [remaining] = [e for e in result.remaining_registrations if isinstance(e, SharedDirectoryEntryRemaining)]
         assert remaining.entry_path == str(libs_root)
-        assert remaining.library_names == ["Library B"]
+        # The entry registers every manifest under it, so the broken one counts too; with no
+        # readable name it is reported by path.
+        assert "Library B" in remaining.library_names
+        assert str(libs_root / "lib_c" / "griptape_nodes_library.json") in remaining.library_names
+
+    @pytest.mark.asyncio
+    async def test_the_only_library_under_the_entry_reports_nothing_remaining(
+        self, engine: Engine, workspace: Path
+    ) -> None:
+        """A scan root holding one library: no sibling to name, so no shared-entry verdict.
+
+        The entry stays in config -- it is a scan root that may hold libraries again later --
+        but with nothing left registering this library, the editor shows a clean uninstall
+        rather than a sentence naming an empty list of siblings.
+        """
+        libs_root = workspace / "libs"
+        manifest = _write_manifest(libs_root / "lib_a", "Library A")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(libs_root)])
+        _track(engine.library_manager, manifest, library_name="Library A", registered_path=str(libs_root))
+
+        result = await _uninstall_after_preview(engine, "Library A", manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.remaining_registrations == []
+        assert result.directory_deleted is True
+        assert not await anyio.Path(libs_root / "lib_a").exists()
+        # The scan root itself survives, as does the entry naming it.
+        assert await anyio.Path(libs_root).exists()
+        assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == [str(libs_root)]
 
     @pytest.mark.asyncio
     async def test_preview_reports_the_same_collateral_as_uninstall(self, engine: Engine, workspace: Path) -> None:
@@ -396,7 +424,9 @@ class TestDirectoryEntryWithSiblings:
 
         preview = await _preview(engine, "Library A", manifest)
 
-        assert preview.collateral_library_names == ["Library B"]
+        # The sibling lives in its own folder beside the target, so it is not collateral.
+        assert preview.install_directory == str(libs_root / "lib_a")
+        assert preview.collateral_library_names == []
         assert any(isinstance(e, SharedDirectoryEntryRemaining) for e in preview.remaining_registrations)
 
 

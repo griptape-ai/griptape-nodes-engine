@@ -221,7 +221,7 @@ class LibraryUninstall(EngineScoped):
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
         """Step 3 (most destructive): delete the install directory, or treat its absence as success."""
-        if resolved.install_directory is None or _has_shared_directory_entry(resolved.remaining_registrations):
+        if resolved.install_directory is None:
             return False, None
         if not await anyio.Path(resolved.install_directory).exists():
             # Already gone is success -- the goal (no install on disk) is met.
@@ -329,7 +329,7 @@ class LibraryUninstall(EngineScoped):
         collateral_library_names = await self._collect_collateral_library_names(
             install_directory, exclude_manifest=resolved_library_path
         )
-        remaining_registrations = self._remaining_registrations_for(
+        remaining_registrations = await self._remaining_registrations_for(
             classification, exclude_manifest=resolved_library_path
         )
 
@@ -343,7 +343,7 @@ class LibraryUninstall(EngineScoped):
             remaining_registrations=remaining_registrations,
         )
 
-    def _remaining_registrations_for(
+    async def _remaining_registrations_for(
         self, classification: _Classification, *, exclude_manifest: Path
     ) -> list[RemainingRegistration]:
         """What would still register this library once its files are gone."""
@@ -353,12 +353,14 @@ class LibraryUninstall(EngineScoped):
             return [UnmatchedEntryRemaining()]
 
         if classification.registered_in == "register" and classification.is_directory_entry:
-            remaining.append(
-                SharedDirectoryEntryRemaining(
-                    entry_path=classification.registered_path or "",
-                    library_names=self._sibling_library_names(classification, exclude_manifest=exclude_manifest),
+            sibling_names = await self._sibling_library_names(classification, exclude_manifest=exclude_manifest)
+            if sibling_names:
+                remaining.append(
+                    SharedDirectoryEntryRemaining(
+                        entry_path=classification.registered_path or "",
+                        library_names=sibling_names,
+                    )
                 )
-            )
 
         if classification.registered_in == "download" and classification.download is not None:
             remaining.append(DownloadEntryRemaining(git_url=classification.download.git_url))
@@ -369,22 +371,17 @@ class LibraryUninstall(EngineScoped):
 
         return remaining
 
-    def _sibling_library_names(self, classification: _Classification, *, exclude_manifest: Path) -> list[str]:
-        """The OTHER libraries a shared directory entry registers, by name where one is known."""
+    async def _sibling_library_names(self, classification: _Classification, *, exclude_manifest: Path) -> list[str]:
+        """The OTHER libraries a shared directory entry registers, by name where one is known.
+
+        Read from the directory rather than from what is tracked: the entry registers every
+        manifest under it, including one that failed to parse or that discovery never reached.
+        """
         if classification.directory_path is None:
             return []
-        directory_identity = canonicalize_for_identity(classification.directory_path)
-        exclude_identity = canonicalize_for_identity(exclude_manifest)
-        names: list[str] = []
-        library_manager = self.engine.library_manager
-        for manifest_path in library_manager.get_libraries_attempted_to_load():
-            library_info = library_manager.get_library_info_for_attempted_load(manifest_path)
-            manifest_identity = canonicalize_for_identity(library_info.library_path)
-            if manifest_identity == exclude_identity or not manifest_identity.is_relative_to(directory_identity):
-                continue
-            if library_info.library_name is not None:
-                names.append(library_info.library_name)
-        return sorted(set(names))
+        return await self._collect_collateral_library_names(
+            classification.directory_path, exclude_manifest=exclude_manifest
+        )
 
     def _shadowed_config_source(self, classification: _Classification) -> ConfigValueSource | None:
         """The layer supplying this entry's config list, when the engine cannot write that layer."""
@@ -414,12 +411,10 @@ class LibraryUninstall(EngineScoped):
 
     def _install_directory_for(self, classification: _Classification, resolved_library_path: Path) -> Path:
         """The folder an uninstall would delete for this classification."""
-        if (
-            classification.registered_in == "register"
-            and classification.is_directory_entry
-            and classification.directory_path is not None
-        ):
-            return classification.directory_path
+        # A directory entry is a scan root that may hold several libraries, so only this
+        # library's own folder is deleted; the root itself stays, as does its config entry.
+        if classification.registered_in == "register" and classification.is_directory_entry:
+            return resolved_library_path.parent
         if classification.registered_in == "download" and classification.download is not None:
             if classification.download.name is not None:
                 return resolved_library_path.parent
@@ -559,10 +554,6 @@ class LibraryUninstall(EngineScoped):
                 continue
             names.append(_read_raw_library_name(manifest_path) or str(manifest_path))
         return names
-
-
-def _has_shared_directory_entry(remaining: list[RemainingRegistration]) -> bool:
-    return any(isinstance(entry, SharedDirectoryEntryRemaining) for entry in remaining)
 
 
 def _read_raw_library_name(manifest_path: Path) -> str | None:
