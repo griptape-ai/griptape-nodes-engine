@@ -134,15 +134,9 @@ async def _preview(engine: Engine, library_name: str, manifest: Path) -> Preview
 
 
 async def _uninstall_after_preview(engine: Engine, library_name: str, manifest: Path):  # noqa: ANN202 (either result shape)
-    """Preview then uninstall with the fingerprint the preview returned, as the editor does."""
-    preview = await _preview(engine, library_name, manifest)
-    return await engine.ahandle_request(
-        UninstallLibraryRequest(
-            library_name=library_name,
-            library_path=str(manifest),
-            resolution_fingerprint=preview.resolution_fingerprint,
-        )
-    )
+    """Preview then uninstall, as the editor does."""
+    await _preview(engine, library_name, manifest)
+    return await engine.ahandle_request(UninstallLibraryRequest(library_name=library_name, library_path=str(manifest)))
 
 
 @pytest.fixture(autouse=True)
@@ -173,7 +167,6 @@ class TestResolutionNotFound:
             UninstallLibraryRequest(
                 library_name="Nope",
                 library_path=str(workspace / "nope" / "griptape_nodes_library.json"),
-                resolution_fingerprint="whatever",
             )
         )
 
@@ -304,7 +297,6 @@ class TestManifestEntry:
         assert preview.registered_in == "register"
         assert preview.blocked_by is None
         assert preview.remaining_registrations == []
-        assert preview.resolution_fingerprint
 
     @pytest.mark.asyncio
     async def test_uninstall_removes_config_entry_unloads_and_deletes(self, engine: Engine, workspace: Path) -> None:
@@ -629,17 +621,12 @@ class TestAlreadyDeletedFolder:
         manifest = _write_manifest(library_dir, "Gone Library")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Gone Library", registered_path=str(manifest))
-        preview = await _preview(engine, "Gone Library", manifest)
-        # The user deletes the folder by hand while the confirmation is open. The fingerprint
-        # still matches: nothing it covers changed (the entry, the target, the collateral list).
+        await _preview(engine, "Gone Library", manifest)
+        # The user deletes the folder by hand while the confirmation is open.
         shutil.rmtree(library_dir)
 
         result = await engine.ahandle_request(
-            UninstallLibraryRequest(
-                library_name="Gone Library",
-                library_path=str(manifest),
-                resolution_fingerprint=preview.resolution_fingerprint,
-            )
+            UninstallLibraryRequest(library_name="Gone Library", library_path=str(manifest))
         )
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
@@ -647,91 +634,20 @@ class TestAlreadyDeletedFolder:
         assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == []
 
 
-class TestResolutionFingerprint:
-    """The fingerprint closes the window between the preview and the click."""
-
+class TestRepeatedUninstall:
     @pytest.mark.asyncio
-    async def test_preview_and_uninstall_agree_when_nothing_changed(self, engine: Engine, workspace: Path) -> None:
-        manifest = _write_manifest(workspace / "libs" / "stable", "Stable Library")
-        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
-        _track(engine.library_manager, manifest, library_name="Stable Library", registered_path=str(manifest))
-
-        result = await _uninstall_after_preview(engine, "Stable Library", manifest)
-
-        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
-
-    @pytest.mark.asyncio
-    async def test_a_stale_fingerprint_changes_nothing(self, engine: Engine, workspace: Path) -> None:
-        library_dir = workspace / "libs" / "moving"
-        manifest = _write_manifest(library_dir, "Moving Library")
-        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
-        _track(engine.library_manager, manifest, library_name="Moving Library", registered_path=str(manifest))
-
-        result = await engine.ahandle_request(
-            UninstallLibraryRequest(
-                library_name="Moving Library",
-                library_path=str(manifest),
-                resolution_fingerprint="not-the-fingerprint-you-were-shown",
-            )
-        )
-
-        assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "stale_resolution"
-        assert await anyio.Path(library_dir).exists()
-        assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == [str(manifest)]
-
-    @pytest.mark.asyncio
-    async def test_a_sibling_appearing_after_the_preview_goes_stale(self, engine: Engine, workspace: Path) -> None:
-        """A new library under the target folder changes what the delete takes with it."""
-        libs_root = workspace / "libs" / "bundle"
-        manifest = _write_manifest(libs_root, "Bundle Library")
-        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
-        _track(engine.library_manager, manifest, library_name="Bundle Library", registered_path=str(manifest))
-        preview = await _preview(engine, "Bundle Library", manifest)
-        assert preview.collateral_library_names == []
-
-        # Something installs a second library inside the folder the user agreed to delete.
-        _write_manifest(libs_root / "nested", "Nested Library")
-
-        result = await engine.ahandle_request(
-            UninstallLibraryRequest(
-                library_name="Bundle Library",
-                library_path=str(manifest),
-                resolution_fingerprint=preview.resolution_fingerprint,
-            )
-        )
-
-        assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "stale_resolution"
-        assert await anyio.Path(libs_root / "nested").exists()
-
-    @pytest.mark.asyncio
-    async def test_a_second_uninstall_with_the_same_fingerprint_is_refused(
-        self, engine: Engine, workspace: Path
-    ) -> None:
-        """A double-click cannot run the delete twice against a world the first one changed."""
+    async def test_a_second_uninstall_finds_nothing_left(self, engine: Engine, workspace: Path) -> None:
+        """A double-click cannot run the delete twice: the first one untracks the library."""
         manifest = _write_manifest(workspace / "libs" / "once", "Once Library")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Once Library", registered_path=str(manifest))
-        preview = await _preview(engine, "Once Library", manifest)
 
-        first = await engine.ahandle_request(
-            UninstallLibraryRequest(
-                library_name="Once Library",
-                library_path=str(manifest),
-                resolution_fingerprint=preview.resolution_fingerprint,
-            )
-        )
+        first = await _uninstall_after_preview(engine, "Once Library", manifest)
         second = await engine.ahandle_request(
-            UninstallLibraryRequest(
-                library_name="Once Library",
-                library_path=str(manifest),
-                resolution_fingerprint=preview.resolution_fingerprint,
-            )
+            UninstallLibraryRequest(library_name="Once Library", library_path=str(manifest))
         )
 
         assert isinstance(first, UninstallLibraryResultSuccess), first.result_details
-        # The library is no longer tracked, so the second resolves to nothing at all.
         assert isinstance(second, UninstallLibraryResultFailure)
         assert second.failure_reason == "not_found"
 
@@ -746,24 +662,9 @@ class TestConcurrentUninstalls:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest_a), str(manifest_b)])
         _track(engine.library_manager, manifest_a, library_name="Library A", registered_path=str(manifest_a))
         _track(engine.library_manager, manifest_b, library_name="Library B", registered_path=str(manifest_b))
-        preview_a = await _preview(engine, "Library A", manifest_a)
-        preview_b = await _preview(engine, "Library B", manifest_b)
-
         results = await asyncio.gather(
-            engine.ahandle_request(
-                UninstallLibraryRequest(
-                    library_name="Library A",
-                    library_path=str(manifest_a),
-                    resolution_fingerprint=preview_a.resolution_fingerprint,
-                )
-            ),
-            engine.ahandle_request(
-                UninstallLibraryRequest(
-                    library_name="Library B",
-                    library_path=str(manifest_b),
-                    resolution_fingerprint=preview_b.resolution_fingerprint,
-                )
-            ),
+            engine.ahandle_request(UninstallLibraryRequest(library_name="Library A", library_path=str(manifest_a))),
+            engine.ahandle_request(UninstallLibraryRequest(library_name="Library B", library_path=str(manifest_b))),
         )
 
         for result in results:
@@ -792,7 +693,6 @@ class TestStructuredVerdictsAreWireReady:
         payload = PreviewUninstallLibraryResultSuccess(
             library_name="Comp",
             library_path="/libs/comp/griptape_nodes_library.json",
-            resolution_fingerprint="abc123",
             install_directory="/libs/comp",
             registered_path="/libs",
             registered_in="register",
@@ -816,7 +716,6 @@ class TestStructuredVerdictsAreWireReady:
             {"kind": "download_entry", "git_url": "https://github.com/o/r"},
             {"kind": "unmatched_entry"},
         ]
-        assert wire["resolution_fingerprint"] == "abc123"
 
     def test_an_absent_blocker_serializes_as_null(self) -> None:
         from cattrs.preconf.json import make_converter
@@ -828,7 +727,6 @@ class TestStructuredVerdictsAreWireReady:
         payload = PreviewUninstallLibraryResultSuccess(
             library_name="Comp",
             library_path="/libs/comp/griptape_nodes_library.json",
-            resolution_fingerprint="abc123",
             install_directory="/libs/comp",
             registered_path=None,
             registered_in=None,

@@ -1,25 +1,12 @@
 """Uninstalling a library: removing its config entry, unloading it, and deleting its folder.
 
-Target selection, classification (which config array registered it, whether a directory entry
-is shared with siblings, whether a higher config layer still supplies it, whether a path is safe
-to delete) all live here rather than in the editor, because the browser cannot resolve a relative
-`libraries_to_register` entry, follow a symlink, see a library whose manifest failed to parse, or
-know which config layer wins. See `PreviewUninstallLibraryRequest` and `UninstallLibraryRequest`
-in `library_events.py` for the full contract.
-
-Verdicts cross the wire structured, never as prose: the engine reports what it resolved and the
-editor owns the sentence, so copy can be localized and reworded without an engine release.
-
-Both requests resolve through `_resolve`, so preview and the real uninstall cannot derive
-different answers from the same state. The resolution fingerprint covers the other half: the
-state itself changing between the two calls, while the confirmation sits open.
+See `PreviewUninstallLibraryRequest` and `UninstallLibraryRequest` in `library_events.py`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import re
@@ -65,23 +52,17 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
-from griptape_nodes.utils.git_utils import extract_repo_name_from_url
 from griptape_nodes.utils.library_utils import normalize_library_downloads, normalize_library_registrations
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.events.config_events import ConfigValueSource
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library.common import LibraryInfo
 
 logger = logging.getLogger("griptape_nodes")
-
-# The config layers `set_config_value` cannot write, highest priority first. A library one of
-# these supplies survives the user-layer write, because a list is replaced by the winning layer
-# rather than merged across layers (`merge_dicts`).
-_SHADOWING_LAYERS = ("environment", "workspace", "project")
 
 
 @dataclass
@@ -112,45 +93,12 @@ class _Resolution:
     blocked_by: UninstallBlocker | None = None
     remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
 
-    def fingerprint(self) -> str:
-        """A hash of what the user was shown and what the delete depends on.
-
-        Covers the install directory, the registered path and which array holds it, the
-        collateral list, and the blocker / remaining verdicts -- everything the confirmation
-        renders and everything the delete acts on. Deliberately NOT the whole object: a field
-        the user never sees and the delete never reads would make the fingerprint go stale for
-        a change that cannot affect them.
-        """
-        payload = {
-            "library_name": self.library_name,
-            "library_path": self.library_path,
-            "install_directory": str(self.install_directory) if self.install_directory is not None else None,
-            "registered_path": self.classification.registered_path,
-            "registered_in": self.classification.registered_in,
-            "collateral_library_names": sorted(self.collateral_library_names),
-            "blocked_by": _verdict_identity(self.blocked_by),
-            "remaining_registrations": [_verdict_identity(entry) for entry in self.remaining_registrations],
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
 
 @dataclass
 class _ResolutionError:
     """The request named no library this engine knows about."""
 
     details: str
-
-
-def _verdict_identity(verdict: object) -> dict | None:
-    """A structured verdict reduced to its plain fields, for hashing.
-
-    Reads the dataclass's own attributes rather than `asdict`, so a verdict gaining a field the
-    user never sees does not silently change every fingerprint.
-    """
-    if verdict is None:
-        return None
-    return {key: value for key, value in vars(verdict).items() if not key.startswith("_")}
 
 
 class LibraryUninstall(EngineScoped):
@@ -176,7 +124,6 @@ class LibraryUninstall(EngineScoped):
         return PreviewUninstallLibraryResultSuccess(
             library_name=resolved.library_name,
             library_path=resolved.library_path,
-            resolution_fingerprint=resolved.fingerprint(),
             install_directory=str(resolved.install_directory) if resolved.install_directory is not None else None,
             registered_path=resolved.classification.registered_path,
             registered_in=resolved.classification.registered_in,
@@ -187,7 +134,7 @@ class LibraryUninstall(EngineScoped):
         )
 
     @handles(UninstallLibraryRequest)
-    async def uninstall_library_request(self, request: UninstallLibraryRequest) -> ResultPayload:  # noqa: PLR0911 (each refusal and each step's failure returns its own result)
+    async def uninstall_library_request(self, request: UninstallLibraryRequest) -> ResultPayload:
         async with self._uninstall_lock:
             resolved = await self._resolve(request.library_name, request.library_path)
             if isinstance(resolved, _ResolutionError):
@@ -205,18 +152,6 @@ class LibraryUninstall(EngineScoped):
                 return UninstallLibraryResultFailure(
                     result_details=details, failure_reason="blocked", blocked_by=resolved.blocked_by
                 )
-
-            # Checked after resolving, so the comparison is against the world as it is now, not
-            # as the preview left it. A mismatch changes nothing: the user consented to what the
-            # preview showed, and that is no longer what would happen.
-            fingerprint = resolved.fingerprint()
-            if fingerprint != request.resolution_fingerprint:
-                details = (
-                    f"Attempted to uninstall Library '{resolved.library_name}'. Failed because what "
-                    f"uninstalling it would do changed after it was last checked, so nothing was "
-                    f"removed. Check again and confirm the new result."
-                )
-                return UninstallLibraryResultFailure(result_details=details, failure_reason="stale_resolution")
 
             config_entry_removed, config_failure = self._uninstall_remove_config_entry(resolved)
             if config_failure is not None:
@@ -236,7 +171,6 @@ class LibraryUninstall(EngineScoped):
 
             return self._uninstall_success(
                 resolved,
-                fingerprint=fingerprint,
                 unloaded=unloaded,
                 config_entry_removed=config_entry_removed,
                 directory_deleted=directory_deleted,
@@ -246,16 +180,7 @@ class LibraryUninstall(EngineScoped):
     def _uninstall_remove_config_entry(
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
-        """Step 1 (least destructive): remove the config entry, if any names this exact copy.
-
-        Skipped entirely when a higher layer supplies the entry. `_classify_registration` reads
-        the MERGED list, which in that case is the higher layer's whole list; writing the
-        remainder back would persist every other library that layer supplies into the user's
-        global config, where it would then load in every other project, and would drop any
-        user-layer entries absent from that list, since layers replace lists rather than merging
-        them. The removal could not take effect anyway -- the higher layer still wins -- so the
-        write is pure damage. `ShadowedConfigRemaining` already tells the user where to go.
-        """
+        """Step 1 (least destructive): remove the config entry, if any names this exact copy."""
         if resolved.classification.registered_in is None or resolved.classification.is_directory_entry:
             return False, None
         if any(isinstance(entry, ShadowedConfigRemaining) for entry in resolved.remaining_registrations):
@@ -272,25 +197,14 @@ class LibraryUninstall(EngineScoped):
     def _uninstall_unload_from_registry(
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
-        """Step 2: unload from the in-memory registry, but only when THIS copy is the loaded one.
-
-        The registry is keyed by name, and two installs can share one. A duplicate that failed to
-        load with `DuplicateLibraryProblem` is still tracked, so uninstalling it would otherwise
-        find the OTHER copy registered under that name and unregister it -- dropping its held
-        objects, stopping its worker, and deleting every tracking entry for the name -- while its
-        own files and config entry stay put. That is the opposite of this module's rule that two
-        installs sharing a name never resolve to each other.
-
-        So the unload runs only when the copy at `resolved.library_path` is the one that loaded.
-        Otherwise just this copy's tracking entry is dropped, leaving the live library alone.
-        """
+        """Step 2: unload from the in-memory registry, but only when THIS copy is the loaded one."""
         library_manager = self.engine.library_manager
         library_name = resolved.library_name
         tracked = library_manager.find_library_info_for_attempted_load(resolved.library_path)
         this_copy_is_loaded = tracked is not None and tracked.lifecycle_state == LibraryLifecycleState.LOADED
 
         if not is_library_name_registered(library_name) or not this_copy_is_loaded:
-            library_manager._library_file_path_to_info.pop(resolved.library_path, None)
+            library_manager.forget_attempted_load(resolved.library_path)
             return False, None
         unload_result = library_manager.registration.unload_library_from_registry_request(
             UnloadLibraryFromRegistryRequest(library_name=library_name)
@@ -306,14 +220,7 @@ class LibraryUninstall(EngineScoped):
     async def _uninstall_delete_directory(
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
-        """Step 3 (most destructive): delete the install directory, or treat its absence as success.
-
-        Never deletes a directory a shared `libraries_to_register` entry still registers: the
-        config entry step left that entry in place precisely because removing it, or the
-        directory it points at, would also un-register the siblings still living under it. A
-        download entry or a shadowing config layer does NOT hold the directory back -- deleting
-        the files is the point, and the remaining registration only says the user has more to do.
-        """
+        """Step 3 (most destructive): delete the install directory, or treat its absence as success."""
         if resolved.install_directory is None or _has_shared_directory_entry(resolved.remaining_registrations):
             return False, None
         if not await anyio.Path(resolved.install_directory).exists():
@@ -337,11 +244,10 @@ class LibraryUninstall(EngineScoped):
             )
         return True, None
 
-    def _uninstall_success(  # noqa: PLR0913 (each argument is a separate fact about what happened)
+    def _uninstall_success(
         self,
         resolved: _Resolution,
         *,
-        fingerprint: str,
         unloaded: bool,
         config_entry_removed: bool,
         directory_deleted: bool,
@@ -360,7 +266,6 @@ class LibraryUninstall(EngineScoped):
         return UninstallLibraryResultSuccess(
             library_name=resolved.library_name,
             library_path=resolved.library_path,
-            resolution_fingerprint=fingerprint,
             install_directory=str(resolved.install_directory) if resolved.install_directory is not None else None,
             registered_path=resolved.classification.registered_path,
             registered_in=resolved.classification.registered_in,
@@ -376,10 +281,7 @@ class LibraryUninstall(EngineScoped):
     async def _resolve(self, library_name: str, library_path: str) -> _Resolution | _ResolutionError:
         """Find the target, classify its registration, and decide whether it is safe to delete.
 
-        Shared by preview and the real uninstall so the two cannot derive different answers from
-        the same state (the first bug the client-side implementation hit -- see the module
-        docstring). `library_path` names which copy is meant, so two installs sharing a name
-        never resolve to each other.
+        Shared by preview and uninstall so the two cannot derive different answers.
         """
         library_info = self._find_library_info(library_name, library_path)
         if library_info is None:
@@ -444,12 +346,7 @@ class LibraryUninstall(EngineScoped):
     def _remaining_registrations_for(
         self, classification: _Classification, *, exclude_manifest: Path
     ) -> list[RemainingRegistration]:
-        """What would still register this library once its files are gone.
-
-        Three separate cases, each of which the editor turns into its own sentence:
-        a shared directory entry left in place, a download entry that re-clones, and a config
-        layer above the user config that the engine cannot write to.
-        """
+        """What would still register this library once its files are gone."""
         remaining: list[RemainingRegistration] = []
 
         if classification.registered_in is None:
@@ -466,24 +363,22 @@ class LibraryUninstall(EngineScoped):
         if classification.registered_in == "download" and classification.download is not None:
             remaining.append(DownloadEntryRemaining(git_url=classification.download.git_url))
 
-        shadowing_layer = self._shadowing_layer_for(classification)
-        if shadowing_layer is not None:
-            remaining.append(ShadowedConfigRemaining(layer=shadowing_layer))
+        shadowed_by = self._shadowed_config_source(classification)
+        if shadowed_by is not None:
+            remaining.append(ShadowedConfigRemaining(layer=shadowed_by.layer))
 
         return remaining
 
     def _sibling_library_names(self, classification: _Classification, *, exclude_manifest: Path) -> list[str]:
-        """The OTHER libraries a shared directory entry registers, by name where one is known.
-
-        The library being uninstalled is excluded: the editor's sentence reads "also registers
-        {names}", so naming the library itself there would be wrong.
-        """
+        """The OTHER libraries a shared directory entry registers, by name where one is known."""
         if classification.directory_path is None:
             return []
         directory_identity = canonicalize_for_identity(classification.directory_path)
         exclude_identity = canonicalize_for_identity(exclude_manifest)
         names: list[str] = []
-        for library_info in self.engine.library_manager._library_file_path_to_info.values():
+        library_manager = self.engine.library_manager
+        for manifest_path in library_manager.get_libraries_attempted_to_load():
+            library_info = library_manager.get_library_info_for_attempted_load(manifest_path)
             manifest_identity = canonicalize_for_identity(library_info.library_path)
             if manifest_identity == exclude_identity or not manifest_identity.is_relative_to(directory_identity):
                 continue
@@ -491,52 +386,17 @@ class LibraryUninstall(EngineScoped):
                 names.append(library_info.library_name)
         return sorted(set(names))
 
-    def _shadowing_layer_for(self, classification: _Classification) -> str | None:
-        """Which config layer above the user config still supplies this entry, if any.
-
-        `set_config_value` only ever writes the user layer, and these settings are LISTS, which
-        `merge_dicts` replaces wholesale rather than merging. So an entry a project, workspace,
-        or environment layer declares survives the user-layer removal entirely, and the engine
-        would load the library again from a folder this uninstall just deleted. Reported so the
-        editor can send the user to the layer that actually owns it.
-        """
-        if classification.registered_in is None or classification.registered_path is None:
+    def _shadowed_config_source(self, classification: _Classification) -> ConfigValueSource | None:
+        """The layer supplying this entry's config list, when the engine cannot write that layer."""
+        if classification.registered_in is None:
             return None
         config_key = (
             LIBRARIES_TO_DOWNLOAD_KEY if classification.registered_in == "download" else LIBRARIES_TO_REGISTER_KEY
         )
-        raw_entry = (
-            classification.raw_download_entry
-            if classification.registered_in == "download"
-            else classification.raw_register_entry
-        )
-        config_mgr = self.engine.config_manager
-        for layer in _SHADOWING_LAYERS:
-            if layer == "environment":
-                layer_values = config_mgr.env_config
-            elif layer == "workspace":
-                layer_values = config_mgr.workspace_config
-            else:
-                layer_values = config_mgr.project_config
-            entries = get_dot_value(layer_values, config_key, None)
-            if isinstance(entries, list) and raw_entry in entries:
-                return layer
-        return None
+        return self.engine.config_manager.shadowed_by(config_key)
 
     def _is_protected_directory(self, install_directory: Path) -> bool:
-        """Whether deleting `install_directory` would take a shared folder with it.
-
-        A library's install directory is meant to be the library's OWN folder. When a manifest
-        sits directly in the home directory, the workspace, or the libraries root -- a hand-added
-        `libraries_to_register` entry, or a library the environment supplies -- its parent is
-        that shared folder, and deleting it would take every workflow in the workspace, or every
-        other installed library, with it. The collateral list names only other MANIFESTS, so the
-        user would never see those files in the confirmation.
-
-        Checked as "is, or contains" rather than equality: the home directory's own parent is
-        also not a library folder, and `_unsafe_install_directory` only catches the literal root.
-        A library in a subfolder of any of these (the normal case) is unaffected.
-        """
+        """Whether deleting `install_directory` would take the workspace, libraries root, or home with it."""
         config_mgr = self.engine.config_manager
         protected = [config_mgr.workspace_path, config_mgr.resolved_libraries_root()]
         # No home directory resolvable on this machine; the other two still apply.
@@ -553,14 +413,7 @@ class LibraryUninstall(EngineScoped):
         return False
 
     def _install_directory_for(self, classification: _Classification, resolved_library_path: Path) -> Path:
-        """The folder an uninstall would delete for this classification.
-
-        Mirrors `_provision_git_library`'s overwrite target exactly for a download entry, so an
-        uninstall never deletes a different directory than a future re-download would overwrite:
-        with an explicit `name` the manifest's own parent is the install directory (the handler's
-        `name`-override branch); otherwise it is `libraries_root/<repo-name>` even when the
-        manifest sits in a nested subdirectory of a monorepo clone.
-        """
+        """The folder an uninstall would delete for this classification."""
         if (
             classification.registered_in == "register"
             and classification.is_directory_entry
@@ -570,17 +423,13 @@ class LibraryUninstall(EngineScoped):
         if classification.registered_in == "download" and classification.download is not None:
             if classification.download.name is not None:
                 return resolved_library_path.parent
-            repo_name = extract_repo_name_from_url(classification.download.git_url)
-            return self.engine.config_manager.resolved_libraries_root() / repo_name
+            return self.engine.library_manager.provisioning.clone_target_directory(
+                classification.download.git_url, self.engine.config_manager.resolved_libraries_root()
+            )
         return resolved_library_path.parent
 
     def _find_library_info(self, library_name: str, library_path: str) -> LibraryInfo | None:
-        """The tracked copy at `library_path`, when its name matches.
-
-        Keyed on the manifest path rather than the name, so two installs sharing a name resolve
-        to the copy the user actually clicked. The name is still checked, so a stale path from
-        a client that has since been re-pointed cannot uninstall a different library.
-        """
+        """The tracked copy at `library_path`, when its name matches."""
         library_manager = self.engine.library_manager
         library_info = library_manager.find_library_info_for_attempted_load(library_path)
         if library_info is not None and library_info.library_name == library_name:
@@ -588,7 +437,8 @@ class LibraryUninstall(EngineScoped):
         # The tracked key is the path as discovery recorded it; a client that canonicalized
         # differently (a symlinked or `~`-spelled libraries dir) still names the same file.
         wanted = canonicalize_for_identity(library_path)
-        for candidate in library_manager._library_file_path_to_info.values():
+        for manifest_path in library_manager.get_libraries_attempted_to_load():
+            candidate = library_manager.get_library_info_for_attempted_load(manifest_path)
             if candidate.library_name != library_name:
                 continue
             if canonicalize_for_identity(candidate.library_path) == wanted:
@@ -617,8 +467,8 @@ class LibraryUninstall(EngineScoped):
     async def _classify_registration(self, identity: Path) -> _Classification:
         """Which config array registered this manifest, re-run per entry (not by index).
 
-        Each raw entry is normalized on its own so a malformed entry elsewhere in the list
-        cannot shift which raw item a later match is removed from.
+        Each raw entry is normalized on its own, so a malformed entry elsewhere cannot shift
+        which raw item a later match is removed from.
         """
         config_mgr = self.engine.config_manager
 
@@ -696,13 +546,7 @@ class LibraryUninstall(EngineScoped):
     async def _collect_collateral_library_names(
         self, install_directory: Path | None, *, exclude_manifest: Path
     ) -> list[str]:
-        """Other library manifests under `install_directory`, including ones that fail to parse.
-
-        The engine can see a sibling whose manifest is broken JSON or fails schema validation;
-        the editor cannot, since it never appears in `successful_libraries` and the failure
-        payload carries no registered_path. This is the one place that can catch it before the
-        directory is deleted out from under it.
-        """
+        """Other library manifests under `install_directory`, including ones that fail to parse."""
         if install_directory is None or not await anyio.Path(install_directory).is_dir():
             return []
         exclude_identity = canonicalize_for_identity(exclude_manifest)
@@ -733,15 +577,7 @@ def _read_raw_library_name(manifest_path: Path) -> str | None:
 
 
 def _path_text_has_traversal_segment(path_text: str) -> bool:
-    r"""Whether raw (unresolved) path text contains a literal `.` or `..` segment.
-
-    Win32 trims trailing spaces from each path component, so `Nuke\.. ` still means parent.
-    Only trailing spaces are stripped here, not trailing dots: `.` and `..` are resolved as
-    navigation before the trailing-dot trim applies, so stripping dots would also reduce `...`
-    (a literal three-dot name) to a traversal segment it is not. Checked on text that has not
-    been resolved yet: resolution collapses `..` away, so by the time a Path exists the segment
-    is already gone and the final directory can look like an ordinary one.
-    """
+    """Whether raw path text contains a literal `.` or `..` segment."""
     normalized = path_text.replace("\\", "/")
     for part in normalized.split("/"):
         if not part:
@@ -755,26 +591,7 @@ _WINDOWS_DRIVE_OR_UNC_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2})")
 
 
 def _unsafe_install_directory(install_directory: PurePath) -> bool:
-    r"""Whether `install_directory` must not be deleted.
-
-    True for a filesystem root, a drive root, and a UNC share -- including the `\\?\UNC\...`
-    long-path spelling, whose prefix is case-insensitive on Win32. Checked on the resolved
-    directory, after any `.`/`..` segments have already been rejected by
-    `_path_text_has_traversal_segment` on the raw config text.
-
-    The path's OWN flavor decides how it is split: a real `Path` already knows whether it is a
-    `WindowsPath` or a `PosixPath`, and `parts` on it is the authoritative answer. Re-parsing
-    `str(path)` under a flavor guessed from the text throws that away, and on a Windows host it
-    throws it away wrongly: `str(Path("/home/user/libs"))` is `\home\user\libs`, which no
-    drive/UNC pattern matches, so a text-sniffing fallback hands it to `PurePosixPath`, which
-    treats the whole backslash string as ONE opaque component and calls an ordinary directory a
-    filesystem root. That refused a legitimate uninstall on Windows.
-
-    The string sniff survives only for a path whose flavor is NOT the host's -- a Windows-spelled
-    path evaluated on POSIX (a studio's config carried across platforms, or this module's own
-    tests), where `Path` has parsed it as a single POSIX component and the text is the only
-    remaining evidence of what it means.
-    """
+    """Whether `install_directory` must not be deleted: a filesystem root, drive root, or UNC share."""
     path_str = str(install_directory)
     backslash_form = path_str.replace("/", "\\")
     if backslash_form.lower().startswith("\\\\?\\unc\\"):
