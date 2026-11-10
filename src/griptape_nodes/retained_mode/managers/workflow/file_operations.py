@@ -134,6 +134,15 @@ class WorkflowFileOperations(EngineScoped):
 
         display_name = self._resolve_rename_display_name(request, source=source)
 
+        # A library update would put the library's own file back, and an open rename would
+        # write a copy and delete the library's file.
+        if source.metadata.is_griptape_provided:
+            details = (
+                f"Attempted to rename workflow '{source.name}'. Failed because a library provides it. "
+                "Create a workflow from it and rename that one instead."
+            )
+            return RenameWorkflowResultFailure(result_details=details)
+
         open_source = self.engine.open_workflows.find(source.workflow_id)
         if open_source is not None:
             return await self._rename_open_workflow(
@@ -283,7 +292,7 @@ class WorkflowFileOperations(EngineScoped):
                 isinstance(save_result, SaveWorkflowResultFailure)
                 and save_result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
             ):
-                reason = "another workflow already has that name"
+                reason = "another workflow or file already has that name"
             details = (
                 f"Attempted to rename workflow '{previous_name}' to '{requested_file_name}'. Failed because {reason}."
             )
@@ -392,12 +401,6 @@ class WorkflowFileOperations(EngineScoped):
             return (
                 f"Attempted to rename workflow '{source.name}'. Failed because its file's metadata header "
                 "could not be read. Open the workflow and save it to regenerate the header."
-            )
-        # A library update would put the library's own file back.
-        if source.metadata.is_griptape_provided:
-            return (
-                f"Attempted to rename workflow '{source.name}'. Failed because a library provides it. "
-                "Create a workflow from it and rename that one instead."
             )
         if new_absolute_path == source.absolute_path:
             return None

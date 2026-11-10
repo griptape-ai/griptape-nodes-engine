@@ -252,7 +252,7 @@ class WorkflowSaver(EngineScoped):
     async def on_save_workflow_request(self, request: SaveWorkflowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         return await self.save_open_workflow(workflow, request)
 
-    async def save_open_workflow(  # noqa: C901, PLR0912, PLR0915
+    async def save_open_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, workflow: WorkflowRuntime, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
     ) -> ResultPayload:
         """Save the open `workflow` as `request` describes.
@@ -315,6 +315,19 @@ class WorkflowSaver(EngineScoped):
                 "this is a programming error in _determine_save_target."
             )
             return SaveWorkflowResultFailure(result_details=msg)
+
+        # A rename moves the workflow to the new file, so it must never replace one: the file
+        # there may be an unregistered module the policy above can't see.
+        if keep_open_workflow_identity and not is_self_save:
+            existing_path = self._existing_file_at(destination)
+            if existing_path is not None:
+                details = (
+                    f"Attempted to save workflow '{current_workflow_name}' to '{relative_file_path}'. "
+                    f"Failed because a file already exists at '{existing_path}'."
+                )
+                return SaveWorkflowResultFailure(
+                    result_details=details, failure_reason=FileIOFailureReason.POLICY_NO_OVERWRITE
+                )
 
         logger.debug(
             "Save workflow: scenario=%s, file_name=%s, registry_key=%s, destination=%s, "
@@ -453,6 +466,18 @@ class WorkflowSaver(EngineScoped):
         if scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
             return False
         return self._destination_is_file_of(destination, current_workflow)
+
+    def _existing_file_at(self, destination: ProjectFileDestination) -> Path | None:
+        """The file already at `destination`, or None when there is none or its macro can't resolve yet."""
+        if destination.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
+            return None
+        try:
+            resolved_path = Path(destination.resolve())
+        except FileLoadError:
+            return None
+        if not resolved_path.exists():
+            return None
+        return resolved_path
 
     def _destination_is_file_of(self, destination: ProjectFileDestination, workflow: Workflow) -> bool:
         """Whether a write to `destination` lands on `workflow`'s own file.

@@ -1143,6 +1143,7 @@ class TestWorkflowManager:
         # No file to delete afterwards: these tests are about what the save is asked for.
         mock_source.absolute_path = None
         mock_source.metadata.name = scenario.source_display_name
+        mock_source.metadata.is_griptape_provided = False
         captured: dict[str, object] = {}
 
         async def fake_save(_workflow: WorkflowRuntime, req: SaveWorkflowRequest, **_: Any) -> object:
@@ -1451,6 +1452,7 @@ class TestWorkflowManager:
         mock_source.file_path = "old.py"
         mock_source.absolute_path = Path("/workspace/old.py")
         mock_source.metadata.name = "Old Display"
+        mock_source.metadata.is_griptape_provided = False
 
         async def fake_save(_workflow: WorkflowRuntime, _req: SaveWorkflowRequest, **_: Any) -> object:
             mock_source.name = "new"
