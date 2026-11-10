@@ -882,6 +882,26 @@ class Engine:
         finally:
             await self._worker_manager.broadcast_local_object_teardown(None)
 
+    async def aempty_all_workflows(self) -> None:
+        """Delete everything every open workflow holds while keeping each one open under its id.
+
+        Like `aclose_all_workflows`, but each workflow stays open, keeps its registry entry, and is
+        not announced as closed, so its clients keep it. A library reload uses this to drop every
+        node built from the old modules and then rebuild each workflow into the same runtime.
+
+        Raises:
+            OpenWorkflowError: A workflow could not be emptied. It and the ones after it keep what they hold.
+        """
+        try:
+            for workflow in self._open_workflows.all_open():
+                await self._cancel_workflow_runs(workflow)
+                self._empty_workflow(workflow)
+            dropped = self._resource_manager.drop_all_local_objects()
+            if dropped:
+                logger.debug("Released %d held object(s) kept for no workflow while emptying every workflow.", dropped)
+        finally:
+            await self._worker_manager.broadcast_local_object_teardown(None)
+
     def clear_current_workflow_data(self) -> None:
         """Close the current workflow (see `close_workflow`).
 
@@ -921,20 +941,7 @@ class Engine:
             OpenWorkflowError: A flow could not be deleted, or objects remained after its flows were.
                 The workflow stays open.
         """
-        with self.bind_workflow(workflow):
-            # Runs still waiting or going (a sync close, or an async cancel that failed) are cancelled
-            # here, the waiting ones first so none starts against the flows being deleted. The reset
-            # after it drops the run's bookkeeping, so it must not run ahead of the cancel: the flow
-            # would look idle and the cancel would be skipped.
-            self.handle_request(CancelAllRunsRequest())
-            self._flow_manager.reset_global_execution_state()
-            self._delete_workflow_flows(workflow)
-        if len(workflow.objects) > 0:
-            msg = (
-                f"Attempted to close workflow '{workflow.workflow_id}'. Failed because {len(workflow.objects)} "
-                "object(s) remained after its flows were deleted."
-            )
-            raise OpenWorkflowError(msg)
+        self._empty_workflow(workflow)
         self._open_workflows.close(workflow)
         if workflow not in self._opening_workflows:
             self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(workflow_id=workflow.workflow_id)))
@@ -944,11 +951,36 @@ class Engine:
         if entry is not None and not entry.is_saved:
             self._workflow_registry.remove(workflow.workflow_id)
 
+    def _empty_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Stop `workflow`'s run, delete its flows, and release the held objects kept for it. It stays open.
+
+        Raises:
+            OpenWorkflowError: A flow could not be deleted, or objects remained after its flows were.
+        """
+        with self.bind_workflow(workflow):
+            # Runs still waiting or going (a sync close, or an async cancel that failed) are cancelled
+            # here, the waiting ones first so none starts against the flows being deleted. The reset
+            # after it drops the run's bookkeeping, so it must not run ahead of the cancel: the flow
+            # would look idle and the cancel would be skipped.
+            self.handle_request(CancelAllRunsRequest())
+            self._flow_manager.reset_global_execution_state()
+            self._delete_workflow_flows(workflow)
+        # Deleting a flow by name leaves it on the context stack. A workflow that stays open would
+        # otherwise make the deleted top-level flow the parent of the next one created.
+        while workflow.context.has_current_flow():
+            workflow.context.pop_flow()
+        if len(workflow.objects) > 0:
+            msg = (
+                f"Attempted to clear workflow '{workflow.workflow_id}'. Failed because {len(workflow.objects)} "
+                "object(s) remained after its flows were deleted."
+            )
+            raise OpenWorkflowError(msg)
+
         # Every key referring to a held object kept for it lived on a node just deleted, so each entry
         # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
         dropped = self._resource_manager.drop_objects_for_workflow(workflow.workflow_id)
         if dropped:
-            logger.debug("Released %d held object(s) while closing the workflow.", dropped)
+            logger.debug("Released %d held object(s) while clearing the workflow.", dropped)
 
     def _finish_opening(self, workflow: WorkflowRuntime, *, keep: bool) -> None:
         """End `opening_workflow`'s block, then wake anything waiting for the build of `workflow`.

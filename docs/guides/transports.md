@@ -130,7 +130,7 @@ While a flow runs, the engine also sends execution events: which node is running
 The engine tells every connection on the session when any client opens or closes a workflow:
 
 - `WorkflowOpenedEvent` carries it in `open_workflow`, as `ListOpenWorkflowsRequest` lists it. A loaded workflow is announced once built; until then only `ListOpenWorkflowsRequest` and the heartbeat list it, and a failed build closes it without a `WorkflowClosedEvent`.
-- `WorkflowClosedEvent` names it in `workflow_id`, one for each workflow closed, even by a library reload or a project switch. It comes before the opened event when a request closes one workflow to open another. Saving sends neither.
+- `WorkflowClosedEvent` names it in `workflow_id`, one for each workflow closed, even by a project switch. It comes before the opened event when a request closes one workflow to open another. Saving and reloading libraries send neither: `ReloadAllLibrariesRequest` keeps every workflow open and rebuilds its nodes from the reloaded libraries.
 
 ### Open workflows
 

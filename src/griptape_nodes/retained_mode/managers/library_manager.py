@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,14 @@ from griptape_nodes.retained_mode.events.app_events import (
 
 # Runtime imports for ResultDetails since it's used at runtime
 from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetails
+from griptape_nodes.retained_mode.events.flow_events import (
+    DeserializeFlowFromCommandsRequest,
+    GetTopLevelFlowRequest,
+    GetTopLevelFlowResultSuccess,
+    SerializedFlowCommands,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+)
 from griptape_nodes.retained_mode.events.library_events import (
     DiscoverLibrariesRequest,
     DiscoverLibrariesResultFailure,
@@ -38,7 +47,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesResultSuccess,
     UnloadLibraryFromRegistryRequest,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.library.catalog import LibraryCatalog
 from griptape_nodes.retained_mode.managers.library.common import (
     LIBRARY_CONFIG_FILENAME,
@@ -74,6 +82,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -83,8 +92,24 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import Payload, RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
+
+
+@dataclass(frozen=True)
+class WorkflowSnapshot:
+    """An open workflow as a library reload found it, to rebuild it from once the libraries are back.
+
+    Args:
+        workflow: The open workflow.
+        display_name: Its display name, for messages.
+        commands: What rebuilds it, as a save serializes it. None for a workflow with no flow.
+    """
+
+    workflow: WorkflowRuntime
+    display_name: str
+    commands: SerializedFlowCommands | None
 
 
 class LibraryManager(EngineScoped):
@@ -96,6 +121,9 @@ class LibraryManager(EngineScoped):
     # Sandbox library constants
     UNRESOLVED_SANDBOX_CLASS_NAME = UNRESOLVED_SANDBOX_CLASS_NAME
     SANDBOX_CATEGORY_NAME = SANDBOX_CATEGORY_NAME
+
+    class ReloadRefusedError(Exception):
+        """A library reload was refused before it changed anything."""
 
     LibraryLifecycleState = LibraryLifecycleState
     LibraryFitness = LibraryFitness
@@ -551,13 +579,101 @@ class LibraryManager(EngineScoped):
         return listed_workflow_ids
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
-        # Start with a clean slate.
-        clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-        clear_all_result = await self.engine.ahandle_request(clear_all_request)
-        if not clear_all_result.succeeded():
-            details = "Failed to clear the existing object state when preparing to reload all libraries."
-            return ReloadAllLibrariesResultFailure(result_details=details)
+        """Reload every library, keeping each open workflow open with what it held.
 
+        Every node built from the old modules has to go, so each open workflow is serialized as a
+        save would, emptied while it stays open under its id, and rebuilt once the libraries are
+        back. Serialized values are plain data, so the rebuilt ones come from the reloaded modules.
+        A workflow that can't be serialized refuses the reload before anything changes.
+        """
+        try:
+            snapshots = await self._snapshot_open_workflows()
+        except self.ReloadRefusedError as err:
+            return ReloadAllLibrariesResultFailure(result_details=str(err))
+
+        try:
+            await self.engine.aempty_all_workflows()
+        except OpenWorkflowError as err:
+            rebuild_failures = await self._rebuild_workflows(snapshots)
+            details = f"Attempted to reload all libraries. Failed because a workflow could not be cleared first: {err}"
+            return ReloadAllLibrariesResultFailure(
+                result_details=self._with_rebuild_failures(details, rebuild_failures)
+            )
+        self.engine.event_manager.clear_event_suppression()
+
+        try:
+            result = await self._reload_libraries_with_workflows_empty()
+        finally:
+            rebuild_failures = await self._rebuild_workflows(snapshots)
+        # Signal readiness once the workflows hold their nodes again, so the app re-renders the
+        # library status table against the reloaded set and the editor reads rebuilt workflows.
+        # is_initial_start=False so the app refreshes the table without re-showing the startup banner.
+        self.engine.lifecycle.announce_ready(is_initial_start=False)
+        if not rebuild_failures:
+            return result
+        details = self._with_rebuild_failures(str(result.result_details), rebuild_failures)
+        return ReloadAllLibrariesResultFailure(result_details=details)
+
+    async def _snapshot_open_workflows(self) -> list[WorkflowSnapshot]:
+        """Every open workflow and the commands that rebuild it, as a save serializes them.
+
+        Raises:
+            ReloadRefusedError: A workflow could not be serialized.
+        """
+        snapshots = []
+        for workflow in self.engine.open_workflows.all_open():
+            display_name = self.engine.workflow_registry.get(workflow.workflow_id).metadata.name
+            top_level_flow = await workflow.ahandle_request(GetTopLevelFlowRequest())
+            if not isinstance(top_level_flow, GetTopLevelFlowResultSuccess):
+                details = f"Attempted to reload all libraries. Failed because workflow '{display_name}' has no readable top-level flow."
+                raise self.ReloadRefusedError(details)
+            if top_level_flow.flow_name is None:
+                snapshots.append(WorkflowSnapshot(workflow=workflow, display_name=display_name, commands=None))
+                continue
+            serialized = await workflow.ahandle_request(
+                SerializeFlowToCommandsRequest(flow_name=top_level_flow.flow_name, include_create_flow_command=True)
+            )
+            if not isinstance(serialized, SerializeFlowToCommandsResultSuccess):
+                details = (
+                    f"Attempted to reload all libraries. Failed because workflow '{display_name}' could not be "
+                    f"saved for the reload, so nothing was reloaded: {serialized.result_details}"
+                )
+                raise self.ReloadRefusedError(details)
+            snapshots.append(
+                WorkflowSnapshot(
+                    workflow=workflow, display_name=display_name, commands=serialized.serialized_flow_commands
+                )
+            )
+        return snapshots
+
+    async def _rebuild_workflows(self, snapshots: list[WorkflowSnapshot]) -> list[str]:
+        """Rebuild each emptied workflow from its snapshot, returning why each that failed did."""
+        failures = []
+        for snapshot in snapshots:
+            if snapshot.commands is None:
+                continue
+            # A workflow closed since it was emptied has nothing to rebuild into.
+            if self.engine.open_workflows.find(snapshot.workflow.workflow_id) is not snapshot.workflow:
+                continue
+            # The workflow holds what it held before, so its clients see no unsaved change.
+            with self.engine.workflow_manager.squelch_workflow_altered():
+                result = await snapshot.workflow.ahandle_request(
+                    DeserializeFlowFromCommandsRequest(
+                        serialized_flow_commands=snapshot.commands, pop_flow_context_after=False
+                    )
+                )
+            if result.failed():
+                failures.append(f"workflow '{snapshot.display_name}' could not be rebuilt: {result.result_details}")
+        return failures
+
+    @staticmethod
+    def _with_rebuild_failures(details: str, rebuild_failures: list[str]) -> str:
+        if not rebuild_failures:
+            return details
+        return f"{details} After the reload, " + "; ".join(rebuild_failures)
+
+    async def _reload_libraries_with_workflows_empty(self) -> ResultPayload:
+        """Unload every library and load them again, while no workflow holds a node."""
         # Unload all libraries now.
         all_libraries_request = ListRegisteredLibrariesRequest(broadcast_result=False)
         all_libraries_result = await self.engine.ahandle_request(all_libraries_request)
@@ -606,11 +722,6 @@ class LibraryManager(EngineScoped):
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
         await self.workers.maybe_start_workers_for_existing_session()
 
-        # Signal readiness again so the app re-renders the library status table against the
-        # reloaded set. is_initial_start=False so the app refreshes the table without
-        # re-showing the startup banner.
-        self.engine.lifecycle.announce_ready(is_initial_start=False)
-
         # Hard activation: a reload is interactive (project switch / explicit reload), so a
         # reconcile failure (bad engine_version gate or a sourced library that could not be
         # provisioned) surfaces to the caller. ProjectManager turns this into a
@@ -619,7 +730,5 @@ class LibraryManager(EngineScoped):
             details = "Reloaded libraries but reconcile reported problem(s): " + "; ".join(reconcile_failures)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
-        details = (
-            "Successfully reloaded all libraries. All object state was cleared and previous libraries were unloaded."
-        )
+        details = "Successfully reloaded all libraries and rebuilt the open workflows from them."
         return ReloadAllLibrariesResultSuccess(result_details=ResultDetails(message=details, level=logging.INFO))

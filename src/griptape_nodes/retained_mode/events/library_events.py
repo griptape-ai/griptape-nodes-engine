@@ -935,21 +935,19 @@ class UnloadLibraryFromRegistryResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class ReloadAllLibrariesRequest(RequestPayload):
-    """WARNING: This request will CLEAR ALL CURRENT WORKFLOW STATE!
+    """Unload every library and load it again, to pick up changes to library code.
 
-    Reloading all libraries requires clearing all existing workflows, nodes, and execution state
-    because there is no way to comprehensively erase references to old Python modules.
-    All current work will be lost and must be recreated after the reload operation completes.
-
-    Use this operation only when you need to pick up changes to library code during development
-    or when library corruption requires a complete reset.
+    Every node is built again from the reloaded code. Each open workflow stays open under its id
+    and comes back with its nodes, values and connections, as a save would write them. A run in
+    progress is cancelled. A workflow that can't be serialized refuses the reload before anything
+    changes. Clients are not told any workflow closed.
     """
 
 
 @dataclass
 @PayloadRegistry.register
 class ReloadAllLibrariesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """All libraries reloaded successfully. All workflow state has been cleared."""
+    """All libraries reloaded, and the open workflows were rebuilt from them."""
 
 
 @dataclass

@@ -73,9 +73,16 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListFlowsInCurrentContextRequest,
     ListNodesInFlowRequest,
     ListNodesInFlowResultSuccess,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultFailure,
 )
 from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenResultFailure
-from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest, ReloadAllLibrariesRequest
+from griptape_nodes.retained_mode.events.library_events import (
+    ListRegisteredLibrariesRequest,
+    ReloadAllLibrariesRequest,
+    ReloadAllLibrariesResultFailure,
+    ReloadAllLibrariesResultSuccess,
+)
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
@@ -128,6 +135,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -1379,6 +1387,97 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert a.objects.get_filtered_subset().keys() == {"canvas"}
 
 
+class TestALibraryReloadRebuildsEachWorkflow:
+    """The reload empties each open workflow and rebuilds it from what it held, keeping it open."""
+
+    @pytest.fixture
+    def libraries_unchanged(self) -> Iterator[None]:
+        """Reload no library, so the test library's nodes rebuild from the same classes."""
+
+        async def reload_nothing(_self: LibraryManager) -> ResultPayload:
+            return ReloadAllLibrariesResultSuccess(result_details="reloaded nothing")
+
+        with patch.object(LibraryManager, "_reload_libraries_with_workflows_empty", reload_nothing):
+            yield
+
+    @pytest.mark.usefixtures("libraries_unchanged")
+    def test_each_workflow_comes_back_with_its_nodes_values_and_connections(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        _make_node(engine, a, "_ValueNode", "source")
+        _make_node(engine, a, "_ValueNode", "target")
+        _set(engine, a, "source", "kept")
+        connected = _send(
+            engine,
+            CreateConnectionRequest(
+                source_node_name="source",
+                source_parameter_name="value",
+                target_node_name="target",
+                target_parameter_name="value",
+            ),
+            a,
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess), connected.result_details
+        _make_node(engine, b, "_ValueNode", "other")
+        old_source = a.objects.get("source")
+
+        result = _send(engine, ReloadAllLibrariesRequest(), None)
+
+        assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
+        assert engine.open_workflows.all_open() == [a, b]
+        assert _nodes_in(engine, a) == ["source", "target"]
+        assert _nodes_in(engine, b) == ["other"]
+        assert a.objects.get("source") is not old_source
+        assert _get(engine, a, "source") == "kept"
+        incoming = _send(engine, ListConnectionsForNodeRequest(node_name="target"), a)
+        assert isinstance(incoming, ListConnectionsForNodeResultSuccess)
+        assert [c.source_node_name for c in incoming.incoming_connections] == ["source"]
+        assert a.context.get_current_flow().name == "canvas"
+        top_level = _send(engine, GetTopLevelFlowRequest(), a)
+        assert isinstance(top_level, GetTopLevelFlowResultSuccess)
+        assert top_level.flow_name == "canvas"
+
+    @pytest.mark.usefixtures("libraries_unchanged")
+    @pytest.mark.asyncio
+    async def test_a_run_in_progress_is_cancelled_and_its_workflow_rebuilt(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, _b = two_open
+        _make_node(engine, a, "_ParkNode", "park")
+        _park("park")
+        run = await _start_parked_run(engine, a, "park")
+
+        result = await _send_async(engine, ReloadAllLibrariesRequest(), None)
+        # The parked node was never released, so the run ends only because the reload cancelled it.
+        await asyncio.wait_for(run, 5)
+
+        assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
+        assert _nodes_in(engine, a) == ["park"]
+        running = await _send_async(engine, GetIsFlowRunningRequest(flow_name="canvas"), a)
+        assert isinstance(running, GetIsFlowRunningResultSuccess)
+        assert not running.is_running
+
+    @pytest.mark.usefixtures("libraries_unchanged")
+    def test_a_workflow_that_cant_be_serialized_refuses_the_reload_and_changes_nothing(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, _b = two_open
+        _make_node(engine, a, "_ValueNode", "kept")
+        before = a.objects.get("kept")
+
+        def refuse(_request: SerializeFlowToCommandsRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG001
+            return SerializeFlowToCommandsResultFailure(result_details="cannot serialize")
+
+        engine.event_manager.replace_manager_for_request_type(SerializeFlowToCommandsRequest, refuse)
+
+        result = _send(engine, ReloadAllLibrariesRequest(), None)
+
+        assert isinstance(result, ReloadAllLibrariesResultFailure)
+        assert "could not be saved for the reload" in str(result.result_details)
+        assert a.objects.get("kept") is before
+
+
 class TestOtherSharedState:
     """Scenario (j): state shared across workflows that a run or request reads."""
 
@@ -1470,27 +1569,20 @@ class TestOtherSharedState:
         assert deleted.succeeded(), deleted.result_details
         assert engine.open_workflows.all_open() == [a]
 
-    def test_reloading_libraries_gets_past_closing_both_workflows(
-        self,
-        engine: Engine,
-        two_open: tuple[WorkflowRuntime, WorkflowRuntime],  # noqa: ARG002
+    @pytest.mark.parametrize("named", [False, True], ids=["no_envelope_id", "envelope_id"])
+    def test_reloading_libraries_keeps_both_workflows_open(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime], *, named: bool
     ) -> None:
+        """A host request: whatever the client named, the reload keeps every workflow."""
+        a, b = two_open
+        sent_from = a if named else None
 
-        result = _send(engine, ReloadAllLibrariesRequest(), None)
+        _send(engine, ReloadAllLibrariesRequest(), sent_from)
 
-        assert "Failed to clear the existing object state" not in str(result.result_details)
-        assert engine.open_workflows.all_open() == []
-
-    def test_reloading_libraries_with_an_envelope_id_closes_every_workflow(
-        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
-    ) -> None:
-        """A host request: the clear-all it sends names no workflow, whatever the client named."""
-        a, _b = two_open
-
-        result = _send(engine, ReloadAllLibrariesRequest(), a)
-
-        assert "Failed to clear the existing object state" not in str(result.result_details)
-        assert engine.open_workflows.all_open() == []
+        assert engine.open_workflows.all_open() == [a, b]
+        assert not a.closed
+        assert not b.closed
+        assert _nodes_in(engine, a) == []
 
     def test_a_host_request_with_the_id_of_a_closed_workflow_succeeds(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]

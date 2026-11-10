@@ -446,14 +446,16 @@ class TestClosing:
         assert _lifecycle_events(_drain(queue)) == [WorkflowClosedEvent(workflow_id=workflow.workflow_id)]
         assert result_event.open_workflow_id is None
 
-    def test_a_library_reload_announces_the_workflow_it_closed(self, engine: Engine, queue: asyncio.Queue) -> None:
+    def test_a_library_reload_keeps_the_workflow_and_announces_nothing(
+        self, engine: Engine, queue: asyncio.Queue
+    ) -> None:
         workflow = _open_new_workflow(engine, "reloaded")
         _drain(queue)
 
         _send(engine, ReloadAllLibrariesRequest(), workflow.workflow_id)
 
-        assert engine.open_workflows.all_open() == []
-        assert WorkflowClosedEvent(workflow_id=workflow.workflow_id) in _lifecycle_events(_drain(queue))
+        assert engine.open_workflows.all_open() == [workflow]
+        assert _lifecycle_events(_drain(queue)) == []
 
     def test_a_project_switch_to_another_workspace_announces_the_workflow_it_closed(
         self, engine: Engine, queue: asyncio.Queue
