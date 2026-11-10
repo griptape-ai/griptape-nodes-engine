@@ -8,6 +8,8 @@
 | `sessions/<id>/clients/<id>/response` | the results of one client's own requests |
 | `clients/<id>/response` | the same, for a client that knows no session, such as a `RequestClient` given none |
 | `sessions/<id>/workflows/<id>/events` | one open workflow's broadcast results and execution events |
+| `sessions/<id>/workers/<id>/request` | requests to one worker engine of the session |
+| `sessions/<id>/workers/<id>/response` | that worker's results |
 | `engines/<id>/request` | requests addressed to one engine |
 | `engines/<id>/response` | replies to one engine's requests, or the session topic's traffic with no session |
 """
@@ -60,6 +62,16 @@ def engine_response_topic(engine_id: str) -> str:
 def engine_topic_prefix(engine_id: str) -> str:
     """The prefix of every topic addressed to one engine, such as replies to its requests."""
     return f"engines/{engine_id}/"
+
+
+def worker_request_topic(session_id: str | None, worker_engine_id: str) -> str:
+    """Topic one worker engine of the session receives requests on."""
+    return f"sessions/{session_id}/workers/{worker_engine_id}/request"
+
+
+def worker_response_topic(session_id: str | None, worker_engine_id: str) -> str:
+    """Topic one worker engine of the session sends its results on."""
+    return f"sessions/{session_id}/workers/{worker_engine_id}/response"
 
 
 def worker_engine_id_of_topic(topic: str) -> str | None:
