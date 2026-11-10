@@ -137,6 +137,7 @@ class TestEngineHeartbeatOpenWorkflows:
             OpenWorkflowInfo(
                 workflow_id=workflow.workflow_id,
                 name=result.current_workflow or "",
+                display_name="only",
                 workflow_file_path=None,
                 is_saved=False,
                 has_active_flow=False,

@@ -230,6 +230,15 @@ class TestOpenWorkflowSaved:
         assert _lifecycle_events(queue) == []
 
 
+class TestOpenWorkflowDisplayName:
+    def test_a_new_workflow_reports_the_display_name_it_was_given(self, engine: Engine) -> None:
+        result = _send(engine, OpenWorkflowRequest(display_name="Shot 10 comp", create_flow=True)).result
+
+        assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
+        assert result.open_workflow.display_name == "Shot 10 comp"
+        assert result.open_workflow.name != "Shot 10 comp"
+
+
 class TestOpenWorkflowAlreadyOpen:
     def test_returns_it_unchanged_and_announces_nothing(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue

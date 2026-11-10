@@ -824,6 +824,7 @@ class Engine:
         return OpenWorkflowInfo(
             workflow_id=workflow.workflow_id,
             name=entry.name,
+            display_name=entry.metadata.name,
             workflow_file_path=file_path,
             is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
