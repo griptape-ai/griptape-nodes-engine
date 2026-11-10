@@ -226,8 +226,8 @@ class OpenWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 class WorkflowNotFoundResultFailure(OpenWorkflowResultFailure):
     """No workflow has the id or name OpenWorkflowRequest named.
 
-    Workflow ids last only until the engine restarts, so a client that gets this for an unsaved
-    workflow's id has lost that workflow.
+    An unsaved workflow's id names nothing once it closes or the engine restarts, so a client that
+    gets this for one has lost that workflow.
     """
 
 
