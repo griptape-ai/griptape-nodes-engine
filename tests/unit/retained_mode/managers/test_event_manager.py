@@ -48,12 +48,13 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     EventManager,
     EventTranslationContext,
     ResultContext,
+    _RequestWorkflow,
     current_request_sender,
     current_request_type,
     require_request_sender,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
@@ -2388,31 +2389,28 @@ class TestNodeProcessEventTranslation:
 
 
 class TestResultWorkflowId:
-    """A result names the envelope's workflow, else the workflow the request was bound to."""
+    """A result names the workflow dispatch ran its request in, or what a refused envelope named."""
 
-    def test_the_envelopes_workflow_wins_over_the_binding(self) -> None:
+    def test_the_workflow_dispatch_bound_wins_over_the_envelope(self) -> None:
         bound = MagicMock(spec=WorkflowRuntime, workflow_id="bound")
-        token = bound_workflow.set(bound)
-        try:
-            assert EventManager._result_workflow_id(ResultContext(open_workflow_id="named")) == "named"
-        finally:
-            bound_workflow.reset(token)
+        request_workflow = _RequestWorkflow(binding=bound, workflow=bound)
 
-    def test_with_no_envelope_id_the_bound_workflow_is_named(self) -> None:
-        bound = MagicMock(spec=WorkflowRuntime, workflow_id="bound")
-        token = bound_workflow.set(bound)
-        try:
-            assert EventManager._result_workflow_id(ResultContext()) == "bound"
-        finally:
-            bound_workflow.reset(token)
+        workflow_id = EventManager._result_workflow_id(request_workflow, ResultContext(open_workflow_id="named"))
+
+        assert workflow_id == "bound"
 
     @pytest.mark.parametrize("binding", [None, NO_WORKFLOW])
     def test_a_request_bound_to_no_workflow_names_none(self, binding: object) -> None:
-        token = bound_workflow.set(binding)  # pyright: ignore[reportArgumentType]
-        try:
-            assert EventManager._result_workflow_id(ResultContext()) is None
-        finally:
-            bound_workflow.reset(token)
+        request_workflow = _RequestWorkflow(binding=binding, workflow=None)  # pyright: ignore[reportArgumentType]
+
+        workflow_id = EventManager._result_workflow_id(request_workflow, ResultContext(open_workflow_id="named"))
+
+        assert workflow_id is None
+
+    def test_a_request_refused_before_dispatch_decided_names_its_envelopes_workflow(self) -> None:
+        workflow_id = EventManager._result_workflow_id(None, ResultContext(open_workflow_id="named"))
+
+        assert workflow_id == "named"
 
 
 class _RecordingWorkerRequestClient:

@@ -72,6 +72,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryResultSuccess,
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultSuccess,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
     SaveWorkflowRequest,
@@ -932,6 +934,58 @@ class TestOpenAndSaveResultsReportTheOpenWorkflow:
         assert loaded.open_workflow.name == saved.workflow_name
         assert loaded.open_workflow.workflow_file_path is not None
         assert loaded.open_workflow.has_active_flow
+
+    def test_a_load_into_the_open_workflow_reports_it(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "saved")
+        target = project_engine.handle_request(SetWorkflowContextRequest(display_name="target"))
+        assert isinstance(target, SetWorkflowContextSuccess), target.result_details
+        assert target.workflow_id is not None
+
+        result_event = asyncio.run(
+            project_engine.event_manager.ahandle_request(
+                RunWorkflowWithCurrentStateRequest(file_path=saved.file_path),
+                result_context=ResultContext(open_workflow_id=target.workflow_id),
+            )
+        )
+
+        loaded = result_event.result
+        assert isinstance(loaded, RunWorkflowWithCurrentStateResultSuccess), loaded.result_details
+        assert loaded.open_workflow is not None
+        assert loaded.open_workflow.workflow_id == target.workflow_id
+        assert loaded.open_workflow.has_active_flow
+
+
+class TestHostResultsNameNoWorkflow:
+    """A move or delete runs in no workflow, so its result's envelope names none, even for the open workflow."""
+
+    def test_a_move_of_the_open_workflow_names_none(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "moved")
+        saved = _save(project_engine)
+
+        result_event = asyncio.run(
+            project_engine.event_manager.ahandle_request(
+                MoveWorkflowRequest(workflow_name=saved.workflow_name, target_directory="elsewhere"),
+                result_context=ResultContext(open_workflow_id=workflow_id),
+            )
+        )
+
+        assert result_event.succeeded(), result_event.result.result_details
+        assert result_event.open_workflow_id is None
+
+    def test_a_delete_of_the_open_workflow_closes_it_and_names_none(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "deleted")
+        saved = _save(project_engine)
+
+        result_event = asyncio.run(
+            project_engine.event_manager.ahandle_request(
+                DeleteWorkflowRequest(name=saved.workflow_name),
+                result_context=ResultContext(open_workflow_id=workflow_id),
+            )
+        )
+
+        assert result_event.succeeded(), result_event.result.result_details
+        assert result_event.open_workflow_id is None
+        assert project_engine.open_workflows.all_open() == []
 
 
 class TestIdentityAcrossTheWorkflowLifecycle:
