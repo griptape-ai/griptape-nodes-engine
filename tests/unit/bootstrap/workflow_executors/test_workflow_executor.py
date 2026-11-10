@@ -208,13 +208,14 @@ class _CliOnlyExecutor(WorkflowExecutor):
 class TestWorkflowExecutorCli:
     """Tests for the executor-level CLI surface introduced for issue #4599."""
 
-    def test_add_cli_arguments_registers_storage_backend_with_default_local(self) -> None:
+    def test_add_cli_arguments_registers_storage_backend_with_no_default(self) -> None:
+        # No default, so an omitted flag keeps the configured storage backend.
         parser = ArgumentParser()
         WorkflowExecutor.add_cli_arguments(parser)
 
         args = parser.parse_args([])
 
-        assert args.storage_backend == StorageBackend.LOCAL.value
+        assert args.storage_backend is None
 
     def test_add_cli_arguments_storage_backend_accepts_gtc(self) -> None:
         parser = ArgumentParser()
