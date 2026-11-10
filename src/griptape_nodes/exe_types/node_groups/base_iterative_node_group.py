@@ -70,37 +70,30 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
     ) -> None:
         super().__init__(name, metadata)
 
-        # Top-level control flow ports — wires this group into a control chain
-        self.exec_in = ControlParameterInput(
-            tooltip="Start the loop",
-            name="exec_in",
+        # The group's one control pair is the loop's entry and exit; label it for what it means here.
+        # Until #6250 the loop added a second pair under these names beside the base's "Flow In" /
+        # "Flow Out", and only this pair was ever read, so a chain wired through "Flow Out" stalled.
+        self.exec_in = self.control_in
+        self.exec_in.tooltip = "Wire the previous node's control output here to start the loop."
+        self.exec_in.display_name = "Start Loop"
+        self.exec_out = self.control_out
+        self.exec_out.tooltip = (
+            "Fires once after every iteration has finished. Wire the next node's control input here."
         )
-        self.exec_in.ui_options = {"display_name": "Start Loop"}
-        self.add_parameter(self.exec_in)
-        # No ordering needed here: the renderer pins control ports to the top of a rail by parameter
-        # type, and the rail list is an unordered membership set (see LEFT_PARAMETERS_KEY).
-        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.exec_in.name)
+        self.exec_out.display_name = "On Complete"
 
         # Per-iteration control output — pairs visually with exec_in on the LEFT rail.
         # Connect this to the first body node to make that node each iteration's entry point.
         # If unconnected, executor falls back to implicit child-discovery.
         self.on_each = ControlParameterOutput(
-            tooltip="Fired at the start of each iteration. Connect to the first node in the loop body.",
+            tooltip="Fires at the start of each iteration. Connect to the first node inside the loop body.",
             name="on_each",
         )
         self.on_each.ui_options = {"display_name": "On Each"}
         self.add_parameter(self.on_each)
+        # No ordering needed here: the renderer pins control ports to the top of a rail by parameter
+        # type, and the rail list is an unordered membership set (see LEFT_PARAMETERS_KEY).
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.on_each.name)
-
-        self.exec_out = ControlParameterOutput(
-            tooltip="Fired after all iterations complete",
-            name="exec_out",
-        )
-        self.exec_out.ui_options = {"display_name": "On Complete"}
-        self.add_parameter(self.exec_out)
-        # As with exec_in, exec_out reaches the top of the right rail by being a control port, not by
-        # its position in this list.
-        self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.exec_out.name)
 
         # Initialize iteration state
         self._items = []
@@ -215,8 +208,8 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 self.hide_parameter_by_name(self.break_loop.name)
 
     def get_next_control_output(self) -> Parameter | None:
-        # Without this override the base returns None and the DAG executor stops at the group
-        # after all iterations complete, never advancing to whatever is wired downstream of exec_out.
+        # Say which port the chain continues from once every iteration has finished, rather than
+        # leaning on the base's first-control-output scan and the order ports happen to be added in.
         return self.exec_out
 
     @abstractmethod

@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 NODE_GROUP_FLOW = "NodeGroupFlow"
+# What the group's control pair was called between engine PRs #5236 and #6250, mapped to the standard
+# names it carries now. Loop groups had both pairs in that window and only exec_in / exec_out worked.
+LEGACY_CONTROL_PORT_NAMES = {
+    "group_exec_in": "exec_in",
+    "group_exec_out": "exec_out",
+}
 # Name which of the group's parameters sit on its left and right rail. Semantically
 # these are sets, not lists (list only for serialization): the editor only ever tests
 # parameter membership.
@@ -92,11 +98,18 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         metadata: dict[Any, Any] | None = None,
     ) -> None:
         super().__init__(name, metadata)
-        self._dedupe_side_parameter_metadata()
-        self.control_in = ControlParameterInput(name="group_exec_in")
+        self._repair_side_parameter_metadata()
+        # One entry port and one exit port, under the names every other control node uses. A subclass
+        # whose entry and exit mean something more specific relabels these (as SuccessFailureNode does
+        # with "Succeeded") rather than adding a pair of its own.
+        self.control_in = ControlParameterInput(
+            tooltip="Wire the previous node's control output here to run this group after it.",
+        )
         self.add_parameter(self.control_in)
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.control_in.name)
-        self.control_out = ControlParameterOutput(name="group_exec_out")
+        self.control_out = ControlParameterOutput(
+            tooltip="Fires once the group has finished. Wire the next node's control input here.",
+        )
         self.add_parameter(self.control_out)
         self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.control_out.name)
         self.execution_environment = Parameter(
@@ -292,21 +305,30 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             "parameter_names": parameter_names,
         }
 
-    def _dedupe_side_parameter_metadata(self) -> None:
-        """Drop duplicate rail entries carried by a workflow saved by an older engine.
+    def _repair_side_parameter_metadata(self) -> None:
+        """Clean rail entries carried by a workflow saved by an older engine.
 
-        This is cleanup for workflows created before #5236; or after #5564 yet prior
-        to libraries adopting it (in particular, griptape-nodes-library-standard#628).
+        Duplicates: workflows created before #5236, or after #5564 yet prior to libraries adopting
+        it (in particular, griptape-nodes-library-standard#628). Older engines and node libraries
+        appended their built-in names on every construction and the repeats were saved in the
+        workflow metadata, growing indefinitely.
 
-        Older engines and node libraries appended their built-in names on every
-        construction and the repeats were saved in the workflow metadata, growing
-        indefinitely.
+        Retired names: between #5236 and #6250 the group's control pair was called group_exec_in /
+        group_exec_out. Those names are dropped here; the current pair re-registers itself.
         """
         for metadata_key in (LEFT_PARAMETERS_KEY, RIGHT_PARAMETERS_KEY):
             side_parameters: list[str] | None = self.metadata.get(metadata_key)
             if side_parameters is None:
                 continue
-            side_parameters[:] = dict.fromkeys(side_parameters)
+            side_parameters[:] = [
+                name for name in dict.fromkeys(side_parameters) if name not in LEGACY_CONTROL_PORT_NAMES
+            ]
+
+    def get_parameter_by_name(self, param_name: str) -> Parameter | None:
+        # Connections in a workflow saved between #5236 and #6250 name the control pair group_exec_in /
+        # group_exec_out. Answer with the port that replaced each so those workflows load and run; the
+        # connection is recorded against the Parameter, so the next save writes the current name.
+        return super().get_parameter_by_name(LEGACY_CONTROL_PORT_NAMES.get(param_name, param_name))
 
     def _register_side_parameter(self, metadata_key: str, parameter_name: str) -> None:
         """Record that a parameter belongs on the group's left or right rail.
