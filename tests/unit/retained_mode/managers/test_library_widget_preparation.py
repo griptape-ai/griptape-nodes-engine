@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.managers.library import widget_preparation as widget_preparation_module
 from griptape_nodes.retained_mode.managers.library.widget_preparation import (
+    INSTALL_ARGS,
     WidgetPreparationStatus,
     build_child_environment,
 )
@@ -49,6 +50,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WIDGET_TOOLING_NODE_EXECUTABLE_KEY,
     WIDGET_TOOLING_NPM_EXECUTABLE_KEY,
 )
+from griptape_nodes.utils.async_utils import run_process_tree
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -63,6 +65,7 @@ WIDGET_PATH = f"{WIDGET_ROOT}/dist/Example.js"
 NODE_PATH = shutil.which("node")
 NPM_PATH = shutil.which("npm")
 GIT_PATH = shutil.which("git")
+PREPARATION_MODULE = "griptape_nodes.retained_mode.managers.library.widget_preparation"
 needs_node = pytest.mark.skipif(NODE_PATH is None or NPM_PATH is None, reason="needs node and npm on PATH")
 needs_git = pytest.mark.skipif(GIT_PATH is None, reason="needs git on PATH")
 
@@ -495,14 +498,14 @@ class TestBuilding:
         assert engine.library_manager.widget_preparation.is_prepared(LIBRARY_NAME, library_dir)
 
     @pytest.mark.asyncio
-    @pytest.mark.usefixtures("ready", "library_dir")
-    async def test_records_the_preparation_state(self, engine: Engine) -> None:
+    @pytest.mark.usefixtures("ready")
+    async def test_records_the_preparation_state(self, engine: Engine, library_dir: Path) -> None:
         preparation = engine.library_manager.widget_preparation
 
         result = await _prepare(engine)
 
         assert isinstance(result, PrepareLibraryWidgetsResultSuccess)
-        state = json.loads(preparation.state_path(LIBRARY_NAME).read_text(encoding="utf-8"))
+        state = json.loads(preparation.state_path(LIBRARY_NAME, library_dir).read_text(encoding="utf-8"))
         assert state["status"] == WidgetPreparationStatus.PREPARED
         assert state["revision"] == "local"
         assert state["node_version"] == result.node_version
@@ -594,7 +597,7 @@ class TestBuilding:
             await task
 
         assert await _process_exits(int(pid_file.read_text(encoding="utf-8")))
-        state = json.loads(preparation.state_path(LIBRARY_NAME).read_text(encoding="utf-8"))
+        state = json.loads(preparation.state_path(LIBRARY_NAME, library_dir).read_text(encoding="utf-8"))
         assert state["status"] == WidgetPreparationStatus.FAILED
         assert state["stage"] == "build"
         assert not preparation.is_prepared(LIBRARY_NAME, library_dir)
@@ -658,7 +661,7 @@ class TestPreparedState:
         assert isinstance(result, PrepareLibraryWidgetsResultFailure)
         assert result.reason == WidgetPreparationFailureReason.NOT_AUTHORIZED
         assert not preparation.is_prepared(LIBRARY_NAME, library_dir)
-        state = json.loads(preparation.state_path(LIBRARY_NAME).read_text(encoding="utf-8"))
+        state = json.loads(preparation.state_path(LIBRARY_NAME, library_dir).read_text(encoding="utf-8"))
         assert state["status"] == WidgetPreparationStatus.STALE
 
     @pytest.mark.asyncio
@@ -705,6 +708,151 @@ class TestPreparedState:
 
     def test_a_library_never_prepared_is_not_prepared(self, engine: Engine, library_dir: Path) -> None:
         assert not engine.library_manager.widget_preparation.is_prepared(LIBRARY_NAME, library_dir)
+
+
+@needs_node
+class TestNothingRunsWithoutPermission:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_an_unauthorised_request_starts_no_process(self, engine: Engine) -> None:
+        """Valid tooling and the beta on still run nothing, not even `node --version`, until allowed."""
+        with patch(f"{PREPARATION_MODULE}.run_process_tree", new=AsyncMock()) as run:
+            result = await _prepare(engine, allow=False)
+
+        _assert_refused(result, WidgetPreparationFailureReason.NOT_AUTHORIZED)
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unauthorised_checkout_starts_no_process(self, engine: Engine, ready: Path) -> None:
+        preparation = engine.library_manager.widget_preparation
+        with patch(f"{PREPARATION_MODULE}.run_process_tree", new=AsyncMock()) as run:
+            result = await preparation.prepare_after_checkout(LIBRARY_NAME, ready, allow_build_execution=False)
+
+        _assert_refused(result, WidgetPreparationFailureReason.NOT_AUTHORIZED)
+        run.assert_not_called()
+
+
+def _failing_state_replace(fail_on_call: int) -> object:
+    """A Path.replace that fails on the `fail_on_call`-th state file write and passes the rest through."""
+    original_replace = Path.replace
+    calls = {"state": 0}
+
+    def replace(self: Path, target: Path) -> Path:
+        if self.name.endswith(".json.tmp"):
+            calls["state"] += 1
+            if calls["state"] == fail_on_call:
+                msg = "No space left on device"
+                raise OSError(msg)
+        return original_replace(self, target)
+
+    return replace
+
+
+@needs_node
+class TestStateThatCannotBeRecorded:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_failing_to_record_preparing_fails_before_npm_runs(self, engine: Engine) -> None:
+        with (
+            patch.object(Path, "replace", new=_failing_state_replace(fail_on_call=1)),
+            patch(f"{PREPARATION_MODULE}.run_process_tree", wraps=run_process_tree) as run,
+        ):
+            result = await _prepare(engine)
+
+        failure = _assert_refused(result, WidgetPreparationFailureReason.BUILD_FAILED)
+        assert failure.stage == "state"
+        npm_runs = [call for call in run.call_args_list if INSTALL_ARGS[0] in call.args[0]]
+        assert npm_runs == []
+
+    @pytest.mark.asyncio
+    async def test_failing_to_mark_a_checkout_stale_fails_before_npm_runs(
+        self, engine: Engine, ready: Path, library_dir: Path
+    ) -> None:
+        preparation = engine.library_manager.widget_preparation
+        assert isinstance(await _prepare(engine), PrepareLibraryWidgetsResultSuccess)
+
+        with (
+            patch.object(Path, "replace", new=_failing_state_replace(fail_on_call=1)),
+            patch(f"{PREPARATION_MODULE}.run_process_tree", new=AsyncMock()) as run,
+        ):
+            result = await preparation.prepare_after_checkout(LIBRARY_NAME, ready, allow_build_execution=True)
+
+        failure = _assert_refused(result, WidgetPreparationFailureReason.BUILD_FAILED)
+        assert failure.stage == "state"
+        run.assert_not_called()
+        assert preparation.state_path(LIBRARY_NAME, library_dir).exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_failing_to_record_prepared_is_a_failure(self, engine: Engine, library_dir: Path) -> None:
+        preparation = engine.library_manager.widget_preparation
+        with patch.object(Path, "replace", new=_failing_state_replace(fail_on_call=2)):
+            result = await _prepare(engine)
+
+        failure = _assert_refused(result, WidgetPreparationFailureReason.BUILD_FAILED)
+        assert failure.stage == "state"
+        assert not preparation.is_prepared(LIBRARY_NAME, library_dir)
+
+
+@needs_node
+class TestCopiesOfOneLibrary:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_a_second_copy_leaves_the_state_of_the_first_alone(
+        self, engine: Engine, library_dir: Path, tmp_path: Path
+    ) -> None:
+        preparation = engine.library_manager.widget_preparation
+        assert isinstance(await _prepare(engine), PrepareLibraryWidgetsResultSuccess)
+        copy_dir = tmp_path / "copy_of_widget_library"
+        copy_manifest = _write_manifest(copy_dir, widget_build=WidgetBuildMetadata(mode="source", root=WIDGET_ROOT))
+        _write_package(copy_dir / WIDGET_ROOT)
+
+        result = await preparation.prepare_after_checkout(LIBRARY_NAME, copy_manifest, allow_build_execution=False)
+
+        _assert_refused(result, WidgetPreparationFailureReason.NOT_AUTHORIZED)
+        assert preparation.state_path(LIBRARY_NAME, copy_dir) != preparation.state_path(LIBRARY_NAME, library_dir)
+        assert preparation.is_prepared(LIBRARY_NAME, library_dir)
+        assert not preparation.is_prepared(LIBRARY_NAME, copy_dir)
+
+
+@needs_node
+class TestNodeModulesContainment:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_node_modules_linked_outside_the_package_is_refused(
+        self, engine: Engine, library_dir: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "precious"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep", encoding="utf-8")
+        (library_dir / WIDGET_ROOT / "node_modules").symlink_to(outside, target_is_directory=True)
+
+        with patch(f"{PREPARATION_MODULE}.run_process_tree", new=AsyncMock()) as run:
+            result = await _prepare(engine)
+
+        _assert_refused(result, WidgetPreparationFailureReason.INVALID_MANIFEST)
+        run.assert_not_called()
+        assert (outside / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_node_modules_linked_inside_the_package_is_refused(self, engine: Engine, library_dir: Path) -> None:
+        package_dir = library_dir / WIDGET_ROOT
+        (package_dir / "elsewhere").mkdir()
+        (package_dir / "node_modules").symlink_to(package_dir / "elsewhere", target_is_directory=True)
+
+        result = await _prepare(engine)
+
+        _assert_refused(result, WidgetPreparationFailureReason.INVALID_MANIFEST)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("ready")
+    async def test_an_existing_node_modules_directory_is_fine(self, engine: Engine, library_dir: Path) -> None:
+        (library_dir / WIDGET_ROOT / "node_modules").mkdir()
+
+        result = await _prepare(engine)
+
+        assert isinstance(result, PrepareLibraryWidgetsResultSuccess), result.result_details
 
 
 class TestChildEnvironment:

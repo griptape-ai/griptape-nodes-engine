@@ -172,3 +172,24 @@ class TestRunProcessTree:
                 break
             await asyncio.sleep(0.05)
         assert not _process_is_running(grandchild_pid)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(sys.platform == "win32", reason="checks the process group with POSIX signals")
+    async def test_a_leader_that_exits_is_done_even_when_a_descendant_holds_the_output_open(
+        self, tmp_path: Path
+    ) -> None:
+        """The leader's exit ends the run; whatever it left behind in its group is stopped."""
+        pid_file = tmp_path / "descendant.pid"
+        script = f'sleep 30 & echo $! > "{pid_file}"; echo done; exit 0'
+
+        result = await run_process_tree(["/bin/sh", "-c", script], cwd=tmp_path, env=dict(os.environ), timeout=3)
+
+        assert result.timed_out is False
+        assert result.returncode == 0
+        assert "done" in result.output
+        descendant_pid = int(pid_file.read_text())
+        for _ in range(100):
+            if not _process_is_running(descendant_pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _process_is_running(descendant_pid)

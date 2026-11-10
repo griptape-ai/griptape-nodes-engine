@@ -14,24 +14,27 @@ user's permissions. So it runs only when all of these hold, checked in this orde
 2. The "Library widget builds" beta feature is on.
 3. The user set both `widget_tooling.node_executable` and `widget_tooling.npm_executable`. The
    engine never looks Node.js up on PATH and never downloads it.
-4. Both are absolute paths to existing files, and they report Node.js 20 or later and npm 10 or
-   later.
+4. Both are absolute paths to existing files, and npm's entry point can be found from the npm.
 5. The request says the user agreed to run the build (`allow_build_execution`). Neither the beta
    feature nor the configured tools imply it.
-6. The widget package is complete and stays inside the library, symlinks included.
+6. The widget package is complete and stays inside the library, symlinks included, and its
+   `node_modules`, which `npm ci` deletes, is not a link.
+7. The configured tools report Node.js 20 or later and npm 10 or later. This is the first step
+   that runs anything, so it waits for the user's agreement.
 
-Every refusal happens before anything runs. The build itself installs with `--ignore-scripts`, so
+Every refusal happens before npm runs. The build itself installs with `--ignore-scripts`, so
 no dependency's install script runs, and runs `npm run build --ignore-scripts`, so the package's
 `prebuild` and `postbuild` do not run either. Both commands run as the configured node executing
 npm's own JavaScript entry point, without a shell, in a new process group, with an environment
 built from an allowlist: no credentials or engine settings reach them. A stage that runs past its
 timeout, or a cancelled preparation, stops the whole process group.
 
-The outcome is recorded per library under the engine's state directory, together with the
-revision it was built from: the git HEAD commit, or "local" for a library that is not a git
+The outcome is recorded per copy of a library (its name and its directory) under the engine's
+state directory, together with the revision it was built from: the git HEAD commit, or "local" for a library that is not a git
 checkout. `is_prepared` trusts only a successful record for the revision on disk now. A git change
 marks the record stale before anything else, so a later refusal or failure leaves the widgets
-withheld rather than publishing a build of other source. Edits to a local checkout without a new
+withheld rather than publishing a build of other source. A record that cannot be written stops
+the preparation, so an earlier success never outlives the files it describes. Edits to a local checkout without a new
 commit are not detected.
 """
 
@@ -94,6 +97,9 @@ STATE_DIR_NAME = "widget_preparation"
 
 INSTALL_STAGE = "install"
 BUILD_STAGE = "build"
+# The stage reported when the preparation state could not be recorded.
+STATE_STAGE = "state"
+NODE_MODULES_DIR = "node_modules"
 INSTALL_ARGS = ("ci", "--include=dev", "--include=optional", "--ignore-scripts")
 BUILD_ARGS = ("run", "build", "--ignore-scripts")
 
@@ -215,8 +221,8 @@ def resolve_npm_cli(npm_executable: Path) -> Path | None:
 class LibraryWidgetPreparation(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # One lock per library name, so two preparations of one library never share its files.
-        self._locks: dict[str, asyncio.Lock] = {}
+        # One lock per copy of a library, so two preparations of one copy never share its files.
+        self._locks: dict[Path, asyncio.Lock] = {}
         event_manager.register_request_handlers(self)
 
     @handles(PrepareLibraryWidgetsRequest)
@@ -236,10 +242,11 @@ class LibraryWidgetPreparation(EngineScoped):
                 "the sandbox library has no widget package to build",
             )
 
-        async with self._lock_for(library_name):
+        library_json_path = Path(library_info.library_path)
+        async with self._lock_for(library_name, library_json_path.parent):
             return await self._prepare(
                 library_name,
-                Path(library_info.library_path),
+                library_json_path,
                 allow_build_execution=request.allow_build_execution,
             )
 
@@ -273,11 +280,19 @@ class LibraryWidgetPreparation(EngineScoped):
         # about, so the state is kept under that name.
         state_name = schema.name if schema is not None else next(iter(names))
 
-        async with self._lock_for(state_name):
-            for name in names:
-                self._mark_stale(name)
+        library_dir = library_json_path.parent
+        async with self._lock_for(state_name, library_dir):
+            unrecorded = [name for name in sorted(names) if not self._mark_stale(name, library_dir)]
             if schema is None or not self._builds_from_source(schema):
                 return None
+            if unrecorded:
+                return self._failure(
+                    state_name,
+                    WidgetPreparationFailureReason.BUILD_FAILED,
+                    "the earlier build could not be marked out of date, so building again could leave it "
+                    "published over half-built files. Check that the engine's state directory is writable",
+                    stage=STATE_STAGE,
+                )
             return await self._prepare(state_name, library_json_path, allow_build_execution=allow_build_execution)
 
     def is_prepared(self, library_name: str, library_dir: Path) -> bool:
@@ -285,7 +300,7 @@ class LibraryWidgetPreparation(EngineScoped):
 
         Blocking: may run git. Callers on the event loop run this in a thread.
         """
-        state = self._read_state(library_name)
+        state = self._read_state(library_name, library_dir)
         if state is None:
             return False
         if state.get("status") != WidgetPreparationStatus.PREPARED:
@@ -296,11 +311,15 @@ class LibraryWidgetPreparation(EngineScoped):
             return False
         return state.get("revision") == self._revision(library_dir)
 
-    def state_path(self, library_name: str) -> Path:
-        """Where the outcome of preparing this library's widgets is recorded."""
-        name_hash = hashlib.sha256(library_name.encode("utf-8")).hexdigest()[:8]
+    def state_path(self, library_name: str, library_dir: Path) -> Path:
+        """Where the outcome of preparing the widgets of this copy of the library is recorded.
+
+        Two copies of one library in different directories keep separate records.
+        """
+        identity = f"{library_name}\0{canonicalize_for_identity(library_dir)}"
+        identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
         slug = library_config_slug(library_name)
-        file_stem = f"{slug}-{name_hash}" if slug else name_hash
+        file_stem = f"{slug}-{identity_hash}" if slug else identity_hash
         return engine_state_dir() / STATE_DIR_NAME / f"{file_stem}.json"
 
     async def _prepare(  # noqa: PLR0911 (one early return per gate, in order)
@@ -328,9 +347,9 @@ class LibraryWidgetPreparation(EngineScoped):
         if isinstance(configured, PrepareLibraryWidgetsResultFailure):
             return configured
 
-        tooling = await self._validate_tooling(library_name, configured)
-        if isinstance(tooling, PrepareLibraryWidgetsResultFailure):
-            return tooling
+        npm_cli = await self._resolve_tooling_paths(library_name, configured)
+        if isinstance(npm_cli, PrepareLibraryWidgetsResultFailure):
+            return npm_cli
 
         if not allow_build_execution:
             return self._failure(
@@ -353,6 +372,11 @@ class LibraryWidgetPreparation(EngineScoped):
                 result_details=str(e),
             )
 
+        # Asking the tools for their versions runs them, so it waits for the user's agreement.
+        tooling = await self._check_tooling_versions(library_name, configured, npm_cli)
+        if isinstance(tooling, PrepareLibraryWidgetsResultFailure):
+            return tooling
+
         library_dir = library_json_path.parent
         revision = await asyncio.to_thread(self._revision, library_dir)
         return await self._build(library_name, library_dir, package_dir, tooling, revision)
@@ -366,7 +390,7 @@ class LibraryWidgetPreparation(EngineScoped):
         revision: str,
     ) -> PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure:
         """Run `npm ci` and then the build script, recording the outcome."""
-        self._write_state(
+        preparing_recorded = self._write_state(
             library_name=library_name,
             library_dir=library_dir,
             status=WidgetPreparationStatus.PREPARING,
@@ -374,6 +398,14 @@ class LibraryWidgetPreparation(EngineScoped):
             stage=None,
             tooling=tooling,
         )
+        if not preparing_recorded:
+            return self._failure(
+                library_name,
+                WidgetPreparationFailureReason.BUILD_FAILED,
+                "the build could not be recorded as started, so an earlier build would stay published over "
+                "half-built files. Check that the engine's state directory is writable",
+                stage=STATE_STAGE,
+            )
         env = build_child_environment(tooling.node)
         outputs: list[str] = []
         for stage, npm_args in ((INSTALL_STAGE, INSTALL_ARGS), (BUILD_STAGE, BUILD_ARGS)):
@@ -447,7 +479,8 @@ class LibraryWidgetPreparation(EngineScoped):
                 )
             outputs.append(result.output)
 
-        self._write_state(
+        output = "\n".join(outputs)[-OUTPUT_LIMIT_CHARS:]
+        prepared_recorded = self._write_state(
             library_name=library_name,
             library_dir=library_dir,
             status=WidgetPreparationStatus.PREPARED,
@@ -455,13 +488,22 @@ class LibraryWidgetPreparation(EngineScoped):
             stage=None,
             tooling=tooling,
         )
+        if not prepared_recorded:
+            return self._failure(
+                library_name,
+                WidgetPreparationFailureReason.BUILD_FAILED,
+                "the build finished but could not be recorded, so its widgets stay unpublished. Check that the "
+                "engine's state directory is writable",
+                stage=STATE_STAGE,
+                output=output,
+            )
         details = f"Built the widgets of Library '{library_name}' (revision {revision})."
         return PrepareLibraryWidgetsResultSuccess(
             library_name=library_name,
             revision=revision,
             node_version=tooling.node_version,
             npm_version=tooling.npm_version,
-            output="\n".join(outputs)[-OUTPUT_LIMIT_CHARS:],
+            output=output,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
@@ -496,10 +538,10 @@ class LibraryWidgetPreparation(EngineScoped):
             npm=Path(values[WIDGET_TOOLING_NPM_EXECUTABLE_KEY]),
         )
 
-    async def _validate_tooling(
+    async def _resolve_tooling_paths(
         self, library_name: str, configured: ConfiguredTooling
-    ) -> WidgetTooling | PrepareLibraryWidgetsResultFailure:
-        """Check that both paths are usable files and report new enough versions."""
+    ) -> Path | PrepareLibraryWidgetsResultFailure:
+        """Check that both paths are usable files and find npm's entry point, without running either."""
         for key, path in (
             (WIDGET_TOOLING_NODE_EXECUTABLE_KEY, configured.node),
             (WIDGET_TOOLING_NPM_EXECUTABLE_KEY, configured.npm),
@@ -518,7 +560,12 @@ class LibraryWidgetPreparation(EngineScoped):
                 f"npm's entry point (npm-cli.js) could not be found from {WIDGET_TOOLING_NPM_EXECUTABLE_KEY} "
                 f"'{configured.npm}'. Set it to the npm inside a Node.js install, or to its npm-cli.js",
             )
+        return npm_cli
 
+    async def _check_tooling_versions(
+        self, library_name: str, configured: ConfiguredTooling, npm_cli: Path
+    ) -> WidgetTooling | PrepareLibraryWidgetsResultFailure:
+        """Run both tools for their versions and check they are new enough."""
         node_version = await self._tool_version(configured.node, [str(configured.node), "--version"])
         node_problem = self._version_problem("Node.js", node_version, MINIMUM_NODE_MAJOR)
         if node_problem is not None:
@@ -584,6 +631,14 @@ class LibraryWidgetPreparation(EngineScoped):
                 f"metadata.widget_build.root '{widget_build.root}' is not a directory",
             )
 
+        node_modules_problem = self._node_modules_problem(package_dir)
+        if node_modules_problem is not None:
+            return self._failure(
+                library_name,
+                WidgetPreparationFailureReason.INVALID_MANIFEST,
+                f"'{widget_build.root}/{NODE_MODULES_DIR}' {node_modules_problem}",
+            )
+
         for file_name in (PACKAGE_JSON, PACKAGE_LOCK_JSON):
             file_path = package_dir / file_name
             if not file_path.is_file() or not canonicalize_for_identity(file_path).is_relative_to(library_dir):
@@ -613,16 +668,17 @@ class LibraryWidgetPreparation(EngineScoped):
             return None
         return metadata_result.library_schema
 
-    def _lock_for(self, library_name: str) -> asyncio.Lock:
-        return self._locks.setdefault(library_name, asyncio.Lock())
+    def _lock_for(self, library_name: str, library_dir: Path) -> asyncio.Lock:
+        return self._locks.setdefault(self.state_path(library_name, library_dir), asyncio.Lock())
 
-    def _mark_stale(self, library_name: str) -> None:
-        state = self._read_state(library_name)
+    def _mark_stale(self, library_name: str, library_dir: Path) -> bool:
+        """Mark this copy's record stale. Returns False when a record exists but could not be updated."""
+        state = self._read_state(library_name, library_dir)
         if state is None:
-            return
+            return True
         state["status"] = WidgetPreparationStatus.STALE.value
         state["updated_at"] = datetime.now(tz=UTC).isoformat()
-        self._write_state_file(library_name, state)
+        return self._write_state_file(library_name, library_dir, state)
 
     def _write_state(  # noqa: PLR0913 (one argument per recorded field)
         self,
@@ -633,7 +689,8 @@ class LibraryWidgetPreparation(EngineScoped):
         revision: str,
         stage: str | None,
         tooling: WidgetTooling,
-    ) -> None:
+    ) -> bool:
+        """Record the preparation state. Returns whether it was written."""
         state = {
             "library_name": library_name,
             "library_dir": str(canonicalize_for_identity(library_dir)),
@@ -644,11 +701,11 @@ class LibraryWidgetPreparation(EngineScoped):
             "npm_version": tooling.npm_version,
             "updated_at": datetime.now(tz=UTC).isoformat(),
         }
-        self._write_state_file(library_name, state)
+        return self._write_state_file(library_name, library_dir, state)
 
-    def _write_state_file(self, library_name: str, state: dict[str, Any]) -> None:
-        """Replace the state file in one step, so a reader never sees half of it."""
-        state_path = self.state_path(library_name)
+    def _write_state_file(self, library_name: str, library_dir: Path, state: dict[str, Any]) -> bool:
+        """Replace the state file in one step, so a reader never sees half of it. Returns whether it was written."""
+        state_path = self.state_path(library_name, library_dir)
         temp_path = state_path.with_suffix(".json.tmp")
         try:
             state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -661,9 +718,11 @@ class LibraryWidgetPreparation(EngineScoped):
                 state_path,
                 e,
             )
+            return False
+        return True
 
-    def _read_state(self, library_name: str) -> dict[str, Any] | None:
-        state_path = self.state_path(library_name)
+    def _read_state(self, library_name: str, library_dir: Path) -> dict[str, Any] | None:
+        state_path = self.state_path(library_name, library_dir)
         if not state_path.exists():
             return None
         try:
@@ -743,6 +802,16 @@ class LibraryWidgetPreparation(EngineScoped):
             return "does not exist"
         if not path.is_file():
             return "is not a file"
+        return None
+
+    @staticmethod
+    def _node_modules_problem(package_dir: Path) -> str | None:
+        """Why the package's node_modules cannot be handed to `npm ci`, which deletes it, or None."""
+        node_modules = package_dir / NODE_MODULES_DIR
+        if node_modules.is_symlink() or node_modules.is_junction():
+            return f"is a link. npm ci deletes {NODE_MODULES_DIR}, so it must be a plain directory or absent"
+        if node_modules.exists() and not canonicalize_for_identity(node_modules).is_relative_to(package_dir):
+            return "resolves outside the widget package"
         return None
 
     @staticmethod

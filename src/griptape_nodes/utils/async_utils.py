@@ -28,6 +28,8 @@ PROCESS_TREE_DRAIN_SECONDS = 5.0
 # Default number of trailing output characters run_process_tree keeps.
 DEFAULT_OUTPUT_LIMIT_CHARS = 20_000
 _READ_CHUNK_BYTES = 65_536
+# How often to check whether a process, or a whole process group, has exited.
+_EXIT_POLL_SECONDS = 0.05
 
 
 @dataclass
@@ -209,8 +211,10 @@ async def run_process_tree(
     so a noisy command cannot grow memory without bound.
 
     The command starts in a new process group (a new session on POSIX), so the children it starts
-    are stopped with it. On a timeout the group is stopped and the result reports `timed_out`. If
-    the calling task is cancelled, the group is stopped before CancelledError propagates.
+    are stopped with it. The run ends when the command itself exits, even if something it started
+    still holds its output open; whatever is left of the group is then stopped. On a timeout the
+    group is stopped and the result reports `timed_out`. If the calling task is cancelled, the
+    group is stopped before CancelledError propagates.
 
     Args:
         args: The program and its arguments
@@ -250,67 +254,59 @@ async def run_process_tree(
     output = _OutputTail(output_limit)
     reader = asyncio.create_task(_read_into(process, output))
     try:
-        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=timeout)
-    except TimeoutError:
-        await terminate_process_tree(process)
-        await _finish_reading(reader)
-        return ProcessTreeResult(returncode=None, output=output.text(), timed_out=True)
+        leader_exited = await _wait_for_leader_exit(process, timeout)
     except asyncio.CancelledError:
         await terminate_process_tree(process)
         await _finish_reading(reader)
         raise
 
-    # A child the command left running in its group would keep the output pipe open and keep
-    # running after this returns, so whatever is left of the group is stopped too.
-    try:
-        await asyncio.wait_for(asyncio.shield(reader), timeout=PROCESS_TREE_DRAIN_SECONDS)
-    except TimeoutError:
-        await terminate_process_tree(process)
-        await _finish_reading(reader)
-
+    # Whatever the command left running in its group would keep the output pipe open and keep
+    # running after this returns, so the rest of the group is stopped either way.
+    await terminate_process_tree(process)
+    await _finish_reading(reader)
+    if not leader_exited:
+        return ProcessTreeResult(returncode=None, output=output.text(), timed_out=True)
     return ProcessTreeResult(returncode=process.returncode, output=output.text(), timed_out=False)
 
 
 async def terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     """Stop a process started by `run_process_tree` together with every process in its group.
 
+    Runs whether or not the process itself has exited, since its children may still be running.
     On POSIX sends SIGTERM to the group, then SIGKILL to whatever is left after a grace period.
-    On Windows runs `taskkill /T /F`, which ends the process and its descendants at once.
+    On Windows runs `taskkill /T /F` on the process's id, which ends it and its descendants.
     Does nothing for a process group that is already gone.
     """
+    # The group id is the leader's pid (it started a new session), and stays valid while any
+    # member is alive, even after the leader exited.
+    process_group_id = process.pid
     if sys.platform == "win32":
-        if process.returncode is None:
-            taskkill = await asyncio.create_subprocess_exec(
-                "taskkill",
-                "/T",
-                "/F",
-                "/PID",
-                str(process.pid),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await taskkill.wait()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(process.wait(), timeout=PROCESS_TREE_GRACE_SECONDS)
+        taskkill = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/T",
+            "/F",
+            "/PID",
+            str(process_group_id),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await taskkill.wait()
+        await _wait_bounded(process)
         return
 
-    # The group outlives its leader when children are still running, so it is signalled even
-    # after the leader exited.
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        await process.wait()
+    if not _signal_group(process_group_id, signal.SIGTERM):
+        await _wait_bounded(process)
         return
 
-    try:
-        await asyncio.wait_for(process.wait(), timeout=PROCESS_TREE_GRACE_SECONDS)
-    except TimeoutError:
-        logger.debug("Process group %s did not exit after SIGTERM; killing it.", process.pid)
+    if await _wait_for_group_exit(process_group_id, PROCESS_TREE_GRACE_SECONDS):
+        await _wait_bounded(process)
+        return
 
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    await process.wait()
+    logger.debug("Process group %s did not exit after SIGTERM; killing it.", process_group_id)
+    _signal_group(process_group_id, signal.SIGKILL)
+    await _wait_for_group_exit(process_group_id, PROCESS_TREE_GRACE_SECONDS)
+    await _wait_bounded(process)
 
 
 class _OutputTail:
@@ -334,6 +330,49 @@ async def _read_into(process: asyncio.subprocess.Process, output: _OutputTail) -
         return
     while chunk := await stream.read(_READ_CHUNK_BYTES):
         output.feed(chunk)
+
+
+async def _wait_for_leader_exit(process: asyncio.subprocess.Process, timeout: float) -> bool:  # noqa: ASYNC109 (a deadline for the leader alone, not for the caller)
+    """Wait until the process itself exits, without waiting for its output pipe to close.
+
+    `Process.wait()` also waits for every pipe to close, which a descendant still holding stdout
+    delays indefinitely. The transport records the exit code as soon as the process exits, so
+    polling it sees the exit on time. Returns whether the process exited within `timeout`.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while process.returncode is None:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(_EXIT_POLL_SECONDS, remaining))
+    return True
+
+
+def _signal_group(process_group_id: int, signal_number: int) -> bool:
+    """Send a signal to a process group. Returns False when the group no longer exists."""
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_for_group_exit(process_group_id: int, timeout: float) -> bool:  # noqa: ASYNC109 (a grace period, not a deadline for the caller)
+    """Poll until no process is left in the group. Returns whether that happened within `timeout`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while _signal_group(process_group_id, 0):
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(_EXIT_POLL_SECONDS)
+    return True
+
+
+async def _wait_bounded(process: asyncio.subprocess.Process) -> None:
+    """Let asyncio finish with a stopped process, without hanging on a pipe something still holds."""
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=PROCESS_TREE_DRAIN_SECONDS)
 
 
 async def _finish_reading(reader: asyncio.Task[None]) -> None:
