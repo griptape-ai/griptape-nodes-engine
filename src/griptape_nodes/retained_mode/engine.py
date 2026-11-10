@@ -19,6 +19,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -137,6 +138,18 @@ _root_engine_lock = threading.RLock()
 _root_engine_building = False
 
 
+@dataclass
+class OpeningWorkflow:
+    """A workflow `Engine.opening_workflow` opened to build into."""
+
+    workflow: WorkflowRuntime
+    abandoned: bool = False
+
+    def abandon(self) -> None:
+        """Close the workflow when the block ends, as a build that failed does."""
+        self.abandoned = True
+
+
 class EngineScoped:
     """Base for objects that belong to a single `Engine`.
 
@@ -250,6 +263,8 @@ class Engine:
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
         self._open_workflows = OpenWorkflowSet(self)
+        # Each open workflow still being built, set once its build ends. See `opening_workflow`.
+        self._opening_workflows: dict[WorkflowRuntime, asyncio.Event] = {}
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
         self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
@@ -763,13 +778,43 @@ class Engine:
     def open_workflow(self, workflow_id: str) -> WorkflowRuntime:
         """Open the registered workflow with this id and return its empty runtime.
 
+        To build into the workflow, closing it again if the build fails, open it with `opening_workflow`.
+
         Raises:
             OpenWorkflowError: That workflow, or another one, is already open.
         """
-        return self._open_workflows.open(workflow_id)
+        with self.opening_workflow(workflow_id) as opening:
+            pass
+        return opening.workflow
+
+    @contextmanager
+    def opening_workflow(self, workflow_id: str) -> Iterator[OpeningWorkflow]:
+        """Open the registered workflow with this id to build into, closing it again if the build fails.
+
+        A block that raises, or calls `OpeningWorkflow.abandon`, closes the workflow when it ends.
+        If that close fails, the workflow stays open as it is. Until the block ends, another open of
+        the workflow waits for its build with `wait_for_opening`.
+
+        Raises:
+            OpenWorkflowError: That workflow, or another one, is already open.
+        """
+        opening = OpeningWorkflow(workflow=self._open_workflows.open(workflow_id))
+        self._opening_workflows[opening.workflow] = asyncio.Event()
+        try:
+            yield opening
+        except BaseException:
+            self._finish_opening(opening.workflow, keep=False)
+            raise
+        self._finish_opening(opening.workflow, keep=not opening.abandoned)
+
+    async def wait_for_opening(self, workflow: WorkflowRuntime) -> None:
+        """Wait until the `opening_workflow` block building `workflow` ends, if one is under way."""
+        build_ended = self._opening_workflows.get(workflow)
+        if build_ended is not None:
+            await build_ended.wait()
 
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
-        """What clients are told of an open workflow: its id, name, file and whether it has a flow."""
+        """What clients are told of an open workflow."""
         entry = self.workflow_registry.get(workflow.workflow_id)
         file_path = None
         if entry.absolute_path is not None:
@@ -778,6 +823,7 @@ class Engine:
             workflow_id=workflow.workflow_id,
             name=entry.name,
             workflow_file_path=file_path,
+            is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
         )
 
@@ -892,6 +938,23 @@ class Engine:
         dropped = self._resource_manager.drop_objects_for_workflow(workflow.workflow_id)
         if dropped:
             logger.debug("Released %d held object(s) while closing the workflow.", dropped)
+
+    def _finish_opening(self, workflow: WorkflowRuntime, *, keep: bool) -> None:
+        """End `opening_workflow`'s block, closing `workflow` unless `keep`, then wake anything waiting for its build.
+
+        A workflow already closed, such as by the file building it, is left as it is.
+        """
+        try:
+            if not keep and not workflow.closed:
+                self.close_workflow(workflow)
+        except OpenWorkflowError as err:
+            logger.warning(
+                "Attempted to close workflow '%s' after it failed to build. Failed, so it stays open: %s",
+                workflow.workflow_id,
+                err,
+            )
+        finally:
+            self._opening_workflows.pop(workflow).set()
 
     def _delete_workflow_flows(self, workflow: WorkflowRuntime) -> None:
         """Delete `workflow`'s flows, which deletes their nodes.
@@ -1018,15 +1081,14 @@ class Engine:
         return instance_info
 
     def _get_current_workflow_info(self) -> dict[str, Any]:
-        """The heartbeat's workflow fields: every open workflow, and the one opened last as the current one.
+        """The heartbeat's workflow fields: every open workflow, and the current one when exactly one is open.
 
         What the engine has open, not the current workflow: the heartbeat is a host request bound
-        to no workflow, and a worker's runtimes never show here. With several open, the one opened
-        last is likely the tab the user just opened.
+        to no workflow, and a worker's runtimes never show here. With several open, none of them is
+        the current one, as in the app's engine registry record and the diagnostics.
         """
         workflow_info: dict[str, Any] = {
             "current_workflow": None,
-            "current_workflow_id": None,
             "workflow_file_path": None,
             "has_active_flow": False,
             "open_workflows": [],
@@ -1037,15 +1099,14 @@ class Engine:
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
             return workflow_info
-        if not open_workflows:
+        workflow_info["open_workflows"] = open_workflows
+        if len(open_workflows) != 1:
             return workflow_info
 
-        current = open_workflows[-1]
+        (current,) = open_workflows
         workflow_info["current_workflow"] = current.name
-        workflow_info["current_workflow_id"] = current.workflow_id
         workflow_info["workflow_file_path"] = current.workflow_file_path
         workflow_info["has_active_flow"] = current.has_active_flow
-        workflow_info["open_workflows"] = open_workflows
         return workflow_info
 
 

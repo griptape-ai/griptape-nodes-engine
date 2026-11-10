@@ -1,6 +1,6 @@
 - `SetWorkflowContextSuccess`, `SaveWorkflowResultSuccess`, `RunWorkflowFromRegistryResultSuccess`
   and `RunWorkflowFromScratchResultSuccess` now carry `open_workflow`, the workflow open after the
-  request, in the form `EngineHeartbeatResultSuccess.open_workflows` uses.
+  request, as `ListOpenWorkflowsRequest` lists it.
   `RunWorkflowWithCurrentStateResultSuccess` and `EnsureWorkflowAndFlowResultSuccess` carry it
   too, whether they used the open workflow the envelope named or opened a new one. After a save, it
   tells whether the open workflow moved onto the copy, which a save of a Griptape-provided workflow

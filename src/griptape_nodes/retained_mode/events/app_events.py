@@ -44,12 +44,14 @@ class OpenWorkflowInfo:
         workflow_id: The workflow's id, which a request envelope's `open_workflow_id` names.
         name: The workflow's name.
         workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
+        is_saved: Whether the workflow has a file, for clients that are not sent its path.
         has_active_flow: Whether the workflow has a current flow.
     """
 
     workflow_id: str
     name: str
     workflow_file_path: str | None
+    is_saved: bool
     has_active_flow: bool
 
 
@@ -567,10 +569,9 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         instance_region: Cloud instance region (None if not applicable)
         instance_provider: Cloud provider name (None if not applicable)
         deployment_type: Type of deployment (None if not applicable)
-        current_workflow: Name of the workflow opened last (None if none is open)
-        current_workflow_id: Id of the workflow opened last (None if none is open)
-        workflow_file_path: Path to that workflow's file (None if none, or while it is unsaved)
-        has_active_flow: Whether that workflow has a current flow
+        current_workflow: Name of the open workflow when exactly one is open, else None
+        workflow_file_path: Path to that workflow's file (None if there is none, or while it is unsaved)
+        has_active_flow: Whether that workflow has a current flow (False if there is none)
         open_workflows: Every workflow the engine has open, in the order they were opened
         engine_name: Human-readable engine name
         engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
@@ -619,10 +620,7 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # Entries leave when the host is displaced or the session ends; nothing expires them, so a
     # host that crashed stays listed until then. Defaulted for backward compatibility.
     clients: list[SessionClient] = field(default_factory=list)
-    # Id of the workflow opened last (None if none). Defaulted for backward compatibility.
-    current_workflow_id: str | None = None
-    # Every open workflow, oldest first; the last is the one the `current_*` fields describe.
-    # Defaulted for backward compatibility.
+    # Every open workflow, oldest first. Defaulted for backward compatibility.
     open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)
     # Changes on every engine restart, unlike session_id. None from an engine too old to report it.
     engine_run_id: str | None = None
