@@ -241,6 +241,8 @@ class ParameterDescription:
         element_type: Element class name, e.g. "Parameter", "ParameterString", or "ParameterList".
             "ParameterList" marks a multi-input that accepts several incoming connections, one per item.
         max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
+        deprecation: Message naming what to use instead, when the parameter is deprecated and kept only so
+            older workflows load (None if the parameter is current). Leave deprecated parameters out of new work.
     """
 
     name: str
@@ -260,6 +262,7 @@ class ParameterDescription:
     parent_container_name: str | None
     element_type: str
     max_items: int | None
+    deprecation: str | None = None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -289,6 +292,7 @@ class ParameterDescription:
             parent_container_name=param_dict["parent_container_name"],
             element_type=param_dict["element_type"],
             max_items=max_items,
+            deprecation=param_dict["deprecation"],
         )
 
 

@@ -110,6 +110,10 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     private: bool = False
     exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
+    # Set on a parameter kept only so older workflows still load. Holds the message shown to whoever
+    # reads the node's schema (people, MCP clients, the built-in chat), naming what to use instead.
+    # Declared by the node class rather than saved, so it is never written into a workflow file.
+    deprecation: str | None = None
     _allowed_modes: set = field(
         default_factory=lambda: {
             ParameterMode.OUTPUT,
@@ -162,6 +166,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         private: bool = False,
         exclude_from_metadata: bool = False,
         allow_variable_substitution: bool = True,
+        deprecation: str | None = None,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -200,6 +205,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         self.private = private
         self.exclude_from_metadata = exclude_from_metadata
         self.allow_variable_substitution = allow_variable_substitution
+        self.deprecation = deprecation
 
         # Process allowed_modes - use convenience parameters if allowed_modes not explicitly set
         if allowed_modes is None:
@@ -287,6 +293,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         our_dict["private"] = self.private
         our_dict["exclude_from_metadata"] = self.exclude_from_metadata
         our_dict["allow_variable_substitution"] = self.allow_variable_substitution
+        our_dict["deprecation"] = self.deprecation
         our_dict["ui_options"] = self.ui_options
 
         # Let's bundle up the mode details.
