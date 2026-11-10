@@ -130,6 +130,68 @@ class TestTrimResponse:
 
         assert trimmed == {"ok": True}
 
+    def test_drops_null_fields_at_every_depth(self) -> None:
+        raw = {
+            "result_type": "DescribeNodeTypeResultSuccess",
+            "result": {
+                "result_details": None,
+                "node_type": "Probe",
+                "tooltip": None,
+                "parameter": {"name": "prompt", "ui_options": None, "traits": {"options": None, "kind": "text"}},
+            },
+        }
+
+        trimmed = _trim_response(raw)
+
+        assert trimmed == {
+            "ok": True,
+            "node_type": "Probe",
+            "parameter": {"name": "prompt", "traits": {"kind": "text"}},
+        }
+
+    def test_drops_null_fields_inside_list_items(self) -> None:
+        raw = {
+            "result_type": "ListParametersResultSuccess",
+            "result": {
+                "parameters": [
+                    {"name": "a", "parent_container_name": None},
+                    {"name": "b", "tooltip": None, "children": [{"name": "c", "default": None}]},
+                ],
+            },
+        }
+
+        trimmed = _trim_response(raw)
+
+        assert trimmed["parameters"] == [
+            {"name": "a"},
+            {"name": "b", "children": [{"name": "c"}]},
+        ]
+
+    def test_keeps_falsy_values_that_are_not_null(self) -> None:
+        raw = {
+            "result_type": "SomethingSuccess",
+            "result": {
+                "altered_workflow_state": False,
+                "count": 0,
+                "label": "",
+                "items": [],
+                "settings": {},
+                "nested": {"enabled": False, "values": [0, "", None]},
+            },
+        }
+
+        trimmed = _trim_response(raw)
+
+        assert trimmed == {
+            "ok": True,
+            "altered_workflow_state": False,
+            "count": 0,
+            "label": "",
+            "items": [],
+            "settings": {},
+            "nested": {"enabled": False, "values": [0, "", None]},
+        }
+
 
 class TestEventRequestBatchInputSchema:
     def test_enumerates_every_supported_request_type(self) -> None:
@@ -250,6 +312,27 @@ class TestTrimBatchResults:
         assert trimmed == [
             {"ok": True, "details": "a", "node_name": "A_1"},
             {"ok": True, "details": "b", "node_name": "B_1"},
+        ]
+
+    def test_drops_null_fields_from_each_inner_response(self) -> None:
+        raw = [
+            {
+                "result_type": "DescribeNodeTypeResultSuccess",
+                "result": {"node_type": "A", "tooltip": None, "parameters": [{"name": "x", "ui_options": None}]},
+            },
+            Exception("boom"),
+            {
+                "result_type": "DescribeNodeTypeResultFailure",
+                "result": {"result_details": "Missing", "node_type": None},
+            },
+        ]
+
+        trimmed = _trim_batch_results(raw)
+
+        assert trimmed == [
+            {"ok": True, "node_type": "A", "parameters": [{"name": "x"}]},
+            {"ok": False, "details": "boom"},
+            {"ok": False, "details": "Missing"},
         ]
 
     def test_maps_exception_slots_to_failure_responses(self) -> None:

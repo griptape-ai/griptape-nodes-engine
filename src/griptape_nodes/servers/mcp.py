@@ -296,7 +296,7 @@ def _trim_response(result: dict) -> dict:
     The raw response wraps the real payload in engine/session/routing metadata and an echoed
     request. Agents only need to know whether the call succeeded and the payload fields the
     handler produced, so we surface a success discriminator, a terse `details` string, and the
-    rest of the inner `result` object.
+    rest of the inner `result` object with its null-valued keys left out.
     """
     inner = dict(result.get("result") or {})
     result_type = result.get("result_type", "")
@@ -305,8 +305,22 @@ def _trim_response(result: dict) -> dict:
     trimmed: dict = {"ok": result_type.endswith("Success")}
     if details is not None:
         trimmed["details"] = details
-    trimmed.update(inner)
+    trimmed.update(_drop_none_fields(inner))
     return trimmed
+
+
+def _drop_none_fields(value: Any) -> Any:
+    """Remove dict keys whose value is None, recursing through nested dicts and lists.
+
+    Optional fields left unset make up a large share of some responses (a node type description
+    is about 40% nulls), and they cost the model tokens without telling it anything; a missing
+    key reads as null. Falsy values that are not None (False, 0, "", [], {}) are kept.
+    """
+    if isinstance(value, dict):
+        return {key: _drop_none_fields(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_drop_none_fields(item) for item in value]
+    return value
 
 
 def _event_request_batch_input_schema(tool_names: list[str]) -> dict[str, Any]:
