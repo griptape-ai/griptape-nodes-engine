@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -826,19 +827,31 @@ class TestToolCallWorkflow:
         assert all("canvas" not in workflow.flows.name_to_parent_name for workflow in two_open)
 
     @pytest.mark.asyncio
-    async def test_a_header_follows_its_workflow_when_a_save_moves_it(
+    async def test_a_header_keeps_reaching_its_workflow_after_a_save_as_continues_in_the_copy(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
-        """Saving a template continues in a copy under another id, and the header still reaches it."""
+        """The open workflow keeps its id through any save, so a header never has to follow it."""
         _, second = two_open
-        held_id = second.workflow_id
-        copy = engine.workflow_registry.register_unsaved("copy", listed=False)
-        engine.open_workflows.move(second, copy.workflow_id)
+        header = _http_context({"X-Griptape-Workflow-Id": second.workflow_id})
+        await call_tool(header, _create_flow_call("canvas"))
+        stem = f"mcp_{uuid.uuid4().hex}"
+        first_save = await call_tool(
+            header, CallToolRequestParams(name="SaveWorkflowRequest", arguments={"file_name": stem})
+        )
+        assert _payload(first_save)["ok"], first_save
 
-        result = await call_tool(_http_context({"X-Griptape-Workflow-Id": held_id}), _create_flow_call("canvas"))
+        copy = await call_tool(
+            header,
+            CallToolRequestParams(
+                name="SaveWorkflowRequest", arguments={"file_name": f"{stem}_copy", "continue_in_copy": True}
+            ),
+        )
+        context = await call_tool(header, CallToolRequestParams(name="GetWorkflowContextRequest", arguments={}))
 
-        assert _payload(result)["ok"], result
-        assert "canvas" in second.flows.name_to_parent_name
+        assert _payload(copy)["ok"], copy
+        assert _payload(context)["ok"], context
+        assert engine.open_workflows.find(second.workflow_id) is second
+        assert engine.workflow_registry.get(second.workflow_id).name == f"{stem}_copy"
 
     @pytest.mark.asyncio
     async def test_the_header_wins_over_the_sessions_workflow(

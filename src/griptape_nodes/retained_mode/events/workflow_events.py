@@ -168,7 +168,8 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             standing in for nodes whose library could not be registered -- editable, but not
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
-        workflow_id: Id of the workflow now open.
+        workflow_id: Id of the workflow now open. For a Griptape-provided workflow, the id of the
+            new unsaved copy it opened as, not the requested workflow's.
         open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it. None
             when the file opened none.
     """
@@ -496,8 +497,11 @@ class SaveWorkflowRequest(RequestPayload):
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
         overwrite_existing: When False and ``file_name`` exactly matches the registry key of a *different* already-registered workflow, the save fails with ``FileIOFailureReason.POLICY_NO_OVERWRITE`` instead of clobbering that workflow's file. When True (default), proceed with the overwrite. Re-saving the workflow that is currently open always succeeds regardless of this flag. Scope is deliberately narrow — the guard covers exact registered registry keys only, so it does not catch a key that differs by case on a case-insensitive filesystem, nor an unregistered stray ``.py`` file sitting at the computed save path; those paths defer to the ``save_workflow`` situation's own collision policy. Also has no effect when ``create_versioned=True``, since versioned saves write a new file rather than overwriting in place.
+        continue_in_copy: What a save that writes a copy (a Save As, a versioned save) does with the open workflow. When False (default), the copy is a new workflow with its own id, and the open workflow stays on its original file. When True, the open workflow keeps its id and its graph and names the new file from then on, and the original file is registered as a separate, closed workflow with a new id. Has no effect on a save to the workflow's own file, or on the first save of an unsaved workflow, which always continue the open workflow.
 
-    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error or refused overwrite)
+    A save never writes over the file of another open workflow.
+
+    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error, refused overwrite, or the file belongs to another open workflow)
     """
 
     file_name: str | None = None
@@ -506,6 +510,7 @@ class SaveWorkflowRequest(RequestPayload):
     display_name: str | None = None
     create_versioned: bool = False
     overwrite_existing: bool = True
+    continue_in_copy: bool = False
 
 
 @dataclass
@@ -539,10 +544,10 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         file_path: Path where the workflow was saved
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
         workflow_id: Id of the saved workflow. A Save As or versioned save
-            writes a copy, with a new id.
-        open_workflow: The workflow open after the save, as `ListOpenWorkflowsRequest` lists it. When its
-            id is `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
-            workflow moves onto its copy. Otherwise the save wrote a copy and the original stays open.
+            writes a copy, with a new id, unless it continues in the copy.
+        open_workflow: The workflow open after the save, as `ListOpenWorkflowsRequest` lists it. When
+            its id is `workflow_id`, the open workflow is the file saved; otherwise the save wrote a
+            copy and the open workflow stays on its original file.
     """
 
     file_path: str

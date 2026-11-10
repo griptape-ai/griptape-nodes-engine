@@ -1172,3 +1172,36 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
 
         assert isinstance(result, GetWorkflowRunCommandResultFailure)
         assert "no workflow is loaded" in str(result.result_details)
+
+
+class TestSavingOntoAnotherOpenWorkflowsFile:
+    """A save never takes the file, and with it the identity, of a workflow open in another tab."""
+
+    @pytest.mark.parametrize("tab_saved", [False, True])
+    @pytest.mark.parametrize("continue_in_copy", [False, True])
+    def test_it_is_refused_and_writes_nothing(
+        self, project_engine: Engine, *, tab_saved: bool, continue_in_copy: bool
+    ) -> None:
+        _allow_several_open(project_engine)
+        other = _open_with_flow(project_engine, "other")
+        other_saved = _send_async(project_engine, SaveWorkflowRequest(), other)
+        assert isinstance(other_saved, SaveWorkflowResultSuccess), other_saved.result_details
+        other_content = Path(other_saved.file_path).read_text(encoding="utf-8")
+        tab = _open(project_engine, "tab")
+        _create_flow(project_engine, tab, "canvas")
+        if tab_saved:
+            tab_saved_result = _send_async(project_engine, SaveWorkflowRequest(file_name="tab_file"), tab)
+            assert isinstance(tab_saved_result, SaveWorkflowResultSuccess), tab_saved_result.result_details
+
+        refused = _send_async(
+            project_engine,
+            SaveWorkflowRequest(file_name=other_saved.workflow_name, continue_in_copy=continue_in_copy),
+            tab,
+        )
+
+        assert isinstance(refused, SaveWorkflowResultFailure)
+        assert "which is open" in str(refused.result_details)
+        assert Path(other_saved.file_path).read_text(encoding="utf-8") == other_content
+        assert project_engine.workflow_registry.find_by_path(other_saved.file_path) is (
+            project_engine.workflow_registry.get(other.workflow_id)
+        )
