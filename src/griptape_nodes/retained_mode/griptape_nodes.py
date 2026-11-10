@@ -13,8 +13,11 @@ through it; see `griptape_nodes.retained_mode.engine`.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
-from typing import TYPE_CHECKING
+from contextlib import AbstractContextManager, nullcontext
+from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.common.strict_mode_checks import RULES
@@ -22,6 +25,8 @@ from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
         RequestPayload,
@@ -137,6 +142,93 @@ def _check_manager_access_during_execution(manager_name: str, request_hint: str)
     raise RuntimeError(msg)
 
 
+# ContextManager methods that return a context manager to enter, whose blocks run in the workflow too.
+_CONTEXT_MANAGER_BLOCKS = frozenset({"workflow", "flow", "node", "element"})
+
+
+class _ManagerForUnboundCaller:
+    """A manager the facade hands a caller bound to nothing.
+
+    Each attribute read and method call, and each block its `entered_methods` open, runs bound to
+    the workflow the facade's requests act on at that moment
+    (`GriptapeNodes.only_open_workflow_for_unbound_caller`), not when the manager was fetched. A
+    caller bound by then follows its binding instead, so a stored manager acts where its caller does.
+    """
+
+    def __init__(self, manager: object, entered_methods: frozenset[str]) -> None:
+        self._manager = manager
+        self._entered_methods = entered_methods
+
+    def __getattr__(self, name: str) -> Any:
+        with _bound_as_the_facade_acts():
+            attribute = getattr(self._manager, name)
+        if inspect.iscoroutinefunction(attribute):
+            return self._awaited_bound(attribute)
+        if inspect.ismethod(attribute) or inspect.isfunction(attribute):
+            return self._called_bound(attribute, entered=name in self._entered_methods)
+        return attribute
+
+    def _called_bound(self, method: Any, *, entered: bool) -> Any:
+        @functools.wraps(method)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            with _bound_as_the_facade_acts():
+                result = method(*args, **kwargs)
+            if entered:
+                return _ContextForUnboundCaller(result)
+            return result
+
+        return call
+
+    def _awaited_bound(self, method: Any) -> Any:
+        @functools.wraps(method)
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            with _bound_as_the_facade_acts():
+                return await method(*args, **kwargs)
+
+        return call
+
+
+class _ContextForUnboundCaller:
+    """A context manager from a `_ManagerForUnboundCaller`, exited bound as it was entered (`_bound_as_the_facade_acts`)."""
+
+    def __init__(self, context: Any) -> None:
+        self._context = context
+        self._workflow: WorkflowRuntime | None = None
+
+    def __enter__(self) -> Any:
+        self._workflow = GriptapeNodes.only_open_workflow_for_unbound_caller()
+        with _bound_to(self._workflow):
+            return self._context.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        exc_traceback: TracebackType | None,
+    ) -> Any:
+        with _bound_to(self._workflow):
+            return self._context.__exit__(exc_type, exc_value, exc_traceback)
+
+
+def _bound_as_the_facade_acts() -> AbstractContextManager[None]:
+    """Bind, for a block, the workflow the facade's requests act on now: the only open one for a caller bound to nothing."""
+    return _bound_to(GriptapeNodes.only_open_workflow_for_unbound_caller())
+
+
+def _bound_to(workflow: WorkflowRuntime | None) -> AbstractContextManager[None]:
+    """Bind `workflow` for a block, or with None, leave the caller's binding as it is."""
+    if workflow is None:
+        return nullcontext()
+    return current_engine().bind_workflow(workflow)
+
+
+def _for_caller[M](manager: M, entered_methods: frozenset[str] = frozenset()) -> M:
+    """`manager`, wrapped for a caller bound to nothing so each call decides its workflow (see `_ManagerForUnboundCaller`)."""
+    if bound_workflow.get() is not None:
+        return manager
+    return cast("M", _ManagerForUnboundCaller(manager, entered_methods))
+
+
 class GriptapeNodes(metaclass=_EngineRootMeta):
     """Static accessors for the current engine's managers and request handlers."""
 
@@ -166,8 +258,10 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
         For callers that can't name a workflow: saved workflow files, which open their workflow with
         `push_workflow` and then send requests bound to nothing, node libraries sending from threads
         that carry no binding, and local transport clients, such as `gtn request`, that leave the
-        envelope's `open_workflow_id` out. Dispatch and engine code never guess; engine code can't
-        use the facade (TID251). With none or several open, a request that needs a workflow fails.
+        envelope's `open_workflow_id` out. The facade's requests, `clear_current_workflow_data`, and
+        the context, flow, node, object, workflow and static file managers it hands out act on it
+        (see `_ManagerForUnboundCaller`). Engine code can't use the facade (TID251), so it never
+        guesses.
         """
         if bound_workflow.get() is not None:
             return None
@@ -194,7 +288,9 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def clear_current_workflow_data(cls) -> None:
-        current_engine().clear_current_workflow_data()
+        """Close the caller's workflow, or for a caller bound to nothing, the only open one."""
+        with _bound_as_the_facade_acts():
+            current_engine().clear_current_workflow_data()
 
     @classmethod
     def EventManager(cls) -> EventManager:
@@ -226,33 +322,33 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
         _check_manager_access_during_execution(
             "ObjectManager", "a request against the orchestrator's graph (e.g., RenameObjectRequest(...))"
         )
-        return current_engine().object_manager
+        return _for_caller(current_engine().object_manager)
 
     @classmethod
     def FlowManager(cls) -> FlowManager:
         _check_manager_access_during_execution(
             "FlowManager", "flow requests (e.g., ListNodesInFlowRequest(...), ListConnectionsForNodeRequest(...))"
         )
-        return current_engine().flow_manager
+        return _for_caller(current_engine().flow_manager)
 
     @classmethod
     def NodeManager(cls) -> NodeManager:
         _check_manager_access_during_execution(
             "NodeManager", "node requests (e.g., GetNodeResolutionStateRequest(...), AddParameterToNodeRequest(...))"
         )
-        return current_engine().node_manager
+        return _for_caller(current_engine().node_manager)
 
     @classmethod
     def ContextManager(cls) -> ContextManager:
         _check_manager_access_during_execution(
             "ContextManager", "GetCurrentProjectRequest(...) for the project; flow context belongs to the orchestrator"
         )
-        return current_engine().context_manager
+        return _for_caller(current_engine().context_manager, _CONTEXT_MANAGER_BLOCKS)
 
     @classmethod
     def WorkflowManager(cls) -> WorkflowManager:
         _check_manager_access_during_execution("WorkflowManager", "workflow requests (e.g., ListWorkflowsRequest(...))")
-        return current_engine().workflow_manager
+        return _for_caller(current_engine().workflow_manager)
 
     @classmethod
     def ArbitraryCodeExecManager(cls) -> ArbitraryCodeExecManager:
@@ -293,7 +389,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
     def StaticFilesManager(cls) -> StaticFilesManager:
         # Unguarded: a worker shares the workspace on disk and serves static files through the
         # orchestrator's server URL, so its StaticFilesManager answers correctly.
-        return current_engine().static_files_manager
+        return _for_caller(current_engine().static_files_manager)
 
     @classmethod
     def AgentManager(cls) -> AgentManager:

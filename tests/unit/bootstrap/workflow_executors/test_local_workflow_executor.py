@@ -1,6 +1,7 @@
 """Unit tests for LocalWorkflowExecutor project activation, CLI arguments, and flow input."""
 
 import os
+import uuid
 from argparse import ArgumentParser
 from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
@@ -15,7 +16,13 @@ from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import 
 )
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import StartNode
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultSuccess,
+)
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
     ActivateWorkspaceProjectResultFailure,
@@ -24,6 +31,8 @@ from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
 )
+from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowRequest, SaveWorkflowResultSuccess
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.serialization.values import encode_value
 
 # A Windows path that exceeds the legacy MAX_PATH (260 chars).
@@ -462,3 +471,26 @@ class TestSetInputForFlow:
 
         values = {call.args[0].parameter_name: call.args[0].value for call in mock_gn.ahandle_request.await_args_list}
         assert values == {"pair": (1, 2), "text": "plain"}
+
+
+class TestPrepareWorkflowForRunFromAFile:
+    """A headless run or publish loads the file, then reads the flow of the workflow it opened."""
+
+    @pytest.mark.asyncio
+    async def test_it_finds_the_flow_of_the_workflow_it_loaded(self, engine: Engine) -> None:
+        opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="headless", flow_name="headless_flow"))
+        assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
+        assert opened.workflow_id is not None
+        saved = await engine.open_workflows.get(opened.workflow_id).ahandle_request(
+            SaveWorkflowRequest(file_name=f"headless_{uuid.uuid4().hex}")
+        )
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+
+        flow_name = await executor.aprepare_workflow_for_run(flow_input={}, workflow_path=saved.file_path)
+
+        assert flow_name == "headless_flow"
+        (loaded,) = engine.open_workflows.all_open()
+        # Bound for the rest of the run, not only for the load.
+        assert bound_workflow.get() is loaded
