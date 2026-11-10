@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -68,7 +69,7 @@ def loose_sink_flow(
     library_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(library_result, RegisterLibraryFromFileResultSuccess), library_result
 
-    engine.context_manager.push_workflow(workflow_name="loose_sink_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="loose_sink_wf"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="MainFlow", set_as_new_context=True)
     )

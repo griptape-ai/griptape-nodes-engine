@@ -43,24 +43,16 @@ class WorkflowPublishing(EngineScoped):
     def on_get_publish_options_request(
         self,
         request: GetPublishOptionsRequest,
-        workflow: WorkflowRuntime | None = None,  # noqa: ARG002 - declares the scope dispatch binds for the callback
+        workflow: WorkflowRuntime,
     ) -> ResultPayload:
-        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads."""
-        options_request = request
-        if request.workflow_id is not None:
-            try:
-                named = self.engine.workflow_registry.resolve_address(
-                    workflow_id=request.workflow_id,
-                    workflow_name=request.workflow_name,
-                    action="get publish options for",
-                )
-            except WorkflowAddressError as err:
-                return GetPublishOptionsResultFailure(result_details=str(err))
-            # Publishers read the name.
-            options_request = replace(request, workflow_name=named.name)
-        if options_request.workflow_name is None:
-            details = "Attempted to get publish options for a workflow. Failed because the request names no workflow. Pass workflow_id."
-            return GetPublishOptionsResultFailure(result_details=details)
+        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads.
+
+        WORKFLOW, like `PublishWorkflowRequest`, since the callback reads live state. Like it, this
+        refuses a `workflow_id` that isn't `workflow`'s and a name that is another open workflow's.
+        """
+        options_request = self._options_request_by_name(request, workflow)
+        if isinstance(options_request, GetPublishOptionsResultFailure):
+            return options_request
 
         event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
@@ -168,6 +160,40 @@ class WorkflowPublishing(EngineScoped):
             return PublishWorkflowResultFailure(result_details=details)
         return replace(request, workflow_name=named.name)
 
+    def _options_request_by_name(
+        self, request: GetPublishOptionsRequest, workflow: WorkflowRuntime
+    ) -> GetPublishOptionsRequest | GetPublishOptionsResultFailure:
+        """`request` with its `workflow_id`, which must be `workflow`'s, resolved to `workflow_name`, or why it can't be answered.
+
+        Publishers read the name. The publisher's callback reads `workflow`'s graph, so a request
+        naming another open workflow is refused, as `_publish_request_by_name` refuses one.
+        """
+        options_request = request
+        if request.workflow_id is not None:
+            try:
+                named = self.engine.workflow_registry.resolve_address(
+                    workflow_id=request.workflow_id,
+                    workflow_name=request.workflow_name,
+                    action="get publish options for",
+                )
+            except WorkflowAddressError as err:
+                return GetPublishOptionsResultFailure(result_details=str(err))
+            if named.workflow_id != workflow.workflow_id:
+                return self._publish_options_from_another_tab(named.name)
+            options_request = replace(request, workflow_name=named.name)
+        workflow_name = options_request.workflow_name
+        if workflow_name is None:
+            details = "Attempted to get publish options for a workflow. Failed because the request names no workflow. Pass workflow_id."
+            return GetPublishOptionsResultFailure(result_details=details)
+        saved = self.engine.workflow_registry.find_by_name(workflow_name)
+        if (
+            saved is not None
+            and saved.workflow_id != workflow.workflow_id
+            and self.engine.open_workflows.is_open(saved.workflow_id)
+        ):
+            return self._publish_options_from_another_tab(workflow_name)
+        return options_request
+
     async def _register_published_workflow_file(
         self, workflow_file: Path, result: PublishWorkflowResultSuccess
     ) -> ResultPayload:
@@ -218,3 +244,11 @@ class WorkflowPublishing(EngineScoped):
             final_result = PublishWorkflowResultFailure(result_details=ResultDetails(*result_messages))
 
         return final_result
+
+    @staticmethod
+    def _publish_options_from_another_tab(workflow_name: str) -> GetPublishOptionsResultFailure:
+        details = (
+            f"Attempted to get publish options for workflow '{workflow_name}'. Failed because it isn't the "
+            "workflow open in this tab. Get them from its own tab."
+        )
+        return GetPublishOptionsResultFailure(result_details=details)

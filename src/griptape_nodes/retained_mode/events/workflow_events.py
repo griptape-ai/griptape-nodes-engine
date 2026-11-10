@@ -90,10 +90,17 @@ class RunWorkflowWithCurrentStateRequest(RequestPayload):
     Use when: Loading workflows into a prepared but unpopulated workflow context,
     loading unregistered workflows.
 
-    Fails if any flow is active on the current context. A current workflow with no
-    flow on it -- the state SetWorkflowContextRequest leaves behind -- is fine; a
-    current flow is not. Use DeleteFlowRequest, ClearAllObjectStateRequest, or similar
-    first to remove any active flow.
+    Does one of two things, depending on whether the request names a workflow:
+
+    - Named, by the envelope's `open_workflow_id` or the caller's binding: builds the file into
+      that open workflow. Fails if it has a flow. A workflow with no flow on it, the state
+      SetWorkflowContextRequest leaves behind, is fine. Use DeleteFlowRequest,
+      ClearAllObjectStateRequest, or similar first to remove the flow.
+    - Named none: opens the file as a new workflow beside the open ones, like OpenWorkflowRequest.
+
+    An MCP call with no header and no workflow of its session's own names none, so it opens the
+    file. A local transport client that leaves `open_workflow_id` out, such as the editor, gets the
+    only open workflow named where the app receives the request, so it builds into that one.
 
     Args:
         file_path: Path to the workflow file to load while preserving current state
@@ -686,9 +693,11 @@ class GetPublishOptionsRequest(RequestPayload):
     options after a selection change.
 
     Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-    The publisher gets the request with `workflow_name` filled in.
+    The publisher gets the request with `workflow_name` filled in. It runs in the open workflow the
+    envelope's `open_workflow_id` names, whose graph the publisher's callback reads.
 
-    Results: GetPublishOptionsResultSuccess (with fields) | GetPublishOptionsResultFailure
+    Results: GetPublishOptionsResultSuccess (with fields) | GetPublishOptionsResultFailure |
+        WorkflowNotNamedResultFailure (the request names no open workflow to run in)
     """
 
     workflow_name: str | None = None

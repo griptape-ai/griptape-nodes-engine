@@ -1,7 +1,4 @@
-- `SetWorkflowContextSuccess`, `SaveWorkflowResultSuccess`, `RunWorkflowFromRegistryResultSuccess`
-  and `RunWorkflowFromScratchResultSuccess` now carry `open_workflow`, the workflow open after the
-  request, as `ListOpenWorkflowsRequest` lists it.
-  `RunWorkflowWithCurrentStateResultSuccess` and `EnsureWorkflowAndFlowResultSuccess` carry it
-  too, whether they used the open workflow the envelope named or opened a new one. After a save, it
-  tells whether the open workflow is the file saved or the save wrote a copy.
+- Results of requests that open, load or save a workflow, and of `EnsureWorkflowAndFlowRequest`, now
+  carry `open_workflow`, the workflow open after the request. After a Save As it shows whether the
+  open workflow is the copy or the original.
   [#6199](https://github.com/griptape-ai/griptape-nodes-engine/issues/6199)

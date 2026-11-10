@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowWithCurrentStateRequest,
     RunWorkflowWithCurrentStateResultSuccess,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -85,7 +86,7 @@ class TestLoadingAWorkflowIntoAnOccupiedFlowContext:
 
         # Workflow A is the session the artist is sitting in, with its top-level flow pushed onto
         # the Current Context the way the editor leaves it.
-        engine.context_manager.push_workflow(workflow_name="workflow_a")
+        bind(engine.context_manager.open_workflow(workflow_name="workflow_a"))
         flow_a = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=True)
         )

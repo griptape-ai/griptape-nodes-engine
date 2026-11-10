@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,7 +59,7 @@ async def test_loose_leaf_two_hops_below_a_control_node_tracks_it_every_run(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    engine.context_manager.push_workflow(workflow_name="rerun_loose_leaf_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="rerun_loose_leaf_wf"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="LeafFlow", set_as_new_context=False)
     )

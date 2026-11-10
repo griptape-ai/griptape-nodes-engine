@@ -46,6 +46,7 @@ from griptape_nodes.retained_mode.managers.worker_manager import EngineLease
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import UndecodedValue, encode_value
 from tests.simulated_worker import simulated_worker
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -805,7 +806,7 @@ class TestTheWorkerLoadsACopy:
 @pytest.fixture
 def flow_name(engine: Engine, library_name: str) -> str:  # noqa: ARG001
     """A flow on the test's engine, in the orchestrator role, for this module's nodes."""
-    engine.context_manager.push_workflow(workflow_name="execute_node_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="execute_node_wf"))
     result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=False))
     assert isinstance(result, CreateFlowResultSuccess), result
     return result.flow_name

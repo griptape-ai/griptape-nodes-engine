@@ -112,7 +112,8 @@ def saved_workflow_name(engine: Engine, tmp_path: Path) -> Iterator[str]:
     _use_default_project(engine, workspace)
     opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="saved"))
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
-    saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+    assert opened.workflow_id is not None
+    saved = asyncio.run(engine.open_workflows.get(opened.workflow_id).ahandle_request(SaveWorkflowRequest()))
     assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     yield saved.workflow_name
@@ -343,7 +344,8 @@ class TestOlderOpenRequestsShareTheCode:
         assert not result.created_workflow
         assert result.created_flow
         assert result.open_workflow is not None
-        assert result.open_workflow.workflow_id == result.workflow_id == opened.open_workflow.workflow_id
+        assert result.open_workflow.workflow_id == opened.open_workflow.workflow_id
+        assert result.workflow_id == opened.open_workflow.workflow_id
 
     def test_ensure_refuses_a_workflow_another_request_is_still_opening(self, engine: Engine) -> None:
         with engine.context_manager.opening_requested_workflow(display_name="building") as opened:

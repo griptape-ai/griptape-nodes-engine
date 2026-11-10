@@ -722,12 +722,27 @@ class TestToolCallWorkflow:
         return opened[0], opened[1]
 
     @pytest.mark.asyncio
-    async def test_a_call_naming_no_workflow_acts_on_the_open_one(self, engine: Engine) -> None:
+    async def test_a_call_naming_no_workflow_fails_even_with_one_open(self, engine: Engine) -> None:
         entry = engine.workflow_registry.register_unsaved("only", listed=False)
         only = engine.open_workflow(entry.workflow_id)
 
         result = await call_tool(_NO_CONTEXT, _create_flow_call("canvas"))
 
+        assert not _payload(result)["ok"]
+        assert "OpenWorkflowRequest" in _payload(result)["details"]
+        assert "canvas" not in only.flows.name_to_parent_name
+
+    @pytest.mark.asyncio
+    async def test_a_session_ensuring_with_one_workflow_open_adopts_it(self, engine: Engine) -> None:
+        entry = engine.workflow_registry.register_unsaved("only", listed=False)
+        only = engine.open_workflow(entry.workflow_id)
+        session = _http_context({"mcp-session-id": "session-a"})
+
+        ensured = await call_tool(session, CallToolRequestParams(name="EnsureWorkflowAndFlowRequest", arguments={}))
+        result = await call_tool(session, _create_flow_call("canvas"))
+
+        assert _payload(ensured)["ok"], ensured
+        assert _payload(ensured)["open_workflow"]["workflow_id"] == only.workflow_id
         assert _payload(result)["ok"], result
         assert "canvas" in only.flows.name_to_parent_name
 

@@ -154,7 +154,8 @@ def saved_workflow_name(engine: Engine, tmp_path: Path) -> Iterator[str]:
     _use_default_project(engine, workspace)
     opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="saved"))
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
-    saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+    assert opened.workflow_id is not None
+    saved = asyncio.run(engine.open_workflows.get(opened.workflow_id).ahandle_request(SaveWorkflowRequest()))
     assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     yield saved.workflow_name

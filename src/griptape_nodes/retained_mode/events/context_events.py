@@ -81,12 +81,13 @@ class SetWorkflowContextFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class GetWorkflowContextRequest(RequestPayload):
-    """Get the current workflow context.
+    """Get the open workflow the request runs in.
 
     Use when: Checking which workflow is active, displaying current workflow info,
     validating workflow state, debugging context issues.
 
-    Results: GetWorkflowContextSuccess (with workflow name) | GetWorkflowContextFailure (no context set)
+    Results: GetWorkflowContextSuccess (with workflow name) | GetWorkflowContextFailure |
+        WorkflowNotNamedResultFailure (the request names no workflow)
     """
 
 
@@ -275,6 +276,10 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
     workflow and a flow are already in the current context, returns their names without
     creating new ones. Only creates the pieces that are missing.
 
+    Acts on the workflow the envelope's `open_workflow_id` names. A request that names none
+    adopts the only open workflow, opens one when none is open, and fails with
+    WorkflowNotNamedResultFailure while several are open.
+
     Args:
         workflow_name: Registered workflow to enter if no workflow is in context. Ignored
             when a workflow is already in context. When None, the engine registers a new
@@ -291,7 +296,8 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
             SetWorkflowContextRequest. Ignored when a workflow is already in context. See
             SetWorkflowContextRequest for what the value means and how it is normalized.
 
-    Results: EnsureWorkflowAndFlowResultSuccess | EnsureWorkflowAndFlowResultFailure
+    Results: EnsureWorkflowAndFlowResultSuccess | EnsureWorkflowAndFlowResultFailure |
+        WorkflowNotNamedResultFailure (names none while several are open)
     """
 
     workflow_name: str | None = None
@@ -311,8 +317,7 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
         created_workflow: True if this call created the workflow; False if an existing one was reused.
         created_flow: True if this call created the flow; False if an existing one was reused.
         workflow_id: Id of the workflow in the current context.
-        open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it: the
-            one it used or opened.
+        open_workflow: The workflow it used, opened, or adopted, as `ListOpenWorkflowsRequest` lists it.
     """
 
     workflow_name: str
