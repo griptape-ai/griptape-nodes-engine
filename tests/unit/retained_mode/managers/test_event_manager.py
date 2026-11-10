@@ -2448,6 +2448,30 @@ class TestNodeProcessEventTranslation:
         assert translated.wrapped_event.payload.node_name == "Body"
         assert translated.wrapped_event.open_workflow_id == "wf-1"
 
+    def test_a_translated_event_built_without_a_workflow_names_the_bound_one(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        finish = NodeFinishProcessEvent(
+            node_name="Body_1",
+            node_type="LoopBodyControlNode",
+            specific_library_name="Library",
+            flow_name="Canvas Flow",
+            execution_id="run-1",
+            parent_execution_id=None,
+            outcome=NodeProcessOutcome.SUCCEEDED,
+        )
+
+        with (
+            engine.bind_workflow(WorkflowRuntime("bound", MagicMock())),
+            EventTranslationContext(engine.event_manager, {"Body_1": "Body"}),
+        ):
+            engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish)))
+
+        translated = queue.get_nowait()
+        assert translated.wrapped_event.payload.node_name == "Body"
+        assert translated.wrapped_event.open_workflow_id == "bound"
+
 
 class TestResultWorkflowId:
     """A result names the workflow dispatch ran its request in, or what a refused envelope named."""

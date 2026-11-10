@@ -2333,14 +2333,9 @@ class EventTranslationContext:
         if wrapped_event is None:
             return None
 
-        # Create new wrapped_event with translated payload
-        wrapped_class = type(wrapped_event)
-        try:
-            new_wrapped = wrapped_class(
-                payload=translated_payload, open_workflow_id=getattr(wrapped_event, "open_workflow_id", None)
-            )
-        except Exception:
-            return None
+        # A copy keeps which fields were set, so an event built without `open_workflow_id` still
+        # gets the bound workflow's (`_name_bound_workflow`).
+        new_wrapped = wrapped_event.model_copy(update={"payload": translated_payload})
 
         # Create new outer event with new wrapped_event
         event_class = type(event)
