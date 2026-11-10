@@ -179,7 +179,7 @@ class TestSetWorkflowContext:
         assert _lifecycle_events(_drain(queue)) == [WorkflowOpenedEvent(open_workflow=opened)]
         assert result_event.open_workflow_id is None
 
-    def test_fails_while_another_workflow_is_open_and_announces_nothing(
+    def test_opens_beside_another_open_workflow_and_announces_only_its_own(
         self, engine: Engine, queue: asyncio.Queue
     ) -> None:
         open_workflow = _open_new_workflow(engine, "open")
@@ -187,9 +187,11 @@ class TestSetWorkflowContext:
 
         result_event = _send(engine, SetWorkflowContextRequest(display_name="next"), open_workflow.workflow_id)
 
-        assert isinstance(result_event, EventResultFailure)
-        assert engine.open_workflows.all_open() == [open_workflow]
-        assert _lifecycle_events(_drain(queue)) == []
+        assert isinstance(result_event.result, SetWorkflowContextSuccess), result_event.result.result_details
+        opened = result_event.result.open_workflow
+        assert opened is not None
+        assert not open_workflow.closed
+        assert _lifecycle_events(_drain(queue)) == [WorkflowOpenedEvent(open_workflow=opened)]
 
 
 class TestEnsureWorkflowAndFlow:
@@ -283,42 +285,38 @@ class TestRunWorkflowFromRegistry:
         assert engine.open_workflows.all_open() == []
         assert _lifecycle_events(_drain(queue)) == []
 
-    def test_a_clean_slate_load_closes_the_open_workflow_before_announcing_its_own(
+    def test_a_clean_slate_load_leaves_the_open_workflow_open_and_announces_its_own(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
-        replaced = _open_new_workflow(engine, "replaced")
+        other = _open_new_workflow(engine, "other")
         _drain(queue)
         request = RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=True)
 
-        result_event = asyncio.run(_send_async(engine, request, replaced.workflow_id))
+        result_event = asyncio.run(_send_async(engine, request, other.workflow_id))
 
         assert isinstance(result_event.result, RunWorkflowFromRegistryResultSuccess), result_event.result.result_details
         opened = result_event.result.open_workflow
         assert opened is not None
-        assert _lifecycle_events(_drain(queue)) == [
-            WorkflowClosedEvent(workflow_id=replaced.workflow_id),
-            WorkflowOpenedEvent(open_workflow=opened),
-        ]
+        assert not other.closed
+        assert _lifecycle_events(_drain(queue)) == [WorkflowOpenedEvent(open_workflow=opened)]
         assert result_event.open_workflow_id is None
 
 
 class TestRunWorkflowFromFile:
-    def test_from_scratch_closes_the_open_workflow_then_announces_the_file(
+    def test_from_scratch_leaves_the_open_workflow_open_and_announces_the_file(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
-        replaced = _open_new_workflow(engine, "replaced")
+        other = _open_new_workflow(engine, "other")
         _drain(queue)
         request = RunWorkflowFromScratchRequest(file_path=_saved_file_path(engine, saved_workflow_name))
 
-        result_event = asyncio.run(_send_async(engine, request, replaced.workflow_id))
+        result_event = asyncio.run(_send_async(engine, request, other.workflow_id))
 
         assert isinstance(result_event.result, RunWorkflowFromScratchResultSuccess), result_event.result.result_details
         opened = result_event.result.open_workflow
         assert opened is not None
-        assert _lifecycle_events(_drain(queue)) == [
-            WorkflowClosedEvent(workflow_id=replaced.workflow_id),
-            WorkflowOpenedEvent(open_workflow=opened),
-        ]
+        assert not other.closed
+        assert _lifecycle_events(_drain(queue)) == [WorkflowOpenedEvent(open_workflow=opened)]
         assert result_event.open_workflow_id is None
 
     def test_with_current_state_announces_the_file_it_opened(

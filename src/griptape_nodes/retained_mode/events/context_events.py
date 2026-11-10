@@ -42,13 +42,11 @@ class SetWorkflowContextRequest(RequestPayload):
                       when None, `{workflow_dir}` answers the folder this workflow's first save
                       would land in, read from the project's `save_workflow` situation.
 
-    Fails while a workflow is open and only one may be. That failure names no blocking workflow:
-    a client that needs it sends `OpenWorkflowRequest`, whose `AnotherWorkflowOpenResultFailure`
-    carries `blocking_workflow`. Ignores the envelope's `open_workflow_id`.
+    Ignores the envelope's `open_workflow_id`.
 
     Results: SetWorkflowContextSuccess (carries the resolved workflow_name and workflow_id) |
-             SetWorkflowContextFailure (workflow not found or already open, another workflow
-             open, working_directory names an existing non-directory)
+             SetWorkflowContextFailure (workflow not found or already open, working_directory
+             names an existing non-directory)
     """
 
     workflow_name: str | None = None
@@ -185,7 +183,6 @@ class OpenWorkflowRequest(RequestPayload):
 
     Results: OpenWorkflowResultSuccess | WorkflowNotFoundResultFailure (no workflow has that id or
         name, such as an unsaved workflow that was closed or lost to an engine restart) |
-        AnotherWorkflowOpenResultFailure (another workflow is open and only one may be) |
         OpenWorkflowResultFailure (both an id and a name, working_directory names a file, the file
         failed to build)
     """
@@ -232,18 +229,6 @@ class WorkflowNotFoundResultFailure(OpenWorkflowResultFailure):
     An unsaved workflow's id names nothing once it closes or the engine restarts, so a client that
     gets this for one has lost that workflow.
     """
-
-
-@dataclass
-@PayloadRegistry.register
-class AnotherWorkflowOpenResultFailure(OpenWorkflowResultFailure):
-    """OpenWorkflowRequest was refused because another workflow is open and only one may be.
-
-    Args:
-        blocking_workflow: The open workflow. Close it with CloseWorkflowRequest to open another.
-    """
-
-    blocking_workflow: OpenWorkflowInfo
 
 
 @dataclass

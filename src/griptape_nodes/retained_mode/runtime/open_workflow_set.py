@@ -21,37 +21,27 @@ class NoOpenWorkflowError(OpenWorkflowError):
 class OpenWorkflowSet:
     """The runtimes of the workflows the engine has open, by workflow id.
 
-    One workflow is open at a time. Reads never open anything: only `open` adds a runtime.
-    `Engine.open_workflow` and `Engine.close_workflow` are the operations that open and close one.
+    Reads never open anything: only `open` adds a runtime. `Engine.open_workflow` and
+    `Engine.close_workflow` are the operations that open and close one.
     """
 
-    def __init__(self, engine: Engine, *, allow_several_open: bool = False) -> None:
+    def __init__(self, engine: Engine) -> None:
         """Make an empty set.
 
         Args:
             engine: The engine holding the runtimes, handed to each one.
-            allow_several_open: Test seam that lets a workflow open beside another. The engine never
-                sets it: it opens one workflow at a time.
         """
         self._engine = engine
         self._by_id: dict[str, WorkflowRuntime] = {}
-        self._allow_several_open = allow_several_open
 
     def open(self, workflow_id: str) -> WorkflowRuntime:
         """Open the workflow with this id and return its empty runtime.
 
         Raises:
-            OpenWorkflowError: That workflow, or another one, is already open.
+            OpenWorkflowError: That workflow is already open.
         """
         if workflow_id in self._by_id:
             msg = f"Attempted to open workflow '{workflow_id}'. Failed because it is already open."
-            raise OpenWorkflowError(msg)
-        blocking = self.workflow_blocking_open()
-        if blocking is not None:
-            msg = (
-                f"Attempted to open workflow '{workflow_id}'. Failed because workflow '{blocking.workflow_id}' "
-                "is already open."
-            )
             raise OpenWorkflowError(msg)
 
         workflow = WorkflowRuntime(workflow_id, self._engine)
@@ -69,12 +59,6 @@ class OpenWorkflowSet:
             raise OpenWorkflowError(msg)
         del self._by_id[workflow.workflow_id]
         workflow.closed = True
-
-    def workflow_blocking_open(self) -> WorkflowRuntime | None:
-        """The open workflow that keeps another from opening: the one open, when only one may be."""
-        if self._allow_several_open or not self._by_id:
-            return None
-        return next(iter(self._by_id.values()))
 
     def is_open(self, workflow_id: str) -> bool:
         return workflow_id in self._by_id
