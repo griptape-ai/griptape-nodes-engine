@@ -1,4 +1,7 @@
 import os
+import subprocess
+import sys
+import textwrap
 import threading
 from collections.abc import Generator
 from pathlib import Path
@@ -464,3 +467,38 @@ class TestWatcherThread:
             assert "Attempted to watch 1 folders for changes to previewed files" in caplog.text
         finally:
             file_watcher.stop()
+
+
+class TestInterpreterExit:
+    def test_the_thread_is_stopped_before_the_interpreter_finalizes(self, tmp_path: Path) -> None:
+        # A watch still running while the interpreter finalizes can crash the process, but only when
+        # it races the final garbage collection. So check the precondition directly: an exit hook
+        # registered before the watcher starts runs after the watcher's own, and sees the thread gone.
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        script = textwrap.dedent(
+            """
+            import atexit
+            import sys
+            import threading
+            from pathlib import Path
+
+            from griptape_nodes.retained_mode.managers.static_file_watcher import StaticFileWatcher
+
+            def report() -> None:
+                alive = any(t.name == "WatchFiles-StaticFiles" and t.is_alive() for t in threading.enumerate())
+                print(f"alive_at_exit={alive}")
+
+            atexit.register(report)
+            image = Path(sys.argv[1])
+            StaticFileWatcher(on_change=lambda change: None).watch_file(image, "plate")
+            threading.Event().wait(0.5)
+            """
+        )
+
+        result = subprocess.run(  # noqa: S603 - subprocess input is constructed inside the test
+            [sys.executable, "-c", script, str(image)], capture_output=True, text=True, timeout=60, check=False
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "alive_at_exit=False" in result.stdout
