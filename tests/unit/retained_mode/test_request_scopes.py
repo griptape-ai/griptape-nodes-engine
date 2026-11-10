@@ -190,7 +190,7 @@ class TestScopesThatTakeAWorkflow:
     def test_an_envelope_id_that_is_not_open_fails_without_running(
         self, engine: Engine, calls: _Calls, scope: RequestScope
     ) -> None:
-        _open_workflow(engine)
+        workflow = _open_workflow(engine)
         _register(engine, calls, scope, _ScopeProbeRequest)
 
         result_event = engine.event_manager.handle_request(
@@ -199,6 +199,7 @@ class TestScopesThatTakeAWorkflow:
 
         assert isinstance(result_event.result, WorkflowNotOpenResultFailure)
         assert result_event.open_workflow_id == NOT_OPEN_ID
+        assert [info.workflow_id for info in result_event.result.open_workflows] == [workflow.workflow_id]
         assert calls.workflows == []
 
     @pytest.mark.asyncio
@@ -528,12 +529,13 @@ class TestRequestsARuntimeSends:
     ) -> None:
         closed = _open_workflow(engine, "closed")
         engine.close_workflow(closed)
-        _open_workflow(engine)
+        still_open = _open_workflow(engine)
         _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
 
         result = await closed.ahandle_request(_ScopeProbeRequest())
 
         assert isinstance(result, WorkflowNotOpenResultFailure)
+        assert [info.workflow_id for info in result.open_workflows] == [still_open.workflow_id]
         assert calls.workflows == []
 
 

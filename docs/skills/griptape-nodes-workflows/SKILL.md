@@ -169,10 +169,28 @@ submitted. So either:
 The one-batch + explicit names path is almost always shorter and is what the
 batched recipe below uses.
 
+## Choose the Workflow
+
+Calls act on the workflow your client's `X-Griptape-Workflow-Id` header names. With
+no header, pick one before building:
+
+```
+A. griptape_nodes_ListOpenWorkflowsRequest()
+   → each open workflow's workflow_id and name.
+B. griptape_nodes_OpenWorkflowRequest(workflow_id="<id>") → work in that open workflow,
+   or griptape_nodes_OpenWorkflowRequest(create_flow=True) → start a new one.
+```
+
+Later calls in the MCP session act on that workflow. If another client closes it,
+calls fail with `WorkflowNotOpenResultFailure`, which lists the open workflows, until
+you repeat step B.
+
 ## Canonical Cold-Start Recipe
 
 For a typical 3-node linear pipeline (`TextInput → Agent → DisplayText`), once the
-workspace survey above has confirmed the relevant library exposes those node types:
+workspace survey above has confirmed the relevant library exposes those node types.
+On an empty engine, step 1 opens a new workflow with its flow. With one open, choose
+it first (see Choose the Workflow); step 1 then gives it a flow if it has none.
 
 ```
 1. griptape_nodes_EnsureWorkflowAndFlowRequest()
@@ -410,7 +428,8 @@ an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
 
 ### Several workflows can be open
 
-`SetWorkflowContextRequest` opens a workflow beside the ones already open.
+`OpenWorkflowRequest` and `SetWorkflowContextRequest` open a workflow beside the ones
+already open. Close yours with `CloseWorkflowRequest(workflow_id=...)` when you're done.
 `ClearAllObjectStateRequest(i_know_what_im_doing=True)` closes every workflow, other
 clients' included.
 
@@ -425,7 +444,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 
 | Goal                                                                                | Tool                                                                                                                                                      |
 | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bootstrap a workflow + flow from cold                                               | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
+| Bootstrap a workflow + flow on an empty engine                                      | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
 | Fan N requests out in one round trip                                                | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                                     | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest` (`include_metadata` for descriptions), `ListCategoriesInLibraryRequest`                 |
 | Inspect a node type's parameters                                                    | `DescribeNodeTypeRequest`                                                                                                                                 |
@@ -448,8 +467,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
-| See which workflows are open, and their ids                                         | `ListOpenWorkflowsRequest()`                                                                                                                              |
-| Close a workflow, leaving the others open                                           | `CloseWorkflowRequest(workflow_id=...)`                                                                                                                   |
+| List, work in, start or close workflows                                             | `ListOpenWorkflowsRequest()`, `OpenWorkflowRequest(workflow_id=...)`, `OpenWorkflowRequest(create_flow=True)`, `CloseWorkflowRequest(workflow_id=...)`    |
 | Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes
