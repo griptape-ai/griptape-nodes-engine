@@ -452,10 +452,26 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         )
 
         assert isinstance(renamed, RenameWorkflowResultFailure)
-        assert "Failed because another workflow already has that name." in str(renamed.result_details)
+        assert "Failed because another workflow or file already has that name." in str(renamed.result_details)
         assert taken.file_path.read_text(encoding="utf-8") == taken_content
         assert Path(saved.file_path).is_file()
         assert project_engine.workflow_registry.get(taken.workflow_id).name == taken.workflow_name
+
+    def test_renaming_an_open_workflow_onto_an_unregistered_file_is_refused(self, project_engine: Engine) -> None:
+        tab = _open_with_flow(project_engine, "tab")
+        saved = _send_async(project_engine, SaveWorkflowRequest(), tab)
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        helper = Path(saved.file_path).with_name("helper.py")
+        helper.write_text("VALUE = 1\n", encoding="utf-8")
+
+        renamed = _send_async(
+            project_engine, RenameWorkflowRequest(workflow_id=tab.workflow_id, requested_name="helper"), None
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert "Failed because another workflow or file already has that name." in str(renamed.result_details)
+        assert helper.read_text(encoding="utf-8") == "VALUE = 1\n"
+        assert Path(saved.file_path).is_file()
 
     def test_a_failed_save_of_an_open_rename_says_why(self, project_engine: Engine) -> None:
         tab = _open_with_flow(project_engine, "tab")
@@ -480,6 +496,20 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert isinstance(renamed, RenameWorkflowResultFailure)
         assert "a library provides it" in str(renamed.result_details)
         assert closed.file_path.is_file()
+
+    def test_renaming_an_open_library_workflow_is_refused(self, project_engine: Engine) -> None:
+        tab = _open_with_flow(project_engine, "library")
+        saved = _send_async(project_engine, SaveWorkflowRequest(), tab)
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        project_engine.workflow_registry.get(tab.workflow_id).metadata.is_griptape_provided = True
+
+        renamed = _send_async(
+            project_engine, RenameWorkflowRequest(workflow_id=tab.workflow_id, requested_name="mine"), None
+        )
+
+        assert isinstance(renamed, RenameWorkflowResultFailure)
+        assert "a library provides it" in str(renamed.result_details)
+        assert Path(saved.file_path).is_file()
 
     def test_renaming_an_open_workflow_by_id_from_another_tab_saves_its_own_graph(self, project_engine: Engine) -> None:
         _allow_several_open(project_engine)
