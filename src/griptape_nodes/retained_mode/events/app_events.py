@@ -152,9 +152,11 @@ class AppInitializationComplete(AppPayload):
     # URL of the static file server the host process runs for this workspace. The engine serves
     # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
-    # `Engine.engine_run_id` of the engine that sent the event, so a client that reconnects sees a
-    # restart without waiting for a heartbeat. The host process forwards a worker's copy too
-    # (`is_worker` True) carrying the worker's own id, so clients read it only when `is_worker` is False.
+    # `Engine.engine_run_id` of the engine that sent the event. The event goes out once, at startup,
+    # so a client that stays connected while the engine restarts (one on a relay) sees the restart
+    # without waiting for a heartbeat. A client whose own connection dropped never receives it and
+    # reads the heartbeat instead. The host process forwards a worker's copy too (`is_worker` True)
+    # carrying the worker's own id, so clients read it only when `is_worker` is False.
     engine_run_id: str | None = None
 
 
