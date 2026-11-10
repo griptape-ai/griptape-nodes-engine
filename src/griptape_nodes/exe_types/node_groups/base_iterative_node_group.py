@@ -30,8 +30,8 @@ EXECUTION_MODE_VALUE_LOOKUP = {
 }
 
 
-# The base pair, group_exec_in / group_exec_out, that loop groups carried beside Start Loop / On
-# Complete until #6250. Maps each to the loop port that stands in for it.
+# Saved connections may still name a loop group's entry and exit by the base class's port names.
+# Each resolves to the loop port that carries that wire now.
 LEGACY_CONTROL_PORT_NAMES = {
     "group_exec_in": "exec_in",
     "group_exec_out": "exec_out",
