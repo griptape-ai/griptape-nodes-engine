@@ -20,6 +20,7 @@ from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowShape,
 )
@@ -597,15 +598,15 @@ class WorkflowSaver(EngineScoped):
         self, request: SaveSubflowToWorkflowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Save a subflow of the open `workflow` back into the file of the saved workflow the request names."""
-        registry_key = request.workflow_name
-
-        if not self.engine.workflow_registry.has_workflow_with_name(registry_key):
-            details = (
-                f"Attempted to save subflow '{request.flow_name}'. Workflow '{registry_key}' not found in registry."
+        try:
+            target = self.engine.workflow_registry.resolve_address(
+                workflow_id=request.workflow_id,
+                workflow_name=request.workflow_name,
+                action=f"save subflow '{request.flow_name}' into",
             )
-            return SaveSubflowToWorkflowResultFailure(result_details=details)
-
-        target = self.engine.workflow_registry.get_workflow_by_name(registry_key)
+        except WorkflowAddressError as err:
+            return SaveSubflowToWorkflowResultFailure(result_details=str(err))
+        registry_key = target.name
         if target.file_path is None:
             # Saving a subflow back into its parent requires that parent to have a file.
             # Unsaved workflows have no destination to write into.

@@ -22,6 +22,7 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowMetadataError,
     WorkflowMetadataFileError,
@@ -945,18 +946,32 @@ class WorkflowManager(EngineScoped):
     def on_get_workflow_shape_request(
         self, request: GetWorkflowShapeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
+        """Read the shape of `workflow`'s flow the request names. Its workflow names only label messages."""
+        workflow_name = request.workflow_name
+        if request.workflow_id is not None:
+            try:
+                workflow_name = self.engine.workflow_registry.resolve_address(
+                    workflow_id=request.workflow_id,
+                    workflow_name=request.workflow_name,
+                    action="read the inputs and outputs of",
+                ).name
+            except WorkflowAddressError as err:
+                return GetWorkflowShapeResultFailure(result_details=str(err))
+        if workflow_name is None:
+            details = "Attempted to read the inputs and outputs of a workflow. Failed because the request names no workflow. Pass workflow_id."
+            return GetWorkflowShapeResultFailure(result_details=details)
+
         try:
-            shape = self.extract_workflow_shape_in(workflow, request.workflow_name, flow_name=request.flow_name)
+            shape = self.extract_workflow_shape_in(workflow, workflow_name, flow_name=request.flow_name)
         except (ValueError, KeyError) as err:
             details = (
-                f"Attempted to read the inputs and outputs of workflow '{request.workflow_name}'. "
-                f"Failed because: {err.args[0]}"
+                f"Attempted to read the inputs and outputs of workflow '{workflow_name}'. Failed because: {err.args[0]}"
             )
             return GetWorkflowShapeResultFailure(result_details=details)
 
         return GetWorkflowShapeResultSuccess(
             workflow_shape=WorkflowShape(inputs=shape["input"], outputs=shape["output"]),
-            result_details=f"Read the inputs and outputs of workflow '{request.workflow_name}'.",
+            result_details=f"Read the inputs and outputs of workflow '{workflow_name}'.",
         )
 
     def _walk_object_tree(
