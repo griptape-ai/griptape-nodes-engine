@@ -1796,14 +1796,7 @@ class FlowManager(EngineScoped):
             if has_incoming_control:
                 continue
 
-            if node.name in connections.outgoing_index:
-                for param_name in connections.outgoing_index[node.name]:
-                    param = node.get_parameter_by_name(param_name)
-                    if param and ParameterTypeBuiltin.CONTROL_TYPE.value == param.output_type:
-                        control_nodes.append(node)
-                        break
-            else:
-                control_nodes.append(node)
+            control_nodes.append(node)
 
         valid_data_nodes = []
         for node in data_nodes:

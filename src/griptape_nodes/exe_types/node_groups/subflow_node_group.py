@@ -1393,6 +1393,22 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     self.parameter_output_values[proxy_param_name] = value
                 break
 
+    def get_next_control_output(self) -> Parameter | None:
+        """Follow the first control output wired to a node outside the group.
+
+        Grouping a node whose Flow Out was connected moves that wire onto a pass-through port
+        rather than group_exec_out, so following group_exec_out alone ends the run at the group.
+        """
+        connections = self._require_workflow().flows.connections
+        for parameter in self.parameters:
+            if parameter.output_type != ParameterTypeBuiltin.CONTROL_TYPE.value:
+                continue
+            if ParameterMode.OUTPUT not in parameter.allowed_modes:
+                continue
+            if connections.get_connected_node(self, parameter, include_internal=False) is not None:
+                return parameter
+        return self.control_out
+
     @abstractmethod
     async def aprocess(self) -> None:
         """Execute all nodes in the group.
