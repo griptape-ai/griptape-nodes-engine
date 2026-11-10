@@ -5,7 +5,8 @@
   requires, so a library installed, moved, or re-registered while the confirmation is open cannot
   be acted on against what was shown. Both report structured verdicts rather than prose:
   `blocked_by` says why an uninstall is refused (environment-managed, the Sandbox Library, or an
-  unsafe path such as a filesystem root, a drive root, a UNC share, or a `.`/`..` segment), and
+  unsafe path such as a filesystem root, a drive root, a UNC share, a `.`/`..` segment, or a
+  folder shared with your workspace, libraries directory, or home directory), and
   `remaining_registrations` says what would still register the library afterwards (a shared
   directory entry and the libraries it also registers, a `libraries_to_download` git URL, or a
   project/workspace/environment config layer the engine cannot write to). Both also list any

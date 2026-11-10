@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
 import anyio
@@ -51,6 +51,16 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from griptape_nodes.retained_mode.engine import Engine
+
+# Both path flavors, exercised on every host. `Path` is the host's own flavor, so asserting
+# through `Path` alone answers only half the question: these cases passed on Linux while a
+# Windows host read `/home/user/libs/Nuke` (whose `str()` is `\home\user\libs\Nuke` there) as a
+# filesystem root and refused an ordinary uninstall. Pinning the flavor keeps both answers
+# honest wherever the suite runs.
+_PATH_FLAVORS = [
+    pytest.param(PurePosixPath, id="posix_flavor"),
+    pytest.param(PureWindowsPath, id="windows_flavor"),
+]
 
 
 def _write_manifest(directory: Path, name: str, *, version: str = "1.0.0") -> Path:
@@ -233,10 +243,12 @@ class TestBlockedTargets:
         assert isinstance(result.blocked_by, EnvironmentManagedBlocker)
         assert await anyio.Path(manifest).exists()
 
+    @pytest.mark.parametrize("flavor", _PATH_FLAVORS)
     @pytest.mark.parametrize(
         "unsafe_path",
         [
             pytest.param("C:\\", id="windows_drive_root"),
+            pytest.param("C:/", id="windows_drive_root_forward_slash"),
             pytest.param("\\\\server\\share", id="unc_share"),
             pytest.param("\\\\server\\share\\lib", id="unc_share_subfolder"),
             pytest.param("\\\\?\\UNC\\server\\share", id="long_unc_share"),
@@ -244,13 +256,21 @@ class TestBlockedTargets:
             pytest.param("/", id="posix_root"),
         ],
     )
-    def test_unsafe_install_directory_is_refused(self, unsafe_path: str) -> None:
+    def test_unsafe_install_directory_is_refused(self, unsafe_path: str, flavor: type[PurePath]) -> None:
         """Direct unit coverage of the root/UNC safety check, independent of the real filesystem."""
-        assert _unsafe_install_directory(Path(unsafe_path)) is True
+        assert _unsafe_install_directory(flavor(unsafe_path)) is True
 
-    def test_ordinary_directory_is_not_flagged_unsafe(self) -> None:
-        assert _unsafe_install_directory(Path("C:\\libs\\Nuke")) is False
-        assert _unsafe_install_directory(Path("/home/user/libs/Nuke")) is False
+    @pytest.mark.parametrize("flavor", _PATH_FLAVORS)
+    @pytest.mark.parametrize(
+        "ordinary_path",
+        [
+            pytest.param("C:\\libs\\Nuke", id="windows_library_folder"),
+            pytest.param("/home/user/libs/Nuke", id="posix_library_folder"),
+            pytest.param("/libs", id="posix_single_segment"),
+        ],
+    )
+    def test_ordinary_directory_is_not_flagged_unsafe(self, ordinary_path: str, flavor: type[PurePath]) -> None:
+        assert _unsafe_install_directory(flavor(ordinary_path)) is False
 
     @pytest.mark.asyncio
     async def test_traversal_segment_in_register_entry_is_blocked(self, engine: Engine, workspace: Path) -> None:
@@ -455,6 +475,151 @@ class TestShadowedConfigLayer:
         preview = await _preview(engine, "Plain Library", manifest)
 
         assert not any(isinstance(e, ShadowedConfigRemaining) for e in preview.remaining_registrations)
+
+    @pytest.mark.asyncio
+    async def test_a_shadowed_uninstall_writes_nothing_to_the_user_config(
+        self, engine: Engine, workspace: Path, tmp_path: Path
+    ) -> None:
+        """The config write is skipped entirely, not just ineffective.
+
+        `_classify_registration` reads the MERGED list, which here is the project layer's whole
+        list. Writing the remainder back would persist the project's OTHER libraries into the
+        user's global config, where they would load in every other project, and would drop any
+        user-layer entries absent from that list. The removal could not take effect either way,
+        so the write is pure damage.
+        """
+        config = engine.config_manager
+        mine = _write_manifest(workspace / "libs" / "mine", "Mine")
+        theirs = _write_manifest(workspace / "libs" / "theirs", "Theirs")
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        (project_dir / "griptape_nodes_config.json").write_text(
+            json.dumps(
+                {"app_events": {"on_app_initialization_complete": {"libraries_to_register": [str(mine), str(theirs)]}}}
+            ),
+            encoding="utf-8",
+        )
+        config.load_project_config(project_dir)
+        config.load_configs()
+        _track(engine.library_manager, mine, library_name="Mine", registered_path=str(mine))
+
+        result = await _uninstall_after_preview(engine, "Mine", mine)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.config_entry_removed is False
+        user_entries = config.get_config_value(LIBRARIES_TO_REGISTER_KEY, config_source="user_config", default=[]) or []
+        assert str(theirs) not in user_entries, "the project layer's other library leaked into the user config"
+        assert user_entries == []
+        assert any(isinstance(e, ShadowedConfigRemaining) for e in result.remaining_registrations)
+
+
+class TestProtectedDirectories:
+    """A manifest sitting directly in a shared folder must not make that folder the delete target.
+
+    The install directory is meant to be the library's OWN folder. A hand-added
+    `libraries_to_register` entry pointing at a manifest in the workspace, the libraries root, or
+    the home directory would otherwise resolve to that shared folder, and the delete would take
+    every workflow or every other installed library with it. The collateral list names only other
+    manifests, so the confirmation would never show those files.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_manifest_at_the_workspace_root_is_blocked(self, engine: Engine, workspace: Path) -> None:
+        workflow = workspace / "my_workflow.py"
+        workflow.write_text("# a user's workflow", encoding="utf-8")
+        manifest = _write_manifest(workspace, "Workspace Root Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Workspace Root Library", registered_path=str(manifest))
+
+        result = await _uninstall_after_preview(engine, "Workspace Root Library", manifest)
+
+        assert isinstance(result, UninstallLibraryResultFailure)
+        assert result.failure_reason == "blocked"
+        assert isinstance(result.blocked_by, UnsafePathBlocker)
+        assert await anyio.Path(workflow).exists()
+        assert await anyio.Path(workspace).exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("workspace")
+    async def test_a_manifest_in_the_libraries_root_is_blocked(self, engine: Engine) -> None:
+        libraries_root = engine.config_manager.resolved_libraries_root()
+        libraries_root.mkdir(parents=True, exist_ok=True)
+        neighbour = _write_manifest(libraries_root / "other_lib", "Other Library")
+        manifest = _write_manifest(libraries_root, "Libraries Root Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Libraries Root Library", registered_path=str(manifest))
+
+        result = await _uninstall_after_preview(engine, "Libraries Root Library", manifest)
+
+        assert isinstance(result, UninstallLibraryResultFailure)
+        assert result.failure_reason == "blocked"
+        assert await anyio.Path(neighbour).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_library_in_its_own_subfolder_is_still_allowed(self, engine: Engine, workspace: Path) -> None:
+        """The guard must not catch the normal case: a library in a folder under the workspace."""
+        library_dir = workspace / "libs" / "ordinary"
+        manifest = _write_manifest(library_dir, "Ordinary Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Ordinary Library", registered_path=str(manifest))
+
+        result = await _uninstall_after_preview(engine, "Ordinary Library", manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert not await anyio.Path(library_dir).exists()
+
+
+class TestDuplicateNameCopies:
+    """Two installs can share a name; the registry is keyed by name alone."""
+
+    @pytest.mark.asyncio
+    async def test_uninstalling_a_duplicate_leaves_the_loaded_copy_alone(self, engine: Engine, workspace: Path) -> None:
+        """Uninstalling the failed duplicate must not unregister the copy that actually loaded.
+
+        A duplicate that failed with `DuplicateLibraryProblem` is still tracked. Unloading by
+        name would find the OTHER copy registered under that name and unregister it, dropping
+        its held objects and workers, while its own files and config entry stayed put.
+        """
+        loaded_manifest = _write_manifest(workspace / "libs" / "loaded", "Dup Library")
+        duplicate_manifest = _write_manifest(workspace / "libs" / "duplicate", "Dup Library")
+        _track(
+            engine.library_manager,
+            loaded_manifest,
+            library_name="Dup Library",
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+        )
+        _track(engine.library_manager, duplicate_manifest, library_name="Dup Library")
+        _register_in_registry("Dup Library")
+
+        result = await _uninstall_after_preview(engine, "Dup Library", duplicate_manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.unloaded is False
+        # The live copy keeps its registry entry, its tracking record, and its files.
+        assert "Dup Library" in LibraryRegistry.list_libraries()
+        assert str(loaded_manifest) in engine.library_manager._library_file_path_to_info
+        assert await anyio.Path(loaded_manifest).exists()
+        # Only the duplicate is gone.
+        assert not await anyio.Path(duplicate_manifest.parent).exists()
+        assert str(duplicate_manifest) not in engine.library_manager._library_file_path_to_info
+
+    @pytest.mark.asyncio
+    async def test_uninstalling_the_loaded_copy_does_unload_it(self, engine: Engine, workspace: Path) -> None:
+        loaded_manifest = _write_manifest(workspace / "libs" / "loaded", "Dup Library")
+        _write_manifest(workspace / "libs" / "duplicate", "Dup Library")
+        _track(
+            engine.library_manager,
+            loaded_manifest,
+            library_name="Dup Library",
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+        )
+        _register_in_registry("Dup Library")
+
+        result = await _uninstall_after_preview(engine, "Dup Library", loaded_manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.unloaded is True
+        assert "Dup Library" not in LibraryRegistry.list_libraries()
 
 
 class TestAlreadyDeletedFolder:

@@ -18,12 +18,13 @@ state itself changing between the two calls, while the confirmation sits open.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import re
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import TYPE_CHECKING
 
 import anyio
@@ -56,7 +57,7 @@ from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileResultFailure,
     DeletionBehavior,
 )
-from griptape_nodes.retained_mode.managers.library.common import LIBRARY_CONFIG_GLOB_PATTERN
+from griptape_nodes.retained_mode.managers.library.common import LIBRARY_CONFIG_GLOB_PATTERN, LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.library.metadata_loading import is_library_name_registered
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
@@ -245,8 +246,19 @@ class LibraryUninstall(EngineScoped):
     def _uninstall_remove_config_entry(
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
-        """Step 1 (least destructive): remove the config entry, if any names this exact copy."""
+        """Step 1 (least destructive): remove the config entry, if any names this exact copy.
+
+        Skipped entirely when a higher layer supplies the entry. `_classify_registration` reads
+        the MERGED list, which in that case is the higher layer's whole list; writing the
+        remainder back would persist every other library that layer supplies into the user's
+        global config, where it would then load in every other project, and would drop any
+        user-layer entries absent from that list, since layers replace lists rather than merging
+        them. The removal could not take effect anyway -- the higher layer still wins -- so the
+        write is pure damage. `ShadowedConfigRemaining` already tells the user where to go.
+        """
         if resolved.classification.registered_in is None or resolved.classification.is_directory_entry:
+            return False, None
+        if any(isinstance(entry, ShadowedConfigRemaining) for entry in resolved.remaining_registrations):
             return False, None
         removed = self._remove_config_entry(resolved.classification)
         if not removed:
@@ -260,12 +272,27 @@ class LibraryUninstall(EngineScoped):
     def _uninstall_unload_from_registry(
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
-        """Step 2: unload from the in-memory registry, if it was loaded there at all."""
+        """Step 2: unload from the in-memory registry, but only when THIS copy is the loaded one.
+
+        The registry is keyed by name, and two installs can share one. A duplicate that failed to
+        load with `DuplicateLibraryProblem` is still tracked, so uninstalling it would otherwise
+        find the OTHER copy registered under that name and unregister it -- dropping its held
+        objects, stopping its worker, and deleting every tracking entry for the name -- while its
+        own files and config entry stay put. That is the opposite of this module's rule that two
+        installs sharing a name never resolve to each other.
+
+        So the unload runs only when the copy at `resolved.library_path` is the one that loaded.
+        Otherwise just this copy's tracking entry is dropped, leaving the live library alone.
+        """
+        library_manager = self.engine.library_manager
         library_name = resolved.library_name
-        if not is_library_name_registered(library_name):
-            self.engine.library_manager._library_file_path_to_info.pop(resolved.library_path, None)
+        tracked = library_manager.find_library_info_for_attempted_load(resolved.library_path)
+        this_copy_is_loaded = tracked is not None and tracked.lifecycle_state == LibraryLifecycleState.LOADED
+
+        if not is_library_name_registered(library_name) or not this_copy_is_loaded:
+            library_manager._library_file_path_to_info.pop(resolved.library_path, None)
             return False, None
-        unload_result = self.engine.library_manager.registration.unload_library_from_registry_request(
+        unload_result = library_manager.registration.unload_library_from_registry_request(
             UnloadLibraryFromRegistryRequest(library_name=library_name)
         )
         if isinstance(unload_result, UnloadLibraryFromRegistryResultFailure):
@@ -388,7 +415,7 @@ class LibraryUninstall(EngineScoped):
 
         install_directory = self._install_directory_for(classification, resolved_library_path)
 
-        if _unsafe_install_directory(install_directory):
+        if _unsafe_install_directory(install_directory) or self._is_protected_directory(install_directory):
             return self._blocked_resolution(
                 library_name,
                 library_info,
@@ -495,6 +522,35 @@ class LibraryUninstall(EngineScoped):
             if isinstance(entries, list) and raw_entry in entries:
                 return layer
         return None
+
+    def _is_protected_directory(self, install_directory: Path) -> bool:
+        """Whether deleting `install_directory` would take a shared folder with it.
+
+        A library's install directory is meant to be the library's OWN folder. When a manifest
+        sits directly in the home directory, the workspace, or the libraries root -- a hand-added
+        `libraries_to_register` entry, or a library the environment supplies -- its parent is
+        that shared folder, and deleting it would take every workflow in the workspace, or every
+        other installed library, with it. The collateral list names only other MANIFESTS, so the
+        user would never see those files in the confirmation.
+
+        Checked as "is, or contains" rather than equality: the home directory's own parent is
+        also not a library folder, and `_unsafe_install_directory` only catches the literal root.
+        A library in a subfolder of any of these (the normal case) is unaffected.
+        """
+        config_mgr = self.engine.config_manager
+        protected = [config_mgr.workspace_path, config_mgr.resolved_libraries_root()]
+        # No home directory resolvable on this machine; the other two still apply.
+        with contextlib.suppress(RuntimeError):
+            protected.append(Path.home())
+
+        target = canonicalize_for_identity(install_directory)
+        for directory in protected:
+            guarded = canonicalize_for_identity(directory)
+            # `guarded.is_relative_to(target)` covers the target being a PARENT of a protected
+            # folder (deleting it takes the protected folder too); equality is the common case.
+            if guarded == target or guarded.is_relative_to(target):
+                return True
+        return False
 
     def _install_directory_for(self, classification: _Classification, resolved_library_path: Path) -> Path:
         """The folder an uninstall would delete for this classification.
@@ -695,10 +751,10 @@ def _path_text_has_traversal_segment(path_text: str) -> bool:
     return False
 
 
-_WINDOWS_DRIVE_OR_UNC_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+_WINDOWS_DRIVE_OR_UNC_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2})")
 
 
-def _unsafe_install_directory(install_directory: Path) -> bool:
+def _unsafe_install_directory(install_directory: PurePath) -> bool:
     r"""Whether `install_directory` must not be deleted.
 
     True for a filesystem root, a drive root, and a UNC share -- including the `\\?\UNC\...`
@@ -706,11 +762,18 @@ def _unsafe_install_directory(install_directory: Path) -> bool:
     directory, after any `.`/`..` segments have already been rejected by
     `_path_text_has_traversal_segment` on the raw config text.
 
-    Parsed with `PureWindowsPath` only when the text itself looks like a Windows drive or UNC
-    path (so a studio's config, or a test, exercises the Windows rules on any host OS);
-    everything else is parsed as `PurePosixPath`. Checking the same string against both parsers
-    unconditionally is wrong: `PurePosixPath` treats an entire backslash-separated Windows path
-    as one opaque component, so every Windows path would read as a root.
+    The path's OWN flavor decides how it is split: a real `Path` already knows whether it is a
+    `WindowsPath` or a `PosixPath`, and `parts` on it is the authoritative answer. Re-parsing
+    `str(path)` under a flavor guessed from the text throws that away, and on a Windows host it
+    throws it away wrongly: `str(Path("/home/user/libs"))` is `\home\user\libs`, which no
+    drive/UNC pattern matches, so a text-sniffing fallback hands it to `PurePosixPath`, which
+    treats the whole backslash string as ONE opaque component and calls an ordinary directory a
+    filesystem root. That refused a legitimate uninstall on Windows.
+
+    The string sniff survives only for a path whose flavor is NOT the host's -- a Windows-spelled
+    path evaluated on POSIX (a studio's config carried across platforms, or this module's own
+    tests), where `Path` has parsed it as a single POSIX component and the text is the only
+    remaining evidence of what it means.
     """
     path_str = str(install_directory)
     backslash_form = path_str.replace("/", "\\")
@@ -718,8 +781,10 @@ def _unsafe_install_directory(install_directory: Path) -> bool:
         return True
     if backslash_form.startswith("\\\\") and not backslash_form.startswith("\\\\?\\"):
         return True
-    if _WINDOWS_DRIVE_OR_UNC_PATTERN.match(path_str):
+
+    parts = install_directory.parts
+    # A foreign-flavored path collapses to one component under the host's parser while its text
+    # plainly names a drive or UNC root; re-read it under the flavor it was written in.
+    if len(parts) <= 1 and _WINDOWS_DRIVE_OR_UNC_PATTERN.match(path_str):
         parts = PureWindowsPath(path_str).parts
-    else:
-        parts = PurePosixPath(path_str).parts
     return len(parts) <= 1
