@@ -795,7 +795,7 @@ class Engine:
     def opening_workflow(self, workflow_id: str) -> Iterator[OpeningWorkflow]:
         """Open the registered workflow with this id to build into, telling every client once the block ends.
 
-        Every open goes through here, and every close through `close_workflow`, so clients hear of
+        Every open goes through here, and every close through `_tear_down_workflow`, so clients hear of
         each workflow with one `WorkflowOpenedEvent` and one `WorkflowClosedEvent`. Clients hear of
         the workflow once the block ends, so none reads it half built. A block that raises, or calls
         `OpeningWorkflow.abandon`, closes the workflow again, and clients never hear of it. If that
