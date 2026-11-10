@@ -955,7 +955,7 @@ class WorkflowSaver(EngineScoped):
             names_library_copy = False
             if not requested_file_name and current_workflow is not None:
                 suggested_file_stem = self.engine.workflow_registry.suggested_file_stem(current_workflow)
-                names_library_copy = current_workflow.seeded_from_workflow_id is not None
+                names_library_copy = self.engine.workflow_registry.seed_source(current_workflow) is not None
             raw_name = requested_file_name or suggested_file_stem or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
             creation_date = datetime.now(tz=UTC)
             branched_from = None
