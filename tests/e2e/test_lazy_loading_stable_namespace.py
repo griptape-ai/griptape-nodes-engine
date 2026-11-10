@@ -219,6 +219,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 
 
 async def _e2e_run() -> None:
+    GriptapeNodes.ContextManager().push_workflow(file_path=__file__)  # noqa: F821
     await build_workflow()  # noqa: F821 - defined by exec'd workflow source above
     top_level = await GriptapeNodes.ahandle_request(_E2EGetTopLevelFlowRequest())  # noqa: F821
     if not isinstance(top_level, _E2EGetTopLevelFlowResultSuccess) or top_level.flow_name is None:

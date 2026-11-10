@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -14,13 +15,19 @@ import anyio
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketUnavailableError
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
 from griptape_nodes.common.isolated_execution_scope import isolated_execution_scope
+from griptape_nodes.common.loop_body_scope import (
+    LoopBodyScope,
+    current_loop_body_scope,
+    entered_loop_body_scope,
+    loop_body_scope_for,
+)
 from griptape_nodes.drivers.storage.storage_backend import StorageBackend
 from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
 )
-from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import ParameterList, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
     BaseWhileNodeGroup,
@@ -38,13 +45,17 @@ from griptape_nodes.exe_types.node_types import (
     StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
-from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
-from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
+from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionPayload,
+    ForwardedException,
+    ProgressEvent,
+    ResultPayload,
+)
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
@@ -63,6 +74,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     InvolvedNodesEvent,
     NodeFinishProcessEvent,
     NodeMetadata,
+    NodeProcessOutcome,
     NodeResolvedEvent,
     NodeStartProcessEvent,
     NodeUnresolvedEvent,
@@ -82,11 +94,16 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeserializeFlowFromCommandsRequest,
     DeserializeFlowFromCommandsResultFailure,
     DeserializeFlowFromCommandsResultSuccess,
+    OriginalNodeParameter,
     PackagedNodeParameterMapping,
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails, build_engine_error_details
+from griptape_nodes.retained_mode.events.node_error_details import (
+    NodeErrorDetails,
+    build_engine_error_details,
+    build_node_error_details,
+)
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultFailure,
     CreateNodeResultSuccess,
@@ -128,14 +145,20 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
 # Tracks the name of the node currently being executed in this async context.
 # Each asyncio task gets its own copy, so parallel node execution is safe.
 current_executing_node_name: ContextVar[str | None] = ContextVar("current_executing_node_name", default=None)
+
+# The execution_id of the node run in progress in this async context, sent as parent_execution_id
+# on the node events of every run nested inside it.
+current_node_execution_id: ContextVar[str | None] = ContextVar("current_node_execution_id", default=None)
 
 
 class IterationControlAction(StrEnum):
@@ -206,18 +229,20 @@ LOOP_EVENTS_TO_SUPPRESS = {
     SetLockNodeStateResultFailure,
     DeserializeFlowFromCommandsResultSuccess,
     DeserializeFlowFromCommandsResultFailure,
+    # Everything else the bookkeeping dispatches (connection listings, parameter additions, deletes), by
+    # base class: should_suppress_event matches by isinstance.
+    ResultPayload,
+    # Element events of the packaged copies. These cannot be translated to the real node: the editor
+    # matches elements by id, and a copy's ids are its own.
+    AlterElementEvent,
+    RemoveElementEvent,
 }
 
-# NOTE: every member of this set is inert, and test_execution_events_to_suppress_is_entirely_inert
-# checks that it stays that way. Execution events are emitted through put_event/aput_event, which
-# never consult should_suppress_event -- only request results are checked (engine.py). The set is
-# kept as the record of intent: the aim is to stop parallel iterations from flooding the websocket
-# with per-node execution traffic. Wiring put_event up to suppression would also silence the node
-# highlighting that EventTranslationContext exists to provide, so it needs its own design rather
-# than a one-line change.
-#
-# Only ExecutionPayload members belong here. A ResultPayload in this set is a live transport change
-# wearing the costume of a no-op: put it in LOOP_EVENTS_TO_SUPPRESS deliberately, or leave it out.
+# Execution events from a parallel loop's iteration flows. The editor has no node by those names.
+# Don't use in the sequential path: it relies on EventTranslationContext to highlight the real node.
+# Execution-event listeners hear every parallel iteration either way. NodeStartProcessEvent and
+# NodeFinishProcessEvent are not here: the loop body scope reports them under canvas names (#5950).
+# Only ExecutionPayload members belong here; request results go in LOOP_EVENTS_TO_SUPPRESS.
 EXECUTION_EVENTS_TO_SUPPRESS = {
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -228,8 +253,6 @@ EXECUTION_EVENTS_TO_SUPPRESS = {
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
     NodeUnresolvedEvent,
-    NodeStartProcessEvent,
-    NodeFinishProcessEvent,
     InvolvedNodesEvent,
     GriptapeEvent,
     PublishWorkflowProgressEvent,
@@ -285,6 +308,13 @@ class ExecuteNodeFailedError(RuntimeError):
         self.details = details
 
 
+def node_error_details_for(node_name: str, exc: BaseException) -> NodeErrorDetails:
+    """Use the details built where the node failed, or build them from an engine exception that never became a result."""
+    if isinstance(exc, ExecuteNodeFailedError):
+        return exc.details
+    return build_node_error_details(node_name, exc)
+
+
 class NodeExecutor(EngineScoped):
     """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
@@ -298,11 +328,52 @@ class NodeExecutor(EngineScoped):
         raise ValueError(msg)
 
     async def execute(self, node: BaseNode) -> None:
-        """Execute the given node.
+        """Execute the given node in the workflow it joined, sending NodeStartProcessEvent before it runs and NodeFinishProcessEvent after.
+
+        The events use the synchronous put_event so the finish event still goes out from a cancelled
+        task. Nodes the engine added to a loop body run without either event. The node's own
+        workflow is the one it runs in, so the node lookup, the worker's paths and cancellation
+        can't disagree with the helpers below, which read it from the node too.
 
         Args:
             node: The BaseNode to execute
-            library_name: The library that the execute method should come from.
+
+        Raises:
+            WorkflowContextError: The node never joined a workflow.
+        """
+        workflow = node._require_workflow()
+        loop_body_scope = current_loop_body_scope.get()
+        if loop_body_scope is not None and loop_body_scope.is_engine_node(node.name):
+            await self._run_node(workflow, node)
+            return
+
+        start_event = self._node_start_process_event(workflow, node, loop_body_scope)
+        self._put_execution_event(workflow, start_event)
+        outcome = NodeProcessOutcome.FAILED
+        failure: Exception | None = None
+        token = current_node_execution_id.set(start_event.execution_id)
+        try:
+            await self._run_node(workflow, node)
+            outcome = self._outcome_after_return(node)
+        except asyncio.CancelledError:
+            outcome = NodeProcessOutcome.CANCELLED
+            raise
+        except Exception as err:
+            # Broad by design: only recorded for the finish event, then re-raised unchanged.
+            failure = err
+            raise
+        finally:
+            current_node_execution_id.reset(token)
+            self._put_execution_event(
+                workflow, self._node_finish_process_event(start_event, outcome=outcome, failure=failure)
+            )
+
+    async def _run_node(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
+        """Run the given node by the path its type and execution environment call for.
+
+        Args:
+            workflow: The workflow the node runs in
+            node: The BaseNode to execute
         """
         token = current_executing_node_name.set(node.name)
         try:
@@ -345,17 +416,17 @@ class NodeExecutor(EngineScoped):
             # Resolved here because only this process has workflow context to resolve it FROM;
             # a worker would answer from an empty context and silently degrade the paths its node
             # writes to. Harmless on the local route, where these are this process's own values.
-            workflow_context = self.engine.project_manager.workflow_context_for_dispatch()
+            workflow_context = self.engine.project_manager.workflow_context_for_dispatch(workflow)
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
-            result = await self.engine.ahandle_request(
+            result = await workflow.ahandle_request(
                 ExecuteNodeRequest(
                     node_name=node.name,
-                    parameter_values=node._list_rows.values_for_dispatch(),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
-                    variables=self._resolve_variables_for_node(node.name),
+                    variables=self._resolve_variables_for_node(workflow, node.name),
                     local_object_source=node.local_object_source,
+                    orchestrator_workflow_id=workflow_context.workflow_id,
                     workflow_name=workflow_context.name,
                     workflow_file_path=workflow_context.file_path,
                     workflow_working_directory=workflow_context.working_directory,
@@ -384,6 +455,70 @@ class NodeExecutor(EngineScoped):
             # node could finish on it. Now that it has, drop it.
             node.reset_deferred_input_values()
 
+    def _node_start_process_event(
+        self, workflow: WorkflowRuntime, node: BaseNode, loop_body_scope: LoopBodyScope | None
+    ) -> NodeStartProcessEvent:
+        """Describe the node about to run as the artist placed it, with a fresh execution_id.
+
+        Everything is captured here, before the run, so the finish event can describe a node that
+        was deleted while it ran.
+        """
+        canvas_node_name = node.name
+        if loop_body_scope is not None:
+            scoped_node_name = loop_body_scope.canvas_name_for(node.name)
+            if scoped_node_name is not None:
+                canvas_node_name = scoped_node_name
+        return NodeStartProcessEvent(
+            node_name=canvas_node_name,
+            node_type=node.__class__.__name__,
+            specific_library_name=node.metadata.get("library"),
+            flow_name=self._parent_flow_name(workflow, canvas_node_name),
+            execution_id=uuid.uuid4().hex,
+            parent_execution_id=current_node_execution_id.get(),
+        )
+
+    def _node_finish_process_event(
+        self,
+        start_event: NodeStartProcessEvent,
+        *,
+        outcome: NodeProcessOutcome,
+        failure: Exception | None,
+    ) -> NodeFinishProcessEvent:
+        """Describe how the run that start_event announced ended."""
+        error_message = None
+        error = None
+        if failure is not None:
+            error_message = str(failure)
+            error = node_error_details_for(start_event.node_name, failure)
+        return NodeFinishProcessEvent(
+            node_name=start_event.node_name,
+            node_type=start_event.node_type,
+            specific_library_name=start_event.specific_library_name,
+            flow_name=start_event.flow_name,
+            execution_id=start_event.execution_id,
+            parent_execution_id=start_event.parent_execution_id,
+            outcome=outcome,
+            error_message=error_message,
+            error=error,
+        )
+
+    def _parent_flow_name(self, workflow: WorkflowRuntime, node_name: str) -> str | None:
+        """The flow the node is in, or None when no node by that name exists."""
+        try:
+            return workflow.nodes.parent_flow_name(node_name)
+        except KeyError:
+            return None
+
+    def _put_execution_event(self, workflow: WorkflowRuntime, payload: ExecutionPayload) -> None:
+        self.engine.event_manager.put_event(workflow.execution_event(payload))
+
+    @staticmethod
+    def _outcome_after_return(node: BaseNode) -> NodeProcessOutcome:
+        """A node that returned after a cancel was requested stopped early on purpose: it was cancelled."""
+        if node.is_cancellation_requested:
+            return NodeProcessOutcome.CANCELLED
+        return NodeProcessOutcome.SUCCEEDED
+
     def _execute_node_failed_error(self, node_name: str, result: Any, exc: Exception | None) -> ExecuteNodeFailedError:
         message = self._format_node_failure_message(node_name, result, exc)
         details = None
@@ -395,20 +530,20 @@ class NodeExecutor(EngineScoped):
             details = build_engine_error_details(node_name, result_details, exc)
         return ExecuteNodeFailedError(message, details=details)
 
-    def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
+    def _resolve_variables_for_node(self, workflow: WorkflowRuntime, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.
 
         Workers run transient nodes that are never added to ObjectManager, so the
         lazy fetch inside VariableResolver.get_variables_if_enabled fails with
         KeyError. Pre-seeding here lets the worker skip that path entirely.
         """
-        if not VariableResolver.is_substitution_enabled(self.engine):
+        if not VariableResolver.is_substitution_enabled(self.engine, workflow):
             return {}
         try:
-            flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
+            flow_name = workflow.nodes.parent_flow_name(node_name)
         except KeyError:
             return {}
-        var_result = self.engine.handle_request(
+        var_result = workflow.handle_request(
             ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
         if not isinstance(var_result, ListVariablesResultSuccess):
@@ -772,6 +907,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             PublishLocalWorkflowResult containing workflow_result, file_name, and output_parameter_prefix
         """
+        workflow = node._require_workflow()
         sanitized_node_name = node.name.replace(" ", "_")
         output_parameter_prefix = f"{sanitized_node_name}_packaged_node_"
         # We have to make our defaults strings because the PackageNodesAsSerializedFlowRequest doesn't accept None types.
@@ -803,7 +939,7 @@ class NodeExecutor(EngineScoped):
             entry_control_parameter_name=None,
             node_group_name=node_group_name,
         )
-        package_result = self.engine.handle_request(request)
+        package_result = workflow.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package node '{node.name}'. Error: {package_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -815,7 +951,7 @@ class NodeExecutor(EngineScoped):
             workflow_shape=package_result.workflow_shape,
         )
 
-        workflow_result = await self.engine.ahandle_request(workflow_file_request)
+        workflow_result = await workflow.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to Save Workflow File from Serialized Flow for node '{node.name}'. Error: {workflow_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -962,6 +1098,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             LoopBodyNodes containing all_nodes, execution_type, and node_group_name
         """
+        workflow = start_node._require_workflow()
         all_nodes: set[str] = set()
         visited_deps: set[str] = set()
 
@@ -971,7 +1108,7 @@ class NodeExecutor(EngineScoped):
         for node_name in nodes_in_control_flow:
             # Add ALL nodes in control flow for removal from parent DAG
             all_nodes.add(node_name)
-            node_obj = node_manager.get_node_by_name(node_name)
+            node_obj = node_manager.get_node_by_name_in(workflow, node_name)
             deps = DagBuilder.collect_data_dependencies_for_node(
                 node_obj, connections, nodes_in_control_flow, visited_deps
             )
@@ -986,7 +1123,7 @@ class NodeExecutor(EngineScoped):
         node_group_name = None
         if len(all_nodes) == 1:
             node_inside = all_nodes.pop()
-            node_obj = node_manager.get_node_by_name(node_inside)
+            node_obj = node_manager.get_node_by_name_in(workflow, node_inside)
             if isinstance(node_obj, SubflowNodeGroup):
                 execution_type = node_obj.get_parameter_value(node_obj.execution_environment.name)
                 all_nodes.update(node_obj.get_all_nodes())
@@ -1011,8 +1148,12 @@ class NodeExecutor(EngineScoped):
         Returns:
             PackageNodesAsSerializedFlowResultSuccess if successful, None if empty loop body
         """
-        flow_manager = self.engine.flow_manager
-        connections = flow_manager.get_connections()
+        workflow = start_node._require_workflow()
+        connections = workflow.flows.connections
+
+        # Data dependency collection skips RESOLVED nodes. A node fed by the start node's per-pass
+        # outputs is still RESOLVED from the previous run, and must be packaged to re-evaluate per pass.
+        connections.unresolve_future_nodes(start_node)
 
         # Collect all nodes in the forward control path from start to end
         nodes_in_control_flow = DagBuilder.collect_nodes_in_forward_control_path(start_node, end_node, connections)
@@ -1059,7 +1200,7 @@ class NodeExecutor(EngineScoped):
             node_group_name=node_group_name,
         )
 
-        package_result = self.engine.handle_request(request)
+        package_result = workflow.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package loop nodes for '{end_node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
@@ -1076,12 +1217,14 @@ class NodeExecutor(EngineScoped):
         # exist in the outer flow but should not execute there - they only execute in the packaged iterations.
         node_manager = self.engine.node_manager
         for node_name in all_nodes:
-            node = node_manager.get_node_by_name(node_name)
+            node = node_manager.get_node_by_name_in(workflow, node_name)
             if node:
                 node.state = NodeResolutionState.RESOLVED
 
-        # Remove packaged nodes from global queue since they will be copied into loop iterations
-        self._remove_packaged_nodes_from_queue(all_nodes)
+        # Remove packaged nodes from global queue since they will be copied into loop iterations.
+        # end_node stays in the outer DAG and is where the real values land once copied back, so
+        # any outside consumer of a packaged node waits on end_node instead of losing the edge.
+        self._remove_packaged_nodes_from_queue(workflow, all_nodes, replacement_node_name=end_node.name)
 
         return package_result, execution_type
 
@@ -1096,6 +1239,7 @@ class NodeExecutor(EngineScoped):
             start_node: The BaseIterativeStartNode
             end_node: The BaseIterativeEndNode
         """
+        workflow = start_node._require_workflow()
         total_iterations = start_node._get_total_iterations()
         logger.debug(
             "No nodes found between '%s' and '%s'. Processing empty loop body.",
@@ -1105,7 +1249,7 @@ class NodeExecutor(EngineScoped):
 
         # Check if there are direct data connections from start to end
         list_connections_request = ListConnectionsForNodeRequest(node_name=start_node.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
 
         connected_source_param = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -1145,128 +1289,156 @@ class NodeExecutor(EngineScoped):
     def _get_iteration_control_action(
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
     ) -> IterationControlAction:
         """Determine which control action was taken during an iteration.
 
-        Checks if any nodes whose control outputs connect to the loop end node's
-        skip_iteration, break_loop, or loop_complete inputs have fired. Works for both
-        the legacy BaseIterativeEndNode path and the BaseIterativeNodeGroup path —
-        both expose identically-named control inputs and the detection is purely
-        connection/name based.
+        Checks whether control left the body through a node output connected to the loop end
+        node's skip_iteration, break_loop, or loop_complete inputs. Works for both the legacy
+        BaseIterativeEndNode path and the BaseIterativeNodeGroup path — both expose
+        identically-named control inputs and the detection is purely connection/name based.
 
         Args:
             end_loop_node: The loop end node (BaseIterativeEndNode or BaseIterativeNodeGroup)
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
             IterationControlAction indicating which control path was taken
         """
+        workflow = end_loop_node._require_workflow()
         # Get incoming connections to the end_loop_node (the iterative group)
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for node %s", end_loop_node.name)
             return IterationControlAction.ADD
 
         incoming_connections = list_connections_result.incoming_connections
 
-        # Check each control parameter to see if its source node has fired
-        # Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
-        break_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.BREAK_LOOP)
-        skip_source = self._find_source_for_control_param(incoming_connections, IterationControlParam.SKIP_ITERATION)
-        loop_complete_source = self._find_source_for_control_param(
-            incoming_connections, IterationControlParam.LOOP_COMPLETE
+        source_that_reached_end = self._get_control_source_that_reached_end(
+            workflow, end_node_mapping, node_name_mappings
+        )
+
+        # Check each control parameter to see if one of its sources is the exit the body took.
+        # Several body paths can converge on one input, so every source is checked, not just the
+        # first wire drawn. Priority: BREAK > SKIP > LOOP_COMPLETE > default ADD
+        break_sources = self._find_sources_for_control_param(
+            workflow, incoming_connections, IterationControlParam.BREAK_LOOP
+        )
+        skip_sources = self._find_sources_for_control_param(
+            workflow, incoming_connections, IterationControlParam.SKIP_ITERATION
+        )
+        loop_complete_sources = self._find_sources_for_control_param(
+            workflow, incoming_connections, IterationControlParam.LOOP_COMPLETE
         )
 
         # Check if break was triggered
-        if self._check_control_source_fired(break_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in break_sources):
             return IterationControlAction.BREAK
 
         # Check if skip was triggered
-        if self._check_control_source_fired(skip_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in skip_sources):
             return IterationControlAction.SKIP
 
         # Check if loop_complete was triggered
-        if self._check_control_source_fired(loop_complete_source, node_name_mappings):
+        if any(self._check_control_source_fired(source, source_that_reached_end) for source in loop_complete_sources):
             return IterationControlAction.ADD
 
         # If none of the control parameters were triggered, default to ADD
         # This preserves backward compatibility for workflows without explicit loop_complete connections
         return IterationControlAction.ADD
 
-    def _check_control_source_fired(
+    def _get_control_source_that_reached_end(
         self,
-        source: tuple[str, str] | None,
+        workflow: WorkflowRuntime,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
-    ) -> bool:
-        """Check if a control source node has fired its control output.
+    ) -> OriginalNodeParameter | None:
+        """Return the body node and control output that handed control to the packaged End node.
+
+        The End node records the control input it was entered on, and the packager gives it one
+        control input per body control output that leaves the group, so that input names exactly
+        which exit the body took. A body node's own next control output cannot answer this: a
+        node on a branch that was not taken can still run, pulled in to supply the End node's
+        data, and it reports the output it would follow even though control never reached it.
 
         Args:
-            source: Tuple of (source_node_name, source_parameter_name) or None
+            workflow: The workflow the nodes are in.
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
-            True if the source node's next control output matches the specified parameter
+            The original node and control output that reached the End node, or None if control
+            never reached it
+        """
+        end_node = self._get_packaged_end_node(workflow, end_node_mapping, node_name_mappings)
+        if end_node is None:
+            return None
+
+        entry_parameter = end_node._entry_control_parameter
+        if entry_parameter is None:
+            return None
+
+        return end_node_mapping.parameter_mappings.get(entry_parameter.name)
+
+    def _forget_control_source_that_reached_end(
+        self,
+        workflow: WorkflowRuntime,
+        end_node_mapping: PackagedNodeParameterMapping,
+        node_name_mappings: dict[str, str],
+    ) -> None:
+        """Clear the packaged End node's recorded entry before a pass runs.
+
+        Every pass reuses the same End node, and a pass whose control never reaches it leaves the
+        previous pass's entry in place, which would read as this pass taking the same exit.
+        """
+        end_node = self._get_packaged_end_node(workflow, end_node_mapping, node_name_mappings)
+        if end_node is None:
+            return
+
+        end_node.set_entry_control_parameter(None)
+
+    def _get_packaged_end_node(
+        self,
+        workflow: WorkflowRuntime,
+        end_node_mapping: PackagedNodeParameterMapping,
+        node_name_mappings: dict[str, str],
+    ) -> BaseNode | None:
+        deserialized_end_node_name = node_name_mappings.get(end_node_mapping.node_name)
+        if deserialized_end_node_name is None:
+            logger.debug("No deserialized name for packaged End node '%s'", end_node_mapping.node_name)
+            return None
+
+        try:
+            return self.engine.node_manager.get_node_by_name_in(workflow, deserialized_end_node_name)
+        except ValueError:
+            logger.debug("Packaged End node '%s' not found", deserialized_end_node_name)
+            return None
+
+    def _check_control_source_fired(
+        self,
+        source: tuple[str, str] | None,
+        source_that_reached_end: OriginalNodeParameter | None,
+    ) -> bool:
+        """Check if control left the body through a given control output.
+
+        Args:
+            source: Tuple of (source_node_name, source_parameter_name) or None
+            source_that_reached_end: The node and control output that reached the packaged End
+                node, from _get_control_source_that_reached_end
+
+        Returns:
+            True if source is the control output that reached the End node
         """
         if source is None:
             return False
 
-        source_node_name, source_param_name = source
-        deserialized_source_name = node_name_mappings.get(source_node_name)
-        if deserialized_source_name is None:
-            logger.debug("_check_control_source_fired: no deserialized name for '%s'", source_node_name)
+        if source_that_reached_end is None:
             return False
 
-        node_manager = self.engine.node_manager
-        try:
-            deserialized_source_node = node_manager.get_node_by_name(deserialized_source_name)
-        except ValueError:
-            logger.debug("_check_control_source_fired: node '%s' not found", deserialized_source_name)
-            return False
-
-        if deserialized_source_node is None:
-            return False
-
-        # Check if the node's next control output matches the source parameter
-        next_control_output = deserialized_source_node.get_next_control_output()
-        if next_control_output is None:
-            logger.debug(
-                "_check_control_source_fired: node '%s' next_control_output is None (state=%s, output_values=%s)",
-                deserialized_source_name,
-                deserialized_source_node.state,
-                deserialized_source_node.parameter_output_values,
-            )
-            return False
-
-        # Get the parameter object to compare
-        source_param = deserialized_source_node.get_parameter_by_name(source_param_name)
-        result = next_control_output == source_param
-        logger.debug(
-            "_check_control_source_fired: node '%s' next_control_output='%s' vs source_param='%s' -> %s",
-            deserialized_source_name,
-            next_control_output.name if next_control_output else None,
-            source_param.name if source_param else None,
-            result,
-        )
-        return result
-
-    def _find_source_for_control_param(
-        self,
-        incoming_connections: list,
-        control_param_name: str,
-    ) -> tuple[str, str] | None:
-        """Find the first source node and parameter that connects to a control parameter.
-
-        Args:
-            incoming_connections: List of incoming connections to the group
-            control_param_name: Name of the control parameter to find (e.g., "break_loop")
-
-        Returns:
-            Tuple of (source_node_name, source_parameter_name), or None if not found
-        """
-        sources = self._find_sources_for_control_param(incoming_connections, control_param_name)
-        return sources[0] if sources else None
+        return tuple(source_that_reached_end) == source
 
     async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
         self,
@@ -1292,13 +1464,14 @@ class NodeExecutor(EngineScoped):
             - break_occurred: True if the loop exited early due to a break signal
             - iteration_failures: One IterationFailure per iteration that raised a subflow error
         """
+        workflow = end_loop_node._require_workflow()
         # Deserialize the loop body once and reuse it for every iteration.
         # Everything from deserialization onward is inside the try so the finally deletes the
         # iteration flow on ALL exit paths (success, exception, cancellation), closing the window
         # where a raise after creation but before execution would leak the flow. deserialized_flows
         # is populated the instant the flow is created. (The flow is also tagged transient at
         # packaging time, so a mid-run save cannot bake it into the workflow regardless.)
-        context_manager = self.engine.context_manager
+        workflow_context = workflow.context
         event_manager = self.engine.event_manager
         deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
         self._silence_packaged_node_creation_broadcasts(package_result)
@@ -1307,7 +1480,7 @@ class NodeExecutor(EngineScoped):
                 deserialize_request = DeserializeFlowFromCommandsRequest(
                     serialized_flow_commands=package_result.serialized_flow_commands
                 )
-                deserialize_result = self.engine.handle_request(deserialize_request)
+                deserialize_result = workflow.handle_request(deserialize_request)
                 if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                     msg = f"Failed to deserialize flow for sequential loop. Error: {deserialize_result.result_details}"
                     raise TypeError(msg)
@@ -1319,14 +1492,15 @@ class NodeExecutor(EngineScoped):
                 deserialized_flows.append((0, flow_name, node_name_mappings))
 
                 # Pop the deserialized flow from context stack
-                if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
-                    context_manager.pop_flow()
+                if workflow_context.has_current_flow() and workflow_context.get_current_flow().name == flow_name:
+                    workflow_context.pop_flow()
 
             logger.debug("Successfully deserialized flow for sequential execution: %s", flow_name)
             # Get node mappings
             start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
             start_node_name = start_node_mapping.node_name
             packaged_start_node_name = node_name_mappings.get(start_node_name)
+            end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
 
             iteration_results: dict[int, Any] = {}
             successful_iterations: list[int] = []
@@ -1338,6 +1512,7 @@ class NodeExecutor(EngineScoped):
             reverse_node_mapping = {
                 packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
             }
+            loop_body_scope = self._loop_body_scope(package_result, node_name_mappings)
 
             if packaged_start_node_name is None:
                 msg = f"Could not find deserialized Start node (original: '{start_node_name}') for sequential loop"
@@ -1351,6 +1526,8 @@ class NodeExecutor(EngineScoped):
                     total_iterations,
                     end_loop_node.name,
                 )
+                self._forget_control_source_that_reached_end(workflow, end_node_mapping, node_name_mappings)
+
                 # Set input values for this iteration
                 parameter_values = parameter_values_per_iteration[iteration_index]
 
@@ -1360,7 +1537,7 @@ class NodeExecutor(EngineScoped):
                         parameter_name=startflow_param_name,
                         value=value_to_set,
                     )
-                    set_value_result = await self.engine.ahandle_request(set_value_request)
+                    set_value_result = await workflow.ahandle_request(set_value_request)
                     if not isinstance(set_value_result, SetParameterValueResultSuccess):
                         logger.warning(
                             "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -1378,12 +1555,16 @@ class NodeExecutor(EngineScoped):
                     flow_name,
                     packaged_start_node_name,
                 )
-                with EventTranslationContext(event_manager, reverse_node_mapping):
+                with (
+                    EventTranslationContext(event_manager, reverse_node_mapping),
+                    entered_loop_body_scope(loop_body_scope),
+                    EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+                ):
                     start_subflow_request = StartLocalSubflowRequest(
                         flow_name=flow_name,
                         start_node=packaged_start_node_name,
                     )
-                    start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
+                    start_subflow_result = await workflow.ahandle_request(start_subflow_request)
 
                 if not isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
                     logger.warning(
@@ -1404,7 +1585,7 @@ class NodeExecutor(EngineScoped):
                     successful_iterations.append(iteration_index)
 
                 # Check control action to handle skip/break for both group and legacy end nodes
-                control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
+                control_action = self._get_iteration_control_action(end_loop_node, end_node_mapping, node_name_mappings)
 
                 if control_action == IterationControlAction.SKIP:
                     logger.debug(
@@ -1456,6 +1637,7 @@ class NodeExecutor(EngineScoped):
             last_successful_iteration = successful_iterations[-1] if successful_iterations else 0
             single_flow_ref = [(last_successful_iteration, flow_name, node_name_mappings)]
             last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
+                workflow,
                 deserialized_flows=single_flow_ref,
                 package_result=package_result,
                 total_iterations=len(successful_iterations),
@@ -1472,7 +1654,7 @@ class NodeExecutor(EngineScoped):
 
         finally:
             # Cleanup - delete the iteration flow on ALL exit paths (success, exception, cancel).
-            await self._delete_iteration_flows(deserialized_flows, event_manager)
+            await self._delete_iteration_flows(workflow, deserialized_flows, event_manager)
 
     async def _handle_sequential_loop_execution(  # noqa: C901
         self, start_node: BaseIterativeStartNode, end_node: BaseIterativeEndNode
@@ -1483,6 +1665,7 @@ class NodeExecutor(EngineScoped):
             start_node: The BaseIterativeStartNode marking the start of the loop
             end_node: The BaseIterativeEndNode marking the end of the loop
         """
+        workflow = start_node._require_workflow()
         total_iterations = start_node._get_total_iterations()
         logger.debug(
             "Executing loop sequentially from '%s' to '%s' for %d iterations",
@@ -1511,7 +1694,7 @@ class NodeExecutor(EngineScoped):
         # Get resolved upstream values (constant across all iterations)
         # Reuse the packaged_node_names from package_result instead of recalculating
         resolved_upstream_values = self.get_resolved_upstream_values(
-            packaged_node_names=package_result.packaged_node_names, package_result=package_result
+            workflow, packaged_node_names=package_result.packaged_node_names, package_result=package_result
         )
 
         # Merge upstream values into each iteration (only if parameter doesn't already exist)
@@ -1605,6 +1788,7 @@ class NodeExecutor(EngineScoped):
 
         # Apply last iteration values to the original packaged nodes
         self._apply_last_iteration_to_packaged_nodes(
+            workflow,
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
@@ -1629,12 +1813,13 @@ class NodeExecutor(EngineScoped):
         Returns:
             Dict mapping iteration_index -> {parameter_name: value}
         """
+        workflow = start_node._require_workflow()
         # Get parameter values from start node (vary per iteration)
         parameter_values_per_iteration = self.get_parameter_values_per_iteration(start_node, package_result)
 
         # Get resolved upstream values (constant across all iterations)
         resolved_upstream_values = self.get_resolved_upstream_values(
-            packaged_node_names=package_result.packaged_node_names, package_result=package_result
+            workflow, packaged_node_names=package_result.packaged_node_names, package_result=package_result
         )
 
         # Merge upstream values into each iteration (only if parameter doesn't already exist)
@@ -1658,6 +1843,7 @@ class NodeExecutor(EngineScoped):
             node: The BaseIterativeEndNode marking the end of the loop
             execution_type: The execution environment type
         """
+        workflow = node._require_workflow()
         # Validate start node exists
         if node.start_node is None:
             msg = f"BaseIterativeEndNode '{node.name}' has no start_node reference"
@@ -1762,6 +1948,7 @@ class NodeExecutor(EngineScoped):
 
         # Step 8: Apply last iteration values to the original packaged nodes in main flow
         self._apply_last_iteration_to_packaged_nodes(
+            workflow,
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
@@ -1786,6 +1973,7 @@ class NodeExecutor(EngineScoped):
         Args:
             node: The BaseWhileNodeGroup to execute
         """
+        workflow = node._require_workflow()
         node._initialize_loop_data()
         max_iterations = node._get_max_iterations()
 
@@ -1805,7 +1993,7 @@ class NodeExecutor(EngineScoped):
 
         # Get resolved upstream values (constant across all iterations)
         resolved_upstream_values = self.get_resolved_upstream_values(
-            packaged_node_names=package_result.packaged_node_names, package_result=package_result
+            workflow, packaged_node_names=package_result.packaged_node_names, package_result=package_result
         )
 
         # Find StartFlow parameter(s) that correspond to iteration
@@ -1813,10 +2001,11 @@ class NodeExecutor(EngineScoped):
         iteration_startflow_params = self._get_while_iteration_param_mappings(
             node, start_node_mapping.parameter_mappings
         )
+        end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
 
         # Deserialize the flow once for sequential re-execution
         flow_name, node_name_mappings, packaged_start_node_name = self._deserialize_while_flow(
-            package_result, start_node_mapping.node_name
+            workflow, package_result, start_node_mapping.node_name
         )
 
         # Build reverse mapping for event translation
@@ -1834,10 +2023,12 @@ class NodeExecutor(EngineScoped):
                 node=node,
                 flow_name=flow_name,
                 node_name_mappings=node_name_mappings,
+                end_node_mapping=end_node_mapping,
                 packaged_start_node_name=packaged_start_node_name,
                 resolved_upstream_values=resolved_upstream_values,
                 iteration_startflow_params=iteration_startflow_params,
                 reverse_node_mapping=reverse_node_mapping,
+                loop_body_scope=self._loop_body_scope(package_result, node_name_mappings),
                 event_manager=event_manager,
                 max_iterations=max_iterations,
                 total_iterations=total_iterations,
@@ -1846,6 +2037,7 @@ class NodeExecutor(EngineScoped):
             # Extract final values from the deserialized flow
             deserialized_flows = [(0, flow_name, node_name_mappings)]
             last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
+                workflow,
                 deserialized_flows=deserialized_flows,
                 package_result=package_result,
                 total_iterations=1,
@@ -1855,7 +2047,7 @@ class NodeExecutor(EngineScoped):
             # Clean up the deserialized flow
             with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
                 delete_request = DeleteFlowRequest(flow_name=flow_name)
-                delete_result = self.engine.handle_request(delete_request)
+                delete_result = workflow.handle_request(delete_request)
                 if isinstance(delete_result, DeleteFlowResultFailure):
                     logger.warning("Failed to clean up while group flow '%s': %s", flow_name, delete_result)
 
@@ -1865,6 +2057,7 @@ class NodeExecutor(EngineScoped):
 
         # Apply last iteration values to the original child nodes
         self._apply_last_iteration_to_packaged_nodes(
+            workflow,
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
@@ -1881,26 +2074,28 @@ class NodeExecutor(EngineScoped):
 
     def _deserialize_while_flow(
         self,
+        workflow: WorkflowRuntime,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         start_node_name: str,
     ) -> tuple[str, dict[str, str], str]:
         """Deserialize a packaged while-loop flow and return execution context.
 
         Args:
+            workflow: The workflow the nodes are in.
             package_result: The packaged flow result
             start_node_name: Original name of the start node
 
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
         """
-        context_manager = self.engine.context_manager
+        workflow_context = workflow.context
         event_manager = self.engine.event_manager
         self._silence_packaged_node_creation_broadcasts(package_result)
         with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
             deserialize_request = DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=package_result.serialized_flow_commands
             )
-            deserialize_result = self.engine.handle_request(deserialize_request)
+            deserialize_result = workflow.handle_request(deserialize_request)
             if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                 msg = f"Failed to deserialize flow for while group. Error: {deserialize_result.result_details}"
                 raise TypeError(msg)
@@ -1908,8 +2103,8 @@ class NodeExecutor(EngineScoped):
             flow_name = deserialize_result.flow_name
             node_name_mappings = deserialize_result.node_name_mappings
 
-            if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
-                context_manager.pop_flow()
+            if workflow_context.has_current_flow() and workflow_context.get_current_flow().name == flow_name:
+                workflow_context.pop_flow()
 
         packaged_start_node_name = node_name_mappings.get(start_node_name)
         if packaged_start_node_name is None:
@@ -1924,10 +2119,12 @@ class NodeExecutor(EngineScoped):
         node: BaseWhileNodeGroup,
         flow_name: str,
         node_name_mappings: dict[str, str],
+        end_node_mapping: PackagedNodeParameterMapping,
         packaged_start_node_name: str,
         resolved_upstream_values: dict[str, Any],
         iteration_startflow_params: list[str],
         reverse_node_mapping: dict[str, str],
+        loop_body_scope: LoopBodyScope,
         event_manager: Any,
         max_iterations: int,
         total_iterations: int,
@@ -1937,6 +2134,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             True if the loop's done condition was met, False otherwise
         """
+        workflow = node._require_workflow()
         for iteration in range(total_iterations):
             node._current_iteration = iteration
             logger.debug(
@@ -1949,7 +2147,10 @@ class NodeExecutor(EngineScoped):
             if iteration > 0:
                 node._before_loop_iteration(iteration, flow_name)
 
+            self._forget_control_source_that_reached_end(workflow, end_node_mapping, node_name_mappings)
+
             await self._set_while_iteration_parameters(
+                workflow,
                 packaged_start_node_name=packaged_start_node_name,
                 resolved_upstream_values=resolved_upstream_values,
                 iteration_startflow_params=iteration_startflow_params,
@@ -1957,12 +2158,16 @@ class NodeExecutor(EngineScoped):
             )
 
             # Execute the subflow
-            with EventTranslationContext(event_manager, reverse_node_mapping):
+            with (
+                EventTranslationContext(event_manager, reverse_node_mapping),
+                entered_loop_body_scope(loop_body_scope),
+                EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            ):
                 start_subflow_request = StartLocalSubflowRequest(
                     flow_name=flow_name,
                     start_node=packaged_start_node_name,
                 )
-                start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
+                start_subflow_result = await workflow.ahandle_request(start_subflow_request)
 
             execution_failed = isinstance(start_subflow_result, StartLocalSubflowResultFailure)
 
@@ -1978,6 +2183,7 @@ class NodeExecutor(EngineScoped):
                 node=node,
                 execution_failed=execution_failed,
                 node_name_mappings=node_name_mappings,
+                end_node_mapping=end_node_mapping,
                 iteration=iteration,
                 max_iterations=max_iterations,
             )
@@ -1989,6 +2195,7 @@ class NodeExecutor(EngineScoped):
 
     async def _set_while_iteration_parameters(
         self,
+        workflow: WorkflowRuntime,
         *,
         packaged_start_node_name: str,
         resolved_upstream_values: dict[str, Any],
@@ -2008,7 +2215,7 @@ class NodeExecutor(EngineScoped):
                 parameter_name=startflow_param_name,
                 value=value_to_set,
             )
-            set_value_result = await self.engine.ahandle_request(set_value_request)
+            set_value_result = await workflow.ahandle_request(set_value_request)
             if not isinstance(set_value_result, SetParameterValueResultSuccess):
                 logger.warning(
                     "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -2018,12 +2225,13 @@ class NodeExecutor(EngineScoped):
                     set_value_result.result_details,
                 )
 
-    def _evaluate_while_iteration_result(
+    def _evaluate_while_iteration_result(  # noqa: PLR0913
         self,
         *,
         node: BaseWhileNodeGroup,
         execution_failed: bool,
         node_name_mappings: dict[str, str],
+        end_node_mapping: PackagedNodeParameterMapping,
         iteration: int,
         max_iterations: int,
     ) -> bool | None:
@@ -2054,7 +2262,7 @@ class NodeExecutor(EngineScoped):
             return False
 
         # Check which control input was triggered
-        loop_action = self._get_while_control_action(node, node_name_mappings)
+        loop_action = self._get_while_control_action(node, end_node_mapping, node_name_mappings)
 
         if loop_action == WhileControlParam.DONE:
             logger.debug("While group '%s': done on iteration %d/%d", node.name, iteration + 1, total_iterations)
@@ -2087,6 +2295,7 @@ class NodeExecutor(EngineScoped):
 
     def _resolve_outgoing_target_through_proxy(
         self,
+        workflow: WorkflowRuntime,
         target_node_name: str,
         target_param_name: str,
     ) -> tuple[str, str]:
@@ -2096,6 +2305,7 @@ class NodeExecutor(EngineScoped):
         to find the actual destination node and parameter.
 
         Args:
+            workflow: The workflow the nodes are in.
             target_node_name: Name of the direct target node
             target_param_name: Name of the direct target parameter
 
@@ -2104,15 +2314,14 @@ class NodeExecutor(EngineScoped):
         """
         node_manager = self.engine.node_manager
         try:
-            target_node = node_manager.get_node_by_name(target_node_name)
+            target_node = node_manager.get_node_by_name_in(workflow, target_node_name)
         except ValueError:
             return (target_node_name, target_param_name)
 
         if not isinstance(target_node, SubflowNodeGroup):
             return (target_node_name, target_param_name)
 
-        flow_manager = self.engine.flow_manager
-        connections = flow_manager.get_connections()
+        connections = workflow.flows.connections
         proxy_param = target_node.get_parameter_by_name(target_param_name)
         if proxy_param:
             internal_connections = connections.get_all_outgoing_connections(target_node)
@@ -2139,10 +2348,11 @@ class NodeExecutor(EngineScoped):
         Returns:
             List of StartFlow parameter names that should receive the iteration value
         """
+        workflow = node._require_workflow()
         iteration_params: list[str] = []
 
         list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for while group node %s", node.name)
             return iteration_params
@@ -2152,7 +2362,7 @@ class NodeExecutor(EngineScoped):
                 continue
 
             target_node_name, target_param_name = self._resolve_outgoing_target_through_proxy(
-                conn.target_node_name, conn.target_parameter_name
+                workflow, conn.target_node_name, conn.target_parameter_name
             )
 
             # Find the corresponding StartFlow parameter
@@ -2169,23 +2379,26 @@ class NodeExecutor(EngineScoped):
     def _get_while_control_action(
         self,
         while_node: BaseWhileNodeGroup,
+        end_node_mapping: PackagedNodeParameterMapping,
         node_name_mappings: dict[str, str],
     ) -> WhileControlParam | None:
         """Determine which control action was taken during while group execution.
 
-        Checks if internal nodes have triggered the 'done' or 'continue_loop' control
-        inputs on the while group. Multiple nodes may connect to the same control input,
-        so all sources are checked.
+        Checks whether control left the body through a node output connected to the 'done' or
+        'continue_loop' control inputs on the while group. Multiple nodes may connect to the
+        same control input, so all sources are checked.
 
         Args:
             while_node: The BaseWhileNodeGroup being executed
+            end_node_mapping: Parameter mappings for the packaged End node
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
             WhileControlParam.DONE, WhileControlParam.CONTINUE, or None
         """
+        workflow = while_node._require_workflow()
         list_connections_request = ListConnectionsForNodeRequest(node_name=while_node.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for while group node %s", while_node.name)
             return None
@@ -2193,14 +2406,20 @@ class NodeExecutor(EngineScoped):
         incoming_connections = list_connections_result.incoming_connections
 
         # Collect all sources for both control params
-        done_sources = self._find_sources_for_control_param(incoming_connections, WhileControlParam.DONE)
-        continue_sources = self._find_sources_for_control_param(incoming_connections, WhileControlParam.CONTINUE)
+        done_sources = self._find_sources_for_control_param(workflow, incoming_connections, WhileControlParam.DONE)
+        continue_sources = self._find_sources_for_control_param(
+            workflow, incoming_connections, WhileControlParam.CONTINUE
+        )
+
+        source_that_reached_end = self._get_control_source_that_reached_end(
+            workflow, end_node_mapping, node_name_mappings
+        )
 
         # Check if any done source fired
-        done_fired = any(self._check_control_source_fired(source, node_name_mappings) for source in done_sources)
+        done_fired = any(self._check_control_source_fired(source, source_that_reached_end) for source in done_sources)
         # Check if any continue source fired
         continue_fired = any(
-            self._check_control_source_fired(source, node_name_mappings) for source in continue_sources
+            self._check_control_source_fired(source, source_that_reached_end) for source in continue_sources
         )
 
         logger.debug(
@@ -2222,24 +2441,25 @@ class NodeExecutor(EngineScoped):
 
     def _find_sources_for_control_param(
         self,
+        workflow: WorkflowRuntime,
         incoming_connections: list,
         control_param_name: str,
     ) -> list[tuple[str, str]]:
         """Find all source nodes and parameters that connect to a control parameter.
 
-        Returns all matching sources. Used by retry groups where multiple nodes
-        may connect to the same control input, and by iterative groups (via
-        _find_source_for_control_param) which only need the first match.
+        Returns all matching sources, in the order their connections were made. Several body
+        nodes can connect to the same control input, so callers check every source rather than
+        trusting the first.
 
         Args:
+            workflow: The workflow the nodes are in.
             incoming_connections: List of incoming connections to the group
             control_param_name: Name of the control parameter to find
 
         Returns:
             List of (source_node_name, source_parameter_name) tuples
         """
-        flow_manager = self.engine.flow_manager
-        connections = flow_manager.get_connections()
+        connections = workflow.flows.connections
         sources: list[tuple[str, str]] = []
 
         for conn in incoming_connections:
@@ -2252,7 +2472,7 @@ class NodeExecutor(EngineScoped):
             # If source is a SubflowNodeGroup, follow the internal connection to get the actual source
             node_manager = self.engine.node_manager
             try:
-                source_node = node_manager.get_node_by_name(source_node_name)
+                source_node = node_manager.get_node_by_name_in(workflow, source_node_name)
             except ValueError:
                 continue
 
@@ -2275,11 +2495,11 @@ class NodeExecutor(EngineScoped):
 
     def _resolve_on_each_entry(self, node: SubflowNodeGroup) -> tuple[str | None, str | None]:
         """Return (entry_node_name, entry_param_name) from on_each connection, or (None, None)."""
+        workflow = node._require_workflow()
         # on_each only exists on iterative groups; non-iterative subflows fall back to implicit child-discovery.
         if not isinstance(node, BaseIterativeNodeGroup):
             return None, None
-        flow_manager = self.engine.flow_manager
-        connections = flow_manager.get_connections()
+        connections = workflow.flows.connections
         # Use node.on_each.name instead of a literal so renames stay in sync.
         # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
         on_each_conns = connections.outgoing_index.get(node.name, {}).get(node.on_each.name, [])
@@ -2312,6 +2532,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             PackageNodesAsSerializedFlowResultSuccess if successful, None if no child nodes
         """
+        workflow = node._require_workflow()
         all_nodes = node.get_all_nodes()
         node_names = list(all_nodes.keys())
 
@@ -2347,7 +2568,7 @@ class NodeExecutor(EngineScoped):
             node_group_name=node.name,
         )
 
-        package_result = self.engine.handle_request(request)
+        package_result = workflow.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package {label} '{node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
@@ -2362,11 +2583,13 @@ class NodeExecutor(EngineScoped):
         # Mark packaged nodes as RESOLVED to prevent outer flow execution
         node_manager = self.engine.node_manager
         for node_name in node_names:
-            node_reference = node_manager.get_node_by_name(node_name)
+            node_reference = node_manager.get_node_by_name_in(workflow, node_name)
             if node_reference:
                 node_reference.state = NodeResolutionState.RESOLVED
 
-        self._remove_packaged_nodes_from_queue(set(node_names))
+        # node (the group) stays in the outer DAG, so an outside consumer of a packaged child
+        # waits on it instead of losing the edge -- see _remove_packaged_nodes_from_queue.
+        self._remove_packaged_nodes_from_queue(workflow, set(node_names), replacement_node_name=node.name)
 
         return package_result
 
@@ -2381,6 +2604,7 @@ class NodeExecutor(EngineScoped):
         Args:
             node: The BaseIterativeNodeGroup to execute
         """
+        workflow = node._require_workflow()
         # Initialize iteration data to determine total iterations
         node._initialize_iteration_data()
 
@@ -2478,6 +2702,7 @@ class NodeExecutor(EngineScoped):
 
         # Apply last iteration values to the original child nodes in main flow
         self._apply_last_iteration_to_packaged_nodes(
+            workflow,
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
@@ -2497,6 +2722,7 @@ class NodeExecutor(EngineScoped):
             node: The BaseIterativeNodeGroup to execute
             execution_type: The execution environment type
         """
+        workflow = node._require_workflow()
         total_iterations = node._get_total_iterations()
         logger.debug(
             "Executing iterative group '%s' sequentially for %d iterations",
@@ -2600,6 +2826,7 @@ class NodeExecutor(EngineScoped):
 
         # Apply last iteration values to the original child nodes
         self._apply_last_iteration_to_packaged_nodes(
+            workflow,
             last_iteration_values=last_iteration_values,
             package_result=package_result,
         )
@@ -2622,12 +2849,13 @@ class NodeExecutor(EngineScoped):
         Returns:
             Dict mapping iteration_index -> {parameter_name: value}
         """
+        workflow = node._require_workflow()
         # Get parameter values that vary per iteration (current_item, index mappings)
         parameter_values_per_iteration = self.get_parameter_values_per_iteration(node, package_result)
 
         # Get resolved upstream values (constant across all iterations)
         resolved_upstream_values = self.get_resolved_upstream_values(
-            packaged_node_names=package_result.packaged_node_names, package_result=package_result
+            workflow, packaged_node_names=package_result.packaged_node_names, package_result=package_result
         )
 
         # Merge upstream values into each iteration
@@ -2689,6 +2917,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             Dict mapping iteration_index -> {startflow_param_name: value}
         """
+        workflow = iteration_source._require_workflow()
         total_iterations = iteration_source._get_total_iterations()
 
         # Calculate current_item values for ForEach nodes
@@ -2701,7 +2930,7 @@ class NodeExecutor(EngineScoped):
         index_values = iteration_source.get_all_iteration_values()
 
         list_connections_request = ListConnectionsForNodeRequest(node_name=iteration_source.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             msg = (
                 f"Failed to list connections for node {iteration_source.name}: {list_connections_result.result_details}"
@@ -2726,7 +2955,7 @@ class NodeExecutor(EngineScoped):
             for conn in outgoing_connections:
                 source_param_name = conn.source_parameter_name
                 target_node_name, target_param_name = self._resolve_outgoing_target_through_proxy(
-                    conn.target_node_name, conn.target_parameter_name
+                    workflow, conn.target_node_name, conn.target_parameter_name
                 )
 
                 # Find the target parameter that corresponds to this target
@@ -2749,6 +2978,7 @@ class NodeExecutor(EngineScoped):
 
     def get_resolved_upstream_values(
         self,
+        workflow: WorkflowRuntime,
         packaged_node_names: list[str],
         package_result: PackageNodesAsSerializedFlowResultSuccess,
     ) -> dict[str, Any]:
@@ -2759,14 +2989,14 @@ class NodeExecutor(EngineScoped):
         via the StartFlow node parameters.
 
         Args:
+            workflow: The workflow the nodes are in.
             packaged_node_names: List of node names being packaged in the loop
             package_result: PackageNodesAsSerializedFlowResultSuccess containing parameter_name_mappings
 
         Returns:
             Dict mapping startflow_param_name -> value from resolved upstream node
         """
-        flow_manager = self.engine.flow_manager
-        connections = flow_manager.get_connections()
+        connections = workflow.flows.connections
         node_manager = self.engine.node_manager
 
         # Get Start node's parameter mappings (index 0 in the list)
@@ -2778,7 +3008,7 @@ class NodeExecutor(EngineScoped):
         # For each packaged node, check its incoming data connections
         for packaged_node_name in packaged_node_names:
             try:
-                packaged_node = node_manager.get_node_by_name(packaged_node_name)
+                packaged_node = node_manager.get_node_by_name_in(workflow, packaged_node_name)
             except Exception:
                 logger.warning("Could not find packaged node '%s' to check upstream connections", packaged_node_name)
                 continue
@@ -2874,8 +3104,8 @@ class NodeExecutor(EngineScoped):
         Returns:
             The value from the resolved external source, or None if not found
         """
-        flow_manager = self.engine.flow_manager
-        connections = flow_manager.get_connections()
+        workflow = subflow_group._require_workflow()
+        connections = workflow.flows.connections
 
         # Find the incoming connection TO the proxy parameter on the group
         # This will give us the actual external source node
@@ -2945,12 +3175,14 @@ class NodeExecutor(EngineScoped):
 
     def _find_endflow_param_for_end_loop_node(
         self,
+        workflow: WorkflowRuntime,
         incoming_connections: list,
         end_node_param_mappings: dict,
     ) -> str | None:
         """Find the EndFlow parameter name that corresponds to BaseIterativeEndNode's new_item_to_add.
 
         Args:
+            workflow: The workflow the nodes are in.
             incoming_connections: List of incoming connections to end_loop_node
             end_node_param_mappings: Parameter mappings from EndFlow node
 
@@ -2964,14 +3196,13 @@ class NodeExecutor(EngineScoped):
 
                 # If source is a NodeGroup, follow the internal connection to get the actual source
                 node_manager = self.engine.node_manager
-                flow_manager = self.engine.flow_manager
                 try:
-                    source_node = node_manager.get_node_by_name(source_node_name)
+                    source_node = node_manager.get_node_by_name_in(workflow, source_node_name)
                 except ValueError:
                     continue
                 if isinstance(source_node, SubflowNodeGroup):
                     # Get connections to this proxy parameter to find the actual internal source
-                    connections = flow_manager.get_connections()
+                    connections = workflow.flows.connections
                     proxy_param = source_node.get_parameter_by_name(source_param_name)
                     if proxy_param:
                         internal_connections = connections.get_all_incoming_connections(source_node)
@@ -3004,6 +3235,24 @@ class NodeExecutor(EngineScoped):
         msg = f"start_or_end must be 'start' or 'end', got {start_or_end}"
         raise ValueError(msg)
 
+    def _loop_body_scope(
+        self, package_result: PackageNodesAsSerializedFlowResultSuccess, node_name_mappings: dict[str, str]
+    ) -> LoopBodyScope:
+        """The scope naming one deserialized copy of a loop body by the canvas nodes it stands for.
+
+        Entered around each iteration, so the node events it sends name canvas nodes rather than
+        the copies, and leave out the Start and End nodes the engine adds to the body.
+        """
+        engine_made_node_names = {
+            self.get_node_parameter_mappings(package_result, "start").node_name,
+            self.get_node_parameter_mappings(package_result, "end").node_name,
+        }
+        return loop_body_scope_for(
+            node_name_mappings,
+            engine_made_node_names=engine_made_node_names,
+            enclosing_scope=current_loop_body_scope.get(),
+        )
+
     def get_parameter_values_from_iterations(
         self,
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
@@ -3025,9 +3274,10 @@ class NodeExecutor(EngineScoped):
         Returns:
             Dict mapping iteration_index -> value for that iteration
         """
+        workflow = end_loop_node._require_workflow()
         # Step 1: Get incoming connections TO the end_loop_node
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             msg = f"Failed to list connections for node {end_loop_node.name}: {list_connections_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -3040,7 +3290,9 @@ class NodeExecutor(EngineScoped):
         end_node_param_mappings = end_node_mapping.parameter_mappings
 
         # Step 3: Find the EndFlow parameter that corresponds to new_item_to_add
-        endflow_param_name = self._find_endflow_param_for_end_loop_node(incoming_connections, end_node_param_mappings)
+        endflow_param_name = self._find_endflow_param_for_end_loop_node(
+            workflow, incoming_connections, end_node_param_mappings
+        )
 
         if endflow_param_name is None:
             logger.warning(
@@ -3065,7 +3317,7 @@ class NodeExecutor(EngineScoped):
                 continue
 
             try:
-                deserialized_end_node = node_manager.get_node_by_name(deserialized_end_node_name)
+                deserialized_end_node = node_manager.get_node_by_name_in(workflow, deserialized_end_node_name)
                 if endflow_param_name in deserialized_end_node.parameter_output_values:
                     extracted_value = deserialized_end_node.parameter_output_values[endflow_param_name]
                     iteration_results[iteration_index] = extracted_value
@@ -3079,6 +3331,7 @@ class NodeExecutor(EngineScoped):
 
     def get_last_iteration_values_for_packaged_nodes(
         self,
+        workflow: WorkflowRuntime,
         deserialized_flows: list[tuple[int, str, dict[str, str]]],
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
@@ -3089,6 +3342,7 @@ class NodeExecutor(EngineScoped):
         _apply_parameter_values_to_node(). This sets the final state of packaged nodes after loop completes.
 
         Args:
+            workflow: The workflow the nodes are in.
             deserialized_flows: List of (iteration_index, flow_name, node_name_mappings)
             package_result: PackageNodesAsSerializedFlowResultSuccess containing parameter mappings
             total_iterations: Total number of iterations that were executed
@@ -3133,7 +3387,7 @@ class NodeExecutor(EngineScoped):
         # Get the End node instance
         node_manager = self.engine.node_manager
         try:
-            deserialized_end_node = node_manager.get_node_by_name(deserialized_end_node_name)
+            deserialized_end_node = node_manager.get_node_by_name_in(workflow, deserialized_end_node_name)
         except Exception as e:
             logger.warning("Failed to get End node '%s' for last iteration: %s", deserialized_end_node_name, e)
             return {}
@@ -3155,8 +3409,16 @@ class NodeExecutor(EngineScoped):
 
         return last_iteration_values
 
+    def _parallel_iteration_gate(self, total_iterations: int) -> asyncio.Semaphore:
+        """Semaphore sized by `max_loop_iterations_in_parallel`; 0 or unset means no limit."""
+        configured_limit = self.engine.config_manager.get_config_value("max_loop_iterations_in_parallel", default=0)
+        if configured_limit is None or configured_limit <= 0:
+            return asyncio.Semaphore(max(total_iterations, 1))
+        return asyncio.Semaphore(configured_limit)
+
     async def _delete_iteration_flows(
         self,
+        workflow: WorkflowRuntime,
         deserialized_flows: list[tuple[int, str, dict[str, str]]],
         event_manager: EventManager,
     ) -> None:
@@ -3169,12 +3431,12 @@ class NodeExecutor(EngineScoped):
         an in-flight exception (including CancelledError).
         """
         # Suppress events during deletion to prevent sending them to websockets.
-        with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
+        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
             for iteration_index, flow_name, _ in deserialized_flows:
                 # Skip flows already torn down (e.g. a partially-run iteration cleaned itself up).
-                if self.engine.object_manager.attempt_get_object_by_name(flow_name) is None:
+                if workflow.objects.get(flow_name) is None:
                     continue
-                delete_result = await self.engine.ahandle_request(DeleteFlowRequest(flow_name=flow_name))
+                delete_result = await workflow.ahandle_request(DeleteFlowRequest(flow_name=flow_name))
                 if not isinstance(delete_result, DeleteFlowResultSuccess):
                     logger.error(
                         "Failed to delete iteration flow '%s' (iteration %d): %s. This flow may leak into a "
@@ -3210,6 +3472,7 @@ class NodeExecutor(EngineScoped):
             - successful_iterations: List of iteration indices that succeeded
             - last_iteration_values: Dict mapping parameter names -> values from last iteration
         """
+        workflow = end_loop_node._require_workflow()
         # Step 1: Deserialize N flow instances from the serialized flow
         # Save the current context and restore it after each deserialization to prevent
         # iteration flows from becoming children of each other.
@@ -3221,29 +3484,34 @@ class NodeExecutor(EngineScoped):
         # flows are also tagged transient at packaging time, so a mid-run save can never bake them
         # into the workflow even in the window before cleanup runs.)
         deserialized_flows = []
-        context_manager = self.engine.context_manager
-        saved_context_flow = context_manager.get_current_flow() if context_manager.has_current_flow() else None
+        workflow_context = workflow.context
+        saved_context_flow = workflow_context.get_current_flow() if workflow_context.has_current_flow() else None
         self._silence_packaged_node_creation_broadcasts(package_result)
 
-        # Suppress events during deserialization to prevent sending them to websockets
+        # Everything about the iteration flows stays off the wire, from the first deserialize to the last
+        # delete: the bookkeeping and, since nothing here can be translated to a canvas node, the
+        # execution events of the copies too.
         event_manager = self.engine.event_manager
-        try:
-            with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+        with (
+            EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS),
+        ):
+            try:
                 for iteration_index in range(total_iterations):
                     # Restore context before each deserialization to ensure all iteration flows
                     # are created at the same level (not as children of each other)
                     if saved_context_flow is not None:
                         # Pop any flows that were pushed during previous iteration
                         while (
-                            context_manager.has_current_flow()
-                            and context_manager.get_current_flow() != saved_context_flow
+                            workflow_context.has_current_flow()
+                            and workflow_context.get_current_flow() != saved_context_flow
                         ):
-                            context_manager.pop_flow()
+                            workflow_context.pop_flow()
 
                     deserialize_request = DeserializeFlowFromCommandsRequest(
                         serialized_flow_commands=package_result.serialized_flow_commands
                     )
-                    deserialize_result = self.engine.handle_request(deserialize_request)
+                    deserialize_result = workflow.handle_request(deserialize_request)
                     if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                         msg = f"Failed to deserialize flow for iteration {iteration_index}. Error: {deserialize_result.result_details}"
                         raise TypeError(msg)
@@ -3256,164 +3524,168 @@ class NodeExecutor(EngineScoped):
                     # Deserialization pushes the flow onto the stack, but we don't want iteration flows
                     # to remain on the stack after deserialization
                     if (
-                        context_manager.has_current_flow()
-                        and context_manager.get_current_flow().name == deserialize_result.flow_name
+                        workflow_context.has_current_flow()
+                        and workflow_context.get_current_flow().name == deserialize_result.flow_name
                     ):
-                        context_manager.pop_flow()
-            logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
-            # Step 2: Define the per-iteration coroutine
-            packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
+                        workflow_context.pop_flow()
+                logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
+                # Step 2: Define the per-iteration coroutine
+                packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
+                # All tasks are created up front so a cancel reaches them; the gate limits how many run.
+                concurrency_gate = self._parallel_iteration_gate(total_iterations)
 
-            async def run_single_iteration(
-                flow_name: str, iteration_index: int, start_node_name: str
-            ) -> IterationOutcome:
-                """Run a single iteration flow and report whether it finished, and why not."""
-                # Suppress execution events during parallel iteration to prevent flooding websockets
-                with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
-                    start_subflow_request = StartLocalSubflowRequest(
-                        flow_name=flow_name,
-                        start_node=start_node_name,
-                    )
-                    start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
-                    if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
-                        return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
-                    # The reason travels out with the verdict: this closure is the only place that
-                    # holds it, so anything narrower than IterationOutcome loses it for good.
-                    return IterationOutcome(
-                        iteration_index=iteration_index,
-                        succeeded=False,
-                        detail=str(start_subflow_result.result_details),
-                    )
+                async def run_single_iteration(
+                    flow_name: str, iteration_index: int, start_node_name: str, loop_body_scope: LoopBodyScope
+                ) -> IterationOutcome:
+                    """Run a single iteration flow and report whether it finished, and why not."""
+                    async with concurrency_gate:
+                        with entered_loop_body_scope(loop_body_scope):
+                            start_subflow_request = StartLocalSubflowRequest(
+                                flow_name=flow_name,
+                                start_node=start_node_name,
+                            )
+                            start_subflow_result = await workflow.ahandle_request(start_subflow_request)
+                            if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
+                                return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
+                            # The reason travels out with the verdict: this closure is the only place that
+                            # holds it, so anything narrower than IterationOutcome loses it for good.
+                            return IterationOutcome(
+                                iteration_index=iteration_index,
+                                succeeded=False,
+                                detail=str(start_subflow_result.result_details),
+                            )
 
-            # Step 3: Set input values on start nodes for each iteration
-            for iteration_index, _, node_name_mappings in deserialized_flows:
-                parameter_values = parameter_values_per_iteration[iteration_index]
+                # Step 3: Set input values on start nodes for each iteration
+                for iteration_index, _, node_name_mappings in deserialized_flows:
+                    parameter_values = parameter_values_per_iteration[iteration_index]
 
-                # Get Start node mapping (index 0 in the list)
-                start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
-                start_node_name = start_node_mapping.node_name
-                start_params = start_node_mapping.parameter_mappings
+                    # Get Start node mapping (index 0 in the list)
+                    start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
+                    start_node_name = start_node_mapping.node_name
+                    start_params = start_node_mapping.parameter_mappings
 
-                # Find the deserialized name for the Start node
-                deserialized_start_node_name = node_name_mappings.get(start_node_name)
-                if deserialized_start_node_name is None:
-                    logger.warning(
-                        "Could not find deserialized Start node (original: '%s') for iteration %d",
-                        start_node_name,
-                        iteration_index,
-                    )
-                    continue
-
-                # Set all parameter values on the deserialized Start node
-                for startflow_param_name in start_params:
-                    if startflow_param_name not in parameter_values:
+                    # Find the deserialized name for the Start node
+                    deserialized_start_node_name = node_name_mappings.get(start_node_name)
+                    if deserialized_start_node_name is None:
+                        logger.warning(
+                            "Could not find deserialized Start node (original: '%s') for iteration %d",
+                            start_node_name,
+                            iteration_index,
+                        )
                         continue
 
-                    value_to_set = parameter_values[startflow_param_name]
+                    # Set all parameter values on the deserialized Start node
+                    for startflow_param_name in start_params:
+                        if startflow_param_name not in parameter_values:
+                            continue
 
-                    set_value_request = SetParameterValueRequest(
-                        node_name=deserialized_start_node_name,
-                        parameter_name=startflow_param_name,
-                        value=value_to_set,
-                    )
-                    set_value_result = await self.engine.ahandle_request(set_value_request)
-                    if not isinstance(set_value_result, SetParameterValueResultSuccess):
-                        logger.warning(
-                            "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
-                            startflow_param_name,
-                            deserialized_start_node_name,
-                            iteration_index,
-                            set_value_result.result_details,
+                        value_to_set = parameter_values[startflow_param_name]
+
+                        set_value_request = SetParameterValueRequest(
+                            node_name=deserialized_start_node_name,
+                            parameter_name=startflow_param_name,
+                            value=value_to_set,
                         )
-
-            logger.debug("Successfully set input values for %d iterations", total_iterations)
-            # Step 4: Run all iterations concurrently.
-            # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
-            # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
-            # falling through to the finally that deletes the iteration flows. Each iteration unwinds
-            # its isolated subflow machine on cancellation (see on_start_local_subflow_request), so
-            # awaiting them here guarantees no body-node task is still running when its flow is
-            # deleted. gather(return_exceptions=True) alone would not await the children on cancel.
-            iteration_tasks = [
-                asyncio.ensure_future(
-                    run_single_iteration(
-                        flow_name,
-                        iteration_index,
-                        node_name_mappings.get(packaged_start_node_name),
-                    )
-                )
-                for iteration_index, flow_name, node_name_mappings in deserialized_flows
-            ]
-            try:
-                iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
-            except asyncio.CancelledError:
-                for task in iteration_tasks:
-                    task.cancel()
-                # Let every iteration finish unwinding (tearing down its isolated machine) before the
-                # finally deletes the flows out from under them.
-                await asyncio.gather(*iteration_tasks, return_exceptions=True)
-                raise
-
-            # Step 5: Collect successful and failed iterations
-            successful_iterations = []
-            failed_iteration_indices = []
-            iteration_failures: list[IterationFailure] = []
-
-            for idx, result in enumerate(iteration_task_results):
-                if isinstance(result, Exception):
-                    # Exception doesn't include iteration_index, use enumerate index
-                    failed_iteration_indices.append(idx)
-                    iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
-                    continue
-                if isinstance(result, IterationOutcome):
-                    if result.succeeded:
-                        successful_iterations.append(result.iteration_index)
-                    else:
-                        failed_iteration_indices.append(result.iteration_index)
-                        iteration_failures.append(
-                            IterationFailure(
-                                iteration_index=result.iteration_index,
-                                detail=result.detail or "The iteration reported failure without a reason.",
+                        set_value_result = await workflow.ahandle_request(set_value_request)
+                        if not isinstance(set_value_result, SetParameterValueResultSuccess):
+                            logger.warning(
+                                "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
+                                startflow_param_name,
+                                deserialized_start_node_name,
+                                iteration_index,
+                                set_value_result.result_details,
                             )
-                        )
 
-            if failed_iteration_indices:
-                logger.warning(
-                    "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
-                    "iterations.\n%s",
-                    len(failed_iteration_indices),
-                    total_iterations,
-                    "\n".join(
-                        self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
-                    ),
+                logger.debug("Successfully set input values for %d iterations", total_iterations)
+                # Step 4: Run all iterations concurrently.
+                # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
+                # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
+                # falling through to the finally that deletes the iteration flows. Each iteration unwinds
+                # its isolated subflow machine on cancellation (see on_start_local_subflow_request), so
+                # awaiting them here guarantees no body-node task is still running when its flow is
+                # deleted. gather(return_exceptions=True) alone would not await the children on cancel.
+                iteration_tasks = [
+                    asyncio.ensure_future(
+                        run_single_iteration(
+                            flow_name,
+                            iteration_index,
+                            node_name_mappings.get(packaged_start_node_name),
+                            self._loop_body_scope(package_result, node_name_mappings),
+                        )
+                    )
+                    for iteration_index, flow_name, node_name_mappings in deserialized_flows
+                ]
+                try:
+                    iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    for task in iteration_tasks:
+                        task.cancel()
+                    # Let every iteration finish unwinding (tearing down its isolated machine) before the
+                    # finally deletes the flows out from under them.
+                    await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                    raise
+
+                # Step 5: Collect successful and failed iterations
+                successful_iterations = []
+                failed_iteration_indices = []
+                iteration_failures: list[IterationFailure] = []
+
+                for idx, result in enumerate(iteration_task_results):
+                    if isinstance(result, Exception):
+                        # Exception doesn't include iteration_index, use enumerate index
+                        failed_iteration_indices.append(idx)
+                        iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
+                        continue
+                    if isinstance(result, IterationOutcome):
+                        if result.succeeded:
+                            successful_iterations.append(result.iteration_index)
+                        else:
+                            failed_iteration_indices.append(result.iteration_index)
+                            iteration_failures.append(
+                                IterationFailure(
+                                    iteration_index=result.iteration_index,
+                                    detail=result.detail or "The iteration reported failure without a reason.",
+                                )
+                            )
+
+                if failed_iteration_indices:
+                    logger.warning(
+                        "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
+                        "iterations.\n%s",
+                        len(failed_iteration_indices),
+                        total_iterations,
+                        "\n".join(
+                            self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
+                        ),
+                    )
+
+                # Step 6: Extract parameter values from iterations BEFORE cleanup
+                iteration_results = self.get_parameter_values_from_iterations(
+                    end_loop_node=end_loop_node,
+                    deserialized_flows=deserialized_flows,
+                    package_flow_result_success=package_result,
                 )
 
-            # Step 6: Extract parameter values from iterations BEFORE cleanup
-            iteration_results = self.get_parameter_values_from_iterations(
-                end_loop_node=end_loop_node,
-                deserialized_flows=deserialized_flows,
-                package_flow_result_success=package_result,
-            )
+                # Add None values for failed iterations that didn't produce any results
+                # (e.g., nested loops may fail but still produce partial output)
+                for failed_idx in failed_iteration_indices:
+                    if failed_idx not in iteration_results:
+                        iteration_results[failed_idx] = None
 
-            # Add None values for failed iterations that didn't produce any results
-            # (e.g., nested loops may fail but still produce partial output)
-            for failed_idx in failed_iteration_indices:
-                if failed_idx not in iteration_results:
-                    iteration_results[failed_idx] = None
+                # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
+                last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
+                    workflow,
+                    deserialized_flows=deserialized_flows,
+                    package_result=package_result,
+                    total_iterations=total_iterations,
+                )
 
-            # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
-            last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
-                deserialized_flows=deserialized_flows,
-                package_result=package_result,
-                total_iterations=total_iterations,
-            )
-
-            return iteration_results, successful_iterations, last_iteration_values
-        finally:
-            # Cleanup - delete every iteration flow created above, on ALL exit paths
-            # (success, raise, cancellation). deserialized_flows is complete because each flow is
-            # appended immediately after creation, inside this try.
-            await self._delete_iteration_flows(deserialized_flows, event_manager)
+                return iteration_results, successful_iterations, last_iteration_values
+            finally:
+                # Cleanup - delete every iteration flow created above, on ALL exit paths
+                # (success, raise, cancellation). deserialized_flows is complete because each flow is
+                # appended immediately after creation, inside this try.
+                await self._delete_iteration_flows(workflow, deserialized_flows, event_manager)
 
     async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,
@@ -3632,6 +3904,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             Tuple of (workflow_path, workflow_result)
         """
+        workflow = end_loop_node._require_workflow()
         sanitized_loop_name = end_loop_node.name.replace(" ", "_")
         file_name = f"{sanitized_loop_name}_private_loop_flow"
 
@@ -3641,7 +3914,7 @@ class NodeExecutor(EngineScoped):
             workflow_shape=package_result.workflow_shape,
         )
 
-        workflow_result = await self.engine.ahandle_request(workflow_file_request)
+        workflow_result = await workflow.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to save workflow file for private loop execution: {workflow_result.result_details}"
             raise TypeError(msg)
@@ -3667,6 +3940,7 @@ class NodeExecutor(EngineScoped):
         Returns:
             Tuple of (iteration_results, successful_iterations, last_iteration_values)
         """
+        workflow = end_loop_node._require_workflow()
         successful_iterations = []
         iteration_subprocess_outputs = {}
 
@@ -3681,12 +3955,12 @@ class NodeExecutor(EngineScoped):
 
         # Find which EndFlow parameter corresponds to new_item_to_add
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = self.engine.handle_request(list_connections_request)
+        list_connections_result = workflow.handle_request(list_connections_request)
 
         endflow_param_name = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             endflow_param_name = self._find_endflow_param_for_end_loop_node(
-                list_connections_result.incoming_connections, end_node_param_mappings
+                workflow, list_connections_result.incoming_connections, end_node_param_mappings
             )
 
         # Extract iteration results from subprocess outputs
@@ -3716,6 +3990,7 @@ class NodeExecutor(EngineScoped):
         execution_type: str,
     ) -> tuple[dict[int, Any], list[int], dict[str, Any]]:
         """Execute loop iterations sequentially via cloud publisher (Deadline Cloud, etc.)."""
+        workflow = end_loop_node._require_workflow()
         try:
             library = LibraryRegistry.get_library(name=execution_type)
         except KeyError:
@@ -3729,6 +4004,7 @@ class NodeExecutor(EngineScoped):
         # Pass node for publishing progress events if it's a SubflowNodeGroup
         publish_node = end_loop_node if isinstance(end_loop_node, SubflowNodeGroup) else None
         published_workflow_filename, workflow_result = await self._publish_workflow_for_loop_execution(
+            workflow,
             package_result=package_result,
             library_name=library_name,
             file_name=file_name_prefix,
@@ -3762,6 +4038,7 @@ class NodeExecutor(EngineScoped):
         execution_type: str,
     ) -> tuple[dict[int, Any], list[int], dict[str, Any]]:
         """Execute loop iterations in parallel via cloud publisher (Deadline Cloud, etc.)."""
+        workflow = end_loop_node._require_workflow()
         try:
             library = LibraryRegistry.get_library(name=execution_type)
         except KeyError:
@@ -3775,6 +4052,7 @@ class NodeExecutor(EngineScoped):
         # Pass node for publishing progress events if it's a SubflowNodeGroup
         publish_node = end_loop_node if isinstance(end_loop_node, SubflowNodeGroup) else None
         published_workflow_filename, workflow_result = await self._publish_workflow_for_loop_execution(
+            workflow,
             package_result=package_result,
             library_name=library_name,
             file_name=file_name_prefix,
@@ -3801,6 +4079,7 @@ class NodeExecutor(EngineScoped):
 
     async def _publish_workflow_for_loop_execution(
         self,
+        workflow: WorkflowRuntime,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         library_name: str,
         file_name: str,
@@ -3809,6 +4088,7 @@ class NodeExecutor(EngineScoped):
         """Save and publish workflow for loop execution via publisher.
 
         Args:
+            workflow: The workflow the nodes are in.
             package_result: The packaged flow
             library_name: Name of the library to publish to
             file_name: Base file name for the workflow
@@ -3823,7 +4103,7 @@ class NodeExecutor(EngineScoped):
             workflow_shape=package_result.workflow_shape,
         )
 
-        workflow_result = await self.engine.ahandle_request(workflow_file_request)
+        workflow_result = await workflow.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to save workflow file for loop: {workflow_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004 - This is a runtime failure, not a type validation error
@@ -3861,44 +4141,75 @@ class NodeExecutor(EngineScoped):
             parameter_output_values.update(end_node_values)
         return parameter_output_values
 
-    def _remove_packaged_nodes_from_queue(self, packaged_node_names: set[str]) -> None:
+    def _remove_packaged_nodes_from_queue(
+        self, workflow: WorkflowRuntime, packaged_node_names: set[str], replacement_node_name: str
+    ) -> None:
         """Remove nodes from global flow queue after they've been packaged for loop execution.
 
         When nodes are packaged for For Each loops, they will be deserialized into separate
         flow instances. We need to remove them from the global queue to prevent them from
         being executed in the main flow while also being copied into loop iterations.
 
+        A packaged node can still have a data consumer outside the package (a loose sink, or a
+        node pulled in only because it reads one of these nodes). Dropping the packaged node from
+        a network drops that edge too, so the consumer's in-degree reaches zero and it can run
+        before this node's real value is copied back onto ``replacement_node_name`` (the node that
+        stays in the outer DAG standing in for the whole package -- the loop's End node, or the
+        group node itself). Re-pointing the edge at that stand-in instead keeps the consumer
+        waiting until the copy-back has happened.
+
         Args:
+            workflow: The workflow the nodes are in.
             packaged_node_names: Set of node names that were packaged
+            replacement_node_name: The node left in the outer DAG to carry packaged nodes'
+                outside-facing data edges once the package's real values land on it
         """
-        flow_manager = self.engine.flow_manager
+        flows = workflow.flows
         node_manager = self.engine.node_manager
 
         # Get the nodes from the names
         packaged_nodes = set()
         for node_name in packaged_node_names:
-            node = node_manager.get_node_by_name(node_name)
+            node = node_manager.get_node_by_name_in(workflow, node_name)
             if node:
                 packaged_nodes.add(node)
 
         # Remove matching queue items from global queue
-        items_to_remove = [item for item in flow_manager.global_flow_queue.queue if item.node in packaged_nodes]
+        items_to_remove = [item for item in flows.global_flow_queue.queue if item.node in packaged_nodes]
 
         for item in items_to_remove:
-            flow_manager.global_flow_queue.queue.remove(item)
+            flows.global_flow_queue.queue.remove(item)
 
         # Remove from DAG builder to prevent parallel execution in parent flow
-        dag_builder = flow_manager.global_dag_builder
+        dag_builder = flows.global_dag_builder
         if dag_builder:
             for node_name in packaged_node_names:
                 # Remove from node_to_reference
                 if node_name in dag_builder.node_to_reference:
                     dag_builder.node_to_reference.pop(node_name)
 
-                # Remove from all networks and check if any become empty
-                for network in list(dag_builder.graphs.values()):
-                    if node_name in network.nodes():
-                        network.remove_node(node_name)
+            for network in list(dag_builder.graphs.values()):
+                self._redirect_packaged_edges_and_remove(network, packaged_node_names, replacement_node_name)
+
+    @staticmethod
+    def _redirect_packaged_edges_and_remove(
+        network: DirectedGraph, packaged_node_names: set[str], replacement_node_name: str
+    ) -> None:
+        """Drop every packaged node from one network, keeping its outside-facing edges alive.
+
+        An outside consumer's edge from a packaged node is re-pointed to `replacement_node_name`
+        instead of being dropped, so the consumer still waits for the real value. An edge whose
+        successor is the replacement node itself is left alone rather than turned into a self-loop
+        that would never clear -- that is simply the replacement node's own existing dependency.
+        """
+        for node_name in packaged_node_names:
+            if node_name not in network.nodes():
+                continue
+            for successor in network.get_successors(node_name):
+                if successor in packaged_node_names or successor == replacement_node_name:
+                    continue
+                network.add_edge(replacement_node_name, successor)
+            network.remove_node(node_name)
 
     def _apply_parameter_values_to_node(
         self,
@@ -3912,6 +4223,7 @@ class NodeExecutor(EngineScoped):
         Uses parameter_name_mappings from package_result to map packaged parameters back to original nodes.
         Works for both single-node and multi-node packages (SubflowNodeGroup).
         """
+        workflow = node._require_workflow()
         # If the packaged flow fails, the End Flow Node in the library published workflow will have entered from 'failed'
         if "failed" in parameter_output_values and parameter_output_values["failed"] == CONTROL_INPUT_PARAMETER:
             msg = f"Failed to execute node: {node.name}, with exception: {parameter_output_values.get('result_details', 'No result details were returned.')}"
@@ -3973,14 +4285,15 @@ class NodeExecutor(EngineScoped):
                 if target_node.should_preserve_stored_template(target_param_name, param_value):
                     self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
                 else:
-                    self.engine.node_manager.on_set_parameter_value_request(
+                    self.engine.node_manager.on_set_parameter_value_request_in_workflow(
                         SetParameterValueRequest(
                             node_name=target_node_name,
                             parameter_name=target_param_name,
                             value=param_value,
                             incoming_connection_source_node_name=node.name,
                             incoming_connection_source_parameter_name=target_param_name,
-                        )
+                        ),
+                        workflow,
                     )
             target_node.parameter_output_values[target_param_name] = param_value
 
@@ -4013,8 +4326,9 @@ class NodeExecutor(EngineScoped):
         ``collect_values_from_upstream_nodes`` re-reads upstream
         ``parameter_output_values`` before each node runs.
         """
+        workflow = target_node._require_workflow()
         try:
-            self.engine.flow_manager.get_connections().unresolve_future_nodes(target_node)
+            workflow.flows.connections.unresolve_future_nodes(target_node)
         except Exception:
             logger.warning(
                 "Could not unresolve nodes downstream of '%s' after preserving the variable template on '%s'",
@@ -4025,6 +4339,7 @@ class NodeExecutor(EngineScoped):
 
     def _apply_last_iteration_to_packaged_nodes(
         self,
+        workflow: WorkflowRuntime,
         last_iteration_values: dict[str, Any],
         package_result: PackageNodesAsSerializedFlowResultSuccess,
     ) -> None:
@@ -4035,6 +4350,7 @@ class NodeExecutor(EngineScoped):
         output values or produce artifacts during loop execution.
 
         Args:
+            workflow: The workflow the nodes are in.
             last_iteration_values: Dict mapping sanitized End node parameter names to values
             package_result: PackageNodesAsSerializedFlowResultSuccess containing parameter mappings and node names
         """
@@ -4060,7 +4376,7 @@ class NodeExecutor(EngineScoped):
 
             # Get the original packaged node in the main flow
             try:
-                target_node = node_manager.get_node_by_name(target_node_name)
+                target_node = node_manager.get_node_by_name_in(workflow, target_node_name)
             except Exception:
                 logger.warning(
                     "Could not find packaged node '%s' in main flow to apply last iteration values", target_node_name
@@ -4087,7 +4403,22 @@ class NodeExecutor(EngineScoped):
             # parameter_values would destroy the template the user typed rather than
             # merely hiding it. The output value below still reflects the last
             # iteration for downstream consumers and artifacts.
-            if not target_node.should_preserve_stored_template(target_param_name, param_value):
+            #
+            # Skip it as well for a list whose rows are connected to other nodes. A whole
+            # list written to a node becomes its rows, and replacing a connected row would
+            # remove its connection, which the list refuses. Those rows belong to their
+            # connections; the output value below still carries the iteration's list.
+            #
+            # And for a list connected to as a whole: the value here is the connected items
+            # followed by the list's own entries, and storing it as the connected value would
+            # read the entries twice, and save them twice. The connection is checked itself, since
+            # a body node the loop never fed holds no stored value yet on the first run.
+            preserves_template = target_node.should_preserve_stored_template(target_param_name, param_value)
+            rows_are_connected = target_node._list_rows.has_connected_rows(target_param)
+            whole_list_is_connected = isinstance(
+                target_param, ParameterList
+            ) and target_node._param_has_incoming_connection(target_param.name)
+            if not preserves_template and not rows_are_connected and not whole_list_is_connected:
                 target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
 
@@ -4103,32 +4434,28 @@ class NodeExecutor(EngineScoped):
         )
 
     async def _delete_workflow(self, workflow_path: Path) -> None:
-        # Derive the registry key from the workflow path using workspace-relative logic so it
-        # matches the key used during registration (push_workflow(file_path=__file__) in the workflow).
-        workspace_path = await anyio.Path(self.engine.config_manager.workspace_path).resolve()
-        resolved = await anyio.Path(workflow_path).resolve()
-        if resolved.is_relative_to(workspace_path):
-            path_for_key = str(resolved.relative_to(workspace_path))
-        else:
-            path_for_key = str(resolved)
-        workflow_name = derive_registry_key(path_for_key)
-
-        if not self.engine.workflow_registry.has_workflow_with_name(workflow_name):
+        workflow = self.engine.workflow_registry.find_by_path(workflow_path)
+        if workflow is None:
             # Register the workflow so DeleteWorkflowRequest can find and remove it.
             # A subprocess may have registered it in its own process but not in the main process.
+            # Unlisted: it is registered only to be deleted.
             load_workflow_metadata_request = LoadWorkflowMetadata(file_name=workflow_path.name)
             result = await self.engine.ahandle_request(load_workflow_metadata_request)
-            if isinstance(result, LoadWorkflowMetadataResultSuccess):
-                self.engine.workflow_registry.generate_new_workflow(
-                    registry_key=workflow_name, metadata=result.metadata, file_path=path_for_key
-                )
+            if not isinstance(result, LoadWorkflowMetadataResultSuccess):
+                logger.debug("Could not read workflow '%s' to clean it up: %s", workflow_path, result.result_details)
+                return
+            try:
+                workflow = self.engine.workflow_registry.register_file(workflow_path, result.metadata, listed=False)
+            except ValueError as err:
+                logger.debug("Could not register workflow '%s' to clean it up: %s", workflow_path, err)
+                return
 
-        delete_request = DeleteWorkflowRequest(name=workflow_name)
+        delete_request = DeleteWorkflowRequest(name=workflow.name)
         delete_result = await self.engine.ahandle_request(delete_request)
         if not isinstance(delete_result, DeleteWorkflowResultFailure):
             logger.debug(
                 "Cleanup result for workflow '%s': %s",
-                workflow_name,
+                workflow.name,
                 delete_result.result_details,
             )
 

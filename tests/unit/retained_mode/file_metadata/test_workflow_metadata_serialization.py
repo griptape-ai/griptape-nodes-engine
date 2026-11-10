@@ -1,7 +1,7 @@
 """Tests for workflow metadata collection and image-metadata serialization primitives.
 
 Covers the module that lets a saved image carry a workflow inside its own metadata
-(`_serialize_flow`, `_serialize_node`, `collect_workflow_metadata`) and the
+(`_serialize_flow`, `collect_workflow_metadata`) and the
 `WorkflowMetadata` fields that need custom (de)serialization to survive a TOML header
 (`node_types_used`, `workflow_shape`). Deliberately does not cover the sidecar metadata
 module (`test_sidecar_metadata.py`) or `ExtractFlowCommandsFromImageMetadata`
@@ -13,10 +13,8 @@ from collections.abc import Generator
 
 import pytest
 
-from griptape_nodes.exe_types.node_types import ErrorProxyNode
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType, WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -28,7 +26,6 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
     METADATA_NAMESPACE,
     _serialize_flow,
-    _serialize_node,
     collect_workflow_metadata,
 )
 from griptape_nodes.serialization.commands import decode_commands
@@ -47,24 +44,6 @@ def clean_object_state(engine: Engine) -> Generator[None, None, None]:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
-def _add_error_proxy_node(engine: Engine, node_name: str) -> ErrorProxyNode:
-    """Add a node to the object manager without needing a registered library.
-
-    `ErrorProxyNode` is the engine's own stand-in for a node whose real type could not be
-    created, so constructing one directly sidesteps library registration entirely while
-    still exercising a real, fully-formed `BaseNode`.
-    """
-    node = ErrorProxyNode(
-        name=node_name,
-        original_node_type="SomeOriginalType",
-        original_library_name="SomeOriginalLibrary",
-        failure_reason="library unavailable in this test",
-        metadata={},
-    )
-    engine.object_manager.add_object_by_name(node.name, node)
-    return node
-
-
 class TestSerializeFlow:
     """`_serialize_flow` packs a flow's commands into a JSON string for image metadata."""
 
@@ -77,7 +56,7 @@ class TestSerializeFlow:
         )
         assert isinstance(created, CreateFlowResultSuccess)
 
-        payload = _serialize_flow(engine, flow_name=created.flow_name)
+        payload = _serialize_flow(engine.current_workflow(), flow_name=created.flow_name)
         assert payload is not None
 
         decoded = decode_commands(json.loads(payload), SerializedFlowCommands)
@@ -94,14 +73,14 @@ class TestSerializeFlow:
         engine.context_manager.push_workflow(workflow_name="wf_no_flow")
 
         assert not engine.context_manager.has_current_flow()
-        assert _serialize_flow(engine, flow_name=None) is None
+        assert _serialize_flow(engine.current_workflow(), flow_name=None) is None
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_unknown_flow_name_returns_none(self, engine: Engine) -> None:
         """A flow name that does not exist fails the underlying request; this must degrade to None, not raise."""
         engine.context_manager.push_workflow(workflow_name="wf_missing_flow")
 
-        assert _serialize_flow(engine, flow_name="does_not_exist") is None
+        assert _serialize_flow(engine.current_workflow(), flow_name="does_not_exist") is None
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_none_flow_name_uses_current_flow_context(self, engine: Engine) -> None:
@@ -113,34 +92,11 @@ class TestSerializeFlow:
         assert isinstance(created, CreateFlowResultSuccess)
         assert engine.context_manager.has_current_flow()
 
-        payload = _serialize_flow(engine, flow_name=None)
+        payload = _serialize_flow(engine.current_workflow(), flow_name=None)
         assert payload is not None
 
         decoded = decode_commands(json.loads(payload), SerializedFlowCommands)
         assert decoded.flow_name is None  # SerializeFlowToCommandsResult doesn't stamp a name for the payload itself
-
-
-class TestSerializeNode:
-    """`_serialize_node` packs a single node's commands into a JSON string for image metadata."""
-
-    @pytest.mark.usefixtures("clean_object_state")
-    def test_returns_json_loadable_payload(self, engine: Engine) -> None:
-        """The returned string is valid JSON naming the node's original type."""
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="wf_node", flow_name="fl_node"))
-        _add_error_proxy_node(engine, "my_node")
-
-        payload = _serialize_node("my_node", engine)
-        assert payload is not None
-
-        parsed = json.loads(payload)
-        assert parsed["serialized_node_commands"]["create_node_command"]["node_type"] == "SomeOriginalType"
-
-    @pytest.mark.usefixtures("clean_object_state")
-    def test_unknown_node_name_returns_none(self, engine: Engine) -> None:
-        """A node name that does not exist fails the underlying request; this must degrade to None, not raise."""
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="wf_missing_node", flow_name="fl_missing"))
-
-        assert _serialize_node("no_such_node", engine) is None
 
 
 class TestCollectWorkflowMetadata:
@@ -155,17 +111,15 @@ class TestCollectWorkflowMetadata:
         )
         assert isinstance(created, CreateFlowResultSuccess)
 
-        metadata = collect_workflow_metadata(engine)
+        metadata = collect_workflow_metadata(engine, engine.current_workflow())
 
         assert metadata  # sanity: something was collected
         assert all(key.startswith(METADATA_NAMESPACE) for key in metadata)
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_no_workflow_context_still_returns_saved_at(self, engine: Engine) -> None:
-        """Even with no workflow in context, a timestamp is always available."""
-        assert not engine.context_manager.has_current_workflow()
-
-        metadata = collect_workflow_metadata(engine)
+    def test_no_workflow_still_returns_saved_at(self, engine: Engine) -> None:
+        """Even for a file written for no workflow, a timestamp is always available."""
+        metadata = collect_workflow_metadata(engine, None)
 
         assert f"{METADATA_NAMESPACE}saved_at" in metadata
         assert f"{METADATA_NAMESPACE}workflow_name" not in metadata
@@ -181,7 +135,7 @@ class TestCollectWorkflowMetadata:
         )
         assert isinstance(created, CreateFlowResultSuccess)
 
-        metadata = collect_workflow_metadata(engine)
+        metadata = collect_workflow_metadata(engine, engine.current_workflow())
 
         assert FLOW_COMMANDS_KEY in metadata
         decoded = decode_commands(json.loads(metadata[FLOW_COMMANDS_KEY]), SerializedFlowCommands)

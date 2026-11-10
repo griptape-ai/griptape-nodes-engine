@@ -6,6 +6,15 @@ The **MCP servers** dropdown lets you attach one or more MCP servers to the agen
 
 See [MCP Integration](../mcp/index.md) for how to set up MCP servers.
 
+## Library tools
+
+Some node libraries come with their own tools, such as listing or starting renders in an app the
+library connects to. Loaded libraries with tools appear under **Libraries** in the **MCP servers**
+dropdown, with nothing to set up. Pick one to give the agent its tools for the conversation.
+
+The agent asks before it uses a library tool, unless the library marks the tool as only reading
+information. See [Approvals](./approvals.md).
+
 ## Editing a server mid-conversation
 
 Changes you make to an MCP server take effect on your **next message** — you don't have to restart the engine or start a new conversation. This covers everything on the server: its command, arguments, environment variables, working directory, URL, headers, and its **Rules**.

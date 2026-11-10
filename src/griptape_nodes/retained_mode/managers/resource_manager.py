@@ -38,8 +38,16 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
-from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeInstance
+from griptape_nodes.retained_mode.managers.resource_types.compute_resource import (
+    ComputeBackend,
+    ComputeInstance,
+    ComputeResourceType,
+    detect_compute_capabilities,
+)
+from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType, detect_cpu_capabilities
+from griptape_nodes.retained_mode.managers.resource_types.os_resource import OSResourceType, detect_os_capabilities
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
@@ -81,6 +89,9 @@ class LocalObjectEntry:
     # what it parked, and an owner-chosen key can look like anything.
     slot: str | None = None
     on_drop: Callable[[Any], None] | None = None
+    # The workflow the object was held for, so closing that workflow releases it, or None for one held
+    # for no workflow. On a worker, the orchestrator's workflow id its node ran for.
+    workflow_id: str | None = None
 
     @property
     def is_slot_bound(self) -> bool:
@@ -126,6 +137,29 @@ class ResourceManager(EngineScoped):
 
         # Register event handlers
         event_manager.register_request_handlers(self)
+
+        # Libraries check their requirements against these as they load.
+        self._register_system_resources()
+
+    def _register_system_resources(self) -> None:
+        """Register this machine's OS, CPU, and compute resources."""
+        system_resources: list[tuple[ResourceType, dict[str, Any]]] = [
+            (OSResourceType(), detect_os_capabilities()),
+            (CPUResourceType(), detect_cpu_capabilities()),
+            (ComputeResourceType(), detect_compute_capabilities()),
+        ]
+        for resource_type, capabilities in system_resources:
+            type_name = type(resource_type).__name__
+            self.on_register_resource_type_request(RegisterResourceTypeRequest(resource_type=resource_type))
+            result = self.on_create_resource_instance_request(
+                CreateResourceInstanceRequest(resource_type_name=type_name, capabilities=capabilities)
+            )
+            if not isinstance(result, CreateResourceInstanceResultSuccess):
+                logger.error(
+                    "Attempted to create the system %s resource instance. Failed due to: %s",
+                    type_name,
+                    result.result_details,
+                )
 
     # Public Event Handlers
     @handles(ListRegisteredResourceTypesRequest)
@@ -423,6 +457,7 @@ class ResourceManager(EngineScoped):
             slot=slot,
             group=group,
             on_drop=on_drop,
+            workflow_id=self._current_workflow_id(),
         )
         with self._local_objects_lock:
             displaced = self._local_objects.get(full_key)
@@ -503,11 +538,14 @@ class ResourceManager(EngineScoped):
             return default
         return entry.value
 
-    def drop_local_object(self, key: str, *, owner: str | None = None) -> bool:
+    def drop_local_object(self, key: str, *, owner: str | None = None, defer_during_execution: bool = True) -> bool:
         """Release one held object. Returns whether it was released.
 
         Pass `owner` to refuse a key belonging to someone else: releasing it would run their teardown
         under them and leave their still-valid keys reporting the object as gone.
+
+        `defer_during_execution=False` runs the release hook now even while nodes are running, for a caller
+        that knows no running node still uses the object.
         """
         with self._local_objects_lock:
             entry = self._local_objects.get(key)
@@ -525,7 +563,7 @@ class ResourceManager(EngineScoped):
             survives = self._value_still_held_locked(entry.value)
 
         if not survives:
-            self._invoke_hooks_once_per_object({key: entry})
+            self._invoke_hooks_once_per_object({key: entry}, defer_during_execution=defer_during_execution)
         return True
 
     def release_parked_key(self, key: str, *, owner: str) -> bool:
@@ -652,10 +690,42 @@ class ResourceManager(EngineScoped):
         self._invoke_hooks_once_per_object(doomed)
         return len(doomed)
 
-    def drop_objects_for_group(self, group: str | None) -> int:
+    def drop_library_named_local_objects(self) -> int:
+        """Release the objects libraries named themselves, such as a loaded model, returning how many went.
+
+        Parked entries stay: they hold a value one node handed the next, which a later node of a run in
+        progress may still need and which nothing could rebuild. A library-named entry is one the library
+        rebuilds on a miss, at the cost of a reload.
+        """
+        with self._local_objects_lock:
+            doomed = {key: entry for key, entry in self._local_objects.items() if not entry.is_slot_bound}
+            for key in doomed:
+                del self._local_objects[key]
+            to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
+
+        self._invoke_hooks_once_per_object(to_release)
+        return len(doomed)
+
+    def drop_objects_for_workflow(self, workflow_id: str) -> int:
+        """Release everything held in this process for one workflow, returning how many went.
+
+        For closing that workflow while others stay open: their objects, and those held for no
+        workflow, stay. A value another workflow's entry also holds is not released.
+        """
+        with self._local_objects_lock:
+            doomed = {key: entry for key, entry in self._local_objects.items() if entry.workflow_id == workflow_id}
+            for key in doomed:
+                del self._local_objects[key]
+            to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
+
+        self._invoke_hooks_once_per_object(to_release)
+        return len(doomed)
+
+    def drop_objects_for_group(self, group: str | None, *, defer_during_execution: bool = True) -> int:
         """Release everything one group parked in this process, leaving its co-tenants' objects alone.
 
         The namespace is the owner, so a group sharing an owner with others cannot be found by owner alone.
+        `defer_during_execution` is as for `drop_local_object`.
         """
         with self._local_objects_lock:
             doomed = {key: entry for key, entry in self._local_objects.items() if entry.group == group}
@@ -665,8 +735,18 @@ class ResourceManager(EngineScoped):
             # so one group's release must not tear down what another is still handing out.
             to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
 
-        self._invoke_hooks_once_per_object(to_release)
+        self._invoke_hooks_once_per_object(to_release, defer_during_execution=defer_during_execution)
         return len(doomed)
+
+    def _current_workflow_id(self) -> str | None:
+        """The id of the workflow the current work acts on, or None when it acts on none or cannot tell which."""
+        try:
+            workflow = self.engine.current_workflow_or_none()
+        except WorkflowNotNamedError:
+            return None
+        if workflow is None:
+            return None
+        return workflow.workflow_id
 
     def _value_still_held_locked(self, value: Any) -> bool:
         """`_value_still_held` for callers already holding the lock.

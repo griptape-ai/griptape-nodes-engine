@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.project_events import (
+    ActivateWorkspaceProjectRequest,
     GetCurrentProjectRequest,
     GetCurrentProjectResultSuccess,
     GetPathForMacroRequest,
@@ -79,12 +80,16 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         """Async context manager entry: initialize queue and broadcast app initialization."""
         GriptapeNodes.EventManager().initialize_queue()
 
-        # Activate the user-specified project BEFORE broadcasting AppInitializationComplete.
+        # Activate the project BEFORE broadcasting AppInitializationComplete: the
+        # user-specified one, else the configured one, so a configured project that
+        # can't be activated fails the run instead of falling back to system defaults.
         # At this point ProjectManager._initialization_complete is still False, so the
         # project switch skips the heavy library reload that would otherwise clear the
         # flow/nodes already created at module import time.
         if self._project_file_path is not None:
             await self._load_project(self._project_file_path)
+        else:
+            await self._activate_workspace_project()
 
         await GriptapeNodes.EventManager().abroadcast_app_event(
             AppInitializationComplete(
@@ -102,7 +107,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
-        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
+        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
         if exc_val is not None and self._save_on_failure_path is not None:
             await self._save_failed_workflow(exc_val)
 
@@ -151,6 +156,18 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             raise LocalExecutorError(msg)
 
         logger.info("Loaded and activated project template from %s", project_file_path)
+
+    async def _activate_workspace_project(self) -> None:
+        """Activate the configured project, raising LocalExecutorError if it cannot be activated."""
+        result = await GriptapeNodes.ahandle_request(ActivateWorkspaceProjectRequest(fail_if_project_file_missing=True))
+        if result.failed():
+            msg = (
+                "Attempted to activate the configured project before running the workflow. "
+                f"Failed because: {result.result_details}"
+            )
+            raise LocalExecutorError(msg)
+
+        logger.debug("Workspace project activation: %s", result.result_details)
 
     def _submit_output(self, output: dict) -> None:
         self.output = output

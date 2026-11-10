@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -13,17 +14,21 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.common.project_templates import ProjectValidationInfo
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
     from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath, ResolvedProjectPath
-    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+    from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
 from griptape_nodes.common.project_templates import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
@@ -47,7 +52,55 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
+
+# Workflow ids another engine minted, in the registry's form.
+_PEER_WORKFLOW_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+_OTHER_PEER_WORKFLOW_ID = "1f2e3d4c5b6a79808f9e8d7c6b5a4f3e"
+
+
+def _file_path(context_manager: ContextManager) -> str | None:
+    """The current workflow's file path, or None while it is unsaved."""
+    absolute_path = context_manager.get_current_workflow().absolute_path
+    if absolute_path is None:
+        return None
+    return str(absolute_path)
+
+
+_HANDED_WORKFLOW_ID = "0000000000000000000000000000a001"
+_HANDED_WORKFLOW = WorkflowRuntime(_HANDED_WORKFLOW_ID, engine=MagicMock())
+
+
+def _engine_with_nothing_open(project_manager: ProjectManager) -> MagicMock:
+    """Give `project_manager` a stand-in engine with no workflow open, and return it."""
+    engine = MagicMock()
+    engine.only_open_workflow_or_none.return_value = None
+    project_manager._engine = engine
+    return engine
+
+
+def _hand_workflow(
+    project_manager: ProjectManager,
+    *,
+    name: str = "my_workflow",
+    file_path: str | Path | None = None,
+    working_directory: str | None = None,
+) -> WorkflowRuntime:
+    """Register one workflow on a stand-in engine for `project_manager`, and return its runtime.
+
+    The runtime is what dispatch hands an OPTIONAL_WORKFLOW handler; its paths resolve through its
+    registry entry, by id.
+    """
+    absolute_path = None
+    if file_path is not None:
+        absolute_path = Path(file_path)
+    entry = MagicMock(workflow_id=_HANDED_WORKFLOW_ID, absolute_path=absolute_path, working_directory=working_directory)
+    entry.name = name
+    engine = _engine_with_nothing_open(project_manager)
+    engine.workflow_registry.get.side_effect = {_HANDED_WORKFLOW_ID: entry}.__getitem__
+    return WorkflowRuntime(_HANDED_WORKFLOW_ID, engine=MagicMock())
 
 
 def _stub_config_for_listing(mock_config: Mock, *, global_workspace: str = "/global/ws") -> None:
@@ -343,9 +396,8 @@ class TestProjectManagerMacroHandlers:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "My Cool Workflow"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager._engine = MagicMock()
+        project_manager._engine.only_open_workflow_or_none.return_value = None
         project_manager._engine.context_manager = mock_context_manager
 
         cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
@@ -427,7 +479,7 @@ class TestProjectManagerMacroHandlers:
 
         # Caller asserts a directory that isn't the workspace.
         bag = cast("dict[str, Any]", {"workspace_dir": "/completely/different/path"})
-        result = project_manager._resolve_builtins_into_bag(bag, ["workspace_dir"], project_info)
+        result = project_manager._resolve_builtins_into_bag(bag, ["workspace_dir"], project_info, None)
 
         # `resolve_path_safely` normalizes both sides and picks up the disagreement.
         assert "workspace_dir" in result.conflicts
@@ -462,6 +514,7 @@ class TestProjectManagerMacroHandlers:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
         project_manager._engine = MagicMock()
+        project_manager._engine.only_open_workflow_or_none.return_value = None
         project_manager._engine.context_manager = mock_context_manager
 
         cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
@@ -478,16 +531,14 @@ class TestProjectManagerMacroHandlers:
 
         bag = cast("dict[str, Any]", {})
         result = project_manager._resolve_builtins_into_bag(
-            bag,
-            ["workflow_name", "workflow_dir", "workspace_dir"],
-            project_info,
+            bag, ["workflow_name", "workflow_dir", "workspace_dir"], project_info, None
         )
 
         # workflow_* resolvers both raised — recorded as unavailable with the exception attached.
         assert "workflow_name" in result.unavailable
         assert "workflow_dir" in result.unavailable
         assert isinstance(result.unavailable["workflow_name"], RuntimeError)
-        assert "No current workflow" in str(result.unavailable["workflow_name"])
+        assert "the request has no workflow" in str(result.unavailable["workflow_name"])
         # workspace_dir resolves fine → not in unavailable, and injected into the bag.
         assert "workspace_dir" not in result.unavailable
         assert bag["workspace_dir"] == str(tmp_path.resolve())
@@ -535,7 +586,7 @@ class TestProjectManagerMacroHandlers:
 
         # Caller asserts a value that disagrees with the resolved builtin.
         bag = cast("dict[str, Any]", {"static_files_dir": "user-overridden-value"})
-        result = project_manager._resolve_builtins_into_bag(bag, ["static_files_dir"], project_info)
+        result = project_manager._resolve_builtins_into_bag(bag, ["static_files_dir"], project_info, None)
 
         # String compare picked up the disagreement → conflict recorded.
         assert "static_files_dir" in result.conflicts
@@ -652,33 +703,22 @@ class TestProjectManagerBuiltinVariables:
 
         cast("Mock", project_manager_with_template._config_manager).workspace_path = Path("/workspace")
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_name.return_value = "my_workflow"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        workflow = _hand_workflow(project_manager_with_template)
 
         parsed_macro = ParsedMacro("{workflow_name}_output.txt")
 
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
 
-        result = project_manager_with_template.on_get_path_for_macro_request(request)
+        result = project_manager_with_template.on_get_path_for_macro_request(request, workflow)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("my_workflow_output.txt")
-        mock_context_manager.has_current_workflow.assert_called_once()
-        mock_context_manager.get_current_workflow_name.assert_called_once()
 
     def test_builtin_workflow_name_no_current_workflow(self, project_manager_with_template: ProjectManager) -> None:
-        """Test that {workflow_name} raises RuntimeError when no current workflow."""
+        """Test that {workflow_name} fails when the request has no workflow."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        _engine_with_nothing_open(project_manager_with_template)
 
         parsed_macro = ParsedMacro("{workflow_name}_output.txt")
 
@@ -691,7 +731,7 @@ class TestProjectManagerBuiltinVariables:
         from griptape_nodes.retained_mode.events.base_events import ResultDetails
 
         assert isinstance(result.result_details, ResultDetails)
-        assert "No current workflow" in str(result.result_details)
+        assert "the request has no workflow" in str(result.result_details)
 
     def test_builtin_project_name_not_implemented(self, project_manager_with_template: ProjectManager) -> None:
         """Test that {project_name} raises NotImplementedError."""
@@ -710,121 +750,273 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result.result_details, ResultDetails)
         assert "project_name not yet implemented" in str(result.result_details)
 
-    def test_mirrored_workflow_context_resolves_the_lenders_folder(
+    @staticmethod
+    def _worker_context_manager(workspace: Path) -> ContextManager:
+        """A worker engine's ContextManager, with nothing open and no orchestrator workflow adopted."""
+        engine = Engine()
+        engine.config_manager.workspace_path = workspace
+        return engine.context_manager
+
+    @staticmethod
+    @contextmanager
+    def _running_in(
+        context_manager: ContextManager,
+        workflow_id: str | None,
+        name: str | None,
+        file_path: str | None,
+        working_directory: str | None,
+    ) -> Iterator[None]:
+        """Adopt the orchestrator's workflow and run in it for the block, as a worker's node does."""
+        workflow = context_manager.adopt_orchestrator_workflow(workflow_id, name, file_path, working_directory)
+        with context_manager.engine.run_in_worker_workflow(workflow):
+            yield
+
+    @staticmethod
+    def _workflow_file(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# stub")
+        return path
+
+    def test_the_orchestrators_workflow_resolves_its_folder_on_the_worker(
         self,
         project_manager_with_template: ProjectManager,
+        tmp_path: Path,
     ) -> None:
-        """After adopting a peer's context, workflow builtins resolve through the NORMAL path.
+        """While a worker runs the orchestrator's node, workflow builtins resolve through the NORMAL path.
 
-        Unadopted, a worker's resolver raises, the optional `{workflow_dir?:/}` in the default
+        Outside it, a worker's resolver raises, the optional `{workflow_dir?:/}` in the default
         `{outputs}` template swallows it, and the path degrades to workspace-relative -- so the
         worker writes where the orchestrator does not read, with no error at the divergence.
         """
         from griptape_nodes.common.macro_parser import ParsedMacro
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 
-        # A real ContextManager with an empty stack: exactly a worker before adopting.
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        project_manager_with_template._engine = MagicMock()
-        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
-        project_manager_with_template._engine.context_manager = context_manager
+        show_folder = tmp_path / "orchestrator" / "shows" / "my_show"
+        workflow_file = self._workflow_file(show_folder / "my_show.py")
+        context_manager = self._worker_context_manager(show_folder)
+        project_manager_with_template._engine = context_manager.engine
 
         dir_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/output.txt"), variables={})
         name_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_name}.txt"), variables={})
 
-        # Unadopted: the folder is unresolvable, which is what silently degrades the path.
+        # Outside the node: the folder is unresolvable, which is what silently degrades the path.
         assert not isinstance(
             project_manager_with_template.on_get_path_for_macro_request(dir_request),
             GetPathForMacroResultSuccess,
         )
 
-        context_manager.mirror_workflow_context("my_show", "/orchestrator/shows/my_show/my_show.py", None)
-
-        resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request)
-        resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request)
+        with self._running_in(context_manager, "show-id", "my_show", str(workflow_file), None):
+            # Dispatch hands a node's request the worker runtime its node runs bound to.
+            worker_workflow = context_manager.engine.current_workflow()
+            resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request, worker_workflow)
+            resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request, worker_workflow)
 
         assert isinstance(resolved_dir, GetPathForMacroResultSuccess)
-        assert resolved_dir.resolved_path == Path("/orchestrator/shows/my_show/output.txt")
+        assert resolved_dir.resolved_path == show_folder / "output.txt"
         # workflow_name is the same defect, fixed by the same adoption rather than a second handoff.
         assert isinstance(resolved_name, GetPathForMacroResultSuccess)
         assert resolved_name.resolved_path.name == "my_show.txt"
-        mock_workflow_registry.get_workflow_by_name.assert_not_called()
 
-    def test_mirroring_keeps_the_stack_indexable(self) -> None:
-        """Adoption installs a REAL entry, so stack-indexing readers stay safe.
+    def test_adopting_registers_the_orchestrators_workflow_unlisted_under_its_id(self, tmp_path: Path) -> None:
+        """The worker's entry carries the orchestrator's id and stays out of the worker's workflow list."""
+        context_manager = self._worker_context_manager(tmp_path)
+        workflow_file = self._workflow_file(tmp_path / "w.py")
 
-        `has_current_workflow()` also means "there is an entry to index", so answering it True
-        without one raises IndexError in has_current_flow, push_flow, pop_flow and the setters.
-        """
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        with self._running_in(context_manager, "peer-id", "w", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == "peer-id"
 
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        context_manager.mirror_workflow_context("w", "/a/b/w.py", None)
+        registry = context_manager.engine.workflow_registry
+        assert registry.get("peer-id").listed is False
+        assert registry.list_workflows() == {}
 
-        assert context_manager.has_current_workflow() is True
-        assert context_manager.has_current_flow() is False
-        assert context_manager.get_current_workflow_name() == "w"
-        assert context_manager.get_current_workflow_file_path() == "/a/b/w.py"
+    def test_adopting_an_unsaved_workflow_answers_its_working_directory(self, tmp_path: Path) -> None:
+        context_manager = self._worker_context_manager(tmp_path)
 
-    def test_mirroring_replaces_rather_than_stacks(self) -> None:
-        """A mirror tracks ONE peer context; stacking would leave a stale workflow to be read."""
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        with self._running_in(
+            context_manager, _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, str(tmp_path / "shots")
+        ):
+            assert context_manager.get_current_workflow_name() == f"unsaved:{_PEER_WORKFLOW_ID}"
+            assert _file_path(context_manager) is None
+            assert context_manager.get_current_workflow().working_directory == str(tmp_path / "shots")
 
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        context_manager.mirror_workflow_context("first", "/a/first.py", None)
-        context_manager.mirror_workflow_context("second", "/b/second.py", None)
-        # Re-adopting the same context must not grow the stack either.
-        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+    def test_adopting_follows_the_orchestrator_saving_its_workflow(self, tmp_path: Path) -> None:
+        """An orchestrator that first saved the workflow since the last node moves this engine's entry, same id."""
+        context_manager = self._worker_context_manager(tmp_path)
+        context_manager.adopt_orchestrator_workflow(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        workflow_file = self._workflow_file(tmp_path / "saved.py")
 
-        assert len(context_manager._workflow_stack) == 1
-        assert context_manager.get_current_workflow_name() == "second"
+        with self._running_in(context_manager, _PEER_WORKFLOW_ID, "saved", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+            assert context_manager.get_current_workflow_name() == "saved"
+            assert _file_path(context_manager) == str(workflow_file)
 
-    def test_mirroring_an_empty_context_drops_the_previous_one(self) -> None:
-        """A peer with no workflow must leave this engine with none either.
+    def test_adopting_takes_the_orchestrators_id_for_a_file_known_here_under_another(self, tmp_path: Path) -> None:
+        """The orchestrator's id is the authority: this engine's stale entry for the file is replaced, not used."""
+        context_manager = self._worker_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        workflow_file = self._workflow_file(tmp_path / "w.py")
+        local = registry.register_file(
+            workflow_file,
+            WorkflowMetadata(
+                name="w",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+            ),
+        )
 
-        The mirror is replaced in place and never popped, so skipping the empty case left the
-        previous execution's workflow installed: the worker resolved `{workflow_dir}` to that
-        folder while the orchestrator degraded to workspace-relative, and wrote a real file
+        with self._running_in(context_manager, "orchestrator-id", "w", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == "orchestrator-id"
+
+        assert registry.find_by_id(local.workflow_id) is None
+        assert registry.find_by_path(workflow_file) is registry.get("orchestrator-id")
+
+    def test_adopting_moves_the_orchestrators_unsaved_entry_onto_a_file_known_here_under_another_id(
+        self, tmp_path: Path
+    ) -> None:
+        """The orchestrator first saved its unsaved workflow onto a file this engine scanned under another id."""
+        context_manager = self._worker_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        context_manager.adopt_orchestrator_workflow(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        workflow_file = self._workflow_file(tmp_path / "b.py")
+        local = registry.register_file(
+            workflow_file,
+            WorkflowMetadata(
+                name="b",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+            ),
+        )
+
+        with self._running_in(context_manager, _PEER_WORKFLOW_ID, "b", str(workflow_file), None):
+            assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+            assert _file_path(context_manager) == str(workflow_file)
+
+        assert registry.find_by_id(local.workflow_id) is None
+
+    def test_adopting_a_file_that_is_gone_resolves_paths_in_its_folder(self, tmp_path: Path) -> None:
+        """The orchestrator still has the workflow open at that path, so it resolves paths in that folder."""
+        context_manager = self._worker_context_manager(tmp_path)
+        missing = tmp_path / "shots" / "moved_away.py"
+
+        with self._running_in(context_manager, _PEER_WORKFLOW_ID, "moved_away", str(missing), None):
+            assert context_manager.get_current_workflow_id() == _PEER_WORKFLOW_ID
+            assert _file_path(context_manager) is None
+            assert context_manager.get_current_workflow().working_directory == str(tmp_path / "shots")
+
+    def test_a_sweep_closes_the_runtimes_and_drops_the_entries_made_for_them(self, tmp_path: Path) -> None:
+        """A long-lived worker does not keep an entry for every orchestrator workflow it ever ran a node for."""
+        context_manager = self._worker_context_manager(tmp_path)
+        engine = context_manager.engine
+        context_manager.adopt_orchestrator_workflow(_PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None)
+        context_manager.adopt_orchestrator_workflow(
+            _OTHER_PEER_WORKFLOW_ID, f"unsaved:{_OTHER_PEER_WORKFLOW_ID}", None, None
+        )
+
+        assert engine.sweep_worker_workflows() == 2  # noqa: PLR2004
+
+        assert not engine.worker_workflows.holds(_PEER_WORKFLOW_ID)
+        assert not engine.worker_workflows.holds(_OTHER_PEER_WORKFLOW_ID)
+        assert engine.workflow_registry.find_by_id(_PEER_WORKFLOW_ID) is None
+        assert engine.workflow_registry.find_by_id(_OTHER_PEER_WORKFLOW_ID) is None
+
+    def test_a_sweep_keeps_the_runtime_a_node_is_running_in(self, tmp_path: Path) -> None:
+        context_manager = self._worker_context_manager(tmp_path)
+        engine = context_manager.engine
+        busy = context_manager.adopt_orchestrator_workflow(
+            _PEER_WORKFLOW_ID, f"unsaved:{_PEER_WORKFLOW_ID}", None, None
+        )
+
+        with engine.run_in_worker_workflow(busy):
+            assert engine.sweep_worker_workflows() == 0
+
+        assert engine.worker_workflows.find(_PEER_WORKFLOW_ID) is busy
+        assert engine.workflow_registry.find_by_id(_PEER_WORKFLOW_ID) is not None
+
+    def test_a_sweep_keeps_an_entry_from_this_engines_scan(self, tmp_path: Path) -> None:
+        """The scanned entry goes to the orchestrator's id, and stays listed, so the sweep keeps it."""
+        context_manager = self._worker_context_manager(tmp_path)
+        registry = context_manager.engine.workflow_registry
+        workflow_file = self._workflow_file(tmp_path / "scanned.py")
+        registry.register_file(
+            workflow_file,
+            WorkflowMetadata(
+                name="scanned",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+            ),
+        )
+        context_manager.adopt_orchestrator_workflow("peer-id", "scanned", str(workflow_file), None)
+
+        context_manager.engine.sweep_worker_workflows()
+
+        kept = registry.find_by_id("peer-id")
+        assert kept is not None
+        assert kept.listed
+        assert registry.find_by_path(workflow_file) is kept
+
+    def test_the_adopted_workflow_has_an_indexable_stack(self, tmp_path: Path) -> None:
+        """The runtime gives the worker a context stack of its own, so readers that index it stay safe."""
+        context_manager = self._worker_context_manager(tmp_path)
+        workflow_file = self._workflow_file(tmp_path / "w.py")
+
+        with self._running_in(context_manager, "w-id", "w", str(workflow_file), None):
+            assert context_manager.has_current_workflow() is True
+            assert context_manager.has_current_flow() is False
+            assert context_manager.get_current_workflow_name() == "w"
+            assert _file_path(context_manager) == str(workflow_file)
+
+    def test_each_orchestrator_workflow_keeps_one_runtime(self, tmp_path: Path) -> None:
+        """Adopting the same workflow again returns its runtime; another workflow gets its own."""
+        context_manager = self._worker_context_manager(tmp_path)
+        first = self._workflow_file(tmp_path / "first.py")
+        second = self._workflow_file(tmp_path / "second.py")
+        first_runtime = context_manager.adopt_orchestrator_workflow("first-id", "first", str(first), None)
+        second_runtime = context_manager.adopt_orchestrator_workflow("second-id", "second", str(second), None)
+
+        again = context_manager.adopt_orchestrator_workflow("second-id", "second", str(second), None)
+
+        assert again is second_runtime
+        assert first_runtime is not second_runtime
+        with self._running_in(context_manager, "second-id", "second", str(second), None):
+            assert context_manager.get_current_workflow_id() == "second-id"
+            assert context_manager.get_current_workflow_name() == "second"
+
+    def test_a_node_from_an_orchestrator_with_no_workflow_is_refused(self, tmp_path: Path) -> None:
+        """An orchestrator with no workflow gives the worker no workflow to build the node's copy in.
+
+        An earlier node's workflow must not be used either: the worker would resolve `{workflow_dir}` to
+        that folder while the orchestrator degraded to workspace-relative, and write a real file
         where the orchestrator does not read.
         """
-        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        context_manager = self._worker_context_manager(tmp_path)
+        workflow_file = self._workflow_file(tmp_path / "showA.py")
+        with self._running_in(context_manager, "show-a", "showA", str(workflow_file), None):
+            pass
 
-        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
-        context_manager.mirror_workflow_context("showA", "/a/showA.py", None)
+        with pytest.raises(context_manager.OrchestratorWorkflowError, match="no workflow was open"):
+            context_manager.adopt_orchestrator_workflow(None, None, None, None)
 
-        context_manager.mirror_workflow_context(None, None, None)
-
-        assert context_manager.has_current_workflow() is False
-
-    def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
-        self,
-        project_manager_with_template: ProjectManager,
-    ) -> None:
-        """Nothing to lend, so the peer must drop any mirror it holds and degrade identically."""
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        assert project_manager_with_template.workflow_context_for_dispatch().name is None
-
-    def test_dispatch_snapshot_carries_the_whole_context(
+    def test_dispatch_snapshot_carries_the_whole_context_of_the_workflow_it_is_handed(
         self,
         project_manager_with_template: ProjectManager,
     ) -> None:
         """Raw context, not a resolved path: derived values are then computed by the peer."""
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_name.return_value = "my_show"
-        mock_context_manager.get_current_workflow_file_path.return_value = "/shows/my_show/my_show.py"
-        mock_context_manager.get_current_workflow_working_directory.return_value = "/shows/my_show"
+        entry = MagicMock(
+            workflow_id="show_id", working_directory="/shows/my_show", absolute_path=Path("/shows/my_show/my_show.py")
+        )
+        entry.name = "my_show"
         project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        project_manager_with_template._engine.workflow_registry.get.return_value = entry
+        workflow = WorkflowRuntime("show_id", MagicMock())
 
-        snapshot = project_manager_with_template.workflow_context_for_dispatch()
+        snapshot = project_manager_with_template.workflow_context_for_dispatch(workflow)
 
+        project_manager_with_template._engine.workflow_registry.get.assert_called_once_with("show_id")
+        assert snapshot.workflow_id == "show_id"
         assert snapshot.name == "my_show"
-        assert snapshot.file_path == "/shows/my_show/my_show.py"
+        assert snapshot.file_path == str(Path("/shows/my_show/my_show.py"))
         assert snapshot.working_directory == "/shows/my_show"
 
     def test_builtin_workflow_dir_resolves_correctly(
@@ -834,24 +1026,13 @@ class TestProjectManagerBuiltinVariables:
         """Test that {workflow_dir} resolves to the workflow file's parent directory."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_name.return_value = "my_workflow"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
-        project_manager_with_template._engine = MagicMock()
-        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        mock_workflow = Mock()
-        mock_workflow.file_path = "my_project/my_workflow.json"
-        mock_workflow_registry.get_workflow_by_name.return_value = mock_workflow
-        mock_workflow_registry.get_complete_file_path.return_value = "/workspace/my_project/my_workflow.json"
+        # The workflow's file, as its registry entry reports it.
+        workflow = _hand_workflow(project_manager_with_template, file_path="/workspace/my_project/my_workflow.json")
 
         parsed_macro = ParsedMacro("{workflow_dir}/output.txt")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
 
-        result = project_manager_with_template.on_get_path_for_macro_request(request)
+        result = project_manager_with_template.on_get_path_for_macro_request(request, workflow)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("/workspace/my_project/output.txt")
@@ -860,10 +1041,7 @@ class TestProjectManagerBuiltinVariables:
         """Test that required {workflow_dir} fails when there is no current workflow."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        _engine_with_nothing_open(project_manager_with_template)
 
         parsed_macro = ParsedMacro("{workflow_dir}/output.txt")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
@@ -875,7 +1053,7 @@ class TestProjectManagerBuiltinVariables:
         from griptape_nodes.retained_mode.events.base_events import ResultDetails
 
         assert isinstance(result.result_details, ResultDetails)
-        assert "No current workflow" in str(result.result_details)
+        assert "the request has no workflow" in str(result.result_details)
 
     def test_builtin_workflow_dir_optional_skipped_when_no_workflow(
         self, project_manager_with_template: ProjectManager
@@ -885,10 +1063,7 @@ class TestProjectManagerBuiltinVariables:
 
         cast("Mock", project_manager_with_template._config_manager).workspace_path = Path("/workspace")
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        _engine_with_nothing_open(project_manager_with_template)
 
         parsed_macro = ParsedMacro("{workflow_dir?:/}staticfiles/output.txt")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
@@ -918,22 +1093,13 @@ class TestProjectManagerBuiltinVariables:
             expected_folder = resolve_path_safely(Path(working_directory))
             working_directory = str(expected_folder)
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
-        mock_context_manager.get_current_workflow_name.return_value = "workflow_5"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = working_directory
-        project_manager_with_template._engine = MagicMock()
-        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        mock_workflow_registry.has_workflow_with_name.return_value = False
+        workflow = _hand_workflow(project_manager_with_template, name="workflow_5", working_directory=working_directory)
 
         parsed_macro = ParsedMacro(macro)
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = project_manager_with_template.on_get_path_for_macro_request(request)
+            result = project_manager_with_template.on_get_path_for_macro_request(request, workflow)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == expected_folder / "staticfiles/output.txt"
@@ -948,7 +1114,7 @@ class TestProjectManagerBuiltinVariables:
 
         `{workflow_dir?:/}outputs/image.png` degrades to a PLAUSIBLE workspace-relative path
         rather than an error, so without a log line the only symptom is media that resolves to a
-        file which was never written there. `_ProjectVariableResolver._resolve_macro_string` warns
+        file which was never written there. `ProjectVariableResolver._resolve_macro_string` warns
         on its own copy of this degradation; this is the path GetPathForMacro takes, and it is the
         one the `workflow_dir` regression tests above drive.
         """
@@ -956,10 +1122,7 @@ class TestProjectManagerBuiltinVariables:
 
         cast("Mock", project_manager_with_template._config_manager).workspace_path = Path("/workspace")
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = False
-        project_manager_with_template._engine = MagicMock()
-        project_manager_with_template._engine.context_manager = mock_context_manager
+        _engine_with_nothing_open(project_manager_with_template)
 
         parsed_macro = ParsedMacro("{workflow_dir?:/}outputs/image.png")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
@@ -991,27 +1154,22 @@ class TestProjectManagerBuiltinVariables:
 
         cast("Mock", project_manager_with_template._config_manager).workspace_path = Path("/workspace")
 
-        mock_context_manager = Mock()
-        mock_context_manager.has_current_workflow.return_value = True
         # Stale: keyed against the workspace that was active when the workflow was opened.
-        mock_context_manager.get_current_workflow_name.return_value = "stale/key/my_workflow"
-        mock_context_manager.get_current_workflow_file_path.return_value = "/elsewhere/shot_042/my_workflow.py"
-        project_manager_with_template._engine = MagicMock()
-        mock_workflow_registry = project_manager_with_template._engine.workflow_registry
-        project_manager_with_template._engine.context_manager = mock_context_manager
-
-        # The registry no longer holds that key -- this is what used to poison the result.
-        mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("stale/key/my_workflow")
+        workflow = _hand_workflow(
+            project_manager_with_template, name="stale/key/my_workflow", file_path="/elsewhere/shot_042/my_workflow.py"
+        )
 
         parsed_macro = ParsedMacro("{workflow_dir?:/}outputs/image.png")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
 
-        result = project_manager_with_template.on_get_path_for_macro_request(request)
+        result = project_manager_with_template.on_get_path_for_macro_request(request, workflow)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
         # Anchored to the workflow, NOT degraded to a bare workspace-relative "outputs".
         assert result.resolved_path == Path("/elsewhere/shot_042/outputs/image.png")
-        mock_workflow_registry.get_workflow_by_name.assert_not_called()
+        cast(
+            "MagicMock", project_manager_with_template._engine
+        ).workflow_registry.get_workflow_by_name.assert_not_called()
 
     def test_builtin_static_files_dir_resolves_from_config(self, project_manager_with_template: ProjectManager) -> None:
         """Test that {static_files_dir} resolves to the configured static_files_directory setting."""
@@ -1415,6 +1573,7 @@ class TestProjectManagerGetStateForMacro:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
         project_manager_with_current_project._engine = MagicMock()
+        project_manager_with_current_project._engine.only_open_workflow_or_none.return_value = None
         project_manager_with_current_project._engine.context_manager = mock_context_manager
 
         parsed_macro = ParsedMacro("{workflow_name}_output.txt")
@@ -1859,6 +2018,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ContextManager()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(project_manager, "_engine", mock_engine):
             cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -1913,6 +2073,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(project_manager, "_engine", mock_engine):
             cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -1983,6 +2144,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(project_manager, "_engine", mock_engine):
             cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -2037,6 +2199,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(project_manager, "_engine", mock_engine):
             cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -2089,6 +2252,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(project_manager, "_engine", mock_engine):
             cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -2153,6 +2317,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes - workflow_name will fail because no workflow
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(project_manager, "_engine", mock_engine):
             cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
@@ -4377,6 +4542,7 @@ class TestResolveWorkspaceDirForProjectId:
             failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="not found"
         )
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             mock_engine.ahandle_request = AsyncMock(return_value=read_failure)
 
@@ -5191,6 +5357,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_workflow_manager = Mock()
         mock_workflow_manager.refresh_workflow_registry = AsyncMock(return_value=None)
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         mock_engine.workflow_manager = mock_workflow_manager
         return self._WorkspaceSwitchHarness(pm, mock_engine, mock_workflow_manager, str(project_file))
 
@@ -5701,6 +5868,8 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
@@ -5752,6 +5921,8 @@ class TestProjectManagerProjectWorkspaces:
         pm._initialization_complete = True
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock()
@@ -5795,6 +5966,8 @@ class TestProjectManagerProjectWorkspaces:
         unknown_file = tmp_path / "from-a-previous-install.yml"
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             mock_engine.ahandle_request = AsyncMock()
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
@@ -5825,6 +5998,8 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock()
@@ -5860,6 +6035,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_workflow_manager = Mock()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
@@ -6016,6 +6192,8 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -6164,6 +6342,8 @@ class TestRegisterProjectPath:
         project_id = "/path/to/project.yml"
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
@@ -6176,6 +6356,7 @@ class TestRegisterProjectPath:
     def test_register_exception_is_swallowed(self, pm: ProjectManager) -> None:
         """A config manager exception does not propagate out of _register_project_path."""
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
@@ -6213,6 +6394,7 @@ situations:
     async def test_empty_list_does_nothing(self, pm: ProjectManager) -> None:
         """An empty projects_to_register list results in no load attempts."""
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
@@ -6226,6 +6408,7 @@ situations:
     async def test_none_config_return_does_nothing(self, pm: ProjectManager) -> None:
         """None from config (treated as empty via 'or []') results in no load attempts."""
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
@@ -6258,6 +6441,8 @@ situations:
         pm._successfully_loaded_project_templates[existing_path] = project_info
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
@@ -6284,6 +6469,8 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -6324,6 +6511,8 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         # find_files_recursive takes its max_depth from self.engine.config_manager.discovery_max_depth.
         mock_engine.config_manager.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
         with (
@@ -6424,6 +6613,8 @@ situations:
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -6606,6 +6797,8 @@ situations:
         absolute_path = (tmp_path / "project.yml").resolve()
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -6672,6 +6865,8 @@ situations:
         tilde_path = Path("~/project.yml")
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -6935,6 +7130,7 @@ class TestProjectEnvironmentVariableRecursion:
 
         pm = self._make_pm_with_template(environment={"WF": "{workflow_name}_suffix"})
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -6956,6 +7152,7 @@ class TestProjectEnvironmentVariableRecursion:
             directories={"inputs": "{workflow_dir?:/}inputs"},
         )
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -6977,6 +7174,7 @@ class TestProjectEnvironmentVariableRecursion:
             directories={"inputs": "{workflow_dir}/inputs"},
         )
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -6997,25 +7195,13 @@ class TestProjectEnvironmentVariableRecursion:
             environment={},
             directories={"inputs": "{workflow_dir?:/}inputs"},
         )
-        mock_engine = MagicMock()
-        mock_workflow_registry = mock_engine.workflow_registry
-        with patch.object(pm, "_engine", mock_engine):
-            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
-            mock_context = Mock()
-            mock_context.has_current_workflow.return_value = True
-            mock_context.get_current_workflow_name.return_value = "my_workflow"
-            mock_context.get_current_workflow_file_path.return_value = None
-            mock_context.get_current_workflow_working_directory.return_value = None
-            mock_engine.context_manager = mock_context
+        cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+        # The workflow's file, as its registry entry reports it.
+        workflow = _hand_workflow(pm, file_path="/workspace/my_project/my_workflow.json")
 
-            mock_workflow = Mock()
-            mock_workflow.file_path = "my_project/my_workflow.json"
-            mock_workflow_registry.get_workflow_by_name.return_value = mock_workflow
-            mock_workflow_registry.get_complete_file_path.return_value = "/workspace/my_project/my_workflow.json"
-
-            result = pm.on_get_path_for_macro_request(
-                GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
-            )
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={}), workflow
+        )
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("/workspace/my_project/inputs/img.png")
 
@@ -7025,6 +7211,7 @@ class TestProjectEnvironmentVariableRecursion:
 
         pm = self._make_pm_with_template(environment={"WF": "{workflow_dir?:/}sub"})
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
@@ -7122,6 +7309,26 @@ class TestProjectEnvironmentVariableRecursion:
             os.environ.pop("A", None)
             os.environ.pop("B", None)
 
+    @pytest.mark.parametrize(
+        "open_workflows",
+        [
+            pytest.param(lambda: _HANDED_WORKFLOW, id="one open"),
+            pytest.param(Mock(side_effect=WorkflowNotNamedError("2 workflows are open")), id="several open"),
+        ],
+    )
+    def test_env_values_never_resolve_for_an_open_workflow(self, open_workflows: Any) -> None:
+        """Environment values apply to the whole engine, so one using `{workflow_dir}` is skipped, never resolved."""
+        pm = self._make_pm_with_template(environment={"ASSETS": "{workflow_dir}/assets", "PLAIN": "{workspace_dir}/x"})
+        assert pm._current_project_id is not None
+        project_info = pm._successfully_loaded_project_templates[pm._current_project_id]
+        mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.side_effect = open_workflows
+        with patch.object(pm, "_engine", mock_engine):
+            resolved = pm._resolve_project_env_values(project_info.template, project_info)
+
+        assert resolved == {"PLAIN": f"{Path('/workspace')}/x"}
+        mock_engine.only_open_workflow_or_none.assert_not_called()
+
 
 class TestProjectDirectoryRecursion:
     """Tests for recursive resolution of directory path_macros.
@@ -7151,6 +7358,7 @@ class TestProjectDirectoryRecursion:
         mock_config.workspace_path = workspace_path
         mock_config.get_config_value.return_value = "staticfiles"
         pm = ProjectManager(Mock(), mock_config, Mock())
+        _engine_with_nothing_open(pm)
 
         template = ProjectTemplate(
             project_template_schema_version="0.1.0",
@@ -7435,6 +7643,7 @@ directories:
 
         project_path = (tmp_path / "binary.yml").resolve()
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -7465,6 +7674,7 @@ directories:
         unexpected = Mock()
         unexpected.failed.return_value = False
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(return_value=unexpected)
@@ -7487,6 +7697,7 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.replace('parent_project_path: "{parent}"\n', "").format(),
         }
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7514,6 +7725,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7547,6 +7760,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7577,6 +7792,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7597,6 +7814,8 @@ directories:
         files = {self_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=self_path.as_posix())}
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7621,6 +7840,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7642,6 +7863,8 @@ directories:
         files = {child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=missing_parent.as_posix())}
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7680,6 +7903,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7718,6 +7943,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7760,6 +7987,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7791,6 +8020,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7843,6 +8074,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7895,6 +8128,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7926,6 +8161,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7960,6 +8197,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -7984,6 +8223,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8018,6 +8259,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8060,6 +8303,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path") as persist_spy:
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8089,6 +8334,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8120,6 +8367,8 @@ file_extension_directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8165,6 +8414,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8216,6 +8467,8 @@ directories:
             return None
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.side_effect = deny
             mock_engine.ahandle_request = self._file_router(files)
@@ -8259,6 +8512,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8359,6 +8614,7 @@ directories:
 
         files = {parent_path: parent_yaml}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8607,6 +8863,7 @@ directories:
         # Round-trip: reload the child and confirm the inherited description is cleared.
         files = {parent_path: parent_yaml, child_path: child_path.read_text()}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -8815,6 +9072,7 @@ parent_project_path: "{grandparent_path.as_posix()}"
             parent_path: parent_yaml,
         }
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -9079,6 +9337,8 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -9119,6 +9379,8 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -9218,6 +9480,8 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock(
@@ -9314,6 +9578,8 @@ directories:
         }
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -9356,6 +9622,8 @@ directories:
         files = {child_path: child_yaml}
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -9394,6 +9662,8 @@ directories:
         files = {base_path: self.BASE_PROJECT_YAML, child_path: child_yaml}
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -9427,6 +9697,8 @@ directories:
         files = {base_path: self.BASE_PROJECT_YAML, child_path: child_yaml}
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -9503,6 +9775,8 @@ class TestProjectPathFieldValidation:
         from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateRequest
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -9855,6 +10129,8 @@ class TestProjectPathFieldValidation:
         assert isinstance(result, LoadProjectTemplateResultSuccess)
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             mock_engine.ahandle_request = self._file_router(files)
             libraries_decision = await pm._decide_libraries_root_from_disk(child_path, None, {})
@@ -9889,6 +10165,8 @@ class TestProjectPathFieldValidation:
         await self._load(pm, files, project_path)
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             mock_engine.ahandle_request = self._file_router(files)
             listing = await pm.on_list_project_templates_request(
@@ -10054,6 +10332,8 @@ class TestListProjectTemplatesEffectivePaths:
         )
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10168,6 +10448,8 @@ class TestListProjectTemplatesEffectivePaths:
         )
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             mock_engine.ahandle_request = self._file_router({})
             pm._load_system_defaults()
@@ -10335,6 +10617,77 @@ situations:
 
         assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    def _configure_project_file(self, pm: ProjectManager, tmp_path: Path, project_file: Path) -> None:
+        """Set up system defaults and a workspace project, with `project_file` pointing at `project_file`."""
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+        (tmp_path / WORKSPACE_PROJECT_FILE).write_text(self.VALID_PROJECT_YAML)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return str(project_file)
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+    async def _activate(self, pm: ProjectManager, *, fail_if_project_file_missing: bool) -> object:
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+            mock_file_cls.return_value = mock_file_instance
+
+            request = ActivateWorkspaceProjectRequest(fail_if_project_file_missing=fail_if_project_file_missing)
+            return await pm.on_activate_workspace_project_request(request)
+
+    @pytest.mark.asyncio
+    async def test_missing_project_file_fails_when_requested(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """With the flag, a project_file naming a missing file fails instead of using the workspace project."""
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectResultFailure
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        missing_project_path = tmp_path / "unmounted" / "griptape-nodes-project.yml"
+        self._configure_project_file(pm, tmp_path, missing_project_path)
+
+        result = await self._activate(pm, fail_if_project_file_missing=True)
+
+        assert isinstance(result, ActivateWorkspaceProjectResultFailure)
+        assert str(missing_project_path) in str(result.result_details)
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_missing_project_file_falls_back_by_default(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """Without the flag, a project_file naming a missing file falls back to the workspace project."""
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectResultSuccess
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._configure_project_file(pm, tmp_path, tmp_path / "unmounted" / WORKSPACE_PROJECT_FILE)
+
+        result = await self._activate(pm, fail_if_project_file_missing=False)
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == str(tmp_path / WORKSPACE_PROJECT_FILE)
+
+    @pytest.mark.asyncio
+    async def test_existing_project_file_activates_when_flag_set(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """With the flag, a project_file naming an existing file is activated."""
+        from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectResultSuccess
+
+        configured_project_path = tmp_path / "configured" / "griptape-nodes-project.yml"
+        configured_project_path.parent.mkdir()
+        configured_project_path.write_text(self.VALID_PROJECT_YAML)
+        self._configure_project_file(pm, tmp_path, configured_project_path)
+
+        result = await self._activate(pm, fail_if_project_file_missing=True)
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == str(configured_project_path)
 
     @pytest.mark.asyncio
     async def test_resolvable_workspace_project_activates(self, pm: ProjectManager, tmp_path: Path) -> None:
@@ -10674,6 +11027,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10701,6 +11055,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "legacy.yml").resolve()
         files = {project_path: self.LEGACY_NO_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10723,6 +11078,7 @@ parent_project_id: "ghost-parent-id"
         path_b = (tmp_path / "b.yml").resolve()
         files = {path_a: self.EXPLICIT_ID_YAML, path_b: self.EXPLICIT_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10749,6 +11105,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10925,6 +11282,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10963,6 +11321,7 @@ parent_project_id: "ghost-parent-id"
         child_path = (tmp_path / "child.yml").resolve()
         files = {parent_path: self.PARENT_WITH_ID_YAML, child_path: self.CHILD_BY_PARENT_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -10990,6 +11349,7 @@ parent_project_id: "ghost-parent-id"
         child_path = (tmp_path / "orphan.yml").resolve()
         files = {child_path: self.CHILD_MISSING_PARENT_ID_YAML}
         mock_engine = MagicMock()
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -11017,6 +11377,8 @@ parent_project_id: "ghost-parent-id"
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+
+        mock_engine.only_open_workflow_or_none.return_value = None
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
@@ -12533,7 +12895,7 @@ class TestProjectVariableResolution:
         pm = self._pm()
         synthetic_ws = Path("/synthetic/ws")
         pm._config_manager.workspace_path = synthetic_ws
-        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None, workflow=None)
         assert type(variable) is FlowVariable
         # Production stringifies the Path, so compare via str(Path) — on Windows the
         # separators come back as backslashes.
@@ -12543,18 +12905,18 @@ class TestProjectVariableResolution:
     def test_resolve_unknown_name_raises_value_error(self) -> None:
         pm = self._pm()
         with pytest.raises(ValueError, match="Unknown computed project variable"):
-            pm.resolve_project_variable("not_defined_anywhere", project_id=None)
+            pm.resolve_project_variable("not_defined_anywhere", project_id=None, workflow=None)
 
     def test_resolve_unknown_project_raises_value_error(self) -> None:
         pm = self._pm()
         with pytest.raises(ValueError, match="not loaded"):
-            pm.resolve_project_variable("workspace_dir", project_id="not_loaded")
+            pm.resolve_project_variable("workspace_dir", project_id="not_loaded", workflow=None)
 
     def test_resolve_context_not_ready_propagates(self) -> None:
         """A builtin whose live context isn't ready raises for the caller to handle."""
         pm = self._pm()
 
-        def blow_up(name: str, project_info: object) -> str:  # noqa: ARG001
+        def blow_up(name: str, project_info: object, workflow: object) -> str:  # noqa: ARG001
             msg = "context not ready"
             raise RuntimeError(msg)
 
@@ -12562,7 +12924,7 @@ class TestProjectVariableResolution:
             patch.object(pm, "_get_builtin_variable_value", side_effect=blow_up),
             pytest.raises(RuntimeError, match="context not ready"),
         ):
-            pm.resolve_project_variable("workflow_dir", project_id=None)
+            pm.resolve_project_variable("workflow_dir", project_id=None, workflow=None)
 
     def test_resolved_snapshot_serializes_cleanly(self) -> None:
         """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
@@ -12571,7 +12933,7 @@ class TestProjectVariableResolution:
         pm = self._pm()
         synthetic_ws = Path("/synthetic/ws")
         pm._config_manager.workspace_path = synthetic_ws
-        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None, workflow=None)
         serialized = converter.unstructure(variable)
         assert serialized["name"] == "workspace_dir"
         # Compare via str(Path): Windows stringifies with backslash separators.
@@ -12697,7 +13059,7 @@ variables:
             assert warnings, "expected a collision warning for workspace_dir"
             # Resolution: computed wins — the stored /hijack value is unreachable.
             pm = engine.project_manager
-            resolved = pm.resolve_project_variable("workspace_dir", project_id=load_result.project_id)
+            resolved = pm.resolve_project_variable("workspace_dir", project_id=load_result.project_id, workflow=None)
             assert resolved.value != "/hijack"
         finally:
             self._unload(engine, load_result.project_id)
@@ -13322,9 +13684,8 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "unsaved:abc"
-        mock_context_manager.get_current_workflow_file_path.return_value = None
-        mock_context_manager.get_current_workflow_working_directory.return_value = None
         pm._engine = MagicMock()
+        pm._engine.only_open_workflow_or_none.return_value = None
         pm._engine.context_manager = mock_context_manager
         # The probe resolves through on_get_path_for_macro_request, which consults stored project
         # variables. A MagicMock's return value is not a mapping it can walk.
@@ -13349,17 +13710,20 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         recorded = workflow_dir_requests if workflow_dir_requests is not None else []
         real_get_builtin = ProjectManager._get_builtin_variable_value
 
-        def counting_get_builtin(pm_self: ProjectManager, var_name: str, project_info: ProjectInfo) -> str:
+        def counting_get_builtin(
+            pm_self: ProjectManager, var_name: str, project_info: ProjectInfo, workflow: WorkflowRuntime | None
+        ) -> str:
             if var_name == "workflow_dir":
                 recorded.append(var_name)
-            return real_get_builtin(pm_self, var_name, project_info)
+            return real_get_builtin(pm_self, var_name, project_info, workflow)
 
         registered_unsaved = Mock()
-        registered_unsaved.file_path = None
-        cast("MagicMock", pm._engine).workflow_registry.get_workflow_by_name.return_value = registered_unsaved
+        registered_unsaved.absolute_path = None
+        registered_unsaved.working_directory = None
+        cast("MagicMock", pm._engine).workflow_registry.get.return_value = registered_unsaved
         with patch.object(ProjectManager, "_get_builtin_variable_value", counting_get_builtin):
             project_info = pm._successfully_loaded_project_templates[cast("str", pm._current_project_id)]
-            return pm._resolve_workflow_dir(project_info)
+            return pm._resolve_workflow_dir(project_info, WorkflowRuntime("unsaved-workflow", engine=MagicMock()))
 
     def test_default_macro_answers_the_workspace_root(self) -> None:
         """The shipped `{workspace_dir}/{sub_dirs?:/}...` macro puts a workflow at the root."""
@@ -13446,3 +13810,193 @@ class TestUnsavedWorkflowDirFromSaveSituation:
         pm = self._project_manager("{no_such_directory}/{file_name_base}.{file_extension}")
 
         assert self._resolve_workflow_dir(pm) == self._expected_dir()
+
+
+class TestRefreshProjectTemplates:
+    """Test ProjectManager.on_refresh_project_templates_request."""
+
+    VALID_PROJECT_YAML = TestLoadRegisteredProjects.VALID_PROJECT_YAML
+
+    @pytest.fixture
+    def pm(self) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.get_config_value.return_value = []
+        mock_config_manager.read_config_file_value.return_value = None
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    def _engine_reading_disk(self) -> MagicMock:
+        """An engine whose ReadFileRequest reads the real file, failing when it does not exist."""
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            ReadFileResultFailure,
+            ReadFileResultSuccess,
+        )
+
+        def read_file(request: Any) -> object:
+            path = Path(request.file_path)
+            if not path.is_file():
+                return ReadFileResultFailure(
+                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="not found"
+                )
+            content = path.read_text()
+            return ReadFileResultSuccess(
+                content=content,
+                file_size=len(content),
+                mime_type="text/plain",
+                encoding="utf-8",
+                result_details="ok",
+            )
+
+        mock_engine = MagicMock()
+        mock_engine.config_manager.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
+        mock_engine.ahandle_request = AsyncMock(side_effect=read_file)
+        return mock_engine
+
+    def _register(self, pm: ProjectManager, entries: list[str | dict]) -> None:
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        def get_config_value_side_effect(key: str, default: object = None, **_: object) -> object:
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return entries
+            return default
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+
+    @pytest.mark.asyncio
+    async def test_directory_mounted_after_boot_loads_on_refresh(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A registered directory that was unreachable at boot loads on refresh and leaves no failure behind."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectTemplatesRequest,
+            RefreshProjectTemplatesRequest,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        drive = tmp_path / "drive"
+        self._register(pm, [str(drive)])
+        mock_engine = self._engine_reading_disk()
+
+        with (
+            patch.object(pm, "_engine", mock_engine),
+            patch.object(pm, "_register_project_path"),
+            patch.object(pm, "_build_unloaded_id_index", new=AsyncMock(return_value={})),
+        ):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            before = await pm.on_list_project_templates_request(ListProjectTemplatesRequest())
+            assert before.successfully_loaded == []
+            assert [info.project_id for info in before.failed_to_load] == [str(canonicalize_for_identity(drive))]
+
+            project_file = drive / "show" / WORKSPACE_PROJECT_FILE
+            project_file.parent.mkdir(parents=True)
+            project_file.write_text(self.VALID_PROJECT_YAML)
+
+            result = await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert result.succeeded()
+        assert str(canonicalize_for_identity(project_file)) in pm._successfully_loaded_project_templates
+        # The boot-time MISSING entry under the directory path is what kept it in failed_to_load.
+        assert canonicalize_for_identity(drive) not in pm._registered_template_status
+
+    @pytest.mark.asyncio
+    async def test_still_missing_file_stays_failed(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A registered file that is still unreachable is listed as failed after refresh."""
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        missing = canonicalize_for_identity(tmp_path / "missing.yml")
+        self._register(pm, [str(missing)])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert pm._registered_template_status[missing].status == ProjectValidationStatus.MISSING
+
+    @pytest.mark.asyncio
+    async def test_loaded_project_keeps_its_status(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """Refresh does not drop the status of a registered project that is already loaded."""
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        project_file = canonicalize_for_identity(tmp_path / "project.yml")
+        project_file.write_text(self.VALID_PROJECT_YAML)
+        self._register(pm, [str(project_file)])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            status_before = pm._registered_template_status[project_file]
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert pm._registered_template_status[project_file] is status_before
+
+    @pytest.mark.asyncio
+    async def test_failure_inside_directory_that_is_gone_is_cleared(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A discovered file that failed and has since been removed is no longer reported as failed."""
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        drive = tmp_path / "drive"
+        broken = drive / "broken" / WORKSPACE_PROJECT_FILE
+        broken.parent.mkdir(parents=True)
+        broken.write_text("not: [valid")
+        good = drive / "good" / WORKSPACE_PROJECT_FILE
+        good.parent.mkdir()
+        good.write_text(self.VALID_PROJECT_YAML)
+        self._register(pm, [str(drive)])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm._load_registered_projects()
+            assert canonicalize_for_identity(broken) in pm._registered_template_status
+
+            broken.unlink()
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert canonicalize_for_identity(broken) not in pm._registered_template_status
+        assert str(canonicalize_for_identity(good)) in pm._successfully_loaded_project_templates
+
+    @pytest.mark.asyncio
+    async def test_failure_outside_registered_paths_is_kept(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A failure discovery won't revisit, such as an unregistered file loaded by hand, survives refresh."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        unregistered = canonicalize_for_identity(tmp_path / "elsewhere" / "project.yml")
+        pm._registered_template_status[unregistered] = ProjectValidationInfo(status=ProjectValidationStatus.MISSING)
+        self._register(pm, [str(tmp_path / "drive")])
+        mock_engine = self._engine_reading_disk()
+
+        with patch.object(pm, "_engine", mock_engine), patch.object(pm, "_register_project_path"):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        assert unregistered in pm._registered_template_status
+
+    @pytest.mark.asyncio
+    async def test_invalid_entry_warns_once_per_refresh(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Refresh selects the registered entries once, so an invalid entry's warning is logged once."""
+        from griptape_nodes.retained_mode.events.project_events import RefreshProjectTemplatesRequest
+
+        self._register(pm, [str(tmp_path / "drive"), {"not_a_platform": "x"}])
+        mock_engine = self._engine_reading_disk()
+
+        with (
+            patch.object(pm, "_engine", mock_engine),
+            patch.object(pm, "_register_project_path"),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            await pm.on_refresh_project_templates_request(RefreshProjectTemplatesRequest())
+
+        skipped = [r for r in caplog.records if r.getMessage().startswith("Skipping")]
+        assert len(skipped) == 1

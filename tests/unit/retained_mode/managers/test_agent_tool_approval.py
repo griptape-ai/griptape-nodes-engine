@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+from pydantic_ai.toolsets import FunctionToolset
 
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.agents.pydantic_ai.tool_approval import (
@@ -37,6 +39,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
 from griptape_nodes.retained_mode.events.budget_events import GetAttributionContextResultFailure
 from griptape_nodes.retained_mode.events.mcp_events import GetEnabledMCPServersResultSuccess
 from griptape_nodes.retained_mode.managers.agent_manager import AgentManager, ComposedPrompt
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.unit.agents.pydantic_ai.test_tool_approval import ScriptedModel, ToolGate, runner_with
 
 if TYPE_CHECKING:
@@ -76,19 +79,20 @@ class _Harness:
         thread_id, _ = self.storage.create_thread()
         return thread_id
 
-    async def send(self, thread_id: str, text: str) -> RunAgentResultSuccess:
+    async def send(self, thread_id: str, text: str, workflow: WorkflowRuntime | None = None) -> RunAgentResultSuccess:
         result = await self.manager.on_handle_run_agent_request(
-            RunAgentRequest(input=text, url_artifacts=[], thread_id=thread_id)
+            RunAgentRequest(input=text, url_artifacts=[], thread_id=thread_id), workflow
         )
         assert isinstance(result, RunAgentResultSuccess), result
         return result
 
-    async def resolve(self, thread_id: str, **decisions: str) -> Any:
+    async def resolve(self, thread_id: str, workflow: WorkflowRuntime | None = None, **decisions: str) -> Any:
         return await self.manager.on_handle_resolve_tool_approvals_request(
             ResolveToolApprovalsRequest(
                 thread_id=thread_id,
                 decisions=[ToolApprovalDecision(tool_call_id=key, decision=value) for key, value in decisions.items()],
-            )
+            ),
+            workflow,
         )
 
     def tool_returns(self, thread_id: str) -> dict[str, str]:
@@ -113,13 +117,41 @@ def _manager_on(
     manager._providers = []
     manager._active_provider_name = "griptape_cloud"
     monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: runner)
+    # The runner's agent already carries the stand-in for the engine's MCP server.
+    monkeypatch.setattr(manager, "_engine_mcp_toolset", lambda _workflow: FunctionToolset())
     monkeypatch.setattr(_AGENT_MANAGER_MODULE + "._compose_prompt", _plain_prompt)
     manager._engine = SimpleNamespace(  # type: ignore[assignment]
         event_manager=SimpleNamespace(put_event=lambda _e: None),
         handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
         ahandle_request=_no_attribution,
+        # Libraries still loading and no flow open, so the run's instructions carry
+        # neither the node types nor a flow.
+        library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
+        only_open_workflow_or_none=lambda: None,
     )
     return manager
+
+
+@pytest.mark.asyncio
+class TestRunWorkflow:
+    async def test_a_message_and_its_answer_address_the_engine_tools_to_the_workflow_they_came_from(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness = _Harness(tmp_path, monkeypatch, ScriptedModel([(START, {}, "c1")], "Started."))
+        addressed: list[WorkflowRuntime | None] = []
+
+        def engine_toolset(workflow: WorkflowRuntime | None) -> FunctionToolset:
+            addressed.append(workflow)
+            return FunctionToolset()
+
+        monkeypatch.setattr(harness.manager, "_engine_mcp_toolset", engine_toolset)
+        workflow = WorkflowRuntime("tab-workflow", MagicMock())
+        thread_id = harness.thread()
+
+        await harness.send(thread_id, "Run the flow.", workflow)
+        await harness.resolve(thread_id, workflow, c1="approve_once")
+
+        assert addressed == [workflow, workflow]
 
 
 @pytest.mark.asyncio

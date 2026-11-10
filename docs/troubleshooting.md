@@ -96,8 +96,14 @@ Two separate problems stack here:
 Give every additional engine **its own identity and its own ports**:
 
 ```bash
-GTN_ENGINE_ID=second-engine STATIC_SERVER_PORT=9000 GTN_MCP_SERVER_PORT=9928 gtn engine
+GTN_ENGINE_ID=second-engine \
+GTN_CONFIG_TRANSPORTS__WEBSOCKET_DIRECT__PORT=18126 \
+STATIC_SERVER_PORT=9000 \
+GTN_MCP_SERVER_PORT=9928 \
+gtn engine
 ```
+
+Every port must differ from the other engine's. See [Transports](guides/transports.md#settings) for the other transport settings.
 
 If you never intended to run more than one engine, find and stop the extra one using the steps in the [media section above](#images-or-videos-arent-showing-in-the-editor).
 
@@ -198,7 +204,7 @@ A known, elusive bug. In almost all cases it's harmless and doesn't affect your 
 
 1. You can usually disregard it and keep working.
 1. If it's blocking you, restart the engine and it should clear up.
-1. If you can reproduce it, we'd be grateful if you'd [log a bug](https://github.com/griptape-ai/griptape-nodes/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) with any context about what led to it.
+1. If you can reproduce it, we'd be grateful if you'd [log a bug](https://github.com/griptape-ai/griptape-nodes-engine/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) with any context about what led to it.
 
 ## "ssl.SSLCertVerificationError" / the engine won't run
 

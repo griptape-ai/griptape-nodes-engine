@@ -107,8 +107,8 @@ def flow_name(engine: Engine) -> str:
 def _add[NodeT: BaseNode](engine: Engine, node: NodeT, flow_name: str) -> NodeT:
     """Register a hand-built node the way CreateNodeRequest does, with no library to create it from."""
     engine.flow_manager.get_flow_by_name(flow_name).add_node(node)
-    engine.object_manager.add_object_by_name(node.name, node)
-    engine.node_manager._name_to_parent_flow_name[node.name] = flow_name
+    engine.object_manager.add_object_by_name_in(engine.current_workflow(), node.name, node)
+    engine.current_workflow().nodes.name_to_parent_flow_name[node.name] = flow_name
     return node
 
 
@@ -462,13 +462,13 @@ class TestTheRealRunPathReleases:
     def test_a_fresh_node_instance_reparking_the_same_slot_displaces(self, engine: Engine) -> None:  # noqa: ARG002 (the store the fixture builds is the subject)
         """Worker semantics: the previous run's object is displaced by slot, wherever it lives.
 
-        The transient node is rebuilt every execution, but the store is process-level.
+        A worker loads a new copy of the node for every execution, but the store is process-level.
         """
         first_run = _Producer(name="Producer")
         first_run.parameter_output_values["latent"] = Held("first")
         _egress(first_run)
 
-        # ExecuteNodeRequest carries local_object_source, and the worker's transient node adopts it. That
+        # ExecuteNodeRequest carries local_object_source, and the worker's copy of the node adopts it. That
         # is what makes the identity stable across instances; a node that mints its own is a different node.
         second_run = _Producer(name="Producer")
         second_run.local_object_source = first_run.local_object_source
@@ -662,6 +662,16 @@ class TestAHookRunsOncePerObject:
         _egress(producer)
 
         engine.clear_current_workflow_data()
+
+        assert producer.released == ["shared"]
+
+    def test_popping_the_workflow_releases_what_its_nodes_hold(self, engine: Engine, flow_name: str) -> None:
+        """Closing the workflow by popping it is a teardown too, not a drop of live nodes."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("shared")
+        _egress(producer)
+
+        engine.context_manager.pop_workflow()
 
         assert producer.released == ["shared"]
 

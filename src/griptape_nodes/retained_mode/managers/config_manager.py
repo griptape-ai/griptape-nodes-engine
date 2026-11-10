@@ -1290,7 +1290,7 @@ class ConfigManager(EngineScoped):
 
         An exception is made for `workflows_to_register` since resetting it gives the appearance of the user losing their workflows.
         """
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1241 need a better way to annotate fields to ignore.
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/1241 need a better way to annotate fields to ignore.
         workflows_to_register = self.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
         USER_CONFIG_PATH.write_text(
             json.dumps(
@@ -1472,7 +1472,7 @@ class ConfigManager(EngineScoped):
 
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/437
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/437
         # Reapplies the log level and sinks from the reloaded merged config rather than from
         # `value`: logging is configured from several related settings at once.
         self.load_configs()

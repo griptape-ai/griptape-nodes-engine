@@ -311,6 +311,24 @@ class ListProjectTemplatesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
 
 @dataclass
 @PayloadRegistry.register
+class RefreshProjectTemplatesRequest(RequestPayload):
+    """Re-check every path in projects_to_register and load the projects that have appeared since startup.
+
+    Use when: A registered project became reachable after the engine started, such as a project on a
+    network drive that mounted late, forcing a re-discovery without restarting the engine.
+
+    Results: RefreshProjectTemplatesResultSuccess
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class RefreshProjectTemplatesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Registered project paths re-checked. List the templates to see what loaded."""
+
+
+@dataclass
+@PayloadRegistry.register
 class GetSituationRequest(RequestPayload):
     """Get the full situation template for a specific situation.
 
@@ -839,7 +857,15 @@ class ActivateWorkspaceProjectRequest(RequestPayload):
     config/workspace/env layers first ensures LibraryManager loads libraries
     against the correct workspace (and enforces the project's engine_version and
     library pins) instead of the default workspace.
+
+    Args:
+        fail_if_project_file_missing: Fail when the `project_file` setting names a file
+            that does not exist, instead of falling back to the workspace default.
+
+    Results: ActivateWorkspaceProjectResultSuccess | ActivateWorkspaceProjectResultFailure
     """
+
+    fail_if_project_file_missing: bool = False
 
 
 @dataclass

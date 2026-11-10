@@ -1,11 +1,16 @@
 """File driver for Griptape Cloud asset locations."""
 
 import os
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import httpx2
 
-from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import (
+    DEFAULT_CLOUD_BASE_URL,
+    join_cloud_url,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+)
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 
@@ -29,7 +34,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         """
         return 10
 
-    def __init__(self, bucket_id: str, api_key: str, base_url: str = "https://cloud.griptape.ai") -> None:
+    def __init__(self, bucket_id: str, api_key: str, base_url: str = DEFAULT_CLOUD_BASE_URL) -> None:
         """Initialize GriptapeCloudFileDriver.
 
         Args:
@@ -55,7 +60,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         """
         bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
         api_key = resolve_cloud_credential()
-        base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        base_url = resolve_cloud_base_url()
 
         if bucket_id and api_key:
             return cls(bucket_id, api_key, base_url)
@@ -115,7 +120,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
             async with httpx2.AsyncClient() as client:
@@ -148,11 +153,11 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
             async with httpx2.AsyncClient() as client:
-                # TODO: Standardize timeout values https://github.com/griptape-ai/griptape-nodes/issues/3958
+                # TODO: Standardize timeout values https://github.com/griptape-ai/griptape-nodes-engine/issues/3958
                 response = await client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=10.0)
                 return response.status_code < _HTTP_SUCCESS_THRESHOLD
         except (httpx2.HTTPError, Exception):
@@ -178,7 +183,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
             with httpx2.Client() as client:

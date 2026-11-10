@@ -108,7 +108,7 @@ class TestTheHookGatesExecution:
         node.validate_in_execution_environment.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_it_runs_after_hydration(self) -> None:
+    async def test_it_runs_after_the_values_the_request_carried_are_set(self) -> None:
         """Checking a value before it is set would read the wrong thing."""
         order: list[str] = []
         node = _node()
@@ -119,6 +119,7 @@ class TestTheHookGatesExecution:
 
         node.set_parameter_value = MagicMock(side_effect=record_set)
         node.get_parameter_by_name = MagicMock(return_value=MagicMock())
+        node._list_rows.set_as_rows_if_unconnected.return_value = False
         request = ExecuteNodeRequest(node_name="Node 1", parameter_values={"width": 512})
 
         await _manager()._hydrate_and_run_node(node, request)

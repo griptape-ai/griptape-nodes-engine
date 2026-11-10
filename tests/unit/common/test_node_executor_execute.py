@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
+from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
@@ -33,6 +34,18 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+def _in_workflow_of(executor: NodeExecutor, node: Any) -> Any:
+    """`node`, joined to a workflow whose requests go to the executor's engine."""
+    node._require_workflow.return_value = WorkflowRuntime("wf", executor.engine)
+    return node
+
+
+async def _execute(node: Any) -> None:
+    executor = _make_executor()
+    await executor.execute(_in_workflow_of(executor, node))
 
 
 def _make_executor() -> NodeExecutor:
@@ -52,8 +65,19 @@ def _make_node(
     # None of these values are held, so the egress pass must not treat them as parkable. A MagicMock
     # parameter answers truthy to is_process_local, which would swap every value for a mock key.
     node.get_parameter_by_name.return_value = None
-    # No lists, so what is dispatched is the values themselves.
-    node._list_rows.values_for_dispatch.side_effect = lambda: dict(node.parameter_values)
+    return node
+
+
+def _make_spec_node(spec: type, name: str) -> MagicMock:
+    """A node of a specific type, for the routes that branch on it.
+
+    A spec'd mock has no attributes the class only sets in __init__, so the ones execute() reads
+    to describe the node in its events are set here.
+    """
+    node = MagicMock(spec=spec)
+    node.name = name
+    node.metadata = {}
+    node.is_cancellation_requested = False
     return node
 
 
@@ -74,7 +98,7 @@ class TestExecuteDispatchContract:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
-        await executor.execute(node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         mock_engine.ahandle_request.assert_awaited_once()
         request = mock_engine.ahandle_request.call_args.args[0]
@@ -82,35 +106,40 @@ class TestExecuteDispatchContract:
         assert request.node_name == "Greeter"
 
     @pytest.mark.asyncio
-    async def test_dispatches_current_parameter_values(self) -> None:
+    async def test_dispatches_the_open_workflows_context_and_id(self) -> None:
+        """A worker runs the node in the runtime it keeps for the orchestrator's workflow, under the id the request carries."""
+        node = _make_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
+        mock_engine.project_manager.workflow_context_for_dispatch.return_value = WorkflowContextSnapshot(
+            workflow_id="open-workflow-id",
+            name="shots/lighting",
+            file_path="/workspace/shots/lighting.py",
+            working_directory=None,
+        )
+
+        await executor.execute(_in_workflow_of(executor, node))
+
+        request = mock_engine.ahandle_request.call_args.args[0]
+        assert request.orchestrator_workflow_id == "open-workflow-id"
+        assert request.workflow_name == "shots/lighting"
+        assert request.workflow_file_path == "/workspace/shots/lighting.py"
+        assert request.workflow_working_directory is None
+
+    @pytest.mark.asyncio
+    async def test_dispatches_no_values_since_the_node_already_holds_them(self) -> None:
+        """The handler reads the node's own values, and fills them in itself when it forwards to a worker."""
         node = _make_node(parameter_values={"in": "hi", "n": 3})
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
-        await executor.execute(node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         request = mock_engine.ahandle_request.call_args.args[0]
-        assert request.parameter_values == {"in": "hi", "n": 3}
-
-    @pytest.mark.asyncio
-    async def test_dispatched_parameter_values_are_independent_copy(self) -> None:
-        """Mutating node.parameter_values after dispatch must not leak into the request."""
-        node = _make_node(parameter_values={"in": "hi"})
-        captured: dict[str, Any] = {}
-
-        async def capture(req: Any) -> ExecuteNodeResultSuccess:
-            # Mutate the node's live dict; the request's snapshot must not change.
-            node.parameter_values["in"] = "MUTATED"
-            captured["params"] = req.parameter_values
-            return _success_result()
-
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.ahandle_request = AsyncMock(side_effect=capture)
-        await executor.execute(node)
-
-        assert captured["params"] == {"in": "hi"}
+        assert request.parameter_values == {}
+        assert request.element_modification_commands == []
 
     @pytest.mark.asyncio
     async def test_dispatches_node_metadata(self) -> None:
@@ -119,7 +148,7 @@ class TestExecuteDispatchContract:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
-        await executor.execute(node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         request = mock_engine.ahandle_request.call_args.args[0]
         assert request.node_metadata == {"node_type": "Foo", "library": "Bar"}
@@ -137,7 +166,7 @@ class TestExecuteDispatchContract:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(side_effect=capture)
-        await executor.execute(node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         assert captured["meta"] == {"node_type": "Foo", "library": "Bar"}
 
@@ -150,7 +179,7 @@ class TestExecuteDispatchContract:
         mock_engine.ahandle_request = AsyncMock(
             return_value=_success_result({"a": 1, "b": "two"}),
         )
-        await executor.execute(node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         assert node.parameter_output_values == {"a": 1, "b": "two"}
 
@@ -168,7 +197,7 @@ class TestExecuteFailureContract:
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
         with pytest.raises(RuntimeError):
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
     @pytest.mark.asyncio
     async def test_runtime_error_mentions_node_name(self) -> None:
@@ -180,7 +209,7 @@ class TestExecuteFailureContract:
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
         with pytest.raises(RuntimeError, match="Broken"):
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
     @pytest.mark.asyncio
     async def test_runtime_error_mentions_failure_details(self) -> None:
@@ -192,7 +221,7 @@ class TestExecuteFailureContract:
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
         with pytest.raises(RuntimeError, match="kaboom-detail"):
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
     @pytest.mark.asyncio
     async def test_outputs_are_not_copied_back_on_failure(self) -> None:
@@ -204,7 +233,7 @@ class TestExecuteFailureContract:
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
         with pytest.raises(RuntimeError):
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         assert node.parameter_output_values == {}
 
@@ -220,7 +249,7 @@ class TestExecuteFailureContract:
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
         with pytest.raises(ExecuteNodeFailedError) as caught:
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         assert caught.value.details is built
         assert caught.value.__cause__ is raised
@@ -235,7 +264,7 @@ class TestExecuteFailureContract:
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
         with pytest.raises(ExecuteNodeFailedError) as caught:
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         assert caught.value.details == NodeErrorDetails(message="no worker is available")
         assert caught.value.__cause__ is None
@@ -246,8 +275,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_basewhilenodegroup_routes_to_handle_while_group_execution(self) -> None:
-        node = MagicMock(spec=BaseWhileNodeGroup)
-        node.name = "WhileGroup"
+        node = _make_spec_node(BaseWhileNodeGroup, "WhileGroup")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -257,7 +285,7 @@ class TestExecuteSpecialNodeRouting:
             patch.object(NodeExecutor, "handle_loop_execution", new_callable=AsyncMock) as mock_loop,
         ):
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_while.assert_awaited_once_with(node)
         mock_iter.assert_not_awaited()
@@ -266,8 +294,7 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_baseiterativenodegroup_routes_to_handle_iterative_group_execution(self) -> None:
-        node = MagicMock(spec=BaseIterativeNodeGroup)
-        node.name = "IterGroup"
+        node = _make_spec_node(BaseIterativeNodeGroup, "IterGroup")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -277,7 +304,7 @@ class TestExecuteSpecialNodeRouting:
             patch.object(NodeExecutor, "handle_loop_execution", new_callable=AsyncMock) as mock_loop,
         ):
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_iter.assert_awaited_once_with(node)
         mock_while.assert_not_awaited()
@@ -286,14 +313,13 @@ class TestExecuteSpecialNodeRouting:
 
     @pytest.mark.asyncio
     async def test_baseiterativeendnode_routes_to_handle_loop_execution(self) -> None:
-        node = MagicMock(spec=BaseIterativeEndNode)
-        node.name = "EndLoop"
+        node = _make_spec_node(BaseIterativeEndNode, "EndLoop")
 
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         with patch.object(NodeExecutor, "handle_loop_execution", new_callable=AsyncMock) as mock_loop:
             mock_engine.ahandle_request = AsyncMock()
-            await executor.execute(node)
+            await executor.execute(_in_workflow_of(executor, node))
 
         mock_loop.assert_awaited_once_with(node)
         mock_engine.ahandle_request.assert_not_awaited()
@@ -301,8 +327,7 @@ class TestExecuteSpecialNodeRouting:
     @pytest.mark.asyncio
     async def test_subflownodegroup_local_execution_calls_aprocess(self) -> None:
         """When execution_environment is LOCAL_EXECUTION, run aprocess in-process and skip dispatch."""
-        node = MagicMock(spec=SubflowNodeGroup)
-        node.name = "Subflow"
+        node = _make_spec_node(SubflowNodeGroup, "Subflow")
         node.execution_environment = MagicMock()
         node.execution_environment.name = "execution_environment"
         node.get_parameter_value = MagicMock(return_value=LOCAL_EXECUTION)
@@ -311,7 +336,7 @@ class TestExecuteSpecialNodeRouting:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock()
-        await executor.execute(node)
+        await executor.execute(_in_workflow_of(executor, node))
 
         node.aprocess.assert_awaited_once()
         mock_engine.ahandle_request.assert_not_awaited()

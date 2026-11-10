@@ -22,13 +22,21 @@ from griptape_nodes.retained_mode.managers.external_environment import (  # noqa
     LIBRARY_PATHS_ENV_VAR,
     LIBRARY_WORKER_REQUESTS_ENV_VAR,
 )
+from griptape_nodes.retained_mode.runtime.read_observer import install_workflow_read_observer  # noqa: E402
 from griptape_nodes.utils import engine_dirs  # noqa: E402
+from tests.unit.host_workflow_reads import HostWorkflowRead, HostWorkflowReadRecorder  # noqa: E402
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
 # level, so merely collecting them wrote to the real XDG state directory and pruned it.
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
 _session_log_home_patch = patch.object(engine_dirs, "xdg_state_home", lambda: Path(_session_log_home.name))
+
+# `workspace_directory` defaults to `GriptapeNodes` under the working directory, frozen at import.
+# From the repo root that is a developer's real workspace, whose sandbox library and project file
+# the engine would load and write into. Resolved because the real default holds no symlinks,
+# while macOS temporary directories sit behind `/var`.
+_session_workspace = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-workspace-")
 
 
 def _real_log_directory() -> Path | None:
@@ -57,6 +65,8 @@ def pytest_configure() -> None:
     if real_log_directory is not None:
         _own_names_in_real_log_directory.update(path.name for path in real_log_directory.glob(_own_log_file_glob))
     _session_log_home_patch.start()
+    settings_module.Settings.model_fields["workspace_directory"].default = str(Path(_session_workspace.name).resolve())
+    settings_module.Settings.model_rebuild(force=True)
 
 
 def pytest_unconfigure() -> None:
@@ -64,6 +74,7 @@ def pytest_unconfigure() -> None:
     log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
     _session_log_home_patch.stop()
     _session_log_home.cleanup()
+    _session_workspace.cleanup()
 
 
 @pytest.fixture
@@ -165,6 +176,24 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
             # Detach the sinks while the directory still exists: they live on the process-global
             # logger, so one left behind holds an open file in a directory about to be deleted.
             log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
+
+
+@pytest.fixture(autouse=True)
+def fail_on_host_workflow_reads() -> Generator[list[HostWorkflowRead], None, None]:
+    """Fail a test whose HOST request read the current workflow while one was open.
+
+    A HOST request acts on no workflow, so such a read finds none: its handler depends on a workflow it
+    should take. See `RequestScope`.
+    """
+    recorder = HostWorkflowReadRecorder()
+    previous = install_workflow_read_observer(recorder)
+    try:
+        yield recorder.reads
+    finally:
+        install_workflow_read_observer(previous)
+    assert recorder.reads == [], "HOST requests read the current workflow while one was open: " + "; ".join(
+        f"{read.request_type_name} {read.read}" for read in recorder.reads
+    )
 
 
 @pytest.fixture

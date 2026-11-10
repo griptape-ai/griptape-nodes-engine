@@ -10,6 +10,10 @@ from griptape_nodes.utils.version_utils import (
 
 logger = logging.getLogger(__name__)
 
+SHADOWED_PACKAGES_DOCS_URL = (
+    "https://docs.griptapenodes.com/en/stable/guides/libraries/#a-library-warns-that-it-installs-older-components"
+)
+
 
 @dataclass
 class ShadowedEnginePackagesProblem(LibraryProblem):
@@ -41,6 +45,8 @@ class ShadowedEnginePackagesProblem(LibraryProblem):
         )
         return (
             f"Installs components older than the ones Griptape Nodes runs on: {described}. This "
-            "library still works, but those versions replace the engine's own, so unrelated parts "
-            "of the editor may misbehave."
+            "library still works, but Griptape Nodes uses those older versions in place of its own, "
+            "so features unrelated to this library may break. If they are left over from an earlier "
+            "install, resetting the library rebuilds its environment without them. If they come "
+            f"back after a reset, the library requires them.\n\nMore: {SHADOWED_PACKAGES_DOCS_URL}"
         )

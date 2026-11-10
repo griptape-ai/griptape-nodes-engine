@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path  # noqa: TC003 - read at runtime by the converter
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -19,6 +20,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue
+from griptape_nodes.traits.options import Options
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
@@ -240,6 +242,9 @@ class ParameterDescription:
         ui_options: UI configuration options (includes display_name when set). None when the
             request left ui_options out.
         parent_container_name: Name of the parent ParameterGroup, if any
+        element_type: Element class name, e.g. "Parameter", "ParameterString", or "ParameterList".
+            "ParameterList" marks a multi-input that accepts several incoming connections, one per item.
+        max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
         options: The choices a dropdown or multi-select offers, or None when the parameter is
             neither. Read from ui_options, but kept when ui_options are left out.
     """
@@ -259,6 +264,8 @@ class ParameterDescription:
     settable: bool
     ui_options: dict | None
     parent_container_name: str | None
+    element_type: str
+    max_items: int | None
     options: list[DisplayValue] | None = None
 
     @classmethod
@@ -269,6 +276,7 @@ class ParameterDescription:
         serialization used elsewhere (e.g. workflow shape extraction).
         """
         param_dict = param.to_dict()
+        max_items = param.max_items if isinstance(param, ParameterList) else None
 
         return cls(
             name=param_dict["name"],
@@ -286,6 +294,8 @@ class ParameterDescription:
             settable=param_dict["settable"],
             ui_options=param_dict["ui_options"],
             parent_container_name=param_dict["parent_container_name"],
+            element_type=param_dict["element_type"],
+            max_items=max_items,
             options=_choices_from_ui_options(param_dict["ui_options"]),
         )
 
@@ -296,9 +306,6 @@ def _choices_from_ui_options(ui_options: dict | None) -> list | None:
     ui_options carries the choices of an attached Options or MultiOptions trait, as well as ones a
     library wrote into ui_options directly.
     """
-    # Imported here: traits import exe_types, which imports these events.
-    from griptape_nodes.traits.options import Options
-
     if not ui_options:
         return None
     for choices_key in Options.CHOICES_KEYS:
@@ -494,7 +501,9 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                          sees in their config. None for libraries registered through other
                          channels (e.g. sandbox, ad-hoc loads).
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
+                    Also None when the request set `include_git_info` to False.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
+                 Also None when the request set `include_git_info` to False.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
         is_registered: Whether a library of this name is in the LibraryRegistry right now.
                        Metadata is derived from config while the registry holds what actually
@@ -577,7 +586,14 @@ class LoadMetadataForAllLibrariesRequest(RequestPayload):
 
     Provides a lightweight way to discover all available libraries and their schemas
     without the overhead of importing Python modules or registering them in the system.
+
+    Args:
+        include_git_info: Whether to look up each library's `git_remote` and `git_ref`. The lookup
+                          costs several git subprocesses per library, so callers that only need
+                          the schemas should pass False; both fields are then None.
     """
+
+    include_git_info: bool = True
 
 
 @dataclass
@@ -1471,14 +1487,16 @@ class InspectLibraryRepoRequest(RequestPayload):
     validating library compatibility, checking library versions remotely.
 
     Args:
-        git_url: Git repository URL (supports GitHub shorthand like "user/repo")
-        ref: Branch, tag, or commit to inspect (defaults to "HEAD")
+        git_url: Git repository URL (supports GitHub shorthand like "user/repo"), optionally
+                 followed by @ref (e.g., "user/repo@stable")
+        ref: Branch, tag, or commit to inspect. Overrides a url@ref suffix. Defaults to the
+             suffix, or "HEAD" when there is none.
 
     Results: InspectLibraryRepoResultSuccess (with library metadata) | InspectLibraryRepoResultFailure (invalid URL, network error, no library JSON found)
     """
 
     git_url: str
-    ref: str = "HEAD"
+    ref: str | None = None
 
 
 @dataclass

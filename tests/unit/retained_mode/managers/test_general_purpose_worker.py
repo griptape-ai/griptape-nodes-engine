@@ -23,6 +23,8 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 _SESSION = "sess-abc"
 _WORKER = "eng-general"
@@ -113,6 +115,31 @@ class TestSpawn:
 
         manager._spawn_general_purpose_worker_when_session_ready.assert_awaited_once()
         manager._spawn_when_session_ready.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_start_task_and_the_exit_watcher_act_on_no_workflow(self) -> None:
+        """They outlive the request that starts them, so they must not act on the workflow it was bound to."""
+        manager = _worker_manager()
+        seen: dict[str, object] = {}
+
+        async def spawn() -> None:
+            seen["start"] = bound_workflow.get()
+
+        async def settle(_worker_key: str | None, _proc: object) -> None:
+            seen["watcher"] = bound_workflow.get()
+
+        manager._spawn_general_purpose_worker_when_session_ready = spawn  # type: ignore[method-assign]
+        manager._settle_when_worker_exits_early = settle  # type: ignore[method-assign]
+        token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
+        try:
+            await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
+            with patch("asyncio.create_subprocess_exec", return_value=_managed_proc()):
+                await manager.spawn_worker(["gtn", "engine"], None)
+        finally:
+            bound_workflow.reset(token)
+        await asyncio.sleep(0)
+
+        assert seen == {"start": NO_WORKFLOW, "watcher": NO_WORKFLOW}
 
 
 class TestReadiness:
@@ -313,6 +340,21 @@ class TestRestartWhenLibrariesChange:
         assert not worker_manager.has_settled(None), "routing must wait for the restarted worker to load"
 
     @pytest.mark.asyncio
+    async def test_the_restart_acts_on_no_workflow(self) -> None:
+        """It outlives the request whose library change started it."""
+        manager, _worker_manager = await self._running_worker()
+        token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
+        try:
+            manager.workers.note_library_set_changed()
+        finally:
+            bound_workflow.reset(token)
+        restart = manager.workers._general_purpose_restart
+        assert restart is not None
+
+        assert restart.get_context().get(bound_workflow) is NO_WORKFLOW
+        await self._settle(manager)
+
+    @pytest.mark.asyncio
     async def test_an_unload_and_a_register_restart_it_once(self) -> None:
         """Updating one library unloads it and registers it again: one change, one restart."""
         manager, _worker_manager = await self._running_worker()
@@ -389,14 +431,10 @@ class TestRestartWhenLibrariesChange:
 
 
 def _initializing_library_manager() -> LibraryManager:
-    """A LibraryManager whose app-init steps around the library load are inert."""
+    """A LibraryManager whose startup steps around the library load are inert."""
     manager = _library_manager()
-    engine = cast("MagicMock", manager._engine)
-    engine.get_session_id.return_value = None
-    engine.workflow_manager = AsyncMock()
     manager.provisioning.ensure_libraries_from_config = AsyncMock()  # type: ignore[method-assign]
     manager.discovery.migrate_old_xdg_library_paths = MagicMock()  # type: ignore[method-assign]
-    manager.workers.maybe_start_workers_for_existing_session = AsyncMock()  # type: ignore[method-assign]
     manager._collect_library_workflow_files = AsyncMock(return_value=[])  # type: ignore[method-assign]
     manager.load_all_libraries_from_config = AsyncMock(return_value=[])  # type: ignore[method-assign]
     manager.workers.report_general_purpose_worker_ready = AsyncMock()  # type: ignore[method-assign]
@@ -408,7 +446,7 @@ class TestWorkerSideLoading:
     async def test_loads_every_library_and_then_reports_ready(self) -> None:
         manager = _initializing_library_manager()
 
-        await manager.on_app_initialization_complete(
+        await manager.load_libraries_for_startup(
             AppInitializationComplete(is_worker=True, is_general_purpose_worker=True)
         )
 
@@ -420,7 +458,7 @@ class TestWorkerSideLoading:
     async def test_a_library_worker_still_loads_only_its_library_and_reports_no_readiness(self) -> None:
         manager = _initializing_library_manager()
 
-        await manager.on_app_initialization_complete(
+        await manager.load_libraries_for_startup(
             AppInitializationComplete(is_worker=True, libraries_to_register=["Heavy Library"])
         )
 
@@ -434,7 +472,7 @@ class TestWorkerSideLoading:
     async def test_the_flag_means_nothing_on_the_orchestrator(self) -> None:
         manager = _initializing_library_manager()
 
-        await manager.on_app_initialization_complete(AppInitializationComplete(is_general_purpose_worker=True))
+        await manager.load_libraries_for_startup(AppInitializationComplete(is_general_purpose_worker=True))
 
         cast("AsyncMock", manager.workers.report_general_purpose_worker_ready).assert_not_awaited()
         assert not manager.is_general_purpose_worker

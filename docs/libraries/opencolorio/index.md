@@ -69,8 +69,10 @@ application.
     source colorspace, display, and view.
 1. Wire the `color_params` output to any node that accepts an
     `OCIOColorParamsArtifact` — for example the
-    [Display EXR Part](../openexr/display_exr_part.md) and
-    [Display EXR Channel](../openexr/display_exr_channel.md) nodes from the
+    [Read EXR](../openexr/read_exr.md),
+    [Display EXR Part](../openexr/display_exr_part.md),
+    [Display EXR Channel](../openexr/display_exr_channel.md), and
+    [EXR Sequence to Preview](../openexr/exr_sequence_to_preview.md) nodes from the
     [OpenEXR Library](../openexr/index.md).
 
 ```text
@@ -83,7 +85,7 @@ Besides its picker nodes, this library provides a colorspace-transform service
 that other libraries can call. The [OpenEXR Library](../openexr/index.md)
 detects it automatically: when the OpenColorIO Library is installed, the EXR
 display nodes default to OCIO-managed color (`color_mode: ocio`) instead of
-local tone mapping.
+a local display transform.
 
 ## Support
 

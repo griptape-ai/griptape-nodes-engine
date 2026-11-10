@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.node_library.library_declarations import (
@@ -2494,6 +2494,16 @@ class _DescribeNodeTypeProbe(BaseNode):
         )
         self.add_parameter(temperature)
 
+        images = ParameterList(
+            name="images",
+            input_types=["ImageArtifact"],
+            type="ImageArtifact",
+            tooltip="Images to combine",
+            max_items=4,
+            allowed_modes={ParameterMode.INPUT},
+        )
+        self.add_parameter(images)
+
 
 class _RaisingProbe(BaseNode):
     """Stand-in for node types whose __init__ performs failing I/O (auth, network, disk)."""
@@ -2661,6 +2671,25 @@ class TestDescribeNodeTypeRequest:
             )
             is None
         )
+
+    def test_distinguishes_parameter_list_from_plain_parameter(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        self._register_probe_library()
+
+        result = library_manager.catalog.describe_node_type_request(
+            DescribeNodeTypeRequest(node_type=_DescribeNodeTypeProbe.__name__, library=self._LIBRARY_NAME),
+        )
+
+        assert isinstance(result, DescribeNodeTypeResultSuccess)
+        by_name = {param.name: param for param in result.parameters}
+
+        images = by_name["images"]
+        assert images.element_type == "ParameterList"
+        assert images.max_items == 4  # noqa: PLR2004
+
+        prompt = by_name["prompt"]
+        assert prompt.element_type == "Parameter"
+        assert prompt.max_items is None
 
     def test_resolves_library_when_node_type_is_unambiguous(self, engine: Engine) -> None:
         library_manager = engine.library_manager
@@ -4061,100 +4090,6 @@ class TestProvisionGitLibraryOverwriteDir:
         assert sent_request.target_directory_name is None
 
 
-class TestLibraryManagerInitializationFlag:
-    """Test the is_initializing flag reported on the engine heartbeat."""
-
-    def test_initializing_before_app_initialization(self) -> None:
-        """A fresh engine reports initializing until AppInitializationComplete has been handled."""
-        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
-
-        library_manager = LibraryManager(MagicMock(), worker_manager=MagicMock(), engine=MagicMock())
-
-        assert library_manager.is_initializing() is True
-
-    @pytest.mark.asyncio
-    async def test_app_initialization_clears_is_initializing(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
-
-        library_manager = engine.library_manager
-        library_manager._is_initializing = True
-        observed: dict[str, bool] = {}
-
-        async def fake_run(_payload: AppInitializationComplete) -> None:
-            observed["during"] = library_manager.is_initializing()
-
-        monkeypatch.setattr(library_manager, "_run_app_initialization", fake_run)
-
-        await library_manager.on_app_initialization_complete(AppInitializationComplete())
-
-        assert observed["during"] is True
-        assert library_manager.is_initializing() is False
-
-    @pytest.mark.asyncio
-    async def test_app_initialization_clears_is_initializing_on_exception(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
-
-        library_manager = engine.library_manager
-        library_manager._is_initializing = True
-
-        async def boom(_payload: AppInitializationComplete) -> None:
-            msg = "boom"
-            raise RuntimeError(msg)
-
-        monkeypatch.setattr(library_manager, "_run_app_initialization", boom)
-
-        with pytest.raises(RuntimeError, match="boom"):
-            await library_manager.on_app_initialization_complete(AppInitializationComplete())
-
-        assert library_manager.is_initializing() is False
-
-    @pytest.mark.asyncio
-    async def test_reload_brackets_is_initializing(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        """is_initializing() is True for the duration of the reload and False once it returns."""
-        from griptape_nodes.retained_mode.events.library_events import (
-            ReloadAllLibrariesRequest,
-            ReloadAllLibrariesResultSuccess,
-        )
-
-        library_manager = engine.library_manager
-        observed: dict[str, bool] = {}
-
-        async def fake_run(_request: ReloadAllLibrariesRequest) -> ReloadAllLibrariesResultSuccess:
-            observed["during"] = library_manager.is_initializing()
-            return ReloadAllLibrariesResultSuccess(result_details="ok")
-
-        monkeypatch.setattr(library_manager, "_run_reload_libraries", fake_run)
-
-        await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
-
-        assert observed["during"] is True
-        assert library_manager.is_initializing() is False
-
-    @pytest.mark.asyncio
-    async def test_reload_clears_is_initializing_on_exception(
-        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A failure during reload still clears the flag (finally), so the GUI doesn't hang."""
-        from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
-
-        library_manager = engine.library_manager
-
-        async def boom(_request: ReloadAllLibrariesRequest) -> None:
-            msg = "boom"
-            raise RuntimeError(msg)
-
-        monkeypatch.setattr(library_manager, "_run_reload_libraries", boom)
-
-        with pytest.raises(RuntimeError, match="boom"):
-            await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
-
-        assert library_manager.is_initializing() is False
-
-
 class TestDownloadLibraryRegisterPersistence:
     """download_library_request must only persist to the GLOBAL config when registering now.
 
@@ -4611,7 +4546,7 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
 
 
 class TestCollectLibraryLoadStatuses:
-    """_collect_library_load_statuses turns LibraryInfo into serializable status data."""
+    """collect_library_load_statuses turns LibraryInfo into serializable status data."""
 
     def test_maps_fields_and_disabled_state(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -4639,7 +4574,7 @@ class TestCollectLibraryLoadStatuses:
             "/libs/off.json": disabled,
         }
 
-        statuses = library_manager._collect_library_load_statuses()
+        statuses = library_manager.collect_library_load_statuses()
 
         # Unpacking enforces exactly two statuses were produced.
         good_status, disabled_status = statuses
@@ -4658,7 +4593,7 @@ class TestCollectLibraryLoadStatuses:
         library_manager = engine.library_manager
         library_manager._library_file_path_to_info = {}
 
-        assert library_manager._collect_library_load_statuses() == []
+        assert library_manager.collect_library_load_statuses() == []
 
 
 class TestLibraryFitnessAuthorizationCheckpoint:

@@ -17,21 +17,37 @@ execution dependencies is untouched by any of it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import pytest
 
+from griptape_nodes.exe_types.local_objects import is_reference
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+)
+from griptape_nodes.retained_mode.events.execution_events import (
+    ExecuteNodeRequest,
+    ExecuteNodeResultSuccess,
+    NodeMetadata,
+    StartFlowRequest,
+    StartFlowResultSuccess,
+)
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
     SendNodeMessageRequest,
     SendNodeMessageResultSuccess,
 )
@@ -43,6 +59,7 @@ from griptape_nodes.testing.offline_wheels import build_wheel, offline_install_f
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
 from griptape_nodes.utils.version_utils import engine_version
 from tests.e2e.fixtures.behavior_preservation_library.behavior_preservation_node import CLICK_ACKNOWLEDGEMENT
+from tests.simulated_worker import sent_from_open_workflow, simulated_worker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -222,7 +239,8 @@ class TestParameterBehaviorsSurviveOnRealClasses:
         node = LibraryRegistry.create_node(
             node_type="BehaviorPreservationNode", name="behaviors", specific_library_name="Behavior Library"
         )
-        current_engine().object_manager.add_object_by_name("behaviors", node)
+        current_engine().context_manager.push_workflow(workflow_name="behaviors_workflow")
+        current_engine().object_manager.add_object_by_name_in(current_engine().current_workflow(), "behaviors", node)
 
         parameter = node.get_parameter_by_name("model_manager")
         assert parameter is not None
@@ -343,38 +361,84 @@ class TestUnshippableOutputIsKept:
     @pytest.mark.asyncio
     async def test_worker_producing_an_unshippable_value_ships_a_reference(self, tmp_path: Path) -> None:
         """A serializable=False output stays in the worker and a reference crosses in its place."""
-        from griptape_nodes.exe_types.local_objects import is_reference
-        from griptape_nodes.retained_mode.events.execution_events import (
-            ExecuteNodeRequest,
-            ExecuteNodeResultSuccess,
-        )
-
         _register(
             tmp_path,
             fixture_dir=NONSERIALIZABLE_FIXTURE,
             node_file="nonserializable_nodes.py",
             name="Guardrail Library",
         )
-        library_manager = current_engine().library_manager
-        library_manager._is_worker = True
-        node = LibraryRegistry.create_node(
-            node_type="ProducerNode", name="Producer", specific_library_name="Guardrail Library"
+        engine = current_engine()
+        engine.context_manager.push_workflow(workflow_name="unshippable_wf")
+        flow_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="unshippable_flow", set_as_new_context=False)
         )
-        current_engine().object_manager.add_object_by_name("Producer", node)
-
-        result = await current_engine().ahandle_request(
-            ExecuteNodeRequest(
+        assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+        create_result = engine.handle_request(
+            CreateNodeRequest(
+                node_type="ProducerNode",
+                specific_library_name="Guardrail Library",
                 node_name="Producer",
-                node_metadata={"node_type": "ProducerNode", "library": "Guardrail Library"},
+                override_parent_flow_name=flow_result.flow_name,
             )
         )
+        assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        node = engine.node_manager.get_node_by_name("Producer")
+
+        with simulated_worker(engine, "Guardrail Library") as worker:
+            request = ExecuteNodeRequest(node_name="Producer", node_metadata=cast("NodeMetadata", dict(node.metadata)))
+            result = await engine.current_workflow().ahandle_request(sent_from_open_workflow(request, engine))
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         sent = result.parameter_output_values["session"]
         assert is_reference(sent), sent
-        entry = current_engine().resource_manager.entry_for(sent["key"])
+        entry = worker.engine.resource_manager.entry_for(sent["key"])
         assert entry is not None
         assert entry.value.marker == "live-session-marker"
+
+    @pytest.mark.asyncio
+    async def test_worker_copy_receives_a_serializable_false_input(self, tmp_path: Path) -> None:
+        """A consumer's serializable=False input reaches its worker copy, which a save would leave out."""
+        _register(
+            tmp_path,
+            fixture_dir=NONSERIALIZABLE_FIXTURE,
+            node_file="nonserializable_nodes.py",
+            name="Guardrail Library",
+        )
+        engine = current_engine()
+        engine.context_manager.push_workflow(workflow_name="handoff_wf")
+        flow_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="handoff_flow", set_as_new_context=False)
+        )
+        assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+        for node_type, node_name in (("ProducerNode", "Producer"), ("ConsumerNode", "Consumer")):
+            create_result = engine.handle_request(
+                CreateNodeRequest(
+                    node_type=node_type,
+                    specific_library_name="Guardrail Library",
+                    node_name=node_name,
+                    override_parent_flow_name=flow_result.flow_name,
+                )
+            )
+            assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        connect_result = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Producer",
+                source_parameter_name="session",
+                target_node_name="Consumer",
+                target_parameter_name="session",
+            )
+        )
+        assert isinstance(connect_result, CreateConnectionResultSuccess), connect_result
+
+        engine.event_manager.initialize_queue(asyncio.Queue())
+        with simulated_worker(engine, "Guardrail Library"), engine.context_manager.flow(flow_result.flow_name):
+            run_result = await engine.ahandle_request(
+                StartFlowRequest(flow_name=flow_result.flow_name, flow_node_name="Consumer")
+            )
+
+        assert isinstance(run_result, StartFlowResultSuccess), run_result.result_details
+        consumer = engine.node_manager.get_node_by_name("Consumer")
+        assert consumer.parameter_output_values.get("marker") == "live-session-marker"
 
 
 class TestManagerAccessDuringWorkerExecution:

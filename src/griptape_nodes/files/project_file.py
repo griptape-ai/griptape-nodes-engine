@@ -1,12 +1,16 @@
 """ProjectFileDestination - project-aware FileDestination built from a situation template."""
 
+import dataclasses
 import logging
 from pathlib import Path, PureWindowsPath
+from typing import TYPE_CHECKING
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.files.file import File, FileDestination
 from griptape_nodes.files.path_utils import FilenameParts, is_url, parse_file_uri
 from griptape_nodes.files.situation_resolver import resolve_situation
+from griptape_nodes.files.workflow_requests import handle_request_in
+from griptape_nodes.retained_mode.events.destination_events import FileDestinationSpec
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
@@ -17,19 +21,42 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
 FALLBACK_MACRO_TEMPLATE = "{outputs}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}"
 
 
-def _attempt_map_to_project(absolute_path: Path) -> str | None:
-    """Fire AttemptMapAbsolutePathToProjectRequest; return the mapped macro path string or None."""
-    map_result = GriptapeNodes.handle_request(AttemptMapAbsolutePathToProjectRequest(absolute_path=absolute_path))
+def _attempt_map_to_project(absolute_path: Path, workflow: "WorkflowRuntime | None" = None) -> str | None:
+    """Fire AttemptMapAbsolutePathToProjectRequest in `workflow`; return the mapped macro path string or None."""
+    map_result = handle_request_in(workflow, AttemptMapAbsolutePathToProjectRequest(absolute_path=absolute_path))
     if isinstance(map_result, AttemptMapAbsolutePathToProjectResultSuccess) and map_result.mapped_path is not None:
         return map_result.mapped_path
     return None
+
+
+def file_destination_from_spec(spec: FileDestinationSpec, workflow: "WorkflowRuntime | None" = None) -> FileDestination:
+    """Rebuild the destination ``FileDestination.to_spec`` described, keeping its project mapping.
+
+    The only way to rebuild a file destination from its spec, so the mapping can't be dropped.
+    A spec carries no workflow, so the rebuilt destination writes in ``workflow``, or as
+    ``FileDestination`` decides when it is None.
+    """
+    destination_type = FileDestination
+    if spec.map_to_project:
+        destination_type = ProjectFileDestination
+    return destination_type(
+        spec.file_path,
+        existing_file_policy=spec.existing_file_policy,
+        append=spec.append,
+        create_parents=spec.create_parents,
+        file_metadata=spec.file_metadata,
+        coerce_extension_to_match_bytes=spec.coerce_extension_to_match_bytes,
+        workflow=workflow,
+    )
 
 
 class ProjectFileDestination(FileDestination):
@@ -60,6 +87,9 @@ class ProjectFileDestination(FileDestination):
     async def awrite_text(self, content: str, encoding: str = "utf-8") -> File:
         return self._map_to_macro_file(await super().awrite_text(content, encoding))
 
+    def to_spec(self) -> FileDestinationSpec:
+        return dataclasses.replace(super().to_spec(), map_to_project=True)
+
     def _map_to_macro_file(self, result_file: File) -> File:
         """Attempt to convert the written path to its portable macro form.
 
@@ -68,9 +98,9 @@ class ProjectFileDestination(FileDestination):
         portable reference via ``file.as_macro()``.  Falls back to the original
         File (absolute path) if mapping is not possible.
         """
-        mapped = _attempt_map_to_project(Path(result_file.resolve()))
+        mapped = _attempt_map_to_project(Path(result_file.resolve()), self.workflow)
         if mapped is not None:
-            return File(mapped)
+            return File(mapped, workflow=self.workflow)
         return result_file
 
     @classmethod
@@ -95,6 +125,23 @@ class ProjectFileDestination(FileDestination):
 
         Raises:
             ValueError: If the filename is a URL that names no local file.
+        """
+        return cls.from_situation_in_workflow(None, filename, situation, **extra_vars)
+
+    @classmethod
+    def from_situation_in_workflow(
+        cls,
+        workflow: "WorkflowRuntime | None",
+        /,
+        filename: str,
+        situation: str,
+        **extra_vars: str | int,
+    ) -> "ProjectFileDestination":
+        """`from_situation`, looking the situation up and writing in `workflow`.
+
+        Pass a node's `self.workflow` from code on a plain thread or in a thread pool, which has
+        no workflow of its own. None looks up and writes as the caller is bound. `workflow` is
+        positional-only so a macro variable named `workflow` stays in `extra_vars`.
         """
         # Classify the input before any path handling: FilenameParts.from_filename is a
         # plain Path() split with no URL awareness, so a URL that reaches it is mangled
@@ -157,7 +204,7 @@ class ProjectFileDestination(FileDestination):
             # bypass an absolute filename takes below.
             filename = local_path_from_uri
 
-        resolved = resolve_situation(situation, FALLBACK_MACRO_TEMPLATE)
+        resolved = resolve_situation(situation, FALLBACK_MACRO_TEMPLATE, workflow=workflow)
         situation_obj = resolved.situation_obj
         existing_file_policy = resolved.existing_file_policy
         create_dirs = resolved.create_parents
@@ -180,6 +227,7 @@ class ProjectFileDestination(FileDestination):
                 existing_file_policy=existing_file_policy,
                 create_parents=create_dirs,
                 file_metadata=None,
+                workflow=workflow,
             )
 
         variables: dict[str, str | int] = {
@@ -223,4 +271,5 @@ class ProjectFileDestination(FileDestination):
             existing_file_policy=existing_file_policy,
             create_parents=create_dirs,
             file_metadata=file_metadata,
+            workflow=workflow,
         )

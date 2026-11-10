@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+    from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary, MCPTool
     from griptape_nodes.node_library.library_declarations import ResolvedModel
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
@@ -353,12 +353,17 @@ class LibraryRegistry:
         del cls._libraries[library_name]
 
     @classmethod
-    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:
+    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:  # noqa: C901
         """Remove everything the engine registered on the library's behalf at load time."""
         if library._registered_app_event_listeners:
             for event_type, listener in library._registered_app_event_listeners:
                 event_manager.remove_listener_for_app_event(event_type, listener)
             library._registered_app_event_listeners.clear()
+
+        if library._registered_execution_event_listeners:
+            for event_type, listener in library._registered_execution_event_listeners:
+                event_manager.remove_listener_for_execution_event(event_type, listener)
+            library._registered_execution_event_listeners.clear()
 
         if library._registered_pre_dispatch_hooks:
             for hook in library._registered_pre_dispatch_hooks:
@@ -374,6 +379,8 @@ class LibraryRegistry:
             for request_type in library._registered_request_handler_types:
                 event_manager.remove_manager_from_request_type(request_type)
             library._registered_request_handler_types.clear()
+
+        library._mcp_tools.clear()
 
     @classmethod
     def get_library(cls, name: str) -> Library:
@@ -611,9 +618,11 @@ class Library:
     # Tracks handlers registered on behalf of this library so they can be
     # deregistered automatically when the library is unloaded.
     _registered_app_event_listeners: list[tuple[type, Callable]]
+    _registered_execution_event_listeners: list[tuple[type, Callable]]
     _registered_pre_dispatch_hooks: list[Callable]
     _registered_post_dispatch_hooks: list[tuple[type, Callable]]
     _registered_request_handler_types: list[type]
+    _mcp_tools: list[MCPTool]
 
     def __init__(
         self,
@@ -635,9 +644,11 @@ class Library:
         self._beta_features = None
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
+        self._registered_execution_event_listeners = []
         self._registered_pre_dispatch_hooks = []
         self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
+        self._mcp_tools = []
 
     def get_beta_features(self) -> dict[str, BetaFeature]:
         """The valid beta features this library declares, keyed by id, including expired ones."""
@@ -649,6 +660,9 @@ class Library:
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)
+
+    def get_registered_execution_event_listeners(self) -> list[tuple[type, Callable]]:
+        return list(self._registered_execution_event_listeners)
 
     def get_registered_pre_dispatch_hooks(self) -> list[Callable]:
         return list(self._registered_pre_dispatch_hooks)
@@ -674,6 +688,13 @@ class Library:
         Returns a copy; mutating the returned list has no effect.
         """
         return list(self._registered_request_handler_types)
+
+    def get_mcp_tools(self) -> list[MCPTool]:
+        """Return the request types this library exposes on the engine's MCP server.
+
+        Returns a copy; mutating the returned list has no effect.
+        """
+        return list(self._mcp_tools)
 
     def register_new_node_type(self, node_class: type[BaseNode], metadata: NodeMetadata) -> LibraryProblem | None:
         """Register a new node type in this library. Returns a LibraryProblem if registration fails, or None if all clear."""

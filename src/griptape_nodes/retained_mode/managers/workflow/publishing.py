@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -18,9 +18,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
-    RegisterWorkflowRequest,
-    RegisterWorkflowResultFailure,
-    RegisterWorkflowResultSuccess,
     SaveWorkflowRequest,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -29,6 +26,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -40,7 +38,12 @@ class WorkflowPublishing(EngineScoped):
         event_manager.register_request_handlers(self)
 
     @handles(GetPublishOptionsRequest)
-    def on_get_publish_options_request(self, request: GetPublishOptionsRequest) -> ResultPayload:
+    def on_get_publish_options_request(
+        self,
+        request: GetPublishOptionsRequest,
+        workflow: WorkflowRuntime | None = None,  # noqa: ARG002 - declares the scope dispatch binds for the callback
+    ) -> ResultPayload:
+        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads."""
         event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
         )
@@ -59,7 +62,14 @@ class WorkflowPublishing(EngineScoped):
         )
 
     @handles(PublishWorkflowRequest)
-    async def on_publish_workflow_request(self, request: PublishWorkflowRequest) -> ResultPayload:
+    async def on_publish_workflow_request(
+        self, request: PublishWorkflowRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        """Save and publish the open `workflow`, which the request names by its registry name.
+
+        The publisher reads the graph through the bound workflow, which dispatch binds to `workflow`
+        and `asyncio.to_thread` carries into the publisher's thread.
+        """
         try:
             publisher_name = request.publisher_name
             event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
@@ -75,22 +85,30 @@ class WorkflowPublishing(EngineScoped):
             # Unsaved (registry-only) workflows cannot be published because publish emits a file
             # reference to the engine-registered workflow; the user must choose a save name first.
             workflow_file_name = request.workflow_name
-            try:
-                workflow = self.engine.workflow_registry.get_workflow_by_name(request.workflow_name)
-                if workflow.file_path is None:
-                    msg = (
-                        f"Cannot publish unsaved workflow '{request.workflow_name}'. "
-                        "Save the workflow before publishing."
-                    )
-                    raise ValueError(msg)
-                workflow_file_name = derive_registry_key(workflow.file_path)
-            except KeyError:
+            saved = self.engine.workflow_registry.find_by_name(request.workflow_name)
+            if saved is None:
                 details = (
                     f"While publishing, workflow '{request.workflow_name}' had not been saved or could not be found in the Workflow Registry. "
                     "Saving as a new and registered workflow before proceeding on publish attempt."
                 )
                 logger.info(details)
-            await self.engine.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
+            else:
+                # The publisher packages `workflow`'s graph, so another open workflow's name would
+                # publish one workflow's graph under the other's file.
+                if saved.workflow_id != workflow.workflow_id and self.engine.open_workflows.is_open(saved.workflow_id):
+                    msg = (
+                        f"Cannot publish workflow '{request.workflow_name}' from another workflow's tab. "
+                        "Publish it from its own tab."
+                    )
+                    raise ValueError(msg)  # noqa: TRY301
+                if saved.file_path is None:
+                    msg = (
+                        f"Cannot publish unsaved workflow '{request.workflow_name}'. "
+                        "Save the workflow before publishing."
+                    )
+                    raise ValueError(msg)  # noqa: TRY301
+                workflow_file_name = derive_registry_key(saved.file_path)
+            await workflow.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
 
             result = await asyncio.to_thread(publishing_handler.handler, request)
             if isinstance(result, PublishWorkflowResultSuccess) and not result.skip_published_workflow_registration:
@@ -123,31 +141,22 @@ class WorkflowPublishing(EngineScoped):
                 load_workflow_metadata_request
             )
             if isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
-                workflow_registry_key = derive_registry_key(workflow_file.name)
+                # The scan's path: a workflow published before keeps its entry, and with it its id,
+                # and takes the metadata just read.
                 try:
-                    self.engine.workflow_registry.get_workflow_by_name(workflow_registry_key)
-                    # This workflow was registered previously, but now it's been updated (potentially including the metadata), so let's re-register
-                    self.engine.workflow_registry.delete_workflow_by_name(workflow_registry_key)
-                except KeyError:
-                    pass
-
-                register_workflow_result = self.engine.workflow_manager.on_register_workflow_request(
-                    RegisterWorkflowRequest(
-                        metadata=load_metadata_result.metadata,
-                        file_name=workflow_file.name,
+                    self.engine.workflow_manager.refresh_workflow_file(
+                        workflow_file.name, load_metadata_result.metadata
                     )
-                )
-                if isinstance(register_workflow_result, RegisterWorkflowResultSuccess):
+                except ValueError as err:
+                    failure_message = f"Failed to register workflow with file '{workflow_file.name}': {err}"
+                    result_messages.append(ResultDetail(message=failure_message, level=logging.ERROR))
+                    final_result = PublishWorkflowResultFailure(
+                        result_details=ResultDetails(*result_messages), exception=err
+                    )
+                else:
                     success_message = f"Successfully registered new workflow with file '{workflow_file.name}'."
                     result_messages.append(ResultDetail(message=success_message, level=logging.INFO))
                     final_result.result_details = ResultDetails(*result_messages)
-                else:
-                    exception = cast("RegisterWorkflowResultFailure", register_workflow_result).exception
-                    failure_message = f"Failed to register workflow with file '{workflow_file.name}': {exception}"
-                    result_messages.append(ResultDetail(message=failure_message, level=logging.ERROR))
-                    final_result = PublishWorkflowResultFailure(
-                        result_details=ResultDetails(*result_messages), exception=exception
-                    )
             else:
                 metadata_failure_message = (
                     f"Failed to load metadata for workflow file '{workflow_file.name}'. Not registering workflow."

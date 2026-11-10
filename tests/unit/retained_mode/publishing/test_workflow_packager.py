@@ -13,7 +13,7 @@ import pytest
 from dotenv import dotenv_values
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata
+from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, new_workflow_id
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
@@ -2131,4 +2131,12 @@ def _make_packageable_workflow(name: str, file_path: str) -> Workflow:
         engine_version_created_with="0.1.0",
         node_libraries_referenced=[],
     )
-    return Workflow(registry=current_engine().workflow_registry, metadata=metadata, file_path=file_path)
+    workflow = Workflow(
+        registry=current_engine().workflow_registry,
+        workflow_id=new_workflow_id(),
+        metadata=metadata,
+        absolute_path=Path(file_path),
+    )
+    # The registry form `file_path` reports, set as the registry would when it registers the entry.
+    workflow._keys = workflow._keys._replace(file_path=file_path)
+    return workflow

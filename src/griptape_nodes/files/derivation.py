@@ -37,6 +37,11 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
+
+    # Resolves a nested macro for the same workflow as the resolution a rule runs inside.
+    ResolveMacro = Callable[[GetPathForMacroRequest], ResultPayload]
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -48,18 +53,19 @@ class DerivationRule:
         name: Macro variable this rule produces.
         requires: Variable names that must all be present for the rule to fire.
         derive: Computes the derived value. Receives the full variables mapping
-            (useful when derivation needs context beyond `requires`). Returns
-            None to abstain.
+            (useful when derivation needs context beyond `requires`) and the
+            resolver for any macro it needs resolved. Returns None to abstain.
     """
 
     name: str
     requires: frozenset[str]
-    derive: Callable[[Mapping[str, str | int]], str | None]
+    derive: Callable[[Mapping[str, str | int], ResolveMacro], str | None]
 
 
 def apply_derivation_rules(
     macro_path: MacroPath,
     rules: Sequence[DerivationRule],
+    resolve_macro: ResolveMacro,
 ) -> MacroPath:
     """Run derivation rules against a MacroPath and inject produced variables.
 
@@ -79,7 +85,7 @@ def apply_derivation_rules(
             continue
         if not rule.requires.issubset(variables):
             continue
-        derived = rule.derive(variables)
+        derived = rule.derive(variables, resolve_macro)
         if derived is None:
             continue
         variables[rule.name] = derived
@@ -94,13 +100,15 @@ def _template_variable_names(parsed_macro: ParsedMacro) -> set[str]:
     return {segment.info.name for segment in parsed_macro.segments if isinstance(segment, ParsedVariable)}
 
 
-def resolve_file_extension_directory(extension: str, extra_vars: Mapping[str, str | int] | None = None) -> str | None:
+def resolve_file_extension_directory(
+    extension: str, resolve_macro: ResolveMacro, extra_vars: Mapping[str, str | int] | None = None
+) -> str | None:
     """Resolve an extension to a folder fragment via the current project's template.
 
     Looks up the extension (case-insensitively) in the current project's
     `file_extension_directories` mapping. Plain names like `"images"` are returned
     as-is; values containing macro syntax (e.g. `"{outputs}/videos"`) are
-    resolved via `GetPathForMacroRequest` against the project's builtins and
+    resolved through `resolve_macro` against the project's builtins and
     directory definitions, plus any caller-supplied `extra_vars` (e.g.
     `node_name`, `parameter_name`, `sub_dirs`, `_index`). Filename parts
     (`file_name_base`, `file_extension`) are intentionally excluded --
@@ -128,7 +136,7 @@ def resolve_file_extension_directory(extension: str, extra_vars: Mapping[str, st
     resolution_vars: dict[str, str | int] = {
         k: v for k, v in (extra_vars or {}).items() if k not in ("file_name_base", "file_extension")
     }
-    resolve_result = GriptapeNodes.handle_request(
+    resolve_result = resolve_macro(
         GetPathForMacroRequest(parsed_macro=ParsedMacro(raw_macro), variables=resolution_vars, broadcast_result=False)
     )
     if not isinstance(resolve_result, GetPathForMacroResultSuccess):
@@ -144,11 +152,11 @@ def resolve_file_extension_directory(extension: str, extra_vars: Mapping[str, st
     return resolve_result.resolved_path.as_posix()
 
 
-def _derive_file_extension_directory(variables: Mapping[str, str | int]) -> str | None:
+def _derive_file_extension_directory(variables: Mapping[str, str | int], resolve_macro: ResolveMacro) -> str | None:
     extension = variables.get("file_extension")
     if not isinstance(extension, str):
         return None
-    return resolve_file_extension_directory(extension, variables)
+    return resolve_file_extension_directory(extension, resolve_macro, variables)
 
 
 FILE_EXTENSION_DIRECTORY_RULE = DerivationRule(

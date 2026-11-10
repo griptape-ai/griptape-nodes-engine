@@ -30,13 +30,14 @@ from griptape_nodes.common.project_templates.situation import SituationFilePolic
 from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
-from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayloadFailure
+from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload, ResultPayloadFailure
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
+    WriteTempFileRequest,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
@@ -53,11 +54,25 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
-from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
+from griptape_nodes.retained_mode.managers.filesystem.file_writing import StagingFailedError
+from griptape_nodes.retained_mode.managers.os_manager import OSManager
+from tests.workflow_context import unsaved_workflow_open
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
 WINDOWS_MAX_PATH = 260
+
+
+def _write_temp_in_open_workflow(os_manager: OSManager, request: WriteTempFileRequest) -> ResultPayload:
+    """Hand the handler the workflow `unsaved_workflow` opened, as dispatch would."""
+    return os_manager.writer.on_write_temp_file_request(request, os_manager.engine.current_workflow())
+
+
+@pytest.fixture(autouse=True)
+def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
+    """The default project's directories use `{workflow_dir?:/}`, which needs a workflow to resolve."""
+    with unsaved_workflow_open(engine):
+        yield
 
 
 class TestCreateNewWarningLevelResultDetails:
@@ -188,7 +203,7 @@ class TestBlanketExceptionHandling:
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
         # Mock _resolve_file_path to raise unexpected exception (not ValueError/RuntimeError)
-        with patch.object(os_manager, "_resolve_file_path", side_effect=TypeError("Unexpected type error")):
+        with patch.object(os_manager, "resolve_file_path", side_effect=TypeError("Unexpected type error")):
             result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
@@ -205,7 +220,7 @@ class TestBlanketExceptionHandling:
 
         # Mock the atomic write primitive to raise an unclassified OSError
         with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
             side_effect=OSError("Unexpected I/O error"),
         ):
             result = os_manager.engine.handle_request(request)
@@ -251,7 +266,7 @@ class TestBlanketExceptionHandling:
         request = WriteFileRequest(file_path=str(temp_dir / "some.txt"), content="Content")
 
         with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
             side_effect=IsADirectoryError("that is a directory"),
         ):
             result = engine.os_manager.engine.handle_request(request)
@@ -267,7 +282,7 @@ class TestBlanketExceptionHandling:
         request = WriteFileRequest(file_path=str(temp_dir / "held.png"), content=b"payload")
 
         with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
             side_effect=locked_error,
         ):
             result = engine.os_manager.engine.handle_request(request)
@@ -292,7 +307,7 @@ class TestBlanketExceptionHandling:
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
         with patch(
-            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
             side_effect=OSError(errno.ENOSPC, "No space left on device"),
         ):
             result = os_manager.engine.handle_request(request)
@@ -361,7 +376,7 @@ class TestParentDirectoryMatchCase:
 
         # Mock _ensure_parent_directory_ready to return PERMISSION_DENIED
         with patch.object(
-            os_manager, "_ensure_parent_directory_ready", return_value=FileIOFailureReason.PERMISSION_DENIED
+            os_manager.writer, "_ensure_parent_directory_ready", return_value=FileIOFailureReason.PERMISSION_DENIED
         ):
             result = os_manager.engine.handle_request(request)
 
@@ -397,7 +412,9 @@ class TestParentDirectoryMatchCase:
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
 
         # Mock _ensure_parent_directory_ready to return IO_ERROR (not permission or policy)
-        with patch.object(os_manager, "_ensure_parent_directory_ready", return_value=FileIOFailureReason.IO_ERROR):
+        with patch.object(
+            os_manager.writer, "_ensure_parent_directory_ready", return_value=FileIOFailureReason.IO_ERROR
+        ):
             result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
@@ -484,13 +501,13 @@ class TestOnDemandCandidateGeneration:
 
         # Track _write_with_portalocker calls
         write_attempts = []
-        original_write = os_manager._write_with_portalocker
+        original_write = os_manager.writer._write_with_portalocker
 
         def tracking_write(*args: object, **kwargs: object) -> int:  # type: ignore[misc]
             write_attempts.append(args[0] if args else None)  # Track the path
             return original_write(*args, **kwargs)  # type: ignore[arg-type]
 
-        with patch.object(os_manager, "_write_with_portalocker", tracking_write):
+        with patch.object(os_manager.writer, "_write_with_portalocker", tracking_write):
             result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
@@ -539,8 +556,27 @@ class TestMetadataInjection:
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_lookup.assert_called_once_with("image.png")
-        provider.collect_metadata_for_write.assert_called_once_with("image.png")
+        provider.collect_metadata_for_write.assert_called_once_with("image.png", engine.current_workflow())
         provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
+
+    def test_metadata_is_collected_for_the_open_workflow_when_the_request_names_none(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """The embedded metadata describes the workflow the sidecar records, not none."""
+        workflow = engine.current_workflow()
+        seen = []
+
+        def collect(_file_name: str, collected_for: object) -> dict[str, str]:
+            seen.append(collected_for)
+            return {}
+
+        provider = MagicMock()
+        provider.collect_metadata_for_write.side_effect = collect
+        with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
+            result = engine.handle_request(WriteFileRequest(file_path=str(temp_dir / "image.png"), content=b"png"))
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert seen == [workflow]
 
     def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""
@@ -1194,7 +1230,7 @@ class TestOSWritePermissionVet:
             msg = "simulated staging outage"
             raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
 
-        monkeypatch.setattr(os_manager, "_stage_bytes_at_temp", raise_staging)
+        monkeypatch.setattr(os_manager.writer, "_stage_bytes_at_temp", raise_staging)
 
         requested_path = temp_dir / "image.png"
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
@@ -1606,7 +1642,7 @@ class TestCreateNewMacroIndexSeed:
     def test_read_path_does_not_seed_padded_index(self, outputs_dir: Path) -> None:
         """`File.read()` against a padded `{_index:03}` macro must fail loudly, not auto-allocate.
 
-        The seed-on-retry only fires when ``_resolve_file_path`` is called with
+        The seed-on-retry only fires when ``resolve_file_path`` is called with
         ``existing_file_policy=CREATE_NEW``. Read paths leave the policy as ``None`` so an
         unbound index variable surfaces as MISSING_REQUIRED_VARIABLES. Critical: a silent
         auto-fill on a read would point reads at non-existent indexed files and quietly
@@ -1625,7 +1661,7 @@ class TestCreateNewMacroIndexSeed:
     def test_same_index_variable_used_in_directory_and_filename(self, outputs_dir: Path) -> None:
         """Same `{_index:03}` referenced twice (as dir AND filename component) — both seeded equally.
 
-        ``_find_padded_unresolved_required`` picks the first ParsedVariable matching the
+        ``find_padded_unresolved_required`` picks the first ParsedVariable matching the
         missing name; ``GetPathForMacroRequest.resolve`` then renders BOTH occurrences with
         the same value. Pre-create a v001 sibling so the scan must gap-fill / extend.
 
@@ -1728,7 +1764,7 @@ class TestOptionalPaddedIndexCollision:
         """Optional `{_index?:03}` SECOND save: walks to padded `_001`, NOT unpadded `_1`.
 
         This is the bug #4544 / #4092 regression test. Pre-fix behavior:
-        `_convert_str_path_to_macro_with_index("file.png")` synthesized
+        `convert_str_path_to_macro_with_index("file.png")` synthesized
         `file_{_index}.png` (no format spec) → produced `file_1.png`. The fix walks
         the user's ORIGINAL macro's `{_index?:03}` slot, preserving the `:03` format.
         """
@@ -1859,7 +1895,7 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
     def test_two_distinct_padded_required_vars_fail_loudly(self, temp_dir: Path) -> None:
         """Macro with TWO distinct padded unresolved required vars must fail, not auto-pick.
 
-        ``_find_padded_unresolved_required`` only fires for a SINGLE missing required
+        ``find_padded_unresolved_required`` only fires for a SINGLE missing required
         variable. With two (``{a:03}`` and ``{b:03}``), the heuristic refuses to guess —
         the user sees ``MISSING_REQUIRED_VARIABLES`` naming both, no silent allocation.
         """
@@ -1921,7 +1957,7 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
         Defensive contract: rather than busy-loop forever, the candidate loop gives up
         and the caller sees a real error.
         """
-        from griptape_nodes.retained_mode.managers.os_manager import MAX_INDEXED_CANDIDATES
+        from griptape_nodes.retained_mode.managers.filesystem.file_writing import MAX_INDEXED_CANDIDATES
 
         # Pre-create v001..vMAX so every candidate the walk tries is taken. The walk
         # starts at 2 (the seed already tried 1 and saw it exist), so we need
@@ -1981,7 +2017,7 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
         r"""Workspace + nested dirs + filename combine to >260 chars; gap-fill must still work.
 
         ``_apply_windows_long_path_prefix`` (``\\?\``) is added by ``canonicalize_for_io``
-        only at the OS-level write boundary. The scan in ``_scan_for_next_available_index``
+        only at the OS-level write boundary. The scan in ``scan_for_next_available_index``
         uses ``Path.glob()`` directly. If pathlib can't enumerate long-path entries on this
         runner, the scan returns 1 and the test fails — surfacing a real bug to fix or
         track.
@@ -2078,11 +2114,12 @@ class TestWriteTempFileRequest:
         os_manager = engine.os_manager
         payload = b"probe target bytes"
 
-        result = os_manager.on_write_temp_file_request(
+        result = _write_temp_in_open_workflow(
+            os_manager,
             WriteTempFileRequest(
                 content=payload,
                 variables={"file_name_base": "probe", "file_extension": "mp4"},
-            )
+            ),
         )
 
         assert isinstance(result, WriteTempFileResultSuccess)
@@ -2111,11 +2148,13 @@ class TestWriteTempFileRequest:
 
         os_manager = engine.os_manager
 
-        result_a = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"})
+        result_a = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"}),
         )
-        result_b = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"b", variables={"file_name_base": "unique-b", "file_extension": "mp4"})
+        result_b = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"b", variables={"file_name_base": "unique-b", "file_extension": "mp4"}),
         )
 
         assert isinstance(result_a, WriteTempFileResultSuccess)
@@ -2139,8 +2178,9 @@ class TestWriteTempFileRequest:
 
         os_manager = engine.os_manager
 
-        result = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        result = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"}),
         )
 
         assert isinstance(result, WriteTempFileResultSuccess)
@@ -2165,7 +2205,7 @@ class TestWriteTempFileRequest:
         )
 
         os_manager = engine.os_manager
-        result = os_manager.on_write_temp_file_request(WriteTempFileRequest(content=b"payload", variables={}))
+        result = _write_temp_in_open_workflow(os_manager, WriteTempFileRequest(content=b"payload", variables={}))
 
         assert isinstance(result, WriteTempFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
@@ -2198,8 +2238,9 @@ class TestWriteTempFileRequest:
         monkeypatch.setitem(registry, GetSituationRequest, situation_missing_handler)
 
         os_manager = engine.os_manager
-        result = os_manager.on_write_temp_file_request(
-            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        result = _write_temp_in_open_workflow(
+            os_manager,
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"}),
         )
 
         assert isinstance(result, WriteTempFileResultFailure)
@@ -2295,7 +2336,7 @@ class TestFailedWriteLeavesNoLitter:
         file is indistinguishable from a real output, every subsequent save fails
         immediately on FileExistsError for all candidates.
         """
-        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.MAX_INDEXED_CANDIDATES", 5)
+        monkeypatch.setattr("griptape_nodes.retained_mode.managers.filesystem.file_writing.MAX_INDEXED_CANDIDATES", 5)
         self._fail_lock_times(monkeypatch, count=None)
 
         with pytest.raises(FileWriteError):
@@ -2334,7 +2375,7 @@ class TestFailedWriteLeavesNoLitter:
             msg = "simulated disk full"
             raise OSError(msg)
 
-        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.os.fsync", exploding_fsync)
+        monkeypatch.setattr("griptape_nodes.retained_mode.managers.filesystem.file_writing.os.fsync", exploding_fsync)
         target = outputs_dir / "partial.png"
 
         result = engine.os_manager.engine.handle_request(
@@ -2365,7 +2406,7 @@ class TestFailedWriteLeavesNoLitter:
         # Even with every lock attempt rigged to fail, mode="x" over an existing file
         # raises from open() first, so the cleanup is never reachable.
         with pytest.raises(FileExistsError):
-            engine.os_manager._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
+            engine.os_manager.writer._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
 
         assert target.read_bytes() == b"REAL USER DATA"
 

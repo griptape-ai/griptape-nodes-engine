@@ -14,7 +14,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
     WorkflowShape,
 )
-from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializedFlowCommands,
 )
 from griptape_nodes.retained_mode.managers.workflow.shape import WorkflowShapeType
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.values import is_plain_data
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 
@@ -310,7 +311,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # shape — that's what makes the file runnable as a CLI program. Shapeless workflows
         # have no input/output surface and are loaded by the engine via `await build_workflow()`
         # (see WorkflowManager.run_workflow), so they don't need a `__main__` guard.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4205 — decide how shapeless
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4205 — decide how shapeless
         # workflows should behave when invoked directly (build-only vs build + StartFlowRequest)
         # and emit an appropriate `__main__` guard.
         workflow_execution_code = self._generate_workflow_execution(
@@ -359,7 +360,9 @@ class WorkflowCodeGenerator(EngineScoped):
         """Recursively walk through object tree, calling process_class_fn for each class found.
 
         This unified helper handles the common pattern of recursively traversing nested objects
-        to find all class instances. Used by both patching and import collection.
+        to find all class instances. Used by both patching and import collection. It stops at the
+        engine and at workflow runtimes, which a node holds a reference to, so walking one node
+        doesn't reach every other node and manager.
 
         Args:
             obj: Object to traverse (can contain nested lists, dicts, class instances)
@@ -378,7 +381,7 @@ class WorkflowCodeGenerator(EngineScoped):
             visited = set()
 
         obj_id = id(obj)
-        if obj_id in visited:
+        if obj_id in visited or isinstance(obj, (Engine, WorkflowRuntime)):
             return
         visited.add(obj_id)
 
@@ -498,7 +501,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # Construct a default LocalWorkflowExecutor only when the caller did not supply one.
         # `**kwargs` is splatted into the constructor; a typo'd kwarg surfaces as a TypeError
         # from LocalWorkflowExecutor.__init__.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/3771 Update for workflows that call other workflows - need to include referenced workflows in the list
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/3771 Update for workflows that call other workflows - need to include referenced workflows in the list
         executor_assign = ast.If(
             test=ast.Compare(
                 left=ast.Name(id="workflow_executor", ctx=ast.Load()),
@@ -576,7 +579,27 @@ class WorkflowCodeGenerator(EngineScoped):
         # the project passed via --project-file-path, and only then is a bundle's own
         # griptape_nodes_config.json read, which is what registers the bundle's required
         # node libraries.
-        with_stmt.body = [await_main_call, ensure_context_call, *with_stmt.body]
+        # A standalone run has nothing open, so it opens the file as its workflow first.
+        open_workflow_call = ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
+                            attr="ContextManager",
+                            ctx=ast.Load(),
+                        ),
+                        args=[],
+                        keywords=[],
+                    ),
+                    attr="push_workflow",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[ast.keyword(arg="file_path", value=ast.Name(id="__file__", ctx=ast.Load()))],
+            )
+        )
+        with_stmt.body = [open_workflow_call, await_main_call, ensure_context_call, *with_stmt.body]
 
         # === Generate async aexecute_workflow function ===
         async_func_def = ast.AsyncFunctionDef(
@@ -663,7 +686,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # Delegate executor-level CLI flags to LocalWorkflowExecutor.add_cli_arguments(parser).
         # This replaces hand-rolled --storage-backend / --project-file-path / --save-on-failure
         # add_argument calls so that future executor-level flags can be added without bumping
-        # the workflow file schema. See https://github.com/griptape-ai/griptape-nodes/issues/4599.
+        # the workflow file schema. See https://github.com/griptape-ai/griptape-nodes-engine/issues/4599.
         add_arg_calls.append(
             ast.Expr(
                 value=ast.Call(
@@ -1213,53 +1236,9 @@ class WorkflowCodeGenerator(EngineScoped):
             ast.fix_missing_locations(register_call)
             code_blocks.append(register_call)
 
-        # Generate context manager assignment
-        assign_context_manager = ast.Assign(
-            targets=[ast.Name(id="context_manager", ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
-                    attr="ContextManager",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[],
-            ),
-        )
-        ast.fix_missing_locations(assign_context_manager)
-        code_blocks.append(assign_context_manager)
-
-        has_check = ast.Call(
-            func=ast.Attribute(
-                value=ast.Name(id="context_manager", ctx=ast.Load()),
-                attr="has_current_workflow",
-                ctx=ast.Load(),
-            ),
-            args=[],
-            keywords=[],
-        )
-        test = ast.UnaryOp(op=ast.Not(), operand=has_check)
-
-        push_call = ast.Expr(
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="context_manager", ctx=ast.Load()),
-                    attr="push_workflow",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[ast.keyword(arg="file_path", value=ast.Name(id="__file__", ctx=ast.Load()))],
-            )
-        )
-        ast.fix_missing_locations(push_call)
-
-        if_stmt = ast.If(
-            test=test,
-            body=[push_call],
-            orelse=[],
-        )
-        ast.fix_missing_locations(if_stmt)
-        code_blocks.append(if_stmt)
+        # build_workflow() opens no workflow: it builds into the one its caller opened or bound.
+        # The engine's load paths decide that (`WorkflowRunner.run_workflow`), and a standalone run
+        # opens the file in aexecute_workflow().
 
         # When variable substitution is disabled, bake a request call into build_workflow()
         # so the setting is restored on every load — including running the file as a script.

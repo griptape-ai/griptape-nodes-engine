@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from pydantic_ai import Agent, Tool
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -25,15 +25,20 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolResults, ToolDenied
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.usage import RunUsage
 
 from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    BATCH_TOOL_BARE_NAME,
     GTN_APPROVAL_REQUIRED_REQUESTS,
     GTN_BATCH_TOOL_NAME,
     GTN_SERVER_NAME,
     _compose,
     _gtn_tool_requires_approval,
+    _library_tool_approval,
+    _library_toolset,
     _user_tool_requires_approval,
     grant_keys_for_call,
 )
@@ -51,7 +56,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
     from pathlib import Path
 
-    from pydantic_ai import RunContext
     from pydantic_ai.tools import ToolDefinition
 
 
@@ -77,6 +81,7 @@ class TestGatedSetMatchesTheEngineServer:
         assert set(GTN_APPROVAL_REQUIRED_REQUESTS) <= set(SUPPORTED_REQUEST_EVENTS)
 
     def test_batch_tool_name_matches_the_server(self) -> None:
+        assert EVENT_REQUEST_BATCH_TOOL_NAME == BATCH_TOOL_BARE_NAME
         assert f"{GTN_SERVER_NAME}_{EVENT_REQUEST_BATCH_TOOL_NAME}" == GTN_BATCH_TOOL_NAME
 
 
@@ -166,6 +171,34 @@ class TestUserToolRequiresApproval:
         deps = ToolApprovalDeps(granted=frozenset({"brave_search"}))
 
         assert _user_tool_requires_approval(_ctx(deps), _tool("brave_search"), {}) is False
+
+
+class TestLibraryToolApproval:
+    GATE = staticmethod(_library_tool_approval("acme", frozenset({"ListRendersRequest"})))
+
+    def test_a_read_only_tool_runs_without_asking(self) -> None:
+        assert self.GATE(_ctx(ON), _tool("acme_ListRendersRequest"), {}) is False
+
+    def test_every_other_tool_asks(self) -> None:
+        assert self.GATE(_ctx(ON), _tool("acme_StartRenderRequest"), {}) is True
+
+    def test_a_granted_tool_runs_without_asking(self) -> None:
+        deps = ToolApprovalDeps(granted=frozenset({"acme_StartRenderRequest"}))
+
+        assert self.GATE(_ctx(deps), _tool("acme_StartRenderRequest"), {}) is False
+
+    @pytest.mark.asyncio
+    async def test_the_batch_tool_is_hidden(self) -> None:
+        async def run() -> str:
+            return "ok"
+
+        tools = [Tool(run, name=name, takes_ctx=False) for name in ("ListRendersRequest", "EventRequestBatch")]
+        toolset = _library_toolset("acme", FunctionToolset(tools=tools), frozenset())
+        ctx = RunContext(deps=ON, model=TestModel(), usage=RunUsage())
+
+        names = set(await toolset.get_tools(ctx))
+
+        assert names == {"acme_ListRendersRequest"}
 
 
 def _call(tool_call_id: str, tool_name: str = "GriptapeNodes_StartFlowRequest") -> ToolCallPart:
@@ -284,7 +317,7 @@ def gtn_like_toolset(ran: list[str], gate: ToolGate | None = None) -> Any:
         Tool(recorder(name), name=name, takes_ctx=False)
         for name in ("StartFlowRequest", "ListFlowsInCurrentContextRequest", "EventRequestBatch")
     ]
-    return _compose(GTN_SERVER_NAME, FunctionToolset(tools=tools), requires_approval=_gtn_tool_requires_approval)
+    return _compose(GTN_SERVER_NAME, FunctionToolset(tools=tools)).approval_required(_gtn_tool_requires_approval)
 
 
 def runner_with(

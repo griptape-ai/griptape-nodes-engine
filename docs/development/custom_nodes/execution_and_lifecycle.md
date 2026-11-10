@@ -11,7 +11,11 @@ All callbacks are overridable:
 - **after_incoming_connection_removed**, **after_outgoing_connection_removed**: Handle disconnection
 - **before_value_set**: Return modified value before setting
 - **after_value_set**: React to parameter value changes
-- **validate_before_workflow_run**, **validate_before_node_run**: Return list[Exception]|None
+- **validate_before_workflow_run**, **validate_before_node_run**: Return list[Exception]|None.
+    `validate_before_workflow_run` runs before any connection has delivered a value, so a connected input
+    may still hold its default there. Check whether a parameter is connected before reporting it as
+    missing; `validate_empty_parameter(..., skip_if_connected=True)` does. `validate_before_node_run`
+    runs after the node's inputs have arrived.
 - **on_griptape_event**: Handle workflow events
 - **initialize_spotlight**: Setup spotlight functionality
 - **get_next_control_output**: Return Parameter|None for control flow
@@ -149,6 +153,20 @@ class MyBlockingNode(ControlNode):
 - `process()` returns `AsyncResult | None` and yields a callable
 - Each yielded callable runs synchronously on a background thread; the generator resumes with its return value
 - Fine for existing synchronous code (`requests`, blocking SDKs), but prefer `aprocess()` for new integrations
+
+### Starting Your Own Threads
+
+The engine knows which workflow a node runs in from the context of the code that runs it. `aprocess()`, yielded callables, and `asyncio.to_thread` carry that context along. A thread you start yourself doesn't: `threading.Thread`, a `ThreadPoolExecutor`, and `loop.run_in_executor` begin with an empty context. Code in such a thread can't find the node's workflow, so workflow-relative paths such as `{workflow_dir}` and `{outputs}` fail to resolve.
+
+Prefer `asyncio.to_thread`. When you need your own thread or pool, run each task inside its own copy of the current context:
+
+```python
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor() as pool:
+    futures = [pool.submit(contextvars.copy_context().run, render_frame, frame) for frame in frames]
+```
 
 ### Polling Pattern for Long-Running Tasks
 

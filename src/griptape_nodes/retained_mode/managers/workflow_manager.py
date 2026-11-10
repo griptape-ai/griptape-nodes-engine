@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
@@ -19,6 +21,7 @@ from griptape_nodes.files.path_utils import (
     derive_registry_key,
 )
 from griptape_nodes.node_library.workflow_registry import (
+    Workflow,
     WorkflowMetadata,
     WorkflowMetadataError,
     WorkflowMetadataFileError,
@@ -26,6 +29,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadataSchemaError,
     WorkflowMetadataSectionCountError,
     WorkflowMetadataTomlError,
+    WorkflowShape,
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -44,6 +48,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
+    GetWorkflowShapeRequest,
+    GetWorkflowShapeResultFailure,
+    GetWorkflowShapeResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultFailure,
     ImportWorkflowResultSuccess,
@@ -97,7 +104,8 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+    from contextvars import Token
     from types import TracebackType
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -105,11 +113,22 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
     from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
+
+# How many squelch contexts the current context is inside of; see `WorkflowManager.WorkflowSquelchContext`.
+#
+# Scoped to the context rather than to the manager because a squelch belongs to the load that
+# entered it, not to a workflow: a load closes the workflow it starts from and opens the one it
+# loads. A ContextVar is inherited by the requests the load dispatches, the tasks it spawns, and
+# `asyncio.to_thread` work, so edits made from any other task are still reported as edits.
+_squelch_workflow_altered_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_squelch_workflow_altered_depth", default=0
+)
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -117,6 +136,8 @@ class WorkflowRegistrationResult(NamedTuple):
 
     succeeded: list[str]
     failed: list[str]
+    # Ids of the entries the files were registered under, or found already registered under.
+    workflow_ids: list[str]
 
 
 class WorkflowCandidate(NamedTuple):
@@ -135,7 +156,7 @@ class WorkflowCandidate(NamedTuple):
 class WorkflowManager(EngineScoped):
     WORKFLOW_METADATA_HEADER: ClassVar[str] = WORKFLOW_METADATA_HEADER
     MAX_MINOR_VERSION_DEVIATION: ClassVar[int] = (
-        100  # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1219 <- make the versioning enforcement softer after we get a release going
+        100  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/1219 <- make the versioning enforcement softer after we get a release going
     )
 
     WorkflowStatus = WorkflowStatus
@@ -153,6 +174,11 @@ class WorkflowManager(EngineScoped):
         problems: list[WorkflowProblem] = field(default_factory=list)
 
     _workflow_file_path_to_info: dict[str, WorkflowInfo]
+    # FlowManager reads the top of this stack to tag each new flow with the workflow being imported.
+    # A ContextVar keeps concurrent imports apart (Workflow nodes in PARALLEL mode run as separate
+    # tasks), and it lives on the instance so each engine has its own. A balanced set/reset removes
+    # the entry from the Context that set it.
+    _referenced_workflow_stack: contextvars.ContextVar[tuple[str, ...]]
 
     # Track how many contexts we have that intend to squelch (set to False) altered_workflow_state event values.
     class WorkflowSquelchContext:
@@ -160,9 +186,10 @@ class WorkflowManager(EngineScoped):
 
         def __init__(self, manager: WorkflowManager):
             self.manager = manager
+            self._token: Token[int] | None = None
 
         def __enter__(self) -> None:
-            self.manager._squelch_workflow_altered_count += 1
+            self._token = _squelch_workflow_altered_depth.set(_squelch_workflow_altered_depth.get() + 1)
 
         def __exit__(
             self,
@@ -170,37 +197,13 @@ class WorkflowManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            self.manager._squelch_workflow_altered_count -= 1
-
-    _squelch_workflow_altered_count: int = 0
-
-    # Track referenced workflow import context stack
-    class ReferencedWorkflowContext:
-        """Context manager for tracking workflow import operations."""
-
-        def __init__(self, manager: WorkflowManager, workflow_name: str):
-            self.manager = manager
-            self.workflow_name = workflow_name
-
-        def __enter__(self) -> WorkflowManager.ReferencedWorkflowContext:
-            self.manager._referenced_workflow_stack.append(self.workflow_name)
-            return self
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            self.manager._referenced_workflow_stack.pop()
-
-    _referenced_workflow_stack: list[str] = field(default_factory=list)
+            if self._token is not None:
+                _squelch_workflow_altered_depth.reset(self._token)
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._workflow_file_path_to_info = {}
-        self._squelch_workflow_altered_count = 0
-        self._referenced_workflow_stack = []
+        self._referenced_workflow_stack = contextvars.ContextVar("referenced_workflow_stack", default=())
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -222,7 +225,7 @@ class WorkflowManager(EngineScoped):
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
-        return len(self._referenced_workflow_stack) > 0
+        return len(self._referenced_workflow_stack.get()) > 0
 
     def get_current_referenced_workflow(self) -> str:
         """Get the current workflow source path from the context stack.
@@ -230,13 +233,27 @@ class WorkflowManager(EngineScoped):
         Raises:
             IndexError: If no referenced workflow context is active.
         """
-        return self._referenced_workflow_stack[-1]
+        return self._referenced_workflow_stack.get()[-1]
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
-        # Clear everything, library-provided workflows included, before re-registering. Workflows
-        # under the workspace are keyed workspace-relative, so after a workspace change (e.g. a
-        # project switch) an entry kept from before would resolve against the wrong directory.
-        self.engine.workflow_registry.clear_all_workflows()
+        """Rescan for workflow files and bring the registry up to date, in place.
+
+        A file found again keeps its entry and its id, and takes its freshly read metadata. Saved
+        entries the scan did not find (files deleted, moved, or made unreadable outside the
+        engine, and an unloaded library's workflows) are removed once the scan has finished.
+        If the scan raises, nothing is removed. Unsaved workflows stay, and so do entries whose path
+        changed while the scan ran (registered, saved for the first time, or moved), since the scan
+        listed the files before that. Each refresh tracks only what its own scan found, so
+        overlapping refreshes share no state.
+        """
+        registry = self.engine.workflow_registry
+        # Names are derived workspace-relative, so after a workspace change (e.g. a project
+        # switch) a name kept from before would be wrong.
+        registry.reindex_workflows()
+        paths_before_scan = {
+            workflow_id: registry.get(workflow_id).absolute_path for workflow_id in registry.workflow_ids()
+        }
+        found_workflow_ids: set[str] = set()
 
         # Discover workflows from libraries, config, and workspace.
         self._workflows_loading_complete.clear()
@@ -246,11 +263,16 @@ class WorkflowManager(EngineScoped):
             config_mgr = self.engine.config_manager
 
             if workflows_to_register is None:
-                # Library-declared workflows go first so they claim their registry keys before
-                # the workspace scan, then the workflows behind library workflow nodes.
+                # Library-declared workflows go first, then the workflows behind library workflow
+                # nodes, which keep the metadata the first ones read for a file both list.
                 library_workflow_files = await self.engine.library_manager.collect_library_workflow_files()
-                await self._process_workflows_for_registration(library_workflow_files)
-                self.engine.library_manager.register_library_workflow_node_workflows()
+                library_result = await self._process_workflows_for_registration(library_workflow_files)
+                found_workflow_ids.update(library_result.workflow_ids)
+                found_workflow_ids.update(
+                    self.engine.library_manager.register_library_workflow_node_workflows(
+                        found_workflow_ids=found_workflow_ids
+                    )
+                )
 
                 workflows_to_register = []
 
@@ -263,7 +285,15 @@ class WorkflowManager(EngineScoped):
                 workflows_to_register.extend([str(workspace_path)])
 
             # Register all discovered workflows at once if any were found
-            await self._process_workflows_for_registration(workflows_to_register)
+            scan_result = await self._process_workflows_for_registration(workflows_to_register)
+            found_workflow_ids.update(scan_result.workflow_ids)
+
+            changed_during_scan = {
+                workflow_id
+                for workflow_id in registry.workflow_ids()
+                if registry.get(workflow_id).absolute_path != paths_before_scan.get(workflow_id)
+            }
+            registry.remove_saved_workflows_except(found_workflow_ids | changed_during_scan)
 
             # Now remove any workflows that were missing files.
             paths_to_remove = set()
@@ -412,20 +442,25 @@ class WorkflowManager(EngineScoped):
         """Wait until any registry refresh in progress has finished."""
         await self._workflows_loading_complete.wait()
 
-    def referenced_workflow(self, workflow_name: str) -> ReferencedWorkflowContext:
-        """Track `workflow_name` as the referenced workflow being imported for the `with` block."""
-        return self.ReferencedWorkflowContext(self, workflow_name)
+    @contextmanager
+    def referenced_workflow(self, workflow_name: str) -> Iterator[None]:
+        """Track `workflow_name` as the referenced workflow being imported for the `with` block.
+
+        Enter and exit must run in the same asyncio task, as a plain `with` inside one coroutine does,
+        because `ContextVar.reset` rejects a token from another Context.
+        """
+        token = self._referenced_workflow_stack.set((*self._referenced_workflow_stack.get(), workflow_name))
+        try:
+            yield
+        finally:
+            self._referenced_workflow_stack.reset(token)
 
     def squelch_workflow_altered(self) -> WorkflowSquelchContext:
         """Suppress workflow-altered events for the duration of the `with` block."""
         return self.WorkflowSquelchContext(self)
 
     def should_squelch_workflow_altered(self) -> bool:
-        return self._squelch_workflow_altered_count > 0
-
-    def clear_object_state(self) -> None:
-        """Clear per-workflow state when the engine is reset."""
-        self.variable_substitution.clear()
+        return _squelch_workflow_altered_depth.get() > 0
 
     def persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
@@ -456,16 +491,15 @@ class WorkflowManager(EngineScoped):
                 display_name=request.metadata.name, registry_key=registry_key
             )
 
-            self.engine.workflow_registry.generate_new_workflow(
-                registry_key=registry_key, metadata=request.metadata, file_path=request.file_name
-            )
+            workflow = self.engine.workflow_registry.register_file(request.file_name, request.metadata)
         except Exception as e:
             details = f"Failed to register workflow with name '{request.metadata.name}'. Error: {e}"
             return RegisterWorkflowResultFailure(result_details=details)
         return RegisterWorkflowResultSuccess(
-            workflow_name=registry_key,
+            workflow_name=workflow.name,
+            workflow_id=workflow.workflow_id,
             result_details=ResultDetails(
-                message=f"Successfully registered workflow: {registry_key}",
+                message=f"Successfully registered workflow: {workflow.name}",
                 level=logging.DEBUG,
             ),
         )
@@ -512,14 +546,14 @@ class WorkflowManager(EngineScoped):
         if not isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
             return ImportWorkflowResultFailure(result_details=load_metadata_result.result_details)
 
-        # Check if workflow is already registered by file path (registry key).
-        # The registry key is derived from the file path, not metadata.name (the display name).
-        workflow_name = derive_registry_key(request.file_path)
-        if self.engine.workflow_registry.has_workflow_with_name(workflow_name):
-            # Workflow already exists - no need to re-register
+        # Check if the file is already registered. A file registered only because it was opened
+        # is registered below, which lists it.
+        existing = self.engine.workflow_registry.find_by_path(request.file_path)
+        if existing is not None and existing.listed:
             return ImportWorkflowResultSuccess(
-                workflow_name=workflow_name,
-                result_details=f"Workflow '{workflow_name}' already exists - no need to re-import.",
+                workflow_name=existing.name,
+                workflow_id=existing.workflow_id,
+                result_details=f"Workflow '{existing.name}' already exists - no need to re-import.",
             )
 
         # Now register the workflow with the extracted metadata
@@ -536,6 +570,7 @@ class WorkflowManager(EngineScoped):
 
         return ImportWorkflowResultSuccess(
             workflow_name=register_result.workflow_name,
+            workflow_id=register_result.workflow_id,
             result_details=ResultDetails(
                 message=f"Successfully imported workflow: {register_result.workflow_name}", level=logging.INFO
             ),
@@ -591,7 +626,7 @@ class WorkflowManager(EngineScoped):
             registered_libraries: Registered library names, or None to fetch them here.
         """
         # We have valid dependencies, etc.
-        # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes/issues/617
+        # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes-engine/issues/617
         problems = []
         had_critical_error = False
 
@@ -859,43 +894,70 @@ class WorkflowManager(EngineScoped):
     async def register_list_of_workflows(self, workflows_to_register: list[str]) -> None:
         await self._process_workflows_for_registration(workflows_to_register)
 
-    def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
-        """Registers a workflow from a file.
+    def refresh_workflow_file(self, file_path: str, metadata: WorkflowMetadata) -> Workflow:
+        """Register a workflow file a scan or a publish found, or refresh the entry it already has.
 
-        Args:
-            workflow_to_register: The path to the workflow file to register.
-            workflow_metadata: Metadata already loaded from that file by the caller.
-                Passed in rather than re-read here: loading it parses the file's TOML
-                header, and the caller has to do that anyway to decide the file is
-                registerable, so re-reading would parse every workflow twice.
+        Repairs the display name the way `RegisterWorkflowRequest` does, then hands the file to
+        the registry's `refresh_file`, which keeps an existing entry and its id.
 
-        Returns:
-            bool: True if the workflow was successfully registered, False otherwise.
+        Raises:
+            ValueError: The file is not on disk.
+            WorkflowPathTakenError: The file is new, and another entry holds the name derived from it.
         """
-        # Presently, this will not fail if a workflow with that name is already registered. That failure happens with a later check.
-        # However, the table of WorkflowInfo DOES get updated in this request, which may present a confusing state of affairs to the user.
-        # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
-
-        # Register it as a success.
-        workflow_register_request = RegisterWorkflowRequest(
-            metadata=workflow_metadata, file_name=str(workflow_to_register)
+        metadata.name = self._repair_path_shaped_display_name(
+            display_name=metadata.name, registry_key=derive_registry_key(file_path)
         )
-        workflow_register_result = self.engine.handle_request(workflow_register_request)
-        if not isinstance(workflow_register_result, RegisterWorkflowResultSuccess):
-            err_str = f"Error attempting to register workflow '{workflow_to_register}': {workflow_register_result}. SKIPPING IT."
-            logger.error(err_str)
-            return False
-
-        return True
+        return self.engine.workflow_registry.refresh_file(file_path, metadata)
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
-        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`."""
-        return await self.runner.run_workflow(relative_file_path)
+        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`.
+
+        Builds into the current workflow, else opens the file as one.
+        """
+        return await self.runner.run_workflow(relative_file_path, self.engine.current_workflow_or_none())
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
-        """Extracts the input and output shape for a workflow. See `shape.extract_workflow_shape`."""
-        return extract_workflow_shape(self.engine.flow_manager, workflow_name, flow_name)
+        """Extracts the input and output shape of the open workflow. See `shape.extract_workflow_shape`.
+
+        Edge method for code not handed a workflow (node library publishers); engine code calls
+        `extract_workflow_shape_in`.
+
+        Raises:
+            KeyError: No workflow is open and `flow_name` names a flow, or no flow has that name.
+            ValueError: No workflow is open and no flow is named, or the flow has no Start or End node.
+        """
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None and flow_name is not None:
+            details = f"Flow with name {flow_name} doesn't exist"
+            raise KeyError(details)
+        if workflow is None:
+            details = f"Workflow '{workflow_name}' does not have a top-level flow."
+            raise ValueError(details)
+        return self.extract_workflow_shape_in(workflow, workflow_name, flow_name)
+
+    def extract_workflow_shape_in(
+        self, workflow: WorkflowRuntime, workflow_name: str, flow_name: str | None = None
+    ) -> dict[str, Any]:
+        """Extracts the input and output shape of `workflow`. See `shape.extract_workflow_shape`."""
+        return extract_workflow_shape(self.engine.flow_manager, workflow, workflow_name, flow_name)
+
+    @handles(GetWorkflowShapeRequest)
+    def on_get_workflow_shape_request(
+        self, request: GetWorkflowShapeRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        try:
+            shape = self.extract_workflow_shape_in(workflow, request.workflow_name, flow_name=request.flow_name)
+        except (ValueError, KeyError) as err:
+            details = (
+                f"Attempted to read the inputs and outputs of workflow '{request.workflow_name}'. "
+                f"Failed because: {err.args[0]}"
+            )
+            return GetWorkflowShapeResultFailure(result_details=details)
+
+        return GetWorkflowShapeResultSuccess(
+            workflow_shape=WorkflowShape(inputs=shape["input"], outputs=shape["output"]),
+            result_details=f"Read the inputs and outputs of workflow '{request.workflow_name}'.",
+        )
 
     def _walk_object_tree(
         self, obj: Any, process_class_fn: Callable[[type, Any], None], visited: set[int] | None = None
@@ -925,7 +987,9 @@ class WorkflowManager(EngineScoped):
                 )
 
             # Process all workflows and track results
-            succeeded, failed = await self._process_workflows_for_registration(workflows_to_register)
+            registration_result = await self._process_workflows_for_registration(workflows_to_register)
+            succeeded = registration_result.succeeded
+            failed = registration_result.failed
 
         except Exception as e:
             details = f"Failed to register workflows from configuration section '{request.config_section}': {e!s}"
@@ -950,6 +1014,7 @@ class WorkflowManager(EngineScoped):
         """
         succeeded = []
         failed = []
+        workflow_ids = []
 
         # Build the set of registered-library roots (excluding sandbox) so their bundled
         # workflow files are skipped during the workspace scan. Library-declared workflows
@@ -1042,13 +1107,14 @@ class WorkflowManager(EngineScoped):
             )
 
             # Process the workflow
-            result_name = await self._process_single_workflow_file(
+            workflow = await self._process_single_workflow_file(
                 workflow_file,
                 pre_parsed_metadata=parsed_metadata_by_file.get(workflow_file),
                 registered_libraries=registered_libraries,
             )
-            if result_name:
-                succeeded.append(result_name)
+            if workflow is not None:
+                succeeded.append(workflow.name)
+                workflow_ids.append(workflow.workflow_id)
                 # Emit success event
                 self.engine.event_manager.put_event(
                     AppEvent(
@@ -1077,7 +1143,7 @@ class WorkflowManager(EngineScoped):
                     )
                 )
 
-        return WorkflowRegistrationResult(succeeded=succeeded, failed=failed)
+        return WorkflowRegistrationResult(succeeded=succeeded, failed=failed, workflow_ids=workflow_ids)
 
     async def _process_single_workflow_file(
         self,
@@ -1085,11 +1151,12 @@ class WorkflowManager(EngineScoped):
         *,
         pre_parsed_metadata: WorkflowMetadata | None = None,
         registered_libraries: list[str] | None = None,
-    ) -> str | None:
+    ) -> Workflow | None:
         """Process a single workflow file for registration.
 
         Returns:
-            Workflow name if registered successfully, None if failed or skipped
+            The entry the file is registered under, new or kept from before, or None if its
+            metadata is invalid or it could not be registered.
         """
         # Parse metadata once and use it for both registration check and actual registration.
         # With cached metadata in hand, skip straight to evaluation instead of going through
@@ -1117,18 +1184,13 @@ class WorkflowManager(EngineScoped):
         else:
             file_path_to_register = str(workflow_file)
 
-        registry_key = derive_registry_key(file_path_to_register)
-
-        # Check if workflow is already registered using the path-based registry key
-        if self.engine.workflow_registry.has_workflow_with_name(registry_key):
-            logger.debug("Skipping already registered workflow: %s", workflow_file)
+        # Hand the already-parsed metadata to the registry so the file's TOML header is read
+        # once per workflow rather than twice. A file already registered keeps its entry.
+        try:
+            return self.refresh_workflow_file(file_path_to_register, load_metadata_result.metadata)
+        except ValueError as err:
+            logger.error("Error attempting to register workflow '%s': %s. SKIPPING IT.", file_path_to_register, err)
             return None
-
-        # Hand the already-parsed metadata to the registrar so the file's TOML header is
-        # read once per workflow rather than twice.
-        if self._register_workflow(file_path_to_register, load_metadata_result.metadata):
-            return registry_key
-        return None
 
     def _classify_workflow_candidate(self, workflow_file: Path) -> WorkflowCandidate:
         """Decide whether a `.py` file is a workflow, keeping its metadata if it parsed.

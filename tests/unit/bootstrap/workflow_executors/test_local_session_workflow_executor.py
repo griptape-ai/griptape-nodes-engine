@@ -1,11 +1,14 @@
 """Unit tests for LocalSessionWorkflowExecutor's CLI surface (issue #4599) and its event sends."""
 
+import asyncio
 import dataclasses
 import json
 from argparse import ArgumentParser
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from griptape_nodes.bootstrap.workflow_executors.local_session_workflow_executor import (
     LocalSessionWorkflowExecutor,
@@ -21,7 +24,12 @@ from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadSuccess,
 )
-from griptape_nodes.retained_mode.events.execution_events import ControlFlowResolvedEvent, StartFlowRequest
+from griptape_nodes.retained_mode.events.execution_events import (
+    ControlFlowResolvedEvent,
+    NodeStartProcessEvent,
+    StartFlowRequest,
+    StartFlowResultSuccess,
+)
 
 
 class _NoJsonForm:
@@ -226,3 +234,51 @@ class TestSendExecutionEvent:
         event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
 
         assert executor._send_execution_event(event) is None
+
+
+class TestExecutionEventsAreSentOnce:
+    """Each execution event of a run reaches the parent exactly once.
+
+    The parent shows every one it receives in the group's events panel, so a second send showed
+    every line twice.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_execution_event_is_sent_once(self) -> None:
+        executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
+        executor.send_event = MagicMock()
+        executor._on_start_flow_result = None
+        executor._session_id = "session"
+        queue: asyncio.Queue = asyncio.Queue()
+        start = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="A")))
+        resolved = ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(
+                payload=ControlFlowResolvedEvent(end_node_name="End", parameter_output_values={})
+            )
+        )
+
+        async def run_flow(_request: StartFlowRequest) -> StartFlowResultSuccess:
+            await queue.put(start)
+            await queue.put(resolved)
+            return StartFlowResultSuccess(result_details="ok")
+
+        griptape_nodes = MagicMock()
+        griptape_nodes.EventManager.return_value.event_queue = queue
+        griptape_nodes.ahandle_request = AsyncMock(side_effect=run_flow)
+        with (
+            patch(
+                "griptape_nodes.bootstrap.workflow_executors.local_session_workflow_executor.GriptapeNodes",
+                griptape_nodes,
+            ),
+            patch.object(executor, "aprepare_workflow_for_run", AsyncMock(return_value="Flow")),
+            patch.object(executor, "_handle_execution_event", AsyncMock(side_effect=[(False, None), (True, None)])),
+            patch.object(executor, "_wait_for_websocket_queue_flush", AsyncMock()),
+        ):
+            await executor._arun(flow_input={})
+
+        sent_execution_events = [
+            json.loads(sent.args[1])["payload_type"]
+            for sent in executor.send_event.call_args_list
+            if sent.args[0] == "execution_event"
+        ]
+        assert sent_execution_events == ["NodeStartProcessEvent", "ControlFlowResolvedEvent"]

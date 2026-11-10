@@ -19,6 +19,16 @@ class TestLibraryTrackingFields:
         lib = _make_library()
         assert lib.get_registered_app_event_listeners() == []
 
+    def test_registered_execution_event_listeners_starts_empty(self) -> None:
+        lib = _make_library()
+        assert lib.get_registered_execution_event_listeners() == []
+
+    def test_execution_event_listener_accessor_returns_a_copy(self) -> None:
+        lib = _make_library()
+        listeners = lib.get_registered_execution_event_listeners()
+        listeners.append((str, lambda: None))
+        assert lib.get_registered_execution_event_listeners() == []
+
     def test_registered_pre_dispatch_hooks_starts_empty(self) -> None:
         lib = _make_library()
         assert lib.get_registered_pre_dispatch_hooks() == []

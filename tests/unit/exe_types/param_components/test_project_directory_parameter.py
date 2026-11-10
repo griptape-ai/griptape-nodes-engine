@@ -1,13 +1,16 @@
 """Unit tests for _build_directory_destination_from_situation."""
 
+import pathlib
 from unittest import mock
+
+import pytest
 
 from griptape_nodes.common.project_templates import situation
 from griptape_nodes.exe_types.param_components import project_directory_parameter
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
 
-HANDLE_REQUEST_PATH = "griptape_nodes.files.project_file.GriptapeNodes.handle_request"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.workflow_requests.GriptapeNodes.handle_request"
 
 _POLICY_MAP = {
     "CREATE_NEW": situation.SituationFilePolicy.CREATE_NEW,
@@ -31,6 +34,58 @@ def _make_situation(
 
 class TestBuildDirectoryDestinationFromSituation:
     """Tests for _build_directory_destination_from_situation helper."""
+
+    def test_absolute_path_bypasses_situation(self, tmp_path: pathlib.Path) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH) as handle_request:
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                str(tmp_path / "extracted"), "save_output_directory"
+            )
+
+        handle_request.assert_not_called()
+        assert dest._directory._dir_path == str(tmp_path / "extracted")
+        assert dest._existing_dir_policy == os_events.ExistingFilePolicy.OVERWRITE
+
+    def test_home_relative_path_bypasses_situation(self) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH):
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                "~/extracted", "save_output_directory"
+            )
+
+        assert dest._directory._dir_path == str(pathlib.Path("~/extracted").expanduser())
+
+    def test_file_uri_bypasses_situation(self, tmp_path: pathlib.Path) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH) as handle_request:
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                (tmp_path / "extracted").as_uri(), "save_output_directory"
+            )
+
+        handle_request.assert_not_called()
+        assert pathlib.Path(str(dest._directory._dir_path)) == tmp_path / "extracted"
+
+    def test_unresolvable_home_folder_raises(self) -> None:
+        with (
+            mock.patch.object(pathlib.Path, "expanduser", side_effect=RuntimeError("no home")),
+            pytest.raises(ValueError, match="home folder"),
+        ):
+            project_directory_parameter._build_directory_destination_from_situation("~/out", "save_output_directory")
+
+    def test_tilde_name_is_a_plain_name(self) -> None:
+        sit = _make_situation("{outputs}/{dir_name}_v{_index:03}")
+        success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
+
+        with mock.patch(HANDLE_REQUEST_PATH, return_value=success):
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                "~old_renders", "save_output_directory"
+            )
+
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.variables["dir_name"] == "~old_renders"
+
+    def test_web_address_raises(self) -> None:
+        with pytest.raises(ValueError, match="cannot save to"):
+            project_directory_parameter._build_directory_destination_from_situation(
+                "https://example.com/out", "save_output_directory"
+            )
 
     def test_uses_situation_macro(self) -> None:
         sit = _make_situation("{outputs}/{node_name}/{dir_name}_v{_index:03}")

@@ -16,7 +16,12 @@ combinators rather than hand-rolled logic:
   tool names.
 * **Approval** - calls that spend credits or run work wait for the user via
   :meth:`AbstractToolset.approval_required`, which runs against the prefixed
-  names, since those are what grant keys are built from.
+  names, since those are what grant keys are built from. This is the chat
+  sidebar's policy, so :func:`mcp_server_from_config` leaves it off: node
+  libraries build agents from it too, and a node run has no one to ask. The
+  sidebar applies it with :func:`require_user_tool_approval`, and
+  :func:`streamable_http_local` and :func:`streamable_http_library` apply it to
+  the engine's own server.
 
 Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
@@ -90,11 +95,19 @@ Each name must be a key of ``servers.mcp.SUPPORTED_REQUEST_EVENTS``; a test hold
 the two in step.
 """
 
-GTN_BATCH_TOOL_NAME = f"{GTN_SERVER_NAME}_EventRequestBatch"
-"""Prefixed name of the engine's batch tool, whose inner requests are gated one by one.
+BATCH_TOOL_BARE_NAME = "EventRequestBatch"
+"""Bare name of the batch tool the engine's MCP server serves on every address.
 
-The bare name must equal ``servers.mcp.EVENT_REQUEST_BATCH_TOOL_NAME``; a test
-holds the two in step.
+Must equal ``servers.mcp.EVENT_REQUEST_BATCH_TOOL_NAME``; a test holds the two in step.
+"""
+
+GTN_BATCH_TOOL_NAME = f"{GTN_SERVER_NAME}_{BATCH_TOOL_BARE_NAME}"
+"""Prefixed name of the engine's batch tool, whose inner requests are gated one by one."""
+
+GTN_WORKFLOW_ID_HEADER = "X-Griptape-Workflow-Id"
+"""Header naming the open workflow the engine's MCP server acts on for an agent run.
+
+Must equal ``servers.mcp.WORKFLOW_ID_HEADER``; a test holds the two in step.
 """
 
 
@@ -125,7 +138,8 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServ
 
     Never raises: returns ``None`` and logs a warning for any config it cannot
     build from, so one bad server doesn't stop the others being attached. The
-    returned toolset is prefixed with ``name``.
+    returned toolset is prefixed with ``name`` and runs every call without asking;
+    wrap it in :func:`require_user_tool_approval` to attach it to the chat sidebar.
     """
     transport = config.get("transport", "stdio")
 
@@ -155,11 +169,7 @@ def _stdio_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPS
         cwd=config.get("cwd"),
     )
     return BuiltMCPServer(
-        toolset=_compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES),
-            requires_approval=_user_tool_requires_approval,
-        ),
+        toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
         transport=client,
     )
 
@@ -187,7 +197,6 @@ def _http_server_from_config(name: str, config: Mapping[str, Any], transport: st
         toolset=_compose(
             name,
             MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-            requires_approval=_user_tool_requires_approval,
         ),
         transport=client,
     )
@@ -209,18 +218,46 @@ async def disconnect_transport(name: str, transport: ClientTransport) -> None:
         logger.warning("Attempted to shut down MCP server '%s'. Failed because of: %s", name, e)
 
 
-def streamable_http_local(url: str) -> AbstractToolset[Any]:
+def streamable_http_local(url: str, *, workflow_id: str | None) -> AbstractToolset[Any]:
     """Convenience builder for the engine's own MCP server (streamable HTTP).
 
     Always prefixed with :data:`GTN_SERVER_NAME`: the approval gate and grant keys
-    match the engine's tools by that prefix.
+    match the engine's tools by that prefix. ``workflow_id`` names the open workflow
+    the tool calls act on, sent as :data:`GTN_WORKFLOW_ID_HEADER`; None sends no header.
     """
     return _compose(
         GTN_SERVER_NAME,
-        MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES),
-        requires_approval=_gtn_tool_requires_approval,
+        MCPToolset(
+            StreamableHttpTransport(url=url, headers=_workflow_headers(workflow_id)),
+            max_retries=DEFAULT_TOOL_MAX_RETRIES,
+        ),
         tool_blocklist=DEFAULT_GTN_TOOL_BLOCKLIST,
+    ).approval_required(_gtn_tool_requires_approval)
+
+
+def streamable_http_library(
+    name: str, url: str, read_only_tools: frozenset[str], *, workflow_id: str | None
+) -> AbstractToolset[Any]:
+    """Build the chat agent's toolset for one library's tools on the engine's MCP server.
+
+    Prefixed with ``name``, the library's slug. Calls to tools in ``read_only_tools`` (bare names)
+    run without asking and every other call waits for the user. The batch tool is hidden, since
+    approving it would approve every library tool inside it. ``workflow_id`` names the open
+    workflow the calls act on, as for :func:`streamable_http_local`.
+    """
+    toolset = MCPToolset(
+        StreamableHttpTransport(url=url, headers=_workflow_headers(workflow_id)), max_retries=DEFAULT_TOOL_MAX_RETRIES
     )
+    return _library_toolset(name, toolset, read_only_tools)
+
+
+def require_user_tool_approval(toolset: AbstractToolset[Any]) -> AbstractToolset[Any]:
+    """Make every call on a user-configured server's toolset wait for the user's approval.
+
+    Takes a toolset from :func:`mcp_server_from_config`. The gate reads the run's
+    ``ToolApprovalDeps``, so only a run that carries them may use the result.
+    """
+    return toolset.approval_required(_user_tool_requires_approval)
 
 
 def grant_keys_for_call(tool_name: str, args: Mapping[str, Any]) -> list[str]:
@@ -250,6 +287,13 @@ def grant_keys_for_call(tool_name: str, args: Mapping[str, Any]) -> list[str]:
     return keys
 
 
+def _workflow_headers(workflow_id: str | None) -> dict[str, str]:
+    """The headers naming the open workflow `workflow_id` to the engine's MCP server, none for None."""
+    if workflow_id is None:
+        return {}
+    return {GTN_WORKFLOW_ID_HEADER: workflow_id}
+
+
 def _gtn_tool_requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, tool_args: dict[str, Any]) -> bool:
     """Gate the engine tools that run work, and batches containing any of them."""
     bare_name = tool_def.name.removeprefix(f"{GTN_SERVER_NAME}_")
@@ -261,6 +305,25 @@ def _gtn_tool_requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, 
 def _user_tool_requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, tool_args: dict[str, Any]) -> bool:
     """Gate every tool on a user-configured server: the engine cannot tell what they do."""
     return needs_approval(ctx.deps, grant_keys_for_call(tool_def.name, tool_args))
+
+
+def _library_toolset(name: str, toolset: AbstractToolset[Any], read_only_tools: frozenset[str]) -> AbstractToolset[Any]:
+    """Hide the batch tool, prefix with ``name``, and gate every tool not in ``read_only_tools``."""
+    composed = _compose(name, toolset, tool_blocklist=frozenset({BATCH_TOOL_BARE_NAME}))
+    return composed.approval_required(_library_tool_approval(name, read_only_tools))
+
+
+def _library_tool_approval(
+    name: str, read_only_tools: frozenset[str]
+) -> Callable[[RunContext[Any], ToolDefinition, dict[str, Any]], bool]:
+    """Build the approval gate for a library toolset prefixed with ``name``."""
+
+    def requires_approval(ctx: RunContext[Any], tool_def: ToolDefinition, tool_args: dict[str, Any]) -> bool:
+        if tool_def.name.removeprefix(f"{name}_") in read_only_tools:
+            return False
+        return needs_approval(ctx.deps, grant_keys_for_call(tool_def.name, tool_args))
+
+    return requires_approval
 
 
 def _connect_timeout(config: Mapping[str, Any]) -> float:
@@ -286,20 +349,17 @@ def _compose(
     name: str,
     toolset: AbstractToolset[Any],
     *,
-    requires_approval: Callable[[RunContext[Any], ToolDefinition, dict[str, Any]], bool],
     tool_blocklist: frozenset[str] = frozenset(),
 ) -> AbstractToolset[Any]:
-    """Apply the optional blocklist, the name prefix, and the approval gate to a raw MCP toolset.
+    """Apply the optional blocklist and the name prefix to a raw MCP toolset.
 
     Order matters: the blocklist filter runs on bare tool names, so it must be
-    applied *before* :meth:`prefixed` adds the ``<name>_`` prefix, and the
-    approval gate runs on prefixed names, so it goes on *after*.
-    ``requires_approval`` has no default so no server can be attached ungated by
-    omission.
+    applied *before* :meth:`prefixed` adds the ``<name>_`` prefix. An approval
+    gate runs on prefixed names, so callers add it on top of the result.
     """
     if tool_blocklist:
         toolset = toolset.filtered(_blocklist_filter(tool_blocklist))
-    return toolset.prefixed(name).approval_required(requires_approval)
+    return toolset.prefixed(name)
 
 
 def _blocklist_filter(

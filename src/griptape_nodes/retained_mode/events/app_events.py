@@ -37,6 +37,23 @@ class OrganizationInfo:
 
 
 @dataclass
+class OpenWorkflowInfo:
+    """A workflow the engine has open, as the heartbeat reports it.
+
+    Args:
+        workflow_id: The workflow's id, which a request envelope's `open_workflow_id` names.
+        name: The workflow's name.
+        workflow_file_path: Path to the workflow file (None while it is unsaved).
+        has_active_flow: Whether the workflow has a current flow.
+    """
+
+    workflow_id: str
+    name: str
+    workflow_file_path: str | None
+    has_active_flow: bool
+
+
+@dataclass
 class UserInfo:
     """User information from Griptape Cloud."""
 
@@ -55,6 +72,12 @@ class AppStartSessionRequest(RequestPayload):
 
     Results: AppStartSessionResultSuccess (with session ID) | AppStartSessionResultFailure (session creation error)
     """
+
+    # A client that names itself is listed on the session (see SessionClient) so engine
+    # discovery can show who is attached. Blank client_id keeps today's anonymous join.
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
 
 
 @dataclass
@@ -423,6 +446,53 @@ class AppEndSessionResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class AppJoinSessionRequest(RequestPayload):
+    """Join the named session, which must be the active one, and list the client on it.
+
+    Start creates-or-joins without naming a session; Join is for a client that already holds a
+    session id, e.g. one restored from storage, and wants the engine to refuse a stale id.
+    """
+
+    session_id: str
+    client_id: str = ""
+    client_type: str = ""
+    client_label: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+    session_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppJoinSessionResultFailure(ResultPayloadFailure):
+    """Join failed: no session is active, or the named one is not the active session."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionRequest(RequestPayload):
+    """Delist a client from the active session without ending it."""
+
+    client_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionResultSuccess(ResultPayloadSuccess):
+    """The client is no longer listed; leaving when never listed succeeds too."""
+
+
+@dataclass
+@PayloadRegistry.register
+class AppLeaveSessionResultFailure(ResultPayloadFailure):
+    """Leave failed because no session is active."""
+
+
+@dataclass
+@PayloadRegistry.register
 class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use ensure the engine session is still active."""
 
@@ -453,6 +523,16 @@ class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 
 
 @dataclass
+class SessionClient:
+    """A client registered on the active session: an opaque id the client minted, its kind, and a display label."""
+
+    client_id: str
+    client_type: str
+    connected_at: str
+    client_label: str = ""
+
+
+@dataclass
 @PayloadRegistry.register
 class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     """Engine heartbeat successful with comprehensive status information.
@@ -462,14 +542,18 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         engine_version: Current engine version string
         engine_id: Unique engine identifier (None if not set)
         session_id: Current session identifier (None if no session)
+        engine_run_id: Id minted when this engine started, never saved. Workflow ids are only
+            valid while it stays the same; a new value means the engine restarted.
         timestamp: Heartbeat timestamp
         instance_type: Cloud instance type (None if not applicable)
         instance_region: Cloud instance region (None if not applicable)
         instance_provider: Cloud provider name (None if not applicable)
         deployment_type: Type of deployment (None if not applicable)
-        current_workflow: Name of active workflow (None if none)
-        workflow_file_path: Path to workflow file (None if none)
-        has_active_flow: Whether there's an active flow running
+        current_workflow: Name of the workflow opened last (None if none is open)
+        current_workflow_id: Id of the workflow opened last (None if none is open)
+        workflow_file_path: Path to that workflow's file (None if none, or while it is unsaved)
+        has_active_flow: Whether that workflow has a current flow
+        open_workflows: Every workflow the engine has open, in the order they were opened
         engine_name: Human-readable engine name
         engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
         user: User information including ID, email, and name (None if not logged in)
@@ -512,6 +596,18 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # always fills this in, so the "" default means the heartbeat came from an engine too old
     # to report it -- a client should show nothing rather than guess.
     engine_os: str = ""
+    # Clients that identified themselves to the active session (SessionManager.attach_client),
+    # so a discovery client can tell a free engine from one another host is already driving.
+    # Entries leave when the host is displaced or the session ends; nothing expires them, so a
+    # host that crashed stays listed until then. Defaulted for backward compatibility.
+    clients: list[SessionClient] = field(default_factory=list)
+    # Id of the workflow opened last (None if none). Defaulted for backward compatibility.
+    current_workflow_id: str | None = None
+    # Every open workflow, oldest first; the last is the one the `current_*` fields describe.
+    # Defaulted for backward compatibility.
+    open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)
+    # Changes on every engine restart, unlike session_id. None from an engine too old to report it.
+    engine_run_id: str | None = None
 
 
 @dataclass

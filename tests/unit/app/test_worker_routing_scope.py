@@ -1,16 +1,15 @@
-"""Tests for when RemoteHandler forwards versus answers locally.
+"""Tests for when a request dispatched to a RemoteHandler is forwarded versus answered locally.
 
-RemoteHandler is the single chokepoint where a worker services a request whose authoritative state
-lives on the orchestrator. What decides its behavior is one thing: whether the worker is inside a
-node-execution scope. Inside, it forwards; outside (bootstrap, library load, node construction) it
-delegates to the handler it replaced, so a node's ``__init__`` can still call ``add_parameter``.
+A RemoteHandler is the single chokepoint where a worker services a request whose authoritative state
+lives on the orchestrator. What decides whether dispatch forwards through it is one thing: whether the
+worker is inside a node-execution scope. Inside, it forwards; outside (bootstrap, library load, node
+construction) it calls the handler it replaced, so a node's ``__init__`` can still call ``add_parameter``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pytest
@@ -23,21 +22,14 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     RequestPayload,
+    ResultPayload,
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionRequest,
-    DeleteConnectionResultFailure,
+    DeleteConnectionResultSuccess,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
-)
-from griptape_nodes.retained_mode.events.parameter_events import (
-    AddParameterToNodeRequest,
-    AddParameterToNodeResultFailure,
-    AlterParameterDetailsRequest,
-    AlterParameterDetailsResultFailure,
-    SetParameterValueRequest,
-    SetParameterValueResultFailure,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
@@ -86,13 +78,26 @@ def _make_handler_with_fake_forward(event_manager: EventManager) -> RemoteHandle
     return RemoteHandler(original=original, event_manager=event_manager)
 
 
+class _Installed:
+    """A RemoteHandler registered for _ProbeRequest, as a worker registers it, dispatched through its event manager."""
+
+    def __init__(self, handler: RemoteHandler) -> None:
+        self.event_manager = handler.event_manager
+        self.event_manager.assign_manager_to_request_type(_ProbeRequest, handler.original)
+        self.event_manager.replace_manager_for_request_type(_ProbeRequest, handler)
+
+    async def __call__(self, request: RequestPayload) -> ResultPayload:
+        result_event = await self.event_manager.ahandle_request(request)
+        return result_event.result
+
+
 class TestRemoteHandlerRouting:
     """Node-execution scope is the whole routing decision."""
 
     @pytest.mark.asyncio
     async def test_in_node_execution_forwards(self) -> None:
         event_manager = EventManager()
-        handler = _make_handler_with_fake_forward(event_manager)
+        handler = _Installed(_make_handler_with_fake_forward(event_manager))
 
         with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="m1"))
@@ -110,7 +115,7 @@ class TestRemoteHandlerRouting:
             local_calls.append(request)
             return _ProbeResult(seen_by="local", result_details="local")
 
-        handler = RemoteHandler(original=original, event_manager=event_manager)
+        handler = _Installed(RemoteHandler(original=original, event_manager=event_manager))
 
         result = await handler(_ProbeRequest(marker="m2"))
 
@@ -119,18 +124,13 @@ class TestRemoteHandlerRouting:
         assert len(local_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_forwards_during_hydration_not_only_aprocess(self) -> None:
-        """The gate is deliberately wider than ``aprocess``.
-
-        ``node_execution_scope`` is opened by ``_hydrate_and_run_node_inner`` around BOTH
-        hydration and aprocess, so a request issued from ``before/after_value_set`` forwards too.
-        No ``aprocess_scope()`` is entered here; only the refcount is active.
-        """
+    async def test_forwards_whenever_the_scope_is_open_not_only_inside_aprocess(self) -> None:
+        """The gate is the refcount alone: no ``aprocess_scope()`` is entered here."""
         event_manager = EventManager()
-        handler = _make_handler_with_fake_forward(event_manager)
+        handler = _Installed(_make_handler_with_fake_forward(event_manager))
 
         with event_manager.node_execution_scope():
-            result = await handler(_ProbeRequest(marker="hydrate"))
+            result = await handler(_ProbeRequest(marker="scope only"))
 
         assert isinstance(result, _ProbeResult)
         assert result.seen_by == "orchestrator"
@@ -154,7 +154,7 @@ class TestRemoteHandlerRouting:
             )
 
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
-        handler = RemoteHandler(original=original, event_manager=event_manager)
+        handler = _Installed(RemoteHandler(original=original, event_manager=event_manager))
 
         with event_manager.node_execution_scope():
             await handler(_ProbeRequest(marker="first"))
@@ -209,7 +209,8 @@ class TestRemoteHandlerRouting:
         assert isinstance(installed, RemoteHandler)
 
         with event_manager.node_execution_scope():
-            result = await installed(ListConnectionsForNodeRequest(node_name="some-node"))
+            result_event = await event_manager.ahandle_request(ListConnectionsForNodeRequest(node_name="some-node"))
+        result = result_event.result
 
         assert isinstance(result, ListConnectionsForNodeResultSuccess)
         assert len(forwarded_calls) == 1
@@ -229,123 +230,121 @@ def _drop_own_wire() -> DeleteConnectionRequest:
     )
 
 
-def _handler_recording_forwards(event_manager: EventManager, forwarded: list[RequestPayload]) -> RemoteHandler:
-    async def original(_request: RequestPayload) -> ResultPayloadSuccess:
-        return ListConnectionsForNodeResultSuccess(
-            incoming_connections=[], outgoing_connections=[], result_details="local"
-        )
+@dataclass
+class _Answers:
+    """Who answered each request a RemoteHandler was registered for: "local" or "orchestrator"."""
+
+    seen: list[str] = field(default_factory=list)
+
+
+def _register_forwarded_delete(event_manager: EventManager, answers: _Answers) -> None:
+    """Register DeleteConnectionRequest behind a RemoteHandler, as a worker does, recording who answers it."""
+
+    async def original(_request: DeleteConnectionRequest) -> ResultPayloadSuccess:
+        answers.seen.append("local")
+        return DeleteConnectionResultSuccess(result_details="local")
 
     async def fake_forward(
         request: RequestPayload,
         result_context: ResultContext,  # noqa: ARG001
     ) -> EventResultSuccess:
-        forwarded.append(request)
-        return EventResultSuccess(
-            request=request,
-            result=ListConnectionsForNodeResultSuccess(
-                incoming_connections=[], outgoing_connections=[], result_details="forwarded"
-            ),
-        )
+        answers.seen.append("orchestrator")
+        return EventResultSuccess(request=request, result=DeleteConnectionResultSuccess(result_details="forwarded"))
 
     event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
-    return RemoteHandler(original=original, event_manager=event_manager)
+    event_manager.assign_manager_to_request_type(DeleteConnectionRequest, original)
+    register_remote_handlers(event_manager)
+    assert isinstance(event_manager.get_manager_for_request_type(DeleteConnectionRequest), RemoteHandler)
 
 
-class TestEditsToTheNodeBeingRebuilt:
-    """A worker rebuilding a node must not repeat that node's own edits on the orchestrator.
+async def _another_chain_running_a_node(event_manager: EventManager, release: asyncio.Event) -> None:
+    with event_manager.node_execution_scope():
+        await release.wait()
 
-    Hydration replays each value through the node's hooks. A hook that drops or rebuilds its own wires
-    when its value changes did that on the orchestrator when the user made the change, so a forwarded
-    replay deletes real connections from a copy that has none of its own.
+
+class TestRequestsWhileRebuildingACopy:
+    """A worker builds and discards its copy of a node in its own graph, so a rebuild's requests are answered here.
+
+    The node-execution refcount is process-wide, and another node can be running in the worker at the same time.
+    Its requests still go to the orchestrator; only the chain doing the rebuild is answered locally.
     """
 
     @pytest.mark.asyncio
-    async def test_an_edit_to_the_rebuilt_node_is_refused(self) -> None:
+    async def test_ahandle_request_is_answered_here_while_another_chain_runs_a_node(self) -> None:
         event_manager = EventManager()
-        forwarded: list[RequestPayload] = []
-        handler = _handler_recording_forwards(event_manager, forwarded)
+        answers = _Answers()
+        _register_forwarded_delete(event_manager, answers)
+        release = asyncio.Event()
+        running = asyncio.create_task(_another_chain_running_a_node(event_manager, release))
+        await asyncio.sleep(0)
+        assert event_manager.in_node_execution()
 
-        with event_manager.node_execution_scope(), event_manager.hydration_scope(REBUILT):
-            delete_result = await handler(_drop_own_wire())
-            add_result = await handler(AddParameterToNodeRequest(node_name=REBUILT, parent_container_name="items"))
-            set_result = await handler(SetParameterValueRequest(parameter_name="status", node_name=REBUILT, value="x"))
-
-        assert isinstance(delete_result, DeleteConnectionResultFailure)
-        assert isinstance(add_result, AddParameterToNodeResultFailure)
-        assert isinstance(set_result, SetParameterValueResultFailure)
-        assert forwarded == []
-
-    @pytest.mark.asyncio
-    async def test_an_edit_that_leaves_its_node_to_the_current_context_is_refused(self) -> None:
-        """On the orchestrator the current context is some other node, never the one being rebuilt here."""
-        event_manager = EventManager()
-        forwarded: list[RequestPayload] = []
-        handler = _handler_recording_forwards(event_manager, forwarded)
-
-        with event_manager.node_execution_scope(), event_manager.hydration_scope(REBUILT):
-            result = await handler(AlterParameterDetailsRequest(parameter_name="component_output", type="Vae"))
-
-        assert isinstance(result, AlterParameterDetailsResultFailure)
-        assert forwarded == []
-
-    @pytest.mark.asyncio
-    async def test_an_edit_to_another_node_still_forwards(self) -> None:
-        event_manager = EventManager()
-        forwarded: list[RequestPayload] = []
-        handler = _handler_recording_forwards(event_manager, forwarded)
-
-        with event_manager.node_execution_scope(), event_manager.hydration_scope(REBUILT):
-            await handler(SetParameterValueRequest(parameter_name="status", node_name="Tracker", value="x"))
-
-        assert len(forwarded) == 1
-
-    @pytest.mark.asyncio
-    async def test_a_read_about_the_rebuilt_node_still_forwards(self) -> None:
-        """Hooks still need the orchestrator's answers while hydrating, such as whether a list is connected."""
-        event_manager = EventManager()
-        forwarded: list[RequestPayload] = []
-        handler = _handler_recording_forwards(event_manager, forwarded)
-
-        with event_manager.node_execution_scope(), event_manager.hydration_scope(REBUILT):
-            await handler(ListConnectionsForNodeRequest(node_name=REBUILT))
-
-        assert len(forwarded) == 1
-
-    @pytest.mark.asyncio
-    async def test_an_edit_still_forwards_while_the_node_runs(self) -> None:
-        """Once hydration is over, an edit is the node's own and belongs to the orchestrator."""
-        event_manager = EventManager()
-        forwarded: list[RequestPayload] = []
-        handler = _handler_recording_forwards(event_manager, forwarded)
-
-        with event_manager.node_execution_scope():
-            await handler(_drop_own_wire())
-
-        assert len(forwarded) == 1
-
-    @pytest.mark.asyncio
-    async def test_a_sync_hook_is_refused_although_the_handler_runs_on_another_loop(self) -> None:
-        """Value hooks call `handle_request` synchronously, which runs the handler on the websocket loop.
-
-        The node being rebuilt is a context variable, so this holds only while that hop carries the
-        caller's context with it.
-        """
-        event_manager = EventManager()
-        forwarded: list[RequestPayload] = []
-        handler = _handler_recording_forwards(event_manager, forwarded)
-        event_manager.assign_manager_to_request_type(DeleteConnectionRequest, handler)
-
-        ws_loop = asyncio.new_event_loop()
-        ws_thread = threading.Thread(target=ws_loop.run_forever, daemon=True)
-        ws_thread.start()
-        event_manager._websocket_event_loop = ws_loop
         try:
-            with event_manager.node_execution_scope(), event_manager.hydration_scope(REBUILT):
+            with event_manager.rebuild_scope(REBUILT):
+                result = await event_manager.ahandle_request(_drop_own_wire())
+        finally:
+            release.set()
+            await running
+
+        assert isinstance(result.result, DeleteConnectionResultSuccess)
+        assert answers.seen == ["local"]
+
+    @pytest.mark.asyncio
+    async def test_handle_request_is_answered_here_while_another_chain_runs_a_node(self) -> None:
+        """Sync sends from library code during a load must not hop to the forwarding loop at all."""
+        event_manager = EventManager()
+        answers = _Answers()
+        _register_forwarded_delete(event_manager, answers)
+        release = asyncio.Event()
+        running = asyncio.create_task(_another_chain_running_a_node(event_manager, release))
+        await asyncio.sleep(0)
+        assert event_manager.in_node_execution()
+
+        try:
+            with event_manager.rebuild_scope(REBUILT):
                 result = event_manager.handle_request(_drop_own_wire())
         finally:
-            ws_loop.call_soon_threadsafe(ws_loop.stop)
-            ws_thread.join(timeout=1.0)
-            ws_loop.close()
+            release.set()
+            await running
 
-        assert isinstance(result.result, DeleteConnectionResultFailure)
-        assert forwarded == []
+        assert isinstance(result.result, DeleteConnectionResultSuccess)
+        assert answers.seen == ["local"]
+
+    @pytest.mark.asyncio
+    async def test_the_running_chain_still_forwards_while_another_rebuilds(self) -> None:
+        event_manager = EventManager()
+        answers = _Answers()
+        _register_forwarded_delete(event_manager, answers)
+        rebuilding = asyncio.Event()
+        finished_rebuilding = asyncio.Event()
+
+        async def rebuild() -> None:
+            with event_manager.rebuild_scope(REBUILT):
+                rebuilding.set()
+                await finished_rebuilding.wait()
+
+        rebuild_task = asyncio.create_task(rebuild())
+        await rebuilding.wait()
+        try:
+            with event_manager.node_execution_scope():
+                result = await event_manager.ahandle_request(_drop_own_wire())
+        finally:
+            finished_rebuilding.set()
+            await rebuild_task
+
+        assert isinstance(result.result, DeleteConnectionResultSuccess)
+        assert answers.seen == ["orchestrator"]
+
+    @pytest.mark.asyncio
+    async def test_an_edit_forwards_once_the_rebuild_is_over(self) -> None:
+        """Once the copy is built, an edit is the running node's own and belongs to the orchestrator."""
+        event_manager = EventManager()
+        answers = _Answers()
+        _register_forwarded_delete(event_manager, answers)
+
+        with event_manager.node_execution_scope():
+            with event_manager.rebuild_scope(REBUILT):
+                pass
+            await event_manager.ahandle_request(_drop_own_wire())
+
+        assert answers.seen == ["orchestrator"]

@@ -13,6 +13,7 @@ from .duplicate_model_id_problem import DuplicateModelIdProblem
 from .duplicate_node_registration_problem import DuplicateNodeRegistrationProblem
 from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationProblem
 from .engine_version_error_problem import EngineVersionErrorProblem
+from .execution_event_listener_registration_problem import ExecutionEventListenerRegistrationProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
 from .invalid_beta_feature_problem import InvalidBetaFeatureProblem
@@ -25,6 +26,7 @@ from .library_not_provided_by_environment_problem import LibraryNotProvidedByEnv
 from .library_problem import LibraryProblem
 from .library_schema_exception_problem import LibrarySchemaExceptionProblem
 from .library_schema_validation_problem import LibrarySchemaValidationProblem
+from .mcp_tool_registration_problem import MCPToolRegistrationProblem
 from .modified_parameters_set_deprecation_warning_problem import ModifiedParametersSetDeprecationWarningProblem
 from .modified_parameters_set_removed_problem import ModifiedParametersSetRemovedProblem
 from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
@@ -61,6 +63,7 @@ __all__ = [
     "DuplicateNodeRegistrationProblem",
     "DuplicateWidgetRegistrationProblem",
     "EngineVersionErrorProblem",
+    "ExecutionEventListenerRegistrationProblem",
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
     "InvalidBetaFeatureProblem",
@@ -73,6 +76,7 @@ __all__ = [
     "LibraryProblem",
     "LibrarySchemaExceptionProblem",
     "LibrarySchemaValidationProblem",
+    "MCPToolRegistrationProblem",
     "ModifiedParametersSetDeprecationWarningProblem",
     "ModifiedParametersSetRemovedProblem",
     "NodeClassNotBaseNodeProblem",

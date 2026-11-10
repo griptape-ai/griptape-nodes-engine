@@ -51,14 +51,14 @@ def _events() -> dict[str, BaseEvent]:
         "EventRequest": EventRequest(request=_request(), request_id="r1", response_topic="t"),
         "EventRequestBatch": EventRequestBatch(requests=[EventRequest(request=_request(), request_id="a")]),
         "EventResultSuccess": EventResultSuccess(
-            request=_request(), result=_success(), request_id="r1", retained_mode="m"
+            request=_request(), result=_success(), request_id="r1", retained_mode="m", engine_id="e1"
         ),
         "EventResultFailure": EventResultFailure(
             request=_request(),
             result=GetParameterValueResultFailure(result_details="nope"),
             request_id="r2",
         ),
-        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n")),
+        "ExecutionEvent": ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n"), workflow_id="wf"),
         "AppEvent": AppEvent(payload=AppInitializationComplete()),
     }
 
@@ -135,6 +135,16 @@ def test_batch_round_trips_through_json() -> None:
     assert converters.engine.unstructure(restored) == converters.engine.unstructure(original)
 
 
+def test_an_execution_events_workflow_survives_json() -> None:
+    """The workflow an execution event names reaches the client that rebuilds it."""
+    original = _events()["ExecutionEvent"]
+    assert isinstance(original, ExecutionEvent)
+    restored = converters.engine.structure(
+        json.loads(json.dumps(converters.engine.unstructure(original), default=str)), ExecutionEvent
+    )
+    assert restored.workflow_id == original.workflow_id == "wf"
+
+
 def test_payload_fields_hold_unstructured_output() -> None:
     """Payload fields use converter hooks, not pydantic serialization."""
     serialized = converters.engine.unstructure(_events()["EventResultSuccess"])
@@ -149,6 +159,7 @@ def test_non_payload_fields_survive_exclusion() -> None:
     serialized = converters.engine.unstructure(_events()["EventResultSuccess"])
     assert serialized["request_id"] == "r1"
     assert serialized["retained_mode"] == "m"
+    assert serialized["engine_id"] == "e1"
     assert "response_topic" in serialized
 
 
@@ -172,6 +183,8 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "request_id",
         "response_topic",
         "retained_mode",
+        "open_workflow_id",
+        "engine_id",
         "event_type",
         "request_type",
         "result_type",
@@ -179,6 +192,7 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "result",
     ]
     assert list(converters.engine.unstructure(_events()["ExecutionEvent"])) == [
+        "workflow_id",
         "event_type",
         "payload_type",
         "payload",

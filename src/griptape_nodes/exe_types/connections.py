@@ -176,7 +176,7 @@ class Connections:
         connections_from_node = connections.get(node.name, {})
 
         connection_id = connections_from_node.get(parameter.name, [])
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/859
+        # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/859
         if not len(connection_id):
             return None
         # Right now, our special case is that it is ok to have multiple inputs to a CONTROL_TYPE parameter, so if we're going upstream, it's ok. And it's ok to have multiple downstream outputs from a data type parameter.
@@ -202,6 +202,16 @@ class Connections:
                 return ConnectionData(connection.target_node, connection.target_parameter)
             # Return the source (next place to chain back to)
             return ConnectionData(connection.source_node, connection.source_parameter)
+        return None
+
+    def find_connection(
+        self, source_node: str, source_parameter: str, target_node: str, target_parameter: str
+    ) -> Connection | None:
+        """The connection between these node and parameter names, or None."""
+        for connection_id in self.outgoing_index.get(source_node, {}).get(source_parameter, []):
+            connection = self.connections[connection_id]
+            if connection.target_node.name == target_node and connection.target_parameter.name == target_parameter:
+                return connection
         return None
 
     def remove_connection_by_object(self, conn: Connection) -> bool:
@@ -298,14 +308,53 @@ class Connections:
 
         return internal_connections
 
-    def unresolve_future_nodes(self, node: BaseNode) -> None:
+    def collect_downstream_data_nodes(self, node: BaseNode, visited: set[str] | None = None) -> set[str]:
+        """Return the names of every node reachable from ``node`` through data connections.
+
+        The same walk as ``unresolve_future_nodes`` without touching any node's state. A caller that
+        passes its own ``visited`` set gets the union across several roots in one pass; the root
+        itself is recorded in ``visited`` but is not part of the returned set.
+        """
+        if visited is None:
+            visited = set()
+        downstream: set[str] = set()
+        if node.name in visited:
+            return downstream
+        visited.add(node.name)
+        pending = [node]
+        while pending:
+            current = pending.pop()
+            for connection_ids in self.outgoing_index.get(current.name, {}).values():
+                for connection_id in connection_ids:
+                    connection = self.connections.get(connection_id)
+                    if connection is None or not self._carries_data(connection):
+                        continue
+                    target_node = connection.target_node
+                    downstream.add(target_node.name)
+                    if target_node.name in visited:
+                        continue
+                    visited.add(target_node.name)
+                    pending.append(target_node)
+        return downstream
+
+    def unresolve_future_nodes(self, node: BaseNode, visited: set[str] | None = None) -> None:
         """Mark every RESOLVED node downstream of ``node`` through data connections as UNRESOLVED.
 
         The walk goes on through nodes that are already unresolved: resolution state is set per
         node (on workflow load, by locks, on cancel), so an unresolved node can sit upstream of a
         resolved one. Iterative, so a long chain cannot exhaust the recursion limit.
+
+        ``visited`` guards against cycles. A caller that passes its own set makes the walk
+        incremental: a root already in the set is not walked, and the walk does not descend past a
+        node already in the set (it still marks that node when it crosses the edge into it). A
+        scheduler that unresolves downstream of every node it executes can hand it one set per run
+        and have each node's subtree walked once instead of once per upstream execution.
         """
-        visited = {node.name}
+        if visited is None:
+            visited = set()
+        if node.name in visited:
+            return
+        visited.add(node.name)
         pending = [node]
         while pending:
             current = pending.pop()

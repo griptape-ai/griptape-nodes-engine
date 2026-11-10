@@ -280,8 +280,9 @@ def _read_saved_source(file_path: str) -> str:
 
 
 def _reload_from_disk(engine: Engine, file_path: str) -> None:
-    """Tear down the live graph, then exec the saved file's ``build_workflow()`` against the engine."""
+    """Tear down the live graph, then open the saved file and exec its ``build_workflow()`` into it."""
     engine.clear_current_workflow_data()
+    engine.context_manager.push_workflow(file_path=file_path)
 
     source = _read_saved_source(file_path)
     exec_globals: dict[str, object] = {"__file__": file_path}

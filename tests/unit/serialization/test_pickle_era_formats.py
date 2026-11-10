@@ -104,7 +104,9 @@ def _restore_from_image(engine: Engine, file_name: str) -> BaseNode:
     return engine.node_manager.get_node_by_name(result.node_name_mappings["Holder"])
 
 
-def _run_workflow_source(source: str, file_name: str) -> None:
+def _run_workflow_source(engine: Engine, source: str, file_name: str) -> None:
+    """Open the file as a workflow and build it, as the engine's loader does."""
+    engine.context_manager.push_workflow(file_path=file_name)
     exec_globals: dict[str, object] = {"__file__": file_name}
     exec(compile(source, file_name, "exec"), exec_globals)  # noqa: S102
     asyncio.run(exec_globals["build_workflow"]())  # type: ignore[operator]
@@ -114,7 +116,7 @@ class TestPickleEraFormats:
     @pytest.mark.usefixtures("library_name")
     def test_saved_workflow_restores_every_value(self, engine: Engine) -> None:
         workflow_path = FIXTURES / "pickle_era_workflow.py"
-        _run_workflow_source(workflow_path.read_text(), str(workflow_path))
+        _run_workflow_source(engine, workflow_path.read_text(), str(workflow_path))
 
         _assert_holder_restored(engine.node_manager.get_node_by_name("Holder"))
 
@@ -122,7 +124,7 @@ class TestPickleEraFormats:
     def test_saved_workflow_keeps_every_value_after_saving_again(self, engine: Engine) -> None:
         """The first save after upgrading rewrites the file in plain data, so nothing may drop there."""
         workflow_path = FIXTURES / "pickle_era_workflow.py"
-        _run_workflow_source(workflow_path.read_text(), str(workflow_path))
+        _run_workflow_source(engine, workflow_path.read_text(), str(workflow_path))
         serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name="ControlFlow_1"))
         assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
         resaved_source = engine.workflow_manager.codegen.generate_workflow_file_content(
@@ -137,7 +139,7 @@ class TestPickleEraFormats:
         assert "pickle.loads" not in resaved_source
         engine.clear_current_workflow_data()
 
-        _run_workflow_source(resaved_source, "resaved_workflow.py")
+        _run_workflow_source(engine, resaved_source, "resaved_workflow.py")
 
         _assert_holder_restored(engine.node_manager.get_node_by_name("Holder"))
 
