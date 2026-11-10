@@ -39,6 +39,8 @@ LIBRARY_PROVISIONED_BY_KEY = "library.provisioned_by"
 LIBRARY_SANDBOX_ENABLED_KEY = "library.sandbox_enabled"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
+WIDGET_TOOLING_NODE_EXECUTABLE_KEY = "widget_tooling.node_executable"
+WIDGET_TOOLING_NPM_EXECUTABLE_KEY = "widget_tooling.npm_executable"
 LOG_TO_FILE_KEY = "logging.log_to_file"
 LOG_DIRECTORY_KEY = "logging.log_directory"
 LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
@@ -645,6 +647,34 @@ class LibrarySettings(BaseModel):
         return LibraryDependencyInstallBehavior.ALWAYS
 
 
+class WidgetToolingSettings(BaseModel):
+    """The Node.js and npm installation the engine uses to build library widgets from source."""
+
+    node_executable: str | None = Field(
+        category=LIBRARIES,
+        default=None,
+        description=(
+            "Absolute path to the Node.js executable on the computer running the engine (for example "
+            "/usr/local/bin/node or C:\\Program Files\\nodejs\\node.exe), used to build the widgets of "
+            "libraries that ship them as source. The path is on the engine's computer, not the one running "
+            "the editor. Both this and widget_tooling.npm_executable must be set; leaving either unset or "
+            "empty (the default) turns widget builds off. The engine never looks for Node.js on PATH or "
+            "downloads it. Requires Node.js 20 or newer and the 'Library widget builds' beta feature."
+        ),
+    )
+    npm_executable: str | None = Field(
+        category=LIBRARIES,
+        default=None,
+        description=(
+            "Absolute path to npm on the computer running the engine (for example /usr/local/bin/npm or "
+            "C:\\Program Files\\nodejs\\npm.cmd), used to build the widgets of libraries that ship them as "
+            "source. npm always runs under widget_tooling.node_executable. Both must be set; leaving either "
+            "unset or empty (the default) turns widget builds off. The engine never looks for npm on PATH. "
+            "Requires npm 10 or newer."
+        ),
+    )
+
+
 class LoggingSettings(BaseModel):
     """Settings for engine log capture, used when reporting a problem."""
 
@@ -899,6 +929,10 @@ class Settings(BaseModel):
     library: LibrarySettings = Field(
         category=LIBRARIES,
         default_factory=LibrarySettings,
+    )
+    widget_tooling: WidgetToolingSettings = Field(
+        category=LIBRARIES,
+        default_factory=WidgetToolingSettings,
     )
     beta_features: dict[str, bool] = Field(
         category=BETA_FEATURES,

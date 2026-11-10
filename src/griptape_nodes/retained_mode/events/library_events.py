@@ -1130,12 +1130,17 @@ class UpdateLibraryRequest(RequestPayload):
     Args:
         library_name: Name of the library to update
         overwrite_existing: If True, discard any uncommitted local changes. If False, fail if uncommitted changes exist (default: False)
+        allow_widget_build: Whether the user agreed to run the library's widget build tools after
+            the update, for a library that builds its widgets from source. See
+            PrepareLibraryWidgetsRequest. A widget build that is refused or fails never fails the
+            update; the result details say why (default: False)
 
     Results: UpdateLibraryResultSuccess (with version info) | UpdateLibraryResultFailure (library not found, git error, update failure)
     """
 
     library_name: str
     overwrite_existing: bool = False
+    allow_widget_build: bool = False
 
 
 @dataclass
@@ -1191,12 +1196,17 @@ class SwitchLibraryRefRequest(RequestPayload):
     Args:
         library_name: Name of the library to switch
         ref_name: Name of the branch or tag to switch to
+        allow_widget_build: Whether the user agreed to run the library's widget build tools after
+            the switch, for a library that builds its widgets from source. See
+            PrepareLibraryWidgetsRequest. A widget build that is refused or fails never fails the
+            switch; the result details say why (default: False)
 
     Results: SwitchLibraryRefResultSuccess (with ref/version info) | SwitchLibraryRefResultFailure (library not found, git error, ref not found)
     """
 
     library_name: str
     ref_name: str
+    allow_widget_build: bool = False
 
 
 @dataclass
@@ -1244,6 +1254,11 @@ class DownloadLibraryRequest(RequestPayload):
         auto_register: If True, automatically register library after download (default: True)
         fail_on_exists: If True, fail with retryable error when directory exists and overwrite_existing=False.
                        If False, skip clone and register existing library (idempotent). (default: True)
+        allow_widget_build: Whether the user agreed to run the library's widget build tools after the
+            clone, for a library that builds its widgets from source. See PrepareLibraryWidgetsRequest.
+            A widget build that is refused or fails never fails the download; the result details say
+            why. Nothing is built when the clone is skipped because the library already exists.
+            (default: False)
 
     Results: DownloadLibraryResultSuccess (with library info) | DownloadLibraryResultFailure (clone error, directory exists)
     """
@@ -1255,6 +1270,7 @@ class DownloadLibraryRequest(RequestPayload):
     overwrite_existing: bool = False
     auto_register: bool = True
     fail_on_exists: bool = True
+    allow_widget_build: bool = False
 
 
 @dataclass
@@ -1379,6 +1395,111 @@ class ResetLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class ResetLibraryResultFailure(ResultPayloadFailure):
     """Library reset failed. Common causes: library not found, library disabled, the environment provides the libraries, the library failed to load again after its environments were rebuilt."""
+
+
+class WidgetPreparationFailureReason(StrEnum):
+    """Why a library's widgets were not prepared. The string value is what clients receive.
+
+    Each refusal before `build_failed` happens before anything runs, so the library's files and
+    its earlier preparation state are left as they were.
+    """
+
+    # No library with that name is known to the engine.
+    LIBRARY_NOT_FOUND = "library_not_found"
+    # The environment the engine runs in provides its libraries, so the engine builds nothing.
+    MANAGED_ENVIRONMENT = "managed_environment"
+    # The "Library widget builds" beta feature, or beta features as a whole, are turned off.
+    BETA_DISABLED = "beta_disabled"
+    # widget_tooling.node_executable or widget_tooling.npm_executable is not set.
+    TOOLING_NOT_CONFIGURED = "tooling_not_configured"
+    # A configured tool path is not usable: not absolute, missing, not a file, or too old.
+    TOOLING_INVALID = "tooling_invalid"
+    # The request did not allow the library's build tools to run.
+    NOT_AUTHORIZED = "not_authorized"
+    # The library does not declare metadata.widget_build with mode "source".
+    NOT_SOURCE_MODE = "not_source_mode"
+    # The widget package is incomplete or points outside the library.
+    INVALID_MANIFEST = "invalid_manifest"
+    # npm ci or the build script exited with an error.
+    BUILD_FAILED = "build_failed"
+    # A stage ran longer than the engine allows and was stopped.
+    TIMED_OUT = "timed_out"
+    # The preparation was stopped before it finished.
+    CANCELLED = "cancelled"
+
+
+@dataclass
+@PayloadRegistry.register
+class PrepareLibraryWidgetsRequest(RequestPayload):
+    """Build a library's widgets from the source it ships, so the editor can load them.
+
+    For a library whose manifest sets `metadata.widget_build.mode` to "source", runs, from the
+    widget package directory, `npm ci --include=dev --include=optional --ignore-scripts` and then
+    `npm run build --ignore-scripts`, using the Node.js and npm configured in `widget_tooling`.
+    Install-time and implicit lifecycle scripts never run; only the package's `build` script does.
+    Until this succeeds for the library's current revision, its widgets are not published and the
+    editor shows the normal parameter controls instead. Works on a library that failed to load,
+    as long as its manifest can be read.
+
+    Requires the `widget_source_builds` beta feature and both `widget_tooling` paths. Building runs
+    the library's and its dependencies' code on the engine's computer with the user's permissions,
+    so it runs only when `allow_build_execution` is True; neither the beta feature nor the
+    configured tools imply it. Changes made to a local checkout without a new git commit are not
+    detected: prepare it again after editing it.
+
+    Use when: A library's widgets are missing because their build was refused, failed, or never
+    ran, or after editing a local library's widget source.
+
+    Args:
+        library_name: Name of the library whose widgets to build
+        allow_build_execution: Whether the user agreed to run the library's build tools. Defaults
+            to False, which refuses with `not_authorized`.
+
+    Results: PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure (see WidgetPreparationFailureReason)
+    """
+
+    library_name: str
+    allow_build_execution: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class PrepareLibraryWidgetsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The library's widgets were built and are published for its current revision.
+
+    Args:
+        library_name: Name of the library whose widgets were built
+        revision: The git commit the widgets were built from, or "local" for a library that is not
+            a git checkout
+        node_version: Version reported by the configured Node.js, such as "v22.11.0"
+        npm_version: Version reported by the configured npm, such as "10.9.0"
+        output: The last part of the combined output of npm ci and the build
+    """
+
+    library_name: str
+    revision: str
+    node_version: str
+    npm_version: str
+    output: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PrepareLibraryWidgetsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The library's widgets were not built. `reason` says why; see WidgetPreparationFailureReason.
+
+    Args:
+        library_name: Name of the library whose widgets were requested
+        reason: Why the widgets were not built
+        stage: The step that failed when the build had started: "install" (npm ci) or "build"
+            (npm run build). None for a refusal before anything ran.
+        output: The last part of the failed step's combined output, empty for a refusal
+    """
+
+    library_name: str
+    reason: WidgetPreparationFailureReason
+    stage: str | None = None
+    output: str = ""
 
 
 @dataclass

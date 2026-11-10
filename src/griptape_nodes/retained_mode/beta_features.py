@@ -354,3 +354,17 @@ ISOLATED_EXECUTION_IN_WORKER = register_beta_feature(
         remove_by=date(2027, 4, 1),
     )
 )
+
+WIDGET_SOURCE_BUILDS = register_beta_feature(
+    BetaFeature(
+        id="widget_source_builds",
+        name="Library widget builds",
+        description=(
+            "Lets libraries that ship their custom widgets as source code build them when you install, update, "
+            "or prepare the library, using the Node.js and npm set in Settings. Building runs the library's own "
+            "build tools on this computer with your permissions."
+        ),
+        owner="@hutchinson",
+        remove_by=date(2027, 4, 30),
+    )
+)

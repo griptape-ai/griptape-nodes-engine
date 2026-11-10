@@ -14,6 +14,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
     LibraryRegistration,
     Settings,
+    WidgetToolingSettings,
 )
 
 
@@ -186,3 +187,18 @@ class TestDistributedExecutionMaxWorkers:
         settings = DistributedExecutionSettings.model_validate({"max_workers": value})
 
         assert settings.max_workers == value
+
+
+class TestWidgetToolingSettings:
+    def test_both_paths_default_to_unset(self) -> None:
+        settings = Settings()
+
+        assert settings.widget_tooling == WidgetToolingSettings(node_executable=None, npm_executable=None)
+
+    def test_paths_are_read_from_the_widget_tooling_section(self) -> None:
+        settings = Settings.model_validate(
+            {"widget_tooling": {"node_executable": "/opt/node/bin/node", "npm_executable": "/opt/node/bin/npm"}}
+        )
+
+        assert settings.widget_tooling.node_executable == "/opt/node/bin/node"
+        assert settings.widget_tooling.npm_executable == "/opt/node/bin/npm"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -126,6 +126,21 @@ class ResourceRequirements(BaseModel):
         return converted
 
 
+class WidgetBuildMetadata(BaseModel):
+    """How a library's widget bundles come to exist.
+
+    `source` libraries ship widget source and an npm package; the engine runs the package's
+    `build` script to produce the bundles their `widgets` entries name, and publishes those
+    widgets only once that has succeeded for the checked-out revision. `prebuilt` libraries ship
+    the bundles themselves, and the package is only for the author's own builds. A library
+    without this block ships plain JavaScript bundles, as before.
+    """
+
+    mode: Literal["source", "prebuilt"]
+    # Directory holding package.json and package-lock.json, relative to the library JSON's directory.
+    root: str
+
+
 class LibraryMetadata(BaseModel):
     """Metadata that explains details about the library, including versioning and search details."""
 
@@ -142,6 +157,8 @@ class LibraryMetadata(BaseModel):
     # Declarative properties / capabilities for this library. Applies to all nodes in the library.
     # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[LibraryDeclaration] = Field(default_factory=list)
+    # How the library's widget bundles are produced. None means the widgets are plain JavaScript files.
+    widget_build: WidgetBuildMetadata | None = None
 
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
@@ -257,7 +274,8 @@ class LibrarySchema(BaseModel):
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
     # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
     # optional beta_features list, which older engines ignore.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.14.0"
+    # 0.15.0 adds the optional metadata.widget_build block, which older engines ignore.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.15.0"
 
     name: str
     library_schema_version: str

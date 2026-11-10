@@ -19,7 +19,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
 )
-from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
+from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails, ResultPayloadFailure
 from griptape_nodes.retained_mode.events.library_events import (
     CheckLibraryUpdateRequest,
     CheckLibraryUpdateResultFailure,
@@ -30,6 +30,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     InspectLibraryRepoRequest,
     InspectLibraryRepoResultFailure,
     InspectLibraryRepoResultSuccess,
+    PrepareLibraryWidgetsResultFailure,
+    PrepareLibraryWidgetsResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
     SwitchLibraryRefRequest,
@@ -78,6 +80,8 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
+
+LIBRARY_JSON_PATTERN = "griptape[-_]nodes[-_]library.json"
 
 
 class LibraryGitOperationContext(NamedTuple):
@@ -469,6 +473,11 @@ class LibraryGitOperations(EngineScoped):
         except GitError as e:
             logger.debug("Skipped post-update commit verification for Library '%s': %s", library_name, e)
 
+        # Before the reload, so the library's widgets are ready, or withheld, when it loads.
+        widget_preparation = await self._prepare_widgets_after_checkout(
+            library_name, library_dir, library_file_path, allow_build_execution=request.allow_widget_build
+        )
+
         # Reload library
         reload_result = await self.reload_library(
             library_name=library_name,
@@ -481,7 +490,10 @@ class LibraryGitOperations(EngineScoped):
         new_version = reload_result
 
         return self._build_library_update_result(
-            library_name=library_name, old_version=old_version, new_version=new_version
+            library_name=library_name,
+            old_version=old_version,
+            new_version=new_version,
+            widget_preparation=widget_preparation,
         )
 
     @handles(SwitchLibraryRefRequest)
@@ -528,6 +540,11 @@ class LibraryGitOperations(EngineScoped):
             details = f"Failed to switch to '{ref_name}' for Library '{library_name}': {e}"
             return SwitchLibraryRefResultFailure(result_details=details)
 
+        # Before the reload, so the library's widgets are ready, or withheld, when it loads.
+        widget_preparation = await self._prepare_widgets_after_checkout(
+            library_name, library_dir, library_file_path, allow_build_execution=request.allow_widget_build
+        )
+
         # Reload library
         reload_result = await self.reload_library(
             library_name=library_name,
@@ -553,6 +570,7 @@ class LibraryGitOperations(EngineScoped):
             new_ref=new_ref,
             old_version=old_version,
             new_version=new_version,
+            widget_preparation=widget_preparation,
         )
 
     @handles(DownloadLibraryRequest)
@@ -638,7 +656,7 @@ class LibraryGitOperations(EngineScoped):
                 return DownloadLibraryResultFailure(result_details=details)
 
         # Recursively search for griptape_nodes_library.json file
-        library_json_path = find_file_in_directory(target_path, "griptape[-_]nodes[-_]library.json")
+        library_json_path = find_file_in_directory(target_path, LIBRARY_JSON_PATTERN)
         if library_json_path is None:
             details = f"Downloaded library from {git_url} but no library JSON file found in {target_path}"
             return DownloadLibraryResultFailure(result_details=details)
@@ -655,6 +673,16 @@ class LibraryGitOperations(EngineScoped):
         if library_name is None:
             details = "Downloaded library has no 'name' field in griptape_nodes_library.json"
             return DownloadLibraryResultFailure(result_details=details)
+
+        # Only a fresh clone is prepared: a library that was already there keeps whatever
+        # preparation it had. Before registration, so its widgets are ready, or withheld, when it loads.
+        widget_preparation: PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure | None = None
+        if not skip_clone:
+            widget_preparation = await self.engine.library_manager.widget_preparation.prepare_after_checkout(
+                library_name if isinstance(library_name, str) else None,
+                library_json_path,
+                allow_build_execution=request.allow_widget_build,
+            )
 
         # Automatically register the downloaded library (unless disabled for startup downloads)
         if request.auto_register:
@@ -703,7 +731,7 @@ class LibraryGitOperations(EngineScoped):
         return DownloadLibraryResultSuccess(
             library_name=library_name,
             library_path=str(library_json_path),
-            result_details=details,
+            result_details=self._with_widget_preparation_details(details, widget_preparation),
         )
 
     @handles(InspectLibraryRepoRequest)
@@ -776,7 +804,7 @@ class LibraryGitOperations(EngineScoped):
         # Search for the library JSON file using flexible pattern to handle filename variations
         # (after git operations, the filename might change between griptape-nodes-library.json and griptape_nodes_library.json)
         library_dir = Path(library_file_path).parent
-        actual_library_file = find_file_in_directory(library_dir, "griptape[-_]nodes[-_]library.json")
+        actual_library_file = find_file_in_directory(library_dir, LIBRARY_JSON_PATTERN)
 
         if actual_library_file is None:
             details = (
@@ -831,6 +859,23 @@ class LibraryGitOperations(EngineScoped):
             new_version = "unknown"
 
         return new_version
+
+    async def _prepare_widgets_after_checkout(
+        self,
+        library_name: str,
+        library_dir: Path,
+        library_file_path: str,
+        *,
+        allow_build_execution: bool,
+    ) -> PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure | None:
+        """Prepare the widgets of a library git just changed, using the library JSON now on disk.
+
+        The change may have renamed the JSON between its accepted spellings, so it is found again.
+        """
+        library_json_path = find_file_in_directory(library_dir, LIBRARY_JSON_PATTERN) or Path(library_file_path)
+        return await self.engine.library_manager.widget_preparation.prepare_after_checkout(
+            library_name, library_json_path, allow_build_execution=allow_build_execution
+        )
 
     def _check_engine_version_compatibility(self, required_engine_version: str) -> tuple[bool, str]:
         """Check if a required engine version is compatible with the current engine.
@@ -1049,7 +1094,12 @@ class LibraryGitOperations(EngineScoped):
         )
 
     def _build_library_update_result(
-        self, *, library_name: str, old_version: str, new_version: str
+        self,
+        *,
+        library_name: str,
+        old_version: str,
+        new_version: str,
+        widget_preparation: PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure | None = None,
     ) -> UpdateLibraryResultSuccess:
         """Report an update that landed on disk, flagging a restart when this engine cannot run it.
 
@@ -1057,12 +1107,18 @@ class LibraryGitOperations(EngineScoped):
             library_name: Name of the updated library
             old_version: Version the library was on before the update
             new_version: Version now on disk
+            widget_preparation: The result of preparing the library's widgets after the update, or
+                None when it does not build them from source
         """
         stale_module_explanation = self.engine.library_manager.catalog.explain_restart_after_reload(library_name)
 
         if stale_module_explanation is None:
             details = f"Successfully updated Library '{library_name}' from version {old_version} to {new_version}."
-            return UpdateLibraryResultSuccess(old_version=old_version, new_version=new_version, result_details=details)
+            return UpdateLibraryResultSuccess(
+                old_version=old_version,
+                new_version=new_version,
+                result_details=self._with_widget_preparation_details(details, widget_preparation),
+            )
 
         details = (
             f"Updated Library '{library_name}' from version {old_version} to {new_version} on disk. "
@@ -1072,11 +1128,18 @@ class LibraryGitOperations(EngineScoped):
             old_version=old_version,
             new_version=new_version,
             restart_required=True,
-            result_details=details,
+            result_details=self._with_widget_preparation_details(details, widget_preparation),
         )
 
-    def _build_library_ref_switch_result(
-        self, *, library_name: str, old_ref: str, new_ref: str, old_version: str, new_version: str
+    def _build_library_ref_switch_result(  # noqa: PLR0913 (one argument per reported field)
+        self,
+        *,
+        library_name: str,
+        old_ref: str,
+        new_ref: str,
+        old_version: str,
+        new_version: str,
+        widget_preparation: PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure | None = None,
     ) -> SwitchLibraryRefResultSuccess:
         """Report a ref switch that landed on disk, flagging a restart when this engine cannot run it.
 
@@ -1086,6 +1149,8 @@ class LibraryGitOperations(EngineScoped):
             new_ref: Branch or tag now checked out
             old_version: Version the library was on before the switch
             new_version: Version now on disk
+            widget_preparation: The result of preparing the library's widgets after the switch, or
+                None when it does not build them from source
         """
         stale_module_explanation = self.engine.library_manager.catalog.explain_restart_after_reload(library_name)
 
@@ -1096,7 +1161,7 @@ class LibraryGitOperations(EngineScoped):
                 new_ref=new_ref,
                 old_version=old_version,
                 new_version=new_version,
-                result_details=details,
+                result_details=self._with_widget_preparation_details(details, widget_preparation),
             )
 
         details = (
@@ -1109,5 +1174,29 @@ class LibraryGitOperations(EngineScoped):
             old_version=old_version,
             new_version=new_version,
             restart_required=True,
-            result_details=details,
+            result_details=self._with_widget_preparation_details(details, widget_preparation),
         )
+
+    @staticmethod
+    def _with_widget_preparation_details(
+        details: str,
+        widget_preparation: PrepareLibraryWidgetsResultSuccess | PrepareLibraryWidgetsResultFailure | None,
+    ) -> ResultDetails | str:
+        """A git operation's success details, with what happened to the library's widgets.
+
+        A refused or failed preparation never fails the git operation. It is logged and added as a
+        warning, so the user learns why the widgets are missing.
+        """
+        if widget_preparation is None:
+            return details
+        main_detail = ResultDetail(level=logging.DEBUG, message=details)
+        if isinstance(widget_preparation, PrepareLibraryWidgetsResultSuccess):
+            return ResultDetails(
+                main_detail, ResultDetail(level=logging.INFO, message=str(widget_preparation.result_details))
+            )
+        warning = (
+            f"The Library's widgets were not built, so the editor shows its normal controls instead "
+            f"({widget_preparation.reason}). {widget_preparation.result_details}"
+        )
+        logger.warning(warning)
+        return ResultDetails(main_detail, ResultDetail(level=logging.WARNING, message=warning))
