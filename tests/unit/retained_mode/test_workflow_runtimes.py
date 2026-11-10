@@ -57,7 +57,6 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
-    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 def _live_machine() -> MagicMock:
@@ -138,7 +137,7 @@ class TestRuntimeLifecycle:
             assert not engine.context_manager.has_current_workflow()
         assert engine.context_manager.has_current_workflow()
 
-    def test_closing_the_bound_workflow_leaves_the_work_on_no_workflow_not_another_open_one(
+    def test_closing_the_bound_workflow_refuses_the_rest_of_the_work_rather_than_moving_it(
         self, engine: Engine
     ) -> None:
         engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
@@ -150,19 +149,19 @@ class TestRuntimeLifecycle:
 
         with engine.bind_workflow(closed):
             engine.context_manager.pop_workflow()
-            assert engine.current_workflow_or_none() is None
+            with pytest.raises(WorkflowNotOpenError):
+                engine.current_workflow_or_none()
 
         assert engine.open_workflows.all_open() == [other]
 
-    def test_a_request_acts_on_the_workflow_it_opens_until_it_ends(self, engine: Engine) -> None:
+    def test_a_request_that_opens_a_workflow_stays_bound_as_dispatch_bound_it(self, engine: Engine) -> None:
         engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
-        acted_on: list[WorkflowRuntime] = []
+        bindings: list[object] = []
 
         def open_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
-            # Two workflows are open once this one opens, so only the binding finds it.
             engine.context_manager.push_workflow(workflow_name="opened")
-            acted_on.append(engine.current_workflow())
+            bindings.append(bound_workflow.get())
             return ResultPayloadSuccess(result_details="ok")
 
         # A request from another engine starts bound to no workflow, so it can open one beside "other".
@@ -174,31 +173,9 @@ class TestRuntimeLifecycle:
             _ReplaceWorkflowRequest(), result_context=ResultContext(sender=RequestSender(engine_id="another-engine"))
         )
 
-        assert engine.open_workflows.all_open()[1] is acted_on[0]
+        assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
+        assert bindings == [NO_WORKFLOW]
         assert bound_workflow.get() is None
-
-    def test_a_request_with_no_envelope_id_that_replaces_the_workflow_acts_on_the_next_one(
-        self, engine: Engine
-    ) -> None:
-        engine.context_manager.push_workflow(workflow_name="closed")
-        closed = engine.current_workflow()
-        acted_on: list[WorkflowRuntime] = []
-
-        def replace_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
-            # Dispatch bound the request to the only open workflow, the one it closes.
-            engine.context_manager.pop_workflow()
-            engine.context_manager.push_workflow(workflow_name="next")
-            acted_on.append(engine.current_workflow())
-            return ResultPayloadSuccess(result_details="ok")
-
-        engine.event_manager.assign_manager_to_request_type(
-            _ReplaceWorkflowRequest, replace_workflow, without_workflow=None
-        )
-
-        engine.handle_request(_ReplaceWorkflowRequest())
-
-        assert acted_on[0] is not closed
-        assert engine.open_workflows.all_open() == acted_on
 
     def test_clear_all_object_state_closes_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
