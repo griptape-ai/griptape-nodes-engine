@@ -66,8 +66,8 @@ class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
-        open_workflow: The workflow open after the request, as the heartbeat lists it. None when the file
-            opened none.
+        open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it. None
+            when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
@@ -116,8 +116,7 @@ class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPaylo
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
-        open_workflow: The workflow open after the request, as the heartbeat lists it: the one the
-            file built into, whether the envelope named it or the request opened it.
+        open_workflow: The workflow the file built into, as `ListOpenWorkflowsRequest` lists it.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
@@ -148,7 +147,9 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     Args:
         workflow_name: Name of the workflow in the registry to execute
         run_with_clean_slate: Whether to close the open workflow first, while only one may be open
-            (default: True). With False, the request fails while a workflow is open and only one may be.
+            (default: True). With False, the request fails while a workflow is open and only one may
+            be. That failure names no blocking workflow: a client that needs it sends
+            `OpenWorkflowRequest`, whose `AnotherWorkflowOpenResultFailure` carries `blocking_workflow`.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
@@ -168,8 +169,8 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
-        open_workflow: The workflow open after the request, as the heartbeat lists it. None when the file
-            opened none.
+        open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it. None
+            when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
@@ -518,8 +519,8 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
         workflow_id: Id of the saved workflow. A Save As or versioned save
             writes a copy, with a new id.
-        open_workflow: The workflow open after the save, as the heartbeat lists it. When its id is
-            `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
+        open_workflow: The workflow open after the save, as `ListOpenWorkflowsRequest` lists it. When its
+            id is `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
             workflow moves onto its copy. Otherwise the save wrote a copy and the original stays open.
     """
 
