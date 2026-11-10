@@ -97,6 +97,10 @@ _active_request_id: ContextVar[str | None] = ContextVar("_event_manager_active_r
 # same time, and its requests still go to the orchestrator while this chain's are answered here.
 _rebuilding_node_name: ContextVar[str | None] = ContextVar("_event_manager_rebuilding_node_name", default=None)
 
+# Set while a synchronous request made on the engine loop's thread blocks that thread until its handler, driven
+# on a side loop, returns. Code running for it must not wait on the engine loop, which cannot run until it does.
+_blocking_engine_loop: ContextVar[bool] = ContextVar("_event_manager_blocking_engine_loop", default=False)
+
 # The fields a request names a node in.
 _NODE_NAME_FIELDS = ("node_name", "source_node_name", "target_node_name")
 
@@ -402,6 +406,19 @@ class EventManager(EngineScoped):
         dispatch coroutines onto the engine loop via asyncio.run_coroutine_threadsafe.
         """
         return self._event_loop
+
+    def engine_loop_to_wait_on(self) -> asyncio.AbstractEventLoop | None:
+        """The engine loop, if code running here can hand work to it and wait for the result, or None.
+
+        None on the engine loop itself, when no engine loop is running, and in code a synchronous request made
+        on the engine loop's thread is blocking that thread for.
+        """
+        loop = self._event_loop
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return None
+        if _running_loop() is loop or _blocking_engine_loop.get():
+            return None
+        return loop
 
     def should_suppress_event(self, event: BaseEvent | ProgressEvent) -> bool:
         """Whether this event must not reach websocket clients.
@@ -1921,8 +1938,13 @@ class EventManager(EngineScoped):
         if inspect.iscoroutinefunction(callback):
             if _running_loop() is None:
                 return asyncio.run(callback(request))
-            with ThreadRunner() as runner:
-                return runner.run(callback(request))
+            # ThreadRunner hands the coroutine over with the context current here, so the handler sees this.
+            token = _blocking_engine_loop.set(_blocking_engine_loop.get() or not self._is_cross_thread_call())
+            try:
+                with ThreadRunner() as runner:
+                    return runner.run(callback(request))
+            finally:
+                _blocking_engine_loop.reset(token)
 
         return callback(request)
 

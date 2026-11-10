@@ -2364,6 +2364,11 @@ class FlowManager(EngineScoped):
         flows = self._current_flows()
         if self._is_inside_run_in_progress(flows):
             return await self.join_run_in_progress(spec)
+        # The line has no lock: only one loop may touch it, so a run requested from another thread's loop
+        # queues on the engine loop's.
+        engine_loop = self.engine.event_manager.engine_loop_to_wait_on()
+        if engine_loop is not None:
+            return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.start_run(spec), engine_loop))
         run = self.submit_run(spec)
         try:
             return await asyncio.shield(run.outcome)

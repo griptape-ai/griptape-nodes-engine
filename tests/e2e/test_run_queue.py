@@ -7,6 +7,7 @@ starts another run and checks what it does while the first goes on and once it e
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -265,3 +266,66 @@ async def test_a_debug_run_cancelled_while_a_step_checks_a_node_ends_when_the_st
     assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
     assert _state(engine, "Next") is NodeResolutionState.RESOLVED
     assert _state(engine, "Holder") is not NodeResolutionState.RESOLVED
+
+
+def _record_submitting_loops(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[asyncio.AbstractEventLoop]:
+    loops: list[asyncio.AbstractEventLoop] = []
+    real_submit_run = engine.flow_manager.submit_run
+
+    def _record(*args: Any, **kwargs: Any) -> Any:
+        loops.append(asyncio.get_running_loop())
+        return real_submit_run(*args, **kwargs)
+
+    monkeypatch.setattr(engine.flow_manager, "submit_run", _record)
+    return loops
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_run_requested_synchronously_from_another_thread_waits_its_turn_on_the_engine_loop(
+    engine: Engine,
+    flow_name: str,  # noqa: ARG001
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A script thread's synchronous run request queues on the engine loop, so it cannot race the run ending there."""
+    engine.event_manager.initialize_queue()
+    engine_loop = asyncio.get_running_loop()
+    submitting_loops = _record_submitting_loops(engine, monkeypatch)
+    holding = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Holder")))
+    await _wait_for_state(engine, "Holder", NodeResolutionState.RESOLVING)
+
+    results: list[Any] = []
+
+    def request_from_thread() -> None:
+        results.append(engine.handle_request(StartFlowFromNodeRequest(node_name="Next")))
+
+    thread = threading.Thread(target=contextvars.copy_context().run, args=(request_from_thread,))
+    thread.start()
+    await asyncio.sleep(_WAITING_SECONDS)
+    assert thread.is_alive(), f"The thread's run did not wait for the first: {results}"
+    assert _state(engine, "Next") is not NodeResolutionState.RESOLVED
+
+    _open_gate(tmp_path)
+
+    assert isinstance(await _finish(holding), ResolveNodeResultSuccess)
+    await asyncio.to_thread(thread.join, _RUN_TIMEOUT_SECONDS)
+    assert results, "the thread's run request never returned"
+    assert isinstance(results[0], StartFlowFromNodeResultSuccess), results[0]
+    assert _state(engine, "Next") is NodeResolutionState.RESOLVED
+    assert submitting_loops == [engine_loop, engine_loop], "a run was queued off the engine loop"
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_run_requested_synchronously_on_the_engine_loops_thread_runs_without_waiting_on_that_loop(
+    engine: Engine,
+    flow_name: str,  # noqa: ARG001
+) -> None:
+    """The engine loop is blocked until the request returns, so the run cannot be handed to it."""
+    engine.event_manager.initialize_queue()
+
+    result = engine.handle_request(StartFlowFromNodeRequest(node_name="Next"))
+
+    assert isinstance(result, StartFlowFromNodeResultSuccess), result
+    assert _state(engine, "Next") is NodeResolutionState.RESOLVED
