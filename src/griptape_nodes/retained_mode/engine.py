@@ -38,8 +38,11 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    WorkflowClosedEvent,
+    WorkflowOpenedEvent,
 )
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     GriptapeNodeEvent,
     ResultPayloadFailure,
 )
@@ -140,13 +143,13 @@ _root_engine_building = False
 
 @dataclass
 class OpeningWorkflow:
-    """A workflow `Engine.opening_workflow` opened to build into."""
+    """A workflow `Engine.opening_workflow` opened to build into, which clients hear of once it is built."""
 
     workflow: WorkflowRuntime
     abandoned: bool = False
 
     def abandon(self) -> None:
-        """Close the workflow when the block ends, as a build that failed does."""
+        """Close the workflow when the block ends, instead of telling clients it opened."""
         self.abandoned = True
 
 
@@ -263,7 +266,8 @@ class Engine:
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
         self._open_workflows = OpenWorkflowSet(self)
-        # Each open workflow still being built, set once its build ends. See `opening_workflow`.
+        # Each open workflow still being built, which clients have not been told of, set once its
+        # build ends. See `opening_workflow`.
         self._opening_workflows: dict[WorkflowRuntime, asyncio.Event] = {}
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
         self._worker_workflows = WorkerWorkflowSet(self)
@@ -776,9 +780,9 @@ class Engine:
         return None
 
     def open_workflow(self, workflow_id: str) -> WorkflowRuntime:
-        """Open the registered workflow with this id and return its empty runtime.
+        """Open the registered workflow with this id, tell every client, and return its empty runtime.
 
-        To build into the workflow, closing it again if the build fails, open it with `opening_workflow`.
+        To build into the workflow before clients hear of it, open it with `opening_workflow`.
 
         Raises:
             OpenWorkflowError: That workflow, or another one, is already open.
@@ -789,11 +793,14 @@ class Engine:
 
     @contextmanager
     def opening_workflow(self, workflow_id: str) -> Iterator[OpeningWorkflow]:
-        """Open the registered workflow with this id to build into, closing it again if the build fails.
+        """Open the registered workflow with this id to build into, telling every client once the block ends.
 
-        A block that raises, or calls `OpeningWorkflow.abandon`, closes the workflow when it ends.
-        If that close fails, the workflow stays open as it is. Until the block ends, another open of
-        the workflow waits for its build with `wait_for_opening`.
+        Every open goes through here, and every close through `close_workflow`, so clients hear of
+        each workflow with one `WorkflowOpenedEvent` and one `WorkflowClosedEvent`. Clients hear of
+        the workflow once the block ends, so none reads it half built. A block that raises, or calls
+        `OpeningWorkflow.abandon`, closes the workflow again, and clients never hear of it. If that
+        close fails, the workflow stays open as it is, and clients are told of it. Until the block
+        ends, another open of the workflow waits for its build with `wait_for_opening`.
 
         Raises:
             OpenWorkflowError: That workflow, or another one, is already open.
@@ -948,6 +955,8 @@ class Engine:
             )
             raise OpenWorkflowError(msg)
         self._open_workflows.close(workflow)
+        if workflow not in self._opening_workflows:
+            self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(workflow_id=workflow.workflow_id)))
 
         # An unsaved workflow's graph lived only in the runtime just closed, so there is nothing left to reopen.
         entry = self._workflow_registry.find_by_id(workflow.workflow_id)
@@ -961,9 +970,10 @@ class Engine:
             logger.debug("Released %d held object(s) while closing the workflow.", dropped)
 
     def _finish_opening(self, workflow: WorkflowRuntime, *, keep: bool) -> None:
-        """End `opening_workflow`'s block, closing `workflow` unless `keep`, then wake anything waiting for its build.
+        """End `opening_workflow`'s block, then wake anything waiting for the build of `workflow`.
 
-        A workflow already closed, such as by the file building it, is left as it is.
+        Without `keep`, closes it unannounced. Tells clients of it if it is still open after that. A
+        workflow already closed, such as by the file building it, is left as it is.
         """
         try:
             if not keep and not workflow.closed:
@@ -975,7 +985,11 @@ class Engine:
                 err,
             )
         finally:
-            self._opening_workflows.pop(workflow).set()
+            build_ended = self._opening_workflows.pop(workflow)
+            if not workflow.closed:
+                opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+                self._event_manager.put_event(AppEvent(payload=opened_event))
+            build_ended.set()
 
     def _delete_workflow_flows(self, workflow: WorkflowRuntime) -> None:
         """Delete `workflow`'s flows, which deletes their nodes.

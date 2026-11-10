@@ -10,7 +10,9 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.retained_mode.events.app_events import WorkflowClosedEvent, WorkflowOpenedEvent
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     EventResultFailure,
     EventResultSuccess,
     RequestPayload,
@@ -57,6 +59,24 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+@pytest.fixture
+def queue(engine: Engine) -> asyncio.Queue:
+    """The engine's outgoing event queue, which clients read."""
+    events: asyncio.Queue = asyncio.Queue()
+    engine.event_manager.initialize_queue(events)
+    return events
+
+
+def _lifecycle_events(queue: asyncio.Queue) -> list[WorkflowOpenedEvent | WorkflowClosedEvent]:
+    """The workflow lifecycle events clients got since the last call, in order."""
+    events = []
+    while not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, AppEvent) and isinstance(event.payload, (WorkflowOpenedEvent, WorkflowClosedEvent)):
+            events.append(event.payload)
+    return events
 
 
 def _send(
@@ -153,7 +173,7 @@ class TestListOpenWorkflows:
 
 
 class TestOpenWorkflowNew:
-    def test_opens_a_new_unsaved_workflow_and_returns_it(self, engine: Engine) -> None:
+    def test_opens_a_new_unsaved_workflow_and_announces_it(self, engine: Engine, queue: asyncio.Queue) -> None:
         result_event = _send(engine, OpenWorkflowRequest(display_name="fresh"))
 
         result = result_event.result
@@ -163,6 +183,7 @@ class TestOpenWorkflowNew:
         assert not result.open_workflow.is_saved
         assert not result.open_workflow.has_active_flow
         assert engine.workflow_registry.get(result.open_workflow.workflow_id).metadata.name == "fresh"
+        assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=result.open_workflow)]
         assert result_event.open_workflow_id is None
 
     def test_creates_its_flow_when_asked(self, engine: Engine) -> None:
@@ -183,7 +204,9 @@ class TestOpenWorkflowNew:
 
 
 class TestOpenWorkflowSaved:
-    def test_opens_a_saved_workflow_by_id_and_builds_its_file(self, engine: Engine, saved_workflow_name: str) -> None:
+    def test_opens_a_saved_workflow_by_id_and_builds_its_file(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
         workflow_id = _saved_workflow_id(engine, saved_workflow_name)
 
         result = _send(engine, OpenWorkflowRequest(workflow_id=workflow_id)).result
@@ -196,6 +219,7 @@ class TestOpenWorkflowSaved:
         assert result.open_workflow.is_saved
         # Built: the file's flow is in place.
         assert result.open_workflow.has_active_flow
+        assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=result.open_workflow)]
 
     def test_opens_a_saved_workflow_by_name(self, engine: Engine, saved_workflow_name: str) -> None:
         result = _send(engine, OpenWorkflowRequest(workflow_name=saved_workflow_name)).result
@@ -204,7 +228,9 @@ class TestOpenWorkflowSaved:
         assert result.open_workflow.workflow_id == _saved_workflow_id(engine, saved_workflow_name)
         assert result.open_workflow.has_active_flow
 
-    def test_a_file_that_fails_to_build_closes_the_workflow(self, engine: Engine, saved_workflow_name: str) -> None:
+    def test_a_file_that_fails_to_build_closes_the_workflow_and_announces_nothing(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
         failed_run = WorkflowExecutionResult(
             execution_successful=False, execution_details="broken file", status=WorkflowStatus.UNUSABLE
         )
@@ -214,14 +240,18 @@ class TestOpenWorkflowSaved:
 
         assert type(result) is OpenWorkflowResultFailure
         assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(queue) == []
 
 
 class TestOpenWorkflowAlreadyOpen:
-    def test_returns_it_unchanged(self, engine: Engine, saved_workflow_name: str) -> None:
+    def test_returns_it_unchanged_and_announces_nothing(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
         workflow_id = _saved_workflow_id(engine, saved_workflow_name)
         _send(engine, OpenWorkflowRequest(workflow_id=workflow_id))
         workflow = engine.open_workflows.get(workflow_id)
         objects_before = set(workflow.objects.get_filtered_subset())
+        _lifecycle_events(queue)
 
         result_event = _send(engine, OpenWorkflowRequest(workflow_id=workflow_id, create_flow=True))
 
@@ -231,6 +261,7 @@ class TestOpenWorkflowAlreadyOpen:
         assert result.open_workflow == engine.open_workflow_info(workflow)
         assert engine.open_workflows.all_open() == [workflow]
         assert set(workflow.objects.get_filtered_subset()) == objects_before
+        assert _lifecycle_events(queue) == []
         assert result_event.open_workflow_id is None
 
     def test_an_unsaved_workflow_is_returned_by_its_id_without_a_flow_added(self, engine: Engine) -> None:
@@ -270,8 +301,11 @@ class TestOpenWorkflowAlreadyOpen:
 
 
 class TestOpenWorkflowRefused:
-    def test_another_open_workflow_refuses_it_and_names_that_workflow(self, engine: Engine) -> None:
+    def test_another_open_workflow_refuses_it_and_names_that_workflow(
+        self, engine: Engine, queue: asyncio.Queue
+    ) -> None:
         open_workflow = _open_new(engine, "open")
+        _lifecycle_events(queue)
 
         result_event = _send(engine, OpenWorkflowRequest(display_name="refused"), open_workflow.workflow_id)
 
@@ -279,6 +313,7 @@ class TestOpenWorkflowRefused:
         assert isinstance(result, AnotherWorkflowOpenResultFailure)
         assert result.blocking_workflow == engine.open_workflow_info(open_workflow)
         assert engine.open_workflows.all_open() == [open_workflow]
+        assert _lifecycle_events(queue) == []
         # Refused before it registered the new workflow.
         assert all(entry["name"] != "refused" for entry in engine.workflow_registry.list_workflows().values())
         # An open acts on no workflow, so the failure names none.
@@ -428,7 +463,9 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
                 gate.set()
             return list(await asyncio.gather(first, second, return_exceptions=True))
 
-    def test_the_second_open_returns_the_workflow_once_built(self, engine: Engine, saved_workflow_name: str) -> None:
+    def test_the_second_open_returns_the_workflow_once_built_and_it_is_announced_once(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
         request = OpenWorkflowRequest(workflow_id=_saved_workflow_id(engine, saved_workflow_name))
 
         first, second = asyncio.run(self._race(engine, request, request))
@@ -441,8 +478,11 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
         assert second.result.already_open
         assert second.result.open_workflow.has_active_flow
         assert second.result.open_workflow == first.result.open_workflow
+        assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=first.result.open_workflow)]
 
-    def test_the_second_open_fails_when_the_build_fails(self, engine: Engine, saved_workflow_name: str) -> None:
+    def test_the_second_open_fails_when_the_build_fails_and_nothing_is_announced(
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
+    ) -> None:
         request = OpenWorkflowRequest(workflow_id=_saved_workflow_id(engine, saved_workflow_name))
         failed_run = WorkflowExecutionResult(
             execution_successful=False, execution_details="broken file", status=WorkflowStatus.UNUSABLE
@@ -456,9 +496,10 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
         assert type(second.result) is OpenWorkflowResultFailure
         assert "did not finish building it" in str(second.result.result_details)
         assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(queue) == []
 
     def test_a_cancelled_build_closes_the_workflow_before_the_second_open_stops_waiting(
-        self, engine: Engine, saved_workflow_name: str
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
         request = OpenWorkflowRequest(workflow_id=_saved_workflow_id(engine, saved_workflow_name))
 
@@ -468,9 +509,10 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
         assert isinstance(second, EventResultFailure)
         assert type(second.result) is OpenWorkflowResultFailure
         assert engine.open_workflows.all_open() == []
+        assert _lifecycle_events(queue) == []
 
     def test_an_open_waits_for_a_run_with_current_state_that_is_opening_the_file(
-        self, engine: Engine, saved_workflow_name: str
+        self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue
     ) -> None:
         entry = engine.workflow_registry.get_workflow_by_name(saved_workflow_name)
         assert entry.file_path is not None
@@ -486,3 +528,4 @@ class TestOpenWorkflowWhileAnotherRequestOpensIt:
         assert second.result.already_open
         assert second.result.open_workflow.workflow_id == entry.workflow_id
         assert second.result.open_workflow.has_active_flow
+        assert _lifecycle_events(queue) == [WorkflowOpenedEvent(open_workflow=second.result.open_workflow)]

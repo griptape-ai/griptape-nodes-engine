@@ -176,6 +176,37 @@ class AppInitializationComplete(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
+class WorkflowOpenedEvent(AppPayload):
+    """A workflow opened. Every client gets it, whichever client, script or library opened the workflow.
+
+    A request that loads a file into the workflow it opens sends this once the file has built the
+    graph, so a client can read it right away. Until then, `ListOpenWorkflowsRequest` and the
+    heartbeat already list the workflow. A build that fails closes it without a
+    `WorkflowClosedEvent`, unless closing it fails, which leaves it open and sends this event.
+
+    Args:
+        open_workflow: The workflow that opened.
+    """
+
+    open_workflow: OpenWorkflowInfo
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowClosedEvent(AppPayload):
+    """An open workflow closed. Requests that name its id now fail with `WorkflowNotOpenResultFailure`.
+
+    Sent only for a workflow that had a `WorkflowOpenedEvent`.
+
+    Args:
+        workflow_id: Id of the workflow that closed, as `ListOpenWorkflowsRequest` lists it.
+    """
+
+    workflow_id: str
+
+
+@dataclass
+@PayloadRegistry.register
 class AppConnectionEstablished(AppPayload):
     """Notification that a connection to the API has been established."""
 

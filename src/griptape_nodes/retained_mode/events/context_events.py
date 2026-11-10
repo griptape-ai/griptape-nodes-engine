@@ -202,6 +202,9 @@ class OpenWorkflowRequest(RequestPayload):
 class OpenWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The workflow is open.
 
+    Clients get one `WorkflowOpenedEvent` for a workflow, with the first result that reports it open
+    and built, so a result with `already_open` set usually sends none.
+
     Args:
         open_workflow: The workflow, as ListOpenWorkflowsRequest lists it.
         already_open: Whether it was open before the request, which then changed nothing.
