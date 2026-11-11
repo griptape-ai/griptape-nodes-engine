@@ -264,8 +264,8 @@ class ContextManager(EngineScoped):
                 SetWorkflowContextRequest describes.
 
         Raises:
-            OpenRefusedError: The workflow was named more than one way, or `file_path` could not be
-                registered.
+            OpenRefusedError: The workflow was named more than one way, `file_path` could not be
+                registered, or a library reload is under way.
             InvalidWorkingDirectoryError: `working_directory` names a file.
             RequestedWorkflowNotFoundError: No registered workflow has `workflow_id` or `workflow_name`.
         """
@@ -279,6 +279,9 @@ class ContextManager(EngineScoped):
             if already_open is not None:
                 yield OpenedWorkflow(workflow=already_open, already_open=True)
                 return
+        if self.engine.is_reloading_libraries:
+            msg = "Attempted to open a workflow. Failed because the engine is reloading its libraries. Try again once the reload finishes."
+            raise self.OpenRefusedError(msg)
 
         normalized_directory = self._normalize_working_directory(working_directory)
 
@@ -788,6 +791,7 @@ class ContextManager(EngineScoped):
         Raises:
             ValueError: If neither or both of workflow_name and file_path are provided.
             WorkflowAlreadyOpenError: If the current work is bound to a live workflow.
+            OpenWorkflowError: A library reload is under way.
         """
         entry = self._entry_to_open(workflow_name, file_path=file_path, working_directory=working_directory)
         return self.engine.open_workflow(entry.workflow_id)
@@ -801,10 +805,18 @@ class ContextManager(EngineScoped):
             ValueError: If neither or both of workflow_name and file_path are provided.
             WorkflowAlreadyOpenError: If the current work is bound to a live workflow, or another
                 workflow is open and only one may be.
+            OpenWorkflowError: A library reload is under way.
         """
         if workflow_name is not None and file_path is not None:
             msg = "Provide either workflow_name or file_path, not both."
             raise ValueError(msg)
+        # Refused before anything is registered, as `Engine.opening_workflow` would refuse it after.
+        if self.engine.is_reloading_libraries:
+            msg = (
+                f"Attempted to open workflow '{workflow_name or file_path}'. Failed because the engine is "
+                "reloading its libraries. Try again once the reload finishes."
+            )
+            raise OpenWorkflowError(msg)
         blocking = self.engine.bound_live_workflow_or_none()
         if blocking is not None:
             msg = (

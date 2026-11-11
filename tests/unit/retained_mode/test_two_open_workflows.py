@@ -52,6 +52,8 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
     GetWorkflowContextSuccess,
+    OpenWorkflowRequest,
+    OpenWorkflowResultFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
@@ -1509,6 +1511,48 @@ class TestALibraryReloadRebuildsEachWorkflow:
         assert isinstance(during[0], GenericResultFailure)
         assert "reloading its libraries" in str(during[0].result_details)
         assert _nodes_in(engine, a) == ["kept"]
+
+    @pytest.mark.usefixtures("libraries_unchanged")
+    @pytest.mark.asyncio
+    async def test_a_reload_waits_for_a_build_under_way_and_rebuilds_all_of_it(self, engine: Engine) -> None:
+        entry = engine.workflow_registry.register_unsaved("building", listed=False)
+        release = asyncio.Event()
+        built: list[WorkflowRuntime] = []
+
+        async def build() -> None:
+            with engine.opening_workflow(entry.workflow_id) as opening:
+                await release.wait()
+                _make_canvas(engine, opening.workflow)
+                _make_node(engine, opening.workflow, "_ValueNode", "late")
+                built.append(opening.workflow)
+
+        build_task = asyncio.create_task(build())
+        await asyncio.sleep(0)
+        reload_task = asyncio.create_task(_send_async(engine, ReloadAllLibrariesRequest(), None))
+        await asyncio.sleep(0.05)
+        assert not reload_task.done()
+
+        release.set()
+        await build_task
+        result = await asyncio.wait_for(reload_task, 5)
+
+        assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
+        assert _nodes_in(engine, built[0]) == ["late"]
+
+    def test_an_open_during_the_reload_is_refused(self, engine: Engine) -> None:
+        during: list[ResultPayload] = []
+
+        async def reload_while_a_client_opens(_self: LibraryManager) -> ResultPayload:
+            during.append(await _send_async(engine, OpenWorkflowRequest(display_name="late"), None))
+            return ReloadAllLibrariesResultSuccess(result_details="reloaded nothing")
+
+        with patch.object(LibraryManager, "_reload_libraries_with_workflows_empty", reload_while_a_client_opens):
+            result = _send(engine, ReloadAllLibrariesRequest(), None)
+
+        assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
+        assert isinstance(during[0], OpenWorkflowResultFailure)
+        assert "reloading its libraries" in str(during[0].result_details)
+        assert all(workflow.metadata.name != "late" for workflow in engine.workflow_registry._by_id.values())
 
     @pytest.mark.usefixtures("libraries_unchanged")
     def test_a_workflow_that_cant_be_serialized_refuses_the_reload_and_changes_nothing(

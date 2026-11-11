@@ -17,7 +17,7 @@ import logging
 import os
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -70,7 +70,7 @@ from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkf
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterator, Iterator
 
     from griptape_nodes.retained_mode.engine_transports import EngineTransports
     from griptape_nodes.retained_mode.events.base_events import (
@@ -269,7 +269,8 @@ class Engine:
         # Each open workflow still being built, which clients have not been told of, set once its
         # build ends. See `opening_workflow`.
         self._opening_workflows: dict[WorkflowRuntime, asyncio.Event] = {}
-        # Open workflows a library reload has snapshotted and will rebuild (`rebuilding_workflows`).
+        # Set while a library reload runs, and the open workflows it will rebuild (`reloading_libraries`).
+        self._reloading_libraries = False
         self._rebuilding_workflows: set[WorkflowRuntime] = set()
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
         self._worker_workflows = WorkerWorkflowSet(self)
@@ -793,8 +794,15 @@ class Engine:
         ends, another open of the workflow waits for its build with `wait_for_opening`.
 
         Raises:
-            OpenWorkflowError: That workflow, or another one, is already open.
+            OpenWorkflowError: That workflow, or another one, is already open, or a library reload
+                is under way (`reloading_libraries`).
         """
+        if self._reloading_libraries:
+            msg = (
+                f"Attempted to open workflow '{workflow_id}'. Failed because the engine is reloading its "
+                "libraries. Try again once the reload finishes."
+            )
+            raise OpenWorkflowError(msg)
         opening = OpeningWorkflow(workflow=self._open_workflows.open(workflow_id))
         self._opening_workflows[opening.workflow] = asyncio.Event()
         try:
@@ -804,21 +812,35 @@ class Engine:
             raise
         self._finish_opening(opening.workflow, keep=not opening.abandoned)
 
-    @contextmanager
-    def rebuilding_workflows(self, workflows: list[WorkflowRuntime]) -> Iterator[None]:
-        """Turn away client requests naming any of `workflows` until the block ends (`is_rebuilding`).
+    @property
+    def is_reloading_libraries(self) -> bool:
+        """Whether a `reloading_libraries` block is under way, so no workflow may open."""
+        return self._reloading_libraries
 
-        For a library reload, which empties each workflow and rebuilds it from a snapshot: a client
-        request handled in between would change a workflow the rebuild expects to find empty.
+    @asynccontextmanager
+    async def reloading_libraries(self) -> AsyncIterator[list[WorkflowRuntime]]:
+        """Hold every open workflow still while a library reload empties and rebuilds it, yielding them.
+
+        Refuses opens until the block ends, and waits for builds already under way, so no workflow
+        is snapshotted half built or emptied without a snapshot. Then turns away client requests
+        naming any open workflow (`is_rebuilding`): one handled in between would change a workflow
+        the rebuild expects to find empty.
         """
-        self._rebuilding_workflows.update(workflows)
+        self._reloading_libraries = True
         try:
-            yield
+            while self._opening_workflows:
+                await asyncio.gather(*(build_ended.wait() for build_ended in list(self._opening_workflows.values())))
+            workflows = self._open_workflows.all_open()
+            self._rebuilding_workflows.update(workflows)
+            try:
+                yield workflows
+            finally:
+                self._rebuilding_workflows.difference_update(workflows)
         finally:
-            self._rebuilding_workflows.difference_update(workflows)
+            self._reloading_libraries = False
 
     def is_rebuilding(self, workflow: WorkflowRuntime) -> bool:
-        """Whether a `rebuilding_workflows` block holds `workflow`."""
+        """Whether a `reloading_libraries` block is rebuilding `workflow`."""
         return workflow in self._rebuilding_workflows
 
     def is_opening(self, workflow: WorkflowRuntime) -> bool:

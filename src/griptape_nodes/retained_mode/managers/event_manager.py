@@ -1592,7 +1592,7 @@ class EventManager(EngineScoped):
 
         Raises:
             _RequestWorkflowError: No open workflow has that id, answered with `WorkflowNotOpenResultFailure`,
-                or a library reload is rebuilding it (`Engine.rebuilding_workflows`).
+                or a library reload is rebuilding it (`Engine.reloading_libraries`).
         """
         # Looked up once: a workflow closing between a check and a second lookup would otherwise
         # fail the request after it was admitted.

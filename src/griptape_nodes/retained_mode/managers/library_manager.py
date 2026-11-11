@@ -584,10 +584,11 @@ class LibraryManager(EngineScoped):
         Every node built from the old modules has to go, so each open workflow is serialized as a
         save would, emptied while it stays open under its id, and rebuilt once the libraries are
         back. Serialized values are plain data, so the rebuilt ones come from the reloaded modules.
-        A workflow that can't be serialized refuses the reload before anything changes. Until the
-        rebuild, client requests naming one of these workflows are turned away.
+        A workflow that can't be serialized refuses the reload before anything changes. Builds
+        under way finish first, and until the rebuild, no workflow opens and client requests naming
+        an open one are turned away (`Engine.reloading_libraries`).
         """
-        with self.engine.rebuilding_workflows(self.engine.open_workflows.all_open()):
+        async with self.engine.reloading_libraries():
             try:
                 snapshots = await self._snapshot_open_workflows()
             except self.ReloadRefusedError as err:
