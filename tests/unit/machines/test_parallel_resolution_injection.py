@@ -20,6 +20,7 @@ from tests.unit.machines.scheduler_stubs import (
     let_the_run_finish,
     machine_running_one_node,
     node_stub,
+    wait_for_node_state,
 )
 
 
@@ -39,10 +40,7 @@ class TestInjectedNodeStartsImmediately:
 
         # No release of the running node: the whole point is that the injected node
         # does not have to wait for it.
-        for _ in range(20):
-            if dag_builder.node_to_reference["injected"].node_state is NodeState.PROCESSING:
-                break
-            await asyncio.sleep(0)
+        await wait_for_node_state(dag_builder, "injected", NodeState.PROCESSING)
 
         assert dag_builder.node_to_reference["injected"].node_state is NodeState.PROCESSING, (
             "injected node should have been dispatched while the other node is still running"
