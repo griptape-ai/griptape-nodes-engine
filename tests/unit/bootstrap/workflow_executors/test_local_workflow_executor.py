@@ -1,12 +1,15 @@
 """Unit tests for LocalWorkflowExecutor project activation, CLI arguments, and flow input."""
 
+import os
 from argparse import ArgumentParser
+from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest  # type: ignore[reportMissingImports]
 
 from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import (
+    STORAGE_BACKEND_ENV_VAR,
     LocalExecutorError,
     LocalWorkflowExecutor,
 )
@@ -299,6 +302,47 @@ class TestPrepareWorkflowForRunStorageBackend:
         assert "storage_backend" not in await_args.kwargs
 
 
+class TestSetStorageBackend:
+    """The executor applies a storage backend through the environment, never the user's config file."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_storage_backend_env_var(self) -> Iterator[None]:
+        # patch.dict restores os.environ afterwards, removing the variable the executor sets.
+        # monkeypatch.delenv would not: it records nothing to undo when the variable is absent.
+        with patch.dict(os.environ):
+            os.environ.pop(STORAGE_BACKEND_ENV_VAR, None)
+            yield
+
+    def test_explicit_backend_sets_env_var(self) -> None:
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=False):
+            LocalWorkflowExecutor(storage_backend=StorageBackend.GTC)
+
+        assert os.environ[STORAGE_BACKEND_ENV_VAR] == StorageBackend.GTC.value
+
+    def test_no_backend_leaves_env_var_unset(self) -> None:
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=False):
+            LocalWorkflowExecutor()
+
+        assert STORAGE_BACKEND_ENV_VAR not in os.environ
+
+    def test_no_backend_keeps_a_user_set_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(STORAGE_BACKEND_ENV_VAR, StorageBackend.GTC.value)
+
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=False):
+            LocalWorkflowExecutor()
+
+        assert os.environ[STORAGE_BACKEND_ENV_VAR] == StorageBackend.GTC.value
+
+    def test_backend_is_ignored_once_an_engine_exists(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The running engine already picked its storage driver; setting the variable now would
+        # only reach workers it spawns later, putting them on a different backend.
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=True):
+            LocalWorkflowExecutor(storage_backend=StorageBackend.GTC)
+
+        assert STORAGE_BACKEND_ENV_VAR not in os.environ
+        assert "Ignored because the engine had already started" in caplog.text
+
+
 class TestLocalWorkflowExecutorCli:
     """Tests for LocalWorkflowExecutor's CLI surface (issue #4599)."""
 
@@ -309,7 +353,7 @@ class TestLocalWorkflowExecutorCli:
         args = parser.parse_args([])
 
         # Base-class flags carry through.
-        assert args.storage_backend == StorageBackend.LOCAL.value
+        assert args.storage_backend is None
         assert args.project_file_path is None
 
     def test_save_on_failure_absent_is_none(self) -> None:
@@ -349,14 +393,15 @@ class TestLocalWorkflowExecutorCli:
 
         assert kwargs["save_on_failure_path"] == "/var/dump.py"
 
-    def test_cli_constructor_kwargs_storage_backend_default_is_local_enum(self) -> None:
+    def test_cli_constructor_kwargs_storage_backend_default_is_none(self) -> None:
+        # None keeps the configured storage backend instead of forcing local.
         parser = ArgumentParser()
         LocalWorkflowExecutor.add_cli_arguments(parser)
         args = parser.parse_args([])
 
         kwargs = LocalWorkflowExecutor._cli_constructor_kwargs(args)
 
-        assert kwargs["storage_backend"] == StorageBackend.LOCAL
+        assert kwargs["storage_backend"] is None
 
     def test_cli_constructor_kwargs_with_gtc_storage_backend(self) -> None:
         parser = ArgumentParser()

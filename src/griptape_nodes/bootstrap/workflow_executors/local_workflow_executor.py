@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Any, Self
 from griptape_nodes.bootstrap.workflow_executors.workflow_executor import WorkflowExecutor
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
-from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
+from griptape_nodes.retained_mode.engine import has_current_engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
@@ -45,13 +45,18 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.config_manager import ENV_VAR_PREFIX
 from griptape_nodes.serialization.values import decode_value
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
     from types import TracebackType
 
+    from griptape_nodes.drivers.storage import StorageBackend
+
 logger = logging.getLogger(__name__)
+
+STORAGE_BACKEND_ENV_VAR = f"{ENV_VAR_PREFIX}STORAGE_BACKEND"
 
 
 class LocalExecutorError(Exception):
@@ -61,7 +66,7 @@ class LocalExecutorError(Exception):
 class LocalWorkflowExecutor(WorkflowExecutor):
     def __init__(  # noqa: PLR0913
         self,
-        storage_backend: StorageBackend = StorageBackend.LOCAL,
+        storage_backend: StorageBackend | None = None,
         *,
         project_file_path: Path | None = None,
         skip_library_loading: bool = False,
@@ -70,7 +75,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         pickle_control_flow_result: bool = False,  # noqa: ARG002 deprecated and ignored
     ):
         super().__init__()
-        self._set_storage_backend(storage_backend=storage_backend)
+        # None keeps the configured storage backend.
+        if storage_backend is not None:
+            self._set_storage_backend(storage_backend=storage_backend)
         self._project_file_path = project_file_path
         self._skip_library_loading = skip_library_loading
         self._workflows_to_register = workflows_to_register or []
@@ -130,18 +137,20 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             raise LocalExecutorError(msg) from e
 
     def _set_storage_backend(self, storage_backend: StorageBackend) -> None:
-        from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+        """Apply `storage_backend` to this process via its env var, without writing the user's config.
 
-        try:
-            config_manager = ConfigManager()
-            config_manager.set_config_value(
-                key="storage_backend",
-                value=storage_backend,
+        Must run before the engine is built, since the engine picks its storage driver then.
+        """
+        if has_current_engine():
+            logger.warning(
+                "Attempted to use storage backend '%s' for this workflow run. Ignored because the "
+                "engine had already started before the workflow executor was created, so the run "
+                "keeps the storage backend the engine started with.",
+                storage_backend.value,
             )
-        except Exception as e:
-            msg = f"Failed to set storage backend: {e}"
-            logger.exception(msg)
-            raise LocalExecutorError(msg) from e
+            return
+
+        os.environ[STORAGE_BACKEND_ENV_VAR] = storage_backend.value
 
     async def _load_project(self, project_file_path: Path) -> None:
         """Load a project template and set it as the active project."""

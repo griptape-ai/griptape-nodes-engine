@@ -26,6 +26,7 @@ from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
+    IterativeNodeParam,
 )
 from griptape_nodes.exe_types.core_types import ParameterList, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups import (
@@ -98,6 +99,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackagedNodeParameterMapping,
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
+    PassthroughConnection,
 )
 from griptape_nodes.retained_mode.events.node_error_details import (
     NodeErrorDetails,
@@ -146,6 +148,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.common.directed_graph import DirectedGraph
+    from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -1198,6 +1201,12 @@ class NodeExecutor(EngineScoped):
             entry_control_parameter_name=entry_control_parameter_name,
             output_parameter_prefix=f"{end_node.name.replace(' ', '_')}_loop_",
             node_group_name=node_group_name,
+            # Neither loop node is packaged, so a wire straight from start to end (current_item into
+            # new_item_to_add) has no packaged endpoint. Carried StartFlow -> EndFlow, it is set per
+            # iteration and read back like a body node's output.
+            passthrough_connections=self._passthrough_connections_between(
+                connections, start_node, end_node, IterativeNodeParam.NEW_ITEM_TO_ADD.value
+            ),
         )
 
         package_result = workflow.handle_request(request)
@@ -1934,14 +1943,11 @@ class NodeExecutor(EngineScoped):
             total_iterations - len(successful_iterations),
         )
 
-        # Step 6: Build results list in iteration order, with None for failed iterations
+        # Step 6: Build results list in iteration order. Failed iterations were recorded as None by
+        # the execution path; a skipped iteration, or one with nothing wired to new_item_to_add, adds nothing.
         node._results_list = []
-        for iteration_index in range(total_iterations):
-            if iteration_index in iteration_results:
-                value = iteration_results[iteration_index]
-            else:
-                value = None  # Failed iterations get None
-            node._results_list.append(value)
+        for iteration_index in sorted(iteration_results.keys()):
+            node._results_list.append(iteration_results[iteration_index])
 
         # Step 7: Output final results to the results parameter
         node._output_results_list()
@@ -2566,6 +2572,13 @@ class NodeExecutor(EngineScoped):
             entry_control_node_name=entry_control_node_name,
             entry_control_parameter_name=entry_control_parameter_name,
             node_group_name=node.name,
+            # The group is not packaged with its children, so a wire from one of its own outputs
+            # into one of its own inputs (current_item into new_item_to_add) has no packaged
+            # endpoint. Carried StartFlow -> EndFlow, it is set per iteration and read back like a
+            # child's output.
+            passthrough_connections=self._passthrough_connections_between(
+                workflow.flows.connections, node, node, IterativeNodeParam.NEW_ITEM_TO_ADD.value
+            ),
         )
 
         package_result = workflow.handle_request(request)
@@ -3225,6 +3238,30 @@ class NodeExecutor(EngineScoped):
 
         return None
 
+    @staticmethod
+    def _passthrough_connections_between(
+        connections: Connections, source_node: BaseNode, target_node: BaseNode, target_parameter_name: str
+    ) -> list[PassthroughConnection]:
+        """The connections from source_node into target_node's target_parameter_name, as packager passthroughs.
+
+        Both nodes stay outside the package, so the packager would never see these connections. Only
+        the named parameter is carried: the loop nodes are also joined by a hidden tether that holds
+        no value, and it must not become a packaged parameter.
+        """
+        passthroughs = []
+        for conn in connections.get_all_outgoing_connections(source_node):
+            if conn.target_node is not target_node or conn.target_parameter.name != target_parameter_name:
+                continue
+            passthroughs.append(
+                PassthroughConnection(
+                    source_node_name=source_node.name,
+                    source_parameter_name=conn.source_parameter.name,
+                    target_node_name=target_node.name,
+                    target_parameter_name=conn.target_parameter.name,
+                )
+            )
+        return passthroughs
+
     def get_node_parameter_mappings(
         self, package_result: PackageNodesAsSerializedFlowResultSuccess, start_or_end: str
     ) -> PackagedNodeParameterMapping:
@@ -3659,17 +3696,28 @@ class NodeExecutor(EngineScoped):
                         ),
                     )
 
-                # Step 6: Extract parameter values from iterations BEFORE cleanup
+                # Step 6: Extract parameter values from iterations BEFORE cleanup. An iteration that
+                # exited through skip_iteration adds nothing. Every iteration has already run, so a
+                # break_loop exit has nothing left to stop and its result is collected.
+                end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
+                skipped_iteration_indices = {
+                    iteration_index
+                    for iteration_index, _, node_name_mappings in deserialized_flows
+                    if self._get_iteration_control_action(end_loop_node, end_node_mapping, node_name_mappings)
+                    == IterationControlAction.SKIP
+                }
                 iteration_results = self.get_parameter_values_from_iterations(
                     end_loop_node=end_loop_node,
-                    deserialized_flows=deserialized_flows,
+                    deserialized_flows=[
+                        flow_ref for flow_ref in deserialized_flows if flow_ref[0] not in skipped_iteration_indices
+                    ],
                     package_flow_result_success=package_result,
                 )
 
                 # Add None values for failed iterations that didn't produce any results
                 # (e.g., nested loops may fail but still produce partial output)
                 for failed_idx in failed_iteration_indices:
-                    if failed_idx not in iteration_results:
+                    if failed_idx not in iteration_results and failed_idx not in skipped_iteration_indices:
                         iteration_results[failed_idx] = None
 
                 # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
@@ -3963,8 +4011,12 @@ class NodeExecutor(EngineScoped):
                 workflow, list_connections_result.incoming_connections, end_node_param_mappings
             )
 
-        # Extract iteration results from subprocess outputs
-        iteration_results = {}
+        # Extract iteration results from subprocess outputs. A failed iteration is recorded as None,
+        # as the local parallel path does, so the results list keeps its place.
+        iteration_results: dict[int, Any] = {}
+        for iteration_index, success, subprocess_result in iteration_outputs:
+            if not success or subprocess_result is None:
+                iteration_results[iteration_index] = None
         for iteration_index in successful_iterations:
             subprocess_result = iteration_subprocess_outputs[iteration_index]
             parameter_output_values = self._extract_parameter_output_values(subprocess_result)

@@ -12,6 +12,80 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.108.0] - 2026-11-10
+
+### Added
+
+- Node libraries can read the destination a connected `File Output Settings` node supplies with
+  `GetConnectedFileDestinationRequest`, which works in a worker, and rebuild it with
+  `file_destination_from_spec`. `GetConnectedDirectoryDestinationRequest` and
+  `GetConnectedFileSequenceDestinationRequest` do the same for directory and file sequence outputs.
+  [#5971](https://github.com/griptape-ai/griptape-nodes-engine/issues/5971)
+
+### Changed
+
+- `local_objects.drop` and `local_objects.drop_all` now free a library's object as soon as they
+  are called, even while nodes are running, instead of waiting until no node is running. A library
+  switching models now frees the old model before loading the new one, rather than holding both
+  in GPU memory until the run ends.
+
+### Fixed
+
+- Directory parameters built with `ProjectDirectoryParameter` now use an absolute, `~/...`, or
+  `file://` path as the destination instead of nesting it inside the outputs directory. A plain
+  name still goes through the situation template and is versioned. Web addresses are rejected with
+  an error.
+  [#6237](https://github.com/griptape-ai/griptape-nodes-engine/issues/6237)
+- Nodes running in a worker or inside an Isolated Execution group now save with the name, location
+  and "If File Exists" policy from a connected `File Output Settings` node, instead of their own
+  defaults.
+  [#5971](https://github.com/griptape-ai/griptape-nodes-engine/issues/5971)
+- A saved workflow run without `--project-file-path` now fails when its configured project (the
+  `project_file` setting, else the workspace's `griptape-nodes-project.yml`) cannot be activated,
+  instead of running on system defaults.
+  [#6214](https://github.com/griptape-ai/griptape-nodes-engine/issues/6214)
+- Running a saved workflow from the command line no longer writes `storage_backend` to your config
+  file, so it no longer switches the editor's storage backend. `--storage-backend` now applies to
+  the run it is passed to instead of the next one, and leaving it out uses the configured backend
+  instead of `local`.
+- A loop body copy of a node now keeps every value the canvas node holds, including inputs fed by
+  connections, so a node whose parameters depend on an input (such as a diffusers node whose
+  `image_references` depends on `pipeline`) no longer loses them when the loop runs. The copy's
+  connections are made the way a saved workflow makes them, so they push nothing into nodes while the
+  body is still being assembled, and a saved value the copy refuses on a connected input is logged and
+  skipped instead of stopping the loop.
+  [#6104](https://github.com/griptape-ai/griptape-nodes-engine/issues/6104)
+- `ForEach Group`, `For Loop Group` and other loop groups show one way in and one way out, `Start Loop`
+  and `On Complete`. The second `Flow In` / `Flow Out` pair, which nothing read at run time, is gone, so a
+  chain wired through `Flow Out` no longer stops silently at the loop. Workflows saved with connections on
+  `Flow In` or `Flow Out` load unchanged and the connections move to `Start Loop` and `On Complete`.
+  [#6250](https://github.com/griptape-ai/griptape-nodes-engine/issues/6250)
+- A loop with nodes in its body no longer collects an empty list when the start node's
+  `current_item` or `index` is wired straight into the end node's `new_item_to_add`. A ForEach or
+  For Loop group whose own `current_item` or `index` is wired into its own `new_item_to_add` now
+  runs and collects the items instead of being skipped by the run.
+  [#6238](https://github.com/griptape-ai/griptape-nodes-engine/issues/6238)
+- `make run` and `make run/refresh` no longer fail with "The syntax of the command is incorrect"
+  on Windows when make runs recipes through `cmd.exe`.
+  [#6174](https://github.com/griptape-ai/griptape-nodes-engine/issues/6174)
+- A node now saves where a `File Output Settings` node wired to it says when the wire crosses a
+  group boundary: the node inside the group and the settings node outside it, the other way round,
+  or each in its own group. Before, it saved with its own default name, location and
+  existing-file policy.
+  [#6146](https://github.com/griptape-ai/griptape-nodes-engine/issues/6146)
+- A loop run locally with `run_in_order` off no longer collects the item of a pass that exited
+  through `skip_iteration`, so filter loops return the filtered list in parallel too. Loops in an
+  isolated or published execution environment still collect skipped passes.
+  [#6247](https://github.com/griptape-ai/griptape-nodes-engine/issues/6247)
+- Agents can fill `ParameterList` inputs such as `items` on Create Image List. A single-item
+  connection aimed at the list itself now fails with a message saying to add a slot with
+  `AddParameterToNodeRequest(parent_container_name=...)` and connect to the slot it returns. The
+  request's tool description and the `griptape-nodes-workflows` skill teach the same steps.
+  [#5147](https://github.com/griptape-ai/griptape-nodes-engine/issues/5147)
+- A process running the engine no longer risks crashing with a segmentation fault as it exits after
+  refreshing a preview or syncing workflows. The threads that watch those files now stop before
+  Python shuts down.
+
 ## [0.107.0] - 2026-11-06
 
 ### Added
@@ -1019,7 +1093,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.107.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.0...HEAD
+[0.108.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.107.0...v0.108.0
 [0.107.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...v0.107.0
 [0.106.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.105.0...v0.106.0
 [0.105.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.104.2...v0.105.0
