@@ -8,6 +8,7 @@ happens to a live DAG when something changes underneath the parked driver.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
@@ -109,3 +110,15 @@ async def let_the_run_finish(driver: asyncio.Task, release: asyncio.Event, hold:
     release.set()
     hold.set()
     await asyncio.wait_for(driver, timeout=1)
+
+
+async def wait_for_node_state(dag_builder: DagBuilder, name: str, state: NodeState, timeout_s: float = 1.0) -> None:
+    """Give the driver up to `timeout_s` to bring `name` to `state`, then return either way for the caller to assert.
+
+    Bounded by time, not by event-loop turns: dispatch runs `validate_before_node_run` in a
+    thread before the node becomes PROCESSING, so how many turns that takes depends on the OS.
+    """
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(timeout_s):
+            while dag_builder.node_to_reference[name].node_state is not state:
+                await asyncio.sleep(0)
