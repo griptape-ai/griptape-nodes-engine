@@ -205,6 +205,20 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 
 A value of `0` scans only the top-level directory (no subdirectories).
 
+### Workflow Node Recursion Depth (`max_workflow_recursion_depth`)
+
+A Workflow node runs a saved workflow inside your flow. That saved workflow can contain a Workflow node that points back at itself, directly or through another workflow, as long as something such as a branch stops the recursion. The `max_workflow_recursion_depth` setting limits how many times a workflow may run inside itself. Past that, the run fails with an error that names the workflow and this setting. The default is **10** and the minimum is **1**. In a config file, a whole number below 1 is treated as 1, and a value that isn't a whole number is ignored with a warning and the default is used. In the environment variable, a value below 1 is ignored with a warning and the configured value is used.
+
+Each level runs a full copy of the workflow, so raising the limit a lot costs memory and time. Choose the smallest value your workflow needs.
+
+The setting limits how deep the recursion goes, not how much work it does in total. In a loop set to run all items at once, every iteration at every level starts together, so the work grows with the number of items per loop raised to the power of the depth. Raise the setting carefully when the recursion goes through such loops.
+
+Being a normal setting, it can be set in any config file or overridden with the `GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH` environment variable:
+
+```bash
+GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH=20 gtn   # allow deeper recursion
+```
+
 ## Running a Library's Nodes on Another Computer
 
 To run a library's nodes on a different computer, such as one with a more powerful GPU, while you keep working in the editor on your own, list the library in `distributed_execution.library_engines` with that computer's engine ID. See [Running Nodes on Another Computer](run_nodes_on_another_computer.md) for the steps and requirements.

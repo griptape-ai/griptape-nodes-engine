@@ -449,6 +449,29 @@ class FlowManager(EngineScoped):
         msg = f"Flow with name {flow_name} doesn't exist"
         raise ValueError(msg)
 
+    def get_enclosing_flow(self, workflow: WorkflowRuntime, flow_name: str) -> str | None:
+        """Return the flow that `flow_name` runs inside, for walking upward through nested runs.
+
+        That is the flow of the loop that owns it when it is a loop iteration flow whose
+        owner still exists, otherwise its parent.
+        """
+        flows = workflow.flows
+        owner = flows.iteration_flow_to_owner_flow_name.get(flow_name)
+        if owner is not None and owner in flows.name_to_parent_name:
+            return owner
+        return self.get_parent_flow_in(workflow, flow_name)
+
+    def record_iteration_flow_owner(
+        self, workflow: WorkflowRuntime, iteration_flow_name: str, owner_flow_name: str
+    ) -> None:
+        """Remember which flow holds the loop that runs `iteration_flow_name`.
+
+        Iteration flows are parented to whatever flow was current when they were
+        created, which says nothing about the loop that runs them; this records that
+        instead. Held in memory only.
+        """
+        workflow.flows.iteration_flow_to_owner_flow_name[iteration_flow_name] = owner_flow_name
+
     def reparent_flow_in(self, workflow: WorkflowRuntime, flow_name: str, new_parent_flow_name: str) -> None:
         """Move a Flow under a different parent Flow.
 
@@ -829,6 +852,10 @@ class FlowManager(EngineScoped):
         # Clean up referenced workflow tracking
         if flow in flows.flow_to_referenced_workflow_name:
             del flows.flow_to_referenced_workflow_name[flow]
+        owners = flows.iteration_flow_to_owner_flow_name
+        owners.pop(flow.name, None)
+        for iteration_flow in [name for name, owner in owners.items() if owner == flow.name]:
+            del owners[iteration_flow]
 
     @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(
@@ -972,6 +999,18 @@ class FlowManager(EngineScoped):
         for flow_name, parent_name in name_to_parent_name.items():
             if parent_name == old_name:
                 name_to_parent_name[flow_name] = new_name
+
+        # The same name may be recorded as an iteration flow, or as the owner of one.
+        owners = workflow.flows.iteration_flow_to_owner_flow_name
+        renamed_owners: dict[str, str] = {}
+        for iteration_flow, owner in owners.items():
+            if iteration_flow == old_name:
+                iteration_flow = new_name  # noqa: PLW2901
+            if owner == old_name:
+                owner = new_name  # noqa: PLW2901
+            renamed_owners[iteration_flow] = owner
+        owners.clear()
+        owners.update(renamed_owners)
 
         # Let the Node Manager know about the change, too.
         self.engine.node_manager.handle_flow_rename(workflow, old_name=old_name, new_name=new_name)

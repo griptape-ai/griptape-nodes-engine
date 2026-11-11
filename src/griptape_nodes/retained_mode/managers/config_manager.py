@@ -77,16 +77,19 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
     DEFAULT_LIBRARIES_DIRECTORY,
+    DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
     DISCOVERY_MAX_DEPTH_KEY,
     FROM_ENV_CONTEXT,
     LIBRARIES_DIRECTORY_KEY,
     LOG_DIRECTORY_KEY,
     LOG_RETENTION_DAYS_KEY,
     LOG_TO_FILE_KEY,
+    MAX_WORKFLOW_RECURSION_DEPTH_KEY,
     SESSION_LOG_BUFFER_LINES_KEY,
     WORKFLOWS_TO_REGISTER_KEY,
     LogLevel,
     Settings,
+    coerce_max_workflow_recursion_depth,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
@@ -630,6 +633,22 @@ class ConfigManager(EngineScoped):
             The `discovery_max_depth` setting.
         """
         return self.get_config_value(DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int)
+
+    @property
+    def max_workflow_recursion_depth(self) -> int:
+        """Get how many times a workflow may appear inside itself before an import is refused.
+
+        Overridable via the `GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH` env var; falls
+        back to DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH when unset. Read without
+        `cast_type`, which raises on a non-number: `Settings` accepts a bad value from a
+        config file so the rest of the config is kept, and the merged config keeps it
+        raw, so this applies the same rule as the `Settings` validator.
+
+        Returns:
+            The `max_workflow_recursion_depth` setting.
+        """
+        depth = self.get_config_value(MAX_WORKFLOW_RECURSION_DEPTH_KEY, default=DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH)
+        return coerce_max_workflow_recursion_depth(depth)
 
     def value_source(self, key: str) -> ConfigValueSource:
         """Return which config layer currently supplies `key`'s effective value.

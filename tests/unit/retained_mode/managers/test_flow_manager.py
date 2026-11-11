@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
     DeleteFlowRequest,
+    DeleteFlowResultSuccess,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
@@ -1117,6 +1118,120 @@ class TestDeleteIterationFlows:
 
         for _, flow_name, _ in deserialized_flows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None
+
+
+class TestGetEnclosingFlow:
+    """`get_enclosing_flow` steps up to the owner of an iteration flow, and to the parent for any other flow."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_returns_the_parent_for_an_ordinary_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_parent_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        assert engine.flow_manager.get_enclosing_flow(engine.current_workflow(), child.flow_name) == top.flow_name
+        assert engine.flow_manager.get_enclosing_flow(engine.current_workflow(), top.flow_name) is None
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_returns_the_owner_for_an_iteration_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_owner_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        owner = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="owner", set_as_new_context=False)
+        )
+        assert isinstance(owner, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, owner.flow_name)
+
+        assert flow_manager.get_enclosing_flow(engine.current_workflow(), iteration.flow_name) == owner.flow_name
+        # The parent link is left alone.
+        assert flow_manager.get_parent_flow_in(engine.current_workflow(), iteration.flow_name) == top.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_iteration_flow_forgets_its_owner(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_delete_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, top.flow_name)
+
+        delete_result = engine.handle_request(DeleteFlowRequest(flow_name=iteration.flow_name))
+
+        assert isinstance(delete_result, DeleteFlowResultSuccess), delete_result
+        assert iteration.flow_name not in engine.current_workflow().flows.iteration_flow_to_owner_flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_ignores_an_owner_that_is_no_longer_a_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_stale_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, "gone_flow")
+
+        assert flow_manager.get_enclosing_flow(engine.current_workflow(), iteration.flow_name) == top.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_owner_flow_forgets_the_entries_that_point_to_it(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_delete_owner_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        owner = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="owner", set_as_new_context=False)
+        )
+        assert isinstance(owner, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, owner.flow_name)
+
+        delete_result = engine.handle_request(DeleteFlowRequest(flow_name=owner.flow_name))
+
+        assert isinstance(delete_result, DeleteFlowResultSuccess), delete_result
+        assert iteration.flow_name not in engine.current_workflow().flows.iteration_flow_to_owner_flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_renaming_a_flow_renames_it_as_an_iteration_flow_and_as_an_owner(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine.context_manager.push_workflow("enclosing_rename_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        monkeypatch.setattr(
+            engine.node_manager, "handle_flow_rename", Mock(spec=engine.node_manager.handle_flow_rename)
+        )
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), top.flow_name, "owner_a")
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), "iteration_b", top.flow_name)
+
+        flow_manager.handle_flow_rename(engine.current_workflow(), top.flow_name, "top_renamed")
+        try:
+            assert engine.current_workflow().flows.iteration_flow_to_owner_flow_name == {
+                "top_renamed": "owner_a",
+                "iteration_b": "top_renamed",
+            }
+        finally:
+            # Only the manager's maps were renamed, so put the name back for the object cleanup.
+            flow_manager.handle_flow_rename(engine.current_workflow(), "top_renamed", top.flow_name)
 
 
 class TestReparentFlow:

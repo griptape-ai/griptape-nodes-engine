@@ -1,8 +1,10 @@
 """Exceptions that carry a failure up through the Workflow nodes that run it.
 
-``SubflowNodeFailedError`` names the node that failed inside a subflow and what it
-raised. ``NestedWorkflowNodeError`` is what a Workflow node raises for it, so each level
-of nesting adds one step to a path instead of wrapping the message again.
+``WorkflowRecursionLimitError`` marks the refusal to import a workflow that sits inside
+itself too deeply. ``SubflowNodeFailedError`` names the node that failed inside a
+subflow and what it raised. ``NestedWorkflowNodeError`` is what a Workflow node raises
+for either, so each level of nesting adds one step to a path instead of wrapping the
+message again.
 """
 
 from __future__ import annotations
@@ -13,6 +15,14 @@ from griptape_nodes.exe_types.node_error import NodeError
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
+
+
+class WorkflowRecursionLimitError(RuntimeError):
+    """A workflow was refused because it already contains itself as deep as the recursion limit allows.
+
+    It is not a ``NodeError``: the engine raises it while importing, not a node while
+    running, and it has no fields or links to show.
+    """
 
 
 class SubflowNodeFailedError(RuntimeError):
@@ -29,9 +39,11 @@ class NestedWorkflowNodeError(NodeError):
     """A node inside a Workflow node failed, however many Workflow nodes down it sits.
 
     Carries the failing node's own details once, plus the names of the nodes from this
-    Workflow node down to the failing one. ``workflow_depth`` counts the Workflow nodes
-    below this one that contain the failing node; groups and loops on the path are not
-    counted.
+    Workflow node down to the failing one. A path of length 0 means this Workflow node
+    itself could not load. ``workflow_depth`` counts the Workflow nodes below this one
+    that contain the failing node; groups and loops on the path are not counted, and a
+    failing node that is itself a Workflow node that could not load is not counted
+    either.
     """
 
     PATH_FIELD = "Failed node path"
@@ -51,7 +63,8 @@ class NestedWorkflowNodeError(NodeError):
         workflow_depth: int = 0,
     ) -> None:
         fields: dict[str, str | int | float | bool] = dict(root_details.fields)
-        fields[self.PATH_FIELD] = self._format_path(node_path)
+        if node_path:
+            fields[self.PATH_FIELD] = self._format_path(node_path)
         super().__init__(
             self._build_message(workflow_node_name, root_details.message, node_path, workflow_depth),
             fields=fields,
@@ -64,6 +77,16 @@ class NestedWorkflowNodeError(NodeError):
         self.root_cause = root_cause
         self.workflow_depth = workflow_depth
 
+    def workflow_nodes_containing_failure(self) -> int:
+        """Return 1 when this Workflow node runs the failing node (so it sits above it), else 0.
+
+        A path of length 0 means this Workflow node is the one that failed to load, so
+        it does not contain the failure.
+        """
+        if self.node_path:
+            return 1
+        return 0
+
     @classmethod
     def _format_path(cls, node_path: list[str]) -> str:
         if len(node_path) <= cls.MAX_PATH_ENTRIES_SHOWN:
@@ -75,6 +98,11 @@ class NestedWorkflowNodeError(NodeError):
 
     @staticmethod
     def _build_message(workflow_node_name: str, root_message: str, node_path: list[str], workflow_depth: int) -> str:
+        if not node_path:
+            return (
+                f"Attempted to load the workflow behind node '{workflow_node_name}'. "
+                f"Failed because the workflow could not be loaded: {root_message}"
+            )
         failed_node = node_path[-1]
         if workflow_depth == 0:
             where = f"node '{failed_node}' inside it failed"
@@ -97,3 +125,20 @@ def next_failure_link(cause: BaseException | None) -> SubflowNodeFailedError | N
             return current
         current = current.__cause__
     return None
+
+
+def is_recursion_refusal(failure: BaseException | None) -> bool:
+    """Whether a failure is, or chains down to, the refusal to import a workflow nested too deeply."""
+    seen: set[int] = set()
+    current = failure
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, WorkflowRecursionLimitError):
+            return True
+        if isinstance(current, NestedWorkflowNodeError):
+            current = current.root_cause
+        elif isinstance(current, SubflowNodeFailedError):
+            current = current.cause
+        else:
+            current = current.__cause__
+    return False

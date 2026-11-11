@@ -23,6 +23,7 @@ from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
 from griptape_nodes.exe_types.workflow_node_errors import (
     NestedWorkflowNodeError,
     SubflowNodeFailedError,
+    WorkflowRecursionLimitError,
     next_failure_link,
 )
 from griptape_nodes.files.path_utils import (
@@ -40,6 +41,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
     ImportWorkflowAsReferencedSubFlowRequest,
 )
+from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.node_events import GetFlowForNodeRequest, GetFlowForNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -390,7 +392,7 @@ class WorkflowNode(ControlNode):
                 root_details=link.root_details,
                 node_path=[*node_path, *link.node_path],
                 root_cause=link.root_cause,
-                workflow_depth=link.workflow_depth + 1,
+                workflow_depth=link.workflow_depth + link.workflow_nodes_containing_failure(),
             )
         return NestedWorkflowNodeError(
             self.name, root_details=innermost.details, node_path=node_path, root_cause=innermost.cause
@@ -451,6 +453,14 @@ class WorkflowNode(ControlNode):
             )
         )
         if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
+            refusal = _failure_exception(import_result)
+            if isinstance(refusal, WorkflowRecursionLimitError):
+                raise NestedWorkflowNodeError(
+                    self.name,
+                    root_details=build_node_error_details(self.name, refusal),
+                    node_path=[],
+                    root_cause=refusal,
+                ) from refusal
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
                 f"Failed because the workflow could not be loaded: {import_result.result_details}"

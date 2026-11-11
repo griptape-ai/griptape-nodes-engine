@@ -10,6 +10,8 @@ from griptape_nodes.exe_types.workflow_node import WorkflowNode, _failure_except
 from griptape_nodes.exe_types.workflow_node_errors import (
     NestedWorkflowNodeError,
     SubflowNodeFailedError,
+    WorkflowRecursionLimitError,
+    is_recursion_refusal,
 )
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -63,6 +65,14 @@ class TestNestedWorkflowNodeError:
         assert str(error) == (
             "Attempted to run the workflow behind node 'Outer'. Failed because node 'Failing' inside it failed: boom"
         )
+
+    def test_empty_path_reports_a_load_failure(self) -> None:
+        error = NestedWorkflowNodeError("Outer", root_details=_details(), node_path=[])
+
+        assert str(error) == (
+            "Attempted to load the workflow behind node 'Outer'. Failed because the workflow could not be loaded: boom"
+        )
+        assert error.fields == {}
 
     def test_keeps_the_roots_fields_response_and_links(self) -> None:
         link = NodeErrorLink(label="Docs", url="https://example.com")
@@ -145,6 +155,19 @@ class TestNestedSubflowFailure:
         assert nested.root_details is failure.details
         assert nested.root_cause is cause
 
+    def test_recursion_refusal_is_the_root(self, workflow_node: Mock) -> None:
+        root = _details("too deep")
+        cause = NestedWorkflowNodeError(
+            "Inner", root_details=root, node_path=[], root_cause=WorkflowRecursionLimitError("too deep")
+        )
+
+        nested = WorkflowNode._nested_subflow_failure(workflow_node, _failure("Inner", cause))
+
+        assert nested is not None
+        assert nested.node_path == ["Inner"]
+        assert nested.workflow_depth == 0
+        assert nested.root_details is root
+
     def test_a_nested_failure_one_level_down_is_extended_not_wrapped(self, workflow_node: Mock) -> None:
         root = _details()
         cause = NestedWorkflowNodeError("Inner", root_details=root, node_path=["Deeper", "Failing"])
@@ -201,6 +224,57 @@ class TestNestedSubflowFailure:
         assert WorkflowNode._nested_subflow_failure(workflow_node, failure) is None
 
 
+class TestIsRecursionRefusal:
+    """`is_recursion_refusal` finds the refusal at the end of any chain of nested failures."""
+
+    def test_the_refusal_itself(self) -> None:
+        assert is_recursion_refusal(WorkflowRecursionLimitError("too deep"))
+
+    def test_a_nested_failure_rooted_in_the_refusal(self) -> None:
+        nested = NestedWorkflowNodeError(
+            "Inner", root_details=_details(), node_path=[], root_cause=WorkflowRecursionLimitError("too deep")
+        )
+
+        assert is_recursion_refusal(nested)
+
+    def test_a_subflow_failure_wrapping_a_nested_refusal(self) -> None:
+        nested = NestedWorkflowNodeError(
+            "Inner", root_details=_details(), node_path=["Deeper"], root_cause=WorkflowRecursionLimitError("too deep")
+        )
+
+        assert is_recursion_refusal(_failure("Inner", nested))
+
+    def test_a_loop_error_chained_from_the_refusal(self) -> None:
+        loop_error = RuntimeError("Attempted to run all 3 iterations of loop 'Loop'.")
+        loop_error.__cause__ = _failure(
+            "Inner",
+            NestedWorkflowNodeError(
+                "Inner", root_details=_details(), node_path=[], root_cause=WorkflowRecursionLimitError("too deep")
+            ),
+        )
+
+        assert is_recursion_refusal(loop_error)
+
+    def test_an_ordinary_failure_is_not_a_refusal(self) -> None:
+        nested = NestedWorkflowNodeError(
+            "Inner", root_details=_details(), node_path=["Failing"], root_cause=ValueError("boom")
+        )
+
+        assert not is_recursion_refusal(_failure("Inner", nested))
+
+    @pytest.mark.parametrize("failure", [None, RuntimeError("plain")])
+    def test_nothing_or_a_plain_error_is_not_a_refusal(self, failure: BaseException | None) -> None:
+        assert not is_recursion_refusal(failure)
+
+    def test_a_cause_cycle_ends(self) -> None:
+        first = RuntimeError("first")
+        second = RuntimeError("second")
+        first.__cause__ = second
+        second.__cause__ = first
+
+        assert not is_recursion_refusal(first)
+
+
 class TestAprocessNestedFailure:
     """`WorkflowNode.aprocess` reports a failure from inside a nested Workflow node as one nested failure."""
 
@@ -243,8 +317,8 @@ class TestAprocessNestedFailure:
         workflow_node._collect_outputs.assert_called_once()
 
 
-class TestLoadSubflowImportFailure:
-    """`WorkflowNode._load_subflow` reports a failed import as a plain error."""
+class TestLoadSubflowRecursionRefusal:
+    """`WorkflowNode._load_subflow` reports a refused import as a nested failure rooted in the refusal."""
 
     @pytest.fixture
     def workflow_node(self) -> Mock:
@@ -256,6 +330,22 @@ class TestLoadSubflowImportFailure:
         )
         node._register_workflow.return_value = "registry-key"
         return node
+
+    @pytest.mark.asyncio
+    async def test_a_recursion_refusal_raises_a_nested_failure_rooted_in_it(self, workflow_node: Mock) -> None:
+        refusal = WorkflowRecursionLimitError("too deep")
+        workflow_node._ahandle_request_in_workflow = AsyncMock(
+            spec=WorkflowNode._ahandle_request_in_workflow,
+            return_value=ImportWorkflowAsReferencedSubFlowResultFailure(result_details="too deep", exception=refusal),
+        )
+
+        with pytest.raises(NestedWorkflowNodeError) as raised:
+            await WorkflowNode._load_subflow(workflow_node)
+
+        assert raised.value.workflow_node_name == "Outer"
+        assert raised.value.node_path == []
+        assert raised.value.root_cause is refusal
+        assert raised.value.__cause__ is refusal
 
     @pytest.mark.asyncio
     async def test_any_other_import_failure_is_a_plain_runtime_error(self, workflow_node: Mock) -> None:
