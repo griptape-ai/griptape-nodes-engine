@@ -21,6 +21,7 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
 from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
 from griptape_nodes.exe_types.param_types.parameter_int import ParameterInt
 from griptape_nodes.traits.options import Options
+from griptape_nodes.utils.list_utils import flatten_list
 
 # Execution mode choices and their corresponding boolean values (True = run in order)
 EXECUTION_MODE_ONE_AT_A_TIME = "Run Group Items One at a Time"
@@ -38,23 +39,6 @@ LEGACY_CONTROL_PORT_NAMES = {
     "group_exec_in": "exec_in",
     "group_exec_out": "exec_out",
 }
-
-
-def flatten_nested(items: list[Any], depth: int) -> list[Any]:
-    """Flatten nested lists into one list, keeping item order.
-
-    A depth of 0 flattens every level; a positive depth flattens that many levels.
-    Only lists are expanded, so strings, dicts and other values stay whole items.
-    """
-    flat: list[Any] = []
-    for item in items:
-        if isinstance(item, list) and depth != 1:
-            flat.extend(flatten_nested(item, max(depth - 1, 0)))
-        elif isinstance(item, list):
-            flat.extend(item)
-        else:
-            flat.append(item)
-    return flat
 
 
 class IterationControlParam(StrEnum):
@@ -329,7 +313,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         # by creating new object identities for every item on every broadcast.
         if self.get_parameter_value(self.flatten_results.name):
             depth = max(self.get_parameter_value(self.flatten_depth.name) or 0, 0)
-            self.parameter_output_values["results"] = flatten_nested(self._results_list, depth)
+            self.parameter_output_values["results"] = flatten_list(self._results_list, depth)
         else:
             self.parameter_output_values["results"] = list(self._results_list)
 
