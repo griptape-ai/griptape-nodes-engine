@@ -120,5 +120,5 @@ async def wait_for_node_state(dag_builder: DagBuilder, name: str, state: NodeSta
     """
     with contextlib.suppress(TimeoutError):
         async with asyncio.timeout(timeout_s):
-            while dag_builder.node_to_reference[name].node_state is not state:
+            while dag_builder.node_to_reference[name].node_state is not state:  # noqa: ASYNC110 -- the state is the machine's, not an event this test owns
                 await asyncio.sleep(0)
