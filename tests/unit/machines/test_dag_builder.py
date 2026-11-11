@@ -144,6 +144,27 @@ class TestDagBuilder:
         assert default_graph.in_degree("downstream_node") == 1
         assert default_graph.in_degree("upstream_node") == 0
 
+    def test_add_node_with_dependencies_ignores_a_wire_to_itself(self) -> None:
+        """A node fed by its own output (a group's current_item into its new_item_to_add) is not its own dependency."""
+        node = MagicMock(spec=BaseNode)
+        node.name = "group"
+        node.state = MagicMock()
+        node.initialize_spotlight.return_value = MagicMock()
+        mock_param = MagicMock()
+        mock_param.type = "str"
+        node.parameters = [mock_param]
+
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = (node, MagicMock())
+        dag_builder = DagBuilder(mock_connections)
+
+        added_nodes = dag_builder.add_node_with_dependencies(node)
+
+        assert added_nodes == [node]
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert default_graph.in_degree("group") == 0
+
     def test_add_node_with_dependencies_existing_upstream_node(self) -> None:
         """Test adding a node when upstream dependency already exists in DAG."""
         # Create mock nodes

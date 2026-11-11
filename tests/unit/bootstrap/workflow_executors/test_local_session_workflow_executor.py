@@ -60,7 +60,7 @@ class TestLocalSessionWorkflowExecutorCli:
 
         args = parser.parse_args([])
 
-        assert args.storage_backend == StorageBackend.LOCAL.value
+        assert args.storage_backend is None
 
     def test_add_cli_arguments_includes_save_on_failure(self) -> None:
         parser = ArgumentParser()

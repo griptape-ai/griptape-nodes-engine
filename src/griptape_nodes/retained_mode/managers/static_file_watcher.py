@@ -1,5 +1,6 @@
 """Watch the local files behind minted download URLs and report when one changes on disk."""
 
+import atexit
 import logging
 import threading
 from collections import Counter, OrderedDict
@@ -175,6 +176,7 @@ class StaticFileWatcher:
 
     def stop(self) -> None:
         """Stop the watcher thread. The watcher can't be restarted afterwards."""
+        atexit.unregister(self.stop)
         self._shutdown.set()
         self._restart.set()
         if self._thread is not None:
@@ -239,6 +241,9 @@ class StaticFileWatcher:
             return
         self._thread = threading.Thread(target=self._run, name="WatchFiles-StaticFiles", daemon=True)
         self._thread.start()
+        # watchfiles keeps running interpreter code on this thread while it watches, so a watch
+        # still running when the interpreter finalizes can crash the process on exit.
+        atexit.register(self.stop)
 
     def _directories(self) -> set[Path]:
         return set(self._directory_counts)

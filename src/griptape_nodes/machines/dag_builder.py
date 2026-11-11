@@ -203,6 +203,10 @@ class DagBuilder:
         if not upstream_connection:
             return None
         upstream_node, _ = upstream_connection
+        # A node wired to itself (a group's own current_item feeding its own new_item_to_add) supplies
+        # that value while it runs. It is not something to run first, and a self-edge would never clear.
+        if upstream_node is node:
+            return None
         if upstream_node.name in nodes_to_exclude:
             return None
         if upstream_node.state == NodeResolutionState.RESOLVED:
