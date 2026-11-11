@@ -12,14 +12,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind, StrictModeSeverity
-from griptape_nodes.exe_types.core_types import ParameterGroup
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.context_manager import ContextManager
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -258,132 +256,9 @@ class TestFacadeCallersBoundToNothing:
         assert isinstance(results[0], CreateFlowResultSuccess), results[0].result_details
         assert "canvas" in only.flows.name_to_parent_name
 
-    def test_a_manager_read_from_a_raw_thread_reads_the_only_open_workflow(self, engine: Engine) -> None:
-        only = _open(engine, "only")
-        created = only.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
-        assert isinstance(created, CreateFlowResultSuccess), created.result_details
-        flow_names: list[str] = []
-
-        def read_the_flow() -> None:
-            flow_names.append(GriptapeNodes.ContextManager().get_current_flow().name)
-            assert GriptapeNodes.FlowManager().get_flow_by_name("canvas") is not None
-            assert GriptapeNodes.ObjectManager().has_object_with_name("canvas")
-
-        thread = threading.Thread(target=lambda: contextvars.Context().run(read_the_flow))
-        thread.start()
-        thread.join(timeout=10)
-
-        assert flow_names == ["canvas"]
-
-    def test_a_manager_context_block_from_an_unbound_caller_runs_in_the_only_open_workflow(
-        self, engine: Engine
-    ) -> None:
-        only = _open(engine, "only")
-        created = only.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
-        assert isinstance(created, CreateFlowResultSuccess), created.result_details
-
-        with GriptapeNodes.ContextManager().flow("canvas") as flow:
-            assert flow.name == "canvas"
-
-    def test_a_manager_hands_back_an_element_as_it_is(self, engine: Engine) -> None:
-        """An element is a context manager too, but only the block methods' results are wrapped."""
+    def test_a_manager_read_from_an_unbound_caller_finds_no_workflow(self, engine: Engine) -> None:
+        """Only the facade's requests guess the only open workflow; its managers never do."""
         _open(engine, "only")
-        element = ParameterGroup(name="group")
-
-        with patch.object(ContextManager, "get_current_element", lambda _self: element):
-            handed = GriptapeNodes.ContextManager().get_current_element()
-
-        assert handed is element
-
-    def test_a_stored_manager_follows_its_callers_binding(self, engine: Engine) -> None:
-        first = _open(engine, "first")
-        stored = GriptapeNodes.ContextManager()
-        second = _open(engine, "second")
-        for workflow, flow_name in ((first, "first_canvas"), (second, "second_canvas")):
-            created = workflow.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name=flow_name))
-            assert isinstance(created, CreateFlowResultSuccess), created.result_details
-
-        with engine.bind_workflow(second):
-            current_id = stored.get_current_workflow_id()
-            with stored.flow("second_canvas") as flow:
-                entered_in = engine.current_workflow()
-
-        assert current_id == second.workflow_id
-        assert flow.name == "second_canvas"
-        assert entered_in is second
-
-    def test_a_manager_fetched_while_bound_reads_the_only_open_workflow_from_a_raw_thread(self, engine: Engine) -> None:
-        only = _open(engine, "only")
-        created = only.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
-        assert isinstance(created, CreateFlowResultSuccess), created.result_details
-        with engine.bind_workflow(only):
-            stored = GriptapeNodes.ContextManager()
-        flow_names: list[str] = []
-
-        thread = threading.Thread(
-            target=lambda: contextvars.Context().run(lambda: flow_names.append(stored.get_current_flow().name))
-        )
-        thread.start()
-        thread.join(timeout=10)
-
-        assert flow_names == ["canvas"]
-
-    def test_pushing_a_workflow_opens_it_while_exactly_one_is_open(self, engine: Engine) -> None:
-        first = _open(engine, "first")
-
-        GriptapeNodes.ContextManager().push_workflow(workflow_name="second")
-
-        assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
-        assert engine.current_workflow() is not first
-
-    def test_popping_a_pushed_workflow_unbinds_the_caller(self, engine: Engine) -> None:
-        first = _open(engine, "first")
-        context_manager = GriptapeNodes.ContextManager()
-        context_manager.push_workflow(workflow_name="second")
-
-        context_manager.pop_workflow()
-
-        assert context_manager.has_current_workflow()
-        assert context_manager.get_current_workflow_id() == first.workflow_id
-
-    def test_a_workflow_block_opens_its_workflow_while_exactly_one_is_open(self, engine: Engine) -> None:
-        first = _open(engine, "first")
-
-        with GriptapeNodes.ContextManager().workflow("second"):
-            inside = engine.current_workflow()
-            assert inside is not None
-            inside_name = engine.workflow_registry.get(inside.workflow_id).metadata.name
-
-        assert inside is not first
-        assert inside_name == "second"
-
-    def test_a_stored_manager_finds_no_workflow_once_a_second_opens(self, engine: Engine) -> None:
-        first = _open(engine, "first")
-        stored = GriptapeNodes.ContextManager()
-        assert stored.get_current_workflow_id() == first.workflow_id
-
-        _open(engine, "second")
-
-        assert not stored.has_current_workflow()
-
-    def test_a_manager_stored_with_none_open_finds_the_workflow_that_opens_later(self, engine: Engine) -> None:
-        stored = GriptapeNodes.ContextManager()
-        assert not stored.has_current_workflow()
-
-        only = _open(engine, "only")
-
-        assert stored.get_current_workflow_id() == only.workflow_id
-
-    def test_clearing_the_current_workflow_data_closes_the_only_open_workflow(self, engine: Engine) -> None:
-        only = _open(engine, "only")
-
-        GriptapeNodes.clear_current_workflow_data()
-
-        assert only.closed
-
-    def test_a_manager_read_finds_no_workflow_while_several_are_open(self, engine: Engine) -> None:
-        _open(engine, "first")
-        _open(engine, "second")
 
         assert not GriptapeNodes.ContextManager().has_current_workflow()
 
@@ -391,6 +266,51 @@ class TestFacadeCallersBoundToNothing:
         _open(engine, "only")
 
         assert not engine.context_manager.has_current_workflow()
+
+    def test_pushing_a_workflow_binds_the_caller(self, engine: Engine) -> None:
+        context_manager = GriptapeNodes.ContextManager()
+
+        context_manager.push_workflow(workflow_name="pushed")
+
+        pushed = engine.current_workflow()
+        assert engine.workflow_registry.get(pushed.workflow_id).metadata.name == "pushed"
+        assert context_manager.get_current_workflow_id() == pushed.workflow_id
+
+    def test_popping_a_pushed_workflow_unbinds_the_caller(self, engine: Engine) -> None:
+        context_manager = GriptapeNodes.ContextManager()
+        context_manager.push_workflow(workflow_name="pushed")
+        pushed = engine.current_workflow()
+
+        context_manager.pop_workflow()
+
+        assert pushed.closed
+        assert bound_workflow.get() is None
+        assert not context_manager.has_current_workflow()
+
+    def test_a_workflow_block_binds_its_workflow_until_it_ends(self, engine: Engine) -> None:
+        with GriptapeNodes.ContextManager().workflow("block"):
+            inside = engine.current_workflow()
+            inside_name = engine.workflow_registry.get(inside.workflow_id).metadata.name
+
+        assert inside_name == "block"
+        assert inside.closed
+        assert bound_workflow.get() is None
+
+    def test_clearing_the_current_workflow_data_closes_the_callers_workflow(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+
+        with engine.bind_workflow(only):
+            GriptapeNodes.clear_current_workflow_data()
+
+        assert only.closed
+
+    def test_clearing_the_current_workflow_data_needs_a_bound_caller(self, engine: Engine) -> None:
+        only = _open(engine, "only")
+
+        with pytest.raises(RuntimeError, match="without an active workflow context"):
+            GriptapeNodes.clear_current_workflow_data()
+
+        assert not only.closed
 
     def test_a_request_fails_while_several_are_open(self, engine: Engine) -> None:
         first = _open(engine, "first")

@@ -874,8 +874,7 @@ class ContextManager(EngineScoped):
             raise self.WorkerWorkflowNotClosableError(msg)
 
         self.engine.close_workflow(workflow)
-        # A caller `push_workflow` bound to it goes back to unbound, so it doesn't stay bound to a
-        # closed workflow and the facade can find the only open one again.
+        # Undo what `push_workflow` bound, so the caller is back where it was before it pushed.
         unbind_caller_closing(workflow)
         return name
 
