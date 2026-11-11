@@ -1041,7 +1041,7 @@ class TestDeleteFlowByName:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_deleting_the_current_flow_by_name_leaves_it_current_no_longer(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("delete_by_name_wf")
+        bind(engine.context_manager.open_workflow("delete_by_name_wf"))
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
         )
@@ -1054,7 +1054,7 @@ class TestDeleteFlowByName:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_deleting_a_flow_by_name_leaves_the_current_flow_current(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("delete_other_by_name_wf")
+        bind(engine.context_manager.open_workflow("delete_other_by_name_wf"))
         canvas = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
         )
@@ -1071,7 +1071,7 @@ class TestDeleteFlowByName:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_deleting_a_flow_with_children_leaves_the_current_flow_current(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow("delete_parent_by_name_wf")
+        bind(engine.context_manager.open_workflow("delete_parent_by_name_wf"))
         canvas = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
         )
