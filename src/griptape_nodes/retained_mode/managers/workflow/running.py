@@ -42,7 +42,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
-from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext, current_request_type
+from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     LibraryNotRegisteredProblem,
 )
@@ -144,8 +144,7 @@ class WorkflowRunner(EngineScoped):
 
         A saved file never decides whether to open a workflow; its caller does. The file's requests
         name no workflow, so the run binds the workflow it builds into, and the binding ends with
-        the run. The result names that workflow. A request that runs a file opening itself acts on
-        the workflow it opened for the rest of the request, as any load does.
+        the run. The result names that workflow.
         """
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
@@ -154,15 +153,12 @@ class WorkflowRunner(EngineScoped):
         # referenced subflow imported from inside exec() -- see LoadProblemFrame.
         # Bound to no workflow until the file's own is known, so opening it never sees the caller's.
         with LoadProblemFrame() as frame, self.engine.bind_workflow(NO_WORKFLOW):
-            result = await self._run_workflow_in_frame(
+            return await self._run_workflow_in_frame(
                 relative_file_path=relative_file_path,
                 complete_file_path=complete_file_path,
                 frame=frame,
                 workflow=workflow,
             )
-        if workflow is None:
-            self._enter_workflow_the_file_opened(result)
-        return result
 
     @handles(RunWorkflowFromScratchRequest)
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
@@ -224,6 +220,7 @@ class WorkflowRunner(EngineScoped):
             return RunWorkflowWithCurrentStateResultSuccess(
                 status=execution_result.status,
                 workflow_id=execution_result.workflow_id,
+                open_workflow=self._open_workflow_info(execution_result.workflow_id),
                 result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
             )
         return RunWorkflowWithCurrentStateResultFailure(
@@ -433,19 +430,6 @@ class WorkflowRunner(EngineScoped):
         if opened is None:
             return None
         return self.engine.open_workflow_info(opened)
-
-    def _enter_workflow_the_file_opened(self, result: WorkflowExecutionResult) -> None:
-        """Bind the current request to the workflow its file opened, once the load's own binding has ended.
-
-        `open_workflow` binds it inside `run_workflow`'s NO_WORKFLOW block, whose exit undoes that,
-        so without this the request's post-dispatch hooks would act on no workflow.
-        """
-        if current_request_type() is None or result.workflow_id is None:
-            return
-        opened = self.engine.open_workflows.find(result.workflow_id)
-        if opened is None:
-            return
-        self.engine.enter_opened_workflow(opened)
 
     async def _close_failed_load(self, workflow_id: str) -> None:
         """Close the workflow a failed run opened. The file may have closed it itself before failing."""

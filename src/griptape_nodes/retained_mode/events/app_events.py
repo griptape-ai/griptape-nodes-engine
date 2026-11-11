@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
@@ -51,6 +51,18 @@ class OpenWorkflowInfo:
     name: str
     workflow_file_path: str | None
     has_active_flow: bool
+
+
+@runtime_checkable
+class ReportsOpenWorkflow(Protocol):
+    """A result that reports the workflow open after its request. Post-dispatch hooks run bound to it.
+
+    Args:
+        open_workflow: The workflow open after the request: the one it opened, used, or moved to.
+            None when there is none.
+    """
+
+    open_workflow: OpenWorkflowInfo | None
 
 
 @dataclass

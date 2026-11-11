@@ -382,12 +382,14 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events.
 
     Args:
-        open_workflow_id: The open workflow the request acted on: the envelope's `open_workflow_id`
-            when it named one, else the workflow dispatch bound the request to, such as the only
-            open workflow, a run's own workflow, or the workflow a load opened. None when it acted
-            on no workflow. A result payload's own `workflow_id` is something else. For
-            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
-            Save As is a copy that is not open.
+        open_workflow_id: The open workflow the request ran in: the one the envelope named, or
+            with none named, the only open workflow or a run's own workflow. None for a request that
+            runs in no workflow, such as a HOST request, which ignores the envelope's id even when
+            it opens or closes a workflow; an open's result names the workflow it opened in its
+            `open_workflow`. A request refused for the workflow its envelope named echoes that id.
+            A result payload's own `workflow_id` is something else. For example,
+            `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a Save As
+            is a copy that is not open.
         engine_id: The engine that sent the result. A client that reached it through a session
             topic learns from this which engine holds the session. None when the result was built
             outside the engine's dispatch, such as by the MCP server or a bootstrap script.
