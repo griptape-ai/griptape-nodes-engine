@@ -48,6 +48,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
     DeleteFlowRequest,
+    DeleteFlowResultSuccess,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
@@ -1031,6 +1032,61 @@ class TestDeleteIterationFlows:
 
         for _, flow_name, _ in deserialized_flows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None
+
+
+class TestDeleteFlowByName:
+    """Deleting a flow by name leaves no reference to it in the current context."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_current_flow_by_name_leaves_it_current_no_longer(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("delete_by_name_wf")
+        created = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
+        )
+        assert isinstance(created, CreateFlowResultSuccess)
+
+        result = engine.handle_request(DeleteFlowRequest(flow_name=created.flow_name))
+
+        assert isinstance(result, DeleteFlowResultSuccess)
+        assert not engine.current_workflow().context.has_current_flow()
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_a_flow_by_name_leaves_the_current_flow_current(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("delete_other_by_name_wf")
+        canvas = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
+        )
+        assert isinstance(canvas, CreateFlowResultSuccess)
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=canvas.flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        result = engine.handle_request(DeleteFlowRequest(flow_name=child.flow_name))
+
+        assert isinstance(result, DeleteFlowResultSuccess)
+        assert engine.current_workflow().context.get_current_flow().name == canvas.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_a_flow_with_children_leaves_the_current_flow_current(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("delete_parent_by_name_wf")
+        canvas = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
+        )
+        assert isinstance(canvas, CreateFlowResultSuccess)
+        parent = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=canvas.flow_name, flow_name="parent", set_as_new_context=False)
+        )
+        assert isinstance(parent, CreateFlowResultSuccess)
+        grandchild = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="grandchild", set_as_new_context=False)
+        )
+        assert isinstance(grandchild, CreateFlowResultSuccess)
+
+        result = engine.handle_request(DeleteFlowRequest(flow_name=parent.flow_name))
+
+        assert isinstance(result, DeleteFlowResultSuccess)
+        assert engine.current_workflow().context.get_current_flow().name == canvas.flow_name
 
 
 class TestReparentFlow:

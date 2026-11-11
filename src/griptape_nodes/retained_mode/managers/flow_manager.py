@@ -750,14 +750,13 @@ class FlowManager(EngineScoped):
                     )
                     result = DeleteFlowResultFailure(result_details=details)
                     return result
-                with workflow.context.flow(child_flow):
-                    # Delete them.
-                    delete_flow_request = DeleteFlowRequest(flow_name=child_flow_name)
-                    delete_flow_result = workflow.handle_request(delete_flow_request)
-                    if isinstance(delete_flow_result, DeleteFlowResultFailure):
-                        details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Flow '{child_flow.name}'."
-                        result = DeleteFlowResultFailure(result_details=details)
-                        return result
+                # Delete them.
+                delete_flow_request = DeleteFlowRequest(flow_name=child_flow_name)
+                delete_flow_result = workflow.handle_request(delete_flow_request)
+                if isinstance(delete_flow_result, DeleteFlowResultFailure):
+                    details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Flow '{child_flow.name}'."
+                    result = DeleteFlowResultFailure(result_details=details)
+                    return result
             # Delete all child nodes in this Flow.
             list_nodes_request = ListNodesInFlowRequest()
             list_nodes_result = workflow.handle_request(list_nodes_request)
@@ -787,6 +786,14 @@ class FlowManager(EngineScoped):
                 workflow.flows.global_control_flow_machine = None
                 workflow.flows.global_dag_builder.clear()
                 self._finish_run_if_over(flows)
+
+        # A flow deleted by name can still be the Current Context. Leave it, as deleting without a name does.
+        if (
+            flow_name is not None
+            and workflow.context.has_current_flow()
+            and workflow.context.get_current_flow() is flow
+        ):
+            workflow.context.pop_flow()
 
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)
