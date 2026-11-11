@@ -157,10 +157,14 @@ def _build_directory_destination_from_situation(
     explicit_path = _explicit_directory_path(dirname)
     if explicit_path is not None:
         # The user named the destination, so use it as given rather than nesting it inside the
-        # situation's directory. It is not versioned: the user chose this exact location.
+        # situation's directory. Only a `{###}` slot versions it; without one the user chose this
+        # exact location. OVERWRITE on a slotted path would resolve with the slot unbound and fail.
+        existing_dir_policy = os_events.ExistingFilePolicy.OVERWRITE
+        if _has_version_slot(explicit_path):
+            existing_dir_policy = os_events.ExistingFilePolicy.CREATE_NEW
         return directory_mod.DirectoryDestination(
             explicit_path,
-            existing_dir_policy=os_events.ExistingFilePolicy.OVERWRITE,
+            existing_dir_policy=existing_dir_policy,
             create_parents=True,
             workflow=workflow,
         )
@@ -177,6 +181,15 @@ def _build_directory_destination_from_situation(
         create_parents=resolved.create_parents,
         workflow=workflow,
     )
+
+
+def _has_version_slot(path: str) -> bool:
+    """Return True if `path` contains a `{###}` version slot."""
+    try:
+        variables = macro_parser.ParsedMacro(path).get_variables()
+    except macro_parser.MacroSyntaxError:
+        return False
+    return any(variable.name == macro_parser.SEQUENCE_VARIABLE_NAME for variable in variables)
 
 
 def _explicit_directory_path(dirname: str) -> str | None:
