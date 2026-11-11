@@ -1612,11 +1612,10 @@ class EventManager(EngineScoped):
                 f"Attempted to handle {type(request).__name__} in workflow '{open_workflow_id}'. "
                 "Failed because that workflow isn't open in the engine anymore. Reopen the workflow and try again."
             )
-            raise _RequestWorkflowError(WorkflowNotOpenResultFailure(result_details=msg))
+            raise _RequestWorkflowError(self._workflow_not_open_failure(msg))
         return workflow
 
-    @staticmethod
-    def _caller_workflow(request: RequestPayload) -> WorkflowRuntime | NoWorkflow | None:
+    def _caller_workflow(self, request: RequestPayload) -> WorkflowRuntime | NoWorkflow | None:
         """The caller's binding, which a request naming no workflow acts on.
 
         Raises:
@@ -1630,7 +1629,13 @@ class EventManager(EngineScoped):
             f"Attempted to handle {type(request).__name__} in workflow '{caller_binding.workflow_id}'. "
             "Failed because that workflow was closed. Reopen the workflow and try again."
         )
-        raise _RequestWorkflowError(WorkflowNotOpenResultFailure(result_details=msg))
+        raise _RequestWorkflowError(self._workflow_not_open_failure(msg))
+
+    def _workflow_not_open_failure(self, result_details: str) -> WorkflowNotOpenResultFailure:
+        """The failure for a request whose workflow isn't open, listing the ones that are."""
+        return WorkflowNotOpenResultFailure(
+            open_workflows=self.engine.open_workflow_infos(), result_details=result_details
+        )
 
     def _unscoped_request_workflow(
         self, named: WorkflowRuntime | NoWorkflow | None, *, addressed: bool
