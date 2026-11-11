@@ -844,15 +844,14 @@ class TestSetWorkflowContextWhileAWorkflowIsOpen:
     """Setting the context opens the workflow beside the open one, and refuses one already open."""
 
     def test_it_opens_another_workflow_beside_the_open_one(self, project_engine: Engine) -> None:
-        saved = _saved_workflow(project_engine, "saved")
         open_id = _open_new_workflow(project_engine, "open")
 
-        result = project_engine.handle_request(SetWorkflowContextRequest(workflow_name=saved.workflow_name))
+        result = project_engine.handle_request(SetWorkflowContextRequest(display_name="other"))
 
         assert isinstance(result, SetWorkflowContextSuccess), result.result_details
         assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [
             open_id,
-            saved.workflow_id,
+            result.workflow_id,
         ]
 
     def test_it_refuses_the_workflow_that_is_already_open_and_keeps_it(self, project_engine: Engine) -> None:
