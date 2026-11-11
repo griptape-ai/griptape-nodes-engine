@@ -211,11 +211,26 @@ class ContextManager(EngineScoped):
     ) -> OpenedWorkflow:
         """Open the workflow a request names, as `opening_requested_workflow` does, with its top-level flow when `create_flow` is set.
 
-        A flow that can't be created closes the workflow again (see `Engine.opening_workflow`).
+        Refuses a workflow with a file that isn't open: this opens it without building its file, so
+        it would show empty, and its next save would overwrite the file. `OpenWorkflowRequest`
+        builds it. A flow that can't be created closes the workflow again (see
+        `Engine.opening_workflow`).
 
         Raises:
-            OpenRefusedError: As `opening_requested_workflow` raises, or the flow could not be created.
+            OpenRefusedError: As `opening_requested_workflow` raises, the workflow has a file and
+                isn't open, or the flow could not be created.
         """
+        entry = self._find_requested_workflow(None, workflow_name, None)
+        if (
+            entry is not None
+            and entry.file_path is not None
+            and self.engine.open_workflows.find(entry.workflow_id) is None
+        ):
+            msg = (
+                f"Attempted to open workflow '{entry.name}'. Failed because this request can't load the "
+                "nodes saved in its file. Open it with OpenWorkflowRequest instead."
+            )
+            raise self.OpenRefusedError(msg)
         with self.opening_requested_workflow(
             workflow_name=workflow_name, display_name=display_name, working_directory=working_directory
         ) as opened:
@@ -326,9 +341,7 @@ class ContextManager(EngineScoped):
 
     @handles(ListOpenWorkflowsRequest)
     def on_list_open_workflows_request(self, request: ListOpenWorkflowsRequest) -> ResultPayload:  # noqa: ARG002
-        open_workflows = [
-            self.engine.open_workflow_info(workflow) for workflow in self.engine.open_workflows.all_open()
-        ]
+        open_workflows = self.engine.open_workflow_infos()
         return ListOpenWorkflowsResultSuccess(
             open_workflows=open_workflows,
             engine_run_id=self.engine.engine_run_id,

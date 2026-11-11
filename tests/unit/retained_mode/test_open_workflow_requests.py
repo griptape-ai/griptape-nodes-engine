@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     OpenWorkflowRequest,
     OpenWorkflowResultFailure,
     OpenWorkflowResultSuccess,
+    SetWorkflowContextRequest,
     WorkflowNotFoundResultFailure,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
@@ -51,7 +52,7 @@ from griptape_nodes.servers.mcp import SUPPORTED_REQUEST_EVENTS
 ORIGINAL_RUN_WORKFLOW = WorkflowRunner.run_workflow
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -132,6 +133,14 @@ class TestListOpenWorkflows:
 
         assert isinstance(result, ListOpenWorkflowsResultSuccess)
         assert result.open_workflows == [engine.open_workflow_info(first), engine.open_workflow_info(second)]
+
+    def test_leaves_out_a_workflow_still_opening(self, engine: Engine) -> None:
+        """Clients hear of it once its build ends, and never if the build fails."""
+        with engine.context_manager.opening_requested_workflow(display_name="building"):
+            result = _send(engine, ListOpenWorkflowsRequest()).result
+
+        assert isinstance(result, ListOpenWorkflowsResultSuccess)
+        assert result.open_workflows == []
 
     def test_ignores_an_envelope_naming_a_workflow_that_is_not_open(self, engine: Engine) -> None:
         result_event = _send(engine, ListOpenWorkflowsRequest(), uuid.uuid4().hex)
@@ -336,6 +345,24 @@ class TestOlderOpenRequestsShareTheCode:
 
             assert isinstance(result, EnsureWorkflowAndFlowResultFailure)
             assert not opened.workflow.context.has_current_flow()
+
+    @pytest.mark.parametrize(
+        "make_request",
+        [
+            lambda name: EnsureWorkflowAndFlowRequest(workflow_name=name),
+            lambda name: SetWorkflowContextRequest(workflow_name=name),
+        ],
+        ids=["ensure", "set_context"],
+    )
+    def test_refuses_a_saved_workflow_that_is_not_open(
+        self, engine: Engine, saved_workflow_name: str, make_request: Callable[[str], RequestPayload]
+    ) -> None:
+        """Neither builds the file, so the workflow would show empty and its next save would erase the file."""
+        result = engine.handle_request(make_request(saved_workflow_name))
+
+        assert result.failed()
+        assert "OpenWorkflowRequest" in str(result.result_details)
+        assert engine.open_workflows.all_open() == []
 
     def test_a_clean_slate_registry_run_of_the_open_workflow_reloads_it_from_its_file(
         self, engine: Engine, saved_workflow_name: str

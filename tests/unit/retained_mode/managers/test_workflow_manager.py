@@ -4096,21 +4096,23 @@ class TestWorkflowCreationHonorsSaveSituation:
 
     def test_first_save_after_create_from_template_stays_put(self, engine: Engine, context_dir: Path) -> None:
         """The created workflow's first save overwrites it in place, at the right location."""
+        from griptape_nodes.retained_mode.events.context_events import (
+            OpenWorkflowRequest,
+            OpenWorkflowResultSuccess,
+        )
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowRequest,
             SaveWorkflowResultSuccess,
-        )
-        from griptape_nodes.retained_mode.managers.context_manager import (
-            EnsureWorkflowAndFlowRequest,
-            EnsureWorkflowAndFlowResultSuccess,
         )
 
         template_key = self._make_template(engine, "show_template")
         created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
         assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
 
-        opened = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name=created.workflow_name))
-        assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
+        opened = asyncio.run(
+            engine.ahandle_request(OpenWorkflowRequest(workflow_name=created.workflow_name, create_flow=True))
+        )
+        assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
         saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=created.workflow_name)))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details

@@ -25,7 +25,9 @@ class SetWorkflowContextRequest(RequestPayload):
         workflow_name: Name of the workflow to set as current context. When None,
                        the handler registers a new unsaved workflow, named
                        "unsaved:<workflow id>". A name the registry does not hold fails,
-                       "unsaved:" names included.
+                       "unsaved:" names included. So does a workflow with a file that isn't
+                       open, since this request doesn't load its nodes: open it with
+                       OpenWorkflowRequest.
         display_name: Human-readable name used when auto-registering an unsaved entry.
                       Ignored when the workflow is already in the registry. Defaults to
                       None; in that case the auto-registered entry gets a placeholder
@@ -257,7 +259,8 @@ class ListOpenWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
     """The workflows the engine has open.
 
     Args:
-        open_workflows: Every open workflow, in the order they were opened.
+        open_workflows: Every open workflow, in the order they were opened. One still opening is
+            left out until it has finished.
         engine_run_id: Changes each time the engine restarts. Workflow ids last only until a
             restart, so drop the ids you kept when it changes.
     """
@@ -286,7 +289,9 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
         workflow_name: Registered workflow to enter if no workflow is in context. Ignored
             when a workflow is already in context. When None, the engine registers a new
             unsaved workflow and returns its key in the success result. A name the registry
-            does not hold fails; pass display_name to name a new workflow.
+            does not hold fails; pass display_name to name a new workflow. So does a workflow
+            with a file that isn't open, since this request doesn't load its nodes: open it
+            with OpenWorkflowRequest.
         display_name: Human-readable name attached to the auto-registered unsaved
             entry. Ignored when the workflow is already in context or when a saved
             workflow_name is supplied.

@@ -817,6 +817,17 @@ class Engine:
         if build_ended is not None:
             await build_ended.wait()
 
+    def open_workflow_infos(self) -> list[OpenWorkflowInfo]:
+        """What clients are told of every open workflow, in the order they were opened.
+
+        Leaves out a workflow still building, which clients hear of once its build ends.
+        """
+        return [
+            self.open_workflow_info(workflow)
+            for workflow in self._open_workflows.all_open()
+            if not self.is_opening(workflow)
+        ]
+
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
         """What clients are told of an open workflow."""
         entry = self.workflow_registry.get(workflow.workflow_id)
@@ -1099,7 +1110,7 @@ class Engine:
         }
 
         try:
-            open_workflows = [self.open_workflow_info(workflow) for workflow in self._open_workflows.all_open()]
+            open_workflows = self.open_workflow_infos()
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
             return workflow_info
