@@ -44,6 +44,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers.mcp import SUPPORTED_REQUEST_EVENTS
 
@@ -316,7 +317,9 @@ class TestOlderOpenRequestsShareTheCode:
         assert isinstance(opened, OpenWorkflowResultSuccess)
         workflow_name = opened.open_workflow.name
 
-        result = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name=workflow_name))
+        # Bound to no workflow, so Ensure opens by the name rather than using the caller's workflow.
+        with engine.bind_workflow(NO_WORKFLOW):
+            result = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name=workflow_name))
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
         assert not result.created_workflow
@@ -328,7 +331,8 @@ class TestOlderOpenRequestsShareTheCode:
         with engine.context_manager.opening_requested_workflow(display_name="building") as opened:
             workflow_name = engine.workflow_registry.get(opened.workflow.workflow_id).name
 
-            result = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name=workflow_name))
+            with engine.bind_workflow(NO_WORKFLOW):
+                result = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name=workflow_name))
 
             assert isinstance(result, EnsureWorkflowAndFlowResultFailure)
             assert not opened.workflow.context.has_current_flow()
