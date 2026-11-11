@@ -3,8 +3,10 @@ from enum import StrEnum
 from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
     ExecutionPayload,
     GraphAccessMixin,
+    ProgressEvent,
     RequestPayload,
     ResultDetails,
     ResultPayloadFailure,
@@ -719,6 +721,17 @@ class GriptapeEvent(ExecutionPayload):
     parameter_name: str
     type: str
     value: DisplayValue
+
+
+def progress_to_execution_event(progress: ProgressEvent) -> ExecutionEvent:
+    """The execution event a streamed progress event reaches clients as."""
+    payload = GriptapeEvent(
+        node_name=progress.node_name,
+        parameter_name=progress.parameter_name,
+        type=type(progress).__name__,
+        value=progress.value,
+    )
+    return ExecutionEvent(payload=payload, open_workflow_id=progress.open_workflow_id)
 
 
 class NodeMetadata(TypedDict, total=False):

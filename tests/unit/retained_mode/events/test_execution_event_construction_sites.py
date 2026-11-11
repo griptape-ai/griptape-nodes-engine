@@ -25,7 +25,7 @@ _ALLOWED_SITES = {
     # Progress chunks name the node's workflow (`BaseNode._event_workflow_id`).
     ("exe_types/node_types.py", "append_value_to_parameter"): True,
     # A subprocess forwards a progress event to the engine that started it, keeping its id.
-    ("bootstrap/workflow_executors/local_session_workflow_executor.py", "_arun"): True,
+    ("retained_mode/events/execution_events.py", "progress_to_execution_event"): True,
     # A chat about no workflow names none.
     ("retained_mode/managers/agent_manager.py", "emit"): False,
     # Publishing progress is about the engine, not a workflow.
