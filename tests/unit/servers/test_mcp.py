@@ -294,6 +294,15 @@ class TestListTools:
         assert {"CancelFlowRequest", "UnresolveFlowRequest"} <= names
 
     @pytest.mark.asyncio
+    async def test_runs_a_node_with_resolve_node_request_not_execute_node_request(self) -> None:
+        """ExecuteNodeRequest skips the handling NodeExecutor gives groups and loops by type."""
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert "ResolveNodeRequest" in names
+        assert "ExecuteNodeRequest" not in names
+
+    @pytest.mark.asyncio
     async def test_advertises_flow_validation_request(self) -> None:
         result = await list_tools(_NO_CONTEXT, None)
 
