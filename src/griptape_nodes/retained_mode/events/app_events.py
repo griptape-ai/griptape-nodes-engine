@@ -43,7 +43,7 @@ class OpenWorkflowInfo:
     Args:
         workflow_id: The workflow's id, which a request envelope's `open_workflow_id` names.
         name: The workflow's name.
-        workflow_file_path: Path to the workflow file (None while it is unsaved).
+        workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
         has_active_flow: Whether the workflow has a current flow.
     """
 
