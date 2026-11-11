@@ -71,7 +71,9 @@ class WorkflowFileOperations(EngineScoped):
         if open_target is not None:
             await self.engine.aclose_workflow(open_target)
         try:
-            registry.remove(workflow.workflow_id)
+            # Closing an unsaved workflow already forgot its entry.
+            if registry.find_by_id(workflow.workflow_id) is not None:
+                registry.remove(workflow.workflow_id)
         except (KeyError, OpenWorkflowRemovalError) as e:
             details = f"Failed to remove workflow from registry with name '{workflow_name}'. Exception: {e}"
             return DeleteWorkflowResultFailure(result_details=details)
