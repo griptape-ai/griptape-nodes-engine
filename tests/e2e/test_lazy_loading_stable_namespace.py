@@ -49,6 +49,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.library.module_loading import LibraryModuleLoading
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -156,7 +157,7 @@ def _generate_payload_workflow_source(engine: Engine, library_json: Path, *, laz
     module = _import_stable_namespace()
     payload = module.LazyPayload(PAYLOAD_TAG)
 
-    engine.context_manager.push_workflow(workflow_name="lazy_payload_e2e_workflow")
+    bind(engine.context_manager.open_workflow(workflow_name="lazy_payload_e2e_workflow"))
 
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=False)

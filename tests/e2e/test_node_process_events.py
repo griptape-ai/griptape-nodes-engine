@@ -36,6 +36,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -151,7 +152,7 @@ async def _run(engine: Engine, flow_name: str, start_node_name: str) -> None:
 
 
 def _create_parent_flow(engine: Engine, workflow_name: str) -> str:
-    engine.context_manager.push_workflow(workflow_name=workflow_name)
+    bind(engine.context_manager.open_workflow(workflow_name=workflow_name))
     parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )

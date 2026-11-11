@@ -61,7 +61,6 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
-from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -1011,8 +1010,7 @@ class EventManager(EngineScoped):
         Raises:
             ValueError: The request type already has a handler.
             TypeError: The callback's signature does not say what the request acts on (see
-                `scope_from_signature`), or the request type is in `ONLY_OPEN_UNTIL_CLIENTS_NAME` and
-                the callback is not OPTIONAL_WORKFLOW.
+                `scope_from_signature`).
         """
         existing_manager = self._request_type_to_manager.get(request_type)
         if existing_manager is not None:
@@ -1024,12 +1022,6 @@ class EventManager(EngineScoped):
             scope = scope_from_signature(callback)
         if scope is None:
             scope = without_workflow
-        if request_type.__name__ in ONLY_OPEN_UNTIL_CLIENTS_NAME and scope is not RequestScope.OPTIONAL_WORKFLOW:
-            msg = (
-                f"Attempted to register a handler for {request_type.__name__}. Failed because it is listed in "
-                "ONLY_OPEN_UNTIL_CLIENTS_NAME, which only an OPTIONAL_WORKFLOW handler can use."
-            )
-            raise TypeError(msg)
         self._request_type_to_manager[request_type] = callback
         if scope is not None:
             self._request_scopes[request_type] = scope
@@ -1534,17 +1526,14 @@ class EventManager(EngineScoped):
         open workflow. Otherwise it names its caller's binding, if there is one.
 
         - HOST binds NO_WORKFLOW, whatever the request names, and never checks its envelope id.
-        - WORKFLOW binds the workflow the request names, else the only open one, and hands it over.
+        - WORKFLOW binds the workflow the request names and hands it over.
         - OPTIONAL_WORKFLOW binds the workflow the request names and hands it over, else binds
-          NO_WORKFLOW and hands over None. Only a request type in `ONLY_OPEN_UNTIL_CLIENTS_NAME`
-          that names nothing falls back to the only open workflow (see `_optional_workflow`).
-        - With no scope, see `_unscoped_request_workflow`.
+          NO_WORKFLOW and hands over None.
+        - With no scope, the request is bound to what it names, or stays unbound.
 
         Raises:
             _RequestWorkflowError: The envelope id names no open workflow, or the caller is bound to
-                a workflow that has closed, or a WORKFLOW request names no workflow, or names nothing
-                while none or several are open, or a listed OPTIONAL_WORKFLOW request names nothing
-                while several are open.
+                a workflow that has closed, or a WORKFLOW request names no workflow.
         """
         named: WorkflowRuntime | NoWorkflow | None
         if scope is RequestScope.HOST:
@@ -1557,46 +1546,12 @@ class EventManager(EngineScoped):
             named = self._caller_workflow(request)
 
         if scope is None:
-            return self._unscoped_request_workflow(named, addressed=open_workflow_id is not None or sender is not None)
-
-        workflow: WorkflowRuntime | None = None
-        if scope is RequestScope.OPTIONAL_WORKFLOW:
-            workflow = self._optional_workflow(request, named)
-        elif scope is RequestScope.WORKFLOW:
-            workflow = self._workflow_for_workflow_request(request, named)
-        if workflow is None:
+            return _RequestWorkflow(binding=named, workflow=None)
+        if named is None or named is NO_WORKFLOW:
+            if scope is RequestScope.WORKFLOW:
+                raise _RequestWorkflowError(self._workflow_not_named_failure(request))
             return _RequestWorkflow(binding=NO_WORKFLOW, workflow=None)
-        return _RequestWorkflow(binding=workflow, workflow=workflow)
-
-    def _optional_workflow(
-        self, request: RequestPayload, named: WorkflowRuntime | NoWorkflow | None
-    ) -> WorkflowRuntime | None:
-        """The workflow an OPTIONAL_WORKFLOW request acts on: the one it names, else None.
-
-        A request type in `ONLY_OPEN_UNTIL_CLIENTS_NAME` that names nothing gets the only open
-        workflow, and None when none is open.
-
-        Raises:
-            _RequestWorkflowError: A listed request names nothing while several are open, answered
-                with `WorkflowNotNamedResultFailure`: its client means the open one, and which that
-                is can't be told.
-        """
-        if named is NO_WORKFLOW:
-            return None
-        if named is not None:
-            return named
-        if type(request).__name__ not in ONLY_OPEN_UNTIL_CLIENTS_NAME:
-            return None
-        open_workflows = self.engine.open_workflows.all_open()
-        if len(open_workflows) > 1:
-            msg = (
-                f"Attempted to run {type(request).__name__}. Failed because {len(open_workflows)} workflows are open "
-                "and the request did not name one. Name one on the request envelope."
-            )
-            raise _RequestWorkflowError(WorkflowNotNamedResultFailure(result_details=msg))
-        if not open_workflows:
-            return None
-        return open_workflows[0]
+        return _RequestWorkflow(binding=named, workflow=named)
 
     def _open_workflow_named_by_envelope(self, request: RequestPayload, open_workflow_id: str) -> WorkflowRuntime:
         """The open workflow an envelope id names.
@@ -1637,53 +1592,14 @@ class EventManager(EngineScoped):
             open_workflows=self.engine.open_workflow_infos(), result_details=result_details
         )
 
-    def _unscoped_request_workflow(
-        self, named: WorkflowRuntime | NoWorkflow | None, *, addressed: bool
-    ) -> _RequestWorkflow:
-        """The binding for a request whose handler declares no scope.
-
-        A request whose envelope or sender names a workflow, or none, is bound to it. Otherwise it
-        keeps the caller's binding, and unbound work is bound to the only open workflow, so a run it
-        starts keeps that workflow across awaits as one started with an id does. With none open, or
-        several, it stays unbound.
-        """
-        if addressed or named is not None:
-            return _RequestWorkflow(binding=named, workflow=None)
-        open_workflows = self.engine.open_workflows.all_open()
-        if len(open_workflows) != 1:
-            return _RequestWorkflow(binding=None, workflow=None)
-        return _RequestWorkflow(binding=open_workflows[0], workflow=None)
-
-    def _workflow_for_workflow_request(
-        self, request: RequestPayload, named: WorkflowRuntime | NoWorkflow | None
-    ) -> WorkflowRuntime:
-        """The workflow a WORKFLOW request acts on: the one it names, else the only open one.
-
-        Raises:
-            _RequestWorkflowError: The request names no workflow, or names nothing while none or
-                several are open, answered with `WorkflowNotNamedResultFailure`.
-        """
-        request_name = type(request).__name__
-        if named is NO_WORKFLOW:
-            msg = f"Attempted to run {request_name}. Failed because the request names no workflow."
-            raise _RequestWorkflowError(WorkflowNotNamedResultFailure(result_details=msg))
-        if named is not None:
-            return named
-
-        open_workflows = self.engine.open_workflows.all_open()
-        if not open_workflows:
-            msg = (
-                f"Attempted to run {request_name}. Failed because the request names no workflow and none is open. "
-                "Open a workflow, or name one on the request envelope."
-            )
-            raise _RequestWorkflowError(WorkflowNotNamedResultFailure(result_details=msg))
-        if len(open_workflows) > 1:
-            msg = (
-                f"Attempted to run {request_name}. Failed because {len(open_workflows)} workflows are open and "
-                "the request did not name one. Name one on the request envelope."
-            )
-            raise _RequestWorkflowError(WorkflowNotNamedResultFailure(result_details=msg))
-        return open_workflows[0]
+    def _workflow_not_named_failure(self, request: RequestPayload) -> WorkflowNotNamedResultFailure:
+        """The failure for a WORKFLOW request that names no workflow, listing the open ones."""
+        msg = (
+            f"Attempted to run {type(request).__name__}. Failed because the request names no workflow. "
+            "Name an open workflow on the request envelope, or with the X-Griptape-Workflow-Id header from an "
+            "MCP client. ListOpenWorkflowsRequest lists the open workflows, and OpenWorkflowRequest opens one."
+        )
+        return WorkflowNotNamedResultFailure(open_workflows=self.engine.open_workflow_infos(), result_details=msg)
 
     @staticmethod
     def _handler_with_workflow(

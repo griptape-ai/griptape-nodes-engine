@@ -89,6 +89,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from tests.workflow_context import bind, unbind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -131,6 +132,7 @@ def _open_new_workflow(engine: Engine, display_name: str) -> str:
     result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
     assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
     assert result.workflow_id is not None
+    bind(engine.open_workflows.get(result.workflow_id))
     return result.workflow_id
 
 
@@ -142,6 +144,7 @@ def _save(engine: Engine, request: SaveWorkflowRequest | None = None) -> SaveWor
 
 def _close(engine: Engine) -> None:
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    unbind()
 
 
 def _saved_workflow(engine: Engine, display_name: str) -> SaveWorkflowResultSuccess:
@@ -299,7 +302,7 @@ class TestWritePathsKeepOrMintAnId:
             open_entry = branch_entry
         else:
             open_entry = project_engine.workflow_registry.get(source.workflow_id)  # type: ignore[arg-type]
-        project_engine.context_manager.push_workflow(open_entry.name)
+        bind(project_engine.context_manager.open_workflow(open_entry.name))
 
         merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_name=branch.branched_workflow_name))
 
@@ -398,7 +401,7 @@ class TestPlaceholderMetadataIsNeverWrittenBack:
     def _open_damaged_file(self, engine: Engine, workspace: Path) -> Path:
         workflow_file = workspace / "damaged.py"
         workflow_file.write_text("print('no header')\n", encoding="utf-8")
-        engine.context_manager.push_workflow(file_path=str(workflow_file))
+        bind(engine.context_manager.open_workflow(file_path=str(workflow_file)))
         assert engine.context_manager.get_current_workflow().metadata_is_placeholder
         return workflow_file
 
@@ -543,7 +546,7 @@ class TestIdsAcrossRescans:
         engine = current_engine()
         engine.config_manager.workspace_path = workspace
         opened_file = _write_workflow_file(workspace / "opened.py")
-        engine.context_manager.push_workflow(file_path=str(opened_file))
+        bind(engine.context_manager.open_workflow(file_path=str(opened_file)))
         opened_id = engine.context_manager.get_current_workflow_id()
 
         _scan(engine, workspace)
@@ -588,7 +591,7 @@ class TestRegistryRefresh:
         engine = current_engine()
         engine.config_manager.workspace_path = workspace
         workflow_file = _write_workflow_file(workspace / "flow.py", name="Before")
-        engine.context_manager.push_workflow(file_path=str(workflow_file))
+        bind(engine.context_manager.open_workflow(file_path=str(workflow_file)))
         opened = engine.workflow_registry.find_by_path(workflow_file)
         assert opened is not None
         in_memory = opened.metadata
@@ -731,7 +734,7 @@ class TestRegisterWorkflow:
         engine.config_manager.workspace_path = workspace
         # Outside the workspace, so opening it registers it unlisted.
         workflow_file = _write_workflow_file(tmp_path / "elsewhere" / "flow.py")
-        engine.context_manager.push_workflow(file_path=str(workflow_file))
+        bind(engine.context_manager.open_workflow(file_path=str(workflow_file)))
         engine.context_manager.pop_workflow()
         opened_id = _id_at(engine, workflow_file)
         assert opened_id is not None
@@ -749,7 +752,7 @@ class TestRegisterWorkflow:
         engine = current_engine()
         engine.config_manager.workspace_path = workspace
         workflow_file = _write_workflow_file(tmp_path / "elsewhere" / "flow.py")
-        engine.context_manager.push_workflow(file_path=str(workflow_file))
+        bind(engine.context_manager.open_workflow(file_path=str(workflow_file)))
         engine.context_manager.pop_workflow()
         opened_id = _id_at(engine, workflow_file)
         assert opened_id is not None
@@ -815,13 +818,12 @@ class TestFirstSave:
         assert stale_id is not None
         # Deleted outside the engine: its entry stays until the next scan.
         stale.unlink()
-        opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="Scratch"))
-        assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess)
+        opened_id = _open_new_workflow(engine, "Scratch")
 
         saved = _run(engine, SaveWorkflowRequest(file_name="current/comp"))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
-        assert saved.workflow_id == opened.workflow_id
+        assert saved.workflow_id == opened_id
         assert stale.is_file()
         assert engine.workflow_registry.find_by_id(stale_id) is None
 
@@ -1073,9 +1075,13 @@ class TestASavedFileOpensTheWorkflowItLoads:
         )  # type: ignore[arg-type]
 
         assert loaded.result.succeeded(), loaded.result.result_details
-        assert saved.workflow_id is not None
-        opened = project_engine.open_workflows.get(saved.workflow_id)
+        assert isinstance(loaded.result, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
+        assert loaded.result.open_workflow is not None
+        # An open runs in no workflow, whichever one the envelope named.
+        assert loaded.open_workflow_id is None
+        opened = project_engine.open_workflows.get(loaded.result.open_workflow.workflow_id)
         assert opened is not replaced
+        assert opened.workflow_id == saved.workflow_id
         assert opened.context.has_current_flow()
         assert len(opened.objects) > 0
         assert not replaced.closed
@@ -1115,10 +1121,16 @@ _LIBRARY_OPENS = {
 
 
 def _open_library_workflow(engine: Engine, how: str, library: SaveWorkflowResultSuccess) -> str:
-    """Open `library` the way `how` names, and return the id the open reports."""
+    """Open `library` the way `how` names, bind what it opened, and return the id the open reports."""
+    workflow_id = _open_library_workflow_unbound(engine, how, library)
+    bind(engine.open_workflows.get(workflow_id))
+    return workflow_id
+
+
+def _open_library_workflow_unbound(engine: Engine, how: str, library: SaveWorkflowResultSuccess) -> str:
     if how == "script":
         # A saved file run on its own opens itself, then builds into what it opened.
-        engine.context_manager.push_workflow(file_path=library.file_path)
+        bind(engine.context_manager.open_workflow(file_path=library.file_path))
         return engine.open_workflows.all_open()[0].workflow_id
     requests: dict[str, object] = {
         "open_by_id": OpenWorkflowRequest(workflow_id=library.workflow_id),

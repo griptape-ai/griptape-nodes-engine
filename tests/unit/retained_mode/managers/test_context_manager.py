@@ -300,8 +300,9 @@ class TestWorkflowWorkingDirectory:
     """
 
     def _resolve_outputs(self, engine: Engine) -> Path:
-        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node would."""
-        result = engine.handle_request(
+        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node in the test's one open workflow would."""
+        (workflow,) = engine.open_workflows.all_open()
+        result = workflow.handle_request(
             GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir?:/}outputs/img.png"), variables={})
         )
         assert isinstance(result, GetPathForMacroResultSuccess)
@@ -403,7 +404,8 @@ class TestWorkflowWorkingDirectory:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
 
-                resolved = engine.handle_request(
+                assert result.workflow_id is not None
+                resolved = engine.open_workflows.get(result.workflow_id).handle_request(
                     GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
                 )
 

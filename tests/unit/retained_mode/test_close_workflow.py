@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
+from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
@@ -66,10 +67,10 @@ def undeletable_library() -> Iterator[None]:
 
 
 def _open_with_canvas(engine: Engine) -> WorkflowRuntime:
-    engine.context_manager.push_workflow(workflow_name="closing")
+    workflow = open_and_bind(engine, "closing")
     created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
     assert isinstance(created, CreateFlowResultSuccess), created.result_details
-    return engine.current_workflow()
+    return workflow
 
 
 def _add_undeletable_node(engine: Engine) -> None:

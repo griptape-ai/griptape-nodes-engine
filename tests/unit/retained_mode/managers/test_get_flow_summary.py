@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.managers.flow.summary import (
     MAX_VALUE_TEXT_LENGTH,
     summarize_value,
 )
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -169,7 +170,7 @@ def summary_flow(engine: Engine) -> Iterator[None]:
     library.register_new_node_type(
         _PlainGroup, NodeMetadata(category="test", description="d", display_name="Plain Group")
     )
-    engine.context_manager.push_workflow(workflow_name="flow_summary_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="flow_summary_wf"))
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     for name, x in (("source", 0), ("target", 400)):
