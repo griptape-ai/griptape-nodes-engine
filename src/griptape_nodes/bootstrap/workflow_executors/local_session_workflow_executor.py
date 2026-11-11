@@ -9,7 +9,6 @@ from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import 
     LocalExecutorError,
     LocalWorkflowExecutor,
 )
-from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
@@ -35,6 +34,8 @@ if TYPE_CHECKING:
     from pathlib import Path
     from types import TracebackType
 
+    from griptape_nodes.drivers.storage import StorageBackend
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +43,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     def __init__(  # noqa: PLR0913
         self,
         session_id: str,
-        storage_backend: StorageBackend = StorageBackend.LOCAL,
+        storage_backend: StorageBackend | None = None,
         on_start_flow_result: Callable[[ResultPayload], None] | None = None,
         save_on_failure_path: str | None = None,
         *,
