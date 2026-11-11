@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
@@ -43,6 +44,58 @@ class TestNodeTypes:
 
         # Verify all yields were processed
         assert results == ["result1", "result2"]
+
+
+class _ThreadRecordingNode(MockNode):
+    """Records the thread its process() body runs on."""
+
+    def __init__(self, *, as_generator: bool) -> None:
+        super().__init__(name="thread_recording_node")
+        self.as_generator = as_generator
+        self.threads: dict[str, int] = {}
+
+    def process(self) -> AsyncResult | None:
+        self.threads["process"] = threading.get_ident()
+        if not self.as_generator:
+            return None
+        return self._generator()
+
+    def _generator(self) -> AsyncResult:
+        self.threads["before_yield"] = threading.get_ident()
+        yield lambda: None
+        self.threads["after_yield"] = threading.get_ident()
+
+
+class TestAprocessKeepsSyncNodeCodeOffTheLoop:
+    """Sync node code runs in worker threads, so it cannot block the engine loop."""
+
+    @pytest.mark.asyncio
+    async def test_a_plain_process_runs_off_the_loop_thread(self) -> None:
+        node = _ThreadRecordingNode(as_generator=False)
+
+        await node.aprocess()
+
+        assert node.threads["process"] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_generator_code_between_yields_runs_off_the_loop_thread(self) -> None:
+        node = _ThreadRecordingNode(as_generator=True)
+
+        await node.aprocess()
+
+        loop_thread = threading.get_ident()
+        assert set(node.threads) == {"process", "before_yield", "after_yield"}
+        assert loop_thread not in node.threads.values()
+
+    @pytest.mark.asyncio
+    async def test_a_generator_that_yields_nothing_finishes(self) -> None:
+        def generator() -> AsyncResult:
+            return
+            yield
+
+        node = MockNode(process_result=generator())
+
+        await node.aprocess()
 
 
 class TestConnectionRemovedHooks:

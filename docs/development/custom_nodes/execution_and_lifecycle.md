@@ -32,7 +32,7 @@ All callbacks are overridable:
 Nodes have two ways to perform long-running work without stalling the engine:
 
 1. **Override `async def aprocess()` (preferred).** The engine awaits it on its event loop, so genuinely asynchronous integrations (async HTTP clients, `await asyncio.sleep()` polling) run concurrently with the rest of the engine.
-1. **Override `process()` and `yield` callables (`AsyncResult`).** Each yielded callable is executed **synchronously on a background thread** — the engine stays responsive, but the work itself is still blocking, sequential code.
+1. **Override `process()`, optionally yielding callables (`AsyncResult`).** `process()` and each callable it yields run **synchronously on a background thread**. The engine stays responsive, but the work itself is still blocking, sequential code.
 
 If you are writing a new integration, reach for `aprocess()` and async I/O. Use the `yield` pattern when your integration is built on synchronous libraries (`requests`, blocking SDKs) that you don't want to rewrite.
 
@@ -113,7 +113,9 @@ class MyAsyncNode(ControlNode):
 
 ### Blocking Work on a Background Thread (`process()` + `yield`)
 
-For integrations built on synchronous libraries, override `process()` and yield a callable. The engine runs each yielded callable synchronously on a background thread and resumes the generator with its return value — the engine stays responsive, but this does **not** make the work itself asynchronous:
+For integrations built on synchronous libraries, override `process()`. The engine runs it on a background thread. If it yields a callable, the engine runs that on a background thread too and resumes the generator with its return value. The engine stays responsive, but this does **not** make the work itself asynchronous.
+
+A running thread cannot be interrupted, so a cancelled run stops at the next yield. Yield long work as separate steps to make cancelling take effect sooner:
 
 ```python
 from griptape_nodes.exe_types.node_types import ControlNode, AsyncResult

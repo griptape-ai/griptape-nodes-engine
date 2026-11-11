@@ -141,6 +141,21 @@ _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=F
 _running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
 
 
+# What _resume_generator returns once the generator has finished.
+_GENERATOR_DONE = object()
+
+
+def _resume_generator(generator: Generator[Any, Any], value: Any) -> Any:
+    """Send `value` into `generator` and return what it yields next, or `_GENERATOR_DONE`.
+
+    StopIteration is caught here because it cannot be set on the future a thread's result returns in.
+    """
+    try:
+        return generator.send(value)
+    except StopIteration:
+        return _GENERATOR_DONE
+
+
 @functools.cache
 def _base_node_attribute_names() -> frozenset[str]:
     """The attributes every node has from ``BaseNode`` itself, which is engine bookkeeping rather than node state."""
@@ -1456,29 +1471,25 @@ class BaseNode(ABC):
 
         Default implementation wraps the existing process() method to maintain backwards compatibility.
         Subclasses can override this method to provide direct async implementation.
+
+        process(), the generator code between its yields, and each callable it yields run in
+        worker threads, so sync node code never blocks the engine loop. Each runs as its own
+        step, so a cancelled run stops at the next one.
         """
-        result = self.process()
+        result = await async_utils.to_thread(self.process)
 
         if result is None:
             # Simple synchronous node - nothing to do
             return
 
-        if isinstance(result, Generator):
-            try:
-                # Start the generator
-                func = next(result)
-
-                while True:
-                    # Send result back and get next callable
-                    func_result = await async_utils.to_thread(func)
-                    func = result.send(func_result)
-
-            except StopIteration:
-                # Generator is done
-                return
-        else:
-            # Some other return type - log warning but continue
+        if not isinstance(result, Generator):
             logger.warning("Node %s process() returned unexpected type: %s", self.name, type(result))
+            return
+
+        func = await async_utils.to_thread(_resume_generator, result, None)
+        while func is not _GENERATOR_DONE:
+            func_result = await async_utils.to_thread(func)
+            func = await async_utils.to_thread(_resume_generator, result, func_result)
 
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
