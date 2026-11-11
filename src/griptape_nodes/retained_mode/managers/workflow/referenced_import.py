@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import semver
 
-from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -22,6 +22,8 @@ from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecu
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.node_library.workflow_registry import Workflow
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -128,14 +130,15 @@ class ReferencedWorkflowImport(EngineScoped):
             details = f"Attempted to import unsaved workflow '{request.workflow_name}' as a referenced sub flow."
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        # Get current flows before importing
-        flows_before = set(workflow.objects.get_filtered_subset(type=ControlFlow).keys())
-
-        # Execute the workflow within the target flow context.
-        # When track_as_referenced is True, wrap in `referenced_workflow` so the flow
-        # serializes as an import command. When False, the flow serializes as inline content.
         workflow_manager = self.engine.workflow_manager
-        with workflow.context.flow(self.engine.flow_manager.get_flow_by_name_in(workflow, flow_name)):
+        # Execute the workflow within the target flow context, on this task's own copy
+        # of the flow stack so concurrent imports cannot push onto each other's. Only
+        # the flows this import creates are recorded, so flows created by other tasks
+        # are never mistaken for ours. The record outlives the flow context: `new_flows`
+        # is read after the block exits.
+        with self._flow_on_task_local_stack_recording_new_flows(workflow, flow_name) as new_flows:
+            # When track_as_referenced is True, wrap in `referenced_workflow` so the flow
+            # serializes as an import command. When False, the flow serializes as inline content.
             if request.track_as_referenced:
                 with workflow_manager.referenced_workflow(request.workflow_name):
                     workflow_result = await workflow_manager.runner.run_workflow(workflow_file_path, workflow)
@@ -148,15 +151,13 @@ class ReferencedWorkflowImport(EngineScoped):
                 result_details=self._import_result_details(workflow_result, details, level=logging.ERROR)
             )
 
-        # Get flows after importing to find the new referenced sub flow
-        flows_after = set(workflow.objects.get_filtered_subset(type=ControlFlow).keys())
-        new_flows = flows_after - flows_before
-
         if not new_flows:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because no new flow was created"
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        created_flow_name = self._select_top_level_imported_flow(workflow, new_flows, flow_name, request.workflow_name)
+        created_flow_name = self._select_top_level_imported_flow(
+            workflow, set(new_flows), flow_name, request.workflow_name
+        )
 
         # Apply imported flow metadata if provided
         if request.imported_flow_metadata:
@@ -181,6 +182,23 @@ class ReferencedWorkflowImport(EngineScoped):
             status=workflow_result.status,
             result_details=self._import_result_details(workflow_result, details, level=logging.DEBUG),
         )
+
+    @contextmanager
+    def _flow_on_task_local_stack_recording_new_flows(
+        self, workflow: WorkflowRuntime, flow_name: str
+    ) -> Iterator[list[str]]:
+        """Give an import its own task-local flow stack and its own record of created flows.
+
+        Also enters the target flow, after the task-local stack.
+        """
+        target_flow = self.engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
+        with (
+            self.engine.flow_manager.task_local_flow_creation_record() as new_flows,
+            workflow.context.task_local_flow_stack(),
+            # Entered after the task-local stack so its push lands on the task-local stack.
+            workflow.context.flow(target_flow),
+        ):
+            yield new_flows
 
     def _import_result_details(
         self, workflow_result: WorkflowExecutionResult, message: str, *, level: int
