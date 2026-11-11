@@ -1,4 +1,3 @@
-- Results of requests that open, load or save a workflow, and of `EnsureWorkflowAndFlowRequest`, now
-  carry `open_workflow`, the workflow open after the request. After a Save As it shows whether the
-  open workflow is the copy or the original.
+- Results of requests that open, load, or save a workflow now include `open_workflow`, the workflow
+  open after the request.
   [#6199](https://github.com/griptape-ai/griptape-nodes-engine/issues/6199)

@@ -1,5 +1,4 @@
-- The engine keeps several workflows open at once, one per editor tab. Requests that open a
-  workflow, `SetWorkflowContextRequest` and `RunWorkflowFromScratchRequest` included, open it
-  beside the others instead of failing or closing the open one. `ClearAllObjectStateRequest`
-  closes all of them. See [Transports](docs/guides/transports.md#open-workflows).
+- The engine can keep several workflows open at once, one per editor tab. Opening a workflow no
+  longer closes the one already open.
+  See [Transports](docs/guides/transports.md#open-workflows).
   [#6231](https://github.com/griptape-ai/griptape-nodes-engine/issues/6231)
