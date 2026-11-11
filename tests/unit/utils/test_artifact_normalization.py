@@ -291,3 +291,35 @@ def test_url_that_names_no_local_file_is_wrapped_as_is(url: str) -> None:
 def test_missing_path_is_returned_unchanged() -> None:
     """A path to nothing is handed back for the node's own validation to report."""
     assert normalize_artifact_input("missing.jpg", ImageUrlArtifact) == "missing.jpg"
+
+
+@pytest.mark.parametrize("meta_key", ["metadata", "meta"])
+def test_artifact_dict_keeps_its_metadata(meta_key: str) -> None:
+    """The dict's metadata lands on the artifact's `meta`.
+
+    Load 3D's Save Snapshot sends the snapshot's path as `metadata.imageUrl`, and the node
+    reads it back from `meta` to fill its `image` output.
+    """
+    artifact_dict = {
+        "type": "ImageUrlArtifact",
+        "value": "{inputs}/model.png",
+        meta_key: {"imageUrl": "{inputs}/snapshot.png"},
+    }
+
+    result = normalize_artifact_input(artifact_dict, ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.meta == {"imageUrl": "{inputs}/snapshot.png"}
+
+
+@pytest.mark.usefixtures("workspace")
+def test_resolved_file_dict_keeps_its_metadata(workspace: Path) -> None:
+    """Metadata survives when the value resolves to a file and the artifact is rebuilt."""
+    (workspace / "frame.png").write_bytes(b"png")
+    artifact_dict = {"type": "ImageUrlArtifact", "value": "frame.png", "metadata": {"imageUrl": "snap.png"}}
+
+    result = normalize_artifact_input(artifact_dict, ImageUrlArtifact)
+
+    assert isinstance(result, ImageUrlArtifact)
+    assert result.value == "{workspace_dir}/frame.png"
+    assert result.meta == {"imageUrl": "snap.png"}
