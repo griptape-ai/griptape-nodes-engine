@@ -32,13 +32,13 @@ from griptape_nodes.retained_mode.events.library_events import (
     PreviewUninstallLibraryResultFailure,
     PreviewUninstallLibraryResultSuccess,
     SandboxLibraryBlocker,
-    ShadowedConfigRemaining,
     SharedDirectoryEntryRemaining,
     UninstallLibraryRequest,
     UninstallLibraryResultFailure,
     UninstallLibraryResultSuccess,
-    UnmatchedEntryRemaining,
+    UnmatchedEntryBlocker,
     UnsafePathBlocker,
+    UnwritableConfigBlocker,
 )
 from griptape_nodes.retained_mode.managers.library.uninstall import _unsafe_install_directory
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -340,19 +340,28 @@ class TestManifestEntry:
         assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == []
 
     @pytest.mark.asyncio
-    async def test_entry_nothing_in_config_matches_reports_unmatched(self, engine: Engine, workspace: Path) -> None:
-        """A tracked library no config entry names still uninstalls, and says so."""
+    async def test_entry_nothing_in_config_matches_is_refused(self, engine: Engine, workspace: Path) -> None:
+        """With no entry to remove, the uninstall refuses rather than deleting the files.
+
+        Something registered this library that the engine cannot trace back to a setting, so
+        deleting its folder would leave that registration pointing at nothing.
+        """
         library_dir = workspace / "libs" / "orphan"
         manifest = _write_manifest(library_dir, "Orphan Library")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [])
         _track(engine.library_manager, manifest, library_name="Orphan Library")
 
-        result = await _uninstall_after_preview(engine, "Orphan Library", manifest)
+        preview = await _preview(engine, "Orphan Library", manifest)
+        result = await engine.ahandle_request(
+            UninstallLibraryRequest(library_name="Orphan Library", library_path=str(manifest))
+        )
 
-        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
-        assert [type(entry) for entry in result.remaining_registrations] == [UnmatchedEntryRemaining]
-        assert result.config_entry_removed is False
-        assert not await anyio.Path(library_dir).exists()
+        # The preview says so too, so the editor can disable the control before it is clicked.
+        assert isinstance(preview.blocked_by, UnmatchedEntryBlocker)
+        assert isinstance(result, UninstallLibraryResultFailure)
+        assert result.failure_reason == "blocked"
+        assert isinstance(result.blocked_by, UnmatchedEntryBlocker)
+        assert await anyio.Path(library_dir).exists()
 
 
 class TestDirectoryEntryWithSiblings:
@@ -455,19 +464,17 @@ class TestDownloadProvisionedLibrary:
         assert engine.config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) == []
 
 
-class TestShadowedConfigLayer:
-    """A higher config layer supplies the entry, so the user-layer removal cannot take effect.
+class TestUnwritableConfigLayer:
+    """A config layer the engine cannot write supplies the entry, so the uninstall refuses.
 
     `set_config_value` only writes the user layer, and these settings are lists, which
-    `merge_dicts` replaces wholesale. Without this verdict the engine would report a clean
-    uninstall, delete the folder, and then fail to load the library the project layer still
-    registers on the next start.
+    `merge_dicts` replaces wholesale, so the entry would survive. Deleting the files anyway
+    would leave the engine looking for a library that is gone, and the file holding the entry
+    is usually one a team shares.
     """
 
     @pytest.mark.asyncio
-    async def test_project_layer_entry_is_reported_as_shadowed(
-        self, engine: Engine, workspace: Path, tmp_path: Path
-    ) -> None:
+    async def test_project_layer_entry_is_refused(self, engine: Engine, workspace: Path, tmp_path: Path) -> None:
         config = engine.config_manager
         library_dir = workspace / "libs" / "shadowed"
         manifest = _write_manifest(library_dir, "Shadowed Library")
@@ -484,11 +491,12 @@ class TestShadowedConfigLayer:
 
         preview = await _preview(engine, "Shadowed Library", manifest)
 
-        [shadowed] = [e for e in preview.remaining_registrations if isinstance(e, ShadowedConfigRemaining)]
-        assert shadowed.layer == "project"
+        assert isinstance(preview.blocked_by, UnwritableConfigBlocker)
+        assert preview.blocked_by.layer == "project"
+        assert preview.blocked_by.config_key == LIBRARIES_TO_REGISTER_KEY
 
     @pytest.mark.asyncio
-    async def test_user_layer_only_entry_is_not_reported_as_shadowed(self, engine: Engine, workspace: Path) -> None:
+    async def test_user_layer_only_entry_is_not_refused(self, engine: Engine, workspace: Path) -> None:
         library_dir = workspace / "libs" / "plain"
         manifest = _write_manifest(library_dir, "Plain Library")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
@@ -496,20 +504,13 @@ class TestShadowedConfigLayer:
 
         preview = await _preview(engine, "Plain Library", manifest)
 
-        assert not any(isinstance(e, ShadowedConfigRemaining) for e in preview.remaining_registrations)
+        assert preview.blocked_by is None
 
     @pytest.mark.asyncio
-    async def test_a_shadowed_uninstall_writes_nothing_to_the_user_config(
+    async def test_a_refused_uninstall_changes_nothing_at_all(
         self, engine: Engine, workspace: Path, tmp_path: Path
     ) -> None:
-        """The config write is skipped entirely, not just ineffective.
-
-        `_classify_registration` reads the MERGED list, which here is the project layer's whole
-        list. Writing the remainder back would persist the project's OTHER libraries into the
-        user's global config, where they would load in every other project, and would drop any
-        user-layer entries absent from that list. The removal could not take effect either way,
-        so the write is pure damage.
-        """
+        """Nothing is written, unloaded or deleted, and the project's own file is untouched."""
         config = engine.config_manager
         mine = _write_manifest(workspace / "libs" / "mine", "Mine")
         theirs = _write_manifest(workspace / "libs" / "theirs", "Theirs")
@@ -525,14 +526,20 @@ class TestShadowedConfigLayer:
         config.load_configs()
         _track(engine.library_manager, mine, library_name="Mine", registered_path=str(mine))
 
-        result = await _uninstall_after_preview(engine, "Mine", mine)
+        result = await engine.ahandle_request(UninstallLibraryRequest(library_name="Mine", library_path=str(mine)))
 
-        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
-        assert result.config_entry_removed is False
+        assert isinstance(result, UninstallLibraryResultFailure)
+        assert result.failure_reason == "blocked"
+        assert isinstance(result.blocked_by, UnwritableConfigBlocker)
+        assert await anyio.Path(mine.parent).exists()
         user_entries = config.get_config_value(LIBRARIES_TO_REGISTER_KEY, config_source="user_config", default=[]) or []
-        assert str(theirs) not in user_entries, "the project layer's other library leaked into the user config"
-        assert user_entries == []
-        assert any(isinstance(e, ShadowedConfigRemaining) for e in result.remaining_registrations)
+        assert user_entries == [], "the project layer's libraries leaked into the user config"
+        assert (
+            str(theirs)
+            in json.loads((project_dir / "griptape_nodes_config.json").read_text(encoding="utf-8"))["app_events"][
+                "on_app_initialization_complete"
+            ]["libraries_to_register"]
+        )
 
 
 class TestProtectedDirectories:
@@ -604,13 +611,22 @@ class TestDuplicateNameCopies:
         """
         loaded_manifest = _write_manifest(workspace / "libs" / "loaded", "Dup Library")
         duplicate_manifest = _write_manifest(workspace / "libs" / "duplicate", "Dup Library")
+        engine.config_manager.set_config_value(
+            LIBRARIES_TO_REGISTER_KEY, [str(loaded_manifest), str(duplicate_manifest)]
+        )
         _track(
             engine.library_manager,
             loaded_manifest,
             library_name="Dup Library",
             lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            registered_path=str(loaded_manifest),
         )
-        _track(engine.library_manager, duplicate_manifest, library_name="Dup Library")
+        _track(
+            engine.library_manager,
+            duplicate_manifest,
+            library_name="Dup Library",
+            registered_path=str(duplicate_manifest),
+        )
         _register_in_registry("Dup Library")
 
         result = await _uninstall_after_preview(engine, "Dup Library", duplicate_manifest)
@@ -629,11 +645,13 @@ class TestDuplicateNameCopies:
     async def test_uninstalling_the_loaded_copy_does_unload_it(self, engine: Engine, workspace: Path) -> None:
         loaded_manifest = _write_manifest(workspace / "libs" / "loaded", "Dup Library")
         _write_manifest(workspace / "libs" / "duplicate", "Dup Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(loaded_manifest)])
         _track(
             engine.library_manager,
             loaded_manifest,
             library_name="Dup Library",
             lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            registered_path=str(loaded_manifest),
         )
         _register_in_registry("Dup Library")
 
@@ -730,9 +748,7 @@ class TestStructuredVerdictsAreWireReady:
             blocked_by=UnsafePathBlocker(path="/"),
             remaining_registrations=[
                 SharedDirectoryEntryRemaining(entry_path="/libs", library_names=["Roto"]),
-                ShadowedConfigRemaining(layer="project"),
                 DownloadEntryRemaining(git_url="https://github.com/o/r"),
-                UnmatchedEntryRemaining(),
             ],
             result_details="x",
         )
@@ -742,9 +758,7 @@ class TestStructuredVerdictsAreWireReady:
         assert wire["blocked_by"] == {"kind": "unsafe_path", "path": "/"}
         assert wire["remaining_registrations"] == [
             {"kind": "shared_directory_entry", "entry_path": "/libs", "library_names": ["Roto"]},
-            {"kind": "shadowed_config", "layer": "project"},
             {"kind": "download_entry", "git_url": "https://github.com/o/r"},
-            {"kind": "unmatched_entry"},
         ]
 
     def test_an_absent_blocker_serializes_as_null(self) -> None:
@@ -776,5 +790,5 @@ class TestStructuredVerdictsAreWireReady:
     def test_each_remaining_registration_carries_its_kind(self) -> None:
         assert DownloadEntryRemaining(git_url="u").kind == "download_entry"
         assert SharedDirectoryEntryRemaining(entry_path="/libs").kind == "shared_directory_entry"
-        assert ShadowedConfigRemaining(layer="project").kind == "shadowed_config"
-        assert UnmatchedEntryRemaining().kind == "unmatched_entry"
+        assert UnmatchedEntryBlocker().kind == "unmatched_entry"
+        assert UnwritableConfigBlocker(layer="project", config_key="x").kind == "unwritable_config"

@@ -28,7 +28,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     PreviewUninstallLibraryResultSuccess,
     RemainingRegistration,
     SandboxLibraryBlocker,
-    ShadowedConfigRemaining,
     SharedDirectoryEntryRemaining,
     UninstallBlocker,
     UninstallLibraryRequest,
@@ -36,8 +35,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     UninstallLibraryResultSuccess,
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultFailure,
-    UnmatchedEntryRemaining,
+    UnmatchedEntryBlocker,
     UnsafePathBlocker,
+    UnwritableConfigBlocker,
 )
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
@@ -181,9 +181,7 @@ class LibraryUninstall(EngineScoped):
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
         """Step 1 (least destructive): remove the config entry, if any names this exact copy."""
-        if resolved.classification.registered_in is None or resolved.classification.is_directory_entry:
-            return False, None
-        if any(isinstance(entry, ShadowedConfigRemaining) for entry in resolved.remaining_registrations):
+        if resolved.classification.is_directory_entry:
             return False, None
         removed = self._remove_config_entry(resolved.classification)
         if not removed:
@@ -278,7 +276,9 @@ class LibraryUninstall(EngineScoped):
             result_details=ResultDetails(message=message, level=level),
         )
 
-    async def _resolve(self, library_name: str, library_path: str) -> _Resolution | _ResolutionError:
+    async def _resolve(  # noqa: PLR0911 (one return per refusal, each checked before the next)
+        self, library_name: str, library_path: str
+    ) -> _Resolution | _ResolutionError:
         """Find the target, classify its registration, and decide whether it is safe to delete.
 
         Shared by preview and uninstall so the two cannot derive different answers.
@@ -326,6 +326,32 @@ class LibraryUninstall(EngineScoped):
                 install_directory=install_directory,
             )
 
+        # Refuse rather than half-finish: with no entry to remove, or none we are allowed to
+        # remove, the uninstall would delete the files and leave the registration behind, and
+        # the engine would then look for a library that is gone. Decided here, during
+        # resolution, so the preview reports it and the editor can disable the control.
+        if classification.registered_in is None:
+            return self._blocked_resolution(
+                library_name,
+                library_info,
+                blocked_by=UnmatchedEntryBlocker(),
+                classification=classification,
+                install_directory=install_directory,
+            )
+
+        shadowed_by = self._shadowed_config_source(classification)
+        if shadowed_by is not None:
+            config_key = (
+                LIBRARIES_TO_DOWNLOAD_KEY if classification.registered_in == "download" else LIBRARIES_TO_REGISTER_KEY
+            )
+            return self._blocked_resolution(
+                library_name,
+                library_info,
+                blocked_by=UnwritableConfigBlocker(layer=shadowed_by.layer, config_key=config_key),
+                classification=classification,
+                install_directory=install_directory,
+            )
+
         collateral_library_names = await self._collect_collateral_library_names(
             install_directory, exclude_manifest=resolved_library_path
         )
@@ -346,11 +372,13 @@ class LibraryUninstall(EngineScoped):
     async def _remaining_registrations_for(
         self, classification: _Classification, *, exclude_manifest: Path
     ) -> list[RemainingRegistration]:
-        """What would still register this library once its files are gone."""
-        remaining: list[RemainingRegistration] = []
+        """What would still register this library once its files are gone.
 
-        if classification.registered_in is None:
-            return [UnmatchedEntryRemaining()]
+        Only cases an uninstall is allowed to proceed through: a scan-root entry left in place
+        for the libraries beside this one, and a download entry that re-clones. An entry the
+        engine cannot remove at all blocks the uninstall instead.
+        """
+        remaining: list[RemainingRegistration] = []
 
         if classification.registered_in == "register" and classification.is_directory_entry:
             sibling_names = await self._sibling_library_names(classification, exclude_manifest=exclude_manifest)
@@ -364,10 +392,6 @@ class LibraryUninstall(EngineScoped):
 
         if classification.registered_in == "download" and classification.download is not None:
             remaining.append(DownloadEntryRemaining(git_url=classification.download.git_url))
-
-        shadowed_by = self._shadowed_config_source(classification)
-        if shadowed_by is not None:
-            remaining.append(ShadowedConfigRemaining(layer=shadowed_by.layer))
 
         return remaining
 

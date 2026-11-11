@@ -1410,6 +1410,36 @@ class NotFoundBlocker:
     kind: str = "not_found"
 
 
+@dataclass
+class UnwritableConfigBlocker:
+    """The setting that registers this library is in a config file the engine cannot write.
+
+    Project, workspace and environment settings override the user config, and the engine only
+    writes the user config, so the entry would survive the uninstall and the engine would look
+    for a library whose files are gone. Removing it is the owner's to do, in the file that holds
+    it.
+
+    Args:
+        layer: Which layer supplies it, e.g. "project", "workspace", or "env".
+        config_key: The setting holding the entry, so the editor can name it.
+    """
+
+    layer: str
+    config_key: str
+    kind: str = "unwritable_config"
+
+
+@dataclass
+class UnmatchedEntryBlocker:
+    """Nothing in the config matched this library, so there is no entry to remove.
+
+    Something registered it that the engine cannot trace back to a setting, so uninstalling
+    would delete the files and leave whatever did that in place.
+    """
+
+    kind: str = "unmatched_entry"
+
+
 # Why an uninstall cannot proceed at all, as a discriminated union on `kind`.
 #
 # Structured rather than a sentence: the editor owns the wording, so copy can be localized and
@@ -1420,7 +1450,14 @@ class NotFoundBlocker:
 # TYPED as a marker base serializes as the base: cattrs builds its hook from the declared type, so
 # a plain base passes the object through unconverted and a dataclass base emits `{}`. Either way
 # the editor would not receive the `kind` it switches on.
-UninstallBlocker = EnvironmentManagedBlocker | SandboxLibraryBlocker | UnsafePathBlocker | NotFoundBlocker
+UninstallBlocker = (
+    EnvironmentManagedBlocker
+    | SandboxLibraryBlocker
+    | UnsafePathBlocker
+    | NotFoundBlocker
+    | UnwritableConfigBlocker
+    | UnmatchedEntryBlocker
+)
 
 
 @dataclass
@@ -1440,28 +1477,11 @@ class SharedDirectoryEntryRemaining:
     kind: str = "shared_directory_entry"
 
 
-@dataclass
-class ShadowedConfigRemaining:
-    """A config layer the engine does not write still supplies the entry."""
-
-    layer: str
-    kind: str = "shadowed_config"
-
-
-@dataclass
-class UnmatchedEntryRemaining:
-    """Nothing in the config matched the manifest, so its registration lives somewhere else."""
-
-    kind: str = "unmatched_entry"
-
-
 # What still registers the library after an otherwise successful uninstall, as a discriminated
 # union on `kind`. The engine loads it again on its next start unless the user acts, so the editor
 # warns instead of reporting a clean uninstall. A union of concrete variants for the same
 # serialization reason as `UninstallBlocker`.
-RemainingRegistration = (
-    DownloadEntryRemaining | SharedDirectoryEntryRemaining | ShadowedConfigRemaining | UnmatchedEntryRemaining
-)
+RemainingRegistration = DownloadEntryRemaining | SharedDirectoryEntryRemaining
 
 
 @dataclass
@@ -1551,7 +1571,8 @@ class UninstallLibraryResultFailure(ResultPayloadFailure):
     """Uninstall failed.
 
     `failure_reason` is one of: not_found, blocked, config_write_failed, unload_failed,
-    directory_delete_failed.
+    directory_delete_failed. "blocked" carries `blocked_by`, which the preview reports too, so
+    the editor can disable the control before the user clicks it.
     """
 
     failure_reason: str | None = None
