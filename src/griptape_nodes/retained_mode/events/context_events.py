@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
 from griptape_nodes.retained_mode.events.base_events import (
     GraphAccessMixin,
     RequestPayload,
@@ -65,10 +66,12 @@ class SetWorkflowContextSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
                        this is the new unsaved workflow's key. Otherwise it echoes the
                        requested key.
         workflow_id: Id of the workflow now in context.
+        open_workflow: The workflow open after the request, as the heartbeat lists it.
     """
 
     workflow_name: str = ""
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
@@ -110,6 +113,48 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class GetWorkflowContextFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Workflow context retrieval failed. Common causes: context not initialized, system error."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CloseWorkflowRequest(RequestPayload):
+    """Close the open workflow `workflow_id` names, leaving other open workflows alone.
+
+    Use when: A client is done with a workflow, such as when its tab closes. Deletes the workflow's
+    flows and nodes and ends its run. Its saved file, if any, stays as it is. Ignores the
+    envelope's `open_workflow_id`. ClearAllObjectStateRequest closes every open workflow instead.
+
+    A workflow that is not open succeeds with `already_closed`. The engine forgets a closed unsaved
+    workflow's id, so an id it never had and one that already closed get the same answer.
+
+    Args:
+        workflow_id: Id of the workflow to close.
+
+    Results: CloseWorkflowResultSuccess | CloseWorkflowResultFailure (closing the workflow failed,
+        so it stays open)
+    """
+
+    workflow_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CloseWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The workflow is closed. A close leaves nothing unsaved, so it never marks a workflow changed.
+
+    Args:
+        workflow_id: Id of the workflow the request named.
+        already_closed: Whether that workflow was not open, so the request closed nothing.
+    """
+
+    workflow_id: str
+    already_closed: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class CloseWorkflowResultFailure(ResultPayloadFailure):
+    """Closing the workflow failed, so it stays open."""
 
 
 @dataclass

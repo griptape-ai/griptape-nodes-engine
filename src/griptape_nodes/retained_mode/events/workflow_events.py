@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
 from griptape_nodes.retained_mode.events.base_events import (
     GraphAccessMixin,
     RequestPayload,
@@ -42,8 +43,11 @@ class RunWorkflowFromScratchRequest(RequestPayload):
     Use when: Loading and executing saved workflows, testing workflows from files,
     running workflows in clean environments, batch processing workflows.
 
+    Ignores the envelope's `open_workflow_id`. Closes the open workflow first while only one may be
+    open.
+
     Args:
-        file_path: Path to the workflow file to load and execute
+        file_path: Path to the workflow file to load and execute.
 
     Results: RunWorkflowFromScratchResultSuccess | RunWorkflowFromScratchResultFailure (file not found, load error)
     """
@@ -62,10 +66,13 @@ class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
+        open_workflow: The workflow open after the request, as the heartbeat lists it. None when the file
+            opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
@@ -133,10 +140,12 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     Use when: Executing registered workflows, running workflows by name,
     using workflow templates, automated workflow execution.
 
+    Ignores the envelope's `open_workflow_id`.
+
     Args:
         workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to clear the open workflow first (default: True). With False, the
-            request fails while a workflow is open.
+        run_with_clean_slate: Whether to close the open workflow first, while only one may be open
+            (default: True). With False, the request fails while a workflow is open and only one may be.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
     """
@@ -156,10 +165,13 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
+        open_workflow: The workflow open after the request, as the heartbeat lists it. None when the file
+            opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
@@ -503,11 +515,15 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
         workflow_id: Id of the saved workflow. A Save As or versioned save
             writes a copy, with a new id.
+        open_workflow: The workflow open after the save, as the heartbeat lists it. When its id is
+            `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
+            workflow moves onto its copy. Otherwise the save wrote a copy and the original stays open.
     """
 
     file_path: str
     workflow_name: str
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
