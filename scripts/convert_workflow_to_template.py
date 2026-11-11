@@ -13,12 +13,16 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
+import OpenImageIO as oiio  # noqa: N813
 import tomlkit
-from PIL import Image
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 console = Console()
+
+GRAYSCALE_CHANNELS = 1
+GRAYSCALE_ALPHA_CHANNELS = 2
+RGBA_CHANNELS = 4
 
 
 def extract_metadata_block(file_path: Path) -> tuple[str, str]:
@@ -160,18 +164,14 @@ def process_image(image_path: Path, output_path: Path) -> None:
             shutil.copy2(image_path, output_path)
             return
 
-        # Load image
-        img = Image.open(image_path)
-
-        # Convert to RGB if needed (webp supports RGB/RGBA)
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
+        # Load image, apply its EXIF orientation, then convert to RGB or RGBA (what webp holds)
+        img = _to_rgb_or_rgba(oiio.ImageBufAlgo.reorient(_load_image(image_path)))
 
         # Resize to cover 512x512 while maintaining aspect ratio
         # This is similar to CSS object-fit: cover
-        target_size = (512, 512)
-        img_width, img_height = img.size
-        target_width, target_height = target_size
+        target_width, target_height = 512, 512
+        img_width = img.spec().width
+        img_height = img.spec().height
 
         # Calculate scaling factor to cover the target size
         scale = max(target_width / img_width, target_height / img_height)
@@ -181,23 +181,49 @@ def process_image(image_path: Path, output_path: Path) -> None:
         new_height = int(img_height * scale)
 
         # Resize image
-        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        resized_roi = oiio.ROI(0, new_width, 0, new_height, 0, 1, 0, img.nchannels)
+        img_resized = oiio.ImageBufAlgo.resize(img, "lanczos3", roi=resized_roi)
 
         # Crop from center to exact target size
         left = (new_width - target_width) // 2
         top = (new_height - target_height) // 2
-        right = left + target_width
-        bottom = top + target_height
-
-        img_cropped = img_resized.crop((left, top, right, bottom))
+        cropped_roi = oiio.ROI(left, left + target_width, top, top + target_height, 0, 1, 0, img.nchannels)
+        img_cropped = oiio.ImageBufAlgo.cut(img_resized, cropped_roi)
 
         # Save as webp with quality=85
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        img_cropped.save(output_path, format="WEBP", quality=85)
+        _save_webp(img_cropped, output_path, quality=85)
 
     except Exception as err:
         msg = f"Failed to process image: {err}"
         raise ValueError(msg) from err
+
+
+def _load_image(image_path: Path) -> oiio.ImageBuf:
+    img = oiio.ImageBuf(str(image_path))
+    if not img.read(force=True):
+        msg = f"Attempted to load {image_path}. Failed because: {img.geterror()}"
+        raise ValueError(msg)
+    return img
+
+
+def _save_webp(img: oiio.ImageBuf, output_path: Path, *, quality: int) -> None:
+    img.specmod().attribute("compression", f"webp:{quality}")
+    if not img.write(str(output_path), "uint8", "webp"):
+        msg = f"Attempted to save {output_path}. Failed because: {img.geterror()}"
+        raise ValueError(msg)
+
+
+def _to_rgb_or_rgba(img: oiio.ImageBuf) -> oiio.ImageBuf:
+    """Return ``img`` as three-channel color, or four with alpha, expanding grayscale."""
+    channels = img.nchannels
+    if channels == GRAYSCALE_CHANNELS:
+        return oiio.ImageBufAlgo.channels(img, (0, 0, 0), ("R", "G", "B"))
+    if channels == GRAYSCALE_ALPHA_CHANNELS:
+        return oiio.ImageBufAlgo.channels(img, (0, 0, 0, 1), ("R", "G", "B", "A"))
+    if channels > RGBA_CHANNELS:
+        return oiio.ImageBufAlgo.channels(img, (0, 1, 2, 3), ("R", "G", "B", "A"))
+    return img
 
 
 def generate_github_url(library_path: Path, thumbnail_filename: str) -> str:

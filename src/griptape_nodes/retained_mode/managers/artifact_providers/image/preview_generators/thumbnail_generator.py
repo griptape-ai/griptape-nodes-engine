@@ -1,14 +1,19 @@
-"""PIL-based thumbnail generator using Pillow."""
+"""Thumbnail generator."""
 
 from __future__ import annotations
 
-from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PIL import Image, ImageOps
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
 
+from griptape_nodes.image import (
+    DEFAULT_THUMBNAIL_SIZE,
+    GriptapeImage,
+    GriptapeImagePipeline,
+    ImageFormat,
+    ImageMetadata,
+)
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     ReadFileRequest,
@@ -29,26 +34,26 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
 
 
-class PILThumbnailParameters(BaseGeneratorParameters):
-    """Parameters for PIL thumbnail generation."""
+class ThumbnailParameters(BaseGeneratorParameters):
+    """Parameters for thumbnail generation."""
 
     max_width: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum width in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
     )
 
     max_height: PositiveInt = Field(
-        default=1024,
+        default=DEFAULT_THUMBNAIL_SIZE,
         description="Maximum height in pixels for generated preview (1-8192)",
         editor_schema_type="integer",
         le=8192,
     )
 
 
-class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
-    """PIL-based thumbnail generator with dimension constraints.
+class ThumbnailGenerator(BaseArtifactPreviewGenerator):
+    """Thumbnail generator with dimension constraints.
 
     Resizes images to fit within max_width x max_height while preserving aspect ratio.
     """
@@ -87,7 +92,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
 
         # Validate and convert dict -> Pydantic model
         # Raises ValidationError if invalid
-        self.params = PILThumbnailParameters.model_validate(params)
+        self.params = ThumbnailParameters.model_validate(params)
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -107,7 +112,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
     @classmethod
     def get_parameters(cls) -> type[BaseGeneratorParameters]:
         """Get parameter model class."""
-        return PILThumbnailParameters
+        return ThumbnailParameters
 
     async def attempt_generate_preview(self) -> str:
         """Execute preview generation.
@@ -115,7 +120,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
         Raises:
             FileNotFoundError: If source image not found
             TypeError: If image cannot be loaded or format unsupported
-            OSError: If preview generation fails (PIL/Pillow errors)
+            OSError: If preview generation fails (image decode or encode errors)
         """
         # Read the source image file
         read_request = ReadFileRequest(
@@ -157,15 +162,20 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
 
     def _render_thumbnail(self, image_data: bytes) -> bytes:
         """Decode, shrink and re-encode the image. CPU-bound, so callers run it off the event loop."""
-        with Image.open(BytesIO(image_data)) as raw_img:
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            img = ImageOps.exif_transpose(raw_img)
-            # Calculate thumbnail size (preserves aspect ratio, fits within max dimensions)
-            # Access validated parameters via self.params - fully type-safe
-            img.thumbnail((self.params.max_width, self.params.max_height), Image.Resampling.LANCZOS)
-
-            # Save to BytesIO
-            output_buffer = BytesIO()
-            img.save(output_buffer, format=self.preview_format.upper())
-            output_bytes = output_buffer.getvalue()
-        return output_bytes
+        preview_format = ImageFormat.from_name(self.preview_format)
+        if preview_format is None:
+            msg = (
+                f"Attempted to generate a thumbnail. Failed because {self.preview_format} is not a known image format."
+            )
+            raise TypeError(msg)
+        with GriptapeImage.open(image_data) as source:
+            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly, then
+            # fit within the max dimensions, preserving aspect ratio
+            thumbnail = (
+                GriptapeImagePipeline(source)
+                .exif_transpose()
+                .thumbnail(self.params.max_width, self.params.max_height)
+                .end()
+            )
+        # The color profile keeps colors right; embedded workflows and camera EXIF stay out of previews
+        return thumbnail.encode(preview_format, metadata=ImageMetadata(icc_profile=thumbnail.metadata.icc_profile))

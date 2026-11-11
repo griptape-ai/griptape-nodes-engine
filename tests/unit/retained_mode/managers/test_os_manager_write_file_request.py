@@ -14,7 +14,6 @@ import sys
 import tempfile
 import unicodedata
 from collections.abc import Generator
-from io import BytesIO
 from pathlib import Path
 from typing import IO
 from unittest.mock import MagicMock, patch
@@ -22,7 +21,6 @@ from unittest.mock import MagicMock, patch
 import portalocker
 import portalocker.utils
 import pytest
-from PIL import Image
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
@@ -56,6 +54,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifa
 )
 from griptape_nodes.retained_mode.managers.filesystem.file_writing import StagingFailedError
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
+from tests.unit.image.sample_images import encode, solid
 from tests.workflow_context import unsaved_workflow_open
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
@@ -835,15 +834,11 @@ class TestSidecarMetadata:
 
 
 def _png_bytes() -> bytes:
-    buf = BytesIO()
-    Image.new("RGB", (1, 1), color="white").save(buf, format="PNG")
-    return buf.getvalue()
+    return encode(solid(1, 1), "png")
 
 
 def _jpeg_bytes() -> bytes:
-    buf = BytesIO()
-    Image.new("RGB", (1, 1), color="white").save(buf, format="JPEG")
-    return buf.getvalue()
+    return encode(solid(1, 1), "jpg")
 
 
 class TestExtensionCoercion:

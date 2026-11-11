@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
-from PIL import Image
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.files.path_utils import resolve_path_safely
@@ -71,6 +70,7 @@ from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
+from tests.unit.image.sample_images import RED, encode, solid
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -404,7 +404,7 @@ class TestStaticFilesResolveForTheDispatchedWorkflow:
         _open(nothing_open, workspace / "open")
         addressed = _open(nothing_open, workspace / "addressed", beside=True)
         image_path = workspace / "img.png"
-        Image.new("RGB", (64, 64), color="red").save(image_path)
+        image_path.write_bytes(encode(solid(64, 64, RED), "png"))
 
         result = _send(
             nothing_open,

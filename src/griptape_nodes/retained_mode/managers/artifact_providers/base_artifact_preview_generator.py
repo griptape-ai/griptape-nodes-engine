@@ -61,7 +61,7 @@ class BaseArtifactPreviewGenerator(EngineScoped, ABC):
         """Human-readable name for this generator.
 
         Returns:
-            The friendly name for this generator (e.g., 'Pillow Dimension', 'FFmpeg Thumbnail')
+            The friendly name for this generator (e.g., 'Standard Thumbnail Generation', 'FFmpeg Thumbnail')
         """
         ...
 
@@ -94,7 +94,7 @@ class BaseArtifactPreviewGenerator(EngineScoped, ABC):
             Pydantic model class (subclass of BaseGeneratorParameters)
 
         Example:
-            return PILThumbnailParameters
+            return ThumbnailParameters
         """
         ...
 
