@@ -20,6 +20,7 @@ from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowShape,
 )
@@ -251,7 +252,7 @@ class WorkflowSaver(EngineScoped):
     async def on_save_workflow_request(self, request: SaveWorkflowRequest, workflow: WorkflowRuntime) -> ResultPayload:
         return await self.save_open_workflow(workflow, request)
 
-    async def save_open_workflow(  # noqa: C901, PLR0912, PLR0915
+    async def save_open_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, workflow: WorkflowRuntime, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
     ) -> ResultPayload:
         """Save the open `workflow` as `request` describes.
@@ -314,6 +315,19 @@ class WorkflowSaver(EngineScoped):
                 "this is a programming error in _determine_save_target."
             )
             return SaveWorkflowResultFailure(result_details=msg)
+
+        # A rename moves the workflow to the new file, so it must never replace one: the file
+        # there may be an unregistered module the policy above can't see.
+        if keep_open_workflow_identity and not is_self_save:
+            existing_path = self._existing_file_at(destination)
+            if existing_path is not None:
+                details = (
+                    f"Attempted to save workflow '{current_workflow_name}' to '{relative_file_path}'. "
+                    f"Failed because a file already exists at '{existing_path}'."
+                )
+                return SaveWorkflowResultFailure(
+                    result_details=details, failure_reason=FileIOFailureReason.POLICY_NO_OVERWRITE
+                )
 
         logger.debug(
             "Save workflow: scenario=%s, file_name=%s, registry_key=%s, destination=%s, "
@@ -452,6 +466,18 @@ class WorkflowSaver(EngineScoped):
         if scenario is SaveWorkflowScenario.SAVE_FROM_TEMPLATE:
             return False
         return self._destination_is_file_of(destination, current_workflow)
+
+    def _existing_file_at(self, destination: ProjectFileDestination) -> Path | None:
+        """The file already at `destination`, or None when there is none or its macro can't resolve yet."""
+        if destination.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
+            return None
+        try:
+            resolved_path = Path(destination.resolve())
+        except FileLoadError:
+            return None
+        if not resolved_path.exists():
+            return None
+        return resolved_path
 
     def _destination_is_file_of(self, destination: ProjectFileDestination, workflow: Workflow) -> bool:
         """Whether a write to `destination` lands on `workflow`'s own file.
@@ -597,15 +623,15 @@ class WorkflowSaver(EngineScoped):
         self, request: SaveSubflowToWorkflowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Save a subflow of the open `workflow` back into the file of the saved workflow the request names."""
-        registry_key = request.workflow_name
-
-        if not self.engine.workflow_registry.has_workflow_with_name(registry_key):
-            details = (
-                f"Attempted to save subflow '{request.flow_name}'. Workflow '{registry_key}' not found in registry."
+        try:
+            target = self.engine.workflow_registry.resolve_address(
+                workflow_id=request.workflow_id,
+                workflow_name=request.workflow_name,
+                action=f"save subflow '{request.flow_name}' into",
             )
-            return SaveSubflowToWorkflowResultFailure(result_details=details)
-
-        target = self.engine.workflow_registry.get_workflow_by_name(registry_key)
+        except WorkflowAddressError as err:
+            return SaveSubflowToWorkflowResultFailure(result_details=str(err))
+        registry_key = target.name
         if target.file_path is None:
             # Saving a subflow back into its parent requires that parent to have a file.
             # Unsaved workflows have no destination to write into.

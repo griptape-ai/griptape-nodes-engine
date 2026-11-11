@@ -14,6 +14,7 @@ import anyio
 from griptape_nodes.files.path_utils import (
     resolve_workspace_path,
 )
+from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.context_events import (
@@ -458,10 +459,11 @@ class WorkflowRunner(EngineScoped):
     ) -> ResultPayload:
         """The command line that runs the saved workflow or file the request names, else the open `workflow`."""
         workflow_name = request.workflow_name
+        workflow_id = request.workflow_id
         file_path = request.file_path
 
         # Failure: no identifier and no current context
-        if workflow_name is None and file_path is None:
+        if workflow_name is None and workflow_id is None and file_path is None:
             if workflow is None:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(
@@ -472,8 +474,9 @@ class WorkflowRunner(EngineScoped):
             # When neither workflow_name nor file_path is provided, use the open workflow as a fallback.
             workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
 
-        # Failure: both workflow_name and file_path provided
-        if workflow_name is not None and file_path is not None:
+        names_saved_workflow = workflow_name is not None or workflow_id is not None
+        # Failure: both a saved workflow and file_path provided
+        if names_saved_workflow and file_path is not None:
             return GetWorkflowRunCommandResultFailure(
                 result_details=(
                     "Attempted to get workflow run command. Failed with both workflow_name and file_path provided "
@@ -483,15 +486,14 @@ class WorkflowRunner(EngineScoped):
 
         # Resolve relative_file_path and workflow_shape (or fail)
         workflow_shape: WorkflowShape | None = None
-        if workflow_name is not None:
+        if names_saved_workflow:
             try:
-                saved = self.engine.workflow_registry.get_workflow_by_name(workflow_name)
-            except KeyError:
+                saved = self.engine.workflow_registry.resolve_address(
+                    workflow_id=workflow_id, workflow_name=workflow_name, action="get the run command for"
+                )
+            except WorkflowAddressError as err:
                 return GetWorkflowRunCommandResultFailure(
-                    result_details=(
-                        f"Attempted to get workflow run command. Failed with workflow_name='{workflow_name}' "
-                        "because the workflow was not found in the registry. Save the workflow first, or provide file_path."
-                    )
+                    result_details=f"{err} Save the workflow first, or provide file_path."
                 )
             relative_file_path = saved.file_path
             workflow_shape = saved.metadata.workflow_shape
