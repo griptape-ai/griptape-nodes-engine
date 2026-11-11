@@ -18,6 +18,8 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     RIGHT_PARAMETERS_KEY,
     SubflowNodeGroup,
 )
+from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
+from griptape_nodes.exe_types.param_types.parameter_int import ParameterInt
 from griptape_nodes.traits.options import Options
 
 # Execution mode choices and their corresponding boolean values (True = run in order)
@@ -36,6 +38,23 @@ LEGACY_CONTROL_PORT_NAMES = {
     "group_exec_in": "exec_in",
     "group_exec_out": "exec_out",
 }
+
+
+def flatten_results(items: list[Any], depth: int) -> list[Any]:
+    """Flatten nested lists into one list, keeping item order.
+
+    A depth of 0 flattens every level; a positive depth flattens that many levels.
+    Only lists are expanded, so strings, dicts and other values stay whole items.
+    """
+    flat: list[Any] = []
+    for item in items:
+        if isinstance(item, list) and depth != 1:
+            flat.extend(flatten_results(item, max(depth - 1, 0)))
+        elif isinstance(item, list):
+            flat.extend(item)
+        else:
+            flat.append(item)
+    return flat
 
 
 class IterationControlParam(StrEnum):
@@ -194,6 +213,26 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         )
         self.add_parameter(self.results)
 
+        self.flatten_results = ParameterBool(
+            name="flatten_results",
+            tooltip="When an iteration adds a list, put its items into Results instead of the list itself.",
+            default_value=False,
+            allowed_modes={ParameterMode.PROPERTY},
+            display_name="Flatten Results",
+        )
+        self.add_parameter(self.flatten_results)
+
+        self.flatten_depth = ParameterInt(
+            name="flatten_depth",
+            tooltip="How many levels of nesting to flatten. 0 flattens every level.",
+            default_value=0,
+            min_val=0,
+            allowed_modes={ParameterMode.PROPERTY},
+            display_name="Flatten Depth",
+            hide=True,
+        )
+        self.add_parameter(self.flatten_depth)
+
         # Track right parameters for UI layout
         for parameter_name in (
             self.loop_complete.name,
@@ -228,6 +267,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 # Hide controls when running in parallel (not supported)
                 self.hide_parameter_by_name(self.skip_iteration.name)
                 self.hide_parameter_by_name(self.break_loop.name)
+        elif parameter == self.flatten_results:
+            if value:
+                self.show_parameter_by_name(self.flatten_depth.name)
+            else:
+                self.hide_parameter_by_name(self.flatten_depth.name)
 
     def get_next_control_output(self) -> Parameter | None:
         # Say which port the chain continues from once every iteration has finished, rather than
@@ -281,7 +325,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         # replaces _results_list via `= []` rather than clearing in-place, so shared
         # item references are safe. deepcopy was breaking websocket payload deduplication
         # by creating new object identities for every item on every broadcast.
-        self.parameter_output_values["results"] = list(self._results_list)
+        if self.get_parameter_value(self.flatten_results.name):
+            depth = max(self.get_parameter_value(self.flatten_depth.name) or 0, 0)
+            self.parameter_output_values["results"] = flatten_results(self._results_list, depth)
+        else:
+            self.parameter_output_values["results"] = list(self._results_list)
 
     def reset_for_workflow_run(self) -> None:
         """Reset state for a fresh workflow run."""
