@@ -1130,8 +1130,6 @@ _LIBRARY_OPENS = {
     "run_from_scratch": True,
     "run_with_current_state": True,
     "script": False,
-    "set_workflow_context": False,
-    "ensure_workflow_and_flow": False,
 }
 
 
@@ -1147,8 +1145,6 @@ def _open_library_workflow(engine: Engine, how: str, library: SaveWorkflowResult
         "run_from_registry": RunWorkflowFromRegistryRequest(workflow_name=library.workflow_name),
         "run_from_scratch": RunWorkflowFromScratchRequest(file_path=library.file_path),
         "run_with_current_state": RunWorkflowWithCurrentStateRequest(file_path=library.file_path),
-        "set_workflow_context": SetWorkflowContextRequest(workflow_name=library.workflow_name),
-        "ensure_workflow_and_flow": EnsureWorkflowAndFlowRequest(workflow_name=library.workflow_name),
     }
     result = _run(engine, requests[how])
     assert result.succeeded(), result.result_details
@@ -1160,8 +1156,6 @@ def _open_library_workflow(engine: Engine, how: str, library: SaveWorkflowResult
             RunWorkflowFromRegistryResultSuccess,
             RunWorkflowFromScratchResultSuccess,
             RunWorkflowWithCurrentStateResultSuccess,
-            SetWorkflowContextSuccess,
-            EnsureWorkflowAndFlowResultSuccess,
         ),
     )
     assert result.workflow_id is not None
@@ -1191,6 +1185,20 @@ class TestLibraryWorkflowsOpenAsCopies:
         # The library's entry is unchanged, and the workflow list doesn't show the copy beside it.
         assert library_entry.metadata.is_griptape_provided is True
         assert copy.name not in _listed(project_engine)
+
+    @pytest.mark.parametrize("request_type", [SetWorkflowContextRequest, EnsureWorkflowAndFlowRequest])
+    def test_an_open_that_cant_build_refuses_it(
+        self, project_engine: Engine, request_type: type[SetWorkflowContextRequest | EnsureWorkflowAndFlowRequest]
+    ) -> None:
+        """It would open an empty copy, so it points the caller to `OpenWorkflowRequest`."""
+        library = _library_workflow(project_engine, "library_flow")
+
+        result = _run(project_engine, request_type(workflow_name=library.workflow_name))
+
+        assert result.failed()
+        assert "OpenWorkflowRequest" in str(result.result_details)
+        assert project_engine.open_workflows.all_open() == []
+        assert _copies_of(project_engine, library.workflow_id) == []
 
     @pytest.mark.parametrize("how", [how for how, builds in _LIBRARY_OPENS.items() if builds])
     def test_an_open_that_builds_builds_the_library_file_into_the_copy(self, project_engine: Engine, how: str) -> None:
