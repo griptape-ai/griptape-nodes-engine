@@ -21,7 +21,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
+from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
+from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
@@ -356,6 +358,27 @@ class TestExecuteSpecialNodeRouting:
 
         node.aprocess.assert_awaited_once()
         mock_engine.ahandle_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_runs_outside_any_node_run(self) -> None:
+        """Nothing it loads or writes counts as a running node's.
+
+        So strict mode doesn't police the workflow file it imports, and the outputs it copies out
+        keep any variable macro its workflow kept, instead of having it resolved a second time.
+        """
+        node = _make_spec_node(WorkflowNode, "Workflow")
+        seen: dict[str, object] = {}
+
+        async def record_run_markers() -> None:
+            seen["in_aprocess"] = node_types._in_aprocess.get()
+            seen["strict_mode_scope"] = STRICT_MODE.current_scope()
+
+        node.aprocess = AsyncMock(side_effect=record_run_markers)
+
+        executor = _make_executor()
+        await executor.execute(_in_workflow_of(executor, node))
+
+        assert seen == {"in_aprocess": False, "strict_mode_scope": None}
 
     @pytest.mark.asyncio
     async def test_workflow_node_failure_is_reported_as_an_execute_node_request_reports_it(self) -> None:
