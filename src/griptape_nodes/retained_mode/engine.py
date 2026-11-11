@@ -828,10 +828,16 @@ class Engine:
         file_path = None
         if entry.absolute_path is not None:
             file_path = str(entry.absolute_path)
+        # Every client shows `display_name`, so a workflow with no name gets one here, not in each client.
+        display_name = (entry.metadata.name or "").strip()
+        if not display_name and entry.absolute_path is not None:
+            display_name = entry.absolute_path.stem
+        if not display_name:
+            display_name = "Untitled"
         return OpenWorkflowInfo(
             workflow_id=workflow.workflow_id,
             name=entry.name,
-            display_name=entry.metadata.name,
+            display_name=display_name,
             workflow_file_path=file_path,
             is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),

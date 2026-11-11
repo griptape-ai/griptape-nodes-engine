@@ -43,7 +43,8 @@ class OpenWorkflowInfo:
     Args:
         workflow_id: The workflow's id, which a request envelope's `open_workflow_id` names.
         name: The workflow's name.
-        display_name: The name to show for the workflow, such as on an editor tab. Not unique.
+        display_name: The name to show for the workflow, such as on an editor tab. Not unique. Never
+            empty: a workflow with no name shows its file name, or "Untitled" while unsaved.
         workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
         is_saved: Whether the workflow has a file, for clients that are not sent its path.
         has_active_flow: Whether the workflow has a current flow.
