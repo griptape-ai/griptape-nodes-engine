@@ -165,9 +165,6 @@ def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
 class WorkflowRunner(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # Library workflow id -> the unsaved copy of it the last clean slate run opened. The next
-        # clean slate run of it closes that copy, and never one a tab opened.
-        self._clean_slate_copies: dict[str, WorkflowRuntime] = {}
         event_manager.register_request_handlers(self)
 
     async def run_workflow(self, relative_file_path: str, workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
@@ -238,7 +235,7 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromScratchResultFailure(
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
                 )
-            self._remember_clean_slate_copy(target, execution_result.workflow_id)
+            self._mark_clean_slate_copy(target, execution_result.workflow_id)
             return RunWorkflowFromScratchResultSuccess(
                 status=execution_result.status,
                 workflow_id=execution_result.workflow_id,
@@ -340,7 +337,7 @@ class WorkflowRunner(EngineScoped):
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
                 )
             if request.run_with_clean_slate:
-                self._remember_clean_slate_copy(registered, built.workflow_id)
+                self._mark_clean_slate_copy(registered, built.workflow_id)
 
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
@@ -635,31 +632,29 @@ class WorkflowRunner(EngineScoped):
         return None
 
     def _open_workflow_started_from(self, target: Workflow) -> WorkflowRuntime | None:
-        """`target` if it is open, else the copy of it the last clean slate run opened, if still open."""
+        """`target` if it is open, else the unsaved copy of it a clean slate run opened, if still open.
+
+        A copy saved since has no `seed_source`: it is the user's own workflow now, not one to start over.
+        """
         open_workflows = self.engine.open_workflows
         target_open = open_workflows.find(target.workflow_id)
         if target_open is not None:
             return target_open
-        copy = self._clean_slate_copies.pop(target.workflow_id, None)
-        if copy is None or open_workflows.find(copy.workflow_id) is not copy:
-            return None
-        # A copy saved since is the user's own workflow now, not one to start over.
         registry = self.engine.workflow_registry
-        if registry.seed_source(registry.get(copy.workflow_id)) is not target:
-            return None
-        return copy
+        for workflow in open_workflows.all_open():
+            entry = registry.get(workflow.workflow_id)
+            if entry.opened_by_clean_slate_run and registry.seed_source(entry) is target:
+                return workflow
+        return None
 
-    def _remember_clean_slate_copy(self, target: Workflow | None, opened_workflow_id: str | None) -> None:
-        """Remember the workflow a clean slate run of `target` opened, when it is an unsaved copy of `target`."""
+    def _mark_clean_slate_copy(self, target: Workflow | None, opened_workflow_id: str | None) -> None:
+        """Mark the workflow a clean slate run of `target` opened, when it is an unsaved copy of `target`."""
         if target is None or opened_workflow_id is None:
             return
-        opened = self.engine.open_workflows.find(opened_workflow_id)
-        if opened is None:
+        entry = self.engine.workflow_registry.find_by_id(opened_workflow_id)
+        if entry is None or self.engine.workflow_registry.seed_source(entry) is not target:
             return
-        entry = self.engine.workflow_registry.get(opened_workflow_id)
-        if self.engine.workflow_registry.seed_source(entry) is not target:
-            return
-        self._clean_slate_copies[target.workflow_id] = opened
+        entry.opened_by_clean_slate_run = True
 
     async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
         """Ensure `workflow`, which a file just built into, has a current flow."""
