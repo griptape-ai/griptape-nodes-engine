@@ -336,6 +336,16 @@ class TestFacadeCallersBoundToNothing:
         assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
         assert engine.current_workflow() is not first
 
+    def test_popping_a_pushed_workflow_unbinds_the_caller(self, engine: Engine) -> None:
+        first = _open(engine, "first")
+        context_manager = GriptapeNodes.ContextManager()
+        context_manager.push_workflow(workflow_name="second")
+
+        context_manager.pop_workflow()
+
+        assert context_manager.has_current_workflow()
+        assert context_manager.get_current_workflow_id() == first.workflow_id
+
     def test_a_workflow_block_opens_its_workflow_while_exactly_one_is_open(self, engine: Engine) -> None:
         first = _open(engine, "first")
 
