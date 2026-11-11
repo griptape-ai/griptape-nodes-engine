@@ -1,3 +1,2 @@
-- Switching projects, starting the engine, and refreshing the workflow registry now scan a project's
-  workflows faster. On a project with 500 workflows, the scan takes about 280 ms instead of about
-  770 ms.
+- Starting the engine, switching projects, and refreshing the workflow registry are faster on
+  projects with many workflows. Scanning 500 workflows takes about 280 ms instead of 770 ms.
