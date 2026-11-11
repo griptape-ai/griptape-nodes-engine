@@ -1779,6 +1779,14 @@ class EventManager(EngineScoped):
                 handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
                 the workflow the request ran in (see `_result_workflow_id`).
         """
+        # Handlers expect to run on the engine loop, so a request from a plain thread, such as a
+        # node's process(), is handled there while the thread waits. A thread running a loop of its
+        # own may be one the engine loop is blocked on, so it handles the request itself.
+        if self._event_loop is not None and self._event_loop.is_running() and _running_loop() is None:
+            return asyncio.run_coroutine_threadsafe(
+                self.ahandle_request(request, result_context=result_context), self._event_loop
+            ).result()
+
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()

@@ -5,6 +5,7 @@ import inspect
 import logging
 import threading
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -322,6 +323,89 @@ class TestHandleRequestLoopSafety:
 
         event = await event_manager.ahandle_request(_ProbeRequest())
         assert event.result.succeeded()
+
+
+_probe_marker: ContextVar[str | None] = ContextVar("_probe_marker", default=None)
+
+
+class TestSyncRequestFromAThreadRunsOnTheEngineLoop:
+    """A sync request from a thread with no loop of its own is handled on the engine loop."""
+
+    @pytest.mark.asyncio
+    async def test_the_handler_runs_on_the_engine_loop_thread(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        handler_threads: list[int] = []
+
+        def sync_handler(_request: _ProbeRequest) -> _ProbeResult:
+            handler_threads.append(threading.get_ident())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, sync_handler)
+
+        event = await asyncio.to_thread(event_manager.handle_request, _ProbeRequest())
+
+        assert event.result.succeeded()
+        assert handler_threads == [threading.get_ident()]
+
+    @pytest.mark.asyncio
+    async def test_an_async_handler_can_schedule_work_on_the_engine_loop(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        engine_loop = asyncio.get_running_loop()
+        handler_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def async_handler(_request: _ProbeRequest) -> _ProbeResult:
+            handler_loops.append(asyncio.get_running_loop())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, async_handler)
+
+        await asyncio.to_thread(event_manager.handle_request, _ProbeRequest())
+
+        assert handler_loops == [engine_loop]
+
+    @pytest.mark.asyncio
+    async def test_the_handler_sees_the_callers_context(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        seen: list[str | None] = []
+
+        def sync_handler(_request: _ProbeRequest) -> _ProbeResult:
+            seen.append(_probe_marker.get())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, sync_handler)
+
+        def caller() -> None:
+            _probe_marker.set("from the caller")
+            event_manager.handle_request(_ProbeRequest())
+
+        await asyncio.to_thread(caller)
+
+        assert seen == ["from the caller"]
+
+    def test_with_no_engine_loop_the_handler_runs_on_the_calling_thread(self) -> None:
+        event_manager = EventManager()
+        handler_threads: list[int] = []
+
+        def sync_handler(_request: _ProbeRequest) -> _ProbeResult:
+            handler_threads.append(threading.get_ident())
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, sync_handler)
+
+        caller_threads: list[int] = []
+
+        def caller() -> None:
+            caller_threads.append(threading.get_ident())
+            event_manager.handle_request(_ProbeRequest())
+
+        thread = threading.Thread(target=caller)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert handler_threads == caller_threads
 
 
 @dataclass(kw_only=True)
