@@ -216,3 +216,10 @@ def _write_golden() -> None:
     """Regenerate the golden capture. Run by hand, not by the suite."""
     captured = {name: converters.engine.unstructure(event) for name, event in _events().items()}
     GOLDEN_PATH.write_text(json.dumps(captured, indent=2, default=str) + "\n")
+
+
+class TestExecutionEventWorkflow:
+    def test_an_event_that_belongs_to_no_workflow_sends_null(self) -> None:
+        event = ExecutionEvent(payload=CurrentControlNodeEvent(node_name="n"), open_workflow_id=None)
+
+        assert json.loads(converters.client.dumps(event))["open_workflow_id"] is None

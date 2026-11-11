@@ -61,6 +61,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
+from griptape_nodes.retained_mode.topics import engine_request_topic, engine_response_topic
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -167,6 +168,23 @@ def _suppression_candidates(event: Any) -> list[Any]:
     return candidates
 
 
+def _name_bound_workflow(event: Any) -> None:
+    """Name the bound workflow on an execution event built without `open_workflow_id`.
+
+    Node libraries build events without it, and an event that names no workflow reaches every
+    client on the session. One built with `open_workflow_id=None` belongs to no workflow and keeps it.
+    """
+    if not isinstance(event, ExecutionGriptapeNodeEvent):
+        return
+    execution_event = event.wrapped_event
+    if "open_workflow_id" in execution_event.model_fields_set:
+        return
+    workflow = bound_workflow.get()
+    if workflow is None or workflow is NO_WORKFLOW:
+        return
+    execution_event.open_workflow_id = workflow.workflow_id
+
+
 def _is_async_callable(callback: Any) -> bool:
     """Whether calling `callback` returns a coroutine.
 
@@ -242,6 +260,20 @@ class ResultContext(TypedDict, total=False):
     request_id: str | None
     sender: RequestSender | None
     open_workflow_id: str | None
+
+
+def result_context_from_request(event: EventRequest) -> ResultContext:
+    """The `ResultContext` for dispatching `event.request`, from every envelope field dispatch carries.
+
+    A transport that reads an `EventRequest` off the wire builds its context here, so a new envelope
+    field reaches dispatch without each transport copying it by hand.
+    """
+    return ResultContext(
+        response_topic=event.response_topic,
+        request_id=event.request_id,
+        sender=event.sender,
+        open_workflow_id=event.open_workflow_id,
+    )
 
 
 class _RequestWorkflowError(Exception):
@@ -486,6 +518,7 @@ class EventManager(EngineScoped):
         # knows about; publishing that would show clients flows and nodes that don't exist for them.
         if _rebuilding_node_name.get() is not None:
             return
+        _name_bound_workflow(event)
 
         # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
         if self.should_suppress_event(event):
@@ -519,6 +552,7 @@ class EventManager(EngineScoped):
         # knows about; publishing that would show clients flows and nodes that don't exist for them.
         if _rebuilding_node_name.get() is not None:
             return
+        _name_bound_workflow(event)
 
         # Suppressed events still reach the engine's own listeners; only the broadcast is skipped.
         if self.should_suppress_event(event):
@@ -1258,8 +1292,8 @@ class EventManager(EngineScoped):
             raise RuntimeError(msg)
         response_payload = await self._send_from_worker(
             request,
-            request_topic=f"engines/{engine_id}/request",
-            response_topic=f"engines/{own_engine_id}/response",
+            request_topic=engine_request_topic(engine_id),
+            response_topic=engine_response_topic(own_engine_id),
         )
         return _read_forwarded_result(request, response_payload)
 
@@ -2299,14 +2333,9 @@ class EventTranslationContext:
         if wrapped_event is None:
             return None
 
-        # Create new wrapped_event with translated payload
-        wrapped_class = type(wrapped_event)
-        try:
-            new_wrapped = wrapped_class(
-                payload=translated_payload, open_workflow_id=getattr(wrapped_event, "open_workflow_id", None)
-            )
-        except Exception:
-            return None
+        # A copy keeps which fields were set, so an event built without `open_workflow_id` still
+        # gets the bound workflow's (`_name_bound_workflow`).
+        new_wrapped = wrapped_event.model_copy(update={"payload": translated_payload})
 
         # Create new outer event with new wrapped_event
         event_class = type(event)

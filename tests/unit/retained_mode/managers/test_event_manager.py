@@ -52,6 +52,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     current_request_sender,
     current_request_type,
     require_request_sender,
+    result_context_from_request,
 )
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
@@ -2090,7 +2091,7 @@ class TestExecutionEventSubscription:
 
     @staticmethod
     def _wrap(payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
-        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=None))
 
     @pytest.mark.asyncio
     async def test_listener_receives_matching_payloads_in_order(self) -> None:
@@ -2296,6 +2297,62 @@ class TestExecutionEventSubscription:
         assert received == []
 
 
+class TestExecutionEventsNameTheBoundWorkflow:
+    @staticmethod
+    def _queued(event_manager: EventManager, queue: asyncio.Queue, event: ExecutionGriptapeNodeEvent) -> str | None:
+        event_manager.put_event(event)
+        queued = queue.get_nowait()
+        assert queued is event
+        return queued.wrapped_event.open_workflow_id
+
+    def test_an_event_built_without_a_workflow_names_the_bound_one(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=_FakeStreamEvent(text="a")))
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            open_workflow_id = self._queued(engine.event_manager, queue, event)
+
+        assert open_workflow_id == "bound"
+
+    @pytest.mark.asyncio
+    async def test_an_event_queued_from_async_code_names_the_bound_one(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=_FakeStreamEvent(text="a")))
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            await engine.event_manager.aput_event(event)
+
+        assert queue.get_nowait().wrapped_event.open_workflow_id == "bound"
+
+    def test_an_event_built_with_no_workflow_keeps_naming_none(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=_FakeStreamEvent(text="a"), open_workflow_id=None)
+        )
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            open_workflow_id = self._queued(engine.event_manager, queue, event)
+
+        assert open_workflow_id is None
+
+    def test_an_event_queued_bound_to_nothing_names_none(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=_FakeStreamEvent(text="a")))
+
+        with engine.bind_workflow(NO_WORKFLOW):
+            open_workflow_id = self._queued(engine.event_manager, queue, event)
+
+        assert open_workflow_id is None
+
+
 class TestAppEventListenerRemoval:
     """Removing app event listeners is safe to repeat, so a library always unloads cleanly."""
 
@@ -2355,10 +2412,14 @@ class TestNodeProcessEventTranslation:
         )
 
         with EventTranslationContext(manager, {"Body_1": "Body", "Start_Package_MultiNode_1": "Start"}):
-            manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish)))
+            manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish, open_workflow_id=None))
+            )
             # A copy's name is translated; everything else on the event survives the copy it makes.
             manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=replace(finish, node_name="Body_1")))
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=replace(finish, node_name="Body_1"), open_workflow_id=None)
+                )
             )
 
         assert received == [finish, finish]
@@ -2386,6 +2447,30 @@ class TestNodeProcessEventTranslation:
         translated = queue.get_nowait()
         assert translated.wrapped_event.payload.node_name == "Body"
         assert translated.wrapped_event.open_workflow_id == "wf-1"
+
+    def test_a_translated_event_built_without_a_workflow_names_the_bound_one(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        finish = NodeFinishProcessEvent(
+            node_name="Body_1",
+            node_type="LoopBodyControlNode",
+            specific_library_name="Library",
+            flow_name="Canvas Flow",
+            execution_id="run-1",
+            parent_execution_id=None,
+            outcome=NodeProcessOutcome.SUCCEEDED,
+        )
+
+        with (
+            engine.bind_workflow(WorkflowRuntime("bound", MagicMock())),
+            EventTranslationContext(engine.event_manager, {"Body_1": "Body"}),
+        ):
+            engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=finish)))
+
+        translated = queue.get_nowait()
+        assert translated.wrapped_event.payload.node_name == "Body"
+        assert translated.wrapped_event.open_workflow_id == "bound"
 
 
 class TestResultWorkflowId:
@@ -2471,3 +2556,17 @@ class TestAWorkerRequestingAnotherEngine:
                 "timeout_ms": 5000,
             }
         ]
+
+
+class TestResultContextFromRequest:
+    def test_carries_every_envelope_field_dispatch_reads(self) -> None:
+        """A field added to `ResultContext` but not here would be dropped by every transport."""
+        sender = RequestSender(engine_id="other", session_id="s1")
+        event = EventRequest(
+            request=_ProbeRequest(), request_id="req-1", response_topic="t", sender=sender, open_workflow_id="wf-1"
+        )
+
+        context = result_context_from_request(event)
+
+        assert context == ResultContext(response_topic="t", request_id="req-1", sender=sender, open_workflow_id="wf-1")
+        assert context.keys() == ResultContext.__annotations__.keys()
