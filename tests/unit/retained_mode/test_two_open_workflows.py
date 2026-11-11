@@ -1539,6 +1539,26 @@ class TestALibraryReloadRebuildsEachWorkflow:
         assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
         assert _nodes_in(engine, built[0]) == ["late"]
 
+    def test_an_ensure_with_no_envelope_id_during_the_reload_is_refused(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, _b = two_open
+        _make_node(engine, a, "_ValueNode", "kept")
+        during: list[ResultPayload] = []
+
+        async def reload_while_a_client_ensures(_self: LibraryManager) -> ResultPayload:
+            # Bound to `a`, as a headerless Ensure that adopts the only open workflow is.
+            during.append(await a.ahandle_request(EnsureWorkflowAndFlowRequest()))
+            return ReloadAllLibrariesResultSuccess(result_details="reloaded nothing")
+
+        with patch.object(LibraryManager, "_reload_libraries_with_workflows_empty", reload_while_a_client_ensures):
+            result = _send(engine, ReloadAllLibrariesRequest(), None)
+
+        assert isinstance(result, ReloadAllLibrariesResultSuccess), result.result_details
+        assert not during[0].succeeded()
+        assert "reloading its libraries" in str(during[0].result_details)
+        assert _nodes_in(engine, a) == ["kept"]
+
     def test_an_open_during_the_reload_is_refused(self, engine: Engine) -> None:
         during: list[ResultPayload] = []
 

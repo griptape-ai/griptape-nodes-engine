@@ -1072,6 +1072,15 @@ class ContextManager(EngineScoped):
                     "Failed because another request is still opening it. Try again once it has opened."
                 )
             )
+        # Emptied by a library reload until it is rebuilt: a flow created now would replace what it held.
+        if self.engine.is_rebuilding(workflow):
+            return EnsureWorkflowAndFlowResultFailure(
+                result_details=(
+                    f"Attempted to ensure a workflow + flow context in workflow '{workflow_name}'. "
+                    "Failed because the engine is reloading its libraries and rebuilding it. "
+                    "Try again once the reload finishes."
+                )
+            )
         created_flow = False
         if workflow.context.has_current_flow():
             flow_name = workflow.context.get_current_flow().name
