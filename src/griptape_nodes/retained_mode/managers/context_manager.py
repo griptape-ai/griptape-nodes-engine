@@ -33,7 +33,7 @@ from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedR
 from griptape_nodes.retained_mode.managers.event_manager import current_request_sender
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
-from griptape_nodes.retained_mode.runtime.binding import bind_unbound_caller, bound_workflow
+from griptape_nodes.retained_mode.runtime.binding import bind_unbound_caller, bound_workflow, unbind_caller_closing
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
@@ -850,6 +850,8 @@ class ContextManager(EngineScoped):
     def pop_workflow(self) -> str:
         """Close the current workflow through `Engine.close_workflow`, which tears down what it holds.
 
+        A caller `push_workflow` bound to it is unbound again.
+
         Returns:
             The name of the Workflow that was closed. `get_current_workflow_id` gives its id
             beforehand.
@@ -872,6 +874,9 @@ class ContextManager(EngineScoped):
             raise self.WorkerWorkflowNotClosableError(msg)
 
         self.engine.close_workflow(workflow)
+        # A caller `push_workflow` bound to it goes back to unbound, so it doesn't stay bound to a
+        # closed workflow and the facade can find the only open one again.
+        unbind_caller_closing(workflow)
         return name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
