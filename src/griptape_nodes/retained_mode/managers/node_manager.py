@@ -65,7 +65,6 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
-from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.exe_types.workflow_node_errors import NestedWorkflowNodeError
 from griptape_nodes.files.directory import DirectoryDestinationProvider
 from griptape_nodes.files.file import FileDestinationProvider
@@ -3666,12 +3665,6 @@ class NodeManager(EngineScoped):
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
-
-        Like node groups and loops, a Workflow node is the exception and stays in this
-        process: it imports, starts and reads its subflow from this process's flows. The
-        nodes inside its subflow are still routed to their own workers. The check sits here
-        rather than in `NodeExecutor._run_node` beside the group and loop checks, so the
-        node keeps the request path's hydration and failure reporting.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3694,9 +3687,7 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node. The orchestrator found
         # its node in `workflow` above.
-        #
-        # Workflow nodes stay in this process; see the docstring.
-        if node is not None and workflow is not None and not isinstance(node, WorkflowNode):
+        if node is not None and workflow is not None:
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that
@@ -4300,7 +4291,7 @@ class NodeManager(EngineScoped):
                 with aprocess_scope(request.variables, node):
                     await node.aprocess()
             except Exception as e:
-                return self._execution_failure(e, node_name)
+                return self.execution_failure(e, node_name)
             finally:
                 # The scratch marker only means anything while the run is in flight. A parameter
                 # the node still holds here was never torn down, so serialization must treat it
@@ -4334,7 +4325,7 @@ class NodeManager(EngineScoped):
             result_details=f"Node '{node.name}' executed successfully.",
         )
 
-    def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
+    def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
         """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
         budget_halt = self._budget_halt_for(exc, node_name)
         if isinstance(exc, NestedWorkflowNodeError) and budget_halt is not None:

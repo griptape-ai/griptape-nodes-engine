@@ -1,6 +1,6 @@
 """A node whose Griptape Cloud call was refused over budget fails as a budget halt naming that node.
 
-Every node failure passes through ``NodeManager._execution_failure``, so no node type has to
+Every node failure passes through ``NodeManager.execution_failure``, so no node type has to
 recognize the refusal itself. These drive it with the three shapes a refusal arrives in: the raw
 Cloud 403, a halt a Cloud driver raised before it knew which node it was running in, and a halt
 already worded for its node.
@@ -51,7 +51,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         wrapped.__cause__ = _cloud_refusal()
 
         with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
-            failure = _node_manager()._execution_failure(wrapped, "Upscale")
+            failure = _node_manager().execution_failure(wrapped, "Upscale")
 
         assert isinstance(failure.exception, BudgetExceededError)
         assert failure.exception.node_name == "Upscale"
@@ -65,7 +65,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         wrapped = RuntimeError("Attempted to upscale the video. Failed due to a 403.")
         wrapped.__cause__ = _cloud_refusal()
 
-        failure = _node_manager()._execution_failure(wrapped, "Upscale")
+        failure = _node_manager().execution_failure(wrapped, "Upscale")
 
         halt = failure.exception
         assert halt is not None
@@ -80,7 +80,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         wrapped = RuntimeError("the driver gave up")
         wrapped.__cause__ = driver_halt
 
-        failure = _node_manager()._execution_failure(wrapped, "Upscale")
+        failure = _node_manager().execution_failure(wrapped, "Upscale")
 
         assert isinstance(failure.exception, BudgetExceededError)
         assert failure.exception.node_name == "Upscale"
@@ -95,7 +95,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         outer = RuntimeError("the subflow failed")
         outer.__cause__ = inner
 
-        failure = _node_manager()._execution_failure(outer, "Group")
+        failure = _node_manager().execution_failure(outer, "Group")
 
         assert failure.exception is inner
         assert str(failure.result_details) == str(inner)
@@ -103,7 +103,7 @@ class TestExecutionFailureNamesTheRefusedNode:
     def test_an_ordinary_failure_is_reported_as_before(self) -> None:
         error = ValueError("the image was empty")
 
-        failure = _node_manager()._execution_failure(error, "Blur")
+        failure = _node_manager().execution_failure(error, "Blur")
 
         assert failure.exception is error
         assert str(failure.result_details) == "Attempted to execute node 'Blur'. Failed with error: the image was empty"
@@ -128,7 +128,7 @@ class TestHaltDeepInsideNestedWorkflowNodes:
     def test_the_halt_is_still_what_the_run_reports(
         self, nested: NestedWorkflowNodeError, halt: BudgetExceededError
     ) -> None:
-        failure = _node_manager()._execution_failure(nested, "Outer")
+        failure = _node_manager().execution_failure(nested, "Outer")
 
         assert str(failure.result_details) == str(halt)
         assert str(failure.result_details).startswith(BUDGET_HALT_PREFIX)
@@ -136,7 +136,7 @@ class TestHaltDeepInsideNestedWorkflowNodes:
     def test_the_nested_failure_travels_up_so_the_next_level_extends_its_path(
         self, nested: NestedWorkflowNodeError, halt: BudgetExceededError
     ) -> None:
-        failure = _node_manager()._execution_failure(nested, "Outer")
+        failure = _node_manager().execution_failure(nested, "Outer")
 
         assert failure.exception is nested
         assert nested.__cause__ is halt
@@ -144,7 +144,7 @@ class TestHaltDeepInsideNestedWorkflowNodes:
     def test_the_path_to_the_refused_node_is_attached_without_rewording_the_halt(
         self, nested: NestedWorkflowNodeError, halt: BudgetExceededError
     ) -> None:
-        failure = _node_manager()._execution_failure(nested, "Outer")
+        failure = _node_manager().execution_failure(nested, "Outer")
 
         assert failure.error is not None
         assert failure.error.message == str(halt)
@@ -156,7 +156,7 @@ class TestHaltDeepInsideNestedWorkflowNodes:
         wrapped = RuntimeError("the subflow failed")
         wrapped.__cause__ = halt
 
-        failure = _node_manager()._execution_failure(wrapped, "Group")
+        failure = _node_manager().execution_failure(wrapped, "Group")
 
         assert failure.exception is halt
         assert failure.error is None

@@ -83,7 +83,7 @@ def failed_while_running(engine: Engine) -> Any:
     """Build the result node_manager returns when a node's ``aprocess`` raises."""
 
     def build(exc: Exception) -> ExecuteNodeResultFailure:
-        return engine.node_manager._execution_failure(_raised(exc), NODE_NAME)
+        return engine.node_manager.execution_failure(_raised(exc), NODE_NAME)
 
     return build
 

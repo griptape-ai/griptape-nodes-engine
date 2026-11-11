@@ -13,6 +13,7 @@ changes.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -223,6 +224,39 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
     subflows_result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=parent_flow))
     assert isinstance(subflows_result, ListFlowsInFlowResultSuccess), subflows_result
     assert node.metadata["subflow_name"] in subflows_result.flow_names
+
+
+@pytest.mark.skipif(
+    not FIXTURE_WORKFLOW_FILE.exists(),
+    reason=f"Workflow Node Library fixture workflow missing at {FIXTURE_WORKFLOW_FILE}",
+)
+@pytest.mark.asyncio
+async def test_running_a_workflow_node_reports_no_strict_mode_violation_against_it(
+    registered_library: Path,  # noqa: ARG001
+    engine: Engine,
+    create_node: Callable[..., str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The workflow file it loads uses GriptapeNodes.ContextManager(), which is engine-written code, not the node's."""
+    engine.context_manager.push_workflow(workflow_name="workflow_node_strict_mode")
+    flow_result = engine.handle_request(
+        CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
+    )
+    assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+    create_node(WORKFLOW_NODE_TYPE, "Shout It", flow_result.flow_name, library_name=LIBRARY_NAME)
+    set_result = engine.handle_request(
+        SetParameterValueRequest(parameter_name="text", node_name="Shout It", value="hello there")
+    )
+    assert set_result.succeeded(), set_result
+
+    with caplog.at_level(logging.WARNING, logger="griptape_nodes.strict_mode"):
+        run_result = await engine.ahandle_request(
+            StartFlowRequest(flow_name=flow_result.flow_name, flow_node_name="Shout It")
+        )
+
+    assert isinstance(run_result, StartFlowResultSuccess), run_result
+    violations = [record.getMessage() for record in caplog.records if record.name == "griptape_nodes.strict_mode"]
+    assert violations == []
 
 
 @pytest.mark.skipif(
