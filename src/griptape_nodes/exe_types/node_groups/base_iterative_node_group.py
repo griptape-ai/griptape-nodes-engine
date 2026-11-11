@@ -40,7 +40,7 @@ LEGACY_CONTROL_PORT_NAMES = {
 }
 
 
-def flatten_results(items: list[Any], depth: int) -> list[Any]:
+def flatten_nested(items: list[Any], depth: int) -> list[Any]:
     """Flatten nested lists into one list, keeping item order.
 
     A depth of 0 flattens every level; a positive depth flattens that many levels.
@@ -49,7 +49,7 @@ def flatten_results(items: list[Any], depth: int) -> list[Any]:
     flat: list[Any] = []
     for item in items:
         if isinstance(item, list) and depth != 1:
-            flat.extend(flatten_results(item, max(depth - 1, 0)))
+            flat.extend(flatten_nested(item, max(depth - 1, 0)))
         elif isinstance(item, list):
             flat.extend(item)
         else:
@@ -232,6 +232,8 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             hide=True,
         )
         self.add_parameter(self.flatten_depth)
+        self.add_parameter_to_group_settings(self.flatten_results)
+        self.add_parameter_to_group_settings(self.flatten_depth)
 
         # Track right parameters for UI layout
         for parameter_name in (
@@ -327,7 +329,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         # by creating new object identities for every item on every broadcast.
         if self.get_parameter_value(self.flatten_results.name):
             depth = max(self.get_parameter_value(self.flatten_depth.name) or 0, 0)
-            self.parameter_output_values["results"] = flatten_results(self._results_list, depth)
+            self.parameter_output_values["results"] = flatten_nested(self._results_list, depth)
         else:
             self.parameter_output_values["results"] = list(self._results_list)
 

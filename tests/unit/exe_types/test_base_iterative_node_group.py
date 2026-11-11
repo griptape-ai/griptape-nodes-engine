@@ -292,3 +292,8 @@ class TestFlattenResults:
         assert not depth.ui_options.get("hide")
         iterative_group.set_parameter_value("flatten_results", False)
         assert depth.ui_options.get("hide") is True
+
+    def test_flatten_settings_are_in_the_group_settings_panel(self, iterative_group: MockIterativeGroup) -> None:
+        settings = iterative_group.metadata["group_settings_params"]
+        assert "flatten_results" in settings
+        assert "flatten_depth" in settings
