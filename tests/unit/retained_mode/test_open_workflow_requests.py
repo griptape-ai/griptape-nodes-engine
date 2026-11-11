@@ -441,6 +441,24 @@ class TestACleanSlateStartsTheWorkflowOver:
         assert run.succeeded(), run.result_details
         assert not tab_copy.closed
 
+    def test_a_clean_slate_run_of_a_library_workflow_leaves_its_copy_once_saved(
+        self, engine: Engine, request_type: str, saved_workflow_name: str
+    ) -> None:
+        engine.workflow_registry.get_workflow_by_name(saved_workflow_name).metadata.is_griptape_provided = True
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess)), (
+            first.result_details
+        )
+        assert first.workflow_id is not None
+        first_copy = engine.open_workflows.get(first.workflow_id)
+        saved = _send(engine, SaveWorkflowRequest(), first.workflow_id).result
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
+
+        assert again.succeeded(), again.result_details
+        assert not first_copy.closed
+
     def test_it_leaves_the_other_workflows_open(
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:

@@ -643,6 +643,10 @@ class WorkflowRunner(EngineScoped):
         copy = self._clean_slate_copies.pop(target.workflow_id, None)
         if copy is None or open_workflows.find(copy.workflow_id) is not copy:
             return None
+        # A copy saved since is the user's own workflow now, not one to start over.
+        registry = self.engine.workflow_registry
+        if registry.seed_source(registry.get(copy.workflow_id)) is not target:
+            return None
         return copy
 
     def _remember_clean_slate_copy(self, target: Workflow | None, opened_workflow_id: str | None) -> None:
