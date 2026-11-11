@@ -39,8 +39,13 @@ def new_workflow_id() -> str:
 WORKFLOW_METADATA_BLOCK_NAME = "script"
 
 # PEP 723-style inline metadata block: a "# /// <name>" opener, comment-prefixed body lines,
-# and a "# ///" closer.
-_METADATA_BLOCK_PATTERN = re.compile(r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
+# and a "# ///" closer. The pattern starts with a literal so the regex engine can jump straight to
+# each "# /// ", and the lookbehind requires that opener to begin a line. A leading `^` anchor would
+# make the engine try the pattern at every character, which is slow on files with large embedded
+# values.
+_METADATA_BLOCK_PATTERN = re.compile(
+    r"(?m)# /// (?<=(?<![^\n])# /// )(?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
+)
 
 _TOOL_TABLE = "tool"
 _GRIPTAPE_NODES_TABLE = "griptape-nodes"
