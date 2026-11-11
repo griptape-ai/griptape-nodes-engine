@@ -18,7 +18,6 @@ from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.context_events import (
-    AnotherWorkflowOpenResultFailure,
     OpenWorkflowRequest,
     OpenWorkflowResultFailure,
     OpenWorkflowResultSuccess,
@@ -65,6 +64,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from griptape_nodes.node_library.workflow_registry import (
+        Workflow,
         WorkflowShape,
     )
     from griptape_nodes.retained_mode.engine import Engine
@@ -210,7 +210,7 @@ class WorkflowRunner(EngineScoped):
 
     @handles(RunWorkflowFromScratchRequest)
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
-        """Close the open workflow while only one may be open, then open the file as a workflow."""
+        """Close what a clean slate closes (`_clear_slate_for`), then open the file as a workflow."""
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
         with self.engine.workflow_manager.squelch_workflow_altered():
             # Check if file path exists
@@ -222,8 +222,10 @@ class WorkflowRunner(EngineScoped):
                 details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            if not await self._close_blocking_workflow():
-                details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
+            target = self.engine.workflow_registry.find_by_path(str(complete_file_path))
+            close_failure = await self._clear_slate_for(target)
+            if close_failure is not None:
+                details = f"Attempted to run '{complete_file_path}'. Failed because {close_failure}"
                 return RunWorkflowFromScratchResultFailure(result_details=details)
 
             # Opens by the absolute path, as a standalone run does (`push_workflow(file_path=__file__)`),
@@ -233,6 +235,7 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromScratchResultFailure(
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
                 )
+            self._mark_clean_slate_copy(target, execution_result.workflow_id)
             return RunWorkflowFromScratchResultSuccess(
                 status=execution_result.status,
                 workflow_id=execution_result.workflow_id,
@@ -281,7 +284,7 @@ class WorkflowRunner(EngineScoped):
     ) -> ResultPayload:
         """Open the registered workflow and run its file into it.
 
-        With a clean slate, closes the open workflow first while only one may be open.
+        With a clean slate, first closes what `_clear_slate_for` closes.
         """
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
@@ -304,22 +307,14 @@ class WorkflowRunner(EngineScoped):
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-        # Workflows do not nest, so without a clean slate the open workflow has to be closed first.
-        # Refused before anything is registered or run.
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if not request.run_with_clean_slate and blocking is not None:
-            details = (
-                f"Attempted to run workflow '{request.workflow_name}'. Failed because workflow "
-                f"'{self.engine.workflow_registry.get(blocking.workflow_id).name}' is open. Clear the open workflow first, "
-                "or run it with a clean slate (run_with_clean_slate=True)."
-            )
-            return RunWorkflowFromRegistryResultFailure(result_details=details)
-
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate and not await self._close_blocking_workflow():
-                details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
-                return RunWorkflowFromRegistryResultFailure(result_details=details)
+            if request.run_with_clean_slate:
+                # Refused before anything is registered or run.
+                close_failure = await self._clear_slate_for(registered)
+                if close_failure is not None:
+                    details = f"Attempted to run workflow '{request.workflow_name}'. Failed because {close_failure}"
+                    return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             try:
                 built = await self.open_and_build_workflow(workflow_name=request.workflow_name)
@@ -341,6 +336,8 @@ class WorkflowRunner(EngineScoped):
                 return RunWorkflowFromRegistryResultFailure(
                     result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
                 )
+            if request.run_with_clean_slate:
+                self._mark_clean_slate_copy(registered, built.workflow_id)
 
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
@@ -364,10 +361,6 @@ class WorkflowRunner(EngineScoped):
                 )
             except ContextManager.RequestedWorkflowNotFoundError as err:
                 return WorkflowNotFoundResultFailure(result_details=str(err))
-            except ContextManager.AnotherWorkflowOpenError as err:
-                return AnotherWorkflowOpenResultFailure(
-                    blocking_workflow=self.engine.open_workflow_info(err.open_workflow), result_details=str(err)
-                )
             except ContextManager.OpenRefusedError as err:
                 return OpenWorkflowResultFailure(result_details=str(err))
 
@@ -619,16 +612,49 @@ class WorkflowRunner(EngineScoped):
             return None
         return self.engine.open_workflow_info(opened)
 
-    async def _close_blocking_workflow(self) -> bool:
-        """Close the open workflow while only one may be open, returning False if closing it failed."""
-        blocking = self.engine.open_workflows.workflow_blocking_open()
-        if blocking is None:
-            return True
+    async def _clear_slate_for(self, target: Workflow | None) -> str | None:
+        """Close what a clean slate closes before `target` opens, returning why it could not, or None.
+
+        A clean slate starts `target` over, so it closes `target` when it is open. A library
+        workflow is never open itself, so for one it closes the copy the last clean slate run of it
+        opened, if that is still open. Copies a tab opened, and other open workflows, stay open.
+        """
+        if target is None:
+            return None
+        to_close = self._open_workflow_started_from(target)
+        if to_close is None:
+            return None
+        to_close_name = self.engine.workflow_registry.get(to_close.workflow_id).name
         try:
-            await self.engine.aclose_workflow(blocking)
-        except OpenWorkflowError:
-            return False
-        return True
+            await self.engine.aclose_workflow(to_close)
+        except OpenWorkflowError as err:
+            return f"closing the open workflow '{to_close_name}' failed: {err}"
+        return None
+
+    def _open_workflow_started_from(self, target: Workflow) -> WorkflowRuntime | None:
+        """`target` if it is open, else the unsaved copy of it a clean slate run opened, if still open.
+
+        A copy saved since has no `seed_source`: it is the user's own workflow now, not one to start over.
+        """
+        open_workflows = self.engine.open_workflows
+        target_open = open_workflows.find(target.workflow_id)
+        if target_open is not None:
+            return target_open
+        registry = self.engine.workflow_registry
+        for workflow in open_workflows.all_open():
+            entry = registry.get(workflow.workflow_id)
+            if entry.opened_by_clean_slate_run and registry.seed_source(entry) is target:
+                return workflow
+        return None
+
+    def _mark_clean_slate_copy(self, target: Workflow | None, opened_workflow_id: str | None) -> None:
+        """Mark the workflow a clean slate run of `target` opened, when it is an unsaved copy of `target`."""
+        if target is None or opened_workflow_id is None:
+            return
+        entry = self.engine.workflow_registry.find_by_id(opened_workflow_id)
+        if entry is None or self.engine.workflow_registry.seed_source(entry) is not target:
+            return
+        entry.opened_by_clean_slate_run = True
 
     async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
         """Ensure `workflow`, which a file just built into, has a current flow."""

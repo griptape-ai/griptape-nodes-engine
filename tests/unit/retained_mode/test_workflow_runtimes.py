@@ -47,7 +47,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.request_handlers import RequiredSender
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotOpenError, bound_workflow
-from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from tests.unit.exe_types.mocks import MockNode
 
@@ -103,18 +103,19 @@ class TestRuntimeLifecycle:
         assert workflow.workflow_id == engine.context_manager.get_current_workflow_id()
         assert len(workflow.objects) == 0
 
-    def test_a_push_while_a_workflow_is_open_is_refused(self, engine: Engine, tmp_path: Path) -> None:
+    def test_a_push_bound_to_an_open_workflow_is_refused(self, engine: Engine, tmp_path: Path) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
         runtime = engine.current_workflow()
         unregistered_file = tmp_path / "never_registered.py"
         unregistered_file.write_text("# stub")
 
-        with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError, match="is already open"):
-            engine.context_manager.push_workflow(workflow_name="inner")
-        with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
-            engine.context_manager.push_workflow(file_path=str(unregistered_file))
+        with engine.bind_workflow(runtime):
+            with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError, match="is already open"):
+                engine.context_manager.push_workflow(workflow_name="inner")
+            with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
+                engine.context_manager.push_workflow(file_path=str(unregistered_file))
 
-        assert engine.current_workflow() is runtime
+        assert engine.open_workflows.all_open() == [runtime]
         # Refused before anything is registered.
         assert engine.workflow_registry.find_by_name("inner") is None
         assert engine.workflow_registry.find_by_path(str(unregistered_file)) is None
@@ -140,7 +141,6 @@ class TestRuntimeLifecycle:
     def test_closing_the_bound_workflow_refuses_the_rest_of_the_work_rather_than_moving_it(
         self, engine: Engine
     ) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
         other = engine.current_workflow()
         closed = engine.open_workflows.open(
@@ -155,7 +155,6 @@ class TestRuntimeLifecycle:
         assert engine.open_workflows.all_open() == [other]
 
     def test_a_request_that_opens_a_workflow_stays_bound_as_dispatch_bound_it(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
         bindings: list[object] = []
 
@@ -275,7 +274,6 @@ class TestObjectsOnTheRuntime:
         assert engine.object_manager.take_nodes_with_queued_changes() == []
 
     def test_queued_ui_changes_are_taken_from_the_bound_workflow_or_every_open_one(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="first")
         first = engine.current_workflow()
         second = engine.open_workflows.open(

@@ -18,7 +18,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
 )
 from griptape_nodes.retained_mode.events.context_events import (
-    AnotherWorkflowOpenResultFailure,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
@@ -39,6 +38,8 @@ from griptape_nodes.retained_mode.events.project_events import (
 from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromRegistryRequest,
     RunWorkflowFromRegistryResultSuccess,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultSuccess,
     RunWorkflowWithCurrentStateRequest,
     RunWorkflowWithCurrentStateResultSuccess,
     SaveWorkflowRequest,
@@ -48,7 +49,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.servers.mcp import SUPPORTED_REQUEST_EVENTS
 
 ORIGINAL_RUN_WORKFLOW = WorkflowRunner.run_workflow
@@ -86,10 +86,6 @@ def _send(
     return asyncio.run(
         engine.event_manager.ahandle_request(request, result_context=ResultContext(open_workflow_id=open_workflow_id))
     )
-
-
-def _allow_several_open(engine: Engine) -> None:
-    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
 
 
 def _open_new(engine: Engine, display_name: str) -> WorkflowRuntime:
@@ -145,7 +141,6 @@ class TestListOpenWorkflows:
         assert result.open_workflows[0].has_active_flow
 
     def test_lists_every_open_workflow_in_the_order_they_opened(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         first = _open_new(engine, "first")
         second = _open_new(engine, "second")
 
@@ -194,7 +189,6 @@ class TestOpenWorkflowNew:
         assert engine.open_workflows.get(result.open_workflow.workflow_id).context.has_current_flow()
 
     def test_opens_beside_the_others_when_several_may_be_open(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         first = _open_new(engine, "first")
 
         result = _send(engine, OpenWorkflowRequest(display_name="second")).result
@@ -289,7 +283,6 @@ class TestOpenWorkflowAlreadyOpen:
         assert result.already_open
 
     def test_closes_none_of_the_others_when_several_are_open(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         first = _open_new(engine, "first")
         second = _open_new(engine, "second")
 
@@ -301,24 +294,6 @@ class TestOpenWorkflowAlreadyOpen:
 
 
 class TestOpenWorkflowRefused:
-    def test_another_open_workflow_refuses_it_and_names_that_workflow(
-        self, engine: Engine, queue: asyncio.Queue
-    ) -> None:
-        open_workflow = _open_new(engine, "open")
-        _lifecycle_events(queue)
-
-        result_event = _send(engine, OpenWorkflowRequest(display_name="refused"), open_workflow.workflow_id)
-
-        result = result_event.result
-        assert isinstance(result, AnotherWorkflowOpenResultFailure)
-        assert result.blocking_workflow == engine.open_workflow_info(open_workflow)
-        assert engine.open_workflows.all_open() == [open_workflow]
-        assert _lifecycle_events(queue) == []
-        # Refused before it registered the new workflow.
-        assert all(entry["name"] != "refused" for entry in engine.workflow_registry.list_workflows().values())
-        # An open acts on no workflow, so the failure names none.
-        assert result_event.open_workflow_id is None
-
     def test_an_id_no_workflow_has_is_not_found(self, engine: Engine) -> None:
         missing_id = uuid.uuid4().hex
 
@@ -356,7 +331,6 @@ class TestOpenWorkflowRefused:
 
 class TestOlderOpenRequestsShareTheCode:
     def test_ensure_naming_a_workflow_already_open_uses_it_and_creates_its_flow(self, engine: Engine) -> None:
-        _allow_several_open(engine)
         opened = _send(engine, OpenWorkflowRequest(display_name="draft")).result
         assert isinstance(opened, OpenWorkflowResultSuccess)
         workflow_name = opened.open_workflow.name
@@ -399,20 +373,148 @@ class TestOlderOpenRequestsShareTheCode:
         assert "OpenWorkflowRequest" in str(result.result_details)
         assert engine.open_workflows.all_open() == []
 
-    def test_a_clean_slate_registry_run_of_the_open_workflow_reloads_it_from_its_file(
-        self, engine: Engine, saved_workflow_name: str
+
+def _clean_slate_run(
+    engine: Engine, saved_workflow_name: str, request_type: str
+) -> EventResultSuccess | EventResultFailure:
+    """Run the saved workflow with a clean slate, from the registry or from scratch."""
+    request: RequestPayload = RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)
+    if request_type == "scratch":
+        file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+        assert file_path is not None
+        request = RunWorkflowFromScratchRequest(file_path=file_path)
+    return _send(engine, request)
+
+
+@pytest.mark.parametrize("request_type", ["registry", "scratch"])
+class TestACleanSlateStartsTheWorkflowOver:
+    """A clean slate run of an open workflow reloads it from its file."""
+
+    def test_a_clean_slate_run_of_the_open_workflow_reloads_it_from_its_file(
+        self, engine: Engine, request_type: str, saved_workflow_name: str
     ) -> None:
-        first = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
-        assert isinstance(first, RunWorkflowFromRegistryResultSuccess), first.result_details
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert first.succeeded(), first.result_details
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
         assert first.workflow_id is not None
         before = engine.open_workflows.get(first.workflow_id)
 
-        again = _send(engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)).result
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
 
-        assert isinstance(again, RunWorkflowFromRegistryResultSuccess), again.result_details
+        assert again.succeeded(), again.result_details
+        assert isinstance(again, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
         assert again.workflow_id == first.workflow_id
         assert before.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [first.workflow_id]
         assert engine.open_workflows.get(first.workflow_id) is not before
+
+    def test_a_clean_slate_run_of_a_library_workflow_replaces_its_open_copy(
+        self, engine: Engine, request_type: str, saved_workflow_name: str
+    ) -> None:
+        engine.workflow_registry.get_workflow_by_name(saved_workflow_name).metadata.is_griptape_provided = True
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess)), (
+            first.result_details
+        )
+        assert first.workflow_id is not None
+        assert first.workflow_id != _saved_workflow_id(engine, saved_workflow_name)
+        first_copy = engine.open_workflows.get(first.workflow_id)
+
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
+
+        assert isinstance(again, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess)), (
+            again.result_details
+        )
+        assert first_copy.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [again.workflow_id]
+
+    def test_a_clean_slate_run_of_a_library_workflow_leaves_a_copy_a_tab_opened(
+        self, engine: Engine, request_type: str, saved_workflow_name: str
+    ) -> None:
+        engine.workflow_registry.get_workflow_by_name(saved_workflow_name).metadata.is_griptape_provided = True
+        tab = _send(engine, OpenWorkflowRequest(workflow_name=saved_workflow_name)).result
+        assert isinstance(tab, OpenWorkflowResultSuccess), tab.result_details
+        tab_copy = engine.open_workflows.get(tab.open_workflow.workflow_id)
+
+        run = _clean_slate_run(engine, saved_workflow_name, request_type).result
+
+        assert run.succeeded(), run.result_details
+        assert not tab_copy.closed
+
+    def test_a_clean_slate_run_of_a_library_workflow_leaves_its_copy_once_saved(
+        self, engine: Engine, request_type: str, saved_workflow_name: str
+    ) -> None:
+        engine.workflow_registry.get_workflow_by_name(saved_workflow_name).metadata.is_griptape_provided = True
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess)), (
+            first.result_details
+        )
+        assert first.workflow_id is not None
+        first_copy = engine.open_workflows.get(first.workflow_id)
+        saved = _send(engine, SaveWorkflowRequest(), first.workflow_id).result
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
+
+        assert again.succeeded(), again.result_details
+        assert not first_copy.closed
+
+    def test_it_leaves_the_other_workflows_open(
+        self, engine: Engine, saved_workflow_name: str, request_type: str
+    ) -> None:
+        first = _clean_slate_run(engine, saved_workflow_name, request_type).result
+        assert isinstance(first, (RunWorkflowFromRegistryResultSuccess, RunWorkflowFromScratchResultSuccess))
+        assert first.workflow_id is not None
+        before = engine.open_workflows.get(first.workflow_id)
+        other = _open_new(engine, "other")
+
+        again = _clean_slate_run(engine, saved_workflow_name, request_type).result
+
+        assert again.succeeded(), again.result_details
+        assert before.closed
+        assert not other.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [
+            other.workflow_id,
+            first.workflow_id,
+        ]
+
+
+class TestOlderOpensOpenBesideTheOthers:
+    """The requests that opened a workflow before `OpenWorkflowRequest` open it beside the open ones."""
+
+    @pytest.mark.parametrize("run_with_clean_slate", [True, False])
+    def test_a_registry_run_opens_beside_the_open_workflow(
+        self, engine: Engine, saved_workflow_name: str, *, run_with_clean_slate: bool
+    ) -> None:
+        open_workflow = _open_new(engine, "open")
+
+        result = _send(
+            engine,
+            RunWorkflowFromRegistryRequest(
+                workflow_name=saved_workflow_name, run_with_clean_slate=run_with_clean_slate
+            ),
+        ).result
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result.result_details
+        assert not open_workflow.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [
+            open_workflow.workflow_id,
+            result.workflow_id,
+        ]
+
+    def test_a_run_from_scratch_opens_beside_the_open_workflow(self, engine: Engine, saved_workflow_name: str) -> None:
+        saved_file = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+        assert saved_file is not None
+        open_workflow = _open_new(engine, "open")
+
+        result = _send(engine, RunWorkflowFromScratchRequest(file_path=saved_file)).result
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
+        assert not open_workflow.closed
+        assert [workflow.workflow_id for workflow in engine.open_workflows.all_open()] == [
+            open_workflow.workflow_id,
+            result.workflow_id,
+        ]
 
 
 class TestOpenWorkflowWhileAnotherRequestOpensIt:

@@ -23,7 +23,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatResultSuccess,
 )
 from griptape_nodes.retained_mode.events.context_events import (
-    AnotherWorkflowOpenResultFailure,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
@@ -75,7 +74,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
     RunWorkflowFromRegistryRequest,
-    RunWorkflowFromRegistryResultFailure,
     RunWorkflowFromRegistryResultSuccess,
     RunWorkflowFromScratchRequest,
     RunWorkflowFromScratchResultSuccess,
@@ -91,7 +89,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -844,16 +841,18 @@ class TestIdsOnResults:
 
 
 class TestSetWorkflowContextWhileAWorkflowIsOpen:
-    """With only one workflow open at a time, setting the context fails while one is open."""
+    """Setting the context opens the workflow beside the open one, and refuses one already open."""
 
-    def test_it_refuses_another_workflow_and_keeps_the_open_one(self, project_engine: Engine) -> None:
-        saved = _saved_workflow(project_engine, "saved")
+    def test_it_opens_another_workflow_beside_the_open_one(self, project_engine: Engine) -> None:
         open_id = _open_new_workflow(project_engine, "open")
 
-        result = project_engine.handle_request(SetWorkflowContextRequest(workflow_name=saved.workflow_name))
+        result = project_engine.handle_request(SetWorkflowContextRequest(display_name="other"))
 
-        assert isinstance(result, SetWorkflowContextFailure)
-        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [open_id]
+        assert isinstance(result, SetWorkflowContextSuccess), result.result_details
+        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [
+            open_id,
+            result.workflow_id,
+        ]
 
     def test_it_refuses_the_workflow_that_is_already_open_and_keeps_it(self, project_engine: Engine) -> None:
         saved = _saved_workflow(project_engine, "saved")
@@ -868,14 +867,6 @@ class TestSetWorkflowContextWhileAWorkflowIsOpen:
         assert isinstance(result, SetWorkflowContextFailure)
         assert project_engine.open_workflows.all_open() == [workflow]
         assert len(workflow.objects) == objects_before
-
-    def test_a_refused_new_workflow_is_not_registered(self, project_engine: Engine) -> None:
-        _open_new_workflow(project_engine, "open")
-
-        result = project_engine.handle_request(SetWorkflowContextRequest(display_name="fresh"))
-
-        assert isinstance(result, SetWorkflowContextFailure)
-        assert all(workflow["name"] != "fresh" for workflow in _listed(project_engine).values())
 
 
 class TestOpenAndSaveResultsReportTheOpenWorkflow:
@@ -1043,32 +1034,20 @@ class TestIdentityAcrossTheWorkflowLifecycle:
 
 
 class TestWorkflowsDoNotNest:
-    """Only one workflow is open at a time, so opening another one on top of it is refused."""
+    """Work bound to an open workflow can't open another one on top of it."""
 
-    def test_pushing_a_workflow_while_one_is_open_is_refused(self, project_engine: Engine) -> None:
+    def test_pushing_a_workflow_while_bound_to_an_open_one_is_refused(self, project_engine: Engine) -> None:
         other = _saved_workflow(project_engine, "other")
         open_id = _open_new_workflow(project_engine, "open")
 
-        with pytest.raises(ContextManager.WorkflowAlreadyOpenError, match="is already open"):
+        with (
+            project_engine.bind_workflow(project_engine.open_workflows.get(open_id)),
+            pytest.raises(ContextManager.WorkflowAlreadyOpenError, match="is already open"),
+        ):
             project_engine.context_manager.push_workflow(other.workflow_name)
 
-        assert project_engine.context_manager.get_current_workflow_id() == open_id
+        assert [workflow.workflow_id for workflow in project_engine.open_workflows.all_open()] == [open_id]
         assert not project_engine.workflow_registry.is_open(other.workflow_id or "")
-
-    def test_a_run_without_a_clean_slate_while_one_is_open_is_refused(self, project_engine: Engine) -> None:
-        other = _saved_workflow(project_engine, "other")
-        open_id = _open_new_workflow(project_engine, "open")
-        registered_before = set(project_engine.workflow_registry._by_id)
-
-        refused = _run(
-            project_engine,
-            RunWorkflowFromRegistryRequest(workflow_name=other.workflow_name, run_with_clean_slate=False),
-        )
-
-        assert isinstance(refused, RunWorkflowFromRegistryResultFailure)
-        assert "Clear the open workflow first" in str(refused.result_details)
-        assert project_engine.context_manager.get_current_workflow_id() == open_id
-        assert set(project_engine.workflow_registry._by_id) == registered_before
 
 
 class TestASavedFileOpensTheWorkflowItLoads:
@@ -1081,6 +1060,7 @@ class TestASavedFileOpensTheWorkflowItLoads:
         saved = _saved_workflow(project_engine, "saved")
         replaced_id = _open_new_workflow(project_engine, "replaced")
         replaced = project_engine.current_workflow()
+        replaced_objects_before = len(replaced.objects)
         if load == "from_registry":
             request: object = RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name)
         else:
@@ -1093,12 +1073,13 @@ class TestASavedFileOpensTheWorkflowItLoads:
         )  # type: ignore[arg-type]
 
         assert loaded.result.succeeded(), loaded.result.result_details
-        opened = project_engine.current_workflow()
+        assert saved.workflow_id is not None
+        opened = project_engine.open_workflows.get(saved.workflow_id)
         assert opened is not replaced
-        assert opened.workflow_id == saved.workflow_id
-        assert project_engine.context_manager.has_current_flow()
+        assert opened.context.has_current_flow()
         assert len(opened.objects) > 0
-        assert len(replaced.objects) == 0
+        assert not replaced.closed
+        assert len(replaced.objects) == replaced_objects_before
 
 
 def _library_workflow(engine: Engine, display_name: str) -> SaveWorkflowResultSuccess:
@@ -1212,19 +1193,8 @@ class TestLibraryWorkflowsOpenAsCopies:
         assert len(copy.objects) > 0
         assert Path(library.file_path).read_text(encoding="utf-8") == library_content
 
-    def test_a_second_open_while_the_first_copy_is_open_is_refused(self, project_engine: Engine) -> None:
-        library = _library_workflow(project_engine, "library_flow")
-        first_copy_id = _open_library_workflow(project_engine, "open_by_id", library)
-
-        second = _run(project_engine, OpenWorkflowRequest(workflow_id=library.workflow_id))
-
-        assert isinstance(second, AnotherWorkflowOpenResultFailure)
-        assert second.blocking_workflow.workflow_id == first_copy_id
-        assert _copies_of(project_engine, library.workflow_id) == [first_copy_id]
-
     def test_opening_it_twice_beside_each_other_makes_two_copies(self, project_engine: Engine) -> None:
         library = _library_workflow(project_engine, "library_flow")
-        project_engine._open_workflows = OpenWorkflowSet(project_engine, allow_several_open=True)
 
         first_copy_id = _open_library_workflow(project_engine, "open_by_id", library)
         second_copy_id = _open_library_workflow(project_engine, "open_by_id", library)

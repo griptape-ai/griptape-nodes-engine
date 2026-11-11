@@ -1105,6 +1105,9 @@ class Workflow:
         self.metadata_is_placeholder = metadata_is_placeholder
         # The library workflow this one was opened as a copy of (`register_unsaved_copy`), or None.
         self.seeded_from_workflow_id: str | None = None
+        # True for a library workflow's unsaved copy that a clean slate run opened, which the next
+        # clean slate run of that library workflow closes. A copy a tab opened stays open.
+        self.opened_by_clean_slate_run = False
         # Path in the registry's form, legacy names, and path keys: the registry sets them whenever the paths change.
         self._keys = _NO_KEYS
 

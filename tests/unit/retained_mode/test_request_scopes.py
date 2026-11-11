@@ -75,7 +75,6 @@ from griptape_nodes.retained_mode.managers import event_manager as event_manager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from tests.unit.host_workflow_reads import HostWorkflowRead
 
@@ -161,8 +160,7 @@ def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntim
 
 
 def _open_two(engine: Engine) -> list[WorkflowRuntime]:
-    """Two workflows open at once, through the test seam that allows it."""
-    engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+    """Two workflows open at once."""
     opened = []
     for display_name in ("A", "B"):
         workflow = engine.workflow_registry.register_unsaved(display_name, listed=False)
