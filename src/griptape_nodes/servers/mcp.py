@@ -52,6 +52,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
+    ListOpenWorkflowsRequest,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
@@ -121,6 +122,7 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "GetWorkflowContextRequest": GetWorkflowContextRequest,
     "EnsureWorkflowAndFlowRequest": EnsureWorkflowAndFlowRequest,
     "CloseWorkflowRequest": CloseWorkflowRequest,
+    "ListOpenWorkflowsRequest": ListOpenWorkflowsRequest,
     # Libraries
     "ListRegisteredLibrariesRequest": ListRegisteredLibrariesRequest,
     "ListNodeTypesInLibraryRequest": ListNodeTypesInLibraryRequest,

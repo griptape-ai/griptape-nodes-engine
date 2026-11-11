@@ -1396,7 +1396,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 class TestOtherSharedState:
     """Scenario (j): state shared across workflows that a run or request reads."""
 
-    def test_the_heartbeat_reports_every_open_workflow_and_the_one_opened_last_as_current(
+    def test_the_heartbeat_reports_every_open_workflow_and_none_as_current(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
         a, b = two_open
@@ -1405,7 +1405,9 @@ class TestOtherSharedState:
 
         assert isinstance(heartbeat, EngineHeartbeatResultSuccess), heartbeat.result_details
         assert [info.workflow_id for info in heartbeat.open_workflows] == [a.workflow_id, b.workflow_id]
-        assert heartbeat.current_workflow_id == b.workflow_id
+        assert heartbeat.current_workflow is None
+        assert heartbeat.workflow_file_path is None
+        assert not heartbeat.has_active_flow
 
     def test_an_image_written_for_b_collects_bs_metadata(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime], tmp_path: Path

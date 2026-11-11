@@ -500,7 +500,7 @@ class TestHostReads:
         ).result
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
-        assert result.current_workflow_id == workflow.workflow_id
+        assert [info.workflow_id for info in result.open_workflows] == [workflow.workflow_id]
 
     def test_a_model_access_query_is_a_host_request(self, engine: Engine) -> None:
         """It asks about a node type and the host's license, not a node in a workflow."""
