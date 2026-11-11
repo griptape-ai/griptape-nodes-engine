@@ -136,13 +136,14 @@ The engine tells every connection on the session when any client opens or closes
 
 A client with a tab for each workflow uses three requests and the two events above:
 
-- `ListOpenWorkflowsRequest` returns `engine_run_id` and the open workflows in `open_workflows`, each with its `workflow_id`, `name`, `workflow_file_path`, `is_saved` and `has_active_flow`. Send it on connect to find your tab's workflow. `workflow_file_path` is `null`, and `is_saved` false, exactly while the workflow is unsaved.
+- `ListOpenWorkflowsRequest` returns `engine_run_id` and the open workflows in `open_workflows`, each with its `workflow_id`, `name`, `display_name`, `workflow_file_path`, `is_saved` and `has_active_flow`. Show `display_name`, which isn't unique, and address the workflow by `workflow_id`. Send it on connect to find your tab's workflow. `workflow_file_path` is `null`, and `is_saved` false, exactly while the workflow is unsaved.
 - `OpenWorkflowRequest` opens a workflow by `workflow_id` or `workflow_name`, or a new unsaved one when you name neither. `create_flow` gives a new workflow the top-level flow it needs to be saved, and `working_directory` sets where it writes until then. An open workflow comes back with `already_open` set, once built if another request is still opening it. The request opens it beside the open ones and never closes one. It fails with:
     - `WorkflowNotFoundResultFailure` for an unknown id or name, which an unsaved workflow becomes once closed or after a restart.
     - `OpenWorkflowResultFailure` when its file fails to build.
     - `InvalidWorkingDirectoryResultFailure` when `working_directory` names a file.
-- A Griptape-provided workflow never opens itself: each open of one, however it's opened, opens a new unsaved copy with its own `workflow_id`. The copy's first save is named after the library's file.
 - `CloseWorkflowRequest` closes the workflow its `workflow_id` names, or comes back with `already_closed` set if it isn't open. To show another workflow in a tab, close the open one, then open the next.
+
+Opening a Griptape-provided workflow, by any request, opens a new unsaved copy with its own `workflow_id`. The copy's first save is named after the library's file.
 
 Workflow ids last until the engine restarts, which changes the `engine_run_id` that `ListOpenWorkflowsRequest`, `EngineHeartbeatRequest` and `AppInitializationComplete` report; drop your ids when it changes. `AppInitializationComplete` goes out once, when the engine finishes starting, so only a client that stays connected through the restart, such as one on a relay, receives it. A client whose own connection dropped sends one of the requests after it reconnects. Each worker engine sends its own `AppInitializationComplete`, with `is_worker` set; skip those.
 

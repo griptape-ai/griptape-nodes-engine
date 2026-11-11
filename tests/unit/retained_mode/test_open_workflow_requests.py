@@ -239,6 +239,34 @@ class TestOpenWorkflowSaved:
         assert _lifecycle_events(queue) == []
 
 
+class TestOpenWorkflowDisplayName:
+    def test_a_new_workflow_reports_the_display_name_it_was_given(self, engine: Engine) -> None:
+        result = _send(engine, OpenWorkflowRequest(display_name="Shot 10 comp", create_flow=True)).result
+
+        assert isinstance(result, OpenWorkflowResultSuccess), result.result_details
+        assert result.open_workflow.display_name == "Shot 10 comp"
+        assert result.open_workflow.name != "Shot 10 comp"
+
+    def test_an_unsaved_workflow_with_no_name_reports_untitled(self, engine: Engine) -> None:
+        workflow = _open_new(engine, "draft")
+        engine.workflow_registry.get(workflow.workflow_id).metadata.name = "  "
+
+        assert engine.open_workflow_info(workflow).display_name == "Untitled"
+
+    def test_a_saved_workflow_with_no_name_reports_its_file_name(
+        self, engine: Engine, saved_workflow_name: str
+    ) -> None:
+        workflow_id = _saved_workflow_id(engine, saved_workflow_name)
+        _send(engine, OpenWorkflowRequest(workflow_id=workflow_id))
+        entry = engine.workflow_registry.get(workflow_id)
+        entry.metadata.name = ""
+
+        info = engine.open_workflow_info(engine.open_workflows.get(workflow_id))
+
+        assert entry.absolute_path is not None
+        assert info.display_name == entry.absolute_path.stem
+
+
 class TestOpenWorkflowAlreadyOpen:
     def test_returns_it_unchanged_and_announces_nothing(
         self, engine: Engine, saved_workflow_name: str, queue: asyncio.Queue

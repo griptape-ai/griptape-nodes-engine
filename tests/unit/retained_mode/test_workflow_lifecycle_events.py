@@ -612,7 +612,12 @@ class TestWorkers:
     ) -> None:
         worker_engine.context_manager.adopt_orchestrator_workflow(PEER_ID, None, None, None)
         relayed = OpenWorkflowInfo(
-            workflow_id=PEER_ID, name="peer", workflow_file_path=None, is_saved=False, has_active_flow=True
+            workflow_id=PEER_ID,
+            name="peer",
+            display_name="peer",
+            workflow_file_path=None,
+            is_saved=False,
+            has_active_flow=True,
         )
 
         def relay_open(_request: _RelayedOpenRequest) -> ResultPayload:
