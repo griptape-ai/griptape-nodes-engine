@@ -213,8 +213,8 @@ class ContextManager(EngineScoped):
 
         Refuses a workflow with a file that isn't open: this opens it without building its file, so
         it would show empty, and its next save would overwrite the file. `OpenWorkflowRequest`
-        builds it. A flow that can't be created closes the workflow again (see
-        `Engine.opening_workflow`).
+        builds it. Clients hear of a workflow this opens once it has its flow. A flow that can't be
+        created closes the workflow again (see `Engine.opening_workflow`).
 
         Raises:
             OpenRefusedError: As `opening_requested_workflow` raises, the workflow has a file and
@@ -257,10 +257,10 @@ class ContextManager(EngineScoped):
         that only shape a new open (`display_name`, `working_directory`) are neither applied nor
         checked. Every refusal comes before anything is registered or opened.
 
-        A block that raises, or calls `OpenedWorkflow.abandon`, closes a workflow this opens again
-        (see `Engine.opening_workflow`). A library-provided workflow is never open, so naming one
-        always opens a new unsaved copy of it (see `open_workflow`), into which
-        `open_and_build_workflow` builds the library's file.
+        Clients hear of a workflow this opens once the block ends. A block that raises, or calls
+        `OpenedWorkflow.abandon`, closes it again (see `Engine.opening_workflow`). A
+        library-provided workflow is never open, so naming one always opens a new unsaved copy of it
+        (see `open_workflow`), into which `open_and_build_workflow` builds the library's file.
 
         Args:
             workflow_id: Id of a registered workflow.
@@ -1201,7 +1201,7 @@ class OpenedWorkflow:
     opening: OpeningWorkflow | None = None
 
     def abandon(self) -> None:
-        """Close the workflow once the block ends, as a build that failed does. Leaves one already open as it is."""
+        """Close the workflow once the block ends, instead of telling clients of it. Leaves one already open as it is."""
         if self.opening is not None:
             self.opening.abandon()
 
