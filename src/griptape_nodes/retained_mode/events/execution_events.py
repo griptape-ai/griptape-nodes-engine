@@ -737,6 +737,10 @@ class ExecuteNodeRequest(RequestPayload):
     Unlike ResolveNodeRequest, this bypasses flow/DAG machinery and executes
     the node's process method directly.
 
+    NodeExecutor sends it only after choosing, by the node's type, to run the node on its own, and
+    a worker receives it from the orchestrator. Groups and loops never get one. Clients run a node with
+    ResolveNodeRequest, which makes that choice.
+
     Handling depends on where the request lands:
 
     - **Orchestrator**: the node must already exist in ObjectManager. If it does
