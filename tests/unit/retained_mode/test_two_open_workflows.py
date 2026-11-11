@@ -47,6 +47,8 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.context_events import (
+    CloseWorkflowRequest,
+    CloseWorkflowResultSuccess,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
@@ -612,17 +614,42 @@ class TestCloseOneWhileTheOtherRuns:
         assert isinstance(result, StartFlowResultSuccess), result.result_details
         assert _get(engine, b, "park", "result") == "done:b"
 
-    def test_clear_all_addressed_to_b_closes_only_b(
-        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
-    ) -> None:
+    def test_closing_b_leaves_a_open(self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]) -> None:
         a, b = two_open
         _make_node(engine, a, "_ValueNode", "survivor")
 
-        result = _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), b)
+        result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
 
-        assert result.succeeded(), result.result_details
+        assert isinstance(result, CloseWorkflowResultSuccess), result.result_details
+        assert result.workflow_id == b.workflow_id
+        assert not result.already_closed
+        assert not result.altered_workflow_state
         assert engine.open_workflows.all_open() == [a]
         assert a.objects.has("survivor")
+
+    def test_a_close_closes_the_workflow_its_body_names_not_the_envelopes(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+
+        result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), a)
+
+        assert isinstance(result, CloseWorkflowResultSuccess), result.result_details
+        assert engine.open_workflows.all_open() == [a]
+
+    def test_closing_a_workflow_that_is_not_open_succeeds_as_already_closed(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
+
+        result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
+
+        assert isinstance(result, CloseWorkflowResultSuccess), result.result_details
+        assert result.workflow_id == b.workflow_id
+        assert result.already_closed
+        assert not result.altered_workflow_state
+        assert engine.open_workflows.all_open() == [a]
 
 
 # Requests the editor plausibly sends with no envelope id, each paired with whether it still works with
@@ -758,6 +785,17 @@ class TestRequestsWithNoEnvelopeId:
         assert result.workflow_id is not None
         assert engine.open_workflows.all_open() == [a, b, engine.open_workflows.get(result.workflow_id)]
 
+    def test_clear_all_addressed_to_b_still_closes_every_open_workflow(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, _b = two_open
+        _make_node(engine, a, "_ValueNode", "n")
+
+        result = _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), _b)
+
+        assert result.succeeded(), result.result_details
+        assert engine.open_workflows.all_open() == []
+
     def test_clear_all_with_no_id_closes_every_open_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
@@ -820,7 +858,7 @@ class TestEventsNameTheirWorkflow:
         execution_events = [e for e in events if isinstance(e, ExecutionGriptapeNodeEvent)]
         result_events = [e for e in events if isinstance(e, GriptapeNodeEvent)]
         assert execution_events, "the run emitted no execution events"
-        assert {e.wrapped_event.workflow_id for e in execution_events} == {a.workflow_id}
+        assert {e.wrapped_event.open_workflow_id for e in execution_events} == {a.workflow_id}
         assert result_events, "the run emitted no results"
         assert {e.wrapped_event.open_workflow_id for e in result_events} == {a.workflow_id}
 
@@ -838,7 +876,7 @@ class TestEventsNameTheirWorkflow:
         node.append_value_to_parameter("value", "chunk")
 
         progress = [e for e in _drain(queue) if isinstance(e, ProgressEvent)]
-        assert [event.workflow_id for event in progress] == [b.workflow_id]
+        assert [event.open_workflow_id for event in progress] == [b.workflow_id]
 
 
 class TestNodeCodeActsOnItsOwnWorkflow:
@@ -961,20 +999,20 @@ class TestHeldObjects:
         assert released == ["B"]
         assert resources.get_local_object(key_a, owner="Lib") == "model for A"
 
-    def test_clear_all_addressed_to_b_tells_the_workers_only_b_closed(
+    def test_closing_b_tells_the_workers_only_b_closed(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
         _a, b = two_open
         worker_manager = engine.worker_manager
 
         with patch.object(worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
-            result = _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), b)
+            result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
 
         assert result.succeeded(), result.result_details
         assert drop_all.await_args is not None
         assert drop_all.await_args.kwargs == {"workflow_id": b.workflow_id}
 
-    def test_clear_all_addressed_to_the_only_open_workflow_keeps_the_objects_held_for_no_workflow(
+    def test_closing_the_only_open_workflow_keeps_the_objects_held_for_no_workflow(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
         a, b = two_open
@@ -991,7 +1029,7 @@ class TestHeldObjects:
             )
 
         with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
-            result = _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), b)
+            result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
 
         assert result.succeeded(), result.result_details
         assert engine.open_workflows.all_open() == []
@@ -1204,31 +1242,11 @@ def saved_workflow_name(engine: Engine, spike_library: None, tmp_path: Path) -> 
 class TestLoadingASavedFileWhileAnotherIsOpen:
     """Scenario (i)."""
 
-    def test_a_clean_slate_load_into_b_leaves_a_open(self, engine: Engine, saved_workflow_name: str) -> None:
-        _allow_several_open(engine)
-        a = _open(engine, "A")
-        b = _open(engine, "B")
-        _make_canvas(engine, a)
-        _make_node(engine, a, "_ValueNode", "survivor")
-
-        result = asyncio.run(
-            _send_async(
-                engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=True), b
-            )
-        )
-
-        assert result.succeeded(), result.result_details
-        open_now = engine.open_workflows.all_open()
-        assert open_now[0] is a
-        assert b not in open_now
-        assert len(open_now) == 2  # noqa: PLR2004
-        assert a.objects.has("survivor")
-
     @pytest.mark.parametrize("request_type", ["registry", "scratch"])
-    def test_a_clean_slate_load_with_no_id_refuses_while_several_are_open(
+    def test_a_clean_slate_load_that_replaces_nothing_opens_beside_the_others(
         self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
-        """A tab that names no workflow must not close every other tab's workflow."""
+        """A load that names no workflow to replace must not close any tab's workflow."""
         _allow_several_open(engine)
         a = _open(engine, "A")
         b = _open(engine, "B")
@@ -1242,25 +1260,33 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         result = asyncio.run(_send_async(engine, request, None))
 
-        assert _failed_for_no_workflow_named(result), result.result_details
-        assert engine.open_workflows.all_open() == [a, b]
+        assert result.succeeded(), result.result_details
+        open_now = engine.open_workflows.all_open()
+        assert open_now[:2] == [a, b]
+        assert len(open_now) == 3  # noqa: PLR2004
 
-    def test_a_load_without_a_clean_slate_into_an_open_tab_fails_with_a_registry_failure(
-        self, engine: Engine, saved_workflow_name: str
+    @pytest.mark.parametrize("request_type", ["registry", "scratch"])
+    def test_a_load_ignores_an_envelope_naming_a_closed_workflow(
+        self, engine: Engine, saved_workflow_name: str, request_type: str
     ) -> None:
-        """Naming an open workflow without a clean slate is refused as the request's own failure."""
+        """A tab whose workflow closed can still open another; opens never read the envelope."""
         _allow_several_open(engine)
         a = _open(engine, "A")
-        b = _open(engine, "B")
+        closed = _open(engine, "closed")
+        _send(engine, CloseWorkflowRequest(workflow_id=closed.workflow_id), None)
+        assert engine.open_workflows.all_open() == [a]
+        request: RequestPayload = RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)
+        if request_type == "scratch":
+            file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
+            assert file_path is not None
+            request = RunWorkflowFromScratchRequest(file_path=file_path)
 
-        result = asyncio.run(
-            _send_async(
-                engine, RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name, run_with_clean_slate=False), b
-            )
-        )
+        result = asyncio.run(_send_async(engine, request, closed))
 
-        assert isinstance(result, RunWorkflowFromRegistryResultFailure), result.result_details
-        assert engine.open_workflows.all_open() == [a, b]
+        assert result.succeeded(), result.result_details
+        open_now = engine.open_workflows.all_open()
+        assert open_now[0] is a
+        assert len(open_now) == 2  # noqa: PLR2004
 
     def test_loading_a_workflow_that_is_already_open_fails_with_a_registry_failure(
         self, engine: Engine, saved_workflow_name: str
@@ -1306,7 +1332,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         assert loaded.objects.get_filtered_subset() != {}
         assert a.objects.has("canvas")
 
-    def test_a_load_from_scratch_into_b_leaves_a_open_and_names_the_workflow_it_opened(
+    def test_a_load_from_scratch_leaves_the_others_open_and_names_the_workflow_it_opened(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
@@ -1316,24 +1342,23 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
         b = _open(engine, "B")
         _make_canvas(engine, a)
 
-        result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), b))
+        result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), None))
 
         assert isinstance(result, RunWorkflowFromScratchResultSuccess), result.result_details
         open_now = engine.open_workflows.all_open()
-        assert open_now[0] is a
-        assert b not in open_now
+        assert open_now[:2] == [a, b]
         assert result.workflow_id == open_now[-1].workflow_id
         assert a.objects.has("canvas")
 
     def test_a_load_from_scratch_stays_bound_to_the_workflow_it_opened_after_the_run(
         self, engine: Engine, saved_workflow_name: str
     ) -> None:
-        """Post-dispatch hooks act on the workflow the file opened, not the one the clean slate closed."""
+        """Post-dispatch hooks act on the workflow the file opened, not one already open."""
         file_path = engine.workflow_registry.get_workflow_by_name(saved_workflow_name).file_path
         assert file_path is not None
         _allow_several_open(engine)
         _open(engine, "A")
-        b = _open(engine, "B")
+        _open(engine, "B")
         bound_in_hook: list[object] = []
 
         def record_binding(_request: RunWorkflowFromScratchRequest, _result: ResultPayload) -> None:
@@ -1341,7 +1366,7 @@ class TestLoadingASavedFileWhileAnotherIsOpen:
 
         engine.event_manager.add_post_dispatch_hook(RunWorkflowFromScratchRequest, record_binding)
         try:
-            result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), b))
+            result = asyncio.run(_send_async(engine, RunWorkflowFromScratchRequest(file_path=file_path), None))
         finally:
             engine.event_manager.remove_post_dispatch_hook(RunWorkflowFromScratchRequest, record_binding)
 

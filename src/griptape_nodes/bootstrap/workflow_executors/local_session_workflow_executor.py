@@ -22,9 +22,9 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowCancelledEvent,
     ControlFlowResolvedEvent,
-    GriptapeEvent,
     StartFlowRequest,
     StartFlowResultFailure,
+    progress_to_execution_event,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -217,15 +217,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                     if result_send_failure is not None and error is None:
                         error = result_send_failure
                 elif isinstance(event, ProgressEvent):
-                    # Convert ProgressEvent to GriptapeEvent and emit via WebSocket
-                    payload = GriptapeEvent(
-                        node_name=event.node_name,
-                        parameter_name=event.parameter_name,
-                        type=type(event).__name__,
-                        value=event.value,
-                    )
-                    execution_event = ExecutionEvent(payload=payload, workflow_id=event.workflow_id)
-                    self._send_event("execution_event", execution_event)
+                    self._send_event("execution_event", progress_to_execution_event(event))
 
                 event_queue.task_done()
 

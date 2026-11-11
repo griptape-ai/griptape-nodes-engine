@@ -440,7 +440,6 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Run synchronously                                                                   | `StartFlowRequest`                                                                                                                                        |
 | Run from a specific node                                                            | `StartFlowFromNodeRequest`                                                                                                                                |
 | Resolve a single node without firing the control flow                               | `ResolveNodeRequest`                                                                                                                                      |
-| Execute a single node directly                                                      | `ExecuteNodeRequest`                                                                                                                                      |
 | Rename a node or flow                                                               | `RenameObjectRequest(allow_next_closest_name_available=True)`                                                                                             |
 | Lock or unlock a node                                                               | `SetLockNodeStateRequest`                                                                                                                                 |
 | Reset a node's parameters to defaults                                               | `ResetNodeToDefaultsRequest`                                                                                                                              |
@@ -448,6 +447,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
+| Close a workflow, leaving the others open                                           | `CloseWorkflowRequest(workflow_id=...)`                                                                                                                   |
 | Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes

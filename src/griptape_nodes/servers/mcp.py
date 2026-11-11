@@ -48,6 +48,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeRequest,
 )
 from griptape_nodes.retained_mode.events.context_events import (
+    CloseWorkflowRequest,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
     GetWorkflowContextRequest,
@@ -56,7 +57,6 @@ from griptape_nodes.retained_mode.events.context_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
-    ExecuteNodeRequest,
     ResolveNodeRequest,
     StartFlowFromNodeRequest,
     StartFlowRequest,
@@ -120,6 +120,7 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "SetWorkflowContextRequest": SetWorkflowContextRequest,
     "GetWorkflowContextRequest": GetWorkflowContextRequest,
     "EnsureWorkflowAndFlowRequest": EnsureWorkflowAndFlowRequest,
+    "CloseWorkflowRequest": CloseWorkflowRequest,
     # Libraries
     "ListRegisteredLibrariesRequest": ListRegisteredLibrariesRequest,
     "ListNodeTypesInLibraryRequest": ListNodeTypesInLibraryRequest,
@@ -131,7 +132,6 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "GetWorkspaceRequest": GetWorkspaceRequest,
     # Execution
     "ResolveNodeRequest": ResolveNodeRequest,
-    "ExecuteNodeRequest": ExecuteNodeRequest,
     "StartFlowRequest": StartFlowRequest,
     "StartFlowFromNodeRequest": StartFlowFromNodeRequest,
     "CancelFlowRequest": CancelFlowRequest,
