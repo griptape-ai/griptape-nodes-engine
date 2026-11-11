@@ -30,6 +30,8 @@ from griptape_nodes.node_library.workflow_registry import _WorkflowRegistry
 from griptape_nodes.retained_mode.engine_lifecycle import EngineLifecycle
 from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
 from griptape_nodes.retained_mode.events.app_events import (
+    AppGetSessionRequest,
+    AppGetSessionResultSuccess,
     AppInitializationComplete,
     EngineHeartbeatRequest,
     EngineHeartbeatResultFailure,
@@ -38,6 +40,9 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    SessionHeartbeatRequest,
+    SessionHeartbeatResultFailure,
+    SessionHeartbeatResultSuccess,
     WorkflowClosedEvent,
     WorkflowOpenedEvent,
 )
@@ -1071,6 +1076,33 @@ class Engine:
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
+
+    @handles(AppGetSessionRequest)
+    def handle_get_session_request(self, request: AppGetSessionRequest) -> ResultPayload:  # noqa: ARG002
+        """Report the active session and a snapshot of this engine for the client connecting to it."""
+        return AppGetSessionResultSuccess(
+            session_id=self._session_manager.active_session_id,
+            engine_version=engine_version,
+            engine_run_id=self._engine_run_id,
+            engine_os=self._os_manager.platform_name(),
+            is_initializing=self._lifecycle.is_initializing(),
+            result_details="Session ID retrieved successfully.",
+        )
+
+    @handles(SessionHeartbeatRequest)
+    def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
+        """Confirm the session is active and report the engine state that changes while a client stays connected."""
+        session_id = self._session_manager.active_session_id
+        if session_id is None:
+            return SessionHeartbeatResultFailure(
+                result_details="Attempted to check the session. Failed because no session is active."
+            )
+        return SessionHeartbeatResultSuccess(
+            session_id=session_id,
+            engine_run_id=self._engine_run_id,
+            is_initializing=self._lifecycle.is_initializing(),
+            result_details=f"Session heartbeat successful for session: {session_id}",
+        )
 
     async def _on_engine_lost(self, engine_id: str) -> None:
         """Settle what a lost engine left behind, on the engine loop.

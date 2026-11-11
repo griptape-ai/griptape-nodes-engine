@@ -130,13 +130,25 @@ class AppGetSessionRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class AppGetSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Session information retrieved successfully.
+    """Session information retrieved successfully, with the state of the engine holding it.
+
+    A client takes this as its snapshot of the engine when it connects to the session, and again
+    when the session heartbeat reports a new run id. Discovery may not list the engine a client is
+    connected to, so the client reads these facts here rather than there.
 
     Args:
         session_id: Current session identifier (None if no active session)
+        engine_version: Current engine version string
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
+        is_initializing: Whether the engine is still loading libraries and workflows
     """
 
     session_id: str | None
+    engine_version: str
+    engine_run_id: str
+    engine_os: str
+    is_initializing: bool
 
 
 @dataclass
@@ -554,7 +566,20 @@ class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 @dataclass
 @PayloadRegistry.register
 class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
-    """Session heartbeat successful. Session is active and responsive."""
+    """Session heartbeat successful. Session is active and responsive.
+
+    Also carries the engine state that changes while a client stays connected. A new run id means
+    the engine restarted, and the client takes a fresh `AppGetSessionRequest` snapshot.
+
+    Args:
+        session_id: The active session, which is the one the client asked on
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
+    """
+
+    session_id: str
+    engine_run_id: str
+    is_initializing: bool
 
 
 @dataclass

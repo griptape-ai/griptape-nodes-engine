@@ -20,8 +20,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppEndSessionRequest,
     AppEndSessionResultFailure,
     AppEndSessionResultSuccess,
-    AppGetSessionRequest,
-    AppGetSessionResultSuccess,
     AppJoinSessionRequest,
     AppJoinSessionResultFailure,
     AppJoinSessionResultSuccess,
@@ -31,9 +29,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppStartSessionRequest,
     AppStartSessionResultSuccess,
     SessionClient,
-    SessionHeartbeatRequest,
-    SessionHeartbeatResultFailure,
-    SessionHeartbeatResultSuccess,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.engine_dirs import engine_state_dir
@@ -362,31 +357,6 @@ class SessionManager:
         except Exception as err:
             details = f"Failed to end session due to '{err}'."
             return AppEndSessionResultFailure(result_details=details)
-
-    @handles(AppGetSessionRequest)
-    def handle_get_session_request(self, _: AppGetSessionRequest) -> ResultPayload:
-        return AppGetSessionResultSuccess(
-            session_id=self.active_session_id,
-            result_details="Session ID retrieved successfully.",
-        )
-
-    @handles(SessionHeartbeatRequest)
-    def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
-        """Handle session heartbeat requests.
-
-        Simply verifies that the session is active and responds with success.
-        """
-        try:
-            active_session_id = self.active_session_id
-            if active_session_id is None:
-                details = "Session heartbeat received but no active session found"
-                return SessionHeartbeatResultFailure(result_details=details)
-
-            details = f"Session heartbeat successful for session: {active_session_id}"
-            return SessionHeartbeatResultSuccess(result_details=details)
-        except Exception as err:
-            details = f"Failed to handle session heartbeat: {err}"
-            return SessionHeartbeatResultFailure(result_details=details)
 
     @staticmethod
     def _find_session_by_id(sessions_data: SessionsStorage, session_id: str) -> SessionData | None:
