@@ -351,6 +351,8 @@ class LibraryProvisioning(EngineScoped):
                     branch_tag_commit=ref,
                     fail_on_exists=False,
                     auto_register=False,
+                    # Nobody is there to agree to running a library's build tools.
+                    allow_widget_build=False,
                 )
             )
 
@@ -512,6 +514,8 @@ class LibraryProvisioning(EngineScoped):
             fail_on_exists=False,
             download_directory=download_directory,
             target_directory_name=target_directory_name,
+            # Nobody is there to agree to running a library's build tools.
+            allow_widget_build=False,
         )
         download_result = await self.engine.ahandle_request(download_request)
         if not isinstance(download_result, DownloadLibraryResultSuccess):

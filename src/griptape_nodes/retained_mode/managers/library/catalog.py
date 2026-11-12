@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibraryRegistryError,
+    WidgetBuildMetadata,
     WidgetDefinition,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -506,7 +508,9 @@ class LibraryCatalog(EngineScoped):
         widgets_info: list[WidgetInfo] | None = None
         library_data = library.get_library_data()
         if library_data.widgets:
-            widgets_info = await asyncio.to_thread(self._build_widget_info, request.library, library_data.widgets)
+            widgets_info = await asyncio.to_thread(
+                self._build_widget_info, request.library, library_data.widgets, library_data.metadata.widget_build
+            )
 
         details = f"Successfully got all library info for a Library named '{request.library}'."
         result = GetAllInfoForLibraryResultSuccess(
@@ -661,32 +665,83 @@ class LibraryCatalog(EngineScoped):
             return False
         return any(isinstance(problem, NodeModuleImportProblem) for problem in library_info.problems)
 
-    def _build_widget_info(self, library_name: str, widget_defs: Sequence[WidgetDefinition]) -> list[WidgetInfo]:
-        """Resolve each widget bundle to a cache-busting URL.
+    def _build_widget_info(
+        self,
+        library_name: str,
+        widget_defs: Sequence[WidgetDefinition],
+        widget_build: WidgetBuildMetadata | None,
+    ) -> list[WidgetInfo]:
+        """Resolve each publishable widget bundle to a cache-busting URL.
 
-        Blocking: reads and hashes every bundle file. Callers run this off the event loop.
+        A widget is withheld, so the editor shows the normal parameter controls, when its bundle
+        is not a regular file inside the library's directory (symlinks followed), or when the
+        library builds its widgets from source and they are not prepared for the revision on disk.
+        Whether builds are allowed now does not matter here: a build that already succeeded stays
+        published.
+
+        Blocking: reads and hashes every bundle file, and may run git. Callers run this off the
+        event loop.
         """
         logger.debug("Library '%s' has %d widget(s), building widget info", library_name, len(widget_defs))
+        library_info_for_path = self.engine.library_manager.get_library_info_by_library_name(library_name)
+        if library_info_for_path is None:
+            logger.warning(
+                "Withholding the widgets of Library '%s': its directory is unknown, so its bundles cannot be checked.",
+                library_name,
+            )
+            return []
+        library_dir = Path(library_info_for_path.library_path).parent
+
+        is_source_build = widget_build is not None and widget_build.mode == "source"
+        if is_source_build and not self.engine.library_manager.widget_preparation.is_prepared(
+            library_name, library_dir
+        ):
+            logger.info(
+                "Withholding the widgets of Library '%s': they are built from source and have not been "
+                "built for the revision on disk. Prepare the library's widgets to publish them.",
+                library_name,
+            )
+            return []
+
         # Get the static server base URL for constructing absolute bundle URLs
         static_server_base_url = self.engine.static_files_manager.static_server_base_url
-        # Get the library directory so we can hash each bundle file
-        library_info_for_path = self.engine.library_manager.get_library_info_by_library_name(library_name)
-        library_dir = Path(library_info_for_path.library_path).parent if library_info_for_path is not None else None
+        canonical_library_dir = canonicalize_for_identity(library_dir)
 
         widgets_info = []
         for widget_def in widget_defs:
-            # Construct the full URL for this widget
-            # The frontend will fetch from: {static_server_base_url}/api/libraries/{library_name}/widgets/{path}
+            bundle_path = canonicalize_for_identity(library_dir / widget_def.path)
+            if not bundle_path.is_relative_to(canonical_library_dir):
+                logger.warning(
+                    "Withholding widget '%s' of Library '%s': its path '%s' points outside the library.",
+                    widget_def.name,
+                    library_name,
+                    widget_def.path,
+                )
+                continue
+            if not bundle_path.is_file():
+                logger.warning(
+                    "Withholding widget '%s' of Library '%s': no bundle file at '%s'.",
+                    widget_def.name,
+                    library_name,
+                    widget_def.path,
+                )
+                continue
+
+            # The frontend fetches from: {static_server_base_url}/api/libraries/{library_name}/widgets/{path}
             base_url = f"{static_server_base_url}/api/libraries/{library_name}/widgets/{widget_def.path}"
             # Append a content hash so browsers re-fetch when the bundle file changes
             try:
-                if library_dir is not None:
-                    content_hash = hashlib.sha256((library_dir / widget_def.path).read_bytes()).hexdigest()[:8]
-                    bundle_url = f"{base_url}?v={content_hash}"
-                else:
-                    bundle_url = base_url
-            except OSError:
-                bundle_url = base_url
+                content_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()[:8]
+            except OSError as e:
+                logger.warning(
+                    "Withholding widget '%s' of Library '%s': its bundle at '%s' could not be read: %s",
+                    widget_def.name,
+                    library_name,
+                    widget_def.path,
+                    e,
+                )
+                continue
+            bundle_url = f"{base_url}?v={content_hash}"
             logger.debug("Widget '%s' from library '%s': bundle_url=%s", widget_def.name, library_name, bundle_url)
             widgets_info.append(
                 WidgetInfo(

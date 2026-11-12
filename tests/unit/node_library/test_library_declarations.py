@@ -32,6 +32,7 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
+    WidgetBuildMetadata,
 )
 
 
@@ -363,8 +364,31 @@ class TestLibraryMetadataWorkerDeclarations:
 
 
 class TestSchemaVersion:
-    def test_latest_schema_version_is_0_14_0(self) -> None:
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.14.0"
+    def test_latest_schema_version_is_0_15_0(self) -> None:
+        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.15.0"
+
+    def test_widget_build_is_optional_and_parsed(self) -> None:
+        assert (
+            LibraryMetadata(author="a", description="d", library_version="1", engine_version="1", tags=[]).widget_build
+            is None
+        )
+
+        metadata = LibraryMetadata.model_validate(
+            {
+                "author": "a",
+                "description": "d",
+                "library_version": "1",
+                "engine_version": "1",
+                "tags": [],
+                "widget_build": {"mode": "source", "root": "widgets"},
+            }
+        )
+
+        assert metadata.widget_build == WidgetBuildMetadata(mode="source", root="widgets")
+
+    def test_widget_build_rejects_an_unknown_mode(self) -> None:
+        with pytest.raises(ValidationError):
+            WidgetBuildMetadata.model_validate({"mode": "compile", "root": "widgets"})
 
 
 # ---------- Model catalog ----------
