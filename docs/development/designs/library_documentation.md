@@ -7,7 +7,7 @@ Tracking issue: [griptape-ai/internal#222](https://github.com/griptape-ai/intern
 ## Goals
 
 - A library author writes node and library docs in their own repo with no hosting, no build step, and no PR to the engine.
-- Users read the docs inside the editor, fast, offline, and matching the installed library version.
+- Users read the docs inside the editor, fast, offline, and matching the installed library version. The docs are local files in the installed library, so they work in air-gapped environments with no network.
 - Agents read the same docs through the engine.
 - Every node has useful help even if the author writes nothing.
 
@@ -16,6 +16,8 @@ Tracking issue: [griptape-ai/internal#222](https://github.com/griptape-ai/intern
 ### Location and file layout
 
 Docs live in a `docs/` folder next to `griptape_nodes_library.json`. The manifest's folder is the library root, whether the manifest sits at the repo root or inside a package subfolder. It is the one location the engine already resolves paths from.
+
+In the layout below, only `docs/nodes/` has a fixed meaning: it holds one page per node. Everything else under `docs/` is library-level docs, meaning pages about the library as a whole and not about one node. `guides/` and `reference/` are made-up examples of those. A library can name and arrange them any way it likes, or have none.
 
 ```
 my-library/
@@ -34,13 +36,12 @@ my-library/
     shout_text.py             # saved workflow, registered as the node type "ShoutText"
   docs/
     index.md                  # library home page (optional)
-    nav.yml                   # page order and grouping (optional)
-    guides/
-      getting-started.md      # any number of library-level pages, nested folders allowed
-      color-management.md
-    reference/
-      file-formats.md
-    nodes/
+    guides/                   # EXAMPLE of library-level docs: any folder name works, none are required
+      getting-started.md      # not about a specific node
+      color-management.md     # not about a specific node
+    reference/                # EXAMPLE of library-level docs: any folder name works, none are required
+      file-formats.md         # not about a specific node
+    nodes/                    # the one fixed folder: one page per node, matched by node key
       audio/
         LoadAudio.md          # documents the node LoadAudio
         LoadAudio.fr.md       # French version of the same page (locales are later, the name is reserved now)
@@ -80,22 +81,11 @@ Library pages:
 
 - Everything under `docs/` outside the top-level `nodes/` folder is a library page. `nodes/` is reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A library page's title follows the title rule under File format.
 
-- Without `nav.yml`, pages are listed by folder, then by path in case-insensitive alphabetical order, with `index.md` first. `nav.yml` overrides that with an ordered tree:
+- Navigation is the folder hierarchy. There is no navigation file. The panel shows folders and pages as they sit on disk, so adding a page adds an entry. A folder's title is its name with dashes and underscores turned into spaces and the first letter capitalized, so `color-management/` shows as "Color management".
 
-    ```yaml
-    - index.md
-    - Guides:
-        - guides/getting-started.md
-        - guides/color-management.md
-    - Reference:
-        - reference/file-formats.md
-    ```
+- Entries are sorted alphabetically by filename, case-insensitive, with `index.md` first. An author who wants a different order puts a number prefix on the filenames (`01-getting-started.md`, `02-color-management.md`). A leading number prefix is not shown in a title or a folder name.
 
-    Entries are paths relative to `docs/`. Titles follow the title rule under File format.
-
-- Pages that `nav.yml` does not list are appended after the listed ones, sorted by path, and the engine reports a library problem. An entry that points to a missing file is skipped with a library problem, and a group left with no valid entries is dropped. The docs check fails on both.
-
-- Nodes are not listed in `nav.yml`. The editor lists them from the manifest, grouped by category.
+- Nodes are not part of the page tree. The editor lists them from the manifest, grouped by category.
 
 Manifest field:
 
@@ -118,7 +108,7 @@ The format is a portable subset of markdown. It renders on GitHub, reads cleanly
 - Callouts use GitHub alerts (`> [!NOTE]`, `> [!WARNING]`).
 - Diagrams are fenced blocks tagged `mermaid`.
 - Heading anchors are supported.
-- Images are standard markdown images with relative paths into `docs/`. Raw HTML is stripped by the sanitizer.
+- Images are standard markdown images with relative paths into `docs/`. Raw HTML is stripped by the sanitizer. An image at an external URL will not load without a network, so docs that need to work offline keep their images in the library.
 - Video: a relative link to an `.mp4` or `.webm` file renders as a `<video>` element with controls. External video (YouTube, Vimeo) is a plain link, because the sanitizer strips iframes.
 - Content tabs are not in v1. Authors use headings or separate sections. If tabs come back, the syntax is chosen by three criteria: it renders in the editor, reads cleanly as raw text, and degrades on GitHub.
 - Links between pages are relative `.md` paths (`../guides/color-management.md#aces`). These work on GitHub and in the editor, which opens them in the panel.
@@ -176,13 +166,14 @@ GetNodeDocumentationRequest(library: str, node_type: str, node_name: str | None 
        external_url: str | None,      # optional "more docs" link from the manifest
      )
 ListLibraryDocumentationRequest(library: str)
-  -> nav tree: [{title, path, description, when_to_use, kind, children}], plus the node list grouped by category
+  -> page tree: [{title, path, description, when_to_use, kind, children}], plus the node list grouped by category
 GetLibraryDocumentationPageRequest(library: str, path: str)
   -> markdown, title, assets_root
 ```
 
+- The docs are read from the installed library on disk and served by the engine to the editor, so nothing leaves the machine. Reading docs needs no network, which makes them usable in air-gapped environments.
 - Markdown travels in the response, so remote engines work.
-- The engine builds its docs index when a library loads: which node pages exist, the page tree from `nav.yml` or the folder listing, and the problems described above. Choosing Refresh Libraries (or restarting the engine) loads the libraries again and rebuilds the index, so a new, renamed, or deleted doc file shows up after a refresh. The text of a page is read from disk on each request, so an edit to an existing page shows up the next time the panel opens it, with no refresh.
+- The engine builds its docs index when a library loads: which node pages exist, the page tree from the folder hierarchy, and the problems described above. Choosing Refresh Libraries (or restarting the engine) loads the libraries again and rebuilds the index, so a new, renamed, or deleted doc file shows up after a refresh. The text of a page is read from disk on each request, so an edit to an existing page shows up the next time the panel opens it, with no refresh.
 - Paths are canonicalized with `canonicalize_for_identity` and must stay inside the docs folder. A key containing `..` or a separator fails the request.
 - A markdown page over 1 MB is rejected, because the page travels in the response. The engine limits nothing else.
 - Images: the editor mints preview URLs from `assets_root` plus the relative path with `CreateStaticFileDownloadUrlFromPathRequest`, as it does for other files. The engine never stores static URLs. Video is served with range requests so seeking works without loading the whole file.
@@ -205,8 +196,8 @@ Agents read the same docs as people, through the same requests.
 ### Editor
 
 - A docs panel opens from the node book icon and from the selection toolbar. It renders the page and then the parameter table, with the deprecation banner above the page.
-- The panel builds its navigation from whatever the library ships. A library with guides or reference pages shows them as a page tree (from `nav.yml`, or the folder listing), and more pages mean more entries. The library's nodes always appear below, grouped by category. A library with only node docs, or none at all, shows just its nodes. There is no setting for any of this. A node page has a breadcrumb back to its library.
-- Library Management gets a "Documentation" entry that opens the library's home page (`index.md`, or the page tree if there is none).
+- The panel builds its navigation from whatever the library ships. A library with guides or reference pages shows them as a page tree that follows the library's folders, and more pages mean more entries. The library's nodes always appear below, grouped by category. A library with only node docs, or none at all, shows just its nodes. There is no setting for any of this. A node page has a breadcrumb back to its library.
+- Library Management gets a "Documentation" entry that opens the library's home page (`index.md`, or the page tree if there is none). Both work without a network, because the docs come from the installed library.
 - The renderer supports GFM, GitHub alerts, Mermaid, and video. Mermaid loads lazily and runs in strict security mode.
 - GUI PR #3394 becomes the entry point. `documentation_url` stays as an optional "More docs" link at the bottom of the panel. The git-remote parsing is not needed.
 
@@ -220,7 +211,7 @@ A `docs check` command runs in the author's terminal and in the library's CI, wi
 - missing tooltips
 - files over 5 MB for an image, 25 MB for a video, or 100 MB for the whole docs folder, as warnings that do not fail the check
 - broken image and page links
-- `nav.yml` entries that point to missing files, and pages `nav.yml` leaves out
+- external image URLs, which will not load without a network
 - skills that name nodes the library does not have
 
 The engine reports the same problems as library problems when it loads a library, so a renamed class that orphans its doc shows up in the editor without anyone running the command.
@@ -240,6 +231,8 @@ The standard library is the first library to move.
 
 ## Phasing
 
+The order in which this feature is built. Each phase is a stage of development work, not a release or a version of the docs format. Later phases build on earlier ones.
+
 1. Engine and editor panel: manifest field, request handlers, the parameter table, MCP exposure, load-time library problems, the `docs check` command, a panel that shows a node's page and table and a library's pages (home page, guides, reference), tests, authoring docs page, changelog entry.
 1. Editor: alerts, Mermaid, video, deprecation banner, library skill discovery for the sidebar agent.
 1. Scaffold command, the standard library migration, locales.
@@ -247,8 +240,8 @@ The standard library is the first library to move.
 ## Decisions
 
 - A library can ship its own pages (a home page, guides, reference) as well as per-node pages, and users can read both in the editor in the first release.
-- Auto-listing with an optional `nav.yml` is enough. The nav does not go in the manifest.
-- There is no per-page `order` field. Order is set only in `nav.yml`.
+- Navigation is the folder hierarchy, with no `nav.yml` and no navigation in the manifest. Order is alphabetical by filename, and number prefixes on filenames change it. There is no per-page `order` field.
+- Docs are local files in the installed library, read through the engine, so they work in air-gapped environments.
 - Library docs are not mirrored to the main site.
 - No raw HTML, no tabs, and no search request in v1. The engine's only size rule is the 1 MB page limit, and the docs check warns about large files. Frontmatter is limited to `title`, `description` and `when_to_use`.
 - Docs problems are library problems and never stop a library from loading.
