@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path  # noqa: TC003 - read at runtime by the converter
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
@@ -1385,14 +1385,14 @@ class ResetLibraryResultFailure(ResultPayloadFailure):
 class EnvironmentManagedBlocker:
     """`library.provisioned_by` is 'environment', so the environment owns this library."""
 
-    kind: str = "environment_managed"
+    kind: Literal["environment_managed"] = "environment_managed"
 
 
 @dataclass
 class SandboxLibraryBlocker:
     """The sandbox library is a workspace folder rather than an install."""
 
-    kind: str = "sandbox_library"
+    kind: Literal["sandbox_library"] = "sandbox_library"
 
 
 @dataclass
@@ -1400,14 +1400,14 @@ class UnsafePathBlocker:
     """The resolved target is a filesystem root, a drive, a share, or holds `.`/`..` segments."""
 
     path: str
-    kind: str = "unsafe_path"
+    kind: Literal["unsafe_path"] = "unsafe_path"
 
 
 @dataclass
 class NotFoundBlocker:
     """No library of this name and manifest path is known to this engine."""
 
-    kind: str = "not_found"
+    kind: Literal["not_found"] = "not_found"
 
 
 @dataclass
@@ -1426,7 +1426,7 @@ class UnwritableConfigBlocker:
 
     layer: str
     config_key: str
-    kind: str = "unwritable_config"
+    kind: Literal["unwritable_config"] = "unwritable_config"
 
 
 @dataclass
@@ -1437,7 +1437,7 @@ class UnmatchedEntryBlocker:
     would delete the files and leave whatever did that in place.
     """
 
-    kind: str = "unmatched_entry"
+    kind: Literal["unmatched_entry"] = "unmatched_entry"
 
 
 # Why an uninstall cannot proceed at all, as a discriminated union on `kind`.
@@ -1460,13 +1460,18 @@ UninstallBlocker = (
 )
 
 
+# Which step failed once an uninstall was already under way. A refusal never gets this far, so
+# the refusal slugs are not among these: those travel as `blocked_by`.
+UninstallFailureReason = Literal["config_write_failed", "unload_failed", "directory_delete_failed"]
+
+
 @dataclass
 class SharedDirectoryEntryRemaining:
     """A directory entry registers this library and others, so it was left in place."""
 
     entry_path: str
     library_names: list[str] = field(default_factory=list)
-    kind: str = "shared_directory_entry"
+    kind: Literal["shared_directory_entry"] = "shared_directory_entry"
 
 
 # What still registers the library after an otherwise successful uninstall, as a discriminated
@@ -1563,12 +1568,13 @@ class UninstallLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 class UninstallLibraryResultFailure(ResultPayloadFailure):
     """Uninstall failed.
 
-    `failure_reason` is one of: not_found, blocked, config_write_failed, unload_failed,
-    directory_delete_failed. "blocked" carries `blocked_by`, which the preview reports too, so
-    the editor can disable the control before the user clicks it.
+    A refusal sets `blocked_by` and leaves `failure_reason` None: nothing was touched, and the
+    preview reports the same blocker, so the editor can disable the control before the user
+    clicks it. `failure_reason` is for the other kind of failure, where a step ran and failed
+    partway, and has no blocker to carry. Each failure therefore reports itself once.
     """
 
-    failure_reason: str | None = None
+    failure_reason: UninstallFailureReason | None = None
     blocked_by: UninstallBlocker | None = None
 
 

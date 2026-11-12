@@ -143,7 +143,6 @@ class LibraryUninstall(EngineScoped):
             if isinstance(resolved, _ResolutionError):
                 return UninstallLibraryResultFailure(
                     result_details=resolved.details,
-                    failure_reason="not_found",
                     blocked_by=NotFoundBlocker(),
                 )
 
@@ -152,9 +151,7 @@ class LibraryUninstall(EngineScoped):
                     f"Attempted to uninstall Library '{resolved.library_name}'. Refused: "
                     f"{type(resolved.blocked_by).__name__}."
                 )
-                return UninstallLibraryResultFailure(
-                    result_details=details, failure_reason="blocked", blocked_by=resolved.blocked_by
-                )
+                return UninstallLibraryResultFailure(result_details=details, blocked_by=resolved.blocked_by)
 
             config_entry_removed, config_failure = self._uninstall_remove_config_entry(resolved)
             if config_failure is not None:

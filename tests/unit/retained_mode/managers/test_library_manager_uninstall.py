@@ -27,6 +27,7 @@ from griptape_nodes.node_library.library_registry import (
 )
 from griptape_nodes.retained_mode.events.library_events import (
     EnvironmentManagedBlocker,
+    NotFoundBlocker,
     PreviewUninstallLibraryRequest,
     PreviewUninstallLibraryResultFailure,
     PreviewUninstallLibraryResultSuccess,
@@ -170,7 +171,7 @@ class TestResolutionNotFound:
         )
 
         assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "not_found"
+        assert isinstance(result.blocked_by, NotFoundBlocker)
 
     @pytest.mark.asyncio
     async def test_preview_of_unknown_library_fails(self, engine: Engine, workspace: Path) -> None:
@@ -231,7 +232,6 @@ class TestBlockedTargets:
         result = await _uninstall_after_preview(engine, "Test Library", manifest)
 
         assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "blocked"
         assert isinstance(result.blocked_by, EnvironmentManagedBlocker)
         assert await anyio.Path(manifest).exists()
 
@@ -358,7 +358,6 @@ class TestManifestEntry:
         # The preview says so too, so the editor can disable the control before it is clicked.
         assert isinstance(preview.blocked_by, UnmatchedEntryBlocker)
         assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "blocked"
         assert isinstance(result.blocked_by, UnmatchedEntryBlocker)
         assert await anyio.Path(library_dir).exists()
 
@@ -577,7 +576,6 @@ class TestUnwritableConfigLayer:
         result = await engine.ahandle_request(UninstallLibraryRequest(library_name="Mine", library_path=str(mine)))
 
         assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "blocked"
         assert isinstance(result.blocked_by, UnwritableConfigBlocker)
         assert await anyio.Path(mine.parent).exists()
         user_entries = config.get_config_value(LIBRARIES_TO_REGISTER_KEY, config_source="user_config", default=[]) or []
@@ -611,7 +609,6 @@ class TestProtectedDirectories:
         result = await _uninstall_after_preview(engine, "Workspace Root Library", manifest)
 
         assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "blocked"
         assert isinstance(result.blocked_by, UnsafePathBlocker)
         assert await anyio.Path(workflow).exists()
         assert await anyio.Path(workspace).exists()
@@ -629,7 +626,7 @@ class TestProtectedDirectories:
         result = await _uninstall_after_preview(engine, "Libraries Root Library", manifest)
 
         assert isinstance(result, UninstallLibraryResultFailure)
-        assert result.failure_reason == "blocked"
+        assert isinstance(result.blocked_by, UnsafePathBlocker)
         assert await anyio.Path(neighbour).exists()
 
     @pytest.mark.asyncio
@@ -745,7 +742,7 @@ class TestRepeatedUninstall:
 
         assert isinstance(first, UninstallLibraryResultSuccess), first.result_details
         assert isinstance(second, UninstallLibraryResultFailure)
-        assert second.failure_reason == "not_found"
+        assert isinstance(second.blocked_by, NotFoundBlocker)
 
 
 class TestConcurrentUninstalls:
