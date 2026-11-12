@@ -13,8 +13,6 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from tests.workflow_context import bind
-
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -12955,7 +12953,7 @@ class TestWritableProjectVariables:
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow("p4_test_wf"))
+        engine.context_manager.push_workflow("p4_test_wf")
         result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="p4_test_flow", set_as_new_context=True)
         )

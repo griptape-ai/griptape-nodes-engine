@@ -19,7 +19,6 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.serialization.values import UndecodedValue
-from tests.workflow_context import bind
 
 # Workflow ids in the form the registry mints.
 _ORCHESTRATOR_WORKFLOW_ID = "0577bcf13a9809c5fcc5b68d391658f0"
@@ -30,7 +29,7 @@ class TestNodeManagerBatchSetNodeMetadata:
 
     def test_batch_set_node_metadata_empty_request_succeeds(self, engine: Engine) -> None:
         """Test that an empty batch request succeeds without errors."""
-        bind(engine.context_manager.open_workflow(workflow_name="workflow"))
+        engine.context_manager.push_workflow(workflow_name="workflow")
         # Create an empty batch request
         request = BatchSetNodeMetadataRequest(node_metadata_updates={})
 
@@ -44,7 +43,7 @@ class TestNodeManagerBatchSetNodeMetadata:
 
     def test_batch_set_node_metadata_all_nodes_not_found_fails(self, engine: Engine) -> None:
         """Test that batch update fails when all nodes are not found."""
-        bind(engine.context_manager.open_workflow(workflow_name="workflow"))
+        engine.context_manager.push_workflow(workflow_name="workflow")
         # Create request with non-existent nodes
         request = BatchSetNodeMetadataRequest(
             node_metadata_updates={
@@ -317,7 +316,7 @@ class TestUnresolveNodeRequest:
     """Tests for the on_unresolve_node_request handler."""
 
     def test_node_not_found_returns_failure(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="workflow"))
+        engine.context_manager.push_workflow(workflow_name="workflow")
         result = engine.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
         assert isinstance(result, UnresolveNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
@@ -327,7 +326,7 @@ class TestUnresolveNodeRequest:
         mock_node.name = "test_node"
         mock_node.state = NodeResolutionState.RESOLVING
         mock_node.parameter_output_values = MagicMock()
-        bind(engine.context_manager.open_workflow(workflow_name="workflow"))
+        engine.context_manager.push_workflow(workflow_name="workflow")
         with patch.object(engine.current_workflow().objects, "get_as_type", return_value=mock_node):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
@@ -342,7 +341,7 @@ class TestUnresolveNodeRequest:
         mock_node.state = NodeResolutionState.RESOLVED
         mock_node.parameter_output_values = MagicMock()
         mock_connections = MagicMock()
-        bind(engine.context_manager.open_workflow(workflow_name="workflow"))
+        engine.context_manager.push_workflow(workflow_name="workflow")
         workflow = engine.current_workflow()
         with (
             patch.object(workflow.objects, "get_as_type", return_value=mock_node),
@@ -363,7 +362,7 @@ class TestUnresolveNodeRequest:
         mock_node.state = NodeResolutionState.UNRESOLVED
         mock_node.parameter_output_values = MagicMock()
         mock_connections = MagicMock()
-        bind(engine.context_manager.open_workflow(workflow_name="workflow"))
+        engine.context_manager.push_workflow(workflow_name="workflow")
         workflow = engine.current_workflow()
         with (
             patch.object(workflow.objects, "get_as_type", return_value=mock_node),
@@ -429,7 +428,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {"result": output_value}
         mock_node.get_parameter_by_name.return_value = param
 
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
@@ -460,7 +459,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
@@ -491,7 +490,7 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
@@ -570,7 +569,7 @@ class TestNodeManagerCancelExecuteNode:
     @pytest.mark.asyncio
     async def test_cancel_worker_execution_noop_when_not_tracked(self, engine: Engine) -> None:
         """cancel_worker_execution_in is a no-op when the node isn't routed to a worker."""
-        bind(engine.context_manager.open_workflow("wf"))
+        engine.context_manager.push_workflow("wf")
         workflow = engine.current_workflow()
 
         # Should not raise; there is no entry for "ghost_node" and

@@ -23,7 +23,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -173,7 +172,7 @@ class TestBaseIterativeNodeGroupLegacyControlPortNames:
     def test_connection_saved_against_legacy_names_lands_on_the_loop_ports(self, engine: Engine) -> None:
         """A saved workflow's CreateConnectionRequest naming group_exec_in / group_exec_out wires the loop's pair."""
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow(workflow_name="legacy_loop_ports_wf"))
+        engine.context_manager.push_workflow("legacy_loop_ports_wf")
         result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
         assert isinstance(result, CreateFlowResultSuccess)
         workflow = engine.current_workflow()

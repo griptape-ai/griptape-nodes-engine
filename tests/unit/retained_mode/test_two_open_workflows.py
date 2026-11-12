@@ -311,11 +311,9 @@ def _nodes_in(engine: Engine, workflow: WorkflowRuntime, flow: str = "canvas") -
 
 
 def _failed_for_no_workflow_named(result: ResultPayload) -> bool:
-    if isinstance(getattr(result, "exception", None), WorkflowNotNamedError):
-        return True
-    details = str(result.result_details)
-    no_workflow_phrases = ("did not name one", "names no workflow", "request has no workflow", "no workflow is loaded")
-    return any(phrase in details for phrase in no_workflow_phrases)
+    return isinstance(getattr(result, "exception", None), WorkflowNotNamedError) or "did not name one" in str(
+        result.result_details
+    )
 
 
 def _park(name: str) -> asyncio.Event:
@@ -697,6 +695,7 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
 
 # What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
 _FAIL_WITHOUT_AN_ID = {
+    "ResolveMacroPathRequest {workspace_dir}",
     "ResolveMacroPathRequest {workflow_dir}",
     "GetWorkflowContextRequest",
     "ListFlowsInCurrentContextRequest",
@@ -1193,7 +1192,7 @@ class TestRawThreadInNodeCode:
         assert _RawThreadNode.seen["ambient_resolve"].failed()
 
     @pytest.mark.asyncio
-    async def test_with_one_workflow_open_a_raw_threads_request_names_no_workflow(
+    async def test_with_one_workflow_open_a_raw_thread_falls_back_to_it(
         self,
         engine: Engine,
         spike_library: None,  # noqa: ARG002
@@ -1206,8 +1205,7 @@ class TestRawThreadInNodeCode:
 
         assert isinstance(result, StartFlowResultSuccess), result.result_details
         assert _RawThreadNode.seen["ambient"] is only
-        # The engine's own requests never guess, even with one workflow open.
-        assert _RawThreadNode.seen["ambient_resolve"].failed()
+        assert _RawThreadNode.seen["ambient_resolve"].succeeded()
         assert _RawThreadNode.seen["built_in_node_code"] == _RawThreadNode.seen["in_node_code"]
 
 
@@ -1228,8 +1226,7 @@ def saved_workflow_name(engine: Engine, spike_library: None, tmp_path: Path) -> 
     _use_default_project(engine, workspace)
     opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="saved"))
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
-    assert opened.workflow_id is not None
-    saved = asyncio.run(engine.open_workflows.get(opened.workflow_id).ahandle_request(SaveWorkflowRequest()))
+    saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
     assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     assert engine.open_workflows.all_open() == []

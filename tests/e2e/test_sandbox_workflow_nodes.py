@@ -55,7 +55,6 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.library.sandbox import SUBFLOW_NODE_ICON
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, Settings
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -108,7 +107,7 @@ def _list_sandbox_node_types(engine: Engine) -> list[str]:
 
 
 def _create_parent_flow(engine: Engine, workflow_name: str) -> str:
-    bind(engine.context_manager.open_workflow(workflow_name=workflow_name))
+    engine.context_manager.push_workflow(workflow_name=workflow_name)
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=False)
     )
@@ -343,8 +342,6 @@ async def test_saved_workflow_using_a_sandbox_workflow_node_reopens_with_the_rea
 
     run_result = await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=save_result.workflow_name))
     assert isinstance(run_result, RunWorkflowFromRegistryResultSuccess), run_result
-    assert run_result.workflow_id is not None
-    bind(engine.open_workflows.get(run_result.workflow_id))
     assert run_result.status == WorkflowStatus.GOOD
 
     node = engine.node_manager.get_node_by_name("Shout It")
@@ -374,8 +371,6 @@ async def test_saved_workflow_using_a_sandbox_workflow_node_reloads_the_sandbox_
 
     run_result = await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=save_result.workflow_name))
     assert isinstance(run_result, RunWorkflowFromRegistryResultSuccess), run_result
-    assert run_result.workflow_id is not None
-    bind(engine.open_workflows.get(run_result.workflow_id))
     assert run_result.status == WorkflowStatus.GOOD
 
     node = engine.node_manager.get_node_by_name("Shout It")

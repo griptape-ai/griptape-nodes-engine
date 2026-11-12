@@ -29,8 +29,6 @@ from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
-from griptape_nodes.retained_mode.managers.event_manager import current_request_sender
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
@@ -341,14 +339,21 @@ class ContextManager(EngineScoped):
     def on_get_workflow_context_request(
         self,
         request: GetWorkflowContextRequest,  # noqa: ARG002
-        workflow: WorkflowRuntime,
+        workflow: WorkflowRuntime | None = None,
     ) -> ResultPayload:
-        entry = self.engine.workflow_registry.get(workflow.workflow_id)
+        workflow_name = None
+        workflow_id = None
+        is_saved = None
+        if workflow is not None:
+            entry = self.engine.workflow_registry.get(workflow.workflow_id)
+            workflow_name = entry.name
+            workflow_id = entry.workflow_id
+            is_saved = entry.is_saved
         return GetWorkflowContextSuccess(
-            workflow_name=entry.name,
-            workflow_id=entry.workflow_id,
-            is_saved=entry.is_saved,
-            result_details=f"Successfully retrieved workflow context: {entry.name}",
+            workflow_name=workflow_name,
+            workflow_id=workflow_id,
+            is_saved=is_saved,
+            result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
         )
 
     @handles(EnsureWorkflowAndFlowRequest)
@@ -357,33 +362,12 @@ class ContextManager(EngineScoped):
     ) -> ResultPayload:
         """Cold-start bootstrap that guarantees a workflow + flow context exist.
 
-        Uses the `workflow` the request names. A request that names none adopts the engine's only
-        open workflow, and opens one with its flow when none is open, so callers can go from a blank
-        engine to CreateNode in a single round trip. The result's `open_workflow` reports the
-        workflow it used, opened or adopted, which an MCP session then keeps. This adoption is the one
-        fallback to the only open workflow outside `GriptapeNodes.only_open_workflow_for_unbound_caller`.
-        Another engine's request that names none acts on no workflow, so it never adopts one.
+        Uses the open `workflow`, and otherwise opens one with its flow, so callers can go from a
+        blank engine to CreateNode in a single round trip.
         """
-        if workflow is not None:
-            return self._ensure_flow(request, workflow)
-        if current_request_sender() is not None:
+        if workflow is None:
             return self._open_workflow_with_flow(request)
-        open_workflows = self.engine.open_workflows.all_open()
-        if len(open_workflows) > 1:
-            open_workflow_infos = self.engine.open_workflow_infos()
-            listed = ", ".join(f"'{info.name}' ({info.workflow_id})" for info in open_workflow_infos)
-            return WorkflowNotNamedResultFailure(
-                open_workflows=open_workflow_infos,
-                result_details=(
-                    f"Attempted to ensure a workflow + flow context. Failed because the request names no workflow "
-                    f"and {len(open_workflows)} are open: {listed}. Name one on the request envelope, or with the "
-                    "X-Griptape-Workflow-Id header from an MCP client, or open one with OpenWorkflowRequest."
-                ),
-            )
-        if open_workflows:
-            adopted = open_workflows[0]
-            return self._ensure_flow(request, adopted)
-        return self._open_workflow_with_flow(request)
+        return self._ensure_flow(request, workflow)
 
     def workflow(self, workflow_name: str) -> ContextManager.WorkflowContext:
         """Create a context manager for a Workflow context.

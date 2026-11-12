@@ -37,7 +37,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -80,7 +79,7 @@ async def test_serializable_false_output_reresolved_on_load(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    bind(engine.context_manager.open_workflow(workflow_name="nonserializable_test_wf"))
+    engine.context_manager.push_workflow(workflow_name="nonserializable_test_wf")
 
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="TestFlow", set_as_new_context=False)
@@ -120,7 +119,7 @@ async def test_serializable_false_output_reresolved_on_load(
 
     # --- Step 4: Clear state and deserialize (load) ---
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    bind(engine.context_manager.open_workflow(workflow_name="nonserializable_test_wf_reloaded"))
+    engine.context_manager.push_workflow(workflow_name="nonserializable_test_wf_reloaded")
 
     deserialize_result = engine.handle_request(
         DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved_commands)

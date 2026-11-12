@@ -13,7 +13,6 @@ from griptape_nodes.retained_mode.events.base_events import RequestPayload, Resu
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import RequestHandlerRegistrationProblem
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,7 +48,7 @@ def _make_library_info() -> LibraryManager.LibraryInfo:
 
 
 def _open_workflow(engine: Engine) -> WorkflowRuntime:
-    bind(engine.context_manager.open_workflow(workflow_name="open"))
+    engine.context_manager.push_workflow(workflow_name="open")
     return engine.open_workflows.get(engine.context_manager.get_current_workflow_id())
 
 

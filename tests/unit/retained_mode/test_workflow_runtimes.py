@@ -23,6 +23,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
     ListFlowsInFlowRequest,
+    ListFlowsInFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import (
@@ -49,7 +50,6 @@ from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNo
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from tests.unit.exe_types.mocks import MockNode
-from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -195,7 +195,7 @@ class TestRuntimeLifecycle:
 
 class TestObjectsOnTheRuntime:
     def test_a_created_flow_is_held_by_the_open_workflow(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
 
         result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
 
@@ -214,7 +214,7 @@ class TestObjectsOnTheRuntime:
         assert engine.current_workflow_or_none() is None
 
     def test_work_bound_to_no_workflow_finds_no_objects(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
         object_manager = engine.object_manager
 
@@ -224,7 +224,7 @@ class TestObjectsOnTheRuntime:
         assert object_manager.has_object_with_name("canvas")
 
     def test_rename_moves_the_object_within_the_open_workflow(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
 
         result = engine.handle_request(RenameObjectRequest(object_name="canvas", requested_name="renamed"))
@@ -299,7 +299,7 @@ class TestObjectsOnTheRuntime:
 
 class TestVariablesOnTheRuntime:
     def test_global_and_flow_variables_are_held_by_the_open_workflow(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
 
         global_result = engine.handle_request(
@@ -319,7 +319,7 @@ class TestVariablesOnTheRuntime:
         result = engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
 
         assert isinstance(result, WorkflowNotNamedResultFailure)
-        assert "names no workflow" in str(result.result_details)
+        assert "names no workflow and none is open" in str(result.result_details)
         lookup = engine.handle_request(GetVariableValueRequest(name="greeting", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(lookup, WorkflowNotNamedResultFailure)
 
@@ -340,11 +340,11 @@ class TestVariablesOnTheRuntime:
         assert not engine.current_workflow().variables.global_layer.has("farewell")
 
     def test_variables_do_not_survive_clearing_and_reopening(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateVariableRequest(name="greeting", type="str", is_global=True, value="hi"))
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        open_and_bind(engine, "next")
+        engine.context_manager.push_workflow(workflow_name="next")
 
         result = engine.handle_request(GetVariableValueRequest(name="greeting", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(result, GetVariableValueResultFailure)
@@ -358,7 +358,7 @@ class TestSubstitutionFlagOnTheRuntime:
         assert engine.workflow_manager.variable_substitution.is_enabled() is True
 
     def test_the_flag_is_held_by_the_open_workflow(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
 
         engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
@@ -377,7 +377,7 @@ class TestSubstitutionFlagOnTheRuntime:
 
 class TestNodesAndFlowsOnTheRuntime:
     def test_node_and_flow_state_is_held_by_the_open_workflow_and_dropped_when_it_closes(self, engine: Engine) -> None:
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
         runtime = engine.current_workflow()
         runtime.nodes.name_to_parent_flow_name["node"] = "canvas"
@@ -390,7 +390,7 @@ class TestNodesAndFlowsOnTheRuntime:
         assert engine.flow_manager.global_dag_builder.connections is runtime.flows.connections
 
         engine.context_manager.pop_workflow()
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
 
         reopened = engine.current_workflow()
         assert reopened.nodes.name_to_parent_flow_name == {}
@@ -404,10 +404,11 @@ class TestNodesAndFlowsOnTheRuntime:
         assert not engine.flow_manager.check_for_existing_running_flow()
         assert not engine.flow_manager.execution_is_advancing()
 
-    def test_listing_the_canvas_flows_with_no_workflow_open_fails(self, engine: Engine) -> None:
+    def test_listing_the_canvas_flows_with_no_workflow_open_finds_none(self, engine: Engine) -> None:
         result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=None))
 
-        assert isinstance(result, WorkflowNotNamedResultFailure), result.result_details
+        assert isinstance(result, ListFlowsInFlowResultSuccess), result.result_details
+        assert result.flow_names == []
 
     @pytest.mark.asyncio
     async def test_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
@@ -514,7 +515,7 @@ class TestNodesAndFlowsOnTheRuntime:
         assert runtime.nodes.orch_worker_requests == {}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("addressed", [True, False], ids=["with_envelope_id", "with_the_callers_binding"])
+    @pytest.mark.parametrize("addressed", [True, False], ids=["with_envelope_id", "without_envelope_id"])
     async def test_a_run_reading_run_state_after_its_workflow_closed_never_reaches_the_next(
         self, engine: Engine, *, addressed: bool
     ) -> None:
@@ -537,13 +538,13 @@ class TestNodesAndFlowsOnTheRuntime:
             return ResultPayloadSuccess(result_details="ok")
 
         engine.event_manager.assign_manager_to_request_type(_StartRunRequest, start_run, without_workflow=None)
+        workflow_id = None
         if addressed:
-            await engine.event_manager.ahandle_request(
-                _StartRunRequest(), result_context=ResultContext(open_workflow_id=first.workflow_id)
-            )
-        else:
-            with engine.bind_workflow(first):
-                await engine.event_manager.ahandle_request(_StartRunRequest())
+            workflow_id = first.workflow_id
+
+        await engine.event_manager.ahandle_request(
+            _StartRunRequest(), result_context=ResultContext(open_workflow_id=workflow_id)
+        )
         engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name="second")
         engine.current_workflow().flows.global_single_node_resolution = True
@@ -583,7 +584,7 @@ class TestSquelchWorkflowAltered:
     @pytest.mark.asyncio
     async def test_a_squelch_covers_its_own_task_and_not_another(self, engine: Engine) -> None:
         """A load reports its own edits as unaltered; an edit made meanwhile from another task still counts."""
-        open_and_bind(engine, "outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
         load_holds_squelch = asyncio.Event()
         other_edit_done = asyncio.Event()
 

@@ -19,7 +19,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -64,7 +63,7 @@ def value_nodes(engine: Engine) -> Iterator[None]:
     )
     library = LibraryRegistry.generate_new_library(schema)
     library.register_new_node_type(_ValueNode, NodeMetadata(category="test", description="d", display_name="Value"))
-    bind(engine.context_manager.open_workflow(workflow_name="replaced_connection_wf"))
+    engine.context_manager.push_workflow(workflow_name="replaced_connection_wf")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     for name in ("first", "second", "target"):

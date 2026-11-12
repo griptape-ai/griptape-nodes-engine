@@ -24,7 +24,6 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -54,7 +53,7 @@ async def _run_group_with_own_index_as_item(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    open_and_bind(engine, "group_own_item_wf")
+    engine.context_manager.push_workflow(workflow_name="group_own_item_wf")
     parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )

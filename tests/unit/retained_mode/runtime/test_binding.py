@@ -277,10 +277,10 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             assert await spawned[0] is workflow
 
     @pytest.mark.asyncio
-    async def test_tasks_a_request_bound_by_its_caller_spawns_never_reach_the_next_workflow(
+    async def test_tasks_a_request_with_no_envelope_id_spawns_never_reach_the_next_workflow(
         self, engine: Engine
     ) -> None:
-        first = _open(engine, "first")
+        _open(engine, "first")
         release = asyncio.Event()
         spawned: list[asyncio.Task[WorkflowRuntime | None]] = []
 
@@ -294,8 +294,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
 
         engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
-        with engine.bind_workflow(first):
-            await engine.event_manager.ahandle_request(_ProbeRequest())
+        await engine.event_manager.ahandle_request(_ProbeRequest())
         engine.context_manager.pop_workflow()
         second = _open(engine, "second")
         release.set()

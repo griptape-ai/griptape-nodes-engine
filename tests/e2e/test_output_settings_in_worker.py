@@ -35,7 +35,6 @@ from griptape_nodes.retained_mode.events.parameter_events import SetParameterVal
 from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
 from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
-from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -82,7 +81,7 @@ def worker() -> Iterator[SimulatedWorker]:
 def _create(node_type: str, name: str) -> None:
     engine = current_engine()
     if not engine.context_manager.has_current_workflow():
-        open_and_bind(engine, "output_settings_workflow")
+        engine.context_manager.push_workflow(workflow_name="output_settings_workflow")
     if engine.object_manager.attempt_get_object_by_name(_CANVAS_FLOW_NAME) is None:
         flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name=_CANVAS_FLOW_NAME, set_as_new_context=False)

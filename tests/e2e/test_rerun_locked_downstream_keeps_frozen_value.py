@@ -32,7 +32,6 @@ from griptape_nodes.retained_mode.events.node_events import (
     SetLockNodeStateRequest,
     SetLockNodeStateResultSuccess,
 )
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -60,7 +59,7 @@ async def test_locked_doubler_keeps_frozen_value_across_reruns(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    bind(engine.context_manager.open_workflow(workflow_name="probe_locked_wf"))
+    engine.context_manager.push_workflow(workflow_name="probe_locked_wf")
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="RerunFlow", set_as_new_context=False)
     )

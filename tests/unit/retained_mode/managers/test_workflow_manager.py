@@ -128,7 +128,7 @@ from griptape_nodes.retained_mode.managers.workflow_manager import (
     WorkflowManager,
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
-from tests.workflow_context import bind, empty_workflow_registry, handle_and_bind, unbind
+from tests.workflow_context import empty_workflow_registry
 
 
 def _file_path(context_manager: "ContextManager") -> str | None:
@@ -1553,10 +1553,10 @@ class TestWorkflowManager:
 
         with empty_workflow_registry(engine):
             workflow_key = _register_unsaved_workflow(name="Untitled")
-            workflow = context_manager.open_workflow(workflow_name=workflow_key)
+            context_manager.push_workflow(workflow_name=workflow_key)
 
             # Create a top-level flow under the active workflow so there's state to tear down.
-            create_result = workflow.handle_request(CreateFlowRequest(parent_flow_name=None))
+            create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None))
             assert isinstance(create_result, CreateFlowResultSuccess)
             flow_name = create_result.flow_name
             assert object_manager.has_object_with_name(flow_name)
@@ -2795,7 +2795,7 @@ class TestWorkflowManager:
             dispatched.append(request)
             return await original_ahandle(request)  # type: ignore[arg-type]
 
-        bind(engine.context_manager.open_workflow(file_path="runtime_order_test.py"))
+        engine.context_manager.push_workflow(file_path="runtime_order_test.py")
         exec_globals: dict[str, object] = {"__file__": "runtime_order_test.py"}
         exec(compile(script_source, "<runtime_order_test>", "exec"), exec_globals)  # noqa: S102
         # The generated source calls the facade, which resolves to this engine, so stubbing the
@@ -2963,7 +2963,7 @@ class TestWorkflowVariablePersistence:
         if context_manager.has_current_workflow():
             engine.clear_current_workflow_data()
 
-        bind(context_manager.open_workflow(workflow_name="round_trip_workflow"))
+        context_manager.push_workflow(workflow_name="round_trip_workflow")
 
         flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name=flow_name, set_as_new_context=False)
@@ -3217,7 +3217,7 @@ class TestWorkflowVariablePersistence:
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
         engine.clear_current_workflow_data()
-        bind(engine.context_manager.open_workflow(file_path="test_workflow.py"))
+        engine.context_manager.push_workflow(file_path="test_workflow.py")
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
         exec(compile(script_source, "<round_trip_test>", "exec"), exec_globals)  # noqa: S102
@@ -3624,7 +3624,7 @@ class TestRunWorkflowWithCurrentStateRequest:
     @pytest.fixture
     def open_workflow(self, engine: Engine) -> Iterator[WorkflowRuntime]:
         """An open workflow, so each test states the flow stack it is loading into."""
-        bind(engine.context_manager.open_workflow(workflow_name="loading_into"))
+        engine.context_manager.push_workflow(workflow_name="loading_into")
         try:
             yield engine.current_workflow()
         finally:
@@ -4083,7 +4083,7 @@ class TestWorkflowCreationHonorsSaveSituation:
             EnsureWorkflowAndFlowResultSuccess,
         )
 
-        ensure_result = handle_and_bind(engine, EnsureWorkflowAndFlowRequest(display_name=display_name))
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
         save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
@@ -4140,7 +4140,9 @@ class TestWorkflowCreationHonorsSaveSituation:
         created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
         assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
 
-        opened = handle_and_bind(engine, OpenWorkflowRequest(workflow_name=created.workflow_name, create_flow=True))
+        opened = asyncio.run(
+            engine.ahandle_request(OpenWorkflowRequest(workflow_name=created.workflow_name, create_flow=True))
+        )
         assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
         saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=created.workflow_name)))
 
@@ -4412,7 +4414,7 @@ class TestWorkflowCreationOnTheDefaultProject:
             EnsureWorkflowAndFlowResultSuccess,
         )
 
-        ensure_result = handle_and_bind(engine, EnsureWorkflowAndFlowRequest(display_name=display_name))
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
         save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
@@ -4445,7 +4447,7 @@ class TestWorkflowCreationOnTheDefaultProject:
             EnsureWorkflowAndFlowResultSuccess,
         )
 
-        ensure_result = handle_and_bind(engine, EnsureWorkflowAndFlowRequest(display_name=display_name))
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
         save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
@@ -4482,10 +4484,8 @@ class TestWorkflowCreationOnTheDefaultProject:
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        unbind()
         opened = asyncio.run(engine.ahandle_request(OpenWorkflowRequest(workflow_name=library_key)))
         assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
-        bind(engine.open_workflows.get(opened.open_workflow.workflow_id))
         return opened.open_workflow.workflow_id
 
     def test_saving_a_library_workflow_writes_a_copy(self, engine: Engine, temp_dir: Path) -> None:
@@ -4563,7 +4563,7 @@ class TestWorkflowCreationOnTheDefaultProject:
             EnsureWorkflowAndFlowResultSuccess,
         )
 
-        ensure_result = handle_and_bind(engine, EnsureWorkflowAndFlowRequest(display_name="shot_lighting"))
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="shot_lighting"))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
         save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
@@ -5986,7 +5986,7 @@ class TestReferencedWorkflowTagging:
         x_entered = asyncio.Event()
         y_entered = asyncio.Event()
         x_done = asyncio.Event()
-        bind(engine.context_manager.open_workflow(workflow_name="tagging_workflow"))
+        engine.context_manager.push_workflow(workflow_name="tagging_workflow")
         # Only one top-level flow is allowed, so both imports create children of this one.
         parent_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
@@ -6027,7 +6027,7 @@ class TestReferencedWorkflowTagging:
     def test_imports_in_one_engine_do_not_leak_into_another(self, engine: Engine) -> None:
         """An import running in one engine does not tag flows created in another engine."""
         other_engine = Engine()
-        bind(other_engine.context_manager.open_workflow(workflow_name="other_workflow"))
+        other_engine.context_manager.push_workflow(workflow_name="other_workflow")
 
         with engine.workflow_manager.referenced_workflow("workflow_a"):
             assert engine.workflow_manager.has_current_referenced_workflow()
@@ -6631,7 +6631,7 @@ class TestNodeLibraryDelegates:
 
     def test_extract_workflow_shape_reads_the_open_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        bind(engine.context_manager.open_workflow(workflow_name="shaped"))
+        engine.context_manager.push_workflow(workflow_name="shaped")
         try:
             with patch(
                 "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape", return_value={"x": 1}
@@ -6656,7 +6656,7 @@ class TestGetWorkflowShapeRequest:
 
     @pytest.fixture(autouse=True)
     def open_workflow(self, engine: Engine) -> Iterator[WorkflowRuntime]:
-        bind(engine.context_manager.open_workflow(workflow_name="parent"))
+        engine.context_manager.push_workflow(workflow_name="parent")
         try:
             yield engine.current_workflow()
         finally:
