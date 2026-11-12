@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
     collect_workflow_metadata,
 )
 from griptape_nodes.serialization.commands import decode_commands
+from tests.workflow_context import bind
 
 
 @pytest.fixture
@@ -50,7 +51,7 @@ class TestSerializeFlow:
     @pytest.mark.usefixtures("clean_object_state")
     def test_round_trips_through_json(self, engine: Engine) -> None:
         """The payload decodes back into the exact commands a direct request would produce."""
-        engine.context_manager.push_workflow(workflow_name="wf_roundtrip")
+        bind(engine.context_manager.open_workflow(workflow_name="wf_roundtrip"))
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_roundtrip", set_as_new_context=True)
         )
@@ -70,7 +71,7 @@ class TestSerializeFlow:
     @pytest.mark.usefixtures("clean_object_state")
     def test_no_flow_name_and_no_current_flow_returns_none(self, engine: Engine) -> None:
         """With nothing to serialize and no flow context to fall back to, this must not raise."""
-        engine.context_manager.push_workflow(workflow_name="wf_no_flow")
+        bind(engine.context_manager.open_workflow(workflow_name="wf_no_flow"))
 
         assert not engine.context_manager.has_current_flow()
         assert _serialize_flow(engine.current_workflow(), flow_name=None) is None
@@ -78,14 +79,14 @@ class TestSerializeFlow:
     @pytest.mark.usefixtures("clean_object_state")
     def test_unknown_flow_name_returns_none(self, engine: Engine) -> None:
         """A flow name that does not exist fails the underlying request; this must degrade to None, not raise."""
-        engine.context_manager.push_workflow(workflow_name="wf_missing_flow")
+        bind(engine.context_manager.open_workflow(workflow_name="wf_missing_flow"))
 
         assert _serialize_flow(engine.current_workflow(), flow_name="does_not_exist") is None
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_none_flow_name_uses_current_flow_context(self, engine: Engine) -> None:
         """Omitting `flow_name` serializes whichever flow is active in the Current Context."""
-        engine.context_manager.push_workflow(workflow_name="wf_current_context")
+        bind(engine.context_manager.open_workflow(workflow_name="wf_current_context"))
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_current_context", set_as_new_context=True)
         )
@@ -105,7 +106,7 @@ class TestCollectWorkflowMetadata:
     @pytest.mark.usefixtures("clean_object_state")
     def test_every_key_is_namespaced(self, engine: Engine) -> None:
         """Every injected key carries the `gtn_` prefix so it never collides with a user's own PNG text chunks."""
-        engine.context_manager.push_workflow(workflow_name="wf_namespace")
+        bind(engine.context_manager.open_workflow(workflow_name="wf_namespace"))
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_namespace", set_as_new_context=True)
         )
@@ -129,7 +130,7 @@ class TestCollectWorkflowMetadata:
         """A flow in context contributes its serialized commands under FLOW_COMMANDS_KEY."""
         from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 
-        engine.context_manager.push_workflow(workflow_name="wf_flow_commands")
+        bind(engine.context_manager.open_workflow(workflow_name="wf_flow_commands"))
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_flow_commands", set_as_new_context=True)
         )

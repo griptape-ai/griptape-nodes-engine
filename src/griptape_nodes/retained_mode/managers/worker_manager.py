@@ -55,6 +55,15 @@ from griptape_nodes.retained_mode.managers.settings import (
 from griptape_nodes.retained_mode.request_handlers import RequiredSender, handles
 from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
+from griptape_nodes.retained_mode.topics import (
+    REQUEST_TOPIC,
+    default_response_topic,
+    engine_request_topic,
+    engine_response_topic,
+    session_request_topic,
+    worker_request_topic,
+    worker_response_topic,
+)
 from griptape_nodes.serialization.values import untag
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
@@ -488,7 +497,7 @@ class WorkerManager(EngineScoped):
             host_engine_id = remote.host_engine_id
 
         session_id = self.engine.get_session_id()
-        request_topic = f"sessions/{session_id}/workers/{wid}/request"
+        request_topic = worker_request_topic(session_id, wid)
         self._workers[wid] = WorkerRegistration(
             request_topic=request_topic, worker_key=request.library_name, host_engine_id=host_engine_id
         )
@@ -500,7 +509,7 @@ class WorkerManager(EngineScoped):
         if host_engine_id is not None:
             logger.debug("Worker %s runs on engine %s", wid, host_engine_id)
 
-        response_topic = f"sessions/{session_id}/workers/{wid}/response"
+        response_topic = worker_response_topic(session_id, wid)
         await self._tx.subscribe_to_topic(response_topic)
         # Put the worker on this orchestrator's project rather than answering with it. One sender
         # and one adoption path, so a switch landing mid-registration is a second message on the
@@ -556,7 +565,7 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(wid, None)
         worker_key = registration.worker_key if registration else None
-        response_topic = f"sessions/{session_id}/workers/{wid}/response"
+        response_topic = worker_response_topic(session_id, wid)
         await self._tx.unsubscribe_from_topic(response_topic)
         # Remove the managed process entry so a new worker can be spawned for this key.
         if registration is not None:
@@ -591,7 +600,7 @@ class WorkerManager(EngineScoped):
             for wid, registration in list(self._workers.items()):
                 hb = EventRequest(
                     request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
-                    response_topic=f"sessions/{session_id}/workers/{wid}/response",
+                    response_topic=worker_response_topic(session_id, wid),
                 )
                 # Only a challenge that went out counts against the worker, and a send that fails
                 # must not end the loop: the transport raises while a connection is re-establishing,
@@ -908,7 +917,7 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         if session_id and self._transport is not None:
             for wid in worker_ids:
-                response_topic = f"sessions/{session_id}/workers/{wid}/response"
+                response_topic = worker_response_topic(session_id, wid)
                 try:
                     await self._tx.unsubscribe_from_topic(response_topic)
                 except Exception as e:
@@ -1176,7 +1185,7 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(worker_engine_id, None)
         lib_name = registration.worker_key if registration else None
-        topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
+        topic = worker_response_topic(session_id, worker_engine_id)
         await self._tx.unsubscribe_from_topic(topic)
         # A hung worker cannot shut itself down, so the engine that runs it is told to stop it.
         if registration is not None and registration.host_engine_id is not None:
@@ -1635,7 +1644,7 @@ class WorkerManager(EngineScoped):
         logger.warning("Worker %s for library '%s' on %s %s.", wid, library_name, host_engine_id, request.reason)
         if registered:
             del self._workers[wid]
-            await self._tx.unsubscribe_from_topic(f"sessions/{self.engine.get_session_id()}/workers/{wid}/response")
+            await self._tx.unsubscribe_from_topic(worker_response_topic(self.engine.get_session_id(), wid))
             await self._tx.request_client.fail_requests_by_tag(
                 wid, worker_events.WorkerGoneError(f"worker '{wid}' on {host_engine_id} {request.reason}")
             )
@@ -2215,10 +2224,17 @@ class WorkerManager(EngineScoped):
 
     async def _drop_library_named_objects(self, worker_engine_id: str, hosted: _HostedWorker) -> None:
         """Have a worker this engine runs drop what its libraries keep between runs, waiting until it has."""
+        engine_id = self.engine.get_engine_id()
+        if engine_id is None:
+            logger.warning(
+                "Attempted to have worker %s free its models. Failed because this engine has no id to hear its answer on.",
+                worker_engine_id,
+            )
+            return
         event = EventRequest(request=worker_events.DropLibraryNamedLocalObjectsRequest())
-        request_topic = f"sessions/{hosted.session_id}/workers/{worker_engine_id}/request"
+        request_topic = worker_request_topic(hosted.session_id, worker_engine_id)
         # The worker is in the session of the engine it serves, not this engine's, so it answers on this engine's own topic.
-        response_topic = f"engines/{self.engine.get_engine_id()}/response"
+        response_topic = engine_response_topic(engine_id)
         try:
             result = await asyncio.wait_for(
                 self.route_to_worker(event, worker_engine_id, request_topic, response_topic=response_topic),
@@ -2491,18 +2507,18 @@ class WorkerManager(EngineScoped):
 
         topics: list[str] = []
         if engine_id:
-            topics.append(f"engines/{engine_id}/request")
+            topics.append(engine_request_topic(engine_id))
 
         if is_worker:
             # Subscribe ONLY to this worker's dedicated per-worker request topic.
             # The orchestrator explicitly routes events here; worker never sees other workers' events.
             if session_id and engine_id:
-                topics.append(f"sessions/{session_id}/workers/{engine_id}/request")
+                topics.append(worker_request_topic(session_id, engine_id))
         else:
             # Orchestrator handles all broadcast requests from the MCP server and the GUI.
-            topics.append("request")
+            topics.append(REQUEST_TOPIC)
             if session_id:
-                topics.append(f"sessions/{session_id}/request")
+                topics.append(session_request_topic(session_id))
 
         return topics
 
@@ -2562,11 +2578,10 @@ class WorkerManager(EngineScoped):
         Future: consult a WorkerRegistry to select the correct worker based on event type
         or target library.
         """
-        worker_response_topic = response_topic
-        if worker_response_topic is None:
-            session_id = self.engine.get_session_id()
-            worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
-        forwarded = event.model_copy(update={"response_topic": worker_response_topic})
+        reply_topic = response_topic
+        if reply_topic is None:
+            reply_topic = worker_response_topic(self.engine.get_session_id(), worker_engine_id)
+        forwarded = event.model_copy(update={"response_topic": reply_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
         await self._tx.send_message("EventRequest", converters.engine.dumps(forwarded), worker_request_topic)
 
@@ -2876,12 +2891,12 @@ class WorkerManager(EngineScoped):
             logger.exception("Could not broadcast %s to workers", type(event.request).__name__)
 
     async def relay_worker_result(self, payload: dict) -> None:
-        """Relay an unmatched worker result to the GUI session response topic.
+        """Relay an unmatched worker result to the session topic.
 
         Called for worker result messages not claimed by RequestClient
         (heartbeats and any results without a pending request).
         The orchestrator always mediates between workers and the GUI; workers never
-        publish directly to the session response topic.
+        publish their results to clients directly. Clients tell a result's workflow by its `open_workflow_id`.
         """
         # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
         result_event_type = payload.get("result_type", "")
@@ -2901,22 +2916,14 @@ class WorkerManager(EngineScoped):
             logger.debug("Heartbeat received from worker %s", worker_engine_id)
             return  # Internal health check — do not forward to GUI
 
-        # 1 engine = 1 session — the orchestrator's session response topic is always the right target.
-        session_response_topic = self._determine_response_topic()
+        # 1 engine = 1 session, so the orchestrator's session topic reaches every client.
+        relay_topic = default_response_topic(self.engine.get_engine_id(), self.engine.get_session_id())
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"
-        payload["response_topic"] = session_response_topic
-        logger.debug("Relaying %s to %s", payload.get("event_type"), session_response_topic)
+        # Names the topic it goes out on: a client drops a result whose `response_topic` is another topic
+        # it takes, as a copy of a reply it already has.
+        payload["response_topic"] = relay_topic
+        logger.debug("Relaying %s to %s", payload.get("event_type"), relay_topic)
         # Untags the JSON rather than reading the result back, since its payload class may live in a
         # library only the worker has loaded. Only values carry tags, but a plain field holding its own
         # "$type" key would lose it here.
-        await self._tx.send_message(dest_socket, json.dumps(untag(payload)), session_response_topic)
-
-    def _determine_response_topic(self) -> str:
-        """Determine the response topic based on current session and engine IDs."""
-        session_id = self.engine.get_session_id()
-        if session_id:
-            return f"sessions/{session_id}/response"
-        engine_id = self.engine.get_engine_id()
-        if engine_id:
-            return f"engines/{engine_id}/response"
-        return "response"
+        await self._tx.send_message(dest_socket, json.dumps(untag(payload)), relay_topic)

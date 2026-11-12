@@ -9,7 +9,7 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Only ONE can be active at a time. Reset with `ClearAllObjectStateRequest`.
+- **Workflow**: Top-level namespace. Several can be open at once. `ClearAllObjectStateRequest` closes them all.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
@@ -169,10 +169,28 @@ submitted. So either:
 The one-batch + explicit names path is almost always shorter and is what the
 batched recipe below uses.
 
+## Choose the Workflow
+
+Calls act on the workflow your client's `X-Griptape-Workflow-Id` header names. With
+no header, pick one before building:
+
+```
+A. griptape_nodes_ListOpenWorkflowsRequest()
+   → each open workflow's workflow_id and name.
+B. griptape_nodes_OpenWorkflowRequest(workflow_id="<id>") → work in that open workflow,
+   or griptape_nodes_OpenWorkflowRequest(create_flow=True) → start a new one.
+```
+
+Later calls in the MCP session act on that workflow. If another client closes it,
+calls fail with `WorkflowNotOpenResultFailure`, which lists the open workflows, until
+you repeat step B.
+
 ## Canonical Cold-Start Recipe
 
 For a typical 3-node linear pipeline (`TextInput → Agent → DisplayText`), once the
-workspace survey above has confirmed the relevant library exposes those node types:
+workspace survey above has confirmed the relevant library exposes those node types.
+On an empty engine, step 1 opens a new workflow with its flow. With one open, choose
+it first (see Choose the Workflow); step 1 then gives it a flow if it has none.
 
 ```
 1. griptape_nodes_EnsureWorkflowAndFlowRequest()
@@ -408,24 +426,26 @@ The slot name is engine-generated and only known after the add returns, so the
 an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
 `parameter_name`, then batch the connects/sets in the next.
 
-### Only one workflow in context at a time
+### Several workflows can be open
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` first — this wipes
-EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today.
+`OpenWorkflowRequest` and `SetWorkflowContextRequest` open a workflow beside the ones
+already open. Close yours with `CloseWorkflowRequest(workflow_id=...)` when you're done.
+`ClearAllObjectStateRequest(i_know_what_im_doing=True)` closes every workflow, other
+clients' included.
 
 ### Agents cannot be interrupted mid-run
 
 `StartFlowRequest` holds the call until the run finishes or errors. A subsequent
 `StartFlowRequest` waits for that run to finish, then starts. `ListRunsRequest` shows the
-run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a waiting run,
-and `CancelAllRunsRequest` cancels everything. A run request's result carries its `run_id`.
+workflow's run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a
+waiting run, and `CancelAllRunsRequest` cancels every run of the workflow. A run request's
+result carries its `run_id`.
 
 ## Tool Cheat Sheet
 
 | Goal                                                                                | Tool                                                                                                                                                      |
 | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bootstrap a workflow + flow from cold                                               | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
+| Bootstrap a workflow + flow on an empty engine                                      | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
 | Fan N requests out in one round trip                                                | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                                     | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest` (`include_metadata` for descriptions), `ListCategoriesInLibraryRequest`                 |
 | Inspect a node type's parameters                                                    | `DescribeNodeTypeRequest`                                                                                                                                 |
@@ -440,7 +460,6 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Run synchronously                                                                   | `StartFlowRequest`                                                                                                                                        |
 | Run from a specific node                                                            | `StartFlowFromNodeRequest`                                                                                                                                |
 | Resolve a single node without firing the control flow                               | `ResolveNodeRequest`                                                                                                                                      |
-| Execute a single node directly                                                      | `ExecuteNodeRequest`                                                                                                                                      |
 | Rename a node or flow                                                               | `RenameObjectRequest(allow_next_closest_name_available=True)`                                                                                             |
 | Lock or unlock a node                                                               | `SetLockNodeStateRequest`                                                                                                                                 |
 | Reset a node's parameters to defaults                                               | `ResetNodeToDefaultsRequest`                                                                                                                              |
@@ -448,6 +467,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
+| List, work in, start or close workflows                                             | `ListOpenWorkflowsRequest()`, `OpenWorkflowRequest(workflow_id=...)`, `OpenWorkflowRequest(create_flow=True)`, `CloseWorkflowRequest(workflow_id=...)`    |
 | Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes

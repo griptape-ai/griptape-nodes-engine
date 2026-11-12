@@ -99,7 +99,13 @@ Every transport carries the same requests: the ones the editor sends to create n
 - `request_type` names the request, and `request` holds its fields. For example, `StartFlowRequest` with `{}` runs the flow that's currently open, and `ListFlowsInCurrentContextRequest` lists the flows you can name instead.
 - `request_id` is any string you choose. The result carries it back so you can match the two.
 - `response_topic` is where the result is sent. Choose a name for your program and listen on it (see the next section).
-- `open_workflow_id` is optional. It names the open workflow the request runs in, and the result carries it back. If no open workflow has that id, the request fails with `WorkflowNotOpenResultFailure` and does nothing. Requests about the engine rather than a workflow, such as `EngineHeartbeatRequest` or the workflow and library lists, ignore `open_workflow_id`, so only requests that act on a workflow fail this way. `SetWorkflowContextRequest` opens a workflow and ignores `open_workflow_id`. With a clean slate, `RunWorkflowFromScratchRequest` and `RunWorkflowFromRegistryRequest` close the workflow `open_workflow_id` names before opening theirs. Left out, they close the workflow that's open, and fail with `WorkflowNotNamedResultFailure` while several are open, so other workflows are never closed. `RunWorkflowWithCurrentStateRequest` builds into the workflow `open_workflow_id` names, and opens the file as a new workflow when it is left out and none is open. When a request fails with `WorkflowNotOpenResultFailure`, forget that id. Leave it out to act on the workflow that's open. A request that acts on a workflow and leaves it out while none or several are open fails with `WorkflowNotNamedResultFailure`. A request another engine sends with no `open_workflow_id` acts on no workflow. Workflow ids last only until the engine restarts: the `engine_run_id` that `EngineHeartbeatRequest` reports changes on every restart, so when it changes, drop the ids you kept. Requests about saved workflows name them by name or path, not by id. A `workflow_id` inside a request or result is something else: the workflow that request or result is about, such as the copy a Save As creates, which isn't open.
+- `open_workflow_id` is optional. It names the open workflow the request runs in, such as your tab's. If no open workflow has that id, the request does nothing and fails with `WorkflowNotOpenResultFailure`, whose `open_workflows` lists the open workflows.
+
+`open_workflow_id` says where a request runs; the request's own fields say what it acts on. Requests that work inside a workflow need it: nodes, flows, connections, parameters, runs, undo and saving. Requests about the engine or about a workflow their fields name ignore it: `EngineHeartbeatRequest`, the workflow and library lists, settings, `ClearAllObjectStateRequest`, and the requests that open, close, rename, move or delete a workflow.
+
+Path and macro requests use `open_workflow_id` only to resolve `{workflow_dir}` and project folders.
+
+Over these transports, a request that leaves `open_workflow_id` out acts on the only open workflow. With none or several open, or from another engine or an MCP session with no workflow of its own, it acts on none, and a request that needs one fails with `WorkflowNotNamedResultFailure`, whose `open_workflows` lists the open workflows. Left without one, `EnsureWorkflowAndFlowRequest` uses the only open workflow whoever sends it, and opens one when none is open.
 
 [Retained Mode Scripting](../development/retained_mode.md) describes the same operations from Python inside the editor.
 
@@ -111,11 +117,67 @@ Results are delivered on the `response_topic` you named, to every connection tha
 {"type": "subscribe", "topic": "my-app/response", "payload": {}}
 ```
 
-Results then arrive as messages whose `type` is `success_result` or `failure_result`, with your `request_id` inside `payload`. A result's `open_workflow_id` names the open workflow the request acted on. That is the one you named, or, when you left it out, the one the engine chose: the only open workflow, a run's own workflow for a request the run sent, or the workflow a load opened. It is `null` when the request acted on no workflow, such as `EngineHeartbeatRequest`.
+Results then arrive as messages whose `type` is `success_result` or `failure_result`, with your `request_id` inside `payload`. A result's `open_workflow_id` names the open workflow the request ran in:
 
-While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each one has a `workflow_id` naming the open workflow it belongs to, so you can tell which tab it is for when node names repeat across workflows. It is `null` for events that belong to no workflow, such as publishing progress.
+- the one you named, or the one used when you left it out
+- a run's own, for a request the run sent
+- `null` for a request about the engine rather than one workflow, even if you named one. That includes `EngineHeartbeatRequest` and the requests that open, close, rename, move or delete a workflow, such as `OpenWorkflowRequest`, `CloseWorkflowRequest` and `ClearAllObjectStateRequest`. The events below say which workflow they opened or closed, and an open's result carries the workflow in `open_workflow`.
+
+A request refused with `WorkflowNotOpenResultFailure` or `WorkflowNotNamedResultFailure` carries the id you sent, or `null`.
+
+While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each names its workflow in `open_workflow_id`, or `null` when it belongs to none; publishing progress names the workflow being published.
+
+The engine tells every connection on the session when any client opens or closes a workflow:
+
+- `WorkflowOpenedEvent` carries it in `open_workflow`, as `ListOpenWorkflowsRequest` lists it. A loaded workflow is announced once built; until then only `ListOpenWorkflowsRequest` and the heartbeat list it, and a failed build closes it without a `WorkflowClosedEvent`.
+- `WorkflowClosedEvent` names it in `workflow_id`, one for each workflow closed, even by a library reload or a project switch. It comes before the opened event when a request closes one workflow to open another. Saving sends neither.
+
+### Open workflows
+
+A client with a tab for each workflow uses three requests and the two events above:
+
+- `ListOpenWorkflowsRequest` returns `engine_run_id` and the open workflows in `open_workflows`, each with its `workflow_id`, `name`, `display_name`, `workflow_file_path`, `is_saved` and `has_active_flow`. Show `display_name`, which isn't unique, and address the workflow by `workflow_id`. Send it on connect to find your tab's workflow. `workflow_file_path` is `null`, and `is_saved` false, exactly while the workflow is unsaved.
+- `OpenWorkflowRequest` opens a workflow by `workflow_id` or `workflow_name`, or a new unsaved one when you name neither. `create_flow` gives a new workflow the top-level flow it needs to be saved, and `working_directory` sets where it writes until then. An open workflow comes back with `already_open` set, once built if another request is still opening it. The request opens it beside the open ones and never closes one. It fails with:
+    - `WorkflowNotFoundResultFailure` for an unknown id or name, which an unsaved workflow becomes once closed or after a restart.
+    - `OpenWorkflowResultFailure` when its file fails to build.
+    - `InvalidWorkingDirectoryResultFailure` when `working_directory` names a file.
+- `CloseWorkflowRequest` closes the workflow its `workflow_id` names, or comes back with `already_closed` set if it isn't open. To show another workflow in a tab, close the open one, then open the next.
+
+Opening a Griptape-provided workflow, by any request, opens a new unsaved copy with its own `workflow_id`. The copy's first save is named after the library's file.
+
+Workflow ids last until the engine restarts, which changes the `engine_run_id` that `ListOpenWorkflowsRequest`, `EngineHeartbeatRequest` and `AppInitializationComplete` report; drop your ids when it changes. `AppInitializationComplete` goes out once, when the engine finishes starting, so only a client that stays connected through the restart, such as one on a relay, receives it. A client whose own connection dropped sends one of the requests after it reconnects. Each worker engine sends its own `AppInitializationComplete`, with `is_worker` set; skip those.
+
+Older requests open and close workflows too:
+
+- `SetWorkflowContextRequest` and `RunWorkflowFromRegistryRequest` open their workflow beside the open ones. Without a clean slate, `RunWorkflowFromRegistryRequest` fails while its workflow is open.
+- `RunWorkflowFromScratchRequest`, and `RunWorkflowFromRegistryRequest` with a clean slate, start their workflow over: they close it first if it's open. For a Griptape-provided workflow they close the copy the last clean slate run of it opened, never a copy a tab opened. Other open workflows stay open.
+- `ClearAllObjectStateRequest` closes every open workflow.
+
+`RunWorkflowWithCurrentStateRequest` builds its file into the workflow the request names, which must have no flow yet. When it names none (see [Sending requests](#sending-requests)), it opens the file as a new workflow.
+
+`RenameWorkflowRequest`, `MoveWorkflowRequest`, `DeleteWorkflowRequest`, `BranchWorkflowRequest`, `MergeWorkflowBranchRequest`, `ResetWorkflowBranchRequest`, `CompareWorkflowsRequest`, `GetWorkflowMetadataRequest`, `SetWorkflowMetadataRequest` and `GetWorkflowInfoRequest` act on the saved workflow they name, open or not. Name it by `workflow_id`, which a rename or move keeps, or by `workflow_name`, or both if they agree. `CompareWorkflowsRequest` names its second workflow by `compare_workflow_id` or `compare_workflow_name`.
+
+`ImportWorkflowAsReferencedSubFlowRequest`, `SaveSubflowToWorkflowRequest`, `GetWorkflowShapeRequest` and `GetWorkflowRunCommandRequest` act on your open workflow and name another the same way. `PublishWorkflowRequest` and `GetPublishOptionsRequest` take a `workflow_id` that must be the one `open_workflow_id` names.
+
+Renaming an open workflow saves it to the new file, and renaming a closed one moves its file. Neither replaces another workflow's file.
+
+Results of `EnsureWorkflowAndFlowRequest` and of requests that open, load or save a workflow carry `open_workflow`, the workflow open afterwards. After a save, if its `workflow_id` matches the result's own, the open workflow is the saved file; otherwise the save wrote a copy and the original stays open. With `continue_in_copy`, a Save As or versioned save moves the open workflow and its id onto the new file instead, and registers the original file under a new id. No save writes over another open workflow's file.
 
 If your organization uses license keys, the engine checks each request against your license. A request your license doesn't permit is refused rather than run.
+
+### Following a workflow
+
+A connection gets only the topics it subscribes to:
+
+| Topic                                                | Carries                                                                                            |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| The `response_topic` you named                       | The results of your own requests                                                                   |
+| `sessions/<session_id>/clients/<client_id>/response` | Results for a client that uses it as its `response_topic`, as `gtn request` and `RequestClient` do |
+| `sessions/<session_id>/response`                     | Engine events such as `WorkflowOpenedEvent`, execution events, and results a worker engine sends   |
+
+`EngineHeartbeatRequest` reports the `session_id` and `engine_id`. Without a session, the session topic starts with `engines/<engine_id>/` instead, and a client that knows no session uses `clients/<client_id>/response`.
+
+The session topic carries every open workflow's execution events. To show one workflow, keep the messages whose `open_workflow_id` names it or is `null`, and skip the rest. To see the results of other clients' requests too, name the session topic as your `response_topic` and filter results the same way.
 
 ## Examples
 

@@ -66,6 +66,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowFileFromSerializedFlowResultSuccess,
 )
 from griptape_nodes.utils.version_utils import engine_version
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -212,7 +213,7 @@ def _fresh_flow(engine: Engine, workflow_name: str, tmp_path: Path) -> tuple[str
     """
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     library_name = _register_fixture_library(engine, tmp_path)
-    engine.context_manager.push_workflow(workflow_name=workflow_name)
+    bind(engine.context_manager.open_workflow(workflow_name=workflow_name))
     result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name=_FLOW_NAME, set_as_new_context=False)
     )
@@ -282,7 +283,7 @@ def _read_saved_source(file_path: str) -> str:
 def _reload_from_disk(engine: Engine, file_path: str) -> None:
     """Tear down the live graph, then open the saved file and exec its ``build_workflow()`` into it."""
     engine.clear_current_workflow_data()
-    engine.context_manager.push_workflow(file_path=file_path)
+    bind(engine.context_manager.open_workflow(file_path=file_path))
 
     source = _read_saved_source(file_path)
     exec_globals: dict[str, object] = {"__file__": file_path}

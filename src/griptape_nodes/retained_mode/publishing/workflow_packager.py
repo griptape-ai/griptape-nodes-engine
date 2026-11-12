@@ -175,7 +175,7 @@ class WorkflowPackager:
     # -- Progress events --
 
     def emit_progress(self, additional: float, message: str) -> None:
-        """Emit a publish progress event."""
+        """Emit a publish progress event, named by the workflow being published when the publish runs bound to it."""
         self._progress = min(self._progress + additional, 100.0)
         event = ExecutionGriptapeNodeEvent(
             wrapped_event=ExecutionEvent(payload=PublishWorkflowProgressEvent(progress=self._progress, message=message))

@@ -20,6 +20,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     DeleteNodeResultSuccess,
 )
 from tests.unit.exe_types.mocks import MockNode
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -57,7 +58,7 @@ class TestDeleteNodesFromGroup:
 class TestDeleteNodeRequestPrunesGroup:
     def test_deleted_child_is_no_longer_claimed_by_a_plain_group(self, engine: Engine) -> None:
         """The whole point: after the delete request, the group cannot name the deleted node."""
-        engine.context_manager.push_workflow("delete_group_member_wf")
+        bind(engine.context_manager.open_workflow("delete_group_member_wf"))
         flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="delete_group_member_flow", set_as_new_context=True)
         )

@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,7 +54,7 @@ async def test_rerun_recomputes_a_data_node_whose_input_changed(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    engine.context_manager.push_workflow(workflow_name="rerun_marks_downstream_stale_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="rerun_marks_downstream_stale_wf"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="RerunFlow", set_as_new_context=False)
     )

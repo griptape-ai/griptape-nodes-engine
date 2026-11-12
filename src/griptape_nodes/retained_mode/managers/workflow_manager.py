@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -22,6 +23,7 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowMetadataError,
     WorkflowMetadataFileError,
@@ -945,18 +947,32 @@ class WorkflowManager(EngineScoped):
     def on_get_workflow_shape_request(
         self, request: GetWorkflowShapeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
+        """Read the shape of `workflow`'s flow the request names. Its workflow names only label messages."""
+        workflow_name = request.workflow_name
+        if request.workflow_id is not None:
+            try:
+                workflow_name = self.engine.workflow_registry.resolve_address(
+                    workflow_id=request.workflow_id,
+                    workflow_name=request.workflow_name,
+                    action="read the inputs and outputs of",
+                ).name
+            except WorkflowAddressError as err:
+                return GetWorkflowShapeResultFailure(result_details=str(err))
+        if workflow_name is None:
+            details = "Attempted to read the inputs and outputs of a workflow. Failed because the request names no workflow. Pass workflow_id."
+            return GetWorkflowShapeResultFailure(result_details=details)
+
         try:
-            shape = self.extract_workflow_shape_in(workflow, request.workflow_name, flow_name=request.flow_name)
+            shape = self.extract_workflow_shape_in(workflow, workflow_name, flow_name=request.flow_name)
         except (ValueError, KeyError) as err:
             details = (
-                f"Attempted to read the inputs and outputs of workflow '{request.workflow_name}'. "
-                f"Failed because: {err.args[0]}"
+                f"Attempted to read the inputs and outputs of workflow '{workflow_name}'. Failed because: {err.args[0]}"
             )
             return GetWorkflowShapeResultFailure(result_details=details)
 
         return GetWorkflowShapeResultSuccess(
             workflow_shape=WorkflowShape(inputs=shape["input"], outputs=shape["output"]),
-            result_details=f"Read the inputs and outputs of workflow '{request.workflow_name}'.",
+            result_details=f"Read the inputs and outputs of workflow '{workflow_name}'.",
         )
 
     def _walk_object_tree(
@@ -1021,11 +1037,23 @@ class WorkflowManager(EngineScoped):
         # (listed in griptape_nodes_library.json) are registered separately via
         # LibraryManager.collect_library_workflow_files before this scan runs. Sandbox
         # libraries are intentionally left scannable so in-development workflows appear.
-        library_exclusion_roots: list[Path] = []
+        # Held as normalized string prefixes so each directory check is a single `startswith`. A
+        # trailing separator keeps `lib2/` from matching `lib/`, and normcase keeps the match
+        # case-insensitive on Windows.
+        library_exclusion_prefixes: list[str] = []
         for library_info in self.engine.library_manager._library_file_path_to_info.values():
             if library_info.is_sandbox:
                 continue
-            library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
+            root = os.path.normcase(str(Path(library_info.library_path).parent.resolve()))
+            library_exclusion_prefixes.append(root if root.endswith(os.sep) else root + os.sep)
+        library_exclusion_prefix_tuple = tuple(library_exclusion_prefixes)
+
+        def is_library_directory(directory: Path) -> bool:
+            if not library_exclusion_prefix_tuple:
+                return False
+            # Resolved, so a library reached through a symlink is still skipped.
+            resolved_directory = os.path.normcase(str(directory.resolve()))
+            return (resolved_directory + os.sep).startswith(library_exclusion_prefix_tuple)
 
         # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
@@ -1053,17 +1081,16 @@ class WorkflowManager(EngineScoped):
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
                 for workflow_file in await find_files_recursive(
-                    path, "*.py", max_depth=self.engine.config_manager.discovery_max_depth
+                    path,
+                    "*.py",
+                    max_depth=self.engine.config_manager.discovery_max_depth,
+                    skip_directory=is_library_directory,
                 ):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).
                     if workflow_file.name.startswith(self.engine.workflow_registry.UNSAVED_KEY_PREFIX):
                         continue
-                    if library_exclusion_roots:
-                        resolved_workflow_file = workflow_file.resolve()
-                        if any(resolved_workflow_file.is_relative_to(root) for root in library_exclusion_roots):
-                            continue
                     try_parse_workflow_metadata(workflow_file)
             elif path.suffix == ".py":
                 try_parse_workflow_metadata(path)
