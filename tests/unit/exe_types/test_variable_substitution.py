@@ -484,6 +484,48 @@ class TestEndNodeKeepsConnectedStatusAsWritten:
         assert end.parameter_output_values["result_details"] == "[SUCCEEDED]\nShot sc001 finished"
 
 
+class TestEndNodeStatusDoesNotFeedNextRun:
+    """The End node's status message is its output, not the details the flow supplies.
+
+    result_details is the End node's input. When the message was written back to it, each run read
+    the previous run's message as its details and added another status prefix, and saving kept the
+    stacked prefixes in the workflow file.
+    """
+
+    def test_unconnected_runs_show_one_prefix(self) -> None:
+        end = EndNode(name="end")
+        engine = _engine_mock({}, connected_params=set())
+
+        with _patch_engine(engine):
+            for _ in range(3):
+                self._run(end, end.succeeded_control)
+
+        assert end.parameter_output_values["result_details"] == "[SUCCEEDED]\nNo details supplied by flow"
+        assert end.parameter_output_values["was_successful"] is True
+        assert end.parameter_values.get("result_details") is None
+
+    def test_supplied_details_survive_runs_unchanged(self) -> None:
+        end = EndNode(name="end")
+        end.parameter_values["result_details"] = "Shot {SHOT} finished"
+        engine = _engine_mock({"SHOT": "sc001"}, connected_params=set())
+
+        with _patch_engine(engine):
+            self._run(end, end.failed_control)
+            self._run(end, end.failed_control)
+
+        assert end.parameter_output_values["result_details"] == "[FAILED]\nShot sc001 finished"
+        assert end.parameter_output_values["was_successful"] is False
+        assert end.parameter_values["result_details"] == "Shot {SHOT} finished"
+
+    @staticmethod
+    def _run(end: EndNode, entry: Parameter) -> None:
+        # What a run does to the node before process(): outputs cleared, entry control recorded.
+        end.clear_node()
+        end._entry_control_parameter = entry
+        with aprocess_scope():
+            end.process()
+
+
 class TestVariableSubstitutionFallbacks:
     """Substitution degrades gracefully when managers are unavailable."""
 

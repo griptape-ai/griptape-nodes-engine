@@ -154,8 +154,12 @@ class ExecutionStatusComponent:
             parameter: The parameter to update
             value: The new value to set
         """
-        # ALWAYS set parameter value and publish update
-        self._node.set_parameter_value(parameter.name, value)
+        # An INPUT parameter's value is what feeds the node. Writing the node's result there would
+        # make the next run read this run's result as its input, so the result goes to the output.
+        if ParameterMode.INPUT in parameter.get_mode():
+            self._node.parameter_output_values[parameter.name] = value
+        else:
+            self._node.set_parameter_value(parameter.name, value)
         self._node.publish_update_to_parameter(parameter.name, value)
 
         # ONLY set output values if the parameter mode is OUTPUT

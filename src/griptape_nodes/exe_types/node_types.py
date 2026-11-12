@@ -2798,9 +2798,10 @@ class EndNode(BaseNode):
 
         self.status_component.set_execution_result(was_successful=was_successful, result_details=details)
 
-        # Update all values to use the output value
+        # Update all values to use the output value. result_details is skipped: its output already
+        # holds this run's message, and its input holds only what the flow supplied.
         for param in self.parameters:
-            if param.type != ParameterTypeBuiltin.CONTROL_TYPE:
+            if param.type != ParameterTypeBuiltin.CONTROL_TYPE and param.name != "result_details":
                 # Raw: this copies a value along rather than reading it for use, so a held value
                 # stays the key it already is instead of being resolved and parked a second time.
                 value = self._get_raw_parameter_value(param.name)
