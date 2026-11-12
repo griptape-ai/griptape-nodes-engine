@@ -11,10 +11,14 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import anyio
 import anyio.to_thread
 from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +295,7 @@ class _AsyncWalkParams:
     max_depth: int
     max_files: int | None
     matches: list[Path]
+    skip_directory: Callable[[Path], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +356,9 @@ async def _arecurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> No
 
     max_depth is what bounds a symlink loop, so there is no visited-set.
     """
+    if params.skip_directory is not None and params.skip_directory(path):
+        return
+
     # abandon_on_cancel: a cancelled await returns immediately instead of waiting for the
     # in-flight scandir, which is what makes the timeout above a real bound -- on a hung
     # mount, waiting for the thread would leave discovery unbounded. Safe here because the
@@ -377,13 +385,14 @@ async def _arecurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> No
             await _arecurse_find(Path(item.path), depth + 1, params)
 
 
-async def find_files_recursive(
+async def find_files_recursive(  # noqa: PLR0913
     directory: Path,
     pattern: str,
     *,
     max_depth: int,
     skip_hidden: bool = True,
     max_files: int | None = None,
+    skip_directory: Callable[[Path], bool] | None = None,
 ) -> list[Path]:
     """Asynchronously search directory recursively for files matching pattern.
 
@@ -399,6 +408,8 @@ async def find_files_recursive(
         skip_hidden: If True, skip hidden directories (those starting with .).
             This avoids descending into large hidden trees like .git or .venv.
         max_files: If set, stop and return as soon as this many matches are found.
+        skip_directory: If set, called with each directory before it is read (including
+            `directory` itself); a directory it returns True for is not searched.
 
     Returns:
         Sorted list of matching file paths. Returns empty list if none found.
@@ -418,6 +429,7 @@ async def find_files_recursive(
         max_depth=max_depth,
         max_files=max_files,
         matches=matches,
+        skip_directory=skip_directory,
     )
     await _arecurse_find(Path(directory), 0, params)
 

@@ -128,7 +128,7 @@ class TestSendEvent:
     def test_sends_a_serializable_execution_event(self) -> None:
         executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
         executor.send_event = MagicMock()
-        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything="a plain string"))
+        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything="a plain string"), open_workflow_id=None)
 
         executor._send_event("execution_event", event)
 
@@ -140,7 +140,7 @@ class TestSendEvent:
     def test_skips_an_unsendable_execution_event_without_raising(self) -> None:
         executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
         executor.send_event = MagicMock()
-        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything=_NoJsonForm()))
+        event = ExecutionEvent(payload=_UnsendableExecutionPayload(anything=_NoJsonForm()), open_workflow_id=None)
 
         executor._send_event("execution_event", event)
 
@@ -219,7 +219,7 @@ class TestSendExecutionEvent:
         executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
         executor.send_event = MagicMock()
         resolved = ControlFlowResolvedEvent(end_node_name="End", parameter_output_values={"out": _NoJsonForm()})
-        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=resolved))
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=resolved, open_workflow_id=None))
 
         error = executor._send_execution_event(event)
 
@@ -231,7 +231,7 @@ class TestSendExecutionEvent:
         executor = LocalSessionWorkflowExecutor.__new__(LocalSessionWorkflowExecutor)
         executor.send_event = MagicMock()
         payload = _UnsendableExecutionPayload(anything=_NoJsonForm())
-        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+        event = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=None))
 
         assert executor._send_execution_event(event) is None
 
@@ -250,10 +250,12 @@ class TestExecutionEventsAreSentOnce:
         executor._on_start_flow_result = None
         executor._session_id = "session"
         queue: asyncio.Queue = asyncio.Queue()
-        start = ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="A")))
+        start = ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="A"), open_workflow_id=None)
+        )
         resolved = ExecutionGriptapeNodeEvent(
             wrapped_event=ExecutionEvent(
-                payload=ControlFlowResolvedEvent(end_node_name="End", parameter_output_values={})
+                payload=ControlFlowResolvedEvent(end_node_name="End", parameter_output_values={}), open_workflow_id=None
             )
         )
 

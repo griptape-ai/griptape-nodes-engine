@@ -109,16 +109,22 @@ class TestEngineHeartbeatRunId:
         assert after.engine_run_id is not None
         assert after.engine_run_id != before.engine_run_id
 
+    def test_is_the_engines_own_run_id(self, engine: Engine) -> None:
+        result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-own"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.engine_run_id == engine.engine_run_id
+
 
 class TestEngineHeartbeatOpenWorkflows:
-    """Heartbeat lists the open workflows, and reports the one opened last as the current one."""
+    """Heartbeat lists the open workflows, and reports the current one only while exactly one is open."""
 
     def test_reports_no_open_workflows_when_none_is_open(self, engine: Engine) -> None:
         result = engine.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-none-open"))
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.open_workflows == []
-        assert result.current_workflow_id is None
+        assert result.current_workflow is None
 
     def test_reports_the_open_workflow(self, engine: Engine) -> None:
         workflow = engine.workflow_registry.register_unsaved("only", listed=False)
@@ -131,8 +137,10 @@ class TestEngineHeartbeatOpenWorkflows:
             OpenWorkflowInfo(
                 workflow_id=workflow.workflow_id,
                 name=result.current_workflow or "",
+                display_name="only",
                 workflow_file_path=None,
+                is_saved=False,
                 has_active_flow=False,
             )
         ]
-        assert result.current_workflow_id == workflow.workflow_id
+        assert result.current_workflow == workflow.name

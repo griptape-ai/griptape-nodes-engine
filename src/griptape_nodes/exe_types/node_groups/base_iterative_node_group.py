@@ -18,7 +18,10 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     RIGHT_PARAMETERS_KEY,
     SubflowNodeGroup,
 )
+from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
+from griptape_nodes.exe_types.param_types.parameter_int import ParameterInt
 from griptape_nodes.traits.options import Options
+from griptape_nodes.utils.list_utils import flatten_list
 
 # Execution mode choices and their corresponding boolean values (True = run in order)
 EXECUTION_MODE_ONE_AT_A_TIME = "Run Group Items One at a Time"
@@ -27,6 +30,14 @@ EXECUTION_MODE_CHOICES = [EXECUTION_MODE_ONE_AT_A_TIME, EXECUTION_MODE_ALL_AT_ON
 EXECUTION_MODE_VALUE_LOOKUP = {
     EXECUTION_MODE_ONE_AT_A_TIME: True,
     EXECUTION_MODE_ALL_AT_ONCE: False,
+}
+
+
+# Saved connections may still name a loop group's entry and exit by the base class's port names.
+# Each resolves to the loop port that carries that wire now.
+LEGACY_CONTROL_PORT_NAMES = {
+    "group_exec_in": "exec_in",
+    "group_exec_out": "exec_out",
 }
 
 
@@ -68,39 +79,40 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         name: str,
         metadata: dict[Any, Any] | None = None,
     ) -> None:
-        super().__init__(name, metadata)
-
-        # Top-level control flow ports — wires this group into a control chain
-        self.exec_in = ControlParameterInput(
-            tooltip="Start the loop",
-            name="exec_in",
+        # The group's one control pair is the loop's entry and exit; label it for what it means here.
+        super().__init__(
+            name,
+            metadata,
+            control_in=ControlParameterInput(
+                tooltip="Wire the previous node's control output here to start the loop.",
+                display_name="Start Loop",
+            ),
+            control_out=ControlParameterOutput(
+                tooltip="Fires once after every iteration has finished. Wire the next node's control input here.",
+                display_name="On Complete",
+            ),
         )
-        self.exec_in.ui_options = {"display_name": "Start Loop"}
-        self.add_parameter(self.exec_in)
-        # No ordering needed here: the renderer pins control ports to the top of a rail by parameter
-        # type, and the rail list is an unordered membership set (see LEFT_PARAMETERS_KEY).
-        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.exec_in.name)
+        self.exec_in = self.control_in
+        self.exec_out = self.control_out
+        # A workflow saved while the loop still carried the base pair lists those names on its rails.
+        for metadata_key in (LEFT_PARAMETERS_KEY, RIGHT_PARAMETERS_KEY):
+            side_parameters: list[str] | None = self.metadata.get(metadata_key)
+            if side_parameters is None:
+                continue
+            side_parameters[:] = [name for name in side_parameters if name not in LEGACY_CONTROL_PORT_NAMES]
 
         # Per-iteration control output — pairs visually with exec_in on the LEFT rail.
         # Connect this to the first body node to make that node each iteration's entry point.
         # If unconnected, executor falls back to implicit child-discovery.
         self.on_each = ControlParameterOutput(
-            tooltip="Fired at the start of each iteration. Connect to the first node in the loop body.",
+            tooltip="Fires at the start of each iteration. Connect to the first node inside the loop body.",
             name="on_each",
         )
         self.on_each.ui_options = {"display_name": "On Each"}
         self.add_parameter(self.on_each)
+        # No ordering needed here: the renderer pins control ports to the top of a rail by parameter
+        # type, and the rail list is an unordered membership set (see LEFT_PARAMETERS_KEY).
         self._register_side_parameter(LEFT_PARAMETERS_KEY, self.on_each.name)
-
-        self.exec_out = ControlParameterOutput(
-            tooltip="Fired after all iterations complete",
-            name="exec_out",
-        )
-        self.exec_out.ui_options = {"display_name": "On Complete"}
-        self.add_parameter(self.exec_out)
-        # As with exec_in, exec_out reaches the top of the right rail by being a control port, not by
-        # its position in this list.
-        self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.exec_out.name)
 
         # Initialize iteration state
         self._items = []
@@ -185,6 +197,28 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         )
         self.add_parameter(self.results)
 
+        self.flatten_results = ParameterBool(
+            name="flatten_results",
+            tooltip="When an iteration adds a list, put its items into Results instead of the list itself.",
+            default_value=False,
+            allowed_modes={ParameterMode.PROPERTY},
+            display_name="Flatten Results",
+        )
+        self.add_parameter(self.flatten_results)
+
+        self.flatten_depth = ParameterInt(
+            name="flatten_depth",
+            tooltip="How many levels of nesting to flatten. 0 flattens every level.",
+            default_value=0,
+            min_val=0,
+            allowed_modes={ParameterMode.PROPERTY},
+            display_name="Flatten Depth",
+            hide=True,
+        )
+        self.add_parameter(self.flatten_depth)
+        self.add_parameter_to_group_settings(self.flatten_results)
+        self.add_parameter_to_group_settings(self.flatten_depth)
+
         # Track right parameters for UI layout
         for parameter_name in (
             self.loop_complete.name,
@@ -194,6 +228,12 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             self.results.name,
         ):
             self._register_side_parameter(RIGHT_PARAMETERS_KEY, parameter_name)
+
+    def get_parameter_by_name(self, param_name: str) -> Parameter | None:
+        # Connections in a workflow saved while the loop carried the base pair name group_exec_in /
+        # group_exec_out. Answer with the loop port that replaced each so those workflows load and run;
+        # the connection is recorded against the Parameter, so the next save writes the current name.
+        return super().get_parameter_by_name(LEGACY_CONTROL_PORT_NAMES.get(param_name, param_name))
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Handle parameter value changes."""
@@ -213,10 +253,15 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 # Hide controls when running in parallel (not supported)
                 self.hide_parameter_by_name(self.skip_iteration.name)
                 self.hide_parameter_by_name(self.break_loop.name)
+        elif parameter == self.flatten_results:
+            if value:
+                self.show_parameter_by_name(self.flatten_depth.name)
+            else:
+                self.hide_parameter_by_name(self.flatten_depth.name)
 
     def get_next_control_output(self) -> Parameter | None:
-        # Without this override the base returns None and the DAG executor stops at the group
-        # after all iterations complete, never advancing to whatever is wired downstream of exec_out.
+        # Say which port the chain continues from once every iteration has finished, rather than
+        # leaning on the base's first-control-output scan and the order ports happen to be added in.
         return self.exec_out
 
     @abstractmethod
@@ -266,7 +311,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         # replaces _results_list via `= []` rather than clearing in-place, so shared
         # item references are safe. deepcopy was breaking websocket payload deduplication
         # by creating new object identities for every item on every broadcast.
-        self.parameter_output_values["results"] = list(self._results_list)
+        if self.get_parameter_value(self.flatten_results.name):
+            depth = max(self.get_parameter_value(self.flatten_depth.name) or 0, 0)
+            self.parameter_output_values["results"] = flatten_list(self._results_list, depth)
+        else:
+            self.parameter_output_values["results"] = list(self._results_list)
 
     def reset_for_workflow_run(self) -> None:
         """Reset state for a fresh workflow run."""
