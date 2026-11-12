@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.event_manager import (
+    COALESCE_INTERVAL_S,
     EventManager,
     EventTranslationContext,
     ResultContext,
@@ -83,6 +84,264 @@ class TestEventsWhileRebuildingACopy:
         event_manager.put_event("after the rebuild")
 
         assert event_manager.event_queue.get_nowait() == "after the rebuild"
+
+
+class TestCoalescedEvents:
+    """Events put with a `coalesce_key` are sent at most once per interval, newest winning."""
+
+    @staticmethod
+    def _drain(event_manager: EventManager) -> list:
+        drained = []
+        while not event_manager.event_queue.empty():
+            drained.append(event_manager.event_queue.get_nowait())
+        return drained
+
+    @pytest.mark.asyncio
+    async def test_first_event_goes_out_and_later_ones_inside_the_interval_are_held(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        for number in range(1, 5):
+            event_manager.put_event(number, coalesce_key="progress")
+
+        assert self._drain(event_manager) == [1]
+
+    @pytest.mark.asyncio
+    async def test_the_newest_held_event_is_sent_when_the_interval_ends(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        for number in range(1, 5):
+            event_manager.put_event(number, coalesce_key="progress")
+        await asyncio.sleep(COALESCE_INTERVAL_S * 3)
+
+        assert self._drain(event_manager) == [1, 4]
+
+    @pytest.mark.asyncio
+    async def test_keys_are_independent(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        event_manager.put_event("a1", coalesce_key="a")
+        event_manager.put_event("b1", coalesce_key="b")
+        event_manager.put_event("a2", coalesce_key="a")
+
+        assert self._drain(event_manager) == ["a1", "b1"]
+
+    @pytest.mark.asyncio
+    async def test_an_event_without_a_key_sends_held_events_first(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        event_manager.put_event(1, coalesce_key="progress")
+        event_manager.put_event(2, coalesce_key="progress")
+        event_manager.put_event("failure")
+
+        assert self._drain(event_manager) == [1, 2, "failure"]
+
+    @pytest.mark.asyncio
+    async def test_a_flush_sends_held_events_once(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        event_manager.put_event(1, coalesce_key="progress")
+        event_manager.put_event(2, coalesce_key="progress")
+
+        event_manager.flush_coalesced_events()
+        await asyncio.sleep(COALESCE_INTERVAL_S * 3)
+
+        assert self._drain(event_manager) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_a_key_passes_through_an_event_translation_context(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        with EventTranslationContext(event_manager, {}):
+            event_manager.put_event(1, coalesce_key="progress")
+            event_manager.put_event(2, coalesce_key="progress")
+
+        assert self._drain(event_manager) == [1]
+
+    @pytest.mark.asyncio
+    async def test_a_key_can_send_again_after_the_interval(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        event_manager.put_event(1, coalesce_key="progress")
+        await asyncio.sleep(COALESCE_INTERVAL_S * 2)
+        event_manager.put_event(2, coalesce_key="progress")
+
+        assert self._drain(event_manager) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_listeners_see_every_event_even_when_it_is_held(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        with patch.object(event_manager, "_dispatch_to_execution_listeners") as dispatch:
+            for number in range(1, 5):
+                event_manager.put_event(number, coalesce_key="progress")
+
+        assert [call.args[0] for call in dispatch.call_args_list] == [1, 2, 3, 4]
+
+    @pytest.mark.asyncio
+    async def test_a_flush_cancels_the_timer_of_the_events_it_sent(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        event_manager.put_event(1, coalesce_key="progress")
+        event_manager.put_event(2, coalesce_key="progress")
+
+        event_manager.flush_coalesced_events()
+
+        assert event_manager._coalesce_timers == {}
+
+
+class TestCoalescedEventsAtRequestEnd:
+    """Held events are sent when the outermost request finishes, before its result is queued."""
+
+    @staticmethod
+    def _drain(event_manager: EventManager) -> list:
+        drained = []
+        while not event_manager.event_queue.empty():
+            drained.append(event_manager.event_queue.get_nowait())
+        return drained
+
+    @pytest.mark.asyncio
+    async def test_held_event_is_sent_when_the_request_returns(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        async def handler(_request: _ProbeRequest) -> _ProbeResult:
+            event_manager.put_event(1, coalesce_key="progress")
+            event_manager.put_event(2, coalesce_key="progress")
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        await event_manager.ahandle_request(_ProbeRequest())
+
+        assert self._drain(event_manager) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_a_nested_request_leaves_held_events_for_the_outer_request(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        queued_after_inner: list = []
+
+        async def inner_handler(_request: _InnerProbeRequest) -> _ProbeResult:
+            event_manager.put_event(1, coalesce_key="progress")
+            event_manager.put_event(2, coalesce_key="progress")
+            return _ProbeResult(result_details="ok")
+
+        async def outer_handler(_request: _ProbeRequest) -> _ProbeResult:
+            await event_manager.ahandle_request(_InnerProbeRequest())
+            queued_after_inner.extend(self._drain(event_manager))
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_InnerProbeRequest, inner_handler)
+        event_manager.assign_manager_to_request_type(_ProbeRequest, outer_handler)
+
+        await event_manager.ahandle_request(_ProbeRequest())
+
+        assert queued_after_inner == [1]
+        assert self._drain(event_manager) == [2]
+
+    def test_held_event_is_sent_when_the_sync_request_returns(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            event_manager.put_event(1, coalesce_key="progress")
+            event_manager.put_event(2, coalesce_key="progress")
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        event_manager.handle_request(_ProbeRequest())
+
+        assert self._drain(event_manager) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_held_event_is_sent_when_a_sync_request_on_another_thread_returns(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            event_manager.put_event(1, coalesce_key="progress")
+            event_manager.put_event(2, coalesce_key="progress")
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+
+        await asyncio.to_thread(event_manager.handle_request, _ProbeRequest())
+        await asyncio.sleep(0)
+
+        assert self._drain(event_manager) == [1, 2]
+
+
+class TestCoalescedEventsAcrossThreads:
+    """Another thread's events are handled on the loop thread, so they keep their order."""
+
+    @staticmethod
+    def _drain(event_manager: EventManager) -> list:
+        drained = []
+        while not event_manager.event_queue.empty():
+            drained.append(event_manager.event_queue.get_nowait())
+        return drained
+
+    @pytest.mark.asyncio
+    async def test_a_keyless_event_from_another_thread_does_not_overtake_held_events(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+        event_manager.put_event(1, coalesce_key="progress")
+        event_manager.put_event(2, coalesce_key="progress")
+
+        await asyncio.to_thread(event_manager.put_event, "failure")
+        await asyncio.sleep(0)
+
+        assert self._drain(event_manager) == [1, 2, "failure"]
+
+    @pytest.mark.asyncio
+    async def test_keyed_events_from_another_thread_are_throttled(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        def put_many() -> None:
+            for number in range(1, 5):
+                event_manager.put_event(number, coalesce_key="progress")
+
+        await asyncio.to_thread(put_many)
+        await asyncio.sleep(COALESCE_INTERVAL_S * 3)
+
+        assert self._drain(event_manager) == [1, 4]
+
+    @pytest.mark.asyncio
+    async def test_threads_and_the_loop_share_one_throttle(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        event_manager.put_event("loop", coalesce_key="progress")
+        await asyncio.to_thread(event_manager.put_event, "thread", coalesce_key="progress")
+        await asyncio.sleep(COALESCE_INTERVAL_S * 3)
+
+        assert self._drain(event_manager) == ["loop", "thread"]
+
+    @pytest.mark.asyncio
+    async def test_many_threads_cannot_send_anything_after_the_final_event(self) -> None:
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        def put_many(thread_number: int) -> None:
+            for number in range(200):
+                event_manager.put_event((thread_number, number), coalesce_key="progress")
+
+        await asyncio.gather(*(asyncio.to_thread(put_many, thread_number) for thread_number in range(8)))
+        await asyncio.to_thread(event_manager.put_event, "final")
+        await asyncio.sleep(COALESCE_INTERVAL_S * 3)
+
+        drained = self._drain(event_manager)
+        assert drained[-1] == "final"
+        assert drained.count("final") == 1
 
 
 class TestEventManagerBroadcasting:
@@ -252,6 +511,11 @@ class TestEventManagerBroadcasting:
 @dataclass(kw_only=True)
 class _ProbeRequest(RequestPayload):
     """Minimal request type used only to exercise dispatch routing in tests."""
+
+
+@dataclass(kw_only=True)
+class _InnerProbeRequest(RequestPayload):
+    """A second request type, for tests that nest one request inside another."""
 
 
 @dataclass(kw_only=True)

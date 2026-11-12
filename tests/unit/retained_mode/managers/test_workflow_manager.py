@@ -34,7 +34,12 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine, current_engine
-from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails, ResultPayload
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineInitializationProgress,
+    InitializationPhase,
+    InitializationStatus,
+)
+from griptape_nodes.retained_mode.events.base_events import AppEvent, RequestPayload, ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -1858,6 +1863,60 @@ class TestWorkflowManager:
 
         assert len(result.succeeded) == file_count
         assert list_libraries_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_registration_scan_coalesces_progress_but_sends_failures_and_final_as_they_happen(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Routine progress events are coalesced, but a failure and the final event never are.
+
+        Clients list failed items from the failure events and leave their loading state on the
+        final one. A coalesced event can be replaced by a newer one, so those two are sent
+        without a key.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        file_count = 20
+        for index in range(file_count):
+            (tmp_path / f"workflow_{index:02}.py").write_text(
+                _valid_workflow_source(f"workflow_{index:02}"), encoding="utf-8"
+            )
+
+        original_process = workflow_manager._process_single_workflow_file
+
+        async def fail_one(workflow_file: Path, **kwargs: Any) -> Any:
+            if workflow_file.name == "workflow_07.py":
+                return None
+            return await original_process(workflow_file, **kwargs)
+
+        sent: list[tuple[EngineInitializationProgress, Any]] = []
+
+        def record(event: Any, *, coalesce_key: Any = None) -> None:
+            if isinstance(event, AppEvent) and isinstance(event.payload, EngineInitializationProgress):
+                sent.append((event.payload, coalesce_key))
+
+        with (
+            patch.object(workflow_manager, "_process_single_workflow_file", side_effect=fail_one),
+            patch.object(engine.event_manager, "put_event", side_effect=record),
+        ):
+            result = await workflow_manager._process_workflows_for_registration([str(tmp_path)])
+
+        assert len(result.succeeded) == file_count - 1
+        assert len(result.failed) == 1
+        failures = [(p, key) for p, key in sent if p.status == InitializationStatus.FAILED]
+        assert [(p.item_name, p.error, key) for p, key in failures] == [
+            ("workflow_07.py", "Failed to process workflow file", None)
+        ]
+        final_payload, final_key = sent[-1]
+        assert final_payload.current == file_count
+        assert final_payload.status != InitializationStatus.LOADING
+        assert final_key is None
+        routine = [key for p, key in sent if p.status != InitializationStatus.FAILED and p is not final_payload]
+        assert routine
+        assert all(key is not None for key in routine)
+        assert all(p.phase == InitializationPhase.WORKFLOWS and p.total == file_count for p, _ in sent)
 
     @pytest.mark.parametrize(
         ("file_name", "source"),
