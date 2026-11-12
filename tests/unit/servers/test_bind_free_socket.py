@@ -49,3 +49,31 @@ def test_assigns_a_port_when_asked_for_zero() -> None:
         assert sock.getsockname()[1] != 0
     finally:
         sock.close()
+
+
+def test_keeps_its_port_across_a_restart_after_serving() -> None:
+    """A server restarting on the port it just served must get that port back.
+
+    The engine's MCP server is documented as reachable at a fixed port, so falling back to an
+    OS-assigned one after a restart silently breaks every external client pointed at it. A
+    closed connection leaves the port in TIME_WAIT, which is the state a restart has to survive.
+    """
+    first = bind_free_socket(LOOPBACK, 0)
+    port = first.getsockname()[1]
+    first.listen()
+
+    # Serve one connection and close it, so the port is left in TIME_WAIT rather than simply idle.
+    client = socket.create_connection((LOOPBACK, port))
+    served, _ = first.accept()
+    served.close()
+    client.close()
+    first.close()
+
+    restarted = bind_free_socket(LOOPBACK, port)
+    try:
+        assert restarted.getsockname()[1] == port, (
+            "bind_free_socket could not rebind the port it had just served, so a restart would "
+            "move the server to an OS-assigned port"
+        )
+    finally:
+        restarted.close()
