@@ -1,6 +1,7 @@
 """Package for web servers the engine may need to start."""
 
 import socket
+import sys
 
 
 def bind_free_socket(host: str, port: int) -> socket.socket:
@@ -13,7 +14,16 @@ def bind_free_socket(host: str, port: int) -> socket.socket:
     close the socket.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # So a restart is not refused by a socket the previous run left in a wait state. On Windows
+    # SO_REUSEADDR instead grants this bind the port even while another process is listening on
+    # it, so the bind below succeeds, the fallback never runs, and two servers advertise one port
+    # while only one of them answers. SO_EXCLUSIVEADDRUSE is the option that skips the wait state
+    # without granting that. CPython's asyncio draws the same line, defaulting reuse_address to
+    # POSIX only, and the editor server in griptape-nodes-app sets these the same way.
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
     except OSError:
