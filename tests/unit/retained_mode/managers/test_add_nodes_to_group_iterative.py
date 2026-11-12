@@ -25,7 +25,6 @@ from griptape_nodes.retained_mode.events.node_events import (
     RemoveNodeFromNodeGroupResultSuccess,
 )
 from tests.unit.exe_types.mocks import MockNode
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import AsyncResult, BaseNode
@@ -155,7 +154,7 @@ class TestAddNodesToGroupIterativePath:
     def _setup_context(self, engine: Engine) -> None:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
@@ -379,7 +378,7 @@ class TestRemoveNodesFromGroupIterativePath:
     def _setup_context(self, engine: Engine) -> None:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
@@ -503,7 +502,7 @@ class TestPlainNodeGroupDoesNotTether:
     def _setup_context(self, engine: Engine) -> None:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
@@ -572,7 +571,7 @@ class TestCrossGroupMoveKeepsTetheredCompanion:
     def _setup_context(self, engine: Engine) -> None:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
-        bind(engine.context_manager.open_workflow(workflow_name="test_workflow"))
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)

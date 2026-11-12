@@ -46,7 +46,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ENV_VAR_PREFIX
-from griptape_nodes.retained_mode.runtime.binding import bind_unbound_caller
 from griptape_nodes.serialization.values import decode_value
 
 if TYPE_CHECKING:
@@ -257,11 +256,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                 f"which cannot be executed: {result.result_details}"
             )
             _raise_load_error(msg)
-
-        # The load opened its workflow but left this run bound to none, and the rest of the run
-        # reads that workflow's flow and nodes.
-        if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.open_workflow is not None:
-            bind_unbound_caller(GriptapeNodes.get_instance().open_workflows.get(result.open_workflow.workflow_id))
 
     async def _handle_event_request(self, event: EventRequest) -> None:
         """Handle EventRequest objects by processing them through GriptapeNodes."""

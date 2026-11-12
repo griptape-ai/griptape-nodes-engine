@@ -38,7 +38,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
-from tests.workflow_context import bind
 
 
 # A node built outside library registration shares this namespace.
@@ -99,7 +98,7 @@ class _Consumer(BaseNode):
 @pytest.fixture
 def flow_name(engine: Engine) -> str:
     """A flow to hang the nodes off, inside an active workflow."""
-    bind(engine.context_manager.open_workflow("wf"))
+    engine.context_manager.push_workflow("wf")
     result = engine.handle_request(CreateFlowRequest(parent_flow_name=None))
     assert isinstance(result, CreateFlowResultSuccess)
     return result.flow_name

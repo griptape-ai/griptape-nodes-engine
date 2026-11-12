@@ -29,7 +29,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from tests.e2e.fixtures.loop_library.loop_nodes import LoopStartNode
-from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -96,7 +95,7 @@ async def _run_loop(  # noqa: PLR0913 (fixtures plus the knobs that shape the lo
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    open_and_bind(engine, "loop_start_item_e2e_workflow")
+    engine.context_manager.push_workflow(workflow_name="loop_start_item_e2e_workflow")
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="LoopFlow", set_as_new_context=False)
     )

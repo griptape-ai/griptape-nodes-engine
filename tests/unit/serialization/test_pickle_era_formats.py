@@ -35,7 +35,6 @@ from griptape_nodes.retained_mode.events.node_events import (
     DeserializeSelectedNodesFromCommandsResultSuccess,
 )
 from tests.unit.serialization.fixture_paths import FIXTURES
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -107,7 +106,7 @@ def _restore_from_image(engine: Engine, file_name: str) -> BaseNode:
 
 def _run_workflow_source(engine: Engine, source: str, file_name: str) -> None:
     """Open the file as a workflow and build it, as the engine's loader does."""
-    bind(engine.context_manager.open_workflow(file_path=file_name))
+    engine.context_manager.push_workflow(file_path=file_name)
     exec_globals: dict[str, object] = {"__file__": file_name}
     exec(compile(source, file_name, "exec"), exec_globals)  # noqa: S102
     asyncio.run(exec_globals["build_workflow"]())  # type: ignore[operator]

@@ -68,7 +68,6 @@ from griptape_nodes.retained_mode.managers.model_manager import (
     _load_status_file,
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
-from tests.workflow_context import bind
 
 
 @pytest.fixture
@@ -415,7 +414,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             name=node_name,
             metadata={"library": _CATALOG_LIBRARY_NAME, "node_type": _ProbeModelNode.__name__},
         )
-        bind(engine.context_manager.open_workflow(workflow_name="model_workflow"))
+        engine.context_manager.push_workflow(workflow_name="model_workflow")
         workflow = engine.current_workflow()
         engine.object_manager.add_object_by_name_in(workflow, node_name, node)
         return workflow
@@ -452,9 +451,24 @@ class TestDeclareModelInvocationCatalogEnrichment:
             "model_families": ["GPT Image"],
         }
 
-    def test_a_declaration_from_a_fresh_context_names_no_workflow(self, engine: Engine) -> None:
-        """Engine code with no envelope id and no binding acts on no workflow, even with one open."""
+    def test_a_declaration_from_a_fresh_context_is_enriched_from_the_only_open_workflow(
+        self,
+        engine: Engine,
+    ) -> None:
+        """As a node declares from its library's own thread pool: no envelope id and no binding."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
         self._register_node("Probe_1", engine)
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        engine.event_manager.add_authorization_hook(capture)
 
         result = (
             contextvars.Context()
@@ -465,8 +479,12 @@ class TestDeclareModelInvocationCatalogEnrichment:
             .result
         )
 
-        assert isinstance(result, DeclareModelInvocationResultFailure)
-        assert "Probe_1" in str(result.result_details)
+        assert isinstance(result, DeclareModelInvocationResultSuccess)
+        assert seen["attributes"] == {
+            "id": "gtc_gpt_image_1_mini",
+            "provider_id": "openai",
+            "model_families": ["GPT Image"],
+        }
 
     def test_family_scoped_hook_blocks_the_invocation(self, engine: Engine) -> None:
         # Mirrors a license policy that forbids a family via the attribute form

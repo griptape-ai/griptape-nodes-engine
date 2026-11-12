@@ -31,7 +31,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -82,7 +81,7 @@ def registered_library(engine: Engine, tmp_path: Path, materialize_library: Call
 @pytest.fixture
 def flow_name(engine: Engine, registered_library: None, create_node: Callable[..., str], tmp_path: Path) -> str:  # noqa: ARG001
     """A flow with two unconnected nodes: Holder, which parks on its gate, and Next, which does not."""
-    bind(engine.context_manager.open_workflow(workflow_name="run_queue_wf"))
+    engine.context_manager.push_workflow(workflow_name="run_queue_wf")
     result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Flow", set_as_new_context=False))
     assert isinstance(result, CreateFlowResultSuccess), result
     create_node(NODE_TYPE, "Holder", result.flow_name, library_name=LIBRARY_NAME)

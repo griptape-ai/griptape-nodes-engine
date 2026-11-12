@@ -51,7 +51,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.serialization.commands import decode_commands
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -140,7 +139,7 @@ def clean_object_state(engine: Engine) -> Generator[None, None, None]:
 @pytest.fixture
 def flow_name(engine: Engine, library_name: str, clean_object_state: None) -> str:  # noqa: ARG001
     """Push a fresh workflow/flow context that the rest of the test builds nodes in."""
-    bind(engine.context_manager.open_workflow(workflow_name="selected_nodes_wf"))
+    engine.context_manager.push_workflow(workflow_name="selected_nodes_wf")
     result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(result, CreateFlowResultSuccess), result
     return result.flow_name

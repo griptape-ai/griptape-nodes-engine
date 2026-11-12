@@ -25,7 +25,6 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -57,7 +56,7 @@ class _ValueNode(DataNode):
 
 class TestRetainedModeLock:
     def test_lock_without_current_context_returns_failure(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="lock_no_node_wf"))
+        engine.context_manager.push_workflow(workflow_name="lock_no_node_wf")
         # Ensure empty current context for nodes
         ctx = engine.context_manager
         while ctx.has_current_node():
@@ -67,7 +66,7 @@ class TestRetainedModeLock:
         assert "Current Context" in str(res.result_details)
 
     def test_lock_all_missing_nodes_failure(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="lock_missing_wf"))
+        engine.context_manager.push_workflow(workflow_name="lock_missing_wf")
         missing_nodes = ["nope_a_123", "nope_b_456"]
         res = RetainedMode.batch_set_lock_node_state(node_names=missing_nodes, lock=True)
         assert isinstance(res, BatchSetNodeLockStateResultFailure)
@@ -77,7 +76,7 @@ class TestRetainedModeLock:
     def test_batch_lock_with_no_workflow_open_says_none_is_open(self) -> None:
         res = RetainedMode.batch_set_lock_node_state(node_names=["nope_a_123"], lock=True)
         assert isinstance(res, WorkflowNotNamedResultFailure)
-        assert "names no workflow" in str(res.result_details)
+        assert "none is open" in str(res.result_details)
 
 
 class TestUnlockUnresolvesNodeLeftUnexecuted:
@@ -104,7 +103,7 @@ class TestUnlockUnresolvesNodeLeftUnexecuted:
         )
         library = LibraryRegistry.generate_new_library(schema)
         library.register_new_node_type(_ValueNode, NodeMetadata(category="test", description="d", display_name="Value"))
-        bind(engine.context_manager.open_workflow(workflow_name="lock_wf"))
+        engine.context_manager.push_workflow(workflow_name="lock_wf")
         flow = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True)
         )

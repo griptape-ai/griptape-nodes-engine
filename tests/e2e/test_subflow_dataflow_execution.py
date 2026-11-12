@@ -30,7 +30,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -66,7 +65,7 @@ async def test_isolated_subflow_runs_data_only_graph(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    bind(engine.context_manager.open_workflow(workflow_name="subflow_dataflow_wf"))
+    engine.context_manager.push_workflow(workflow_name="subflow_dataflow_wf")
 
     # Parent flow holds the driver; the subflow is a child flow, like an imported referenced workflow.
     parent_result = engine.handle_request(

@@ -20,7 +20,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -107,7 +106,7 @@ def loop_nodes(engine: Engine) -> Iterator[None]:
         library.register_new_node_type(
             node_class, NodeMetadata(category="test", description="d", display_name=node_class.__name__)
         )
-    bind(engine.context_manager.open_workflow(workflow_name="loop_strict_mode_wf"))
+    engine.context_manager.push_workflow(workflow_name="loop_strict_mode_wf")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     # initial_setup keeps the Start from creating and connecting its own End.

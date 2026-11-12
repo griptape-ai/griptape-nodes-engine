@@ -16,7 +16,6 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from tests.unit.serialization.fixture_paths import FIXTURES
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -69,7 +68,7 @@ def library_name(engine: Engine, library_json: Path) -> Generator[str, None, Non
 @pytest.fixture
 def flow_name(engine: Engine, library_name: str) -> str:  # noqa: ARG001
     """Open an empty flow in the current context."""
-    bind(engine.context_manager.open_workflow(workflow_name="serialization_fixture"))
+    engine.context_manager.push_workflow(workflow_name="serialization_fixture")
     result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=True)
     )

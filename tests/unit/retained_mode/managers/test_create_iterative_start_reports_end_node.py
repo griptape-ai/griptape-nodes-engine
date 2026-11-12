@@ -20,7 +20,6 @@ from tests.unit.retained_mode.managers.test_add_nodes_to_group_iterative import 
     _MockIterativeEndNode,
     _MockIterativeStartNode,
 )
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -67,7 +66,7 @@ def loop_flow(engine: Engine) -> Iterator[None]:
         library.register_new_node_type(
             node_class, NodeMetadata(category="test", description="d", display_name=node_class.__name__)
         )
-    bind(engine.context_manager.open_workflow(workflow_name="iterative_pair_wf"))
+    engine.context_manager.push_workflow(workflow_name="iterative_pair_wf")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     try:

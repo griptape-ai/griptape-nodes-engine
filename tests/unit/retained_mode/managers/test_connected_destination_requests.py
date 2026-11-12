@@ -36,7 +36,6 @@ from griptape_nodes.retained_mode.events.node_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -135,7 +134,7 @@ def nodes(engine: Engine) -> Iterator[None]:
     library = LibraryRegistry.generate_new_library(schema)
     for node_class in (_SettingsNode, _PlainNode, _SaverNode, _GroupNode):
         library.register_new_node_type(node_class, NodeMetadata(category="test", description="d", display_name="n"))
-    open_and_bind(engine, "connected_destination_wf")
+    engine.context_manager.push_workflow(workflow_name="connected_destination_wf")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     for node_type, name in (("_SettingsNode", "settings"), ("_PlainNode", "plain"), ("_SaverNode", "saver")):

@@ -118,11 +118,10 @@ class TestEngineIndependence:
         first = Engine()
         second = Engine()
 
-        workflow = first.open_workflows.open("first")
-        first.object_manager.add_object_by_name_in(workflow, "shared_name", object())
+        first.open_workflows.open("first")
+        first.object_manager.add_object_by_name_in(first.current_workflow(), "shared_name", object())
 
-        with first.bind_workflow(workflow):
-            assert first.object_manager.has_object_with_name("shared_name")
+        assert first.object_manager.has_object_with_name("shared_name")
         assert not second.object_manager.has_object_with_name("shared_name")
 
 
@@ -189,8 +188,8 @@ class TestEngineScope:
         with engine_scope(scoped):
             assert GriptapeNodes() is scoped
             assert GriptapeNodes.get_instance() is scoped
-            assert GriptapeNodes.FlowManager().engine is scoped
-            assert GriptapeNodes.ObjectManager().engine is scoped
+            assert GriptapeNodes.FlowManager() is scoped.flow_manager
+            assert GriptapeNodes.ObjectManager() is scoped.object_manager
             assert GriptapeNodes.BudgetManager() is scoped.budget_manager
 
     @pytest.mark.asyncio

@@ -33,7 +33,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -80,7 +79,7 @@ async def test_loop_finishes_when_a_body_list_has_connected_rows(
     registered = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(registered, RegisterLibraryFromFileResultSuccess), registered
 
-    bind(engine.context_manager.open_workflow(workflow_name="loop_copy_back"))
+    engine.context_manager.push_workflow(workflow_name="loop_copy_back")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="Parent", set_as_new_context=False))
     assert isinstance(flow, CreateFlowResultSuccess), flow
     with engine.context_manager.flow(flow.flow_name):

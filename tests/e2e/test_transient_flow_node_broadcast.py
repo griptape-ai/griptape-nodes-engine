@@ -41,7 +41,6 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializedNodeCommands,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -66,7 +65,7 @@ def _register_echo_library(engine: Engine, materialize_library: Callable[..., Pa
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
     # Creating a flow requires an active workflow in the Current Context.
-    bind(engine.context_manager.open_workflow(workflow_name="transient_broadcast_e2e_workflow"))
+    engine.context_manager.push_workflow(workflow_name="transient_broadcast_e2e_workflow")
 
 
 def _build_body_flow_commands(*, broadcast_result: bool) -> SerializedFlowCommands:

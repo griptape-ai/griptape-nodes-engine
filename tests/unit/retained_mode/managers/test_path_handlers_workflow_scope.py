@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     PreviewGenerationPolicy,
     RegisterArtifactProviderRequest,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
@@ -213,24 +214,35 @@ class TestMacrosResolveForTheDispatchedWorkflow:
         assert isinstance(result, GetStateForMacroResultSuccess), result.result_details
         assert result.can_resolve
 
-    @pytest.mark.parametrize("open_count", [1, 2])
-    def test_a_request_naming_no_workflow_resolves_for_none_of_the_open_ones(
-        self, nothing_open: Engine, tmp_path: Path, open_count: int
+    def test_a_request_naming_no_workflow_resolves_for_the_only_open_one(
+        self, nothing_open: Engine, tmp_path: Path
     ) -> None:
-        folders = [tmp_path / f"open_{index}" for index in range(open_count)]
-        for folder in folders:
-            _open(nothing_open, folder)
+        _open(nothing_open, tmp_path / "open")
 
         result = _send(
             nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={})
         )
 
         assert isinstance(result, GetPathForMacroResultSuccess), result.result_details
-        assert all(not result.absolute_path.is_relative_to(_folder(folder)) for folder in folders)
+        assert result.absolute_path == _folder(tmp_path / "open" / "outputs" / "img.png")
 
-    def test_a_request_naming_no_workflow_resolves_a_macro_that_needs_none_while_several_are_open(
+    def test_a_request_naming_no_workflow_while_several_are_open_fails(
         self, nothing_open: Engine, tmp_path: Path
     ) -> None:
+        _open(nothing_open, tmp_path / "a")
+        _open(nothing_open, tmp_path / "b")
+
+        result = _send(
+            nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={})
+        )
+
+        assert not result.succeeded()
+        assert "did not name one" in str(result.result_details)
+
+    def test_naming_no_workflow_while_several_are_open_fails_even_without_a_workflow_builtin(
+        self, nothing_open: Engine, tmp_path: Path
+    ) -> None:
+        """Dispatch picks the workflow before the macro is read, so it can't tell the macro needs none."""
         _open(nothing_open, tmp_path / "a")
         _open(nothing_open, tmp_path / "b")
 
@@ -238,7 +250,7 @@ class TestMacrosResolveForTheDispatchedWorkflow:
             nothing_open, GetPathForMacroRequest(parsed_macro=ParsedMacro("{workspace_dir}/img.png"), variables={})
         )
 
-        assert isinstance(result, GetPathForMacroResultSuccess), result.result_details
+        assert isinstance(result, WorkflowNotNamedResultFailure)
 
 
 class TestNoWorkflow:
