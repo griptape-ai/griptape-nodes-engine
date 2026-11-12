@@ -2,31 +2,47 @@
 
 Tracking issue: [griptape-ai/internal#222](https://github.com/griptape-ai/internal/issues/222).
 
-> **Design iteration only.** This page exists for the team to comment on and revise. It is not part of the published docs, so it is deliberately left out of `mkdocs.yml`. Do not add it to the nav or the `llmstxt` sections.
+> This page is for the team to comment on and revise. It's not part of the published docs, so it stays out of `mkdocs.yml`. Please don't add it to the nav or the `llmstxt` sections.
 
 ## Goals
 
-- A library author writes node and library docs in their own repo with no hosting, no build step, and no PR to the engine.
-- Users read the docs inside the editor, fast, offline, and matching the installed library version. The docs are local files in the installed library, so they work in air-gapped environments with no network.
+- Library authors write docs in their own repo and ship them with the library. They don't host anything and they don't touch the engine.
+- Users read those docs in the editor, or on GitHub where the library lives. In the editor they come from the installed library, so they always match the version you're running, and they work with no network, air-gapped included.
 - Agents read the same docs through the engine.
-- Every node has useful help even if the author writes nothing.
+- A node with no docs still gets a page. The engine builds a basic one from what it already knows about the node.
+- A library gets an overview page and a navigation tree, not just a pile of node pages. The overview is the library's `docs/index.md`, or its README if it doesn't have one. The tree follows the folders under `docs/`, with the library's nodes listed by category below it.
 
 ## Proposal
 
 ### Location and file layout
 
-Docs live in a `docs/` folder next to `griptape_nodes_library.json`. The manifest's folder is the library root, whether the manifest sits at the repo root or inside a package subfolder. It is the one location the engine already resolves paths from.
+Docs live in a `docs/` folder next to `griptape_nodes_library.json`.
 
-In the layout below, only `docs/nodes/` has a fixed meaning: it holds one page per node. Everything else under `docs/` is library-level docs, meaning pages about the library as a whole and not about one node. `guides/` and `reference/` are made-up examples of those. A library can name and arrange them any way it likes, or have none.
+Three folders under `docs/` are special, one for each list in the manifest: `docs/nodes/` holds one page per node, `docs/workflow_nodes/` one page per workflow node, and `docs/workflows/` one page per workflow template. Everything else under `docs/` is about the library as a whole, like a getting-started guide or a file format reference, and the library can name and arrange those however it wants. The `guides/` and `reference/` folders below are just examples. A library can have none of them.
+
+How each one maps to `griptape_nodes_library.json`, plus the skills folders and the folder that sits outside `docs/`:
+
+| Manifest list    | Folder                 | What it holds                                                                      |
+| ---------------- | ---------------------- | ---------------------------------------------------------------------------------- |
+| `nodes`          | `docs/nodes/`          | one page per node, named after its `class_name`                                    |
+| `workflow_nodes` | `docs/workflow_nodes/` | one page per workflow node, named after its `node_type`                            |
+| `workflows`      | `docs/workflows/`      | one page per template, named after its filename without `.py`                      |
+| n/a              | `docs/.agents/skills/` | skills for agents that use the library, one folder per skill                       |
+| n/a              | `.agents/skills/`      | skills for coding agents working on the library, never loaded by the sidebar agent |
+| n/a              | `dev/docs/`            | docs for node developers, in any shape. The engine never reads it                  |
+
+The library's overview page is `docs/index.md`. If there isn't one, the README stands in.
+
+Docs for people who work on the library, like how to add a model or what a node page should look like, don't go in `docs/`. Everything under `docs/` shows up in the editor, so put contributor docs somewhere else, such as `dev/docs/`. The engine only reads the docs path, so those pages stay out of the editor.
 
 ```
 my-library/
   griptape_nodes_library.json
-  .agents/                    # for agents only, same convention as the workspace
+  .agents/                    # for coding agents working on the library. The sidebar agent never loads these
     skills/
-      color-managed-workflow/
-        SKILL.md              # name + description frontmatter, same format as other skills
-  nodes/                      # Python source; the folders here are unrelated to the docs folders
+      run-the-tests/
+        SKILL.md              # same format as other skills
+  nodes/                      # Python source. Its folders have nothing to do with the docs folders
     audio/
       load_audio.py           # defines class LoadAudio
       mix_audio.py            # defines class MixAudio
@@ -34,52 +50,48 @@ my-library/
       load_image.py           # defines class LoadImage
   workflows/
     shout_text.py             # saved workflow, registered as the node type "ShoutText"
+    templates/
+      color_managed_load.py   # a workflow template, listed under "workflows" in the manifest
   docs/
-    index.md                  # library home page (optional)
-    guides/                   # EXAMPLE of library-level docs: any folder name works, none are required
-      getting-started.md      # not about a specific node
-      color-management.md     # not about a specific node
-    reference/                # EXAMPLE of library-level docs: any folder name works, none are required
-      file-formats.md         # not about a specific node
-    nodes/                    # the one fixed folder: one page per node, matched by node key
+    index.md                  # library overview. The README stands in if this is missing
+    guides/                   # an example folder, name these however you like
+      getting-started.md      # about the library, not one node
+      color-management.md
+    reference/                # another example
+      file-formats.md
+    nodes/                    # a fixed folder: one page per node
       audio/
-        LoadAudio.md          # documents the node LoadAudio
-        LoadAudio.fr.md       # French version of the same page (locales are later, the name is reserved now)
-        MixAudio.md           # documents the node MixAudio
-      LoadImage.md            # sits at the top of docs/nodes/, still documents LoadImage
+        LoadAudio.md          # documents LoadAudio
+        LoadAudio.fr.md       # French version (locales come later, the name is reserved now)
+        MixAudio.md           # documents MixAudio
+      LoadImage.md            # doesn't need to sit in a folder
+    workflow_nodes/           # the second fixed folder: one page per workflow node
       ShoutText.md            # documents the workflow node ShoutText
+    workflows/                # the third fixed folder: one page per workflow template
+      color_managed_load.md   # documents workflows/templates/color_managed_load.py
+    .agents/                  # for the agent that uses the library. A dot-folder is never shown as pages
+      skills/
+        color-managed-workflow/
+          SKILL.md            # same format as other skills
     assets/
       screenshot.png
-```
-
-The `nodes` and `workflow_nodes` entries in `griptape_nodes_library.json` that these files document:
-
-```json
-{
-  "nodes": [
-    { "class_name": "LoadAudio", "file_path": "nodes/audio/load_audio.py", "metadata": { "...": "..." } },
-    { "class_name": "MixAudio",  "file_path": "nodes/audio/mix_audio.py",  "metadata": { "...": "..." } },
-    { "class_name": "LoadImage", "file_path": "nodes/image/load_image.py", "metadata": { "...": "..." } }
-  ],
-  "workflow_nodes": [
-    { "node_type": "ShoutText", "workflow_path": "workflows/shout_text.py", "metadata": { "...": "..." } }
-  ]
-}
+  dev/                        # anything for people working on the library
+    docs/                     # docs for node developers. The editor never shows these
+      adding-a-model.md
 ```
 
 Node pages:
 
-- A node's doc file is named after the key the manifest already uses: `class_name` for Python nodes and `node_type` for workflow nodes. No new mapping to maintain.
-- Node docs may sit in nested folders under `docs/nodes/`. The engine indexes `docs/nodes/**/*.md` when it loads the library and matches each filename to a node key, so `docs/nodes/audio/LoadAudio.md` documents `LoadAudio`. The folders are the author's choice. They do not have to match the source folders or the manifest categories, which can change independently.
-- The match is on the node key, not the Python filename. `load_audio.py` documents nothing by itself, and a source file that defines several node classes gets one doc page per class. Matching is exact and case-sensitive. The docs check flags a name that matches a node key except for case, because it would work on a case-insensitive filesystem and fail on another.
-- Locale variants are named `<Key>.<locale>.md`. A name is split at its first dot, so `LoadAudio.fr.md` is the French page for `LoadAudio` and is never read as a node called `LoadAudio.fr`. A node key contains no dots. Locales are not in v1, and `<Key>.md` stays the fallback when they arrive.
-- Two files that resolve to the same key (`audio/LoadAudio.md` and `legacy/LoadAudio.md`) are a conflict. The engine uses the file with the fewest folders, then the first path alphabetically, and reports a library problem that names both files. A docs problem never stops a library from loading. The docs check fails on it.
-- A node with no file falls back to its manifest description and the generated parameter table. A file that matches no node is an orphan. The engine reports it as a library problem at load time, and the docs check fails on it. Changing a node's `display_name` keeps the same class and the same docs. Renaming the class itself changes the key, which also breaks saved workflows, so it is rare. The orphan report tells the author to rename the file, and the docs are not lost silently.
-- Node keys are unique within a library, which the engine already enforces. Only doc files can collide.
+- A page matches a node by its filename. Name it after the node's `class_name` (`LoadAudio.md`), or after its display name in snake_case (a node shown as "Pipeline Builder" gets `pipeline_builder.md`, and hyphens work too). Workflow nodes work the same way with `node_type`, and templates use their filename without `.py`.
+- The match is on the node, not the Python file. `load_audio.py` documents nothing by itself, and a file that defines several node classes gets one page per class. Spell a class name exactly: `loadaudio.md` works on a case-insensitive filesystem and fails on others, so the docs check flags it.
+- Pages can sit in subfolders of `docs/nodes/` however you like. The engine indexes them when the library loads, so a new or moved page shows up after a library refresh. The folders don't have to match your source folders or node categories, which change on their own.
+- Locale variants will be `<Key>.<locale>.md`, so `LoadAudio.fr.md` is the French page for `LoadAudio`. The engine splits a filename at its first dot, so that never reads as a node called `LoadAudio.fr`. Locales aren't in v1, and the engine ignores those files for now.
+- If two pages claim the same node, the one with the fewest folders wins, then the first path alphabetically. The engine reports a library problem naming both, and the docs check fails. Docs problems never stop a library from loading.
+- A node with no page still gets one, built from its description and the parameter table. A page that matches no node is an orphan: the engine reports it when the library loads, and the docs check fails on it. A page named after the class survives a display name change. A page named after the display name doesn't, so it becomes an orphan until someone renames it. Renaming the class itself changes the key, which also breaks saved workflows, so it's rare, and the orphan report points to the file.
 
 Library pages:
 
-- Everything under `docs/` outside the top-level `nodes/` folder is a library page. `nodes/` is reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A library page's title follows the title rule under File format.
+- Everything under `docs/` outside the top-level `nodes/`, `workflow_nodes/` and `workflows/` folders is a library page. Those three names are reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A folder whose name starts with a dot is never shown as pages. A library page's title follows the title rule under File format.
 
 - Navigation is the folder hierarchy. There is no navigation file. The panel shows folders and pages as they sit on disk, so adding a page adds an entry. A folder's title is its name with dashes and underscores turned into spaces and the first letter capitalized, so `color-management/` shows as "Color management".
 
@@ -189,8 +201,9 @@ Agents read the same docs as people, through the same requests.
 - Everything returned over MCP is untrusted content, because it comes from the library author. Tool descriptions say so, and an agent treats docs as information and never as instructions to follow.
 - MCP responses are capped at 64 KB, well below the 1 MB page limit. A longer page is cut with a truncation marker, and the tool takes an offset to read the rest.
 - Responses return raw markdown with no editor-specific markup. The generated parameter table is also returned as structured data, so an agent reads names, types, defaults, choices, and ranges without parsing markdown.
-- The sidebar agent can use library docs and skills. It discovers each library's `.agents/skills/` folder in addition to the workspace's, so one loader scans both.
-- Skills are optional. A skill is `.agents/skills/<name>/SKILL.md` at the library root, outside `docs/`, so `docs/` has no folder reserved for agents. Node pages say what something is, and skills say how to accomplish a task with the library. The list response returns skills flagged as such, with their `description`. The body is fetched on demand. `.agents/` is the home for any other agent-only content later. The folder is hidden in Finder and `ls`, so the scaffold command creates it and the authoring guide names it.
+- The sidebar agent can use library docs and skills. It discovers each library's `docs/.agents/skills/` folder in addition to the workspace's `.agents/skills/`, so one loader scans both.
+- Skills are optional. A skill is `docs/.agents/skills/<name>/SKILL.md`. Node pages say what something is, and skills say how to accomplish a task with the library. The list response returns skills flagged as such, with their `description`. The body is fetched on demand.
+- A library's skills come in two kinds, and the folder tells them apart. Skills for the agent that uses the library go in `docs/.agents/skills/`. Skills for agents that work on the library's code, like how to run the tests or follow the node doc format, go in `.agents/skills/` at the repo root, where coding agents already look. The sidebar agent never loads that folder, so a developer skill can't leak into a user's session.
 - The authoring guide asks authors to write the first paragraph of each page as a standalone summary and to keep `description` to one or two sentences.
 
 ### Editor
