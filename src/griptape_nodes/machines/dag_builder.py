@@ -121,6 +121,9 @@ class DagBuilder:
         if graph is None:
             graph = DirectedGraph()
             self.graphs[graph_name] = graph
+        # Checked on its own: cleanup_empty_graph_nodes drops a graph's node set but keeps the
+        # emptied graph, so a graph existing does not mean its node set does.
+        if graph_name not in self.graph_to_nodes:
             self.graph_to_nodes[graph_name] = set()
 
         def _add_node_recursive(current_node: BaseNode, visited: set[str], graph: DirectedGraph) -> None:
