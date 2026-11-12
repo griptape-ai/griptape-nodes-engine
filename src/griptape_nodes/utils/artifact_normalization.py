@@ -204,9 +204,10 @@ def normalize_artifact_input(
         return _normalize_string_input(artifact_input, artifact_type)
 
     # A serialized *Url* artifact dict carries the path or URL in its ``value``; the rest is
-    # display metadata the editor tracks alongside it. Hand that string to the branch above
-    # rather than rebuilding the artifact from the dict: it resolves the path,
-    # and builds the type this parameter declared. The declared type is what tells a path
+    # display metadata the editor tracks alongside it, plus any ``metadata`` / ``meta`` dict
+    # that nodes read back from the artifact's ``meta`` (Load 3D's snapshot ``imageUrl``).
+    # Hand that string to the branch above rather than rebuilding the artifact from the
+    # dict: it resolves the path, and builds the type this parameter declared. The declared type is what tells a path
     # apart from a payload -- a raw ``ImageArtifact`` dict holds base64 bytes in ``value``,
     # which is not a path and must be left alone. The check trusts the declared type, so a
     # data URI in a *Url* dict is knowingly let through; it fails to resolve as a path and
@@ -219,10 +220,26 @@ def normalize_artifact_input(
             # macro path or a missing file. The dict already declared the artifact type, so
             # build it from the value instead of letting a dict degrade into a bare string.
             if isinstance(normalized, str):
-                return artifact_type(normalized)
+                normalized = artifact_type(normalized)
+            meta = _dict_meta(artifact_input)
+            if meta:
+                normalized.meta = {**normalized.meta, **meta}
             return normalized
 
     return artifact_input
+
+
+def _dict_meta(artifact_dict: dict[str, Any]) -> dict[str, Any]:
+    """Return the artifact metadata a serialized artifact dict carries.
+
+    Griptape serializes it as ``meta``; the editor sends it as ``metadata``.
+    """
+    meta: dict[str, Any] = {}
+    for key in ("meta", "metadata"):
+        value = artifact_dict.get(key)
+        if isinstance(value, dict):
+            meta.update(value)
+    return meta
 
 
 def normalize_artifact_list(
