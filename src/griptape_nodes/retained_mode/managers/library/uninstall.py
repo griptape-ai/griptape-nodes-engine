@@ -91,6 +91,10 @@ class _Resolution:
     collateral_library_names: list[str] = field(default_factory=list)
     blocked_by: UninstallBlocker | None = None
     remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
+    # Whether the config entry names the very folder the uninstall deletes, and so stops
+    # naming anything once it is gone. True for a manifest or download entry, and for a scan
+    # root holding only this library; false for a scan root that outlives the delete.
+    entry_names_deleted_directory: bool = True
 
 
 @dataclass
@@ -156,7 +160,9 @@ class LibraryUninstall(EngineScoped):
             if config_failure is not None:
                 return config_failure
 
-            unloaded, unload_failure = self._uninstall_unload_from_registry(resolved)
+            unloaded, unload_failure = self._uninstall_unload_from_registry(
+                resolved, config_entry_removed=config_entry_removed
+            )
             if unload_failure is not None:
                 return unload_failure
 
@@ -164,7 +170,9 @@ class LibraryUninstall(EngineScoped):
                 resolved.library_name, resolved.library_path
             )
 
-            directory_deleted, delete_failure = await self._uninstall_delete_directory(resolved)
+            directory_deleted, delete_failure = await self._uninstall_delete_directory(
+                resolved, config_entry_removed=config_entry_removed, unloaded=unloaded
+            )
             if delete_failure is not None:
                 return delete_failure
 
@@ -180,7 +188,9 @@ class LibraryUninstall(EngineScoped):
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
         """Step 1 (least destructive): remove the config entry, if any names this exact copy."""
-        if resolved.classification.is_directory_entry:
+        # A scan root that outlives the delete still registers the libraries beside this one,
+        # so it stays. One that names the deleted folder itself is removed with it.
+        if not resolved.entry_names_deleted_directory:
             return False, None
         removed = self._remove_config_entry(resolved.classification)
         if not removed:
@@ -192,7 +202,7 @@ class LibraryUninstall(EngineScoped):
         return True, None
 
     def _uninstall_unload_from_registry(
-        self, resolved: _Resolution
+        self, resolved: _Resolution, *, config_entry_removed: bool
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
         """Step 2: unload from the in-memory registry, but only when THIS copy is the loaded one."""
         library_manager = self.engine.library_manager
@@ -207,15 +217,16 @@ class LibraryUninstall(EngineScoped):
             UnloadLibraryFromRegistryRequest(library_name=library_name)
         )
         if isinstance(unload_result, UnloadLibraryFromRegistryResultFailure):
+            done_so_far = "Its config entry was removed, but it" if config_entry_removed else "It"
             details = (
-                f"Attempted to uninstall Library '{library_name}'. Its config entry was removed, but "
-                f"it failed to unload from the registry: {unload_result.result_details}"
+                f"Attempted to uninstall Library '{library_name}'. {done_so_far} failed to unload "
+                f"from the registry: {unload_result.result_details}"
             )
             return False, UninstallLibraryResultFailure(result_details=details, failure_reason="unload_failed")
         return True, None
 
     async def _uninstall_delete_directory(
-        self, resolved: _Resolution
+        self, resolved: _Resolution, *, config_entry_removed: bool, unloaded: bool
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
         """Step 3 (most destructive): delete the install directory, or treat its absence as success."""
         if resolved.install_directory is None:
@@ -231,10 +242,20 @@ class LibraryUninstall(EngineScoped):
             )
         )
         if isinstance(delete_result, DeleteFileResultFailure):
+            # Only name the steps that actually ran, or a user troubleshooting this goes
+            # looking for a config edit that never happened.
+            undone = [
+                name
+                for name, happened in (("its config entry", config_entry_removed), ("its registry load", unloaded))
+                if happened
+            ]
+            if undone:
+                done_so_far = f"{' and '.join(undone).capitalize()} were removed, but its"
+            else:
+                done_so_far = "Its"
             details = (
-                f"Attempted to uninstall Library '{resolved.library_name}'. Its config entry and registry "
-                f"load were removed, but its folder at {resolved.install_directory} could not be "
-                f"deleted: {delete_result.result_details}"
+                f"Attempted to uninstall Library '{resolved.library_name}'. {done_so_far} folder at "
+                f"{resolved.install_directory} could not be deleted: {delete_result.result_details}"
             )
             return False, UninstallLibraryResultFailure(
                 result_details=details, failure_reason="directory_delete_failed"
@@ -354,8 +375,11 @@ class LibraryUninstall(EngineScoped):
         collateral_library_names = await self._collect_collateral_library_names(
             install_directory, exclude_manifest=resolved_library_path
         )
+        entry_names_deleted_directory = self._entry_names_deleted_directory(classification, install_directory)
         remaining_registrations = await self._remaining_registrations_for(
-            classification, exclude_manifest=resolved_library_path
+            classification,
+            exclude_manifest=resolved_library_path,
+            entry_is_removed=entry_names_deleted_directory,
         )
 
         return _Resolution(
@@ -366,20 +390,23 @@ class LibraryUninstall(EngineScoped):
             collateral_library_names=collateral_library_names,
             blocked_by=None,
             remaining_registrations=remaining_registrations,
+            entry_names_deleted_directory=entry_names_deleted_directory,
         )
 
     async def _remaining_registrations_for(
-        self, classification: _Classification, *, exclude_manifest: Path
+        self, classification: _Classification, *, exclude_manifest: Path, entry_is_removed: bool
     ) -> list[RemainingRegistration]:
         """What would still register this library once its files are gone.
 
         Only the one case an uninstall proceeds through and leaves behind: a scan-root entry kept
         for the libraries beside this one. An entry the engine cannot remove blocks the uninstall
-        instead, and one it can remove is removed, so neither reaches here.
+        instead, and one it can remove is removed, so neither reaches here -- hence
+        `entry_is_removed`, which must be the same answer step 1 acts on, or this would report
+        an entry that is about to be deleted.
         """
         remaining: list[RemainingRegistration] = []
 
-        if classification.registered_in == "register" and classification.is_directory_entry:
+        if not entry_is_removed and classification.registered_in == "register":
             sibling_names = await self._sibling_library_names(classification, exclude_manifest=exclude_manifest)
             if sibling_names:
                 remaining.append(
@@ -390,6 +417,17 @@ class LibraryUninstall(EngineScoped):
                 )
 
         return remaining
+
+    def _entry_names_deleted_directory(self, classification: _Classification, install_directory: Path) -> bool:
+        """Whether removing the install directory leaves this config entry naming nothing.
+
+        A scan-root entry is kept only when it outlives the delete, i.e. names a folder ABOVE
+        the one being removed. An entry naming the deleted folder itself must go with it, or
+        config keeps pointing at a path that no longer exists.
+        """
+        if not classification.is_directory_entry or classification.directory_path is None:
+            return True
+        return canonicalize_for_identity(classification.directory_path) == canonicalize_for_identity(install_directory)
 
     async def _sibling_library_names(self, classification: _Classification, *, exclude_manifest: Path) -> list[str]:
         """The OTHER libraries a shared directory entry registers, by name where one is known.

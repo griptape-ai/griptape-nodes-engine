@@ -438,6 +438,52 @@ class TestDirectoryEntryWithSiblings:
         assert any(isinstance(e, SharedDirectoryEntryRemaining) for e in preview.remaining_registrations)
 
 
+class TestDirectoryEntryNamingOneLibrary:
+    """A libraries_to_register entry naming the library's OWN folder, not a scan root above it.
+
+    The entry is a directory, so it classifies as a directory entry, but deleting the folder
+    leaves it naming a path that no longer exists. It has to go with the folder.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_naming_the_deleted_folder_is_removed_with_it(self, engine: Engine, workspace: Path) -> None:
+        lib_dir = workspace / "mylib"
+        manifest = _write_manifest(lib_dir, "My Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(lib_dir)])
+        _track(engine.library_manager, manifest, library_name="My Library", registered_path=str(lib_dir))
+
+        result = await _uninstall_after_preview(engine, "My Library", manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.directory_deleted is True
+        assert not await anyio.Path(lib_dir).exists()
+        # Keeping the entry would leave config naming a folder that is gone, which is the
+        # broken half-uninstalled state the whole request exists to avoid.
+        assert result.config_entry_removed is True
+        assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == []
+        assert result.remaining_registrations == []
+
+    @pytest.mark.asyncio
+    async def test_entry_naming_a_folder_of_several_goes_too(self, engine: Engine, workspace: Path) -> None:
+        """Two manifests inside the entry's own folder: the delete takes both, so the entry goes."""
+        lib_dir = workspace / "bundle"
+        manifest = _write_manifest(lib_dir, "Bundle Main")
+        nested = _write_manifest(lib_dir / "extra", "Bundle Extra")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(lib_dir)])
+        _track(engine.library_manager, manifest, library_name="Bundle Main", registered_path=str(lib_dir))
+        _track(engine.library_manager, nested, library_name="Bundle Extra", registered_path=str(lib_dir))
+
+        result = await _uninstall_after_preview(engine, "Bundle Main", manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert not await anyio.Path(lib_dir).exists()
+        assert result.collateral_library_names == ["Bundle Extra"]
+        # The sibling is deleted with the folder, so warning that the entry still registers it
+        # would point the user at an entry that is also gone.
+        assert result.config_entry_removed is True
+        assert result.remaining_registrations == []
+
+
 class TestDownloadProvisionedLibrary:
     """A libraries_to_download entry whose installed manifest is what the user clicked."""
 
