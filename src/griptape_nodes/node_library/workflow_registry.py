@@ -325,6 +325,14 @@ class OpenWorkflowRemovalError(WorkflowRegistryError):
     """The entry belongs to an open workflow, which has to be closed before it can be removed."""
 
 
+class WorkflowAddressError(Exception):
+    """A request's `workflow_id` and `workflow_name` don't name exactly one registered workflow."""
+
+
+class UnknownWorkflowAddressError(WorkflowAddressError):
+    """No registered workflow has the id or name a request gives."""
+
+
 class _EntryKeys(NamedTuple):
     """The path and names a registry entry answers to, derived from its file."""
 
@@ -405,6 +413,73 @@ class _WorkflowRegistry:
         if not self._is_workflow_id(candidate):
             return None
         return candidate
+
+    def suggested_file_stem(self, workflow: Workflow) -> str | None:
+        """The file stem `workflow` is named by before it has a file, or None if nothing file-safe is left.
+
+        A library workflow's unsaved copy takes the library file's stem. Any other workflow takes
+        its display name, with each run of characters a file name can't hold replaced by "_".
+        """
+        seed_source = self.seed_source(workflow)
+        if seed_source is not None and seed_source.absolute_path is not None:
+            return seed_source.absolute_path.stem
+        display_name = (workflow.metadata.name or "").strip()
+        sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
+        if not sanitized:
+            return None
+        return sanitized
+
+    def seed_source(self, workflow: Workflow) -> Workflow | None:
+        """The library workflow whose file the unsaved copy `workflow` builds from, or None.
+
+        None when `workflow` is saved, was not seeded from a library workflow, or that workflow is
+        gone or has no file.
+        """
+        if workflow.is_saved or workflow.seeded_from_workflow_id is None:
+            return None
+        library_workflow = self.find_by_id(workflow.seeded_from_workflow_id)
+        if library_workflow is None or library_workflow.file_path is None:
+            return None
+        return library_workflow
+
+    def resolve_address(self, *, workflow_id: str | None, workflow_name: str | None, action: str) -> Workflow:
+        """Return the workflow a request names by id, by legacy name, or by both when they agree.
+
+        `action` is the verb the request performs ("rename", "move"), for the error message.
+
+        Raises:
+            UnknownWorkflowAddressError: Nothing given names a workflow: the id, or the name, or both,
+                match none.
+            WorkflowAddressError: Neither is given, or the id and the name don't name the same
+                workflow, including when only one of them matches one.
+        """
+        if workflow_id is None:
+            if workflow_name is None:
+                msg = (
+                    f"Attempted to {action} a workflow. Failed because the request names no workflow. Pass workflow_id."
+                )
+                raise WorkflowAddressError(msg)
+            return self._resolve_name(workflow_name, action=action)
+        workflow = self._by_id.get(workflow_id)
+        by_name = None
+        if workflow_name is not None:
+            by_name = self.find_by_name(workflow_name)
+        if workflow is None and by_name is not None:
+            msg = (
+                f"Attempted to {action} workflow '{workflow_id}' named '{workflow_name}'. Failed because no "
+                "workflow has that id, though one has that name."
+            )
+            raise WorkflowAddressError(msg)
+        if workflow is None:
+            msg = f"Attempted to {action} workflow '{workflow_id}'. Failed because no workflow has that id."
+            raise UnknownWorkflowAddressError(msg)
+        if workflow_name is not None and by_name is not workflow:
+            msg = (
+                f"Attempted to {action} workflow '{workflow_id}' named '{workflow_name}'. Failed because that id "
+                f"belongs to '{workflow.name}', not '{workflow_name}'."
+            )
+            raise WorkflowAddressError(msg)
+        return workflow
 
     def find_by_path(self, path: str | Path) -> Workflow | None:
         """Return the entry for the file at `path`, or None. Accepts any path the entry is known by."""
@@ -568,6 +643,22 @@ class _WorkflowRegistry:
             listed=listed,
         )
         self._add(workflow)
+        return workflow
+
+    def register_unsaved_copy(self, source: Workflow) -> Workflow:
+        """Register a new unsaved workflow seeded from `source`, which is how a library workflow opens.
+
+        The copy has an id of its own and no file. It takes the source's display name, description,
+        image and workflow shape, is neither library-provided nor a template, and records the
+        source's id as its `seeded_from_workflow_id`. It is unlisted, like a file registered only
+        because it was opened, so the workflow list doesn't show it beside the source until it is
+        saved.
+        """
+        workflow = self.register_unsaved(source.metadata.name, listed=False)
+        workflow.metadata.description = source.metadata.description
+        workflow.metadata.image = source.metadata.image
+        workflow.metadata.workflow_shape = source.metadata.workflow_shape
+        workflow.seeded_from_workflow_id = source.workflow_id
         return workflow
 
     def set_file_path(self, workflow: Workflow, new_path: str | Path) -> None:
@@ -801,6 +892,13 @@ class _WorkflowRegistry:
         """Get all workflows that are branches of the specified workflow."""
         return [workflow.name for workflow in self._by_id.values() if workflow.metadata.branched_from == workflow_name]
 
+    def _resolve_name(self, workflow_name: str, *, action: str) -> Workflow:
+        workflow = self.find_by_name(workflow_name)
+        if workflow is None:
+            msg = f"Attempted to {action} workflow '{workflow_name}'. Failed because no workflow has that name."
+            raise UnknownWorkflowAddressError(msg)
+        return workflow
+
     def _add(self, workflow: Workflow) -> None:
         keys = self._entry_keys(workflow.workflow_id, workflow.absolute_path, [])
         self._raise_if_taken(workflow, keys, self._by_id.values())
@@ -1005,6 +1103,11 @@ class Workflow:
         # True when `metadata` was made up for a header that could not be read, so it must not be
         # written back to a file. A save replaces it with real metadata.
         self.metadata_is_placeholder = metadata_is_placeholder
+        # The library workflow this one was opened as a copy of (`register_unsaved_copy`), or None.
+        self.seeded_from_workflow_id: str | None = None
+        # True for a library workflow's unsaved copy that a clean slate run opened, which the next
+        # clean slate run of that library workflow closes. A copy a tab opened stays open.
+        self.opened_by_clean_slate_run = False
         # Path in the registry's form, legacy names, and path keys: the registry sets them whenever the paths change.
         self._keys = _NO_KEYS
 

@@ -31,7 +31,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
-from tests.workflow_context import empty_workflow_registry
+from tests.workflow_context import bind, empty_workflow_registry, handle_and_bind, unbind
 
 
 def _file_path(context_manager: ContextManager) -> str | None:
@@ -300,8 +300,9 @@ class TestWorkflowWorkingDirectory:
     """
 
     def _resolve_outputs(self, engine: Engine) -> Path:
-        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node would."""
-        result = engine.handle_request(
+        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node in the test's one open workflow would."""
+        (workflow,) = engine.open_workflows.all_open()
+        result = workflow.handle_request(
             GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir?:/}outputs/img.png"), variables={})
         )
         assert isinstance(result, GetPathForMacroResultSuccess)
@@ -319,8 +320,8 @@ class TestWorkflowWorkingDirectory:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+                result = handle_and_bind(
+                    engine, SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
                 # The folder is NOT the registry key: the workflow is still unsaved.
@@ -330,6 +331,7 @@ class TestWorkflowWorkingDirectory:
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
+                unbind()
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
@@ -347,13 +349,14 @@ class TestWorkflowWorkingDirectory:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                result = handle_and_bind(engine, SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
                 assert context_manager.get_current_workflow().working_directory is None
 
                 assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
+                unbind()
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
@@ -403,7 +406,8 @@ class TestWorkflowWorkingDirectory:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
 
-                resolved = engine.handle_request(
+                assert result.workflow_id is not None
+                resolved = engine.open_workflows.get(result.workflow_id).handle_request(
                     GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
                 )
 
@@ -429,8 +433,8 @@ class TestWorkflowWorkingDirectory:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory="shots/sh020")
+                result = handle_and_bind(
+                    engine, SetWorkflowContextRequest(display_name="Untitled", working_directory="shots/sh020")
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
 
@@ -439,6 +443,7 @@ class TestWorkflowWorkingDirectory:
                 assert self._resolve_outputs(engine) == expected / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
+                unbind()
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
@@ -459,8 +464,8 @@ class TestWorkflowWorkingDirectory:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+                result = handle_and_bind(
+                    engine, SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
@@ -474,6 +479,7 @@ class TestWorkflowWorkingDirectory:
                 assert self._resolve_outputs(engine) == saved_to.parent / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
+                unbind()
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
@@ -568,23 +574,10 @@ class TestWorkflowWorkingDirectory:
 
 
 class TestUnsavedWorkflowNames:
-    """An "unsaved:" name only opens a new workflow when it carries a workflow id the engine could mint."""
+    """An "unsaved:" name the registry does not hold fails like any other name, whatever follows the prefix."""
 
-    def test_an_unsaved_name_with_a_hex_id_registers_the_workflow(self, engine: Engine) -> None:
-        name = f"unsaved:{uuid.uuid4().hex}"
-
-        with empty_workflow_registry(engine):
-            try:
-                result = engine.handle_request(SetWorkflowContextRequest(workflow_name=name))
-
-                assert isinstance(result, SetWorkflowContextSuccess)
-                assert engine.workflow_registry.has_workflow_with_name(name)
-            finally:
-                while engine.context_manager.has_current_workflow():
-                    engine.context_manager.pop_workflow()
-
-    @pytest.mark.parametrize("suffix", [str(uuid.UUID(int=1)), "abc-123", ""])
-    def test_an_unsaved_name_without_a_hex_id_is_refused(self, engine: Engine, suffix: str) -> None:
+    @pytest.mark.parametrize("suffix", ["0123456789abcdef0123456789abcdef", str(uuid.UUID(int=1)), "abc-123", ""])
+    def test_an_unregistered_unsaved_name_is_refused(self, engine: Engine, suffix: str) -> None:
         name = f"unsaved:{suffix}"
 
         with empty_workflow_registry(engine):
@@ -596,18 +589,7 @@ class TestUnsavedWorkflowNames:
 
 
 class TestSetWorkflowContextUnsavedNames:
-    """An unregistered "unsaved:<id>" name registers an unsaved workflow under that id; any other unregistered name fails."""
-
-    def test_an_unsaved_name_registers_a_workflow_with_its_id(self, engine: Engine) -> None:
-        workflow_id = "0123456789abcdef0123456789abcdef"
-        try:
-            result = engine.handle_request(SetWorkflowContextRequest(workflow_name=f"unsaved:{workflow_id}"))
-
-            assert isinstance(result, SetWorkflowContextSuccess)
-            assert result.workflow_id == workflow_id
-            assert result.workflow_name == f"unsaved:{workflow_id}"
-        finally:
-            engine.context_manager.pop_workflow()
+    """A name the registry does not hold fails."""
 
     def test_a_name_no_workflow_has_fails(self, engine: Engine) -> None:
         result = engine.handle_request(SetWorkflowContextRequest(workflow_name="shots/sh010_typo"))
@@ -756,6 +738,8 @@ class TestEnsureWorkflowAndFlowRequest:
         )
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess)
+        assert result.workflow_id is not None
+        bind(engine.open_workflows.get(result.workflow_id))
         assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
         assert result.workflow_id == context_manager.get_current_workflow_id()
         assert context_manager.get_current_workflow().metadata.name == "my_workflow"

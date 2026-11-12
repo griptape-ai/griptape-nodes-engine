@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -69,7 +70,7 @@ async def test_group_runs_independent_nodes_in_parallel(
     config_manager.set_config_value("max_nodes_in_parallel", 5)
 
     try:
-        engine.context_manager.push_workflow(workflow_name="repro_4920_wf")
+        bind(engine.context_manager.open_workflow(workflow_name="repro_4920_wf"))
 
         parent_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
