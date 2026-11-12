@@ -469,7 +469,7 @@ class LibraryModuleLoading(EngineScoped):
             return False
         return bool(self.engine.config_manager.get_config_value(LIBRARY_LAZY_NODE_LOADING_KEY, default=True))
 
-    def attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
+    def attempt_load_nodes_from_library(
         self,
         library_data: LibrarySchema,
         library: Library,
@@ -489,6 +489,26 @@ class LibraryModuleLoading(EngineScoped):
                 errors surface here as library problems. When True, node types are registered
                 with a deferred loader and their modules are imported on first use instead.
         """
+        # Artifact providers the library registers while it loads are attributed to it, so they
+        # unload with it.
+        with self.engine.artifact_manager.attributing_providers_to_library(library_data.name):
+            self._load_nodes_from_library(
+                library_data=library_data,
+                library=library,
+                base_dir=base_dir,
+                library_info=library_info,
+                lazy_loading=lazy_loading,
+            )
+
+    def _load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
+        self,
+        library_data: LibrarySchema,
+        library: Library,
+        base_dir: Path,
+        library_info: LibraryInfo,
+        *,
+        lazy_loading: bool,
+    ) -> None:
         any_nodes_loaded_successfully = False
 
         # Check if library is in old engine data location

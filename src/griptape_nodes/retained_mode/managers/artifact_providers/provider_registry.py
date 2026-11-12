@@ -69,6 +69,30 @@ class ProviderRegistry(EngineScoped):
 
         self._friendly_name_to_provider_class[friendly_name_lower] = provider_class
 
+    def unregister_provider(self, provider_class: type[BaseArtifactProvider]) -> None:
+        """Remove a provider class, its cached instance, and its registered preview generators.
+
+        Args:
+            provider_class: The provider class to remove. A class that isn't registered is ignored.
+        """
+        if provider_class not in self._provider_classes:
+            return
+
+        self._provider_classes.remove(provider_class)
+        self._provider_instances.pop(provider_class, None)
+        self._provider_preview_generators.pop(provider_class, None)
+
+        for file_format in list(self._file_format_to_provider_class):
+            format_provider_classes = self._file_format_to_provider_class[file_format]
+            if provider_class in format_provider_classes:
+                format_provider_classes.remove(provider_class)
+            if not format_provider_classes:
+                del self._file_format_to_provider_class[file_format]
+
+        for friendly_name_lower, registered_class in list(self._friendly_name_to_provider_class.items()):
+            if registered_class is provider_class:
+                del self._friendly_name_to_provider_class[friendly_name_lower]
+
     def get_provider_class_by_friendly_name(self, friendly_name: str) -> type[BaseArtifactProvider] | None:
         """Get provider class by friendly name (case-insensitive).
 

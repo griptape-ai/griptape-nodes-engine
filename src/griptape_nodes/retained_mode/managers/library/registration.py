@@ -291,6 +291,16 @@ class LibraryRegistrar(EngineScoped):
                 request.library_name,
             )
 
+        # Remove the artifact providers this library registered, so its next load can register its
+        # current provider classes rather than failing on the names its previous load left behind.
+        removed_providers = self.engine.artifact_manager.unregister_providers_for_library(request.library_name)
+        if removed_providers:
+            logger.debug(
+                "Removed %d artifact provider(s) belonging to library '%s' as it unloaded.",
+                removed_providers,
+                request.library_name,
+            )
+
         # Clean up all stable module aliases for this library. Note first whether any of its node
         # modules had actually been imported: if so, this process is stuck with that code and the
         # library's next load cannot replace it.
