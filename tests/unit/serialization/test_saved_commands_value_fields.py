@@ -37,7 +37,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.variable_types import FlowVariable
 from griptape_nodes.serialization.commands import ALLOWED_ELEMENT_MODIFICATION_COMMAND_TYPES
 from griptape_nodes.serialization.values import DisplayValue
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -125,7 +124,7 @@ def clean_object_state(engine: Engine) -> Generator[None, None, None]:
 @pytest.mark.usefixtures("clean_object_state")
 def test_saved_placeholders_are_none(engine: Engine) -> None:
     """The reason the placeholder fields may stay DisplayValue: a save never puts a value in them."""
-    bind(engine.context_manager.open_workflow(workflow_name="wf_placeholders"))
+    engine.context_manager.push_workflow(workflow_name="wf_placeholders")
     flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="flow_a", set_as_new_context=True))
     assert isinstance(flow, CreateFlowResultSuccess)
     node = engine.handle_request(CreateNodeRequest(node_type="TestNodeA", node_name="node_a"))

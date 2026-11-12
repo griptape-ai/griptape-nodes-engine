@@ -48,7 +48,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -129,7 +128,7 @@ def _deserialize_into_fresh_context(
     keeps the restored graph from colliding on names with whatever the test built to serialize.
     """
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    bind(engine.context_manager.open_workflow(workflow_name=workflow_name))
+    engine.context_manager.push_workflow(workflow_name=workflow_name)
     result = engine.handle_request(
         DeserializeFlowFromCommandsRequest(
             serialized_flow_commands=serialized_flow_commands, pop_flow_context_after=pop_flow_context_after
@@ -144,7 +143,7 @@ class TestIncludeCreateFlowCommand:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_true_includes_create_flow_request(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_include_true"))
+        engine.context_manager.push_workflow(workflow_name="wf_include_true")
         flow_name = _create_flow(engine, "parent")
 
         serialized = _serialize(engine, flow_name, include_create_flow_command=True)
@@ -154,7 +153,7 @@ class TestIncludeCreateFlowCommand:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_false_omits_initialization_command(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_include_false"))
+        engine.context_manager.push_workflow(workflow_name="wf_include_false")
         flow_name = _create_flow(engine, "parent")
 
         serialized = _serialize(engine, flow_name, include_create_flow_command=False)
@@ -167,7 +166,7 @@ class TestSerializeUnknownFlow:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_unknown_flow_name_returns_failure(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_unknown"))
+        engine.context_manager.push_workflow(workflow_name="wf_unknown")
 
         result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name="does_not_exist"))
 
@@ -179,7 +178,7 @@ class TestSubflowAggregation:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_subflow_appears_in_sub_flows_commands_with_its_nodes(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_subflow_shape"))
+        engine.context_manager.push_workflow(workflow_name="wf_subflow_shape")
         parent_name = _create_flow(engine, "parent")
         child_name = _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
         _create_node(engine, "ChildNode", "child_node")
@@ -194,7 +193,7 @@ class TestSubflowAggregation:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_node_types_used_aggregates_and_dedupes_across_subflows(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_node_types_used"))
+        engine.context_manager.push_workflow(workflow_name="wf_node_types_used")
         parent_name = _create_flow(engine, "parent")
         _create_node(engine, "SharedTypeNode", "parent_node_1", library="lib_shared")
         _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
@@ -209,7 +208,7 @@ class TestSubflowAggregation:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_node_dependencies_aggregates_from_nodes_and_subflows(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_node_dependencies"))
+        engine.context_manager.push_workflow(workflow_name="wf_node_dependencies")
         parent_name = _create_flow(engine, "parent")
         _create_node(engine, "ParentDepNode", "parent_node", library="lib_parent_only")
         _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
@@ -226,7 +225,7 @@ class TestConnectionAggregationAndDedup:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_cross_boundary_edge_is_wired_exactly_once_on_deserialize(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_cross_boundary"))
+        engine.context_manager.push_workflow(workflow_name="wf_cross_boundary")
         parent_name = _create_flow(engine, "parent")
         source_name = _create_node(engine, "SourceNode", "source_node")
         _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
@@ -287,7 +286,7 @@ class TestNodeCreationBeforeConnectionWiring:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_deserializing_a_deeply_nested_cross_boundary_edge_succeeds(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_deep_nesting"))
+        engine.context_manager.push_workflow(workflow_name="wf_deep_nesting")
         parent_name = _create_flow(engine, "parent")
         source_name = _create_node(engine, "SourceNode", "source_node")
         _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
@@ -310,7 +309,7 @@ class TestSetParameterValueCommandsKeyedByNodeUuid:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_value_set_on_a_node_is_keyed_by_that_nodes_uuid_and_restored(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_set_value_keying"))
+        engine.context_manager.push_workflow(workflow_name="wf_set_value_keying")
         parent_name = _create_flow(engine, "parent")
         node_name = _create_node(engine, "ValueNode", "value_node")
         _set_value(engine, node_name, "payload", value="distinctive-value-123")
@@ -336,7 +335,7 @@ class TestNodeNameMappings:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_mappings_cover_parent_and_subflow_nodes(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_name_mappings"))
+        engine.context_manager.push_workflow(workflow_name="wf_name_mappings")
         parent_name = _create_flow(engine, "parent")
         parent_node_name = _create_node(engine, "ParentNode", "parent_node")
         _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
@@ -356,7 +355,7 @@ class TestControlAndDataConnectionsRoundTrip:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_control_and_data_edges_both_survive_with_direction(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_control_and_data"))
+        engine.context_manager.push_workflow(workflow_name="wf_control_and_data")
         parent_name = _create_flow(engine, "parent")
         upstream_name = _create_node(engine, "UpstreamNode", "upstream_node")
         downstream_name = _create_node(engine, "DownstreamNode", "downstream_node")
@@ -393,7 +392,7 @@ class TestDeserializeFailureCleanup:
         (a real missing node type still succeeds as an ErrorProxyNode), so it is the way to force
         ``_deserialize_one_node`` into its failure branch deterministically.
         """
-        bind(engine.context_manager.open_workflow(workflow_name="wf_deserialize_cleanup"))
+        engine.context_manager.push_workflow(workflow_name="wf_deserialize_cleanup")
         parent_name = _create_flow(engine, "parent")
         serialized = _serialize(engine, parent_name)
         assert serialized.serialized_node_commands == []
@@ -411,7 +410,7 @@ class TestDeserializeFailureCleanup:
         broken_serialized = replace(serialized, serialized_node_commands=[failing_node_command])
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow(workflow_name="wf_deserialize_cleanup_restored"))
+        engine.context_manager.push_workflow(workflow_name="wf_deserialize_cleanup_restored")
         result = engine.handle_request(DeserializeFlowFromCommandsRequest(serialized_flow_commands=broken_serialized))
 
         assert isinstance(result, DeserializeFlowFromCommandsResultFailure)
@@ -423,12 +422,12 @@ class TestPopFlowContextAfter:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_true_pops_the_pushed_flow_context(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_pop_true"))
+        engine.context_manager.push_workflow(workflow_name="wf_pop_true")
         parent_name = _create_flow(engine, "parent")
         serialized = _serialize(engine, parent_name)
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow(workflow_name="wf_pop_true_restored"))
+        engine.context_manager.push_workflow(workflow_name="wf_pop_true_restored")
         assert not engine.context_manager.has_current_flow()
 
         result = engine.handle_request(
@@ -440,12 +439,12 @@ class TestPopFlowContextAfter:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_false_leaves_the_new_flow_on_the_context_stack(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_pop_false"))
+        engine.context_manager.push_workflow(workflow_name="wf_pop_false")
         parent_name = _create_flow(engine, "parent")
         serialized = _serialize(engine, parent_name)
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow(workflow_name="wf_pop_false_restored"))
+        engine.context_manager.push_workflow(workflow_name="wf_pop_false_restored")
         assert not engine.context_manager.has_current_flow()
 
         result = engine.handle_request(
@@ -463,7 +462,7 @@ class TestUniqueValuePoolSharedAcrossSubtree:
 
     @pytest.mark.usefixtures("clean_object_state")
     def test_shared_value_across_flow_boundary_appears_once_in_pool(self, engine: Engine) -> None:
-        bind(engine.context_manager.open_workflow(workflow_name="wf_shared_value_pool"))
+        engine.context_manager.push_workflow(workflow_name="wf_shared_value_pool")
         parent_name = _create_flow(engine, "parent")
         parent_node_name = _create_node(engine, "ParentValueNode", "parent_value_node")
         _set_value(engine, parent_node_name, "payload", value="shared-across-boundary")

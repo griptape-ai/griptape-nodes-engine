@@ -41,15 +41,10 @@ class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 @dataclass
 @PayloadRegistry.register
 class WorkflowNotNamedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The request names no workflow it can act on, so it did nothing.
+    """The request names no workflow it can act on, so it was not handled.
 
     The one failure for every request that acts on a workflow (`RequestScope.WORKFLOW`) but names
-    none on its envelope, and for `EnsureWorkflowAndFlowRequest` naming none while several are
-    open. A client subscribed to the request's own failure type still receives it:
-    the result envelope carries `request_type`, and the bridge routes on that.
-
-    Args:
-        open_workflows: Every workflow the engine has open, as ListOpenWorkflowsRequest lists them.
+    none, or names nothing while none or several are open, and for a request in
+    `ONLY_OPEN_UNTIL_CLIENTS_NAME` that names nothing while several are open. A client subscribed to the request's own failure type
+    still receives it: the result envelope carries `request_type`, and the bridge routes on that.
     """
-
-    open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)

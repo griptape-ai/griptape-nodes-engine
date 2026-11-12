@@ -33,7 +33,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowRequest,
     ImportWorkflowResultSuccess,
 )
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -60,7 +59,7 @@ def _write_grouped_workflow_file(engine: Engine, library_json: Path, workflow_pa
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    bind(engine.context_manager.open_workflow(workflow_name="grouped_inner_workflow"))
+    engine.context_manager.push_workflow(workflow_name="grouped_inner_workflow")
 
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=False)
@@ -132,7 +131,7 @@ async def test_import_binds_to_top_level_flow_not_group_body(
     workflow_name = import_workflow_result.workflow_name
 
     # Fresh parent flow to import into.
-    bind(engine.context_manager.open_workflow(workflow_name="parent_workflow"))
+    engine.context_manager.push_workflow(workflow_name="parent_workflow")
     parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )

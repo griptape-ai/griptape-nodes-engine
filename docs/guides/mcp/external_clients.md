@@ -164,11 +164,9 @@ Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP
 Tool calls that build or change a workflow act on one open workflow. A client names it in one of two ways:
 
 - **A header.** Send the workflow's id in an `X-Griptape-Workflow-Id` header. Every tool call acts on that workflow, including each request inside `EventRequestBatch`. A workflow keeps its id when it is saved. `ListOpenWorkflowsRequest` lists every open workflow with its id.
-- **The session's own workflow.** A client that sends no header picks one with `OpenWorkflowRequest`: name an open workflow's `workflow_id` to work in it, or set `create_flow` to `true` to start a new one. Later calls in the MCP session act on that workflow, or on the `open_workflow` of a later result that reports one, such as from `SetWorkflowContextRequest`.
+- **The session's own workflow.** A client that sends no header can open a workflow with `OpenWorkflowRequest`. Name an open workflow's `workflow_id` to work in it: it comes back with `already_open` set and nothing about it changes. Name none, with `create_flow` set to `true`, to start a new one. Later calls in the same MCP session act on that workflow. Any call that reports the workflow it opened in `open_workflow` does the same, such as `SetWorkflowContextRequest`, or `EnsureWorkflowAndFlowRequest` when it opens one.
 
-A call whose workflow has closed fails with `WorkflowNotOpenResultFailure`, which lists the open workflows. A session keeps its workflow after another client closes it, so its calls fail until it opens another. `CloseWorkflowRequest` closes the workflow its `workflow_id` names, whatever the header says.
-
-A call with neither a header nor a session workflow acts on no workflow, so one that needs a workflow fails even while only one is open. The exception is `EnsureWorkflowAndFlowRequest`, which uses the only open workflow and makes it the session's.
+When the workflow a call acts on isn't open, such as after its tab was closed, the call fails with `WorkflowNotOpenResultFailure`. Its `open_workflows` lists the workflows that are open, so you can open one of them with `OpenWorkflowRequest`. A session keeps naming its own workflow after it closes, so every call fails this way until the session opens another, unless the session closed it itself with `CloseWorkflowRequest` or `ClearAllObjectStateRequest`. To close a workflow, send `CloseWorkflowRequest` with its `workflow_id`. It closes that workflow whichever one the header or the session names. A call with neither a header nor a workflow of its session's own acts on the workflow that's open in the engine.
 
 ## Parameter values
 

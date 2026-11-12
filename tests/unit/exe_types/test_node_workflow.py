@@ -17,7 +17,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultSuccess,
@@ -161,4 +160,5 @@ class TestNodeEngine:
         with engine.bind_workflow(workflow):
             result = node._handle_request_in_workflow(GetTopLevelFlowRequest())
 
-        assert isinstance(result, WorkflowNotNamedResultFailure)
+        assert isinstance(result, GetTopLevelFlowResultSuccess)
+        assert result.flow_name is None

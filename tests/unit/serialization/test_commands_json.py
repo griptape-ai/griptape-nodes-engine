@@ -57,7 +57,6 @@ from griptape_nodes.retained_mode.events.parameter_events import AddParameterToN
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY, _serialize_flow
 from griptape_nodes.serialization.commands import CommandsFormatError, decode_commands, encode_commands
 from griptape_nodes.serialization.values import TYPE_KEY, ValueEncodeError, dump_json, is_plain_data
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -217,7 +216,7 @@ class TestFlowCommandsJson:
     def test_restored_commands_rebuild_the_flow(self, engine: Engine, flow_commands: SerializedFlowCommands) -> None:
         text = json.dumps(encode_commands(flow_commands))
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow(workflow_name="restored"))
+        engine.context_manager.push_workflow(workflow_name="restored")
 
         result = engine.handle_request(
             DeserializeFlowFromCommandsRequest(
@@ -465,7 +464,7 @@ class TestImageMetadata:
         image_path = tmp_path / "workflow.png"
         Image.new("RGB", (4, 4)).save(image_path, format="PNG", pnginfo=info)
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        bind(engine.context_manager.open_workflow(workflow_name="restored"))
+        engine.context_manager.push_workflow(workflow_name="restored")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
 
         result = engine.handle_request(

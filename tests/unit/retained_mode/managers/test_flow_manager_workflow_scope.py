@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelAllRunsRequest,
     CancelRunRequest,
+    ListRunsRequest,
     StartLocalSubflowRequest,
     StartLocalSubflowResultFailure,
 )
@@ -38,7 +39,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
@@ -58,7 +58,6 @@ from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -66,13 +65,18 @@ if TYPE_CHECKING:
 
 
 def _open_workflow(engine: Engine) -> WorkflowRuntime:
-    bind(engine.context_manager.open_workflow(workflow_name="open"))
+    engine.context_manager.push_workflow(workflow_name="open")
     return engine.current_workflow()
 
 
-# Answers with no workflow, and uses the one it is handed: only `deserialize` builds a flow.
+# They answer with no workflow, and use the one they are handed.
 _OPTIONAL_WORKFLOW_REQUESTS = {
+    GetTopLevelFlowRequest,
+    ListFlowsInFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
+    CancelRunRequest,
+    CancelAllRunsRequest,
+    ListRunsRequest,
 }
 
 
@@ -103,7 +107,7 @@ class TestFlowManagerScopes:
 
 
 class TestTopLevelFlowWithNoEnvelopeId:
-    """A request that names no workflow acts on the one its caller is bound to, else fails."""
+    """The editor names no workflow yet, and reads `flow_name=None` as "nothing is loaded"."""
 
     def test_answers_for_the_only_open_workflow(self, engine: Engine) -> None:
         _open_workflow(engine)
@@ -114,14 +118,15 @@ class TestTopLevelFlowWithNoEnvelopeId:
         assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
         assert result.flow_name == flow_name
 
-    def test_fails_with_nothing_open(self, engine: Engine) -> None:
+    def test_answers_none_with_nothing_open(self, engine: Engine) -> None:
         result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
 
-        assert isinstance(result, WorkflowNotNamedResultFailure), result.result_details
+        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
+        assert result.flow_name is None
 
 
 class TestCancelWithNoEnvelopeId:
-    """Cancelling binds the workflow it is handed: nodes' own cancellation reads the binding."""
+    """Cancelling binds the open workflow it falls back to: nodes' own cancellation reads the binding."""
 
     @pytest.mark.asyncio
     async def test_cancelling_every_run_binds_the_only_open_workflow(self, engine: Engine) -> None:

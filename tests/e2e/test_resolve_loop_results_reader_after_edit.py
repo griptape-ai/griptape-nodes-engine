@@ -39,7 +39,6 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -97,7 +96,7 @@ async def test_resolving_results_reader_after_editing_an_outside_input_reruns_th
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    bind(engine.context_manager.open_workflow(workflow_name="resolve_results_reader_wf"))
+    engine.context_manager.push_workflow(workflow_name="resolve_results_reader_wf")
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="LoopFlow", set_as_new_context=False)
     )

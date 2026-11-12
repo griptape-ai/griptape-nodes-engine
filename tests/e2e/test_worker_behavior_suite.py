@@ -53,7 +53,6 @@ from griptape_nodes.retained_mode.events.project_events import ActivateWorkspace
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
 from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
-from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -85,7 +84,7 @@ def _make(node_type: str, name: str) -> BaseNode:
         node_type=node_type, name=name, specific_library_name=WORKER_BEHAVIOR_LIBRARY_NAME
     )
     if not current_engine().context_manager.has_current_workflow():
-        bind(current_engine().context_manager.open_workflow(workflow_name=f"wf_{name}"))
+        current_engine().context_manager.push_workflow(workflow_name=f"wf_{name}")
     current_engine().object_manager.add_object_by_name_in(current_engine().current_workflow(), name, node)
     return node
 
@@ -98,7 +97,7 @@ def _make_in_flow(node_type: str, name: str) -> BaseNode:
     """
     engine = current_engine()
     if not engine.context_manager.has_current_workflow():
-        bind(engine.context_manager.open_workflow(workflow_name="worker_behavior_workflow"))
+        engine.context_manager.push_workflow(workflow_name="worker_behavior_workflow")
     if engine.object_manager.attempt_get_object_by_name(_CANVAS_FLOW_NAME) is None:
         flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name=_CANVAS_FLOW_NAME, set_as_new_context=False)

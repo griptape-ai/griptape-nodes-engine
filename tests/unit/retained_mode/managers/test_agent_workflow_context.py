@@ -38,7 +38,6 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _render_node_types,
     _WorkflowContext,
 )
-from tests.workflow_context import open_and_bind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -231,7 +230,7 @@ class TestWorkflowContext:
 
     @pytest.mark.asyncio
     async def test_open_flow_gives_its_summary(self, engine: Engine, chat_manager: AgentManager) -> None:
-        open_and_bind(engine, "chat_context_wf")
+        engine.context_manager.push_workflow(workflow_name="chat_context_wf")
         flow = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True)
         )
@@ -266,7 +265,7 @@ class TestWorkflowContext:
     async def test_flow_that_cannot_be_rendered_is_left_out(
         self, engine: Engine, chat_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        open_and_bind(engine, "chat_context_wf")
+        engine.context_manager.push_workflow(workflow_name="chat_context_wf")
         flow = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="main", set_as_new_context=True)
         )

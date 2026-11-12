@@ -437,9 +437,8 @@ clients' included.
 
 `StartFlowRequest` holds the call until the run finishes or errors. A subsequent
 `StartFlowRequest` waits for that run to finish, then starts. `ListRunsRequest` shows the
-workflow's run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a
-waiting run, and `CancelAllRunsRequest` cancels every run of the workflow. A run request's
-result carries its `run_id`.
+run in progress and the runs waiting; `CancelRunRequest(run_id=...)` withdraws a waiting run,
+and `CancelAllRunsRequest` cancels everything. A run request's result carries its `run_id`.
 
 ## Tool Cheat Sheet
 
