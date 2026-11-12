@@ -3583,6 +3583,17 @@ class NodeManager(EngineScoped):
             return await flow_mgr.join_run_in_progress(spec)
         return await flow_mgr.start_run(spec)
 
+    @staticmethod
+    def _resolve_failure_details(node_name: str, error: Exception) -> str:
+        """Describe an exception raised while starting or joining a node's run."""
+        # A run that fails before it begins re-raises as a bare RuntimeError wrapping the original.
+        if type(error) is RuntimeError and isinstance(error.__cause__, Exception):
+            error = error.__cause__
+        # The run's own RuntimeError/ValueError messages already name the node and the cause.
+        if isinstance(error, (RuntimeError, ValueError)):
+            return str(error)
+        return f"Attempted to run '{node_name}'. Failed with an unexpected {type(error).__name__}: {error}"
+
     async def execute_resolve_node(  # noqa: C901, PLR0911
         self, workflow: WorkflowRuntime, node: BaseNode, flow: ControlFlow, *, debug_mode: bool
     ) -> ResultPayload:
@@ -3633,11 +3644,7 @@ class NodeManager(EngineScoped):
         try:
             await self.engine.flow_manager.resolve_singular_node(workflow, flow, node, debug_mode=debug_mode)
         except Exception as e:
-            # The run's own RuntimeError/ValueError messages already name the node and the cause.
-            if isinstance(e, (RuntimeError, ValueError)):
-                details = str(e)
-            else:
-                details = f"Attempted to run '{node_name}'. Failed with an unexpected {type(e).__name__}: {e}"
+            details = self._resolve_failure_details(node_name, e)
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
         details = f'Starting to resolve "{node_name}" in "{flow_name}"'
         return ResolveNodeResultSuccess(result_details=details)
