@@ -535,6 +535,39 @@ class TestUnwritableConfigLayer:
         assert preview.blocked_by.config_key == LIBRARIES_TO_REGISTER_KEY
 
     @pytest.mark.asyncio
+    async def test_shadowed_scan_root_is_not_refused(self, engine: Engine, workspace: Path, tmp_path: Path) -> None:
+        """A scan root stays put, so an unwritable layer does not stop the uninstall.
+
+        Refusing would block an uninstall the engine can finish by deleting the library's own
+        subfolder, and would tell the user to remove a shared entry that registers its siblings.
+        """
+        config = engine.config_manager
+        libs_root = workspace / "libs"
+        manifest = _write_manifest(libs_root / "lib_a", "Library A")
+        sibling = _write_manifest(libs_root / "lib_b", "Library B")
+
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        (project_dir / "griptape_nodes_config.json").write_text(
+            json.dumps({"app_events": {"on_app_initialization_complete": {"libraries_to_register": [str(libs_root)]}}}),
+            encoding="utf-8",
+        )
+        config.load_project_config(project_dir)
+        config.load_configs()
+        _track(engine.library_manager, manifest, library_name="Library A", registered_path=str(libs_root))
+        _track(engine.library_manager, sibling, library_name="Library B", registered_path=str(libs_root))
+
+        result = await _uninstall_after_preview(engine, "Library A", manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.config_entry_removed is False
+        assert not await anyio.Path(libs_root / "lib_a").exists()
+        assert await anyio.Path(libs_root / "lib_b").exists()
+        [remaining] = result.remaining_registrations
+        assert isinstance(remaining, SharedDirectoryEntryRemaining)
+        assert remaining.library_names == ["Library B"]
+
+    @pytest.mark.asyncio
     async def test_user_layer_only_entry_is_not_refused(self, engine: Engine, workspace: Path) -> None:
         library_dir = workspace / "libs" / "plain"
         manifest = _write_manifest(library_dir, "Plain Library")

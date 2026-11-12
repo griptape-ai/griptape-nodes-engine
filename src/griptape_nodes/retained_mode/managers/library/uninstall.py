@@ -349,8 +349,13 @@ class LibraryUninstall(EngineScoped):
                 install_directory=install_directory,
             )
 
+        # Only an entry the uninstall would REMOVE needs a writable layer. A scan root outlives
+        # the delete, so a shadowed one costs nothing: refusing it would block an uninstall the
+        # engine can finish, and tell the user to delete a shared entry that registers the
+        # libraries beside this one.
+        entry_names_deleted_directory = self._entry_names_deleted_directory(classification, install_directory)
         shadowed_by = self._shadowed_config_source(classification)
-        if shadowed_by is not None:
+        if entry_names_deleted_directory and shadowed_by is not None:
             config_key = (
                 LIBRARIES_TO_DOWNLOAD_KEY if classification.registered_in == "download" else LIBRARIES_TO_REGISTER_KEY
             )
@@ -365,7 +370,6 @@ class LibraryUninstall(EngineScoped):
         collateral_library_names = await self._collect_collateral_library_names(
             install_directory, exclude_manifest=resolved_library_path
         )
-        entry_names_deleted_directory = self._entry_names_deleted_directory(classification, install_directory)
         remaining_registrations = await self._remaining_registrations_for(
             classification,
             exclude_manifest=resolved_library_path,
