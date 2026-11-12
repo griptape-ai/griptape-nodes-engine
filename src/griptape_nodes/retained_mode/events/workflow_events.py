@@ -43,8 +43,9 @@ class RunWorkflowFromScratchRequest(RequestPayload):
     Use when: Loading and executing saved workflows, testing workflows from files,
     running workflows in clean environments, batch processing workflows.
 
-    Ignores the envelope's `open_workflow_id`. Closes the open workflow first while only one may be
-    open.
+    Ignores the envelope's `open_workflow_id`. Closes the file's workflow first if it is open, or for
+    a Griptape-provided workflow the copy the last such run opened. Other open workflows, including
+    copies a tab opened, stay open.
 
     Args:
         file_path: Path to the workflow file to load and execute.
@@ -66,8 +67,8 @@ class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
-        open_workflow: The workflow open after the request, as the heartbeat lists it. None when the file
-            opened none.
+        open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it. None
+            when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
@@ -89,10 +90,17 @@ class RunWorkflowWithCurrentStateRequest(RequestPayload):
     Use when: Loading workflows into a prepared but unpopulated workflow context,
     loading unregistered workflows.
 
-    Fails if any flow is active on the current context. A current workflow with no
-    flow on it -- the state SetWorkflowContextRequest leaves behind -- is fine; a
-    current flow is not. Use DeleteFlowRequest, ClearAllObjectStateRequest, or similar
-    first to remove any active flow.
+    Does one of two things, depending on whether the request names a workflow:
+
+    - Named, by the envelope's `open_workflow_id` or the caller's binding: builds the file into
+      that open workflow. Fails if it has a flow. A workflow with no flow on it, the state
+      SetWorkflowContextRequest leaves behind, is fine. Use DeleteFlowRequest,
+      ClearAllObjectStateRequest, or similar first to remove the flow.
+    - Named none: opens the file as a new workflow beside the open ones, like OpenWorkflowRequest.
+
+    An MCP call with no header and no workflow of its session's own names none, so it opens the
+    file. A local transport client that leaves `open_workflow_id` out, such as the editor, gets the
+    only open workflow named where the app receives the request, so it builds into that one.
 
     Args:
         file_path: Path to the workflow file to load while preserving current state
@@ -116,10 +124,12 @@ class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPaylo
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
         workflow_id: Id of the workflow now open.
+        open_workflow: The workflow the file built into, as `ListOpenWorkflowsRequest` lists it.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
     workflow_id: str | None = None
+    open_workflow: OpenWorkflowInfo | None = None
 
 
 @dataclass
@@ -144,10 +154,12 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to close the open workflow first, while only one may be open
-            (default: True). With False, the request fails while a workflow is open and only one may be.
+        run_with_clean_slate: Whether to start the workflow over (default: True): close it first if it
+            is open, or for a Griptape-provided workflow the copy the last clean slate run opened.
+            Other open workflows, including copies a tab opened, stay open. With False, the request
+            fails while the workflow is open.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, a workflow already open without a clean slate, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, the workflow already open without a clean slate, execution error)
     """
 
     workflow_name: str
@@ -164,9 +176,10 @@ class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
             standing in for nodes whose library could not be registered -- editable, but not
             runnable until that library is available. Callers that need a whole graph (the
             headless executor, publishing) should refuse anything but GOOD.
-        workflow_id: Id of the workflow now open.
-        open_workflow: The workflow open after the request, as the heartbeat lists it. None when the file
-            opened none.
+        workflow_id: Id of the workflow now open. For a Griptape-provided workflow, the id of the
+            new unsaved copy it opened as, not the requested workflow's.
+        open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it. None
+            when the file opened none.
     """
 
     status: WorkflowStatus = WorkflowStatus.GOOD
@@ -329,14 +342,17 @@ class GetWorkflowShapeRequest(RequestPayload, GraphAccessMixin):
     renamed on import, so the shape saved with the workflow no longer names them.
 
     Args:
-        workflow_name: Registry key of the workflow, used in error messages
+        workflow_name: Registry key of the imported workflow, used in messages
         flow_name: Flow to read the shape from (None for the top-level flow)
+        workflow_id: Id of the imported workflow, for messages. A request that gives both fails
+            unless they name the same workflow.
 
-    Results: GetWorkflowShapeResultSuccess (with the shape) | GetWorkflowShapeResultFailure (flow not found, no Start or End node)
+    Results: GetWorkflowShapeResultSuccess (with the shape) | GetWorkflowShapeResultFailure (flow not found, no Start or End node, unknown workflow_id)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
     flow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -365,19 +381,30 @@ class DeleteWorkflowRequest(RequestPayload):
     Use when: Removing obsolete workflows, cleaning up workflow libraries,
     unregistering workflows, workflow management.
 
+    Name the workflow by `workflow_id`, by `name`, or by both when they name the same one. It
+    ignores the envelope's `open_workflow_id`, and closes the workflow first if it is open.
+
     Args:
-        name: Name of the workflow to delete from the registry
+        name: Registry name of the workflow to delete
+        workflow_id: Id of the workflow to delete
 
     Results: DeleteWorkflowResultSuccess | DeleteWorkflowResultFailure (workflow not found, deletion error)
     """
 
-    name: str
+    name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class DeleteWorkflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Workflow deleted successfully from registry."""
+    """Workflow deleted successfully from registry.
+
+    Args:
+        workflow_id: Id of the deleted workflow.
+    """
+
+    workflow_id: str
 
 
 @dataclass
@@ -416,8 +443,14 @@ class RenameWorkflowRequest(RequestPayload):
     Use when: Updating workflow names, organizing workflow libraries,
     fixing naming conflicts, workflow management.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
+    one. It ignores the envelope's `open_workflow_id`. An open workflow saves its graph to the new
+    file. A closed one moves its file and rewrites the name in its header. Either way it keeps its
+    id, and the old file is removed. A rename never replaces another workflow's file.
+
     Args:
-        workflow_name: Current name of the workflow
+        workflow_name: Current registry name of the workflow
+        workflow_id: Id of the workflow
         requested_name: New name for the workflow (drives the on-disk filename)
         display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
             ``MATCH_FILE_NAME`` to preserve historical wire behavior — callers who want the
@@ -430,8 +463,9 @@ class RenameWorkflowRequest(RequestPayload):
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
-    workflow_name: str
-    requested_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    requested_name: str = field(kw_only=True)
     display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
     display_name: str | None = None
 
@@ -471,8 +505,11 @@ class SaveWorkflowRequest(RequestPayload):
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
         overwrite_existing: When False and ``file_name`` exactly matches the registry key of a *different* already-registered workflow, the save fails with ``FileIOFailureReason.POLICY_NO_OVERWRITE`` instead of clobbering that workflow's file. When True (default), proceed with the overwrite. Re-saving the workflow that is currently open always succeeds regardless of this flag. Scope is deliberately narrow — the guard covers exact registered registry keys only, so it does not catch a key that differs by case on a case-insensitive filesystem, nor an unregistered stray ``.py`` file sitting at the computed save path; those paths defer to the ``save_workflow`` situation's own collision policy. Also has no effect when ``create_versioned=True``, since versioned saves write a new file rather than overwriting in place.
+        continue_in_copy: What a save that writes a copy (a Save As, a versioned save) does with the open workflow. When False (default), the copy is a new workflow with its own id, and the open workflow stays on its original file. When True, the open workflow keeps its id and its graph and names the new file from then on, and the original file is registered as a separate, closed workflow with a new id. Has no effect on a save to the workflow's own file, or on the first save of an unsaved workflow, which always continue the open workflow.
 
-    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error or refused overwrite)
+    A save never writes over the file of another open workflow.
+
+    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error, refused overwrite, or the file belongs to another open workflow)
     """
 
     file_name: str | None = None
@@ -481,6 +518,7 @@ class SaveWorkflowRequest(RequestPayload):
     display_name: str | None = None
     create_versioned: bool = False
     overwrite_existing: bool = True
+    continue_in_copy: bool = False
 
 
 @dataclass
@@ -514,10 +552,10 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         file_path: Path where the workflow was saved
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
         workflow_id: Id of the saved workflow. A Save As or versioned save
-            writes a copy, with a new id.
-        open_workflow: The workflow open after the save, as the heartbeat lists it. When its id is
-            `workflow_id`, the open workflow is the one saved, which a save of a Griptape-provided
-            workflow moves onto its copy. Otherwise the save wrote a copy and the original stays open.
+            writes a copy, with a new id, unless it continues in the copy.
+        open_workflow: The workflow open after the save, as `ListOpenWorkflowsRequest` lists it. When
+            its id is `workflow_id`, the open workflow is the file saved; otherwise the save wrote a
+            copy and the open workflow stays on its original file.
     """
 
     file_path: str
@@ -584,18 +622,21 @@ class GetWorkflowRunCommandRequest(RequestPayload):
     Use when: Showing users how to run a workflow from a terminal, copying a run command,
     scripting workflow execution from the command line.
 
-    Provide workflow_name (from registry), file_path (path to workflow file), or neither to use
-    the workflow in the current context.
+    Name a saved workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
+    one. Or give file_path (path to workflow file), or nothing to use the workflow in the current
+    context.
 
     Args:
         workflow_name: Name of the workflow in the registry (optional if file_path or current context)
         file_path: Path to the workflow file, relative to workspace or absolute (optional if workflow_name or current context)
+        workflow_id: Id of the workflow in the registry
 
     Results: GetWorkflowRunCommandResultSuccess (with run_command) | GetWorkflowRunCommandResultFailure
     """
 
     workflow_name: str | None = None
     file_path: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -651,11 +692,17 @@ class GetPublishOptionsRequest(RequestPayload):
     Use when: Opening the publish dialog for a specific publisher, refreshing dependent
     options after a selection change.
 
-    Results: GetPublishOptionsResultSuccess (with fields) | GetPublishOptionsResultFailure
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+    The publisher gets the request with `workflow_name` filled in. It runs in the open workflow the
+    envelope's `open_workflow_id` names, whose graph the publisher's callback reads.
+
+    Results: GetPublishOptionsResultSuccess (with fields) | GetPublishOptionsResultFailure |
+        WorkflowNotNamedResultFailure (the request names no open workflow to run in)
     """
 
-    workflow_name: str
-    publisher_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    publisher_name: str = field(kw_only=True)
     current_selections: dict | None = None  # current user selections; used for dependent field resolution
 
 
@@ -725,11 +772,16 @@ class PublishWorkflowRequest(RequestPayload):
     Use when: Sharing workflows with others, creating workflow packages,
     distributing workflow templates, workflow publishing.
 
+    Publishes the open workflow the envelope's `open_workflow_id` names. Name it by `workflow_id`,
+    by `workflow_name`, or by both when they name the same one. A `workflow_id` must be that open
+    workflow's. A `workflow_name` the registry doesn't hold saves the workflow under it first.
+
     Results: PublishWorkflowResultSuccess (with file path) | PublishWorkflowResultFailure (publish error)
     """
 
-    workflow_name: str
-    publisher_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    publisher_name: str = field(kw_only=True)
     # This can be removed after GUI release
     execute_on_publish: bool | None = None
     published_workflow_file_name: str | None = None
@@ -780,8 +832,11 @@ class BranchWorkflowRequest(RequestPayload):
     Use when: Creating workflow variants, branching workflows for experimentation,
     creating personal copies of shared workflows, preparing for workflow collaboration.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the workflow to branch
+        workflow_name: Registry name of the workflow to branch
+        workflow_id: Id of the workflow to branch
         branched_workflow_name: Registry key for the branched workflow (None for auto-generated)
         branched_workflow_display_name: Human-readable label (``metadata.name``) for the branch.
             None derives one from the source workflow's display name, e.g. branching
@@ -790,7 +845,8 @@ class BranchWorkflowRequest(RequestPayload):
     Results: BranchWorkflowResultSuccess (with branch name) | BranchWorkflowResultFailure (branch error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
     branched_workflow_name: str | None = None
     branched_workflow_display_name: str | None = None
 
@@ -869,13 +925,17 @@ class MergeWorkflowBranchRequest(RequestPayload):
     Use when: Integrating branch changes back into the original workflow, consolidating
     successful branch experiments, applying approved branch modifications to source.
 
+    Name the branch by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the branch workflow to merge back into its source
+        workflow_name: Registry name of the branch workflow to merge back into its source
+        workflow_id: Id of the branch workflow
 
     Results: MergeWorkflowBranchResultSuccess (with merge details) | MergeWorkflowBranchResultFailure (merge error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -906,13 +966,17 @@ class ResetWorkflowBranchRequest(RequestPayload):
     Use when: Discarding branch modifications, reverting branch to source state,
     abandoning branch experiments, syncing branch with latest source changes.
 
+    Name the branch by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the branch workflow to reset to its source
+        workflow_name: Registry name of the branch workflow to reset to its source
+        workflow_id: Id of the branch workflow
 
     Results: ResetWorkflowBranchResultSuccess (with reset details) | ResetWorkflowBranchResultFailure (reset error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -943,15 +1007,21 @@ class CompareWorkflowsRequest(RequestPayload):
     Use when: Checking if branched workflows need updates, determining if local changes exist,
     managing workflow synchronization, preparing for merge operations.
 
+    Name each workflow by id, by name, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the workflow to evaluate
-        compare_workflow_name: Name of the workflow to compare against
+        workflow_name: Registry name of the workflow to evaluate
+        compare_workflow_name: Registry name of the workflow to compare against
+        workflow_id: Id of the workflow to evaluate
+        compare_workflow_id: Id of the workflow to compare against
 
     Results: CompareWorkflowsResultSuccess (with status details) | CompareWorkflowsResultFailure (evaluation error)
     """
 
-    workflow_name: str
-    compare_workflow_name: str
+    workflow_name: str | None = None
+    compare_workflow_name: str | None = None
+    workflow_id: str | None = None
+    compare_workflow_id: str | None = None
 
 
 @dataclass
@@ -966,6 +1036,8 @@ class CompareWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
         workflow_last_modified: Last modified timestamp of the workflow
         source_last_modified: Last modified timestamp of the source (if exists)
         details: Additional details about the comparison
+        workflow_id: Id of the evaluated workflow
+        compare_workflow_id: Id of the workflow being compared against, None when it no longer exists
     """
 
     workflow_name: str
@@ -974,6 +1046,8 @@ class CompareWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
     workflow_last_modified: str | None
     source_last_modified: str | None
     details: str
+    workflow_id: str | None = None
+    compare_workflow_id: str | None = None
 
 
 @dataclass
@@ -990,15 +1064,19 @@ class MoveWorkflowRequest(RequestPayload):
     Use when: Organizing workflows into directories, restructuring workflow hierarchies,
     moving workflows to categorized folders, cleaning up workspace organization.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
-        workflow_name: Name of the workflow to move
+        workflow_name: Registry name of the workflow to move
+        workflow_id: Id of the workflow to move
         target_directory: Target directory path relative to workspace root
 
     Results: MoveWorkflowResultSuccess (with new path) | MoveWorkflowResultFailure (move error)
     """
 
-    workflow_name: str
-    target_directory: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    target_directory: str = field(kw_only=True)
 
 
 @dataclass
@@ -1026,9 +1104,13 @@ class MoveWorkflowResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class GetWorkflowMetadataRequest(RequestPayload):
-    """Get selected metadata for a workflow by name from the registry."""
+    """Get a workflow's metadata from the registry.
 
-    workflow_name: str
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+    """
+
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -1081,13 +1163,17 @@ class GetWorkflowInfoRequest(RequestPayload):
     Use when: Displaying workflow health warnings in the UI, checking whether a workflow
     has compatibility issues before loading it, showing dependency status.
 
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+
     Args:
         workflow_name: Registry key for the workflow.
+        workflow_id: Id of the workflow.
 
     Results: GetWorkflowInfoResultSuccess (with status and details) | GetWorkflowInfoResultFailure (not found)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -1115,7 +1201,7 @@ class GetWorkflowInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 @dataclass
 @PayloadRegistry.register
 class GetWorkflowInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow info retrieval failed. Common causes: workflow not found, neither or both identifiers provided."""
+    """Workflow info retrieval failed. Common causes: workflow not found, no workflow named, an id and a name of two different workflows."""
 
 
 @dataclass
@@ -1173,10 +1259,14 @@ class ListAllWorkflowInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 @dataclass
 @PayloadRegistry.register
 class SetWorkflowMetadataRequest(RequestPayload):
-    """Replace the workflow's metadata entirely and persist to file."""
+    """Replace the workflow's metadata entirely and persist to file.
 
-    workflow_name: str
-    workflow_metadata: WorkflowMetadata
+    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+    """
+
+    workflow_name: str | None = None
+    workflow_id: str | None = None
+    workflow_metadata: WorkflowMetadata = field(kw_only=True)
 
 
 @dataclass
@@ -1326,15 +1416,20 @@ class SaveSubflowToWorkflowRequest(RequestPayload):
     Use when: Persisting changes made to a subflow in a modal editor back to
     the workflow file it was loaded from.
 
+    Name the target workflow by `workflow_id`, by `workflow_name`, or by both when they name the
+    same one.
+
     Args:
         flow_name: The engine flow name of the subflow to serialize
         workflow_name: Registry key for the target workflow (used to derive file path and metadata)
+        workflow_id: Id of the target workflow
 
     Results: SaveSubflowToWorkflowResultSuccess | SaveSubflowToWorkflowResultFailure
     """
 
     flow_name: str
-    workflow_name: str
+    workflow_name: str | None = None
+    workflow_id: str | None = None
 
 
 @dataclass

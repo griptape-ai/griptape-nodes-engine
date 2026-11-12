@@ -37,6 +37,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from tests.workflow_context import bind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -109,7 +110,7 @@ async def _run_legacy_loop_with_outside_dependency(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    engine.context_manager.push_workflow(workflow_name="outside_dep_legacy_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="outside_dep_legacy_wf"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="LoopFlow", set_as_new_context=False)
     )
@@ -162,7 +163,7 @@ async def _run_group_loop_with_outside_dependency(
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    engine.context_manager.push_workflow(workflow_name="outside_dep_group_wf")
+    bind(engine.context_manager.open_workflow(workflow_name="outside_dep_group_wf"))
     flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )

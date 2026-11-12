@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.retained_mode.engine import Engine, current_engine
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import (
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -145,11 +147,35 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def handle_request(cls, request: RequestPayload) -> ResultPayload:
-        return current_engine().handle_request(request)
+        workflow = cls.only_open_workflow_for_unbound_caller()
+        if workflow is None:
+            return current_engine().handle_request(request)
+        return workflow.handle_request(request)
 
     @classmethod
     async def ahandle_request(cls, request: RequestPayload) -> ResultPayload:
-        return await current_engine().ahandle_request(request)
+        workflow = cls.only_open_workflow_for_unbound_caller()
+        if workflow is None:
+            return await current_engine().ahandle_request(request)
+        return await workflow.ahandle_request(request)
+
+    @classmethod
+    def only_open_workflow_for_unbound_caller(cls) -> WorkflowRuntime | None:
+        """The workflow a caller bound to nothing acts on: the engine's only open one, else none.
+
+        For requests from callers that can't name a workflow: node libraries sending from threads
+        that carry no binding, and local transport clients, such as `gtn request`, that leave the
+        envelope's `open_workflow_id` out. A saved workflow file is bound by its own `push_workflow`.
+        Only the facade's requests guess. Its managers read the caller's binding, as engine code
+        does, so an unbound caller finds no workflow there. With none or several open, a request
+        that needs a workflow fails.
+        """
+        if bound_workflow.get() is not None:
+            return None
+        open_workflows = current_engine().open_workflows.all_open()
+        if len(open_workflows) != 1:
+            return None
+        return open_workflows[0]
 
     @classmethod
     def broadcast_app_event(cls, app_event: AppPayload) -> None:

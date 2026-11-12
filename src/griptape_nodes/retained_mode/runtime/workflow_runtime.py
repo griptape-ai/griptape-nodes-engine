@@ -35,8 +35,7 @@ class WorkflowRuntime:
         """Make an empty runtime.
 
         Args:
-            workflow_id: The registry id of the workflow this runtime holds open. Saving an open
-                library workflow moves it onto the saved copy's id (see `OpenWorkflowSet.move`).
+            workflow_id: The registry id of the workflow this runtime holds open, which never changes.
             engine: The engine holding this runtime. Its requests go through that engine's dispatch,
                 and nodes in it reach that engine's managers (`BaseNode.engine`).
         """

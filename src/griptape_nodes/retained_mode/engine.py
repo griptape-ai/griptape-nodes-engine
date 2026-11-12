@@ -19,6 +19,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -37,8 +38,11 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    WorkflowClosedEvent,
+    WorkflowOpenedEvent,
 )
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     GriptapeNodeEvent,
     ResultPayloadFailure,
 )
@@ -52,7 +56,6 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
     NoWorkflow,
-    WorkflowNotNamedError,
     WorkflowNotOpenError,
     bound_workflow,
 )
@@ -85,7 +88,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
-    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
@@ -135,6 +138,18 @@ _root_engine: Engine | None = None
 # the building thread reaches the guard in `current_engine` instead of deadlocking.
 _root_engine_lock = threading.RLock()
 _root_engine_building = False
+
+
+@dataclass
+class OpeningWorkflow:
+    """A workflow `Engine.opening_workflow` opened to build into, which clients hear of once it is built."""
+
+    workflow: WorkflowRuntime
+    abandoned: bool = False
+
+    def abandon(self) -> None:
+        """Close the workflow when the block ends, instead of telling clients it opened."""
+        self.abandoned = True
 
 
 class EngineScoped:
@@ -250,6 +265,9 @@ class Engine:
         # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
         self._open_workflows = OpenWorkflowSet(self)
+        # Each open workflow still being built, which clients have not been told of, set once its
+        # build ends. See `opening_workflow`.
+        self._opening_workflows: dict[WorkflowRuntime, asyncio.Event] = {}
         # Always empty on the orchestrator. See `run_in_worker_workflow`.
         self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
@@ -433,6 +451,11 @@ class Engine:
     def worker_workflows(self) -> WorkerWorkflowSet:
         return self._worker_workflows
 
+    @property
+    def engine_run_id(self) -> str:
+        """Id minted when this engine started, never saved. A new one means workflow ids from before name nothing."""
+        return self._engine_run_id
+
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
     # the compat surface has to live here. Engine-internal code uses the snake_case
@@ -556,16 +579,20 @@ class Engine:
         else:
             return result_event.result
 
-    async def ahandle_request(self, request: RequestPayload) -> ResultPayload:
+    async def ahandle_request(
+        self, request: RequestPayload, *, result_context: ResultContext | None = None
+    ) -> ResultPayload:
         """Asynchronous request handler.
 
         Args:
             request: The request payload to handle.
+            result_context: The request envelope's fields, such as the `open_workflow_id` it runs
+                in (see `EventManager.ahandle_request`).
         """
         event_mgr = self._event_manager
 
         try:
-            result_event = await event_mgr.ahandle_request(request=request)
+            result_event = await event_mgr.ahandle_request(request=request, result_context=result_context)
             # Only queue result event if broadcasting is enabled and not suppressed
             if request.broadcast_result and not event_mgr.should_suppress_event(result_event):
                 await event_mgr.aput_event(GriptapeNodeEvent(wrapped_event=result_event))
@@ -653,25 +680,6 @@ class Engine:
         finally:
             bound_workflow.reset(token)
 
-    def enter_opened_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on `workflow`, which the current request just opened, for the rest of that request.
-
-        A load acts on the workflow it opens, so the loaded file builds into it. Only the current
-        context is bound, so dispatch's token reset ends the binding with the request.
-        """
-        bound_workflow.set(workflow)
-
-    def leave_closed_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on no workflow for the rest of the current work, if it acted on `workflow`, which it just closed.
-
-        Bound to NO_WORKFLOW rather than unbound, so the rest of the work never falls back to another
-        open workflow. A load bound to the workflow it closes then acts on the one it opens
-        (`enter_opened_workflow`). Only the current context is rebound: tasks spawned earlier keep their
-        binding, so a run that wakes after the close never reaches the next workflow.
-        """
-        if bound_workflow.get() is workflow:
-            bound_workflow.set(NO_WORKFLOW)
-
     @contextmanager
     def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:
         """Run a worker's node in the runtime it keeps for the node's orchestrator workflow.
@@ -712,12 +720,9 @@ class Engine:
     def current_workflow(self) -> WorkflowRuntime:
         """The open workflow the current work acts on, for writes and runs that need one.
 
-        The workflow the current work is bound to, else the engine's only open workflow.
-
         Raises:
-            NoOpenWorkflowError: The work is bound to no workflow, or is unbound and none is open.
+            NoOpenWorkflowError: The work is bound to no workflow, or is unbound.
             WorkflowNotOpenError: The work is bound to a workflow that has closed.
-            WorkflowNotNamedError: The work is unbound and several workflows are open.
         """
         workflow = self.current_workflow_or_none()
         if workflow is None:
@@ -728,12 +733,11 @@ class Engine:
     def current_workflow_or_none(self) -> WorkflowRuntime | None:
         """Like `current_workflow`, but None when there is none, for reads that find nothing without one.
 
-        A worker opens no workflow, so unbound work there finds none: its node work is bound to the
-        runtime it keeps for the node's workflow (`run_in_worker_workflow`).
+        Unbound work finds none, however many workflows are open: it never guesses. A worker's node
+        work is bound to the runtime it keeps for the node's workflow (`run_in_worker_workflow`).
 
         Raises:
             WorkflowNotOpenError: The work is bound to a workflow that has closed.
-            WorkflowNotNamedError: The work is unbound and several workflows are open.
         """
         bound = bound_workflow.get()
         if bound is NO_WORKFLOW:
@@ -745,25 +749,13 @@ class Engine:
                 "Reopen the workflow and try again."
             )
             raise WorkflowNotOpenError(msg)
-        if bound is not None:
-            return bound
-
-        open_workflows = self._open_workflows.all_open()
-        if len(open_workflows) > 1:
-            msg = (
-                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
-                "open and the request did not name one."
-            )
-            raise WorkflowNotNamedError(msg)
-        if not open_workflows:
-            return None
-        return open_workflows[0]
+        return bound
 
     def bound_live_workflow_or_none(self) -> WorkflowRuntime | None:
         """The workflow the current work is bound to, while it is still open here or kept by this worker.
 
-        Unlike `current_workflow_or_none`, it never falls back to the only open workflow, so it never
-        raises however many are open. A binding to a workflow closed since it was made finds none.
+        Unlike `current_workflow_or_none`, a binding to a workflow closed since it was made finds none
+        rather than raising.
         """
         bound = bound_workflow.get()
         if bound is None or bound is NO_WORKFLOW:
@@ -775,23 +767,79 @@ class Engine:
         return None
 
     def open_workflow(self, workflow_id: str) -> WorkflowRuntime:
-        """Open the registered workflow with this id and return its empty runtime.
+        """Open the registered workflow with this id, tell every client, and return its empty runtime.
+
+        To build into the workflow before clients hear of it, open it with `opening_workflow`.
 
         Raises:
             OpenWorkflowError: That workflow, or another one, is already open.
         """
-        return self._open_workflows.open(workflow_id)
+        with self.opening_workflow(workflow_id) as opening:
+            pass
+        return opening.workflow
+
+    @contextmanager
+    def opening_workflow(self, workflow_id: str) -> Iterator[OpeningWorkflow]:
+        """Open the registered workflow with this id to build into, telling every client once the block ends.
+
+        Every open goes through here, and every close through `_tear_down_workflow`, so clients hear of
+        each workflow with one `WorkflowOpenedEvent` and one `WorkflowClosedEvent`. Clients hear of
+        the workflow once the block ends, so none reads it half built. A block that raises, or calls
+        `OpeningWorkflow.abandon`, closes the workflow again, and clients never hear of it. If that
+        close fails, the workflow stays open as it is, and clients are told of it. Until the block
+        ends, another open of the workflow waits for its build with `wait_for_opening`.
+
+        Raises:
+            OpenWorkflowError: That workflow, or another one, is already open.
+        """
+        opening = OpeningWorkflow(workflow=self._open_workflows.open(workflow_id))
+        self._opening_workflows[opening.workflow] = asyncio.Event()
+        try:
+            yield opening
+        except BaseException:
+            self._finish_opening(opening.workflow, keep=False)
+            raise
+        self._finish_opening(opening.workflow, keep=not opening.abandoned)
+
+    def is_opening(self, workflow: WorkflowRuntime) -> bool:
+        """Whether an `opening_workflow` block is still building `workflow`."""
+        return workflow in self._opening_workflows
+
+    async def wait_for_opening(self, workflow: WorkflowRuntime) -> None:
+        """Wait until the `opening_workflow` block building `workflow` ends, if one is under way."""
+        build_ended = self._opening_workflows.get(workflow)
+        if build_ended is not None:
+            await build_ended.wait()
+
+    def open_workflow_infos(self) -> list[OpenWorkflowInfo]:
+        """What clients are told of every open workflow, in the order they were opened.
+
+        Leaves out a workflow still building, which clients hear of once its build ends.
+        """
+        return [
+            self.open_workflow_info(workflow)
+            for workflow in self._open_workflows.all_open()
+            if not self.is_opening(workflow)
+        ]
 
     def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
-        """What clients are told of an open workflow: its id, name, file and whether it has a flow."""
+        """What clients are told of an open workflow."""
         entry = self.workflow_registry.get(workflow.workflow_id)
         file_path = None
         if entry.absolute_path is not None:
             file_path = str(entry.absolute_path)
+        # Every client shows `display_name`, so a workflow with no name gets one here, not in each client.
+        display_name = (entry.metadata.name or "").strip()
+        if not display_name and entry.absolute_path is not None:
+            display_name = entry.absolute_path.stem
+        if not display_name:
+            display_name = "Untitled"
         return OpenWorkflowInfo(
             workflow_id=workflow.workflow_id,
             name=entry.name,
+            display_name=display_name,
             workflow_file_path=file_path,
+            is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
         )
 
@@ -800,8 +848,9 @@ class Engine:
 
         Cancels its run and resets its run state, deletes its flows (and with them their nodes)
         through the normal delete path, then forgets its runtime, which takes its context stack and
-        queued UI changes with it, and releases the held objects this process kept for it. The
-        workers hold their own: this is sync, so telling them is scheduled on the engine loop
+        queued UI changes with it, forgets an unsaved workflow's registry entry, and releases the
+        held objects this process kept for it. The workers hold their own: this is sync, so telling
+        them is scheduled on the engine loop
         (`WorkerManager.schedule_local_object_teardown`). `aclose_workflow` awaits it instead.
 
         The flows are deleted while the workflow is still open, because deleting one enters its
@@ -900,13 +949,41 @@ class Engine:
             )
             raise OpenWorkflowError(msg)
         self._open_workflows.close(workflow)
-        self.leave_closed_workflow(workflow)
+        if workflow not in self._opening_workflows:
+            self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(workflow_id=workflow.workflow_id)))
+
+        # An unsaved workflow's graph lived only in the runtime just closed, so there is nothing left to reopen.
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.is_saved:
+            self._workflow_registry.remove(workflow.workflow_id)
 
         # Every key referring to a held object kept for it lived on a node just deleted, so each entry
         # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
         dropped = self._resource_manager.drop_objects_for_workflow(workflow.workflow_id)
         if dropped:
             logger.debug("Released %d held object(s) while closing the workflow.", dropped)
+
+    def _finish_opening(self, workflow: WorkflowRuntime, *, keep: bool) -> None:
+        """End `opening_workflow`'s block, then wake anything waiting for the build of `workflow`.
+
+        Without `keep`, closes it unannounced. Tells clients of it if it is still open after that. A
+        workflow already closed, such as by the file building it, is left as it is.
+        """
+        try:
+            if not keep and not workflow.closed:
+                self.close_workflow(workflow)
+        except OpenWorkflowError as err:
+            logger.warning(
+                "Attempted to close workflow '%s' after it failed to build. Failed, so it stays open: %s",
+                workflow.workflow_id,
+                err,
+            )
+        finally:
+            build_ended = self._opening_workflows.pop(workflow)
+            if not workflow.closed:
+                opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+                self._event_manager.put_event(AppEvent(payload=opened_event))
+            build_ended.set()
 
     def _delete_workflow_flows(self, workflow: WorkflowRuntime) -> None:
         """Delete `workflow`'s flows, which deletes their nodes.
@@ -1033,34 +1110,32 @@ class Engine:
         return instance_info
 
     def _get_current_workflow_info(self) -> dict[str, Any]:
-        """The heartbeat's workflow fields: every open workflow, and the one opened last as the current one.
+        """The heartbeat's workflow fields: every open workflow, and the current one when exactly one is open.
 
         What the engine has open, not the current workflow: the heartbeat is a host request bound
-        to no workflow, and a worker's runtimes never show here. With several open, the one opened
-        last is likely the tab the user just opened.
+        to no workflow, and a worker's runtimes never show here. With several open, none of them is
+        the current one, as in the app's engine registry record and the diagnostics.
         """
         workflow_info: dict[str, Any] = {
             "current_workflow": None,
-            "current_workflow_id": None,
             "workflow_file_path": None,
             "has_active_flow": False,
             "open_workflows": [],
         }
 
         try:
-            open_workflows = [self.open_workflow_info(workflow) for workflow in self._open_workflows.all_open()]
+            open_workflows = self.open_workflow_infos()
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
             return workflow_info
-        if not open_workflows:
+        workflow_info["open_workflows"] = open_workflows
+        if len(open_workflows) != 1:
             return workflow_info
 
-        current = open_workflows[-1]
+        (current,) = open_workflows
         workflow_info["current_workflow"] = current.name
-        workflow_info["current_workflow_id"] = current.workflow_id
         workflow_info["workflow_file_path"] = current.workflow_file_path
         workflow_info["has_active_flow"] = current.has_active_flow
-        workflow_info["open_workflows"] = open_workflows
         return workflow_info
 
 

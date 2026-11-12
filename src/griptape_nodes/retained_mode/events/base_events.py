@@ -329,9 +329,12 @@ class EventRequest[P: Payload](BaseEvent):
             handler, and every task it starts, acts on that workflow. An id that names no open
             workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
             handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
-            Left out, the request acts on the engine's only open workflow, unless another engine
-            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
-            else: the workflow the request is about.
+            Left out, the request acts on the workflow the code sending it is bound to, else on no
+            workflow. Two exceptions fall back to the only open workflow: a local transport client's
+            request (`GriptapeNodes.only_open_workflow_for_unbound_caller`, applied where the app
+            receives it), and `EnsureWorkflowAndFlowRequest`, whose handler adopts it. Neither
+            applies to a request another engine sent. A payload field named `workflow_id` is
+            something else: the workflow the request is about.
     """
 
     request: P
@@ -382,12 +385,13 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events.
 
     Args:
-        open_workflow_id: The open workflow the request acted on: the envelope's `open_workflow_id`
-            when it named one, else the workflow dispatch bound the request to, such as the only
-            open workflow, a run's own workflow, or the workflow a load opened. None when it acted
-            on no workflow. A result payload's own `workflow_id` is something else. For
-            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
-            Save As is a copy that is not open.
+        open_workflow_id: The open workflow the request ran in: the one the envelope named, else
+            the one its caller is bound to, such as a run's own workflow. None for a request that
+            runs in no workflow, such as a HOST request, which ignores the envelope's id even when
+            it opens or closes a workflow; `WorkflowOpenedEvent` and `WorkflowClosedEvent` tell
+            clients of those. A request refused for the workflow its envelope named echoes that id.
+            A payload's own `workflow_id` names the workflow the result is about, such as the copy
+            a Save As wrote, which is not open.
         engine_id: The engine that sent the result. A client that reached it through a session
             topic learns from this which engine holds the session. None when the result was built
             outside the engine's dispatch, such as by the MCP server or a bootstrap script.
@@ -465,7 +469,8 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """An event from running a flow. `open_workflow_id` names the open workflow it belongs to, None for a host event.
 
-    It matches a result envelope's `open_workflow_id`, so a client routes both by one field.
+    It matches a result envelope's `open_workflow_id`, so a client routes both by one field. Left
+    out, `EventManager` fills it in with the bound workflow when the event is queued.
 
     Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
     for an event a node reports about itself, naming the workflow it joined. Both go through

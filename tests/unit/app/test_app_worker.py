@@ -1984,26 +1984,39 @@ class TestForwardEventToWorker:
         assert sent_payload.get("response_topic") == _WORKER_RESPONSE_TOPIC
 
 
-class TestDetermineResponseTopic:
-    def test_returns_session_response_topic_when_session_active(self, worker_manager: WorkerManager) -> None:
-        topic = worker_manager._determine_response_topic()
+class TestRelayTopic:
+    """`relay_worker_result` sends a worker's result to the session topic, whatever workflow it names."""
 
-        assert topic == f"sessions/{_SESSION}/response"
+    @staticmethod
+    def _payload(open_workflow_id: str | None) -> dict:
+        return {
+            "event_type": "EventResultSuccess",
+            "result_type": "SomeOtherResultSuccess",
+            "result": {},
+            "response_topic": _WORKER_RESPONSE_TOPIC,
+            "open_workflow_id": open_workflow_id,
+        }
 
-    def test_returns_engine_response_topic_when_no_session(self, worker_manager: WorkerManager) -> None:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("open_workflow_id", ["wf-1", None])
+    async def test_a_result_goes_to_the_session_topic(
+        self, worker_manager: WorkerManager, open_workflow_id: str | None
+    ) -> None:
+        await worker_manager.relay_worker_result(self._payload(open_workflow_id))
+
+        topic = f"sessions/{_SESSION}/response"
+        assert worker_manager._tx.send_message.call_args.args[2] == topic  # type: ignore[union-attr]
+        relayed = json.loads(worker_manager._tx.send_message.call_args.args[1])  # type: ignore[union-attr]
+        assert relayed["response_topic"] == topic
+        assert relayed["open_workflow_id"] == open_workflow_id
+
+    @pytest.mark.asyncio
+    async def test_with_no_session_the_topic_is_the_engines(self, worker_manager: WorkerManager) -> None:
         worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
 
-        topic = worker_manager._determine_response_topic()
+        await worker_manager.relay_worker_result(self._payload("wf-1"))
 
-        assert topic == f"engines/{_ENGINE}/response"
-
-    def test_returns_default_when_no_session_or_engine(self, worker_manager: WorkerManager) -> None:
-        worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
-        worker_manager.engine.get_engine_id.return_value = None  # type: ignore[union-attr]
-
-        topic = worker_manager._determine_response_topic()
-
-        assert topic == "response"
+        assert worker_manager._tx.send_message.call_args.args[2] == f"engines/{_ENGINE}/response"  # type: ignore[union-attr]
 
 
 class TestOrchestratorHeartbeatLoop:

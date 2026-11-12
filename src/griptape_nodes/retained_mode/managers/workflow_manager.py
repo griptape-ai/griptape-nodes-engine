@@ -23,6 +23,7 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowMetadataError,
     WorkflowMetadataFileError,
@@ -120,6 +121,8 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger("griptape_nodes")
+
+_SCAN_PROGRESS_COALESCE_KEY = "workflow_scan_progress"
 
 # How many squelch contexts the current context is inside of; see `WorkflowManager.WorkflowSquelchContext`.
 #
@@ -946,18 +949,32 @@ class WorkflowManager(EngineScoped):
     def on_get_workflow_shape_request(
         self, request: GetWorkflowShapeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
+        """Read the shape of `workflow`'s flow the request names. Its workflow names only label messages."""
+        workflow_name = request.workflow_name
+        if request.workflow_id is not None:
+            try:
+                workflow_name = self.engine.workflow_registry.resolve_address(
+                    workflow_id=request.workflow_id,
+                    workflow_name=request.workflow_name,
+                    action="read the inputs and outputs of",
+                ).name
+            except WorkflowAddressError as err:
+                return GetWorkflowShapeResultFailure(result_details=str(err))
+        if workflow_name is None:
+            details = "Attempted to read the inputs and outputs of a workflow. Failed because the request names no workflow. Pass workflow_id."
+            return GetWorkflowShapeResultFailure(result_details=details)
+
         try:
-            shape = self.extract_workflow_shape_in(workflow, request.workflow_name, flow_name=request.flow_name)
+            shape = self.extract_workflow_shape_in(workflow, workflow_name, flow_name=request.flow_name)
         except (ValueError, KeyError) as err:
             details = (
-                f"Attempted to read the inputs and outputs of workflow '{request.workflow_name}'. "
-                f"Failed because: {err.args[0]}"
+                f"Attempted to read the inputs and outputs of workflow '{workflow_name}'. Failed because: {err.args[0]}"
             )
             return GetWorkflowShapeResultFailure(result_details=details)
 
         return GetWorkflowShapeResultSuccess(
             workflow_shape=WorkflowShape(inputs=shape["input"], outputs=shape["output"]),
-            result_details=f"Read the inputs and outputs of workflow '{request.workflow_name}'.",
+            result_details=f"Read the inputs and outputs of workflow '{workflow_name}'.",
         )
 
     def _walk_object_tree(
@@ -1105,18 +1122,7 @@ class WorkflowManager(EngineScoped):
         for current_index, workflow_file in enumerate(all_workflow_files, start=1):
             workflow_name = str(workflow_file.name)
 
-            # Emit loading event
-            self.engine.event_manager.put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_index,
-                        total=total_workflows,
-                    )
-                )
-            )
+            self._emit_scan_progress(workflow_name, InitializationStatus.LOADING, current_index, total_workflows)
 
             # Process the workflow
             workflow = await self._process_single_workflow_file(
@@ -1127,35 +1133,46 @@ class WorkflowManager(EngineScoped):
             if workflow is not None:
                 succeeded.append(workflow.name)
                 workflow_ids.append(workflow.workflow_id)
-                # Emit success event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.COMPLETE,
-                            current=current_index,
-                            total=total_workflows,
-                        )
-                    )
-                )
+                self._emit_scan_progress(workflow_name, InitializationStatus.COMPLETE, current_index, total_workflows)
             else:
                 failed.append(str(workflow_file))
-                # Emit failure event
-                self.engine.event_manager.put_event(
-                    AppEvent(
-                        payload=EngineInitializationProgress(
-                            phase=InitializationPhase.WORKFLOWS,
-                            item_name=workflow_name,
-                            status=InitializationStatus.FAILED,
-                            current=current_index,
-                            total=total_workflows,
-                            error="Failed to process workflow file",
-                        )
-                    )
+                self._emit_scan_progress(
+                    workflow_name,
+                    InitializationStatus.FAILED,
+                    current_index,
+                    total_workflows,
+                    error="Failed to process workflow file",
                 )
 
         return WorkflowRegistrationResult(succeeded=succeeded, failed=failed, workflow_ids=workflow_ids)
+
+    def _emit_scan_progress(
+        self,
+        item_name: str,
+        status: InitializationStatus,
+        current: int,
+        total: int,
+        *,
+        error: str | None = None,
+    ) -> None:
+        # Failures and the final event are sent as they happen: clients list the failures and end
+        # their loading state on the final event. The rest are coalesced to one per interval.
+        is_final = current >= total and status != InitializationStatus.LOADING
+        must_send = is_final or status == InitializationStatus.FAILED
+        coalesce_key = None if must_send else _SCAN_PROGRESS_COALESCE_KEY
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.WORKFLOWS,
+                    item_name=item_name,
+                    status=status,
+                    current=current,
+                    total=total,
+                    error=error,
+                )
+            ),
+            coalesce_key=coalesce_key,
+        )
 
     async def _process_single_workflow_file(
         self,

@@ -27,19 +27,44 @@ class NoWorkflow(Enum):
 
 NO_WORKFLOW: Final = NoWorkflow.NO_WORKFLOW
 
-# None means nothing was bound, which is different from binding NO_WORKFLOW: unbound work acts on
-# the only open workflow (see `Engine.current_workflow`), and NO_WORKFLOW work acts on none.
+# None means nothing was bound, which is different from binding NO_WORKFLOW: work bound to
+# NO_WORKFLOW explicitly acts on none, and dispatch keeps that for the requests it sends. Unbound
+# work acts on none too.
 bound_workflow: ContextVar[WorkflowRuntime | NoWorkflow | None] = ContextVar(
     "griptape_nodes_bound_workflow", default=None
 )
 
 
-class WorkflowNotNamedError(Exception):
-    """Work that needs a workflow named none, and several are open, so none can be chosen for it."""
+# The workflow `bind_unbound_caller` bound the caller to, so closing it can unbind the caller again.
+_bound_by_open: ContextVar[WorkflowRuntime | None] = ContextVar("griptape_nodes_bound_by_open", default=None)
 
 
 class WorkflowNotOpenError(Exception):
     """Work bound to a workflow that has closed since, so it has no workflow to act on."""
+
+
+def bind_unbound_caller(workflow: WorkflowRuntime) -> None:
+    """Bind `workflow` for the rest of the caller's context when it is bound to nothing, or to a workflow that has closed.
+
+    For code that opens a workflow and then works in it naming none: a saved workflow file run on
+    its own, or the headless executor after loading a file. The binding lasts as long as the
+    context, unless the caller closes the workflow itself (`unbind_caller_closing`).
+    """
+    binding = bound_workflow.get()
+    if binding is None or (binding is not NO_WORKFLOW and binding.closed):
+        bound_workflow.set(workflow)
+        _bound_by_open.set(workflow)
+
+
+def unbind_caller_closing(workflow: WorkflowRuntime) -> None:
+    """Unbind a caller `bind_unbound_caller` bound to `workflow`, which the caller is closing.
+
+    Other bindings to it stay, so work bound to a workflow that closes is refused rather than
+    moving to another.
+    """
+    if bound_workflow.get() is workflow and _bound_by_open.get() is workflow:
+        bound_workflow.set(None)
+        _bound_by_open.set(None)
 
 
 def create_task_bound_to_no_workflow(loop: asyncio.AbstractEventLoop, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
