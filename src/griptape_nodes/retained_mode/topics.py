@@ -4,10 +4,9 @@
 |---|---|
 | `request` | requests addressed to no engine in particular |
 | `sessions/<id>/request` | requests to the engine that holds the session |
-| `sessions/<id>/response` | app events, and results and events that name no workflow |
+| `sessions/<id>/response` | app events, execution events, and results that name no reply topic |
 | `sessions/<id>/clients/<id>/response` | the results of one client's own requests |
 | `clients/<id>/response` | the same, for a client that knows no session, such as a `RequestClient` given none |
-| `sessions/<id>/workflows/<id>/events` | one open workflow's broadcast results and execution events |
 | `sessions/<id>/workers/<id>/request` | requests to one worker engine of the session |
 | `sessions/<id>/workers/<id>/response` | that worker's results |
 | `engines/<id>/request` | requests addressed to one engine |
@@ -26,7 +25,7 @@ def session_request_topic(session_id: str) -> str:
 
 
 def session_response_topic(session_id: str) -> str:
-    """Topic everyone on the session hears: app events, and results and events that name no workflow."""
+    """Topic everyone on the session hears: app events, execution events, and results that name no reply topic."""
     return f"sessions/{session_id}/response"
 
 
@@ -35,18 +34,6 @@ def client_response_topic(session_id: str | None, client_id: str) -> str:
     if session_id:
         return f"sessions/{session_id}/clients/{client_id}/response"
     return f"clients/{client_id}/response"
-
-
-def workflow_events_topic(engine_id: str | None, session_id: str | None, open_workflow_id: str) -> str:
-    """Topic the broadcast results and execution events of one open workflow go out on.
-
-    Under the session when there is one, else under the engine, like `default_response_topic`.
-    """
-    if session_id:
-        return f"sessions/{session_id}/workflows/{open_workflow_id}/events"
-    if engine_id:
-        return f"engines/{engine_id}/workflows/{open_workflow_id}/events"
-    return f"workflows/{open_workflow_id}/events"
 
 
 def engine_request_topic(engine_id: str) -> str:
@@ -99,10 +86,3 @@ def default_response_topic(engine_id: str | None, session_id: str | None) -> str
     if engine_id:
         return engine_response_topic(engine_id)
     return "response"
-
-
-def audience_topic(engine_id: str | None, session_id: str | None, open_workflow_id: str | None) -> str:
-    """Topic the clients following `open_workflow_id` hear its broadcasts on, or with None, `default_response_topic`."""
-    if open_workflow_id is None:
-        return default_response_topic(engine_id, session_id)
-    return workflow_events_topic(engine_id, session_id, open_workflow_id)

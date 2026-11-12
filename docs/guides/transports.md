@@ -169,22 +169,15 @@ If your organization uses license keys, the engine checks each request against y
 
 A connection gets only the topics it subscribes to:
 
-| Topic                                                       | Carries                                                                                             |
-| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| The `response_topic` you named                              | The results of your own requests                                                                    |
-| `sessions/<session_id>/clients/<client_id>/response`        | Results for a client that uses it as its `response_topic`, as `gtn request` and `RequestClient` do  |
-| `sessions/<session_id>/workflows/<open_workflow_id>/events` | One open workflow's execution events, and the results of requests that ran in it                    |
-| `sessions/<session_id>/response`                            | Engine events such as `WorkflowOpenedEvent`, and results and execution events that name no workflow |
+| Topic                                                | Carries                                                                                            |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| The `response_topic` you named                       | The results of your own requests                                                                   |
+| `sessions/<session_id>/clients/<client_id>/response` | Results for a client that uses it as its `response_topic`, as `gtn request` and `RequestClient` do |
+| `sessions/<session_id>/response`                     | Engine events such as `WorkflowOpenedEvent`, execution events, and results a worker engine sends   |
 
-`EngineHeartbeatRequest` reports the `session_id` and `engine_id`. Without a session, the last two topics start with `engines/<engine_id>/` instead, and a client that knows no session uses `clients/<client_id>/response`.
+`EngineHeartbeatRequest` reports the `session_id` and `engine_id`. Without a session, the session topic starts with `engines/<engine_id>/` instead, and a client that knows no session uses `clients/<client_id>/response`.
 
-Most results arrive a second time, on the topic of the workflow they name or the session topic, so every client showing a workflow sees each change. If you subscribe to both, drop copies whose `request_id` you already have. Keep a `response_topic` of your own so other clients don't get your replies.
-
-To follow a workflow:
-
-1. Subscribe to the session topic.
-1. Send `ListOpenWorkflowsRequest` and subscribe to the topics of the workflows you want.
-1. Subscribe to a workflow's topic on its `WorkflowOpenedEvent`, and unsubscribe on its `WorkflowClosedEvent`.
+The session topic carries every open workflow's execution events. To show one workflow, keep the messages whose `open_workflow_id` names it or is `null`, and skip the rest. To see the results of other clients' requests too, name the session topic as your `response_topic` and filter results the same way.
 
 ## Examples
 

@@ -1985,7 +1985,7 @@ class TestForwardEventToWorker:
 
 
 class TestRelayTopic:
-    """`relay_worker_result` sends a worker's result to the clients following the workflow it names."""
+    """`relay_worker_result` sends a worker's result to the session topic, whatever workflow it names."""
 
     @staticmethod
     def _payload(open_workflow_id: str | None) -> dict:
@@ -1998,29 +1998,25 @@ class TestRelayTopic:
         }
 
     @pytest.mark.asyncio
-    async def test_a_result_naming_a_workflow_goes_to_the_workflow_topic(self, worker_manager: WorkerManager) -> None:
-        await worker_manager.relay_worker_result(self._payload("wf-1"))
+    @pytest.mark.parametrize("open_workflow_id", ["wf-1", None])
+    async def test_a_result_goes_to_the_session_topic(
+        self, worker_manager: WorkerManager, open_workflow_id: str | None
+    ) -> None:
+        await worker_manager.relay_worker_result(self._payload(open_workflow_id))
 
-        topic = f"sessions/{_SESSION}/workflows/wf-1/events"
+        topic = f"sessions/{_SESSION}/response"
         assert worker_manager._tx.send_message.call_args.args[2] == topic  # type: ignore[union-attr]
         relayed = json.loads(worker_manager._tx.send_message.call_args.args[1])  # type: ignore[union-attr]
         assert relayed["response_topic"] == topic
+        assert relayed["open_workflow_id"] == open_workflow_id
 
     @pytest.mark.asyncio
-    async def test_a_result_naming_no_workflow_goes_to_the_session_topic(self, worker_manager: WorkerManager) -> None:
-        await worker_manager.relay_worker_result(self._payload(None))
-
-        assert worker_manager._tx.send_message.call_args.args[2] == f"sessions/{_SESSION}/response"  # type: ignore[union-attr]
-
-    @pytest.mark.asyncio
-    async def test_with_no_session_the_topics_are_the_engines(self, worker_manager: WorkerManager) -> None:
+    async def test_with_no_session_the_topic_is_the_engines(self, worker_manager: WorkerManager) -> None:
         worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
 
         await worker_manager.relay_worker_result(self._payload("wf-1"))
-        await worker_manager.relay_worker_result(self._payload(None))
 
-        topics = [call.args[2] for call in worker_manager._tx.send_message.call_args_list]  # type: ignore[union-attr]
-        assert topics == [f"engines/{_ENGINE}/workflows/wf-1/events", f"engines/{_ENGINE}/response"]
+        assert worker_manager._tx.send_message.call_args.args[2] == f"engines/{_ENGINE}/response"  # type: ignore[union-attr]
 
 
 class TestOrchestratorHeartbeatLoop:

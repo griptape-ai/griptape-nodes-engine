@@ -57,7 +57,7 @@ from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.topics import (
     REQUEST_TOPIC,
-    audience_topic,
+    default_response_topic,
     engine_request_topic,
     engine_response_topic,
     session_request_topic,
@@ -2891,14 +2891,12 @@ class WorkerManager(EngineScoped):
             logger.exception("Could not broadcast %s to workers", type(event.request).__name__)
 
     async def relay_worker_result(self, payload: dict) -> None:
-        """Relay an unmatched worker result to the clients following its workflow, or to the session.
+        """Relay an unmatched worker result to the session topic.
 
         Called for worker result messages not claimed by RequestClient
         (heartbeats and any results without a pending request).
         The orchestrator always mediates between workers and the GUI; workers never
-        publish their results to clients directly. A result whose `open_workflow_id` names a
-        workflow goes out on that workflow's topic, any other on the session topic (see
-        `griptape_nodes.retained_mode.topics.audience_topic`).
+        publish their results to clients directly. Clients tell a result's workflow by its `open_workflow_id`.
         """
         # Heartbeat responses update the last-seen timestamp but are not forwarded to the GUI.
         result_event_type = payload.get("result_type", "")
@@ -2918,11 +2916,8 @@ class WorkerManager(EngineScoped):
             logger.debug("Heartbeat received from worker %s", worker_engine_id)
             return  # Internal health check — do not forward to GUI
 
-        # 1 engine = 1 session, so the orchestrator's session holds every client following the workflow.
-        open_workflow_id = payload.get("open_workflow_id")
-        if not isinstance(open_workflow_id, str):
-            open_workflow_id = None
-        relay_topic = audience_topic(self.engine.get_engine_id(), self.engine.get_session_id(), open_workflow_id)
+        # 1 engine = 1 session, so the orchestrator's session topic reaches every client.
+        relay_topic = default_response_topic(self.engine.get_engine_id(), self.engine.get_session_id())
         dest_socket = "success_result" if payload.get("event_type") == "EventResultSuccess" else "failure_result"
         # Names the topic it goes out on: a client drops a result whose `response_topic` is another topic
         # it takes, as a copy of a reply it already has.
