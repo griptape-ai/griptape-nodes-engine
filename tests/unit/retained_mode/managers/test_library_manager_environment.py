@@ -820,7 +820,12 @@ class TestSandboxAllowedByTheEnvironment:
 class TestReloadSandboxLibrary:
     @pytest.mark.asyncio
     async def test_reload_picks_up_new_nodes_and_leaves_environment_libraries_and_workers_alone(
-        self, engine: Engine, configure: Configure, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        engine: Engine,
+        configure: Configure,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        no_local_worker_processes: list[str | None],
     ) -> None:
         sandbox = tmp_path / "sandbox"
         _write_sandbox_node(sandbox, "LooseNode")
@@ -831,9 +836,7 @@ class TestReloadSandboxLibrary:
         environment_library = LibraryRegistry.get_library(name="B Library")
         environment_info = _info_for(library_manager, from_environment)
         reset_workers = AsyncMock()
-        start_workers = AsyncMock()
         monkeypatch.setattr(engine.worker_manager, "reset_workers", reset_workers)
-        monkeypatch.setattr(library_manager.workers, "_start_workers", start_workers)
         monkeypatch.setattr(library_manager, "_pre_reload_callbacks", [reset_workers])
         _write_sandbox_node(sandbox, "NewNode")
 
@@ -846,7 +849,7 @@ class TestReloadSandboxLibrary:
         assert LibraryRegistry.get_library(name="B Library") is environment_library
         assert _info_for(library_manager, from_environment) is environment_info
         reset_workers.assert_not_awaited()
-        start_workers.assert_not_awaited()
+        assert no_local_worker_processes == []
 
     @pytest.mark.asyncio
     async def test_environment_mode_without_the_opt_in_refuses(
@@ -1108,7 +1111,7 @@ class TestSandboxReloadAndFullReload:
         library_manager = engine.library_manager
         await library_manager.load_all_libraries_from_config()
         monkeypatch.setattr(library_manager, "_pre_reload_callbacks", [])
-        monkeypatch.setattr(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock())
+        monkeypatch.setattr(library_manager.workers, "start_workers_after_loading", AsyncMock())
         registration = library_manager.registration
         register = registration.register_library_from_file_request
         full_reload: list[asyncio.Task] = []
