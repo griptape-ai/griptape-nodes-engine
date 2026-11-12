@@ -20,7 +20,6 @@ from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_w
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
-    DownloadEntryRemaining,
     EnvironmentManagedBlocker,
     NotFoundBlocker,
     PreviewUninstallLibraryRequest,
@@ -374,9 +373,9 @@ class LibraryUninstall(EngineScoped):
     ) -> list[RemainingRegistration]:
         """What would still register this library once its files are gone.
 
-        Only cases an uninstall is allowed to proceed through: a scan-root entry left in place
-        for the libraries beside this one, and a download entry that re-clones. An entry the
-        engine cannot remove at all blocks the uninstall instead.
+        Only the one case an uninstall proceeds through and leaves behind: a scan-root entry kept
+        for the libraries beside this one. An entry the engine cannot remove blocks the uninstall
+        instead, and one it can remove is removed, so neither reaches here.
         """
         remaining: list[RemainingRegistration] = []
 
@@ -389,9 +388,6 @@ class LibraryUninstall(EngineScoped):
                         library_names=sibling_names,
                     )
                 )
-
-        if classification.registered_in == "download" and classification.download is not None:
-            remaining.append(DownloadEntryRemaining(git_url=classification.download.git_url))
 
         return remaining
 

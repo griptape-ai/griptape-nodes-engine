@@ -1461,14 +1461,6 @@ UninstallBlocker = (
 
 
 @dataclass
-class DownloadEntryRemaining:
-    """A `libraries_to_download` git URL re-clones the folder on the next start."""
-
-    git_url: str
-    kind: str = "download_entry"
-
-
-@dataclass
 class SharedDirectoryEntryRemaining:
     """A directory entry registers this library and others, so it was left in place."""
 
@@ -1479,9 +1471,10 @@ class SharedDirectoryEntryRemaining:
 
 # What still registers the library after an otherwise successful uninstall, as a discriminated
 # union on `kind`. The engine loads it again on its next start unless the user acts, so the editor
-# warns instead of reporting a clean uninstall. A union of concrete variants for the same
-# serialization reason as `UninstallBlocker`.
-RemainingRegistration = DownloadEntryRemaining | SharedDirectoryEntryRemaining
+# warns instead of reporting a clean uninstall. Spelled as a union, rather than the one variant it
+# currently holds, for the same serialization reason as `UninstallBlocker` and so a second variant
+# does not change the wire shape.
+RemainingRegistration = SharedDirectoryEntryRemaining
 
 
 @dataclass

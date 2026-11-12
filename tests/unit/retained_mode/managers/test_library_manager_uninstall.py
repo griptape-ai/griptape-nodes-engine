@@ -26,7 +26,6 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
 )
 from griptape_nodes.retained_mode.events.library_events import (
-    DownloadEntryRemaining,
     EnvironmentManagedBlocker,
     PreviewUninstallLibraryRequest,
     PreviewUninstallLibraryResultFailure,
@@ -462,6 +461,9 @@ class TestDownloadProvisionedLibrary:
         assert result.config_entry_removed is True
         assert not await anyio.Path(repo_dir).exists()
         assert engine.config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) == []
+        # The entry is gone, so nothing re-downloads it and the uninstall is clean. Warning that
+        # the download entry survives would describe the state before the entry was removed.
+        assert result.remaining_registrations == []
 
 
 class TestUnwritableConfigLayer:
@@ -746,10 +748,7 @@ class TestStructuredVerdictsAreWireReady:
             registered_in="register",
             collateral_library_names=["Roto"],
             blocked_by=UnsafePathBlocker(path="/"),
-            remaining_registrations=[
-                SharedDirectoryEntryRemaining(entry_path="/libs", library_names=["Roto"]),
-                DownloadEntryRemaining(git_url="https://github.com/o/r"),
-            ],
+            remaining_registrations=[SharedDirectoryEntryRemaining(entry_path="/libs", library_names=["Roto"])],
             result_details="x",
         )
 
@@ -757,8 +756,7 @@ class TestStructuredVerdictsAreWireReady:
 
         assert wire["blocked_by"] == {"kind": "unsafe_path", "path": "/"}
         assert wire["remaining_registrations"] == [
-            {"kind": "shared_directory_entry", "entry_path": "/libs", "library_names": ["Roto"]},
-            {"kind": "download_entry", "git_url": "https://github.com/o/r"},
+            {"kind": "shared_directory_entry", "entry_path": "/libs", "library_names": ["Roto"]}
         ]
 
     def test_an_absent_blocker_serializes_as_null(self) -> None:
@@ -788,7 +786,6 @@ class TestStructuredVerdictsAreWireReady:
         assert UnsafePathBlocker(path="/").kind == "unsafe_path"
 
     def test_each_remaining_registration_carries_its_kind(self) -> None:
-        assert DownloadEntryRemaining(git_url="u").kind == "download_entry"
         assert SharedDirectoryEntryRemaining(entry_path="/libs").kind == "shared_directory_entry"
         assert UnmatchedEntryBlocker().kind == "unmatched_entry"
         assert UnwritableConfigBlocker(layer="project", config_key="x").kind == "unwritable_config"
