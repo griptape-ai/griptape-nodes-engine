@@ -503,6 +503,7 @@ class TestEndNodeStatusDoesNotFeedNextRun:
         assert end.parameter_output_values["result_details"] == "[SUCCEEDED]\nNo details supplied by flow"
         assert end.parameter_output_values["was_successful"] is True
         assert end.parameter_values.get("result_details") is None
+        assert "display_name" not in end.status_component.get_parameter_group().ui_options
 
     def test_supplied_details_survive_runs_unchanged(self) -> None:
         end = EndNode(name="end")
@@ -516,6 +517,7 @@ class TestEndNodeStatusDoesNotFeedNextRun:
         assert end.parameter_output_values["result_details"] == "[FAILED]\nShot sc001 finished"
         assert end.parameter_output_values["was_successful"] is False
         assert end.parameter_values["result_details"] == "Shot {SHOT} finished"
+        assert end.status_component.get_parameter_group().ui_options["display_name"] == "⚠️ Status"
 
     @staticmethod
     def _run(end: EndNode, entry: Parameter) -> None:

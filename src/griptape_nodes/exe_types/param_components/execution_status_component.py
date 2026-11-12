@@ -116,6 +116,18 @@ class ExecutionStatusComponent:
         show_warning = not was_successful and not is_placeholder
         self._update_status_group_display_label(show_warning=show_warning)
 
+    def set_was_successful(self, *, was_successful: bool) -> None:
+        """Set whether the operation succeeded, leaving result_details alone.
+
+        For a node whose result_details is an input, such as End Flow: it writes its own message to
+        its output, because set_execution_result would overwrite the input with it.
+
+        Args:
+            was_successful: Whether the operation succeeded
+        """
+        self._update_parameter_value(self._was_successful, was_successful)
+        self._update_status_group_display_label(show_warning=not was_successful)
+
     def clear_execution_status(self, initial_message: str | None = None) -> None:
         """Clear execution status and reset parameters.
 
@@ -154,12 +166,8 @@ class ExecutionStatusComponent:
             parameter: The parameter to update
             value: The new value to set
         """
-        # An INPUT parameter's value is what feeds the node. Writing the node's result there would
-        # make the next run read this run's result as its input, so the result goes to the output.
-        if ParameterMode.INPUT in parameter.get_mode():
-            self._node.parameter_output_values[parameter.name] = value
-        else:
-            self._node.set_parameter_value(parameter.name, value)
+        # ALWAYS set parameter value and publish update
+        self._node.set_parameter_value(parameter.name, value)
         self._node.publish_update_to_parameter(parameter.name, value)
 
         # ONLY set output values if the parameter mode is OUTPUT
