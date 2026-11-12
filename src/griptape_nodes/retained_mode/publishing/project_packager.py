@@ -96,6 +96,8 @@ _MIRROR_IGNORE_PATTERNS = [
     # install with host-specific binaries and absolute paths in pyvenv.cfg -- gigabytes that
     # are wrong on any other machine.
     ".venv-exec",
+    # Where node libraries keep their dev tooling, apart from the engine-managed .venv.
+    ".venv-dev",
     ".git",
     "__pycache__",
     ".griptape-nodes-previews",
