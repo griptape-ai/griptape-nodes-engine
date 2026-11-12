@@ -1,20 +1,23 @@
 """EXIF metadata injection and extraction driver for JPEG, TIFF, and MPO formats."""
 
+from __future__ import annotations
+
 import json
 import logging
-from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from PIL import Image
 from PIL.ExifTags import GPSTAGS, TAGS
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
+from griptape_nodes.image import EXIF_GPSINFO_TAG, Exif, ImageMetadata
+
+if TYPE_CHECKING:
+    from griptape_nodes.image import GriptapeImage
 
 logger = logging.getLogger("griptape_nodes")
 
 # EXIF tag IDs
 EXIF_USERCOMMENT_TAG = 0x9286
-EXIF_GPSINFO_TAG = 0x8825  # 34853
 
 # GPS coordinate tuple length
 GPS_COORD_TUPLE_LENGTH = 3
@@ -26,25 +29,26 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
     Supports reading ALL EXIF metadata (standard tags, GPS data, custom UserComment)
     and writing custom metadata to EXIF UserComment field as JSON.
     Preserves all existing EXIF data when writing.
-    All EXIF-specific logic is encapsulated in this driver.
+    All EXIF-specific logic is encapsulated in this driver. Tags are read and written through
+    ``Exif``; pixels go through whichever GriptapeImage backend is active.
     """
 
     def get_supported_formats(self) -> list[str]:
-        """Return list of PIL format strings this driver supports.
+        """Return list of GriptapeImage format names this driver supports.
 
         Returns:
             List containing "JPEG", "TIFF", "MPO"
         """
         return ["JPEG", "TIFF", "MPO", "WEBP"]
 
-    def inject_metadata(self, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
+    def inject_metadata(self, image: GriptapeImage, metadata: dict[str, str]) -> bytes:
         """Inject metadata into EXIF UserComment field as JSON.
 
         Serializes metadata dictionary to JSON and stores in EXIF UserComment.
         Preserves all existing EXIF tags.
 
         Args:
-            pil_image: PIL Image to inject metadata into
+            image: Source image to inject metadata into
             metadata: Dictionary of key-value pairs to inject
 
         Returns:
@@ -53,8 +57,12 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         Raises:
             Exception: On EXIF save errors
         """
+        if image.format is None:
+            msg = "Attempted to add EXIF metadata to an image. Failed because the image format is unknown."
+            raise ValueError(msg)
+
         # Get existing EXIF data to preserve it
-        exif_data = pil_image.getexif()
+        exif_data = image.metadata.exif or Exif()
 
         # Serialize metadata to JSON for UserComment field
         metadata_json = json.dumps(metadata, separators=(",", ":"))
@@ -63,11 +71,9 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         exif_data[EXIF_USERCOMMENT_TAG] = metadata_json
 
         # Save with updated EXIF
-        output_buffer = BytesIO()
-        pil_image.save(output_buffer, format=pil_image.format, exif=exif_data)
-        return output_buffer.getvalue()
+        return image.encode(image.format, metadata=ImageMetadata(exif=exif_data))
 
-    def extract_metadata(self, pil_image: Image.Image) -> dict[str, str]:
+    def extract_metadata(self, image: GriptapeImage) -> dict[str, str]:
         """Extract ALL EXIF metadata including standard tags, GPS data, and custom UserComment.
 
         Returns combined metadata from all sources:
@@ -76,12 +82,12 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         - Custom metadata from UserComment field (JSON parsed)
 
         Args:
-            pil_image: PIL Image to extract metadata from
+            image: Source image to extract metadata from
 
         Returns:
             Dictionary of all metadata key-value pairs, empty dict if no EXIF data
         """
-        exif_data = pil_image.getexif()
+        exif_data = image.metadata.exif
         if not exif_data:
             return {}
 
@@ -139,11 +145,11 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         else:
             return f"{decimal_degrees:.6f}"
 
-    def _extract_standard_tags(self, exif_data: Any, metadata: dict[str, str]) -> None:
+    def _extract_standard_tags(self, exif_data: Exif, metadata: dict[str, str]) -> None:
         """Extract standard EXIF tags.
 
         Args:
-            exif_data: EXIF data object from PIL
+            exif_data: Parsed EXIF tags
             metadata: Dictionary to populate with standard tags (modified in-place)
         """
         for tag_id, value in exif_data.items():
@@ -157,16 +163,16 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             # Convert value to string
             metadata[tag_name] = self._exif_value_to_string(value)
 
-    def _extract_gps_metadata(self, exif_data: Any, metadata: dict[str, str]) -> None:
+    def _extract_gps_metadata(self, exif_data: Exif, metadata: dict[str, str]) -> None:
         """Extract GPS metadata from EXIF data.
 
         Formats GPS coordinates as decimal degrees and prefixes all GPS tags with 'GPS_'.
 
         Args:
-            exif_data: EXIF data object from PIL
+            exif_data: Parsed EXIF tags
             metadata: Dictionary to populate with GPS metadata (modified in-place)
         """
-        gps_ifd = exif_data.get_ifd(EXIF_GPSINFO_TAG)
+        gps_ifd = exif_data.gps
         if not gps_ifd:
             return
 
@@ -182,11 +188,11 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             else:
                 metadata[f"GPS_{gps_tag_name}"] = self._exif_value_to_string(gps_value)
 
-    def _extract_user_comment_metadata(self, exif_data: Any, metadata: dict[str, str]) -> None:
+    def _extract_user_comment_metadata(self, exif_data: Exif, metadata: dict[str, str]) -> None:
         """Extract custom metadata from EXIF UserComment field.
 
         Args:
-            exif_data: EXIF data object from PIL
+            exif_data: Parsed EXIF tags
             metadata: Dictionary to populate with custom metadata (modified in-place)
         """
         user_comment = exif_data.get(EXIF_USERCOMMENT_TAG)

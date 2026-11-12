@@ -20,6 +20,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterList, Parame
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
+from griptape_nodes.image import IMAGE_BACKEND_ENV_VAR, PILLOW_BACKEND
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -265,7 +266,11 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         assert reason in str(result.result_details)
 
-    def test_closes_the_image_when_flow_commands_are_damaged(self, engine: Engine) -> None:
+    def test_closes_the_image_when_flow_commands_are_damaged(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Watches Pillow's file handle, so pin the Pillow backend
+        monkeypatch.setenv(IMAGE_BACKEND_ENV_VAR, PILLOW_BACKEND)
         path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}))
         opened: list[ImageFile.ImageFile] = []
         real_open = Image.open
