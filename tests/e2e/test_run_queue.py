@@ -200,11 +200,11 @@ async def test_a_node_run_while_another_node_runs_joins_that_run(
 async def test_a_node_that_joined_a_run_can_run_again_while_that_run_goes_on(
     engine: Engine, flow_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each run of the joining node runs it once, then and there, however many times it is run.
+    """Every run of a node that joined another node's run succeeds and runs it exactly once.
 
-    Its first run leaves an empty graph behind in the run it joined. Running it again used to fail
-    on that graph, leave it half-added so every later run was refused as "already executing", and
-    then run it anyway once the other node finished.
+    The node's first run leaves an empty graph behind in the run it joined, and each later run adds
+    the node back to that graph. Three runs cover both a run into the emptied graph and the run after
+    it. Counting executions after the other node finishes checks that no run happens unasked.
     """
     executed = _record_executions(engine, monkeypatch)
     holding = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Holder")))
