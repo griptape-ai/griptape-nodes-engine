@@ -6,6 +6,7 @@ import functools
 import inspect
 import logging
 import threading
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -66,7 +67,7 @@ from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
     import types
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Hashable, Iterator
     from collections.abc import Set as AbstractSet
 
     from griptape_nodes.api_client.request_client import RequestClient
@@ -339,6 +340,11 @@ def _why_engine_request_is_refused(
     return f"what it names belongs to engine {owner_id}"
 
 
+# Events that share a `coalesce_key` are sent at most once per this many seconds. Ten a second is
+# still smooth for a progress readout, and stops a burst from queueing ahead of a request's result.
+COALESCE_INTERVAL_S = 0.1
+
+
 class EventManager(EngineScoped):
     def __init__(self, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -370,6 +376,12 @@ class EventManager(EngineScoped):
         self._loop_thread_id: int | None = None
         # Keep a reference to the event loop for thread-safe operations
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        # State for events put with a `coalesce_key`: when each key last went out, the newest event
+        # held back for it, and the timer waiting to send it. Only the event loop thread touches these,
+        # so they need no lock: put_event hands every decision to the loop thread (see _enqueue).
+        self._coalesce_last_sent_at: dict[Hashable, float] = {}
+        self._coalesce_pending_event: dict[Hashable, Any] = {}
+        self._coalesce_timers: dict[Hashable, asyncio.TimerHandle] = {}
         # Worker-to-orchestrator forwarding state. Inert until
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
@@ -504,13 +516,17 @@ class EventManager(EngineScoped):
             and self._event_loop is not None
         )
 
-    def put_event(self, event: Any) -> None:
+    def put_event(self, event: Any, *, coalesce_key: Hashable | None = None) -> None:
         """Put event into async queue from sync context (non-blocking).
 
         Automatically detects if we're in a different thread and uses thread-safe operations.
 
         Args:
             event: The event to publish to the queue
+            coalesce_key: Events with the same key are sent at most once per interval, the newest
+                winning, and the newest is always sent when the interval ends. An event without a
+                key first sends anything held, so ordering is preserved. Held events are also sent
+                when the outermost request finishes.
         """
         if self._event_queue is None:
             return
@@ -525,18 +541,18 @@ class EventManager(EngineScoped):
             self._dispatch_to_execution_listeners(event)
             return
 
-        if self._is_cross_thread_call() and self._event_loop is not None:
-            # We're in a different thread from the event loop, use thread-safe method
-            # _is_cross_thread_call() guarantees _event_loop is not None
-            self._event_loop.call_soon_threadsafe(self._event_queue.put_nowait, event)
-        else:
-            # We're on the same thread as the event loop or no loop thread tracked, use direct method
-            self._event_queue.put_nowait(event)
-
-        # Dispatch after enqueuing so a callback that re-enters put_event (e.g. writing a
-        # streamed token to a parameter) enqueues its own events *after* the triggering
-        # event, preserving source order on the queue.
+        self._submit_to_loop(event, coalesce_key)
+        # Every event reaches the engine's own listeners, even one that is held and later replaced.
+        # Dispatch after submitting so a re-entrant emission from a callback lands on the queue
+        # after its triggering event.
         self._dispatch_to_execution_listeners(event)
+
+    def flush_coalesced_events(self) -> None:
+        """Send every event held back by `coalesce_key`."""
+        if self._is_cross_thread_call() and self._event_loop is not None:
+            self._event_loop.call_soon_threadsafe(self._flush_all_coalesced)
+        else:
+            self._flush_all_coalesced()
 
     async def aput_event(self, event: Any) -> None:
         """Put event into async queue from async context.
@@ -559,17 +575,68 @@ class EventManager(EngineScoped):
             self._dispatch_to_execution_listeners(event)
             return
 
-        if self._is_cross_thread_call() and self._event_loop is not None:
-            # We're in a different thread from the event loop, use thread-safe method
-            # _is_cross_thread_call() guarantees _event_loop is not None
-            self._event_loop.call_soon_threadsafe(self._event_queue.put_nowait, event)
-        else:
-            # We're on the same thread as the event loop or no loop thread tracked, use async method
-            await self._event_queue.put(event)
-
-        # Dispatch after enqueuing so a re-entrant emission from a callback lands on the
-        # queue after its triggering event (see put_event).
+        self._submit_to_loop(event, None)
         self._dispatch_to_execution_listeners(event)
+
+    def _submit_to_loop(self, event: Any, coalesce_key: Hashable | None) -> None:
+        if self._is_cross_thread_call() and self._event_loop is not None:
+            self._event_loop.call_soon_threadsafe(self._enqueue, event, coalesce_key)
+        else:
+            self._enqueue(event, coalesce_key)
+
+    # Everything below runs on the event loop thread, one call at a time, so no two of them overlap.
+    def _enqueue(self, event: Any, coalesce_key: Hashable | None) -> None:
+        if coalesce_key is None:
+            # Anything held goes out first, so a newer event never overtakes an older one.
+            self._flush_all_coalesced()
+            self._queue_event(event)
+            return
+
+        if self._hold_if_too_soon(coalesce_key, event):
+            return
+        self._queue_event(event)
+
+    def _queue_event(self, event: Any) -> None:
+        if self._event_queue is None:
+            return
+        self._event_queue.put_nowait(event)
+
+    def _hold_if_too_soon(self, key: Hashable, event: Any) -> bool:
+        """Hold `event` if `key` went out less than an interval ago. Returns whether it was held."""
+        now = time.monotonic()
+        last_sent_at = self._coalesce_last_sent_at.get(key)
+        is_due = last_sent_at is None or now - last_sent_at >= COALESCE_INTERVAL_S
+        if is_due and key not in self._coalesce_pending_event:
+            self._coalesce_last_sent_at[key] = now
+            return False
+
+        self._coalesce_pending_event[key] = event
+        # Without a loop there is nothing to time the flush. The held event still goes out with the
+        # next event that has no key, or when the request finishes.
+        if key not in self._coalesce_timers and self._event_loop is not None:
+            self._coalesce_timers[key] = self._event_loop.call_later(
+                COALESCE_INTERVAL_S, self._flush_coalesced_key, key
+            )
+        return True
+
+    def _flush_coalesced_key(self, key: Hashable) -> None:
+        self._coalesce_timers.pop(key, None)
+        held_event = self._coalesce_pending_event.pop(key, None)
+        if held_event is None:
+            return
+        self._coalesce_last_sent_at[key] = time.monotonic()
+        self._queue_event(held_event)
+
+    def _flush_all_coalesced(self) -> None:
+        now = time.monotonic()
+        held_events = list(self._coalesce_pending_event.items())
+        self._coalesce_pending_event.clear()
+        for key, held_event in held_events:
+            timer = self._coalesce_timers.pop(key, None)
+            if timer is not None:
+                timer.cancel()
+            self._coalesce_last_sent_at[key] = now
+            self._queue_event(held_event)
 
     def add_pre_dispatch_hook(
         self,
@@ -1700,6 +1767,7 @@ class EventManager(EngineScoped):
             )
 
         # Expose the dispatching request type to detectors (see current_request_type).
+        is_outermost_request = _active_request_type.get() is None
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
@@ -1730,6 +1798,9 @@ class EventManager(EngineScoped):
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
+            # Before the caller queues the result, so a held progress update can't arrive after it.
+            if is_outermost_request:
+                self.flush_coalesced_events()
             bound_workflow.reset(binding_token)
 
     @staticmethod
@@ -1812,6 +1883,7 @@ class EventManager(EngineScoped):
             )
 
         # Expose the dispatching request type to detectors (see current_request_type).
+        is_outermost_request = _active_request_type.get() is None
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
@@ -1841,6 +1913,9 @@ class EventManager(EngineScoped):
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
+            # Before the caller queues the result, so a held progress update can't arrive after it.
+            if is_outermost_request:
+                self.flush_coalesced_events()
             bound_workflow.reset(binding_token)
 
     def _invoke_handler_from_sync(
@@ -2216,14 +2291,15 @@ class EventTranslationContext:
 
         return event
 
-    def _translate_and_put(self, event: Any) -> None:
+    def _translate_and_put(self, event: Any, *, coalesce_key: Hashable | None = None) -> None:
         """Translate node names in events and put them in the queue (sync version).
 
         Args:
             event: The event to potentially translate and send
+            coalesce_key: Passed through to `put_event` unchanged
         """
         translated_event = self._translate_event(event)
-        self.original_put_event(translated_event)
+        self.original_put_event(translated_event, coalesce_key=coalesce_key)
 
     async def _translate_and_aput(self, event: Any) -> None:
         """Translate node names in events and put them in the queue (async version).

@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import contextlib
 import contextvars
 import logging
 import re
@@ -34,7 +35,12 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine, current_engine
-from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails, ResultPayload
+from griptape_nodes.retained_mode.events.app_events import (
+    EngineInitializationProgress,
+    InitializationPhase,
+    InitializationStatus,
+)
+from griptape_nodes.retained_mode.events.base_events import AppEvent, RequestPayload, ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -68,6 +74,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowShapeResultFailure,
     GetWorkflowShapeResultSuccess,
     ImportWorkflowAsReferencedSubFlowRequest,
+    ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultFailure,
@@ -1858,6 +1865,60 @@ class TestWorkflowManager:
 
         assert len(result.succeeded) == file_count
         assert list_libraries_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_registration_scan_coalesces_progress_but_sends_failures_and_final_as_they_happen(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Routine progress events are coalesced, but a failure and the final event never are.
+
+        Clients list failed items from the failure events and leave their loading state on the
+        final one. A coalesced event can be replaced by a newer one, so those two are sent
+        without a key.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        file_count = 20
+        for index in range(file_count):
+            (tmp_path / f"workflow_{index:02}.py").write_text(
+                _valid_workflow_source(f"workflow_{index:02}"), encoding="utf-8"
+            )
+
+        original_process = workflow_manager._process_single_workflow_file
+
+        async def fail_one(workflow_file: Path, **kwargs: Any) -> Any:
+            if workflow_file.name == "workflow_07.py":
+                return None
+            return await original_process(workflow_file, **kwargs)
+
+        sent: list[tuple[EngineInitializationProgress, Any]] = []
+
+        def record(event: Any, *, coalesce_key: Any = None) -> None:
+            if isinstance(event, AppEvent) and isinstance(event.payload, EngineInitializationProgress):
+                sent.append((event.payload, coalesce_key))
+
+        with (
+            patch.object(workflow_manager, "_process_single_workflow_file", side_effect=fail_one),
+            patch.object(engine.event_manager, "put_event", side_effect=record),
+        ):
+            result = await workflow_manager._process_workflows_for_registration([str(tmp_path)])
+
+        assert len(result.succeeded) == file_count - 1
+        assert len(result.failed) == 1
+        failures = [(p, key) for p, key in sent if p.status == InitializationStatus.FAILED]
+        assert [(p.item_name, p.error, key) for p, key in failures] == [
+            ("workflow_07.py", "Failed to process workflow file", None)
+        ]
+        final_payload, final_key = sent[-1]
+        assert final_payload.current == file_count
+        assert final_payload.status != InitializationStatus.LOADING
+        assert final_key is None
+        routine = [key for p, key in sent if p.status != InitializationStatus.FAILED and p is not final_payload]
+        assert routine
+        assert all(key is not None for key in routine)
+        assert all(p.phase == InitializationPhase.WORKFLOWS and p.total == file_count for p, _ in sent)
 
     @pytest.mark.parametrize(
         ("file_name", "source"),
@@ -5723,43 +5784,70 @@ class TestWorkflowShapeStartFlowDefaults:
         assert shape[WorkflowShapeType.OUTPUT]["End Flow"]["topic"][SHAPE_DEFAULT_VALUE_KEY] == ""
 
 
+class ImportInputs(NamedTuple):
+    """What `_execute_workflow_import` is handed."""
+
+    request: ImportWorkflowAsReferencedSubFlowRequest
+    imported: Mock
+    workflow: WorkflowRuntime
+
+
 class TestExecuteWorkflowImport:
     """ReferencedWorkflowImport._execute_workflow_import tests."""
 
-    @pytest.mark.asyncio
-    async def test_returns_top_level_imported_flow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        workflow_manager = engine.workflow_manager
-
+    @pytest.fixture
+    def import_inputs(self, engine: Engine) -> ImportInputs:
         request = ImportWorkflowAsReferencedSubFlowRequest(
             workflow_name="wf", flow_name="ParentFlow", imported_flow_metadata=None, track_as_referenced=False
         )
         imported = Mock(spec=Workflow)
         imported.name = "wf"
         imported.file_path = "workflows/wf.py"
-
-        # The import creates two new flows (a top-level flow + a group's body flow). The dict
-        # values are never inspected -- only the keys form the new-flows set.
         workflow = WorkflowRuntime("importing", engine)
-        monkeypatch.setattr(
-            workflow.objects,
-            "get_filtered_subset",
-            Mock(
-                side_effect=[
-                    {"ParentFlow": object()},
-                    {"ParentFlow": object(), "ControlFlow_2": object(), "Group_subflow": object()},
-                ]
-            ),
-        )
-        # The target flow is entered purely as a context manager wrapping the import.
-        monkeypatch.setattr(
-            engine.flow_manager, "get_flow_by_name_in", Mock(return_value=ControlFlow("ParentFlow", engine))
-        )
+        workflow.objects.add("ParentFlow", ControlFlow("ParentFlow", engine))
+        return ImportInputs(request=request, imported=imported, workflow=workflow)
 
-        monkeypatch.setattr(
-            workflow_manager.runner,
-            "run_workflow",
-            AsyncMock(return_value=WorkflowExecutionResult(execution_successful=True, execution_details="ok")),
-        )
+    @pytest.fixture
+    def recorded_flows(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Replace the per-import creation record with the returned list."""
+        recorded: list[str] = []
+
+        @contextlib.contextmanager
+        def task_local_flow_creation_record() -> Iterator[list[str]]:
+            yield recorded
+
+        record_mock = Mock(spec=engine.flow_manager.task_local_flow_creation_record)
+        record_mock.side_effect = task_local_flow_creation_record
+        monkeypatch.setattr(engine.flow_manager, "task_local_flow_creation_record", record_mock)
+        return recorded
+
+    @pytest.fixture
+    def run_workflow_mock(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        run_workflow = AsyncMock(spec=engine.workflow_manager.runner.run_workflow)
+        monkeypatch.setattr(engine.workflow_manager.runner, "run_workflow", run_workflow)
+        return run_workflow
+
+    @pytest.mark.asyncio
+    async def test_returns_top_level_imported_flow(
+        self,
+        engine: Engine,
+        monkeypatch: pytest.MonkeyPatch,
+        import_inputs: ImportInputs,
+        recorded_flows: list[str],
+        run_workflow_mock: AsyncMock,
+    ) -> None:
+        workflow_manager = engine.workflow_manager
+        request, imported, workflow = import_inputs
+
+        # The import creates two new flows (a top-level flow + a group's body flow), which the
+        # per-import record collects.
+        async def run_workflow(_path: str, _workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
+            for name in ("ControlFlow_2", "Group_subflow"):
+                workflow.objects.add(name, ControlFlow(name, engine))
+                recorded_flows.append(name)
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        run_workflow_mock.side_effect = run_workflow
 
         # Spy the selection helper (its own logic is covered by TestSelectTopLevelImportedFlow).
         select_mock = create_autospec(
@@ -5776,6 +5864,112 @@ class TestExecuteWorkflowImport:
         # ...and returns exactly what the helper chose.
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
         assert result.created_flow_name == "ControlFlow_2"
+
+    @pytest.mark.asyncio
+    async def test_fails_when_no_flow_was_created(
+        self, engine: Engine, import_inputs: ImportInputs, recorded_flows: list[str], run_workflow_mock: AsyncMock
+    ) -> None:
+        request, imported, workflow = import_inputs
+        run_workflow_mock.return_value = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        result = await engine.workflow_manager.referenced_import._execute_workflow_import(
+            workflow, request, imported, "ParentFlow"
+        )
+
+        assert recorded_flows == []
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure)
+        assert "no new flow was created" in str(result.result_details)
+
+
+class SiblingTargets(NamedTuple):
+    """The names of the two flows the concurrent imports target."""
+
+    target_a: str
+    target_b: str
+
+
+class TestConcurrentWorkflowImports:
+    """Imports running at the same time into different flows do not share a flow context."""
+
+    @pytest.fixture
+    def sibling_flows(self, engine: Engine) -> Iterator[SiblingTargets]:
+        """Create a root flow with two sibling target flows in a workflow closed afterwards."""
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="concurrent_imports")
+        try:
+            for name, parent in (("ConcRoot", None), ("ConcTargetA", "ConcRoot"), ("ConcTargetB", "ConcRoot")):
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name=parent, flow_name=name, set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+            yield SiblingTargets(target_a="ConcTargetA", target_b="ConcTargetB")
+        finally:
+            context_manager.pop_workflow()
+
+    @pytest.fixture
+    def interleaved_run_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Make both imports reach `run_workflow` before either imported file creates its flow.
+
+        Returns the workflow the imports run.
+        """
+        workflow_manager = engine.workflow_manager
+        imported = Mock(spec=Workflow)
+        imported.name = "wf"
+        imported.file_path = "workflows/wf.py"
+
+        arrived: dict[str, asyncio.Event] = {"A": asyncio.Event(), "B": asyncio.Event()}
+        a_created = asyncio.Event()
+
+        async def run_workflow(_path: str, _workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
+            # Generated workflow files create their top-level flow with no explicit parent.
+            task_name = asyncio.current_task().get_name()  # type: ignore[union-attr]
+            arrived[task_name].set()
+            await asyncio.wait_for(asyncio.gather(arrived["A"].wait(), arrived["B"].wait()), timeout=5.0)
+            # Both imports are inside their flow context; neither push may reach the shared stack.
+            assert self.shared_stack_names(engine) == []
+            if task_name == "B":
+                await asyncio.wait_for(a_created.wait(), timeout=5.0)
+            result = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=None, flow_name=f"ConcImported{task_name}", set_as_new_context=False)
+            )
+            assert isinstance(result, CreateFlowResultSuccess)
+            if task_name == "A":
+                a_created.set()
+            return WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        monkeypatch.setattr(workflow_manager.runner, "run_workflow", run_workflow)
+        return imported
+
+    @pytest.mark.asyncio
+    async def test_concurrent_imports_into_different_flows_get_their_own_parent_and_flow(
+        self, engine: Engine, sibling_flows: SiblingTargets, interleaved_run_workflow: Mock
+    ) -> None:
+        referenced_import = engine.workflow_manager.referenced_import
+        imported = interleaved_run_workflow
+        workflow = engine.current_workflow()
+        target_a, target_b = sibling_flows
+
+        async def import_into(target: str) -> ResultPayload:
+            request = ImportWorkflowAsReferencedSubFlowRequest(
+                workflow_name="wf", flow_name=target, imported_flow_metadata=None, track_as_referenced=False
+            )
+            return await referenced_import._execute_workflow_import(workflow, request, imported, target)
+
+        task_a = asyncio.create_task(import_into(target_a), name="A")
+        task_b = asyncio.create_task(import_into(target_b), name="B")
+        result_a, result_b = await asyncio.gather(task_a, task_b)
+
+        assert isinstance(result_a, ImportWorkflowAsReferencedSubFlowResultSuccess)
+        assert isinstance(result_b, ImportWorkflowAsReferencedSubFlowResultSuccess)
+        assert result_a.created_flow_name == "ConcImportedA"
+        assert result_b.created_flow_name == "ConcImportedB"
+        assert engine.flow_manager.get_parent_flow_in(workflow, "ConcImportedA") == target_a
+        assert engine.flow_manager.get_parent_flow_in(workflow, "ConcImportedB") == target_b
+        assert self.shared_stack_names(engine) == []
+
+    def shared_stack_names(self, engine: Engine) -> list[str]:
+        workflow_stack = engine.current_workflow().context
+        return [flow_state._flow.name for flow_state in workflow_stack._flow_stack]
 
 
 class TestReferencedWorkflowTagging:
