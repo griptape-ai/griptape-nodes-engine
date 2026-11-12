@@ -1,19 +1,27 @@
-"""Regression test for issue #5124: importing a referenced workflow that contains a node group.
+"""Regression tests for referenced workflow imports.
+
+#5124: importing a referenced workflow that contains a node group.
 
 A workflow that contains a node group (ForEach, etc.) serializes as MORE THAN ONE flow — its
 top-level ``ControlFlow`` plus the group's body flow. When such a workflow is imported as a
 referenced sub-flow, ``ReferencedWorkflowImport._execute_workflow_import`` must bind to the TOP-LEVEL
 imported flow (the one that holds the Start/End nodes), because that is what the Workflow node
 records as its ``subflow_name`` and routes I/O through.
+
+#5665: a failed import, including one with nested imports, leaves none of the flows or
+nodes it built.
 """
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 
+from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -29,10 +37,12 @@ from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, C
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowRequest,
+    ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultSuccess,
 )
+from griptape_nodes.retained_mode.runtime.objects import WorkflowObjects
 from tests.workflow_context import bind
 
 if TYPE_CHECKING:
@@ -51,11 +61,66 @@ FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "subflow_echo_node.py"
 LIBRARY_NAME = "Subflow Import Flow Selection Library"
 
 
-def _write_grouped_workflow_file(engine: Engine, library_json: Path, workflow_path: Path) -> None:
-    """Write a self-contained grouped workflow ``.py`` to ``workflow_path``.
+# The header and imports shared by the saved workflows that import `{inner}` from inside
+# a flow they created.
+OUTER_WORKFLOW_PREAMBLE = """# /// script
+# dependencies = []
+#
+# [tool.griptape-nodes]
+# name = "outer_importing_workflow"
+# schema_version = "0.21.0"
+# engine_version_created_with = "0.0.0"
+# node_libraries_referenced = []
+# node_types_used = []
+# is_griptape_provided = false
+# is_template = false
+# is_internal = false
+# ///
 
-    Builds a flow whose only node is a group (which owns a nested body flow), serializes it to a
-    self-contained module, and clears the in-process build so the import starts from a clean slate.
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
+from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowRequest
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+async def build_workflow() -> None:
+    flow_name = (
+        await GriptapeNodes.ahandle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="OuterFlow", set_as_new_context=False)
+        )
+    ).flow_name
+    with GriptapeNodes.ContextManager().flow(flow_name):
+        result = await GriptapeNodes.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name="{inner}")
+        )
+"""
+
+# A saved workflow whose only content is a flow holding an import of `{inner}`, which it expects to fail.
+OUTER_IMPORTING_WORKFLOW = (
+    OUTER_WORKFLOW_PREAMBLE
+    + """        if result.failed():
+            raise RuntimeError(str(result.result_details))
+"""
+)
+
+# A saved workflow that imports `{inner}`, which it expects to succeed, and then fails itself.
+OUTER_FAILING_AFTER_IMPORT_WORKFLOW = (
+    OUTER_WORKFLOW_PREAMBLE
+    + """        if result.failed():
+            raise RuntimeError("the nested import failed")
+    raise RuntimeError("the workflow file failed")
+"""
+)
+
+
+def _write_workflow_file(
+    engine: Engine, library_json: Path, workflow_path: Path, *, grouped: bool = True, fails: bool = False
+) -> None:
+    """Write a self-contained workflow ``.py`` to ``workflow_path``.
+
+    Builds a flow whose only node is a group (which owns a nested body flow), or a plain
+    echo node when ``grouped`` is False, serializes it to a self-contained module, and
+    clears the in-process build so the import starts from a clean slate. When ``fails``
+    is True the module raises after building everything.
     """
     register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
@@ -69,22 +134,25 @@ def _write_grouped_workflow_file(engine: Engine, library_json: Path, workflow_pa
     flow_name = flow_result.flow_name
 
     with engine.context_manager.flow(flow_name):
-        group_result = engine.handle_request(
-            CreateNodeRequest(
-                node_type="SubflowGroupNode",
-                specific_library_name=LIBRARY_NAME,
-                node_name="SubflowGroup_1",
-                initial_setup=True,
+        parent_group_name = None
+        if grouped:
+            group_result = engine.handle_request(
+                CreateNodeRequest(
+                    node_type="SubflowGroupNode",
+                    specific_library_name=LIBRARY_NAME,
+                    node_name="SubflowGroup_1",
+                    initial_setup=True,
+                )
             )
-        )
-        assert isinstance(group_result, CreateNodeResultSuccess), group_result
+            assert isinstance(group_result, CreateNodeResultSuccess), group_result
+            parent_group_name = group_result.node_name
         echo_result = engine.handle_request(
             CreateNodeRequest(
                 node_type="EchoNode",
                 specific_library_name=LIBRARY_NAME,
                 node_name="Echo_1",
                 initial_setup=True,
-                parent_group_name=group_result.node_name,
+                parent_group_name=parent_group_name,
             )
         )
         assert isinstance(echo_result, CreateNodeResultSuccess), echo_result
@@ -105,6 +173,13 @@ def _write_grouped_workflow_file(engine: Engine, library_json: Path, workflow_pa
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
+    if fails:
+        # The raise goes at the end of `build_workflow()`'s body, which only works while
+        # that function is the last statement in the module.
+        last_statement = ast.parse(content).body[-1]
+        assert isinstance(last_statement, ast.AsyncFunctionDef), last_statement
+        assert last_statement.name == "build_workflow", last_statement.name
+        content = content.rstrip("\n") + "\n    raise RuntimeError('the workflow file failed')\n"
     workflow_path.write_text(content)
 
     # Drop the in-process build so the import below starts from a clean parent flow.
@@ -124,7 +199,7 @@ async def test_import_binds_to_top_level_flow_not_group_body(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
     )
     workflow_path = tmp_path / "grouped_inner_workflow.py"
-    _write_grouped_workflow_file(engine, library_json, workflow_path)
+    _write_workflow_file(engine, library_json, workflow_path)
 
     # Register the workflow file so it can be imported by name.
     import_workflow_result = await engine.ahandle_request(ImportWorkflowRequest(file_path=str(workflow_path)))
@@ -153,3 +228,218 @@ async def test_import_binds_to_top_level_flow_not_group_body(
         f"import bound to '{created_flow}' (parent '{flow_manager.get_parent_flow_in(flow_manager.engine.current_workflow(), created_flow)}') "
         f"instead of the top-level flow parented to '{parent_flow}'"
     )
+
+
+class RegisteredImport(NamedTuple):
+    """A registered workflow and the flow it is to be imported into."""
+
+    workflow_name: str
+    parent_flow: str
+
+
+@pytest.mark.skipif(
+    not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
+    reason=f"Subflow Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
+)
+class TestFailedImportCleanup:
+    """A failed referenced import leaves none of the flows or nodes it had already built."""
+
+    @pytest.fixture
+    def created_names(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record the name of every object (flow or node) added to a workflow, in order.
+
+        Nodes are added through `add_object_by_name_in` and flows straight to the workflow's objects,
+        and both end at `WorkflowObjects.add`.
+        """
+        names: list[str] = []
+        real_add = WorkflowObjects.add
+
+        def add(self: WorkflowObjects, name: str, obj: object) -> None:
+            names.append(name)
+            real_add(self, name, obj)
+
+        monkeypatch.setattr(WorkflowObjects, "add", add)
+        return names
+
+    @staticmethod
+    def _flow_names(engine: Engine) -> set[str]:
+        return set(engine.current_workflow().objects.get_filtered_subset(type=ControlFlow))
+
+    @staticmethod
+    def _node_names(engine: Engine) -> set[str]:
+        return set(engine.current_workflow().objects.get_filtered_subset(type=BaseNode))
+
+    async def _failing_import(
+        self, tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path], *, grouped: bool
+    ) -> RegisteredImport:
+        """Register a failing workflow and a parent flow."""
+        return await self._registered_import(tmp_path, engine, materialize_library, grouped=grouped, fails=True)
+
+    async def _registered_import(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        *,
+        grouped: bool,
+        fails: bool,
+    ) -> RegisteredImport:
+        """Register a workflow that fails, or not, and a parent flow."""
+        library_json = materialize_library(
+            tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
+        )
+        workflow_path = tmp_path / "inner_workflow.py"
+        _write_workflow_file(engine, library_json, workflow_path, grouped=grouped, fails=fails)
+        registered = await engine.ahandle_request(ImportWorkflowRequest(file_path=str(workflow_path)))
+        assert isinstance(registered, ImportWorkflowResultSuccess), registered
+
+        engine.context_manager.push_workflow(workflow_name="parent_workflow")
+        parent_result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
+        )
+        assert isinstance(parent_result, CreateFlowResultSuccess), parent_result
+        return RegisteredImport(workflow_name=registered.workflow_name, parent_flow=parent_result.flow_name)
+
+    async def _failed_import_built(
+        self, engine: Engine, created_names: list[str], workflow_name: str, parent_flow: str
+    ) -> list[str]:
+        """Run the import, assert it failed after building things, and return the names it built."""
+        start = len(created_names)
+
+        result = await engine.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name=workflow_name, flow_name=parent_flow)
+        )
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure), result
+        assert "the workflow file failed" in str(result.result_details), result
+        built = created_names[start:]
+        # The file must have got as far as building its graph, or the cleanup checks below prove nothing.
+        assert "Echo_1" in built, built
+        return built
+
+    @pytest.mark.asyncio
+    async def test_failed_import_leaves_no_flows_or_nodes(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        created_names: list[str],
+    ) -> None:
+        """Nothing the failed import built stays in the workflow."""
+        failing = await self._failing_import(tmp_path, engine, materialize_library, grouped=False)
+
+        await self._failed_import_built(engine, created_names, failing.workflow_name, failing.parent_flow)
+
+        assert self._flow_names(engine) == {failing.parent_flow}
+        assert self._node_names(engine) == set()
+
+    @pytest.mark.asyncio
+    async def test_failed_import_is_not_serialized(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        created_names: list[str],
+    ) -> None:
+        """Saving the parent after a failed import writes no import of the failed workflow."""
+        failing = await self._failing_import(tmp_path, engine, materialize_library, grouped=False)
+        await self._failed_import_built(engine, created_names, failing.workflow_name, failing.parent_flow)
+
+        serialize_result = engine.handle_request(
+            SerializeFlowToCommandsRequest(flow_name=failing.parent_flow, include_create_flow_command=True)
+        )
+
+        assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
+        commands = serialize_result.serialized_flow_commands
+        assert not any(
+            isinstance(sub_flow.flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest)
+            for sub_flow in commands.sub_flows_commands
+        ), commands
+        assert self._flow_names(engine) == {failing.parent_flow}
+
+    @pytest.mark.asyncio
+    async def test_failed_import_of_group_workflow_removes_group_body_flow(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        created_names: list[str],
+    ) -> None:
+        """The flow inside a node group goes too, along with the group's nodes."""
+        failing = await self._failing_import(tmp_path, engine, materialize_library, grouped=True)
+
+        built = await self._failed_import_built(engine, created_names, failing.workflow_name, failing.parent_flow)
+
+        assert "SubflowGroup_1" in built, built
+        assert self._flow_names(engine) == {failing.parent_flow}
+        assert self._node_names(engine) == set()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_failed_import_reuses_the_same_names(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        created_names: list[str],
+    ) -> None:
+        """A second attempt builds flows and nodes with the same names as the first, not numbered copies."""
+        failing = await self._failing_import(tmp_path, engine, materialize_library, grouped=True)
+
+        first = await self._failed_import_built(engine, created_names, failing.workflow_name, failing.parent_flow)
+        second = await self._failed_import_built(engine, created_names, failing.workflow_name, failing.parent_flow)
+
+        assert second == first
+
+    @pytest.mark.asyncio
+    async def test_failed_nested_import_leaves_no_flows(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        created_names: list[str],
+    ) -> None:
+        """An import whose file runs a failing nested import removes the flows of both."""
+        failing = await self._failing_import(tmp_path, engine, materialize_library, grouped=False)
+        outer_path = tmp_path / "outer_importing_workflow.py"
+        outer_path.write_text(OUTER_IMPORTING_WORKFLOW.replace("{inner}", failing.workflow_name))
+        registered = await engine.ahandle_request(ImportWorkflowRequest(file_path=str(outer_path)))
+        assert isinstance(registered, ImportWorkflowResultSuccess), registered
+
+        built = await self._failed_import_built(engine, created_names, registered.workflow_name, failing.parent_flow)
+
+        assert "OuterFlow" in built, built
+        assert self._flow_names(engine) == {failing.parent_flow}
+        assert self._node_names(engine) == set()
+        serialize_result = engine.handle_request(
+            SerializeFlowToCommandsRequest(flow_name=failing.parent_flow, include_create_flow_command=True)
+        )
+        assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
+        assert serialize_result.serialized_flow_commands.sub_flows_commands == []
+
+    @pytest.mark.asyncio
+    async def test_failed_import_removes_a_succeeded_nested_imports_flows(
+        self,
+        tmp_path: Path,
+        engine: Engine,
+        materialize_library: Callable[..., Path],
+        created_names: list[str],
+    ) -> None:
+        """An import whose file fails after a nested import succeeded removes the nested flows too."""
+        nested = await self._registered_import(tmp_path, engine, materialize_library, grouped=True, fails=False)
+        outer_path = tmp_path / "outer_importing_workflow.py"
+        outer_path.write_text(OUTER_FAILING_AFTER_IMPORT_WORKFLOW.replace("{inner}", nested.workflow_name))
+        registered = await engine.ahandle_request(ImportWorkflowRequest(file_path=str(outer_path)))
+        assert isinstance(registered, ImportWorkflowResultSuccess), registered
+
+        built = await self._failed_import_built(engine, created_names, registered.workflow_name, nested.parent_flow)
+
+        # The nested import ran to completion, so its flows existed before the cleanup.
+        assert "OuterFlow" in built, built
+        assert "SubflowGroup_1" in built, built
+        assert self._flow_names(engine) == {nested.parent_flow}
+        assert self._node_names(engine) == set()
+        serialize_result = engine.handle_request(
+            SerializeFlowToCommandsRequest(flow_name=nested.parent_flow, include_create_flow_command=True)
+        )
+        assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
+        assert serialize_result.serialized_flow_commands.sub_flows_commands == []
