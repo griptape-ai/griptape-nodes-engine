@@ -3,8 +3,10 @@ from enum import StrEnum
 from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
     ExecutionPayload,
     GraphAccessMixin,
+    ProgressEvent,
     RequestPayload,
     ResultDetails,
     ResultPayloadFailure,
@@ -721,6 +723,17 @@ class GriptapeEvent(ExecutionPayload):
     value: DisplayValue
 
 
+def progress_to_execution_event(progress: ProgressEvent) -> ExecutionEvent:
+    """The execution event a streamed progress event reaches clients as."""
+    payload = GriptapeEvent(
+        node_name=progress.node_name,
+        parameter_name=progress.parameter_name,
+        type=type(progress).__name__,
+        value=progress.value,
+    )
+    return ExecutionEvent(payload=payload, open_workflow_id=progress.open_workflow_id)
+
+
 class NodeMetadata(TypedDict, total=False):
     """Metadata dict carried on nodes. node_type and library are required; all other keys are optional."""
 
@@ -736,6 +749,10 @@ class ExecuteNodeRequest(RequestPayload):
     Hydrates the node's input parameters, calls aprocess(), and returns outputs.
     Unlike ResolveNodeRequest, this bypasses flow/DAG machinery and executes
     the node's process method directly.
+
+    NodeExecutor sends it only after choosing, by the node's type, to run the node on its own, and
+    a worker receives it from the orchestrator. Groups and loops never get one. Clients run a node with
+    ResolveNodeRequest, which makes that choice.
 
     Handling depends on where the request lands:
 

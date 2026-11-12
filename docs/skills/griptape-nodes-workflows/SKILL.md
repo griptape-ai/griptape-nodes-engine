@@ -9,7 +9,7 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Only ONE can be active at a time. Reset with `ClearAllObjectStateRequest`.
+- **Workflow**: Top-level namespace. Several can be open at once. `ClearAllObjectStateRequest` closes them all.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
@@ -169,10 +169,28 @@ submitted. So either:
 The one-batch + explicit names path is almost always shorter and is what the
 batched recipe below uses.
 
+## Choose the Workflow
+
+Calls act on the workflow your client's `X-Griptape-Workflow-Id` header names. With
+no header, pick one before building:
+
+```
+A. griptape_nodes_ListOpenWorkflowsRequest()
+   → each open workflow's workflow_id and name.
+B. griptape_nodes_OpenWorkflowRequest(workflow_id="<id>") → work in that open workflow,
+   or griptape_nodes_OpenWorkflowRequest(create_flow=True) → start a new one.
+```
+
+Later calls in the MCP session act on that workflow. If another client closes it,
+calls fail with `WorkflowNotOpenResultFailure`, which lists the open workflows, until
+you repeat step B.
+
 ## Canonical Cold-Start Recipe
 
 For a typical 3-node linear pipeline (`TextInput → Agent → DisplayText`), once the
-workspace survey above has confirmed the relevant library exposes those node types:
+workspace survey above has confirmed the relevant library exposes those node types.
+On an empty engine, step 1 opens a new workflow with its flow. With one open, choose
+it first (see Choose the Workflow); step 1 then gives it a flow if it has none.
 
 ```
 1. griptape_nodes_EnsureWorkflowAndFlowRequest()
@@ -236,11 +254,11 @@ usually kept out of the build batch so its long timeout does not gate the rest:
 
 ```
 1. EnsureWorkflowAndFlowRequest                        (1 call)
-2. EventRequestBatch([                                  (1 call, runs sequentially)
-     DescribeNodeTypeRequest("TextInput"),
-     DescribeNodeTypeRequest("Agent"),
-     DescribeNodeTypeRequest("DisplayText"),
-   ])
+2. EventRequestBatch([                                  (1 call, trimmed)
+     DescribeNodeTypeRequest("TextInput",   **PLAN),
+     DescribeNodeTypeRequest("Agent",       **PLAN),
+     DescribeNodeTypeRequest("DisplayText", **PLAN),
+   ])   # PLAN = include_metadata, include_tooltips, include_ui_options all False
 3. EventRequestBatch([                                  (1 call, runs sequentially)
      CreateNodeRequest(node_type="TextInput",   node_name="TextInput_1"),
      CreateNodeRequest(node_type="Agent",       node_name="Agent_1"),
@@ -255,6 +273,11 @@ usually kept out of the build batch so its long timeout does not gate the rest:
 4. StartFlowRequest()
    + GetParameterValueRequest("DisplayText_1", "text")            (2 calls)
 ```
+
+With those flags off, each parameter still has its name, types, modes, default and dropdown
+`options`, which is all wiring and setting values needs; `metadata`, tooltips and `ui_options`
+come back as `null`. Listing the node types with `ListNodeTypesInLibraryRequest` and
+`include_metadata` already gives the metadata.
 
 Four round trips instead of thirteen. Walk the result arrays after each batch and
 verify every slot returned `ok: true` before moving on; per-slot failures don't
@@ -403,11 +426,12 @@ The slot name is engine-generated and only known after the add returns, so the
 an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
 `parameter_name`, then batch the connects/sets in the next.
 
-### Only one workflow in context at a time
+### Several workflows can be open
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` first — this wipes
-EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today.
+`OpenWorkflowRequest` and `SetWorkflowContextRequest` open a workflow beside the ones
+already open. Close yours with `CloseWorkflowRequest(workflow_id=...)` when you're done.
+`ClearAllObjectStateRequest(i_know_what_im_doing=True)` closes every workflow, other
+clients' included.
 
 ### Agents cannot be interrupted mid-run
 
@@ -420,7 +444,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 
 | Goal                                                                                | Tool                                                                                                                                                      |
 | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bootstrap a workflow + flow from cold                                               | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
+| Bootstrap a workflow + flow on an empty engine                                      | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
 | Fan N requests out in one round trip                                                | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                                     | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest` (`include_metadata` for descriptions), `ListCategoriesInLibraryRequest`                 |
 | Inspect a node type's parameters                                                    | `DescribeNodeTypeRequest`                                                                                                                                 |
@@ -435,7 +459,6 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Run synchronously                                                                   | `StartFlowRequest`                                                                                                                                        |
 | Run from a specific node                                                            | `StartFlowFromNodeRequest`                                                                                                                                |
 | Resolve a single node without firing the control flow                               | `ResolveNodeRequest`                                                                                                                                      |
-| Execute a single node directly                                                      | `ExecuteNodeRequest`                                                                                                                                      |
 | Rename a node or flow                                                               | `RenameObjectRequest(allow_next_closest_name_available=True)`                                                                                             |
 | Lock or unlock a node                                                               | `SetLockNodeStateRequest`                                                                                                                                 |
 | Reset a node's parameters to defaults                                               | `ResetNodeToDefaultsRequest`                                                                                                                              |
@@ -443,6 +466,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
+| List, work in, start or close workflows                                             | `ListOpenWorkflowsRequest()`, `OpenWorkflowRequest(workflow_id=...)`, `OpenWorkflowRequest(create_flow=True)`, `CloseWorkflowRequest(workflow_id=...)`    |
 | Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes
@@ -497,7 +521,7 @@ Total: 13 MCP calls from empty engine to rendered output.
 ### Same pipeline, batched (4 round trips)
 
 1. `EnsureWorkflowAndFlowRequest()`
-1. `EventRequestBatch([DescribeNodeTypeRequest × 3])`
+1. `EventRequestBatch([DescribeNodeTypeRequest(include_metadata=False, include_tooltips=False, include_ui_options=False) × 3])`
 1. `EventRequestBatch([CreateNodeRequest × 3 (with explicit node_name), SetParameterValueRequest, CreateConnectionRequest × 2, AutoLayoutFlowRequest])`
 1. `StartFlowRequest()` then `GetParameterValueRequest("DisplayText_1", "text")`
 

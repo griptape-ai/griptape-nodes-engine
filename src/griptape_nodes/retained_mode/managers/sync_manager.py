@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import logging
 import threading
@@ -334,9 +335,7 @@ class SyncManager(EngineScoped):
             sync_dir = self._sync_dir
 
             # Stop any existing watching
-            if self._watch_task and self._watch_task.is_alive():
-                self._watching_stopped.set()
-                self._watch_task.join(timeout=2.0)
+            self._stop_file_watching()
 
             # Reset the stop event for new watching
             self._watching_stopped.clear()
@@ -349,11 +348,21 @@ class SyncManager(EngineScoped):
                 daemon=True,
             )
             self._watch_task.start()
+            # watchfiles keeps running interpreter code on this thread while it watches, so a watch
+            # still running when the interpreter finalizes can crash the process on exit.
+            atexit.register(self._stop_file_watching)
 
             logger.debug("Started watching synced workflows directory: %s", sync_dir)
 
         except Exception as e:
             logger.error("Failed to start file watching: %s", str(e))
+
+    def _stop_file_watching(self) -> None:
+        """Stop the watching thread, if one is running."""
+        atexit.unregister(self._stop_file_watching)
+        if self._watch_task and self._watch_task.is_alive():
+            self._watching_stopped.set()
+            self._watch_task.join(timeout=2.0)
 
     def _watch_files_thread(self, sync_dir: str) -> None:
         """Background thread that watches for file changes using watchfiles."""

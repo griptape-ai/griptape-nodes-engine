@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin, WebSocketMessage
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.converters import EventSerializationError
+from griptape_nodes.retained_mode.topics import session_response_topic
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import (
@@ -74,7 +75,7 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
                     logger.warning("WebSocket client not available, message dropped")
                     continue
 
-                topic = message.topic or f"sessions/{self._session_id}/response"
+                topic = message.topic or session_response_topic(self._session_id)
                 payload_dict = json.loads(message.payload)
                 await self._ws_client.publish(message.event_type, payload_dict, topic)
                 logger.debug("DELIVERED: %s event", message.event_type)
@@ -96,7 +97,7 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
             logger.debug("WebSocket sender not active, event not sent: %s", event_type)
             return
 
-        topic = f"sessions/{self._session_id}/response"
+        topic = session_response_topic(self._session_id)
         message = WebSocketMessage(event_type, payload, topic)
 
         try:

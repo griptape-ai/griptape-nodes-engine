@@ -594,6 +594,37 @@ class TestUnsendableResults:
             converters.engine.dumps(event)
 
 
+class TestUnreadableRequestFailure:
+    """A request frame the engine could not read is answered from the raw frame, echoing its envelope."""
+
+    def test_echoes_the_envelope_and_names_the_reason(self) -> None:
+        frame = {
+            "request_type": "NoSuchRequest",
+            "request": {"a": 1},
+            "request_id": "req-1",
+            "response_topic": "sessions/s1/clients/c1/response",
+            "open_workflow_id": "wf-1",
+        }
+
+        failure = converters.client.unreadable_request_failure(frame, "it is not a request this engine knows")
+
+        assert failure["event_type"] == "EventResultFailure"
+        assert failure["request_type"] == "NoSuchRequest"
+        assert failure["request"] == {"a": 1}
+        assert failure["result_type"] == "GenericResultFailure"
+        assert failure["request_id"] == "req-1"
+        assert failure["response_topic"] == "sessions/s1/clients/c1/response"
+        assert failure["open_workflow_id"] == "wf-1"
+        assert "not a request this engine knows" in json.dumps(failure["result"])
+
+    def test_drops_routing_fields_that_are_not_strings(self) -> None:
+        failure = converters.client.unreadable_request_failure({"response_topic": 7, "open_workflow_id": []}, "bad")
+
+        assert failure["response_topic"] is None
+        assert failure["open_workflow_id"] is None
+        assert failure["request"] == {}
+
+
 def _failure_dumps(event: EventResultSuccess) -> str:
     result_json = converters.engine.dumps_result(event)
     assert result_json.error is not None

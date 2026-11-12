@@ -45,6 +45,25 @@ class TestBuildDirectoryDestinationFromSituation:
         assert dest._directory._dir_path == str(tmp_path / "extracted")
         assert dest._existing_dir_policy == os_events.ExistingFilePolicy.OVERWRITE
 
+    def test_absolute_path_with_a_version_slot_is_versioned(self, tmp_path: pathlib.Path) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH) as handle_request:
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                str(tmp_path / "extracted_v{###}"), "save_output_directory"
+            )
+
+        handle_request.assert_not_called()
+        assert dest._directory.location == str(tmp_path / "extracted_v{###}")
+        assert dest._existing_dir_policy == os_events.ExistingFilePolicy.CREATE_NEW
+
+    def test_home_relative_path_with_a_version_slot_is_versioned(self) -> None:
+        with mock.patch(HANDLE_REQUEST_PATH):
+            dest = project_directory_parameter._build_directory_destination_from_situation(
+                "~/extracted_v{###}", "save_output_directory"
+            )
+
+        assert dest._directory.location == str(pathlib.Path("~/extracted_v{###}").expanduser())
+        assert dest._existing_dir_policy == os_events.ExistingFilePolicy.CREATE_NEW
+
     def test_home_relative_path_bypasses_situation(self) -> None:
         with mock.patch(HANDLE_REQUEST_PATH):
             dest = project_directory_parameter._build_directory_destination_from_situation(

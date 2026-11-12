@@ -4,6 +4,7 @@ import json
 import logging
 import weakref
 from collections import Counter
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
@@ -81,26 +82,62 @@ class EventConverter(JsonConverter):
             logger.error("Could not send %s for %s: %s", type(event).__name__, type(event.request).__name__, error)
             return ResultJson(text=self._failure_dumps(event, error, **kwargs), error=error)
 
+    def unreadable_request_failure(self, request_event: Mapping[str, Any], reason: str) -> dict[str, Any]:
+        """The failure envelope answering `request_event`, a request frame's payload the engine could not read.
+
+        Built from the raw frame because an unregistered request type has no class to echo. A
+        transport sends it on the frame's `response_topic`, so the requester hears back instead of
+        timing out.
+        """
+        return self._failure_envelope(
+            request_type=request_event.get("request_type"),
+            request=request_event.get("request", {}),
+            request_id=request_event.get("request_id"),
+            response_topic=_str_or_none(request_event.get("response_topic")),
+            open_workflow_id=_str_or_none(request_event.get("open_workflow_id")),
+            reason=reason,
+        )
+
     def _failure_dumps(self, event: EventResult, error: EventSerializationError, **kwargs: Any) -> str:
         try:
             # Through JSON: unstructuring alone passes some values through for dump_json to reject.
             request = json.loads(_to_json(_unstructure(event.request, self), type(event.request).__name__))
         except EventSerializationError:
             request = {"request_id": event.request.request_id}
-        failure: dict[str, Any] = {
-            "event_type": EventResultFailure.__name__,
-            "request_type": type(event.request).__name__,
-            "request": request,
-            "result_type": GenericResultFailure.__name__,
-            "result": _unstructure(GenericResultFailure(result_details=str(error)), self),
-            "request_id": event.request_id,
-            "response_topic": event.response_topic,
-            "open_workflow_id": event.open_workflow_id,
-            "engine_id": event.engine_id,
-        }
+        failure = self._failure_envelope(
+            request_type=type(event.request).__name__,
+            request=request,
+            request_id=event.request_id,
+            response_topic=event.response_topic,
+            open_workflow_id=event.open_workflow_id,
+            reason=str(error),
+        )
+        failure["engine_id"] = event.engine_id
         if event.retained_mode:
             failure["retained_mode"] = event.retained_mode
         return _to_json(failure, GenericResultFailure.__name__, **kwargs)
+
+    def _failure_envelope(  # noqa: PLR0913
+        self,
+        *,
+        request_type: Any,
+        request: Any,
+        request_id: Any,
+        response_topic: str | None,
+        open_workflow_id: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        """An `EventResultFailure` envelope holding a `GenericResultFailure`, built without the request's class."""
+        return {
+            "event_type": EventResultFailure.__name__,
+            "request_type": request_type,
+            "request": request,
+            "result_type": GenericResultFailure.__name__,
+            "result": _unstructure(GenericResultFailure(result_details=reason), self),
+            "request_id": request_id,
+            "response_topic": response_topic,
+            "open_workflow_id": open_workflow_id,
+        }
 
 
 def make_event_converter(*, value: Callable[[Any], Any], display: Callable[[Any], Any]) -> EventConverter:
@@ -131,6 +168,13 @@ def register_polymorphic_dataclass(cls: type) -> None:
     _polymorphic_roots.append(cls)
     for conv in _event_converters:
         include_subclasses(cls, conv)
+
+
+def _str_or_none(value: Any) -> str | None:
+    """`value` from a raw frame where a string belongs, or None when the frame held anything else."""
+    if isinstance(value, str):
+        return value
+    return None
 
 
 def _to_json(data: Any, payload_type: str, **kwargs: Any) -> str:

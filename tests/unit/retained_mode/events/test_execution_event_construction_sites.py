@@ -18,17 +18,18 @@ _SRC = Path(griptape_nodes.__file__).parent
 _EVENT_TYPES = {"ExecutionEvent", "ProgressEvent"}
 
 # (path under src/griptape_nodes, enclosing function) for each site allowed to build one directly,
-# mapped to whether every event built there must pass `workflow_id`.
+# mapped to whether every event built there must pass `open_workflow_id`.
 _ALLOWED_SITES = {
     # The one builder `WorkflowRuntime`, `WorkflowFlows` and `BaseNode.execution_event` share.
     ("retained_mode/events/base_events.py", "build_execution_event"): True,
     # Progress chunks name the node's workflow (`BaseNode._event_workflow_id`).
     ("exe_types/node_types.py", "append_value_to_parameter"): True,
     # A subprocess forwards a progress event to the engine that started it, keeping its id.
-    ("bootstrap/workflow_executors/local_session_workflow_executor.py", "_arun"): True,
+    ("retained_mode/events/execution_events.py", "progress_to_execution_event"): True,
     # A chat about no workflow names none.
     ("retained_mode/managers/agent_manager.py", "emit"): False,
-    # Publishing progress is about the engine, not a workflow.
+    # Publishing progress names the workflow being published, which `EventManager.put_event` fills
+    # in from the binding, as it does for the progress a publisher library builds.
     ("retained_mode/publishing/workflow_packager.py", "emit_progress"): False,
     # A subprocess run that failed may have failed before it had a workflow, so its cancel names none.
     ("bootstrap/workflow_executors/local_session_workflow_executor.py", "arun"): False,
@@ -71,8 +72,8 @@ class _SiteFinder(ast.NodeVisitor):
 
 
 def _names_a_workflow(keyword: ast.keyword) -> bool:
-    """Whether `keyword` passes a `workflow_id` that isn't a literal None."""
-    if keyword.arg != "workflow_id":
+    """Whether `keyword` passes an `open_workflow_id` that isn't a literal None."""
+    if keyword.arg != "open_workflow_id":
         return False
     return not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None)
 
