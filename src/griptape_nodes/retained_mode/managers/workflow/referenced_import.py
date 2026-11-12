@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import NODE_GROUP_FLOW
+from griptape_nodes.exe_types.workflow_node_errors import WorkflowRecursionLimitError
 from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
@@ -20,6 +22,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.settings import MAX_WORKFLOW_RECURSION_DEPTH_KEY
 from griptape_nodes.retained_mode.managers.workflow.loading import is_loading_workflow
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, execution_result_details
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -105,7 +108,78 @@ class ReferencedWorkflowImport(EngineScoped):
                 details = f"Attempted to import workflow '{imported.name}' into flow '{flow_name}'. Failed because target flow does not exist"
                 return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
+        # Refuse when this workflow already appears inside itself as deep as the
+        # recursion limit allows. That is how a Workflow node pointing back at its own
+        # workflow, directly or through other workflows, shows up at run time; without a
+        # limit it would re-run the file forever.
+        if flow_name is None:
+            flow_name = workflow.context.get_current_flow().name
+        return self._validate_recursion_depth(workflow, flow_name, imported)
+
+    def _validate_recursion_depth(
+        self, workflow: WorkflowRuntime, flow_name: str, imported: Workflow
+    ) -> ResultPayload | None:
+        """Return a failure when importing `imported` into `flow_name` would nest it too deeply."""
+        workflow_name = imported.name
+        depth = self._count_enclosing_imports_of(workflow, flow_name, imported)
+        limit = self.engine.config_manager.max_workflow_recursion_depth
+        if depth > limit:
+            if limit == 1:
+                level_word = "level"
+            else:
+                level_word = "levels"
+            details = (
+                f"Attempted to import workflow '{workflow_name}' into flow '{flow_name}'. "
+                f"Failed because '{workflow_name}' contains itself more than {limit} {level_word} deep, "
+                f"the limit set by the `{MAX_WORKFLOW_RECURSION_DEPTH_KEY}` setting. A Workflow node inside it "
+                "keeps pointing back to it, directly or through another workflow. Make sure the recursion "
+                "stops, or raise the setting."
+            )
+            return ImportWorkflowAsReferencedSubFlowResultFailure(
+                result_details=details, exception=WorkflowRecursionLimitError(details)
+            )
+
         return None
+
+    def _count_enclosing_imports_of(self, workflow: WorkflowRuntime, flow_name: str, imported: Workflow) -> int:
+        """Count the copies of `imported` that `flow_name` is already inside.
+
+        That is the flows from `flow_name` up through the flows enclosing it that were
+        created by importing the workflow, plus one when it is also the workflow that
+        was opened at the top level. Group subflows are skipped: the Workflow node they
+        hold is what nests, not the group.
+        """
+        flow_manager = self.engine.flow_manager
+        count = 0
+        seen: set[str] = set()
+        current: str | None = flow_name
+        while current is not None and current not in seen:
+            seen.add(current)
+            flow = workflow.objects.get_as_type(current, ControlFlow)
+            if (
+                flow is not None
+                and flow.metadata.get("flow_type") != NODE_GROUP_FLOW
+                and flow_manager.get_referenced_workflow_name(workflow, flow) == imported.name
+            ):
+                count += 1
+            current = flow_manager.get_enclosing_flow(workflow, current)
+        if self._is_opened_workflow(workflow, imported):
+            count += 1
+        return count
+
+    def _is_opened_workflow(self, workflow: WorkflowRuntime, imported: Workflow) -> bool:
+        """Whether `imported` is the workflow opened at the top level, which is `workflow`.
+
+        The opened workflow's own top flow is never tagged as an import, so it is counted
+        separately. Compared by registry id, which never changes. A library workflow opens
+        as an unsaved copy with an id of its own, so the copy counts as the workflow it was
+        seeded from.
+        """
+        if imported.workflow_id == workflow.workflow_id:
+            return True
+        registry = self.engine.workflow_registry
+        opened = registry.get(workflow.workflow_id)
+        return registry.seed_source(opened) is imported
 
     async def _execute_workflow_import(
         self,
