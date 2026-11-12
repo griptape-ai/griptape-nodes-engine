@@ -1543,11 +1543,13 @@ class TestWorkflowManager:
         Regression guard for the "phantom workflow" bug: a frontend that reloads after
         a delete used to see a stale context pointing at the dead registry key.
         """
+        from griptape_nodes.exe_types.flow import ControlFlow
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
         workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()
         context_manager = engine.context_manager
+        object_manager = engine.object_manager
 
         with empty_workflow_registry(engine):
             workflow_key = _register_unsaved_workflow(name="Untitled")
@@ -1557,7 +1559,7 @@ class TestWorkflowManager:
             create_result = workflow.handle_request(CreateFlowRequest(parent_flow_name=None))
             assert isinstance(create_result, CreateFlowResultSuccess)
             flow_name = create_result.flow_name
-            assert workflow.objects.has(flow_name)
+            assert object_manager.has_object_with_name(flow_name)
 
             try:
                 result = asyncio.run(
@@ -1569,9 +1571,9 @@ class TestWorkflowManager:
                 assert isinstance(result, DeleteWorkflowResultSuccess)
                 # Context stack is fully torn down.
                 assert not context_manager.has_current_workflow()
-                # Child flow was deleted too; no orphans left in the workflow.
-                assert not workflow.objects.has(flow_name)
-                assert len(workflow.objects) == 0
+                # Child flow was deleted too; no orphans left in the ObjectManager.
+                assert not object_manager.has_object_with_name(flow_name)
+                assert not object_manager.get_filtered_subset(type=ControlFlow)
                 # Registry entry is gone.
                 assert engine.workflow_registry.find_by_name(workflow_key) is None
             finally:
@@ -6612,14 +6614,11 @@ class TestNodeLibraryDelegates:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
         run_mock.assert_awaited_once_with("flow.py", None)
 
-    def test_run_workflow_builds_into_the_bound_workflow(self, engine: Engine) -> None:
+    def test_run_workflow_builds_into_the_open_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         opened = engine.context_manager.open_workflow(workflow_name="open")
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
-        with (
-            patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock,
-            engine.bind_workflow(opened),
-        ):
+        with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
             assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
         run_mock.assert_awaited_once_with("flow.py", opened)
 

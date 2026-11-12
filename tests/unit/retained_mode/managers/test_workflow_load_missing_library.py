@@ -672,8 +672,6 @@ class TestOpenWorkflowRequest:
         result = reopened.handle_request(RunWorkflowFromRegistryRequest(workflow_name=workflow_name))
 
         assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result
-        assert result.workflow_id is not None
-        bind(reopened.open_workflows.get(result.workflow_id))
         assert not isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
 
@@ -752,8 +750,6 @@ class TestHeadlessLoadRefusesPlaceholders:
 
         asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(relative_path))
 
-        (loaded,) = restored.open_workflows.all_open()
-        bind(loaded)
         assert not isinstance(_node(restored, "Vanishing"), ErrorProxyNode)
 
 

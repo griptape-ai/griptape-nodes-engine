@@ -54,6 +54,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
@@ -7310,13 +7311,20 @@ class TestProjectEnvironmentVariableRecursion:
             os.environ.pop("A", None)
             os.environ.pop("B", None)
 
-    def test_env_values_never_resolve_for_an_open_workflow(self) -> None:
+    @pytest.mark.parametrize(
+        "open_workflows",
+        [
+            pytest.param(lambda: _HANDED_WORKFLOW, id="one open"),
+            pytest.param(Mock(side_effect=WorkflowNotNamedError("2 workflows are open")), id="several open"),
+        ],
+    )
+    def test_env_values_never_resolve_for_an_open_workflow(self, open_workflows: Any) -> None:
         """Environment values apply to the whole engine, so one using `{workflow_dir}` is skipped, never resolved."""
         pm = self._make_pm_with_template(environment={"ASSETS": "{workflow_dir}/assets", "PLAIN": "{workspace_dir}/x"})
         assert pm._current_project_id is not None
         project_info = pm._successfully_loaded_project_templates[pm._current_project_id]
         mock_engine = MagicMock()
-        mock_engine.only_open_workflow_or_none.side_effect = lambda: _HANDED_WORKFLOW
+        mock_engine.only_open_workflow_or_none.side_effect = open_workflows
         with patch.object(pm, "_engine", mock_engine):
             resolved = pm._resolve_project_env_values(project_info.template, project_info)
 

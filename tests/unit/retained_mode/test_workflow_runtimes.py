@@ -155,7 +155,7 @@ class TestRuntimeLifecycle:
         assert engine.open_workflows.all_open() == [other]
 
     def test_a_request_that_opens_a_workflow_stays_bound_as_dispatch_bound_it(self, engine: Engine) -> None:
-        engine.context_manager.open_workflow("other")
+        engine.context_manager.push_workflow(workflow_name="other")
         bindings: list[object] = []
 
         def open_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
@@ -177,22 +177,20 @@ class TestRuntimeLifecycle:
         assert bound_workflow.get() is None
 
     def test_clear_all_object_state_closes_the_open_workflow(self, engine: Engine) -> None:
-        engine.context_manager.open_workflow("outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
 
         result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
         assert result.succeeded()
-        assert engine.open_workflows.all_open() == []
+        assert engine.current_workflow_or_none() is None
 
     def test_deleting_the_open_workflow_closes_it(self, engine: Engine) -> None:
-        opened = engine.context_manager.open_workflow("outer")
+        name = engine.context_manager.push_workflow(workflow_name="outer")
 
-        result = engine.handle_request(
-            DeleteWorkflowRequest(name=engine.workflow_registry.get(opened.workflow_id).name)
-        )
+        result = engine.handle_request(DeleteWorkflowRequest(name=name))
 
         assert result.succeeded()
-        assert engine.open_workflows.all_open() == []
+        assert engine.current_workflow_or_none() is None
 
 
 class TestObjectsOnTheRuntime:

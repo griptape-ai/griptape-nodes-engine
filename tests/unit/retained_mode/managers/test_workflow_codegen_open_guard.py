@@ -111,8 +111,8 @@ class TestSavedWorkflowOpen:
 
 class TestWorkflowsDoNotNest:
     def test_unbound_work_may_push_while_several_are_open(self, engine: Engine) -> None:
-        engine.context_manager.open_workflow(workflow_name="first")
-        engine.context_manager.open_workflow(workflow_name="second")
+        engine.context_manager.push_workflow(workflow_name="first")
+        engine.context_manager.push_workflow(workflow_name="second")
 
         engine.context_manager.push_workflow(workflow_name="third")
 

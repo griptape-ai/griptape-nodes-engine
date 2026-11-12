@@ -19,7 +19,7 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.serialization.values import UndecodedValue
-from tests.workflow_context import bind, handle_and_bind
+from tests.workflow_context import bind
 
 # Workflow ids in the form the registry mints.
 _ORCHESTRATOR_WORKFLOW_ID = "0577bcf13a9809c5fcc5b68d391658f0"
@@ -285,7 +285,7 @@ class TestSerializeNodeWithoutLibraryMetadata:
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        handle_and_bind(engine, EnsureWorkflowAndFlowRequest(display_name="proxy_workflow", flow_name="proxy_flow"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="proxy_workflow", flow_name="proxy_flow"))
 
         node = ErrorProxyNode(
             name="Execute Python",

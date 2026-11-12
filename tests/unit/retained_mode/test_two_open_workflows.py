@@ -128,7 +128,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotNamedError, bound_workflow
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
@@ -219,7 +219,10 @@ class _RawThreadNode(ControlNode):
         def in_raw_thread() -> None:
             _RawThreadNode.seen["built_in_node_code"] = built_in_node_code.resolve()
             _RawThreadNode.seen["built_for_the_node"] = File(_RAW_THREAD_FILE, workflow=self.workflow).resolve()
-            _RawThreadNode.seen["ambient"] = engine.current_workflow_or_none()
+            try:
+                _RawThreadNode.seen["ambient"] = engine.current_workflow_or_none()
+            except WorkflowNotNamedError as err:
+                _RawThreadNode.seen["ambient"] = err
             _RawThreadNode.seen["ambient_resolve"] = engine.handle_request(_resolve(_RAW_THREAD_FILE))
 
         thread = threading.Thread(target=in_raw_thread)
@@ -308,6 +311,8 @@ def _nodes_in(engine: Engine, workflow: WorkflowRuntime, flow: str = "canvas") -
 
 
 def _failed_for_no_workflow_named(result: ResultPayload) -> bool:
+    if isinstance(getattr(result, "exception", None), WorkflowNotNamedError):
+        return True
     details = str(result.result_details)
     no_workflow_phrases = ("did not name one", "names no workflow", "request has no workflow", "no workflow is loaded")
     return any(phrase in details for phrase in no_workflow_phrases)
@@ -690,7 +695,7 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
     ("EnsureWorkflowAndFlowRequest", lambda: EnsureWorkflowAndFlowRequest(display_name="C")),
 ]
 
-# What the sweep found: the requests that fail for naming no workflow when no id is sent.
+# What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
 _FAIL_WITHOUT_AN_ID = {
     "ResolveMacroPathRequest {workflow_dir}",
     "GetWorkflowContextRequest",
@@ -1183,8 +1188,8 @@ class TestRawThreadInNodeCode:
         assert in_a != str(in_b.resolved_path)
         assert _RawThreadNode.seen["built_in_node_code"] == in_a
         assert _RawThreadNode.seen["built_for_the_node"] == in_a
-        # An ambient read can't tell which workflow the thread works for, so it finds none, not a guess.
-        assert _RawThreadNode.seen["ambient"] is None
+        # An ambient read can't tell which workflow the thread works for, so it is refused, not guessed.
+        assert isinstance(_RawThreadNode.seen["ambient"], WorkflowNotNamedError)
         assert _RawThreadNode.seen["ambient_resolve"].failed()
 
     @pytest.mark.asyncio
@@ -1200,8 +1205,8 @@ class TestRawThreadInNodeCode:
         result = await _send_async(engine, StartFlowRequest(flow_name="canvas", flow_node_name="threaded"), only)
 
         assert isinstance(result, StartFlowResultSuccess), result.result_details
-        # The engine never guesses, even with one workflow open.
-        assert _RawThreadNode.seen["ambient"] is None
+        assert _RawThreadNode.seen["ambient"] is only
+        # The engine's own requests never guess, even with one workflow open.
         assert _RawThreadNode.seen["ambient_resolve"].failed()
         assert _RawThreadNode.seen["built_in_node_code"] == _RawThreadNode.seen["in_node_code"]
 
@@ -1417,7 +1422,10 @@ class TestOtherSharedState:
         hook_ran = asyncio.Event()
 
         async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
-            seen.append(engine.current_workflow_or_none())
+            try:
+                seen.append(engine.current_workflow_or_none())
+            except WorkflowNotNamedError as err:
+                seen.append(err)
             hook_ran.set()
 
         engine.event_manager.initialize_queue(asyncio.Queue())

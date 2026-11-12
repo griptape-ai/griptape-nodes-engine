@@ -33,12 +33,10 @@ from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedR
 from griptape_nodes.retained_mode.managers.event_manager import current_request_sender
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
-from griptape_nodes.retained_mode.runtime.binding import bind_unbound_caller, bound_workflow, unbind_caller_closing
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from contextvars import Token
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import BaseNodeElement
@@ -47,7 +45,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine, OpeningWorkflow
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.runtime.binding import NoWorkflow
     from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -101,11 +98,9 @@ class ContextManager(EngineScoped):
         def __init__(self, manager: ContextManager, workflow_name: str):
             self._manager = manager
             self._workflow_name = workflow_name
-            self._binding: Token[WorkflowRuntime | NoWorkflow | None] | None = None
 
         def __enter__(self) -> None:
-            workflow = self._manager.open_workflow(self._workflow_name)
-            self._binding = bound_workflow.set(workflow)
+            self._manager.push_workflow(self._workflow_name)
 
         def __exit__(
             self,
@@ -113,11 +108,7 @@ class ContextManager(EngineScoped):
             exc_value: BaseException | None,
             exc_traceback: TracebackType | None,
         ) -> None:
-            try:
-                self._manager.pop_workflow()
-            finally:
-                if self._binding is not None:
-                    bound_workflow.reset(self._binding)
+            self._manager.pop_workflow()
 
     # The admittedly-confusing term for using these as a Python context (e.g., the `with` keyword)
     class FlowContext:
@@ -756,14 +747,8 @@ class ContextManager(EngineScoped):
         file_path: str | None = None,
         working_directory: str | None = None,
     ) -> str:
-        """Open a workflow as the Workflow context, and return its name. See `open_workflow`.
-
-        A caller bound to nothing, or to a workflow that has closed, is bound to the opened workflow
-        for the rest of its context: a saved workflow file run on its own opens itself this way
-        (`push_workflow(file_path=__file__)`) and then sends its requests and reads naming no workflow.
-        """
+        """Open a workflow as the Workflow context, and return its name. See `open_workflow`."""
         opened = self.open_workflow(workflow_name, file_path=file_path, working_directory=working_directory)
-        bind_unbound_caller(opened)
         return self.engine.workflow_registry.get(opened.workflow_id).name
 
     def open_workflow(
@@ -777,8 +762,8 @@ class ContextManager(EngineScoped):
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
-        workflow is refused. Opening binds nothing (`push_workflow` binds an unbound caller): work
-        that builds into the opened workflow binds it (`Engine.bind_workflow`).
+        workflow is refused. Opening binds nothing: work that builds into the opened workflow binds
+        it (`Engine.bind_workflow`).
 
         A library-provided workflow opens as a new unsaved copy of itself
         (`register_unsaved_copy`), so every open, a script's own included, leaves the library's
@@ -870,8 +855,6 @@ class ContextManager(EngineScoped):
     def pop_workflow(self) -> str:
         """Close the current workflow through `Engine.close_workflow`, which tears down what it holds.
 
-        A caller `push_workflow` bound to it is unbound again.
-
         Returns:
             The name of the Workflow that was closed. `get_current_workflow_id` gives its id
             beforehand.
@@ -894,8 +877,6 @@ class ContextManager(EngineScoped):
             raise self.WorkerWorkflowNotClosableError(msg)
 
         self.engine.close_workflow(workflow)
-        # Undo what `push_workflow` bound, so the caller is back where it was before it pushed.
-        unbind_caller_closing(workflow)
         return name
 
     def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:

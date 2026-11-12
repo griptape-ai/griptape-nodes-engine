@@ -163,12 +163,11 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
     def only_open_workflow_for_unbound_caller(cls) -> WorkflowRuntime | None:
         """The workflow a caller bound to nothing acts on: the engine's only open one, else none.
 
-        For requests from callers that can't name a workflow: node libraries sending from threads
+        For callers that can't name a workflow: saved workflow files, which open their workflow with
+        `push_workflow` and then send requests bound to nothing, node libraries sending from threads
         that carry no binding, and local transport clients, such as `gtn request`, that leave the
-        envelope's `open_workflow_id` out. A saved workflow file is bound by its own `push_workflow`.
-        Only the facade's requests guess. Its managers read the caller's binding, as engine code
-        does, so an unbound caller finds no workflow there. With none or several open, a request
-        that needs a workflow fails.
+        envelope's `open_workflow_id` out. Dispatch and engine code never guess; engine code can't
+        use the facade (TID251). With none or several open, a request that needs a workflow fails.
         """
         if bound_workflow.get() is not None:
             return None
