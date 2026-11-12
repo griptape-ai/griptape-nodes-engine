@@ -52,11 +52,9 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
 
-# Both path flavors, exercised on every host. `Path` is the host's own flavor, so asserting
-# through `Path` alone answers only half the question: these cases passed on Linux while a
-# Windows host read `/home/user/libs/Nuke` (whose `str()` is `\home\user\libs\Nuke` there) as a
-# filesystem root and refused an ordinary uninstall. Pinning the flavor keeps both answers
-# honest wherever the suite runs.
+# `Path` is the host's own flavor, so asserting through it alone answers half the question:
+# these passed on Linux while Windows read `/home/user/libs/Nuke` as a filesystem root and
+# refused an ordinary uninstall.
 _PATH_FLAVORS = [
     pytest.param(PurePosixPath, id="posix_flavor"),
     pytest.param(PureWindowsPath, id="windows_flavor"),
@@ -380,8 +378,6 @@ class TestDirectoryEntryWithSiblings:
         result = await _uninstall_after_preview(engine, "Library A", manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
-        # Only Library A's own folder goes. The scan root, its config entry, and the siblings
-        # living in their own folders under it are all left alone.
         assert result.directory_deleted is True
         assert not await anyio.Path(libs_root / "lib_a").exists()
         assert await anyio.Path(libs_root / "lib_b").exists()
@@ -391,8 +387,7 @@ class TestDirectoryEntryWithSiblings:
         assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == [str(libs_root)]
         [remaining] = [e for e in result.remaining_registrations if isinstance(e, SharedDirectoryEntryRemaining)]
         assert remaining.entry_path == str(libs_root)
-        # The entry registers every manifest under it, so the broken one counts too; with no
-        # readable name it is reported by path.
+        # The entry registers every manifest under it, so the broken one counts, by path.
         assert "Library B" in remaining.library_names
         assert str(libs_root / "lib_c" / "griptape_nodes_library.json") in remaining.library_names
 
@@ -456,8 +451,7 @@ class TestDirectoryEntryNamingOneLibrary:
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.directory_deleted is True
         assert not await anyio.Path(lib_dir).exists()
-        # Keeping the entry would leave config naming a folder that is gone, which is the
-        # broken half-uninstalled state the whole request exists to avoid.
+        # Keeping the entry would leave config naming a folder that is gone.
         assert result.config_entry_removed is True
         assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == []
         assert result.remaining_registrations == []
@@ -477,8 +471,7 @@ class TestDirectoryEntryNamingOneLibrary:
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert not await anyio.Path(lib_dir).exists()
         assert result.collateral_library_names == ["Bundle Extra"]
-        # The sibling is deleted with the folder, so warning that the entry still registers it
-        # would point the user at an entry that is also gone.
+        # The sibling is deleted with the folder, and so is the entry registering it.
         assert result.config_entry_removed is True
         assert result.remaining_registrations == []
 
@@ -506,8 +499,7 @@ class TestDownloadProvisionedLibrary:
         assert result.config_entry_removed is True
         assert not await anyio.Path(repo_dir).exists()
         assert engine.config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) == []
-        # The entry is gone, so nothing re-downloads it and the uninstall is clean. Warning that
-        # the download entry survives would describe the state before the entry was removed.
+        # The entry is gone, so nothing re-downloads it.
         assert result.remaining_registrations == []
 
 
@@ -678,11 +670,9 @@ class TestDuplicateNameCopies:
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.unloaded is False
-        # The live copy keeps its registry entry, its tracking record, and its files.
         assert "Dup Library" in LibraryRegistry.list_libraries()
         assert str(loaded_manifest) in engine.library_manager._library_file_path_to_info
         assert await anyio.Path(loaded_manifest).exists()
-        # Only the duplicate is gone.
         assert not await anyio.Path(duplicate_manifest.parent).exists()
         assert str(duplicate_manifest) not in engine.library_manager._library_file_path_to_info
 

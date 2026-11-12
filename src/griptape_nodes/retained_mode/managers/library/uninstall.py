@@ -91,9 +91,7 @@ class _Resolution:
     collateral_library_names: list[str] = field(default_factory=list)
     blocked_by: UninstallBlocker | None = None
     remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
-    # Whether the config entry names the very folder the uninstall deletes, and so stops
-    # naming anything once it is gone. True for a manifest or download entry, and for a scan
-    # root holding only this library; false for a scan root that outlives the delete.
+    # False only for a scan root that outlives the delete; see `_entry_names_deleted_directory`.
     entry_names_deleted_directory: bool = True
 
 
@@ -107,8 +105,8 @@ class _ResolutionError:
 class LibraryUninstall(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # Serializes UninstallLibraryRequest: two in flight would both read the same config
-        # array, and the second write would restore the entry the first one just removed.
+        # Two uninstalls in flight would read the same config array, and the second write
+        # would restore the entry the first just removed.
         self._uninstall_lock = asyncio.Lock()
         event_manager.register_request_handlers(self)
 
@@ -185,8 +183,6 @@ class LibraryUninstall(EngineScoped):
         self, resolved: _Resolution
     ) -> tuple[bool, UninstallLibraryResultFailure | None]:
         """Step 1 (least destructive): remove the config entry, if any names this exact copy."""
-        # A scan root that outlives the delete still registers the libraries beside this one,
-        # so it stays. One that names the deleted folder itself is removed with it.
         if not resolved.entry_names_deleted_directory:
             return False, None
         removed = self._remove_config_entry(resolved.classification)
@@ -239,8 +235,8 @@ class LibraryUninstall(EngineScoped):
             )
         )
         if isinstance(delete_result, DeleteFileResultFailure):
-            # Only name the steps that actually ran, or a user troubleshooting this goes
-            # looking for a config edit that never happened.
+            # Name only the steps that ran, or troubleshooting looks for an edit that
+            # never happened.
             undone = [
                 name
                 for name, happened in (("its config entry", config_entry_removed), ("its registry load", unloaded))
@@ -318,10 +314,8 @@ class LibraryUninstall(EngineScoped):
         resolved_library_path = Path(library_info.library_path)
         classification = await self._classify_registration(canonicalize_for_identity(resolved_library_path))
 
-        # `.`/`..` segments in a hand-typed libraries_to_register entry do not survive to the
-        # resolved path, because resolve_workspace_path normalizes them away; check the raw text
-        # before that happens, or "C:\libs\Nuke\.." would quietly resolve to (and later delete)
-        # the parent "libs".
+        # resolve_workspace_path normalizes `.`/`..` away, so check the raw text first or
+        # "C:\libs\Nuke\.." resolves to (and deletes) the parent "libs".
         if classification.registered_in == "register" and classification.registered_path is not None:
             raw_registered_path = classification.registered_path
             if _path_text_has_traversal_segment(raw_registered_path):
@@ -343,10 +337,9 @@ class LibraryUninstall(EngineScoped):
                 install_directory=install_directory,
             )
 
-        # Refuse rather than half-finish: with no entry to remove, or none we are allowed to
-        # remove, the uninstall would delete the files and leave the registration behind, and
-        # the engine would then look for a library that is gone. Decided here, during
-        # resolution, so the preview reports it and the editor can disable the control.
+        # Refuse rather than half-finish: deleting the files with the registration left behind
+        # leaves the engine looking for a library that is gone. Decided during resolution, so the
+        # preview reports it and the editor can disable the control.
         if classification.registered_in is None:
             return self._blocked_resolution(
                 library_name,
@@ -393,13 +386,10 @@ class LibraryUninstall(EngineScoped):
     async def _remaining_registrations_for(
         self, classification: _Classification, *, exclude_manifest: Path, entry_is_removed: bool
     ) -> list[RemainingRegistration]:
-        """What would still register this library once its files are gone.
+        """What still registers this library once its files are gone.
 
-        Only the one case an uninstall proceeds through and leaves behind: a scan-root entry kept
-        for the libraries beside this one. An entry the engine cannot remove blocks the uninstall
-        instead, and one it can remove is removed, so neither reaches here -- hence
-        `entry_is_removed`, which must be the same answer step 1 acts on, or this would report
-        an entry that is about to be deleted.
+        `entry_is_removed` must be the same answer step 1 acts on, or this reports an entry that
+        is about to be deleted.
         """
         remaining: list[RemainingRegistration] = []
 
@@ -416,11 +406,10 @@ class LibraryUninstall(EngineScoped):
         return remaining
 
     def _entry_names_deleted_directory(self, classification: _Classification, install_directory: Path) -> bool:
-        """Whether removing the install directory leaves this config entry naming nothing.
+        """Whether deleting the install directory leaves this entry naming nothing.
 
-        A scan-root entry is kept only when it outlives the delete, i.e. names a folder ABOVE
-        the one being removed. An entry naming the deleted folder itself must go with it, or
-        config keeps pointing at a path that no longer exists.
+        An entry naming the deleted folder has to go with it; one naming a folder above it
+        outlives the delete and stays.
         """
         if not classification.is_directory_entry or classification.directory_path is None:
             return True
@@ -458,8 +447,8 @@ class LibraryUninstall(EngineScoped):
         target = canonicalize_for_identity(install_directory)
         for directory in protected:
             guarded = canonicalize_for_identity(directory)
-            # `guarded.is_relative_to(target)` covers the target being a PARENT of a protected
-            # folder (deleting it takes the protected folder too); equality is the common case.
+            # is_relative_to covers target being a PARENT of a protected folder, which deleting
+            # would take with it.
             if guarded == target or guarded.is_relative_to(target):
                 return True
         return False
@@ -522,10 +511,8 @@ class LibraryUninstall(EngineScoped):
         """
         config_mgr = self.engine.config_manager
 
-        # Downloads first: a download-provisioned library's registered_path is the installed
-        # manifest's own absolute path (discovery.py), indistinguishable by string alone from a
-        # libraries_to_register entry that happens to name the same absolute path. Checking
-        # libraries_to_download independently resolves the ambiguity instead of guessing from it.
+        # Downloads first: a downloaded library's registered_path is the installed manifest's
+        # absolute path, indistinguishable by string from a register entry naming the same path.
         raw_downloads = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) or []
         libraries_root = config_mgr.resolved_libraries_root()
         for raw_entry in raw_downloads:
@@ -549,11 +536,9 @@ class LibraryUninstall(EngineScoped):
             if not registrations:
                 continue
             entry = registrations[0]
-            # Resolved without requiring the path to exist, unlike `resolve_discovery_path`
-            # (which backs live discovery and returns None for a missing path): a manifest whose
-            # folder is already gone must still match its config entry, or an already-missing
-            # install could never clean up the stale entry pointing at it, which is exactly the
-            # broken state this request exists to avoid creating.
+            # Not `resolve_discovery_path`, which returns None for a missing path: a manifest
+            # whose folder is already gone must still match its entry, or the stale entry could
+            # never be cleaned up.
             resolved_path = resolve_workspace_path(Path(entry.path), config_mgr.workspace_path)
             if await anyio.Path(resolved_path).is_dir():
                 children = await find_files_recursive(
@@ -646,8 +631,8 @@ def _unsafe_install_directory(install_directory: PurePath) -> bool:
         return True
 
     parts = install_directory.parts
-    # A foreign-flavored path collapses to one component under the host's parser while its text
-    # plainly names a drive or UNC root; re-read it under the flavor it was written in.
+    # A foreign-flavored path collapses to one component under the host's parser, so re-read it
+    # under the flavor it was written in.
     if len(parts) <= 1 and _WINDOWS_DRIVE_OR_UNC_PATTERN.match(path_str):
         parts = PureWindowsPath(path_str).parts
     return len(parts) <= 1

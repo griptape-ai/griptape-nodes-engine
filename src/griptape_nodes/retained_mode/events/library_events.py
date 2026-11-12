@@ -1440,16 +1440,9 @@ class UnmatchedEntryBlocker:
     kind: Literal["unmatched_entry"] = "unmatched_entry"
 
 
-# Why an uninstall cannot proceed at all, as a discriminated union on `kind`.
-#
-# Structured rather than a sentence: the editor owns the wording, so copy can be localized and
-# reworded without an engine release, and can read differently in a dialog than in a toast. Each
-# variant carries the specifics the editor cannot work out for itself.
-#
-# Spelled as a union of the concrete variants rather than a shared base class on purpose. A field
-# TYPED as a marker base serializes as the base: cattrs builds its hook from the declared type, so
-# a plain base passes the object through unconverted and a dataclass base emits `{}`. Either way
-# the editor would not receive the `kind` it switches on.
+# Why an uninstall cannot proceed, as a discriminated union on `kind`; the editor owns the wording.
+# Not a shared base class: cattrs builds its hook from the declared type, so a base-typed field
+# serializes as the base and drops the `kind` the editor switches on.
 UninstallBlocker = (
     EnvironmentManagedBlocker
     | SandboxLibraryBlocker
@@ -1460,8 +1453,8 @@ UninstallBlocker = (
 )
 
 
-# Which step failed once an uninstall was already under way. A refusal never gets this far, so
-# the refusal slugs are not among these: those travel as `blocked_by`.
+# Which step failed once an uninstall was under way. Refusals never get this far; they travel as
+# `blocked_by`.
 UninstallFailureReason = Literal["config_write_failed", "unload_failed", "directory_delete_failed"]
 
 
@@ -1474,11 +1467,8 @@ class SharedDirectoryEntryRemaining:
     kind: Literal["shared_directory_entry"] = "shared_directory_entry"
 
 
-# What still registers the library after an otherwise successful uninstall, as a discriminated
-# union on `kind`. The engine loads it again on its next start unless the user acts, so the editor
-# warns instead of reporting a clean uninstall. Spelled as a union, rather than the one variant it
-# currently holds, for the same serialization reason as `UninstallBlocker` and so a second variant
-# does not change the wire shape.
+# What still registers the library after a successful uninstall, so the editor warns rather than
+# reporting it clean. A union of one, for the same serialization reason as `UninstallBlocker`.
 RemainingRegistration = SharedDirectoryEntryRemaining
 
 
