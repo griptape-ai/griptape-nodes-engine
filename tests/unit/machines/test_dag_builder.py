@@ -354,3 +354,29 @@ class TestDagBuilder:
         retrieved_dag_node = dag_builder.node_to_reference["test_node"]
         assert retrieved_dag_node is dag_node
         assert retrieved_dag_node.node_state == NodeState.PROCESSING
+
+    def test_a_node_can_be_added_again_to_a_graph_that_emptied_out(self) -> None:
+        """A node run alongside another run gets a graph named after itself.
+
+        When it finishes, its graph empties and `cleanup_empty_graph_nodes` forgets the graph's
+        nodes, but the empty graph itself stays for the rest of the run. Running the node again
+        must add it to that graph and track it there, not fail on the missing node set.
+        """
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "rerun_node"
+        mock_node.parameters = []
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(mock_connections)
+
+        dag_builder.add_node_with_dependencies(mock_node, "rerun_node")
+        # The node finishes: the run removes it from its graph, which is now empty.
+        dag_builder.graphs["rerun_node"].remove_node("rerun_node")
+        dag_builder.cleanup_empty_graph_nodes("rerun_node")
+
+        added_nodes = dag_builder.add_node_with_dependencies(mock_node, "rerun_node")
+
+        assert added_nodes == [mock_node]
+        assert "rerun_node" in dag_builder.graphs["rerun_node"].nodes()
+        assert dag_builder.graph_to_nodes["rerun_node"] == {"rerun_node"}
+        assert "rerun_node" in dag_builder.node_to_reference
