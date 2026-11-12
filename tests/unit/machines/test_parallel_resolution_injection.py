@@ -12,10 +12,12 @@ to add to a loop that is also reaping node tasks.
 """
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
 from griptape_nodes.machines.dag_builder import NodeState
+from griptape_nodes.machines.parallel_resolution import ExecuteDagState
 from tests.unit.machines.scheduler_stubs import (
     let_the_run_finish,
     machine_running_one_node,
@@ -209,12 +211,16 @@ class TestReinjectingAFinishedNode:
     @pytest.mark.asyncio
     async def test_a_node_that_finished_inside_the_run_can_be_run_again(self) -> None:
         machine, _release, dag_builder = machine_running_one_node(max_nodes_in_parallel=2)
+        machine.context.flows = MagicMock(global_single_node_resolution=True)
+        first = node_stub("again")
+        machine.inject_node(first)
 
-        machine.inject_node(node_stub("again"))
-        # What finishing does in single node resolution: the node leaves its network, and the
-        # emptied network's node list is dropped while the network itself stays registered.
-        dag_builder.graphs["again"].remove_node("again")
-        dag_builder.cleanup_empty_graph_nodes("again")
+        # Finishing in single node resolution: the node leaves its network, and the control-flow
+        # check drops the emptied network's node list while the network stays registered.
+        ExecuteDagState._release_from_all_networks(machine.context, "again")
+        assert ExecuteDagState._should_skip_control_flow(machine.context, first, "again")
+        assert "again" not in dag_builder.graph_to_nodes
+        assert "again" in dag_builder.graphs
 
         added = machine.inject_node(node_stub("again"))
 

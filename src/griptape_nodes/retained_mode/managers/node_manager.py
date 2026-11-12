@@ -3633,7 +3633,11 @@ class NodeManager(EngineScoped):
         try:
             await self.engine.flow_manager.resolve_singular_node(workflow, flow, node, debug_mode=debug_mode)
         except Exception as e:
-            details = f"Attempted to run '{node_name}'. Failed with an internal error ({type(e).__name__}: {e}). Try again once the current run ends."
+            # The run's own RuntimeError/ValueError messages already name the node and the cause.
+            if isinstance(e, (RuntimeError, ValueError)):
+                details = str(e)
+            else:
+                details = f"Attempted to run '{node_name}'. Failed with an unexpected {type(e).__name__}: {e}"
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
         details = f'Starting to resolve "{node_name}" in "{flow_name}"'
         return ResolveNodeResultSuccess(result_details=details)
