@@ -14,7 +14,6 @@ from griptape_nodes.node_library.library_registry import Dependencies, LibraryMe
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     LibraryLoadedNotification,
-    ReportLibraryLoadedRequest,
     ReportLibraryLoadedResultFailure,
     ReportLibraryLoadedResultSuccess,
 )
@@ -22,7 +21,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
 )
-from griptape_nodes.retained_mode.events.worker_events import StartWorkerRequest
+from griptape_nodes.retained_mode.events.worker_events import LibraryLoadReport, StartWorkerRequest
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     IncompatibleRequirementsProblem,
 )
@@ -164,7 +163,7 @@ class TestOnReportLibraryLoadedRequest:
         mgr._library_file_path_to_info["/some/path.json"] = lib_info
 
         result = await mgr.workers.on_report_library_loaded_request(
-            ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD")
+            LibraryLoadReport(library_name="my_lib", fitness="GOOD")
         )
 
         assert isinstance(result, ReportLibraryLoadedResultSuccess)
@@ -185,7 +184,7 @@ class TestOnReportLibraryLoadedRequest:
         mgr._library_file_path_to_info["/some/exec-deps.json"] = lib_info
 
         await mgr.workers.on_report_library_loaded_request(
-            ReportLibraryLoadedRequest(library_name="exec_deps_lib", fitness="GOOD")
+            LibraryLoadReport(library_name="exec_deps_lib", fitness="GOOD")
         )
 
         assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
@@ -199,7 +198,7 @@ class TestOnReportLibraryLoadedRequest:
         mgr._library_file_path_to_info["/some/path.json"] = lib_info
 
         await mgr.workers.on_report_library_loaded_request(
-            ReportLibraryLoadedRequest(library_name="my_lib", fitness="FLAWED", problem_details="some issue")
+            LibraryLoadReport(library_name="my_lib", fitness="FLAWED", problem_details="some issue")
         )
 
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
@@ -210,7 +209,7 @@ class TestOnReportLibraryLoadedRequest:
         mgr = self._make_manager()
 
         result = await mgr.workers.on_report_library_loaded_request(
-            ReportLibraryLoadedRequest(library_name="unknown_lib", fitness="GOOD")
+            LibraryLoadReport(library_name="unknown_lib", fitness="GOOD")
         )
 
         assert isinstance(result, ReportLibraryLoadedResultFailure)
@@ -219,14 +218,14 @@ class TestOnReportLibraryLoadedRequest:
     async def test_accepting_a_report_raises_this_process_s_own_notification(self) -> None:
         """How the GUI hears about a library it has no other way to learn about.
 
-        The worker's report is a request now, and no listener anywhere sees another process's app
+        The worker's report is plain data, and no listener anywhere sees another process's app
         event, so without this the sidebar never learns the worker came up ready to execute.
         """
         mgr = self._make_manager()
         mgr._library_file_path_to_info["/some/path.json"] = self._make_lib_info("my_lib")
 
         await mgr.workers.on_report_library_loaded_request(
-            ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD", problem_details="some issue")
+            LibraryLoadReport(library_name="my_lib", fitness="GOOD", problem_details="some issue")
         )
 
         raised = cast("MagicMock", mgr.engine).abroadcast_app_event.await_args.args[0]
@@ -239,9 +238,7 @@ class TestOnReportLibraryLoadedRequest:
         mgr = self._make_manager()
         mgr._library_file_path_to_info["/some/path.json"] = self._make_lib_info("my_lib")
 
-        await mgr.workers.on_report_library_loaded_request(
-            ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD")
-        )
+        await mgr.workers.on_report_library_loaded_request(LibraryLoadReport(library_name="my_lib", fitness="GOOD"))
 
         cast("MagicMock", mgr._worker_manager).note_library_loaded.assert_called_once_with("my_lib")
 
@@ -252,11 +249,11 @@ class TestLibraryLoadReporter:
         mgr = _make_library_manager()
         reporter = AsyncMock()
         mgr.workers.register_library_load_reporter(reporter)
-        request = ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD")
+        report = LibraryLoadReport(library_name="my_lib", fitness="GOOD")
 
-        await mgr.workers.report_library_loaded(request)
+        await mgr.workers.report_library_loaded(report)
 
-        reporter.assert_awaited_once_with(request)
+        reporter.assert_awaited_once_with(report)
 
     @pytest.mark.asyncio
     async def test_no_reporter_is_logged_rather_than_raised(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -267,7 +264,7 @@ class TestLibraryLoadReporter:
         mgr = _make_library_manager()
 
         with caplog.at_level("ERROR"):
-            await mgr.workers.report_library_loaded(ReportLibraryLoadedRequest(library_name="my_lib", fitness="GOOD"))
+            await mgr.workers.report_library_loaded(LibraryLoadReport(library_name="my_lib", fitness="GOOD"))
 
         assert "my_lib" in caplog.text
 
@@ -368,7 +365,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         async def worker_finishes_loading() -> None:
             order.append("loaded")
             await library_manager.workers.on_report_library_loaded_request(
-                ReportLibraryLoadedRequest(library_name="Lib", fitness="GOOD")
+                LibraryLoadReport(library_name="Lib", fitness="GOOD")
             )
 
         await asyncio.gather(executes(), worker_finishes_loading())

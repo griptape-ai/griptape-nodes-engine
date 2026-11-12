@@ -10,7 +10,7 @@ import re
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 from unittest.mock import MagicMock, Mock
 
 import httpx2
@@ -50,6 +50,9 @@ def _make_component(value: Any, *, param_type: str = "ImageUrlArtifact") -> Comp
     component._node = node
     component._parameter = parameter
     component._storage_driver = driver
+    # The injected driver is reused only while the credential it was built with is current.
+    component._credential = Mock(return_value="key")  # type: ignore[method-assign]
+    component._storage_driver_credential = "key"
     component.gtc_file_path = None
     return ComponentFixture(component=component, driver=driver)
 
@@ -311,7 +314,11 @@ def _make_lazy_component(mocker: Any, value: Any, *, configured_bucket: str | No
     component._node = MagicMock(parameter_values={"image": value})
     component._node.get_parameter_value.return_value = value
     component._storage_driver = None
-    component._api_key = "key"
+    # Read the credential from the secrets below.
+    del component._credential
+    component._node.engine.secrets_manager.get_secret.side_effect = lambda name, should_error_on_not_found=True: (  # noqa: ARG005
+        "key" if name == "GRIPTAPE_NODES_LICENSE" else None
+    )
     component._base_url = "https://base"
     component._request_timeout = None
     mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=configured_bucket)
@@ -490,21 +497,21 @@ class TestBucketLookupLocks:
         started = threading.Event()
 
         def lookup(bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None) -> str:  # noqa: ARG001
-            if api_key == "slow":
+            if bucket_id == "slow":
                 started.set()
                 release.wait(timeout=5)
-            return f"bucket-{api_key}"
+            return f"bucket-{bucket_id}"
 
         mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", side_effect=lookup)
         slow = threading.Thread(
-            target=PublicArtifactUrlParameter._resolve_bucket_id, args=(None, "https://base", "slow")
+            target=PublicArtifactUrlParameter._resolve_bucket_id, args=("slow", "https://base", "key")
         )
         slow.start()
         assert started.wait(timeout=5)
 
         results: list[str] = []
         fast = threading.Thread(
-            target=lambda: results.append(PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "fast"))
+            target=lambda: results.append(PublicArtifactUrlParameter._resolve_bucket_id("fast", "https://base", "key"))
         )
         try:
             fast.start()
@@ -625,3 +632,67 @@ class TestAsyncCancel:
         release.set()
         await _drain_background_tasks()
         driver.delete_file.assert_called_once()
+
+
+class TestCredentialPerCall:
+    """A session credential renews, so it is read for each use rather than once."""
+
+    def test_after_the_secret_changes_the_next_call_uses_the_new_credential(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "/inputs/a.png")
+        current = {"GRIPTAPE_NODES_LICENSE": "the first session token"}
+        secrets_manager = MagicMock()
+        secrets_manager.get_secret.side_effect = lambda name, should_error_on_not_found=True: current.get(name)  # noqa: ARG005
+        cast("MagicMock", component._node).engine.secrets_manager = secrets_manager
+        driver_class = mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver", return_value=driver)
+        lookups: list[str] = []
+
+        def lookup(bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None) -> str:  # noqa: ARG001
+            lookups.append(api_key)
+            return f"bucket-for-{bucket_id}"
+
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", side_effect=lookup)
+
+        component._get_storage_driver()
+        current["GRIPTAPE_NODES_LICENSE"] = "the renewed session token"
+        component._storage_driver = None
+        PublicArtifactUrlParameter._bucket_id_cache.clear()
+        component._get_storage_driver()
+
+        assert lookups == ["the first session token", "the renewed session token"]
+        assert [call.kwargs["api_key"] for call in driver_class.call_args_list] == [
+            "the first session token",
+            "the renewed session token",
+        ]
+
+    def test_a_changed_credential_gets_its_own_bucket(self, mocker: Any) -> None:
+        component, driver = _make_lazy_component(mocker, "/inputs/a.png")
+        current = {"GT_CLOUD_API_KEY": "first org key"}
+        secrets_manager = MagicMock()
+        secrets_manager.get_secret.side_effect = lambda name, should_error_on_not_found=True: current.get(name)  # noqa: ARG005
+        cast("MagicMock", component._node).engine.secrets_manager = secrets_manager
+        driver_class = mocker.patch(f"{MODULE}.GriptapeCloudStorageDriver", return_value=driver)
+        mocker.patch.object(
+            PublicArtifactUrlParameter,
+            "_lookup_bucket_id",
+            side_effect=lambda bucket_id, base_url, api_key, timeout=None: f"default bucket of {api_key}",  # noqa: ARG005
+        )
+
+        component._get_storage_driver()
+        current["GT_CLOUD_API_KEY"] = "second org key"
+        component._get_storage_driver()
+
+        assert [call.kwargs["bucket_id"] for call in driver_class.call_args_list] == [
+            "default bucket of first org key",
+            "default bucket of second org key",
+        ]
+
+    def test_a_renewed_credential_replaces_the_old_entry(self, mocker: Any) -> None:
+        mocker.patch.object(PublicArtifactUrlParameter, "_lookup_bucket_id", return_value="bucket-1")
+
+        PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "first session token")
+        PublicArtifactUrlParameter._resolve_bucket_id(None, "https://base", "renewed session token")
+
+        assert PublicArtifactUrlParameter._bucket_id_cache == {
+            ("https://base", "renewed session token", None): "bucket-1"
+        }
+        assert set(PublicArtifactUrlParameter._bucket_id_locks) == {("https://base", "renewed session token", None)}

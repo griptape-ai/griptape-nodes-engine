@@ -34,6 +34,7 @@ from griptape_nodes.common.sequences import (
 from griptape_nodes.common.sequences.scan import (
     scan_sequences_from_filenames,
 )
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.files import os_utils
 from griptape_nodes.files.drivers.base64_file_driver import Base64FileDriver
 from griptape_nodes.files.drivers.data_uri_file_driver import DataUriFileDriver
@@ -266,6 +267,8 @@ class OSManager(EngineScoped):
     def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None):
         super().__init__(engine)
         self.indexed_filenames = IndexedFilenames(engine)
+        # The Griptape Cloud file driver this manager registered, if any.
+        self._cloud_file_driver: GriptapeCloudFileDriver | None = None
         if event_manager is not None:
             event_manager.register_request_handlers(self)
             self.sequences = FileSequences(event_manager, engine=engine)
@@ -283,9 +286,10 @@ class OSManager(EngineScoped):
         FileDriverRegistry.register(HttpFileDriver())
         FileDriverRegistry.register(DataUriFileDriver())
 
-        cloud_driver = GriptapeCloudFileDriver.create_from_env(self.engine.secrets_manager)
+        cloud_driver = GriptapeCloudFileDriver.create_from_env(resolve_cloud_credential(self.engine.secrets_manager))
         if cloud_driver:
             FileDriverRegistry.register(cloud_driver)
+            self._cloud_file_driver = cloud_driver
 
         FileDriverRegistry.register(Base64FileDriver())
         FileDriverRegistry.register(LocalFileDriver())
@@ -1236,6 +1240,10 @@ class OSManager(EngineScoped):
         try:
             # Get appropriate driver
             driver = FileDriverRegistry.get_driver(location)
+            cloud_driver = self._cloud_file_driver
+            if cloud_driver is not None and driver is cloud_driver:
+                # A session credential renews, so each read sends the current one.
+                cloud_driver.api_key = resolve_cloud_credential(self.engine.secrets_manager)
 
             # Driver validates and reads
             content = await driver.read(location, timeout=120.0)

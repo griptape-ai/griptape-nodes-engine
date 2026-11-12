@@ -23,6 +23,7 @@ from griptape_nodes.retained_mode.events.generic_events import WorkflowNotOpenRe
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
+from griptape_nodes.retained_mode.managers.worker_manager import WorkerRegistration
 from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
@@ -228,7 +229,7 @@ class TestEveryCloseTellsTheWorkers:
 
         with (
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
             patch.object(engine.event_manager, "_event_loop", asyncio.get_running_loop()),
             patch.object(worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all,
         ):
@@ -255,7 +256,7 @@ class TestEveryCloseTellsTheWorkers:
 
         with (
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
             patch.object(engine.event_manager, "_event_loop", asyncio.get_running_loop()),
             patch.object(worker_manager, "broadcast_drop_all_local_objects", side_effect=drop_all),
         ):

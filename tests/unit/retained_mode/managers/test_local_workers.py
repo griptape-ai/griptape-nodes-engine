@@ -213,7 +213,7 @@ class TestGone:
         worker = _Worker(pair.worker)
         worker_id, proc = await _connected(manager, _LIBRARY, pair)
         running = asyncio.create_task(
-            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id, "")
+            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id)
         )
         assert await asyncio.to_thread(worker.request_arrived.wait, _TIMEOUT_S)
 
@@ -233,7 +233,7 @@ class TestGone:
         worker = _Worker(pair.worker)
         worker_id, _ = await _connected(manager, _LIBRARY, pair)
         running = asyncio.create_task(
-            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id, "")
+            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id)
         )
         assert await asyncio.to_thread(worker.request_arrived.wait, _TIMEOUT_S)
 
@@ -259,7 +259,7 @@ class TestRelayedEvents:
         _engine(manager).get_session_id.return_value = "session-1"
         payload = {"event_type": "AppEvent", "payload_type": "CurrentProjectChanged", "payload": {"project_id": "p"}}
 
-        await manager._relay_local_worker_event("AppEvent", payload)
+        await manager._relay_worker_event("AppEvent", payload)
 
         send_message.assert_awaited_once()
         event_type, _, topic = send_message.await_args_list[0].args
@@ -407,7 +407,7 @@ class TestStoppingLocalWorkers:
         worker = _Worker(pair.worker)
         worker_id, _ = await _connected(manager, None, pair)
         running = asyncio.create_task(
-            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id, "")
+            manager.route_to_worker(EventRequest(request=GetEngineVersionRequest()), worker_id)
         )
         assert await asyncio.to_thread(worker.request_arrived.wait, _TIMEOUT_S)
 
@@ -426,7 +426,7 @@ class TestStoppingLocalWorkers:
         pair.parent.close()
 
         await manager.forward_event_to_worker(
-            EventRequest(request=GetEngineVersionRequest()), worker_engine_id=worker_id, worker_request_topic=""
+            EventRequest(request=GetEngineVersionRequest()), worker_engine_id=worker_id
         )
 
 
@@ -436,7 +436,7 @@ class TestRelayedResults:
         manager = _worker_manager()
         payload = {"event_type": "EventResultSuccess", "result_type": "SomeResultSuccess", "result": {}}
 
-        await manager._relay_local_worker_event("EventResult", payload)
+        await manager._relay_worker_event("EventResult", payload)
 
         send_message = AsyncMock()
         manager.attach_transport(
@@ -445,7 +445,7 @@ class TestRelayedResults:
             unsubscribe_from_topic=AsyncMock(),
             request_client=MagicMock(),
         )
-        await manager._relay_local_worker_event("EventResult", payload)
+        await manager._relay_worker_event("EventResult", payload)
 
         send_message.assert_awaited_once()
         assert send_message.await_args_list[0].args[0] == "success_result"

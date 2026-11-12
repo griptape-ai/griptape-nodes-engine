@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from griptape_nodes.app.worker_routing import RefreshSecretsRequest
+from griptape_nodes.app.worker_routing import ReloadConfigRequest
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.converters import EventSerializationError
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
@@ -21,8 +21,8 @@ class TestBroadcastToWorkers:
             "worker-2": WorkerRegistration(request_topic="workers/2/request", worker_key=None),
         }
         manager.forward_event_to_worker = AsyncMock(side_effect=EventSerializationError("boom"))
-        event = EventRequest(request=RefreshSecretsRequest())
+        event = EventRequest(request=ReloadConfigRequest())
 
         await manager.broadcast_to_workers(event)
 
-        assert "Could not broadcast RefreshSecretsRequest" in caplog.text
+        assert "Could not broadcast ReloadConfigRequest" in caplog.text

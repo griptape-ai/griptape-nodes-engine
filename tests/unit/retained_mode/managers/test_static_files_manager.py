@@ -1582,6 +1582,21 @@ class TestStaticFilesManagerCloudCredential:
 
         assert manager._create_cloud_storage_driver(self._BUCKET_ID) is None
 
+    def test_a_renewed_credential_reaches_the_next_upload_through_the_same_driver(
+        self, gtc_config_manager: Mock
+    ) -> None:
+        """A session credential renews, and the driver lives as long as the manager."""
+        secrets: dict[str, str | None] = {
+            "GT_CLOUD_BUCKET_ID": self._BUCKET_ID,
+            "GRIPTAPE_NODES_LICENSE": self._LICENSE,
+        }
+        manager = self._build(gtc_config_manager, secrets)
+        driver = manager.storage_driver
+        secrets["GRIPTAPE_NODES_LICENSE"] = "the renewed session token"
+
+        assert manager.storage_driver is driver
+        assert driver.api_key == "the renewed session token"
+
 
 class TestStaticServerUrlSettlement:
     """The URL decision is awaited, not sampled.

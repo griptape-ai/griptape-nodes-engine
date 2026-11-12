@@ -498,7 +498,7 @@ class TestNodesAndFlowsOnTheRuntime:
         runtime = engine.current_workflow()
         tracked_while_running: list[str] = []
 
-        async def close_while_running(*_: object) -> dict:
+        async def close_while_running(*_args: object, **_kwargs: object) -> dict:
             tracked_while_running.extend(runtime.nodes.orch_worker_requests)
             engine.context_manager.pop_workflow()
             msg = "The worker went away."

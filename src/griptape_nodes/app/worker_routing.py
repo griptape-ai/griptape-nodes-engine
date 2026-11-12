@@ -13,7 +13,7 @@ there. This module provides:
 - ``register_remote_handlers``: swaps the dispatch table entries on a
   just-configured worker after ``configure_worker_forwarding`` has wired up
   the RequestClient and loop references.
-- ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` and their Success/Failure
+- ``ReloadConfigRequest`` and its Success/Failure
   payloads: orchestrator-originated broadcasts that every worker handles
   locally to re-read shared on-disk state. They live here, not in
   ``worker_events.py``, because their reason for existing is a routing
@@ -89,7 +89,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
-    from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 
 HandlerCallback = "Callable[[RequestPayload], ResultPayload | Awaitable[ResultPayload]]"
@@ -182,34 +181,6 @@ class DropAllLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Worker failed to release the objects it was holding."""
-
-
-@dataclass
-@PayloadRegistry.register
-class RefreshSecretsRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by the orchestrator to each registered worker after a secret mutation succeeds.
-
-    The global .env at ~/.config/griptape_nodes/.env is shared across
-    processes on the same machine, but the worker's os.environ snapshot
-    was populated at boot from the file as it existed then. Without this
-    refresh, get_secret() would see the stale env-var shadow (its highest
-    priority source) even after the orchestrator updated the file.
-
-    Uses SkipTheLineMixin to avoid a queued ExecuteNodeRequest reading
-    the stale secret before the refresh lands.
-    """
-
-
-@dataclass
-@PayloadRegistry.register
-class RefreshSecretsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Worker refreshed its secrets from the shared .env file."""
-
-
-@dataclass
-@PayloadRegistry.register
-class RefreshSecretsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Worker failed to refresh its secrets."""
 
 
 @dataclass
@@ -355,8 +326,6 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # Addressed to this worker: re-read the config file both processes share. The orchestrator
         # installs no handler, so forwarding would not find one.
         ReloadConfigRequest,
-        # Addressed to this worker: refresh its env-var view of the shared .env.
-        RefreshSecretsRequest,
         # Addressed to this worker: adopt the project the orchestrator switched to.
         ActivateProjectRequest,
         # Adopting a project reloads THIS worker's libraries. Forwarding would instead reload the
@@ -522,7 +491,7 @@ async def _handle_drop_all_local_objects(
 
     try:
         # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
-        # worker's loop past the heartbeat timeout gets it evicted mid-load.
+        # worker's loop holds up every request and event it handles meanwhile.
         if request.workflow_id is None:
             dropped = await to_thread(resource_manager.drop_all_local_objects)
         else:
@@ -559,7 +528,7 @@ async def _handle_drop_local_objects(
 
     try:
         # Off the loop for the same reason as its sibling: a release hook is `del model` plus a CUDA cache
-        # flush, and a worker whose loop is blocked past the heartbeat timeout is evicted mid-load.
+        # flush, and a worker whose loop is blocked holds up every request and event it handles meanwhile.
         dropped = await to_thread(release_all)
     except Exception as e:
         details = f"Attempted to release {len(request.keys)} held object(s). Failed because of {type(e).__name__}: {e}."
@@ -577,7 +546,7 @@ async def _handle_drop_library_named_local_objects(
 
     try:
         # Off the loop for the same reason as its siblings: a release hook is `del model` plus a CUDA
-        # cache flush, and a worker whose loop is blocked past the heartbeat timeout is evicted.
+        # cache flush, and a worker whose loop is blocked holds up every request and event it handles meanwhile.
         dropped = await to_thread(resource_manager.drop_library_named_local_objects)
     except Exception as e:
         details = (
@@ -597,9 +566,9 @@ async def _adopt_on_engine_loop(
 ) -> ResultPayload:
     """Run `adopt` on the engine loop, and settle the worker once it succeeds.
 
-    ActivateProjectRequest arrives on the transport loop, which also answers heartbeats. Adoption is a
-    whole project switch, with file I/O and synchronous requests that block the loop they run on, so it
-    runs on the engine loop and is only awaited here.
+    ActivateProjectRequest can be handled on a loop other than the engine's. Adoption is a whole
+    project switch, with file I/O and synchronous requests that block the loop they run on, so it runs
+    on the engine loop and is only awaited here.
     """
     engine_loop = event_manager.event_loop
     if engine_loop is None:
@@ -623,13 +592,11 @@ def register_broadcast_handlers(
     event_manager: EventManager,
     *,
     config_manager: ConfigManager,
-    secrets_manager: SecretsManager,
     project_manager: ProjectManager,
 ) -> asyncio.Event:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
-    Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` /
-    ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
+    Workers receive ``ReloadConfigRequest`` / ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
     the shared on-disk state or adopting the orchestrator's current project. The
     actual work is delegated to the corresponding manager so domain logic stays
     in the manager and routing decisions stay here.
@@ -653,14 +620,6 @@ def register_broadcast_handlers(
             details = f"Attempted to reload config from disk. Failed because of {type(e).__name__}: {e}."
             return ReloadConfigResultFailure(result_details=details)
         return ReloadConfigResultSuccess(result_details="Reloaded config from disk.")
-
-    def handle_refresh_secrets(request: RefreshSecretsRequest) -> ResultPayload:  # noqa: ARG001
-        try:
-            secrets_manager.refresh_from_env_file()
-        except Exception as e:
-            details = f"Attempted to refresh secrets from shared .env file. Failed because of {type(e).__name__}: {e}."
-            return RefreshSecretsResultFailure(result_details=details)
-        return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
     # Activation awaits internally, so two arriving close together interleave: the older can pass
     # the staleness check, suspend, and finish after the newer, leaving the worker on the older
@@ -716,7 +675,6 @@ def register_broadcast_handlers(
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
-    event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
 
     _register_local_object_handlers(event_manager)

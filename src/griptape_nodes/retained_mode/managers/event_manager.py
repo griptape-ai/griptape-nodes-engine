@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
 import functools
 import inspect
 import logging
@@ -62,7 +63,6 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
-from griptape_nodes.retained_mode.topics import engine_request_topic, engine_response_topic
 from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
@@ -88,6 +88,26 @@ class WorkerRequestGateDecision(NamedTuple):
 
     forward: dict | None
     denials: list[str]
+
+
+@dataclass(frozen=True)
+class RemoteWorkerSecretAnswer:
+    """How this engine answers a secret read from a library's worker another engine runs for it.
+
+    Attributes:
+        value: The value to answer with, or None for no value.
+        from_serving_engine: Answer with the serving engine's own value for that secret instead of `value`.
+    """
+
+    value: str | None = dataclasses.field(default=None, repr=False)
+    from_serving_engine: bool = False
+
+
+class RemoteWorkerRequest(NamedTuple):
+    """A request a worker another engine runs for this one sent, admitted to be handled here as this engine's own worker's."""
+
+    request: RequestPayload
+    result_context: ResultContext
 
 
 class WorkerRequestSender(Protocol):
@@ -276,14 +296,18 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 class ResultContext(TypedDict, total=False):
     """Request envelope fields dispatch carries to the result.
 
-    `request_id` and `response_topic` are echoed on the result envelope. Its `open_workflow_id` is
-    the workflow the request ran in (see `EventManager._result_workflow_id`).
+    `request_id` and `response_topic` are echoed on the result envelope, and `sender` and
+    `origin_engine_id` are not. Its `open_workflow_id` is the workflow the request ran in (see
+    `EventManager._result_workflow_id`).
     """
 
     response_topic: str | None
     request_id: str | None
     sender: RequestSender | None
     open_workflow_id: str | None
+    # The engine this request started at, which `sender` relayed. Today that is a remote worker
+    # this one runs for the engine that sent it.
+    origin_engine_id: str | None
 
 
 def result_context_from_request(event: EventRequest) -> ResultContext:
@@ -297,6 +321,7 @@ def result_context_from_request(event: EventRequest) -> ResultContext:
         request_id=event.request_id,
         sender=event.sender,
         open_workflow_id=event.open_workflow_id,
+        origin_engine_id=event.origin_engine_id,
     )
 
 
@@ -454,6 +479,12 @@ class EventManager(EngineScoped):
         # Screens each request a library's worker process sends this engine. See add_worker_request_gate.
         self._worker_request_gates: list[Callable[[dict], WorkerRequestGateDecision]] = []
         self._worker_request_gates_lock = threading.Lock()
+        # Decides secret reads from workers other engines run for this one. See set_remote_worker_secret_policy.
+        self._remote_worker_secret_policy: Callable[[str], RemoteWorkerSecretAnswer | None] | None = None
+        # Admits the requests a worker another engine runs for this one sends. See admit_remote_worker_requests.
+        self._admit_remote_worker_request: (
+            Callable[[RequestPayload, ResultContext], Awaitable[RemoteWorkerRequest | ResultPayload]] | None
+        ) = None
 
     @property
     def event_queue(self) -> asyncio.Queue:
@@ -1088,6 +1119,44 @@ class EventManager(EngineScoped):
             except ValueError:
                 return
 
+    def set_remote_worker_secret_policy(self, policy: Callable[[str], RemoteWorkerSecretAnswer | None] | None) -> None:
+        """Install what decides secret reads from workers other engines run for this one, replacing any before it.
+
+        `policy` gets the secret's name and returns how to answer it, or None to answer it from this
+        engine's secrets as a local worker's read is. None removes it.
+        """
+        self._remote_worker_secret_policy = policy
+
+    def remote_worker_secret_answer(self, secret_name: str) -> RemoteWorkerSecretAnswer | None:
+        """How the installed policy answers `secret_name` for a remote worker. A policy that raises answers no value."""
+        policy = self._remote_worker_secret_policy
+        if policy is None:
+            return None
+        try:
+            return policy(secret_name)
+        except Exception as exc:
+            logging.getLogger("griptape_nodes").error(
+                "Could not decide a remote worker's secret read: %s", type(exc).__name__
+            )
+            return RemoteWorkerSecretAnswer()
+
+    def admit_remote_worker_requests(
+        self, admit: Callable[[RequestPayload, ResultContext], Awaitable[RemoteWorkerRequest | ResultPayload]]
+    ) -> None:
+        """Decide the requests another engine relays from a worker it runs for this one, which `ahandle_request` needs.
+
+        `admit` is given a request whose envelope names an `origin_engine_id`, and returns it admitted
+        with the context to handle it in, or the result to answer with instead. The manager that asks
+        other engines for workers gives it, once.
+
+        Raises:
+            ValueError: Another manager already gave one.
+        """
+        if self._admit_remote_worker_request is not None:
+            msg = "Attempted to give the engine a way to admit remote workers' requests. Failed because it already has one."
+            raise ValueError(msg)
+        self._admit_remote_worker_request = admit
+
     def evaluate_worker_request_gate(self, envelope: dict) -> WorkerRequestGateDecision:
         """Run the registered worker request gates over `envelope`. Fails closed: a hook that raises denies."""
         with self._worker_request_gates_lock:
@@ -1425,27 +1494,6 @@ class EventManager(EngineScoped):
             response_topic=result_context.get("response_topic"),
             engine_id=self.engine.get_engine_id(),
         )
-
-    async def request_engine_from_worker(self, engine_id: str, request: RequestPayload) -> ResultPayload:
-        """Send a request from this worker to the engine `engine_id`, as one of that engine's own clients, and return its result.
-
-        For a worker another engine runs, to reach that engine rather than its orchestrator. It travels
-        the connection the worker's orchestrator traffic does, which that engine carries, and is answered
-        on this worker's own engine topic, which no orchestrator listens on.
-
-        Raises:
-            TimeoutError: The engine did not answer within the worker's forwarding timeout.
-        """
-        own_engine_id = self.engine.get_engine_id()
-        if own_engine_id is None:
-            msg = f"Attempted to send a {type(request).__name__} to engine {engine_id}. Failed because this worker has no engine ID."
-            raise RuntimeError(msg)
-        response_payload = await self._send_from_worker(
-            request,
-            request_topic=engine_request_topic(engine_id),
-            response_topic=engine_response_topic(own_engine_id),
-        )
-        return read_forwarded_result(request, response_payload)
 
     async def _send_from_worker(
         self, request: RequestPayload, *, request_topic: str, response_topic: str, open_workflow_id: str | None = None
@@ -1905,6 +1953,9 @@ class EventManager(EngineScoped):
             raise TypeError(msg)
         self._report_graph_access_while_loading(request)
 
+        if result_context.get("origin_engine_id") is not None:
+            return await self._ahandle_remote_worker_request(request, result_context)
+
         refusal = self._refusal_for_sender(request, result_context)
         if refusal is not None:
             return self._handle_request_core(request, refusal, context=result_context, request_workflow=None)
@@ -1961,6 +2012,27 @@ class EventManager(EngineScoped):
             if is_outermost_request:
                 self.flush_coalesced_events()
             bound_workflow.reset(binding_token)
+
+    async def _ahandle_remote_worker_request(
+        self, request: RequestPayload, result_context: ResultContext
+    ) -> EventResultSuccess | EventResultFailure:
+        """Handle a request another engine relayed from a worker it runs for this one, once it is admitted.
+
+        Admitted, it is handled as this engine's own worker's request is, in the context `admit` gives.
+        """
+        admit = self._admit_remote_worker_request
+        if admit is None:
+            details = (
+                f"Attempted to handle a {type(request).__name__} from a worker another engine runs for this one. "
+                "Failed because this engine runs no workers on other engines."
+            )
+            return self._handle_request_core(
+                request, GenericResultFailure(result_details=details), context=result_context, request_workflow=None
+            )
+        admitted = await admit(request, result_context)
+        if isinstance(admitted, RemoteWorkerRequest):
+            return await self.ahandle_request(admitted.request, result_context=admitted.result_context)
+        return self._handle_request_core(request, admitted, context=result_context, request_workflow=None)
 
     @staticmethod
     def _report_graph_access_while_loading(request: RequestPayload) -> None:
@@ -2020,6 +2092,15 @@ class EventManager(EngineScoped):
             msg = f"No manager found to handle request of type '{request_type.__name__}'."
             raise TypeError(msg)
         self._report_graph_access_while_loading(request)
+
+        if result_context.get("origin_engine_id") is not None:
+            details = (
+                f"Attempted to handle a {request_type.__name__} from a worker another engine runs for this one. "
+                "Failed because such a request is admitted only by ahandle_request."
+            )
+            return self._handle_request_core(
+                request, GenericResultFailure(result_details=details), context=result_context, request_workflow=None
+            )
 
         refusal = self._refusal_for_sender(request, result_context)
         if refusal is not None:
