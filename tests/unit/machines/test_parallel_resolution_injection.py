@@ -203,3 +203,20 @@ class TestTeardownWhileParkedOnTheWakeup:
         assert not machine.context.task_to_node
 
         release.set()
+
+
+class TestReinjectingAFinishedNode:
+    @pytest.mark.asyncio
+    async def test_a_node_that_finished_inside_the_run_can_be_run_again(self) -> None:
+        machine, _release, dag_builder = machine_running_one_node(max_nodes_in_parallel=2)
+
+        machine.inject_node(node_stub("again"))
+        # What finishing does in single node resolution: the node leaves its network, and the
+        # emptied network's node list is dropped while the network itself stays registered.
+        dag_builder.graphs["again"].remove_node("again")
+        dag_builder.cleanup_empty_graph_nodes("again")
+
+        added = machine.inject_node(node_stub("again"))
+
+        assert [node.name for node in added] == ["again"]
+        assert dag_builder.node_to_reference["again"].node_state is NodeState.QUEUED

@@ -121,7 +121,9 @@ class DagBuilder:
         if graph is None:
             graph = DirectedGraph()
             self.graphs[graph_name] = graph
-            self.graph_to_nodes[graph_name] = set()
+        # cleanup_empty_graph_nodes drops a finished graph's node list but keeps the graph, so a
+        # node re-run under the same graph name finds the graph without its list.
+        self.graph_to_nodes.setdefault(graph_name, set())
 
         def _add_node_recursive(current_node: BaseNode, visited: set[str], graph: DirectedGraph) -> None:
             # Skip if already visited or already in DAG
