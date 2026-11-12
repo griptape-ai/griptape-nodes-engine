@@ -779,6 +779,66 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             )
         assert seen == {"action": "InstantiateNode", "stage": "LABS"}
 
+    def test_enforce_keeps_the_whole_denial_and_the_library_name(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, _NodeInstantiationDeniedError
+
+        self._register()
+        denial = CheckpointDenial(
+            failures=(
+                CheckpointFailure(detail="First rule applies.", source="policy 'A'"),
+                CheckpointFailure(detail="Second rule applies.", source="policy 'B'"),
+            )
+        )
+        engine.event_manager.add_authorization_hook(lambda _checkpoint: denial)
+
+        with pytest.raises(_NodeInstantiationDeniedError) as excinfo:
+            NodeManager._enforce_instantiation_checkpoint(
+                node_type=_GateProbe.__name__,
+                specific_library_name=None,
+                event_manager=engine.event_manager,
+            )
+
+        assert excinfo.value.denial is denial
+        assert excinfo.value.library_name == self._LIBRARY_NAME
+        assert str(excinfo.value) == "First rule applies.\nSecond rule applies."
+
+    def test_create_node_substitutes_a_proxy_carrying_the_structured_denial(self, engine: Engine) -> None:
+        from griptape_nodes.exe_types.core_types import ParameterMessage
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        self._register()
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="denied_workflow", flow_name="denied_flow"))
+        engine.event_manager.add_authorization_hook(
+            lambda _checkpoint: CheckpointDenial(
+                failures=(
+                    CheckpointFailure(detail="First rule applies.", source="policy 'A'"),
+                    CheckpointFailure(detail="Second rule applies."),
+                )
+            )
+        )
+
+        result = engine.handle_request(
+            CreateNodeRequest(node_type=_GateProbe.__name__, node_name="denied-probe", specific_library_name=None)
+        )
+
+        assert isinstance(result, CreateNodeResultSuccess), result.result_details
+        node = engine.node_manager.get_node_by_name_in(engine.current_workflow(), result.node_name)
+        assert isinstance(node, ErrorProxyNode)
+        assert node.original_library_name == self._LIBRARY_NAME
+        message = node.get_message_by_name_or_element_id("error_proxy_message")
+        assert isinstance(message, ParameterMessage)
+        assert "- First rule applies.\n- Second rule applies." in message.value
+        denial_option = message.ui_options["permission_denial"]
+        assert denial_option["library_name"] == self._LIBRARY_NAME
+        assert denial_option["node_type"] == _GateProbe.__name__
+        assert [failure["source"] for failure in denial_option["failures"]] == ["policy 'A'", None]
+
     def test_enforce_allows_without_hook(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 

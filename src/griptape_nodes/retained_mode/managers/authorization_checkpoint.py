@@ -104,12 +104,17 @@ class CheckpointFailure:
     `detail` is a human-readable sentence the engine surfaces directly (in a
     fitness problem, an error-proxy node, or a failure result). `capability` and
     `advice` are optional structured fields a richer UI can render separately
-    (the entitlement the user lacks and what to ask their admin for).
+    (the entitlement the user lacks and what to ask their admin for). `source` is a
+    short human label naming the rule or rules that produced the failure (for
+    example ``policy 'Image Edits' (rule 'no-invert-image')``), so a user or admin
+    can tell which rule to change. `detail` stays the complete sentence on its own;
+    `source` is supplementary and never needed to understand it.
     """
 
     detail: str
     capability: str | None = None
     advice: str | None = None
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,12 +132,20 @@ class CheckpointDenial:
         """The per-failure detail sentences, for plain-text rendering."""
         return [failure.detail for failure in self.failures]
 
-    def reason(self, *, separator: str = "; ", default: str = "Denied by the license policy.") -> str:
+    def reason(self, *, separator: str | None = None, default: str = "Denied by the license policy.") -> str:
         """The denial as one display string: every failure detail joined, or `default`.
 
         A hook returns `None` (not an empty denial) to allow, so empty `failures` is
         a contract violation; `default` keeps the surfaced message coherent if one
-        slips through. Callers pass `separator` to match their surrounding format
-        (inline `"; "` in a failure result, a newline in a multi-line node error).
+        slips through. With no `separator`, details are joined as sentences: each
+        ends in punctuation exactly once, then a space. Callers pass `separator` to
+        match their surrounding format, such as a newline in a multi-line node error.
         """
-        return separator.join(self.messages()) or default
+        messages = self.messages()
+        if separator is not None:
+            return separator.join(messages) or default
+        stripped = (message.rstrip() for message in messages)
+        sentences = [
+            message if message.endswith((".", "!", "?", "…")) else f"{message}." for message in stripped if message
+        ]
+        return " ".join(sentences) or default
