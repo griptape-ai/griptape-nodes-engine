@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from typing import TYPE_CHECKING, Any
-from unittest.mock import Mock, create_autospec
+from unittest.mock import AsyncMock, Mock, create_autospec
 
 import pytest
 
@@ -15,7 +15,13 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     SubflowNodeGroup,
 )
 from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LEGACY_PRIVATE_EXECUTION, LOCAL_EXECUTION
+from griptape_nodes.exe_types.workflow_node_errors import SubflowNodeFailedError
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from tests.unit.exe_types.mocks import MockNode
@@ -367,6 +373,56 @@ class TestProxySerializable:
         group.after_incoming_connection(outside, outside_output, proxy)
 
         assert proxy.serializable is False
+
+
+class TestExecuteSubflow:
+    """A failed subflow raises the same message as before, with the failure behind it as the cause."""
+
+    @pytest.fixture
+    def workflow(self, engine: Engine) -> WorkflowRuntime:
+        return WorkflowRuntime("wf", engine)
+
+    @pytest.fixture
+    def group(self, workflow: WorkflowRuntime) -> _MiniSubflowGroup:
+        group = _MiniSubflowGroup(name="G")
+        group._set_workflow(workflow)
+        group.metadata["subflow_name"] = "G_subflow"
+        return group
+
+    @pytest.fixture
+    def run_subflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The subflow run, which each test points at a result."""
+        run = AsyncMock(spec=engine.flow_manager.on_start_local_subflow_request_in_workflow)
+        monkeypatch.setattr(engine.flow_manager, "on_start_local_subflow_request_in_workflow", run)
+        return run
+
+    @pytest.mark.asyncio
+    async def test_the_message_is_unchanged_and_the_failure_is_the_cause(
+        self, group: _MiniSubflowGroup, workflow: WorkflowRuntime, run_subflow: Mock
+    ) -> None:
+        failure = SubflowNodeFailedError("Inner", NodeErrorDetails(message="boom"), ValueError("boom"))
+        run_subflow.return_value = StartLocalSubflowResultFailure(
+            result_details="Node 'Inner' failed: boom", exception=failure
+        )
+
+        with pytest.raises(RuntimeError) as raised:
+            await group.execute_subflow()
+
+        assert str(raised.value) == "Node 'Inner' failed: boom"
+        assert raised.value.__cause__ is failure
+        run_subflow.assert_awaited_once_with(StartLocalSubflowRequest(flow_name="G_subflow"), workflow)
+
+    @pytest.mark.asyncio
+    async def test_a_failure_without_an_exception_has_no_cause(
+        self, group: _MiniSubflowGroup, run_subflow: Mock
+    ) -> None:
+        run_subflow.return_value = StartLocalSubflowResultFailure(result_details="could not start")
+
+        with pytest.raises(RuntimeError) as raised:
+            await group.execute_subflow()
+
+        assert str(raised.value) == "could not start"
+        assert raised.value.__cause__ is None
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):
