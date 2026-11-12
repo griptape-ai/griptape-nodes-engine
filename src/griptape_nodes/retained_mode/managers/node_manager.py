@@ -56,6 +56,7 @@ from griptape_nodes.exe_types.node_types import (
     ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
     BaseNode,
+    ConfigurationNode,
     ErrorProxyNode,
     NodeDependencies,
     NodeResolutionState,
@@ -5081,7 +5082,7 @@ class NodeManager(EngineScoped):
         return DeserializeNodeFromCommandsResultSuccess(node_name=node_name, result_details=details)
 
     @handles(SerializeSelectedNodesToCommandsRequest)
-    def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
+    def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: SerializeSelectedNodesToCommandsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """This will take the selected nodes in the Object manager and serialize them into commands."""
@@ -5113,6 +5114,15 @@ class NodeManager(EngineScoped):
             node = workflow.objects.get_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get node '{node_name}'."
+                return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
+            # A workflow holds one Configuration node per publish target, created by publishing, so a
+            # copy would be a second one. Refuse the selection rather than drop the node: the editor
+            # pairs the nodes it sent with the ones it gets back by position.
+            if isinstance(node, ConfigurationNode):
+                details = (
+                    f"Attempted to copy a selection of nodes. Failed because '{node_name}' holds publish "
+                    "settings and can't be copied. Deselect it and try again."
+                )
                 return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
             if isinstance(node, BaseNodeGroup):

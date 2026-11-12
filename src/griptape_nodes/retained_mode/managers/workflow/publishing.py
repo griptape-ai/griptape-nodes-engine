@@ -4,12 +4,20 @@ import asyncio
 import logging
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
+from griptape_nodes.exe_types.core_types import ParameterMode
+from griptape_nodes.exe_types.node_types import ConfigurationNode, StartNode
 from griptape_nodes.files.path_utils import derive_registry_key
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibraryRegistryError
 from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from griptape_nodes.retained_mode.events.parameter_events import (
+    SetParameterValueRequest,
+    SetParameterValueResultSuccess,
+)
 from griptape_nodes.retained_mode.events.workflow_events import (
     GetPublishOptionsRequest,
     GetPublishOptionsResultFailure,
@@ -21,10 +29,12 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
     SaveWorkflowRequest,
+    SaveWorkflowResultSuccess,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
+    from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -32,6 +42,11 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("griptape_nodes")
+
+# Where a newly created Configuration node goes, relative to the workflow's Start node.
+CONFIGURATION_NODE_OFFSET_Y = 300
+
+_ConfigurableRequest = TypeVar("_ConfigurableRequest", GetPublishOptionsRequest, PublishWorkflowRequest)
 
 
 class WorkflowPublishing(EngineScoped):
@@ -43,9 +58,13 @@ class WorkflowPublishing(EngineScoped):
     def on_get_publish_options_request(
         self,
         request: GetPublishOptionsRequest,
-        workflow: WorkflowRuntime | None = None,  # noqa: ARG002 - declares the scope dispatch binds for the callback
+        workflow: WorkflowRuntime | None = None,
     ) -> ResultPayload:
-        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads."""
+        """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads.
+
+        `workflow` is None when the request names no workflow and more than one is open; the
+        publisher still gets options, just with no Configuration node to prefill from.
+        """
         options_request = request
         if request.workflow_id is not None:
             try:
@@ -72,7 +91,7 @@ class WorkflowPublishing(EngineScoped):
 
         event_data = publishing_handler.event_data
         if isinstance(event_data, PublishWorkflowRegisteredEventData) and event_data.get_publish_options is not None:
-            return event_data.get_publish_options(options_request)
+            return event_data.get_publish_options(self._with_configuration(options_request, workflow, event_data))
 
         return GetPublishOptionsResultSuccess(
             fields=[],
@@ -133,7 +152,12 @@ class WorkflowPublishing(EngineScoped):
                 workflow_file_name = derive_registry_key(saved.file_path)
             await workflow.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
 
+            event_data = publishing_handler.event_data
+            publish_request = self._with_configuration(publish_request, workflow, event_data)
+
             result = await asyncio.to_thread(publishing_handler.handler, publish_request)
+            if isinstance(result, PublishWorkflowResultSuccess):
+                await self._store_configuration(workflow, event_data, result, workflow_file_name)
             if isinstance(result, PublishWorkflowResultSuccess) and not result.skip_published_workflow_registration:
                 workflow_file = Path(result.published_workflow_file_path)
                 result = await self._register_published_workflow_file(workflow_file, result)
@@ -143,6 +167,143 @@ class WorkflowPublishing(EngineScoped):
             details = f"Failed to publish workflow '{workflow_name}': {e!s}"
             logger.exception(details)
             return PublishWorkflowResultFailure(exception=e, result_details=details)
+
+    def _with_configuration(
+        self, request: _ConfigurableRequest, workflow: WorkflowRuntime | None, event_data: object
+    ) -> _ConfigurableRequest:
+        """`request` carrying the values of the target's Configuration node in `workflow`, if it has one.
+
+        `workflow` is None when the request is unbound to any open workflow (see
+        `on_get_publish_options_request`); there is then no graph to look a node up in.
+        """
+        if workflow is None or not isinstance(event_data, PublishWorkflowRegisteredEventData):
+            return request
+        configuration_node = self._find_configuration_node(workflow, event_data)
+        if configuration_node is None:
+            return request
+        return replace(request, configuration=_read_configuration(configuration_node))
+
+    async def _store_configuration(
+        self,
+        workflow: WorkflowRuntime,
+        event_data: object,
+        result: PublishWorkflowResultSuccess,
+        workflow_file_name: str,
+    ) -> None:
+        """Find or create the target's Configuration node, write the values the publisher returned, and save.
+
+        The publish has already happened, so a failure here doesn't fail it: it is added to the
+        result's details as a warning, and the next publish starts without the remembered values.
+        """
+        if not isinstance(event_data, PublishWorkflowRegisteredEventData):
+            return
+        node_type = event_data.configuration_node_type
+        if node_type is None:
+            return
+
+        configuration_node = self._find_configuration_node(workflow, event_data)
+        if configuration_node is None:
+            configuration_node_name = await self._create_configuration_node(workflow, event_data)
+            if configuration_node_name is None:
+                _add_warning(
+                    result,
+                    f"Published, but couldn't add a '{node_type}' node to remember this target's settings. "
+                    "The next publish won't start from them.",
+                )
+                return
+        else:
+            configuration_node_name = configuration_node.name
+
+        for parameter_name, value in (result.configuration or {}).items():
+            set_result = await workflow.ahandle_request(
+                SetParameterValueRequest(node_name=configuration_node_name, parameter_name=parameter_name, value=value)
+            )
+            if not isinstance(set_result, SetParameterValueResultSuccess):
+                _add_warning(
+                    result,
+                    f"Published, but couldn't remember '{parameter_name}' on '{configuration_node_name}': "
+                    f"{set_result.result_details}",
+                )
+
+        save_result = await workflow.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
+        if not isinstance(save_result, SaveWorkflowResultSuccess):
+            _add_warning(
+                result,
+                f"Published, but couldn't save the workflow after updating '{configuration_node_name}'. "
+                "Save the workflow to keep this target's settings.",
+            )
+
+    async def _create_configuration_node(
+        self, workflow: WorkflowRuntime, event_data: PublishWorkflowRegisteredEventData
+    ) -> str | None:
+        """Add the target's Configuration node to the workflow's top-level flow and return its name, or None."""
+        node_type = event_data.configuration_node_type
+        if node_type is None:
+            return None
+        flow_name = self._top_level_flow_name(workflow)
+        if flow_name is None:
+            return None
+
+        create_result = await workflow.ahandle_request(
+            CreateNodeRequest(
+                node_type=node_type,
+                specific_library_name=event_data.configuration_node_library_name,
+                node_name=_configuration_node_display_name(event_data),
+                override_parent_flow_name=flow_name,
+                metadata=self._configuration_node_position(workflow, flow_name),
+                create_error_proxy_on_failure=False,
+            )
+        )
+        if not isinstance(create_result, CreateNodeResultSuccess):
+            logger.warning(
+                "Attempted to add a '%s' node after publishing. Failed because: %s",
+                node_type,
+                create_result.result_details,
+            )
+            return None
+        return create_result.node_name
+
+    def _find_configuration_node(
+        self, workflow: WorkflowRuntime, event_data: PublishWorkflowRegisteredEventData
+    ) -> ConfigurationNode | None:
+        """The target's Configuration node in `workflow`'s top-level flow, or None if it has none yet."""
+        node_type = event_data.configuration_node_type
+        if node_type is None:
+            return None
+        flow_name = self._top_level_flow_name(workflow)
+        if flow_name is None:
+            return None
+
+        nodes = self.engine.flow_manager.get_flow_by_name_in(workflow, flow_name).nodes
+        matches = [
+            node
+            for node in nodes.values()
+            if isinstance(node, ConfigurationNode)
+            and node.metadata.get("node_type") == node_type
+            and node.metadata.get("library") == event_data.configuration_node_library_name
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            logger.warning(
+                "Workflow has %d '%s' nodes; using '%s'. A workflow should hold one per publish target.",
+                len(matches),
+                node_type,
+                matches[0].name,
+            )
+        return matches[0]
+
+    def _configuration_node_position(self, workflow: WorkflowRuntime, flow_name: str) -> dict[str, Any] | None:
+        """Metadata placing a new Configuration node below the workflow's Start node, or None to leave it to the editor."""
+        nodes = self.engine.flow_manager.get_flow_by_name_in(workflow, flow_name).nodes
+        for node in nodes.values():
+            if not isinstance(node, StartNode):
+                continue
+            position = node.metadata.get("position")
+            if not isinstance(position, dict) or "x" not in position or "y" not in position:
+                return None
+            return {"position": {"x": position["x"], "y": position["y"] + CONFIGURATION_NODE_OFFSET_Y}}
+        return None
 
     def _publish_request_by_name(
         self, request: PublishWorkflowRequest, workflow: WorkflowRuntime
@@ -218,3 +379,41 @@ class WorkflowPublishing(EngineScoped):
             final_result = PublishWorkflowResultFailure(result_details=ResultDetails(*result_messages))
 
         return final_result
+
+    @staticmethod
+    def _top_level_flow_name(workflow: WorkflowRuntime) -> str | None:
+        for flow_name, parent in workflow.flows.name_to_parent_name.items():
+            if parent is None:
+                return flow_name
+        return None
+
+
+def _read_configuration(node: BaseNode) -> dict[str, Any]:
+    """The values a Configuration node holds for its target's settings, keyed by parameter name."""
+    return {
+        parameter.name: node.get_parameter_value(parameter.name)
+        for parameter in node.parameters
+        if ParameterMode.PROPERTY in parameter.allowed_modes
+    }
+
+
+def _configuration_node_display_name(event_data: PublishWorkflowRegisteredEventData) -> str | None:
+    """The library's display name for the Configuration node type, e.g. "Nuke Configuration"."""
+    node_type = event_data.configuration_node_type
+    library_name = event_data.configuration_node_library_name
+    if node_type is None or library_name is None:
+        return None
+    try:
+        return LibraryRegistry.get_library(library_name).get_node_metadata(node_type).display_name
+    except LibraryRegistryError:
+        return None
+
+
+def _add_warning(result: PublishWorkflowResultSuccess, message: str) -> None:
+    logger.warning(message)
+    if isinstance(result.result_details, ResultDetails):
+        details = list(result.result_details.result_details)
+    else:
+        details = [ResultDetail(message=result.result_details, level=logging.INFO)]
+    details.append(ResultDetail(message=message, level=logging.WARNING))
+    result.result_details = ResultDetails(*details)
