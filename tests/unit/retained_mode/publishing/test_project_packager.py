@@ -10,6 +10,8 @@ else the adjacent config's workspace_directory, else the base dir.
 
 from pathlib import Path
 
+import pytest
+
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
     ProjectValidationInfo,
@@ -18,7 +20,11 @@ from griptape_nodes.common.project_templates import (
 from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
-from griptape_nodes.retained_mode.publishing.project_packager import ProjectExporter
+from griptape_nodes.retained_mode.publishing.project_packager import (
+    _LIBRARY_COPY_IGNORE_PATTERNS,
+    ProjectExporter,
+    _copy_tree,
+)
 
 
 def _project_info(base_dir: Path, *, libraries_dir: object = None, workspace_dir: object = None) -> ProjectInfo:
@@ -88,3 +94,19 @@ class TestResolveLibrariesSink:
         per_platform = PerPlatformProjectPath(default=str(abs_libs))
         exporter = _exporter(engine, tmp_path, adjacent_config={}, libraries_dir=per_platform)
         assert exporter._resolve_libraries_sink() == abs_libs
+
+
+class TestCopyIgnorePatterns:
+    @pytest.mark.parametrize("env_dir", [".venv", ".venv-exec", ".venv-dev"])
+    def test_library_envs_are_not_copied(self, engine: Engine, tmp_path: Path, env_dir: str) -> None:
+        """A copied local library leaves its environment directories behind."""
+        source = tmp_path / "library"
+        (source / env_dir / "lib").mkdir(parents=True)
+        (source / env_dir / "lib" / "pkg.py").write_text("", encoding="utf-8")
+        (source / "node.py").write_text("", encoding="utf-8")
+        destination = tmp_path / "bundle"
+
+        _copy_tree(engine, source, destination, _LIBRARY_COPY_IGNORE_PATTERNS)
+
+        assert (destination / "node.py").is_file()
+        assert not (destination / env_dir).exists()
