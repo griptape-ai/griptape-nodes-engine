@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
+    DocumentationLibraryProperty,
+    DocumentationNodeProperty,
     KeySupport,
     LifecycleStage,
     LifecycleStageLibraryProperty,
@@ -24,6 +26,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerMode,
     WorkerModeCompatibility,
     iter_catalog_models,
+    resolve_node_documentation_url,
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import (
@@ -192,6 +195,148 @@ class TestRoundTripSerialization:
         assert node_decls[0].stage is LifecycleStage.ALPHA
         assert isinstance(node_decls[1], ModelUsageNodeProperty)
         assert node_decls[1].model_ids == ["claude_opus_byok"]
+
+
+# ---------- DocumentationLibraryProperty / DocumentationNodeProperty ----------
+
+
+def _resolve(
+    node_decls: list[Any], library_decls: list[Any], *, node_type: str = "TestNode", node_category: str = "Test"
+) -> str | None:
+    return resolve_node_documentation_url(node_decls, library_decls, node_type=node_type, node_category=node_category)
+
+
+class TestDocumentationProperty:
+    def test_node_documentation_round_trips(self) -> None:
+        metadata = _make_node_metadata(
+            declarations=[DocumentationNodeProperty(url="https://docs.example.com/some-node")],
+        )
+
+        rebuilt = NodeMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, DocumentationNodeProperty)
+        assert decl.url == "https://docs.example.com/some-node"
+
+    def test_library_documentation_url_round_trips(self) -> None:
+        metadata = _make_library_metadata(
+            declarations=[DocumentationLibraryProperty(url="https://docs.example.com/some-library")],
+        )
+
+        rebuilt = LibraryMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, DocumentationLibraryProperty)
+        assert decl.url == "https://docs.example.com/some-library"
+        assert decl.url_template is None
+
+    def test_library_documentation_template_round_trips(self) -> None:
+        metadata = _make_library_metadata(
+            declarations=[
+                DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")
+            ],
+        )
+
+        rebuilt = LibraryMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, DocumentationLibraryProperty)
+        assert decl.url is None
+        assert decl.url_template == "https://docs.example.com/nodes/{category}/{node}/"
+
+    def test_node_url_is_required(self) -> None:
+        with pytest.raises(ValidationError):
+            DocumentationNodeProperty()  # type: ignore[call-arg]
+
+    def test_library_requires_exactly_one_of_url_or_template(self) -> None:
+        with pytest.raises(ValidationError, match="exactly one"):
+            DocumentationLibraryProperty()  # neither set
+        with pytest.raises(ValidationError, match="exactly one"):
+            DocumentationLibraryProperty(url="https://docs.example.com", url_template="https://docs.example.com/{node}")
+
+    @pytest.mark.parametrize(
+        "bad_url", ["javascript:alert(1)", "data:text/html,<script>alert(1)</script>", "#settings", "not-a-url", ""]
+    )
+    def test_rejects_non_http_url(self, bad_url: str) -> None:
+        with pytest.raises(ValidationError, match="http"):
+            DocumentationNodeProperty(url=bad_url)
+        with pytest.raises(ValidationError, match="http"):
+            DocumentationLibraryProperty(url=bad_url)
+
+    @pytest.mark.parametrize("bad_template", ["javascript:alert(1)//{node}", "ftp://docs.example.com/{node}", ""])
+    def test_rejects_non_http_template(self, bad_template: str) -> None:
+        with pytest.raises(ValidationError, match="http"):
+            DocumentationLibraryProperty(url_template=bad_template)
+
+    def test_rejects_template_with_unsupported_placeholder(self) -> None:
+        with pytest.raises(ValidationError, match="placeholder"):
+            DocumentationLibraryProperty(url_template="https://docs.example.com/{nod}/")
+
+    @pytest.mark.parametrize("good_url", ["http://docs.example.com/node", "https://docs.example.com/node"])
+    def test_accepts_http_and_https(self, good_url: str) -> None:
+        assert DocumentationNodeProperty(url=good_url).url == good_url
+        assert DocumentationLibraryProperty(url=good_url).url == good_url
+
+    def test_accepts_template_using_either_or_both_placeholders(self) -> None:
+        assert DocumentationLibraryProperty(url_template="https://docs.example.com/{category}/").url_template
+        assert DocumentationLibraryProperty(url_template="https://docs.example.com/{node}/").url_template
+        assert DocumentationLibraryProperty(url_template="https://docs.example.com/{category}/{node}/").url_template
+
+
+class TestResolveNodeDocumentationUrl:
+    def test_no_declarations_resolves_to_none(self) -> None:
+        assert _resolve([], []) is None
+
+    def test_node_url_alone(self) -> None:
+        node_decls = [DocumentationNodeProperty(url="https://docs.example.com/node")]
+
+        assert _resolve(node_decls, []) == "https://docs.example.com/node"
+
+    def test_library_url_alone(self) -> None:
+        library_decls = [DocumentationLibraryProperty(url="https://docs.example.com/library")]
+
+        assert _resolve([], library_decls) == "https://docs.example.com/library"
+
+    def test_node_url_overrides_library_url(self) -> None:
+        node_decls = [DocumentationNodeProperty(url="https://docs.example.com/node")]
+        library_decls = [DocumentationLibraryProperty(url="https://docs.example.com/library")]
+
+        assert _resolve(node_decls, library_decls) == "https://docs.example.com/node"
+
+    def test_unrelated_declarations_are_ignored(self) -> None:
+        node_decls = [LifecycleStageNodeProperty(stage=LifecycleStage.BETA)]
+        library_decls = [LifecycleStageLibraryProperty(stage=LifecycleStage.STABLE)]
+
+        assert _resolve(node_decls, library_decls) is None
+
+    def test_library_template_interpolates_category_and_node(self) -> None:
+        library_decls = [DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")]
+
+        resolved = _resolve([], library_decls, node_type="DisplayImage", node_category="image")
+
+        assert resolved == "https://docs.example.com/nodes/image/DisplayImage/"
+
+    def test_library_template_with_only_node_placeholder(self) -> None:
+        library_decls = [DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{node}/")]
+
+        resolved = _resolve([], library_decls, node_type="DisplayImage", node_category="image")
+
+        assert resolved == "https://docs.example.com/nodes/DisplayImage/"
+
+    def test_library_template_escapes_special_characters(self) -> None:
+        library_decls = [DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")]
+
+        resolved = _resolve([], library_decls, node_type="My Node/Foo", node_category="a b/c")
+
+        assert resolved == "https://docs.example.com/nodes/a%20b%2Fc/My%20Node%2FFoo/"
+
+    def test_node_url_override_wins_over_library_template(self) -> None:
+        node_decls = [DocumentationNodeProperty(url="https://docs.example.com/override")]
+        library_decls = [DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")]
+
+        assert _resolve(node_decls, library_decls, node_type="DisplayImage", node_category="image") == (
+            "https://docs.example.com/override"
+        )
 
 
 # ---------- ArbitraryPythonExecutionNodeProperty ----------

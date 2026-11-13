@@ -31,6 +31,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
     },
     "declarations": [
       { "type": "lifecycle_stage", "stage": "STABLE" },
+      { "type": "documentation", "url": "https://docs.griptapenodes.com/libraries/my_library" },
       {
         "type": "model_catalog",
         "providers": {
@@ -179,7 +180,7 @@ workflow that only exists to back a node out of the picker, set `is_internal = t
 
 ### Library and Node Declarations
 
-Declarations attach typed metadata to a library or to an individual node. Each entry in a `declarations` array is an object with a `type` discriminator that selects a declaration class. Today's vocabulary covers a lifecycle-stage property, a library-level model catalog with per-node references, and an arbitrary-Python-execution property; future engine releases add more declaration types under the same field.
+Declarations attach typed metadata to a library or to an individual node. Each entry in a `declarations` array is an object with a `type` discriminator that selects a declaration class. Today's vocabulary covers a lifecycle-stage property, a documentation link, a library-level model catalog with per-node references, and an arbitrary-Python-execution property; future engine releases add more declaration types under the same field.
 
 Both `metadata.declarations` (library-level) and per-node `metadata.declarations` accept a list. Order in the list does not matter. The field defaults to `[]`, so libraries on older schema versions (`0.6.0`, `0.4.0`, `0.1.0`) load unchanged.
 
@@ -199,6 +200,31 @@ Semantics:
 
 - **Library-level absence is intentionally distinct from `STABLE`.** A library with no `lifecycle_stage` declaration is "unstated" — consumers should surface that explicitly (`<No lifecycle stage provided by library author>`) rather than silently assume `STABLE`.
 - **Node-level absence means "inherit the library's stage."** A node-level `lifecycle_stage` overrides the library's value.
+
+#### `documentation`
+
+A link to where a library's or a node's documentation lives (for example, a page on `docs.griptapenodes.com`).
+
+| Field          | Meaning                                                                          |
+| -------------- | -------------------------------------------------------------------------------- |
+| `url`          | One literal documentation link. Library-level or node-level.                     |
+| `url_template` | A link template the engine interpolates per node. Library-level only; see below. |
+
+A library-level declaration sets exactly one of `url` or `url_template` — setting both, or neither, fails library validation. A node-level declaration only ever sets `url`: it names one specific node, so there is nothing to template. Either field must start with `http://` or `https://`; anything else fails library validation.
+
+```jsonc
+{ "type": "documentation", "url": "https://docs.griptapenodes.com/libraries/my_library" }
+```
+
+Semantics follow `lifecycle_stage`: **node-level absence means "inherit the library's documentation link."** A node-level `documentation` declaration overrides the library's. A library or node with neither declares no documentation link, and the editor shows no documentation affordance for it.
+
+**`url_template` for libraries with many nodes.** Hand-writing a node-level override for every node in a library that ships hundreds of them isn't practical. `url_template` lets one library-level declaration give every node its own page:
+
+```jsonc
+{ "type": "documentation", "url_template": "https://docs.griptapenodes.com/nodes/{category}/{node}/" }
+```
+
+The engine interpolates `{category}` (the node's declared `category`) and `{node}` (its class name) when a node has no `documentation` override of its own, URL-escaping each before substitution. A template may use either placeholder, both, or neither; any other placeholder fails library validation. A node can still override the templated link with its own literal `url`.
 
 #### `model_catalog`
 
@@ -321,6 +347,7 @@ A node can carry any combination of declarations. For example, a Labs node that 
   "display_name": "Labs Node",
   "declarations": [
     { "type": "lifecycle_stage", "stage": "LABS" },
+    { "type": "documentation", "url": "https://docs.griptapenodes.com/nodes/labs_node" },
     { "type": "model_usage", "model_ids": ["claude_opus_byok", "kling_v2"] }
   ]
 }

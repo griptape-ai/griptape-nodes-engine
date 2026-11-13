@@ -16,6 +16,8 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterList, Parame
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.node_library.library_declarations import (
+    DocumentationLibraryProperty,
+    DocumentationNodeProperty,
     KeySupport,
     LibraryDependencyDeclaration,
     LifecycleStage,
@@ -2951,6 +2953,157 @@ class TestLibraryNodeMetadataInjection:
         injected = node.metadata["library_node_metadata"]
         assert injected["category"] == "test"
         assert injected["description"] == "probe"
+
+
+class TestLibraryNodeMetadataDocumentationResolution:
+    """Library.create_node resolves a node's effective `documentation` url.
+
+    The editor reads a single `documentation` declaration per node rather than
+    merging the node's and library's declaration lists itself, so this resolution
+    (node override, else library default) has to happen before the node's
+    declarations are serialized -- the same contract `lifecycle_stage` resolution
+    follows for the authorization-checkpoint path.
+    """
+
+    _LIBRARY_NAME = "documentation-probe-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register_probe_library(
+        self, node_metadata: NodeMetadata, library_declarations: list[Any] | None = None
+    ) -> None:
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test",
+                description="documentation probe library",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=library_declarations or [],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(_LifecycleProbe, node_metadata)
+
+    def _create_and_get_declarations(self, name: str) -> list[dict[str, Any]]:
+        node = LibraryRegistry.create_node(
+            node_type=_LifecycleProbe.__name__,
+            name=name,
+            specific_library_name=self._LIBRARY_NAME,
+        )
+        return node.metadata["library_node_metadata"]["declarations"]
+
+    def test_no_documentation_declared_resolves_to_no_declaration(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(category="test", description="probe", display_name="Probe"),
+        )
+
+        declarations = self._create_and_get_declarations("probe-1")
+
+        assert declarations == []
+
+    def test_node_level_documentation_is_kept(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(
+                category="test",
+                description="probe",
+                display_name="Probe",
+                declarations=[DocumentationNodeProperty(url="https://docs.example.com/node")],
+            ),
+        )
+
+        declarations = self._create_and_get_declarations("probe-2")
+
+        assert declarations == [{"type": "documentation", "url": "https://docs.example.com/node"}]
+
+    def test_node_inherits_library_level_documentation(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(category="test", description="probe", display_name="Probe"),
+            library_declarations=[DocumentationLibraryProperty(url="https://docs.example.com/library")],
+        )
+
+        declarations = self._create_and_get_declarations("probe-3")
+
+        assert declarations == [{"type": "documentation", "url": "https://docs.example.com/library"}]
+
+    def test_node_level_documentation_overrides_library_level(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(
+                category="test",
+                description="probe",
+                display_name="Probe",
+                declarations=[DocumentationNodeProperty(url="https://docs.example.com/node")],
+            ),
+            library_declarations=[DocumentationLibraryProperty(url="https://docs.example.com/library")],
+        )
+
+        declarations = self._create_and_get_declarations("probe-4")
+
+        assert declarations == [{"type": "documentation", "url": "https://docs.example.com/node"}]
+
+    def test_resolved_documentation_joins_other_declarations(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(
+                category="test",
+                description="probe",
+                display_name="Probe",
+                declarations=[
+                    LifecycleStageNodeProperty(stage=LifecycleStage.BETA),
+                    DocumentationNodeProperty(url="https://docs.example.com/node"),
+                ],
+            ),
+        )
+
+        declarations = self._create_and_get_declarations("probe-5")
+
+        assert declarations == [
+            {"type": "lifecycle_stage", "stage": "BETA"},
+            {"type": "documentation", "url": "https://docs.example.com/node"},
+        ]
+
+    def test_node_inherits_library_level_documentation_template(self) -> None:
+        """A url_template is interpolated per node, not hand-written per node.
+
+        Covers the practical case: a library with hundreds of nodes gives every
+        one of them a distinct docs page from a single library-level declaration.
+        """
+        self._register_probe_library(
+            NodeMetadata(category="test", description="probe", display_name="Probe"),
+            library_declarations=[
+                DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")
+            ],
+        )
+
+        declarations = self._create_and_get_declarations("probe-6")
+
+        assert declarations == [
+            {"type": "documentation", "url": f"https://docs.example.com/nodes/test/{_LifecycleProbe.__name__}/"}
+        ]
+
+    def test_node_level_documentation_overrides_library_level_template(self) -> None:
+        self._register_probe_library(
+            NodeMetadata(
+                category="test",
+                description="probe",
+                display_name="Probe",
+                declarations=[DocumentationNodeProperty(url="https://docs.example.com/node-specific")],
+            ),
+            library_declarations=[
+                DocumentationLibraryProperty(url_template="https://docs.example.com/nodes/{category}/{node}/")
+            ],
+        )
+
+        declarations = self._create_and_get_declarations("probe-7")
+
+        assert declarations == [{"type": "documentation", "url": "https://docs.example.com/node-specific"}]
 
 
 class TestLibraryManagerEngineVersionCheck:

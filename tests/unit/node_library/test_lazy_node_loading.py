@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from griptape_nodes.exe_types.node_types import AsyncResult, BaseNode
-from griptape_nodes.node_library.library_registry import Library, LibrarySchema, NodeMetadata
+from griptape_nodes.node_library.library_registry import Library, LibraryMetadata, LibrarySchema, NodeMetadata
 
 
 class _LazyMockNode(BaseNode):
@@ -37,6 +37,9 @@ def _make_library(name: str = "TestLib") -> Library:
     schema = MagicMock(spec=LibrarySchema)
     schema.is_default_library = False
     schema.name = name
+    schema.metadata = LibraryMetadata(
+        author="test", description="test", library_version="1.0.0", engine_version="1.0.0", tags=[]
+    )
     return Library(library_data=schema)
 
 

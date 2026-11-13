@@ -12,6 +12,7 @@ from griptape_nodes.node_library.library_declarations import (
     ModelCatalogLibraryProperty,
     NodeDeclaration,
     find_model_catalog,
+    resolve_node_documentation_url,
     resolve_node_models,
 )
 from griptape_nodes.retained_mode.beta_features import BetaFeature, parse_library_beta_features
@@ -792,21 +793,43 @@ class Library:
         # into the node's metadata blob.
         if metadata is None:
             metadata = {}
-        # Dump to a JSON-safe dict so downstream consumers (and the workflow
-        # serializer in particular) only ever see plain literals — no Pydantic
-        # models, no StrEnum members. Without this, a NodeMetadata carrying a
-        # LifecycleStageNodeProperty would leak through to the generated workflow
-        # as a Python repr (e.g. `<LifecycleStage.BETA: 'BETA'>`), which is not
-        # valid Python.
-        library_node_metadata_model = self._node_metadata.get(node_type)
-        if library_node_metadata_model is None:
-            metadata["library_node_metadata"] = {}
-        else:
-            metadata["library_node_metadata"] = library_node_metadata_model.model_dump(mode="json")
+        metadata["library_node_metadata"] = self._build_library_node_metadata(node_type)
         metadata["library"] = self._library_data.name
         metadata["node_type"] = node_type
         node = node_class(name=name, metadata=metadata)
         return node
+
+    def _build_library_node_metadata(self, node_type: str) -> dict[str, Any]:
+        """Build the JSON-safe node metadata injected into a created node's `library_node_metadata`.
+
+        Dumps the registered `NodeMetadata` to plain JSON-safe literals so downstream
+        consumers (and the workflow serializer in particular) never see a Pydantic model
+        or a StrEnum member. Without this, a declaration like `LifecycleStageNodeProperty`
+        would leak through to the generated workflow as a Python repr (e.g.
+        `<LifecycleStage.BETA: 'BETA'>`), which is not valid Python.
+
+        Also resolves the node's effective `documentation` url -- its own override when
+        declared, else the library's literal url or its url_template interpolated for
+        this node -- into a single `documentation` declaration. The editor reads one
+        `documentation` value per node rather than merging the node's and library's
+        declaration lists (or interpolating a template) itself, the same contract
+        `lifecycle_stage` resolution follows for the authorization-checkpoint path.
+        """
+        library_node_metadata_model = self._node_metadata.get(node_type)
+        if library_node_metadata_model is None:
+            return {}
+        dumped = library_node_metadata_model.model_dump(mode="json")
+        documentation_url = resolve_node_documentation_url(
+            library_node_metadata_model.declarations,
+            self._library_data.metadata.declarations,
+            node_type=node_type,
+            node_category=library_node_metadata_model.category,
+        )
+        declarations = [d for d in dumped["declarations"] if d.get("type") != "documentation"]
+        if documentation_url is not None:
+            declarations.append({"type": "documentation", "url": documentation_url})
+        dumped["declarations"] = declarations
+        return dumped
 
     def get_registered_nodes(self) -> list[str]:
         """Get a list of all registered node types."""
