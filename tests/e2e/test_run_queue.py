@@ -197,6 +197,48 @@ async def test_a_node_run_while_another_node_runs_joins_that_run(
 
 @pytest.mark.usefixtures("parallel_mode")
 @pytest.mark.asyncio
+async def test_a_node_that_joined_a_run_can_run_again_while_that_run_goes_on(
+    engine: Engine, flow_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every run of a node that joined another node's run succeeds and runs it exactly once.
+
+    The node's first run leaves an empty graph behind in the run it joined, and each later run adds
+    the node back to that graph. Three runs cover both a run into the emptied graph and the run after
+    it. Counting executions after the other node finishes checks that no run happens unasked.
+    """
+    executed = _record_executions(engine, monkeypatch)
+    holding = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Holder")))
+    await _wait_for_state(engine, "Holder", NodeResolutionState.RESOLVING)
+
+    runs_of_next = 3
+    for _ in range(runs_of_next):
+        result = await engine.ahandle_request(ResolveNodeRequest(node_name="Next"))
+        assert isinstance(result, ResolveNodeResultSuccess), result
+        await _wait_for_state(engine, "Next", NodeResolutionState.RESOLVED)
+
+    assert _state(engine, "Holder") is NodeResolutionState.RESOLVING, "Next's runs did not overlap Holder's"
+    _open_gate(tmp_path)
+    assert isinstance(await _finish(holding), ResolveNodeResultSuccess)
+    assert executed.count("Next") == runs_of_next, executed
+    assert engine.flow_manager.check_for_existing_running_flow() is False, flow_name
+
+
+def _record_executions(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the name of every node the engine executes, in order."""
+    executed: list[str] = []
+    node_executor = engine.flow_manager.node_executor
+    real_execute = node_executor.execute
+
+    async def _record(node: Any, *args: Any, **kwargs: Any) -> Any:
+        executed.append(node.name)
+        return await real_execute(node, *args, **kwargs)
+
+    monkeypatch.setattr(node_executor, "execute", _record)
+    return executed
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
 async def test_cancelling_stops_the_run_in_progress_and_the_waiting_run_then_starts(
     engine: Engine, flow_name: str
 ) -> None:
