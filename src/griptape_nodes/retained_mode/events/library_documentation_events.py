@@ -214,7 +214,6 @@ class GetNodeDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
             For a request that named a node on the canvas, these are that node's current parameters.
         assets_root: Absolute path of the library's docs folder, which relative image paths in the page
             resolve against. None when the library ships no docs folder.
-        external_url: The library's optional "more docs" link from its manifest
     """
 
     library: str
@@ -228,7 +227,6 @@ class GetNodeDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
     deprecation: NodeDeprecationMetadata | None = None
     parameters: list[ParameterDescription] = field(default_factory=list)
     assets_root: str | None = None
-    external_url: str | None = None
 
 
 @dataclass
@@ -267,9 +265,13 @@ class ListLibraryDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPaylo
 
     Args:
         library: Name of the library
-        overview_path: Path of the library's overview page relative to its docs folder, or None
-            when it has no overview page and no README. The overview is `index.md`, or the README
-            when there is no `index.md`.
+        overview_path: Path of the library's overview page, to pass to GetLibraryDocumentationPageRequest,
+            or None when it has no `docs/index.md` and no README. The README stands in for a missing
+            `index.md`. It is the README in the library's folder, or in the folder above it when the
+            manifest sits in a package folder, and it counts whether or not the library has a docs
+            folder. The path is `index.md` in both cases.
+        overview_is_readme: True when the overview is the README standing in for `docs/index.md`, so the
+            editor can call it a README and not an overview
         pages: The library's pages and folders in display order, excluding node pages, template
             pages, and skills
         nodes: Every node type the library lists, with whether it has a page of its own
@@ -281,6 +283,7 @@ class ListLibraryDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPaylo
 
     library: str
     overview_path: str | None = None
+    overview_is_readme: bool = False
     pages: list[DocumentationPageEntry] = field(default_factory=list)
     nodes: list[DocumentationNodeEntry] = field(default_factory=list)
     templates: list[DocumentationTemplateEntry] = field(default_factory=list)

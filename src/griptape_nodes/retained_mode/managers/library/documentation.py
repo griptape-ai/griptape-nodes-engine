@@ -164,6 +164,7 @@ class LibraryDocumentation(EngineScoped):
         return ListLibraryDocumentationResultSuccess(
             library=request.library,
             overview_path=docs.overview_path(),
+            overview_is_readme=docs.overview_is_readme(),
             pages=docs.page_entries(),
             nodes=docs.node_entries(),
             templates=docs.template_entries(),
@@ -189,8 +190,9 @@ class LibraryDocumentation(EngineScoped):
 
         text = _slice_text(page.markdown, request.offset, request.limit)
         assets_root = None
-        if docs.docs_root is not None:
-            assets_root = str(docs.docs_root)
+        assets_folder = docs.assets_root(request.path)
+        if assets_folder is not None:
+            assets_root = str(assets_folder)
 
         details = f"Successfully read the page '{request.path}' in Library '{request.library}'."
         return GetLibraryDocumentationPageResultSuccess(

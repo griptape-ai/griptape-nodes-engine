@@ -71,6 +71,7 @@ class DocsProblemKind(StrEnum):
     CONFLICTING_PAGES = "conflicting_pages"
     NEAR_MISS_NAME = "near_miss_name"
     AMBIGUOUS_DISPLAY_NAME = "ambiguous_display_name"
+    LINK_OUTSIDE_DOCS = "link_outside_docs"
 
 
 @dataclass
@@ -200,8 +201,25 @@ class LibraryDocs:
         return entries
 
     def overview_path(self) -> str | None:
-        """Path of the library's overview page: `index.md`, or the README standing in for it."""
+        """Path of the library's overview page: `index.md`, or the README standing in for it.
+
+        Read it with `read_page` either way. `overview_is_readme` says which one it is.
+        """
         return self._listings().overview_path
+
+    def overview_is_readme(self) -> bool:
+        """True when the overview is the library's README because there is no `docs/index.md`."""
+        return self.overview_path() is not None and not self._has_index_page()
+
+    def assets_root(self, path: str) -> Path | None:
+        """The folder a page's relative images resolve against, or None when the library has no such folder.
+
+        That is the docs folder, except for a README standing in as the overview, whose images sit next to it.
+        """
+        readme = self._readme_standing_in(path)
+        if readme is not None:
+            return readme.parent
+        return self.docs_root
 
     def page_entries(self) -> list[DocumentationPageEntry]:
         """The library's pages and folders in display order, leaving out node pages, template pages, and skills."""
@@ -239,13 +257,29 @@ class LibraryDocs:
         return self._listings_snapshot
 
     def _build_overview_path(self) -> str | None:
-        if self.docs_root is None:
-            return None
-        if (self.docs_root / OVERVIEW_PAGE).is_file():
+        if self._has_index_page():
             return OVERVIEW_PAGE
         if self._find_readme() is not None:
             return OVERVIEW_PAGE
         return None
+
+    def _has_index_page(self) -> bool:
+        if self.docs_root is None:
+            return False
+        index = self.docs_root / OVERVIEW_PAGE
+        return index.is_file() and self._is_inside_docs(index)
+
+    def _readme_standing_in(self, path: str) -> Path | None:
+        """The README, when `path` is the overview and there is no `docs/index.md` for it to be."""
+        if path != OVERVIEW_PAGE or self._has_index_page():
+            return None
+        return self._find_readme()
+
+    def _is_inside_docs(self, path: Path) -> bool:
+        """Whether a file or folder really lives in the docs folder, once any link it is reached through is followed."""
+        if self.docs_root is None:
+            return False
+        return _is_inside(self.docs_root, path)
 
     def _build_page_entries(self) -> list[DocumentationPageEntry]:
         if self.docs_root is None:
@@ -294,9 +328,10 @@ class LibraryDocs:
             return []
 
         entries: list[DocumentationSkillEntry] = []
-        for skill_dir in sorted((d for d in skills_root.iterdir() if d.is_dir()), key=lambda d: d.name.lower()):
+        skill_dirs = (d for d in skills_root.iterdir() if d.is_dir() and self._is_inside_docs(d))
+        for skill_dir in sorted(skill_dirs, key=lambda d: d.name.lower()):
             skill_file = skill_dir / SKILL_FILE
-            if not skill_file.is_file():
+            if not skill_file.is_file() or not self._is_inside_docs(skill_file):
                 continue
             page = _read_for_listing(skill_file)
             relative = PurePosixPath(SKILLS_FOLDER) / skill_dir.name / SKILL_FILE
@@ -326,13 +361,17 @@ class LibraryDocs:
         return None
 
     def _resolve_page_path(self, path: str) -> Path:
-        if self.docs_root is None:
-            msg = f"Attempted to read the page '{path}'. Failed because the library has no docs folder."
-            raise DocsPageError(msg)
-
         relative = PurePosixPath(path.replace("\\", "/"))
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             msg = f"Attempted to read the page '{path}'. Failed because a page path must stay inside the library's docs folder."
+            raise DocsPageError(msg)
+
+        readme = self._readme_standing_in(path)
+        if readme is not None:
+            return readme
+
+        if self.docs_root is None:
+            msg = f"Attempted to read the page '{path}'. Failed because the library has no docs folder."
             raise DocsPageError(msg)
 
         candidate = canonicalize_for_identity(self.docs_root / Path(*relative.parts))
@@ -347,10 +386,6 @@ class LibraryDocs:
         if candidate.is_file():
             return candidate
 
-        readme = self._find_readme()
-        if path == OVERVIEW_PAGE and readme is not None:
-            return readme
-
         msg = f"Attempted to read the page '{path}'. Failed because the library has no page at that path."
         raise DocsPageError(msg)
 
@@ -359,6 +394,8 @@ class LibraryDocs:
     ) -> None:
         is_top_level = relative == PurePosixPath()
         for child in _sorted_children(directory, is_top_level=is_top_level):
+            if not self._is_inside_docs(child):
+                continue
             child_relative = relative / child.name
             if child.is_dir():
                 folder_entries: list[DocumentationPageEntry] = []
@@ -418,6 +455,8 @@ class _PageIndexer:
         self._problems: list[DocsProblem] = []
 
     def build(self) -> _PageIndex:
+        self._report_links_outside_docs()
+
         nodes = [_NodeKey(node.class_name, node.metadata.display_name) for node in self._schema.nodes]
         node_pages = self._index_folder(NODES_FOLDER, nodes)
 
@@ -449,7 +488,7 @@ class _PageIndexer:
 
         claims: dict[str, list[Path]] = defaultdict(list)
         for page in sorted(folder.rglob("*.md")):
-            if not page.is_file() or self._is_hidden(page):
+            if not page.is_file() or self._is_hidden(page) or not _is_inside(self._docs_root, page):
                 continue
             # A name with a dot is a locale variant such as LoadAudio.fr.md. Locales are not read yet.
             if "." in page.stem:
@@ -514,6 +553,18 @@ class _PageIndexer:
             ranked,
         )
         return ranked[0]
+
+    def _report_links_outside_docs(self) -> None:
+        """Report every link under the docs folder that leads out of it. Such a page or folder is never shown."""
+        for path in sorted(self._docs_root.rglob("*")):
+            if not path.is_symlink() or _is_inside(self._docs_root, path):
+                continue
+            self._add_problem(
+                DocsProblemKind.LINK_OUTSIDE_DOCS,
+                f"'{self._relative(path)}' is a link to somewhere outside the docs folder, so it is never shown. "
+                f"Copy the file or folder into the docs folder instead.",
+                [path],
+            )
 
     def _is_hidden(self, page: Path) -> bool:
         return any(part.startswith(".") for part in page.relative_to(self._docs_root).parts)
@@ -599,6 +650,11 @@ def _read_for_listing(path: Path | None) -> ParsedPage | None:
         return read_markdown_file(path)
     except DocsPageError:
         return None
+
+
+def _is_inside(root: Path, path: Path) -> bool:
+    """Whether `path` is under `root` once any links in it are followed, so a link out of the folder is not."""
+    return canonicalize_for_identity(path).is_relative_to(root)
 
 
 def _sorted_children(directory: Path, *, is_top_level: bool) -> list[Path]:

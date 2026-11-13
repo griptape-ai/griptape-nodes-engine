@@ -245,6 +245,17 @@ class TestListLibraryDocumentation:
         assert isinstance(result, ListLibraryDocumentationResultSuccess)
         assert result.tools == []
 
+    def test_the_overview_says_whether_it_is_a_readme(self, engine: Engine, library_root: Path) -> None:
+        _write(library_root, "README.md", "# Readme\n")
+        (library_root / "docs").mkdir()
+
+        result = engine.library_manager.documentation.list_library_documentation_request(
+            ListLibraryDocumentationRequest(library=LIBRARY_NAME)
+        )
+
+        assert isinstance(result, ListLibraryDocumentationResultSuccess)
+        assert (result.overview_path, result.overview_is_readme) == ("index.md", True)
+
     def test_unknown_library_fails(self, engine: Engine) -> None:
         result = engine.library_manager.documentation.list_library_documentation_request(
             ListLibraryDocumentationRequest(library="No Such Library")
@@ -350,6 +361,33 @@ class TestGetLibraryDocumentationPage:
         assert result.description == "How to begin."
         assert result.truncated is False
         assert result.assets_root == str((library_root / "docs").resolve())
+
+    def test_a_readme_overview_is_read_with_its_own_folder_as_the_assets_root(
+        self, engine: Engine, library_root: Path
+    ) -> None:
+        _write(library_root, "README.md", "![](images/shot.png)\n")
+        (library_root / "docs").mkdir()
+
+        result = engine.library_manager.documentation.get_library_documentation_page_request(
+            GetLibraryDocumentationPageRequest(library=LIBRARY_NAME, path="index.md")
+        )
+
+        assert isinstance(result, GetLibraryDocumentationPageResultSuccess)
+        assert result.markdown == "![](images/shot.png)\n"
+        assert result.assets_root == str(library_root.resolve())
+
+    def test_a_readme_overview_is_read_for_a_library_with_no_docs_folder(
+        self, engine: Engine, library_root: Path
+    ) -> None:
+        _write(library_root, "README.md", "# Readme\n")
+
+        result = engine.library_manager.documentation.get_library_documentation_page_request(
+            GetLibraryDocumentationPageRequest(library=LIBRARY_NAME, path="index.md")
+        )
+
+        assert isinstance(result, GetLibraryDocumentationPageResultSuccess)
+        assert result.title == "Readme"
+        assert result.assets_root == str(library_root.resolve())
 
     def test_a_long_page_can_be_read_in_parts(self, engine: Engine, library_root: Path) -> None:
         _write(library_root, "docs/long.md", "0123456789")

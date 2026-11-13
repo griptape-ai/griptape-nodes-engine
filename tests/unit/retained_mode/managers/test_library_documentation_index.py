@@ -429,6 +429,61 @@ class TestOverviewAndSkills:
         assert docs.overview_path() == "index.md"
         assert docs.read_page("index.md").markdown == "# Readme\n"
 
+    def test_a_readme_overview_says_it_is_a_readme_and_an_index_page_does_not(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        _write(tmp_path, "README.md", "# Readme\n")
+        assert LibraryDocs(tmp_path, _schema()).overview_is_readme() is True
+
+        _write(tmp_path, "docs/index.md", "# Index\n")
+        with_index = LibraryDocs(tmp_path, _schema())
+        assert with_index.overview_is_readme() is False
+        assert with_index.read_page("index.md").markdown == "# Index\n"
+
+    def test_a_library_with_no_overview_says_it_is_not_a_readme(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert (docs.overview_path(), docs.overview_is_readme()) == (None, False)
+
+    def test_readme_stands_in_even_when_the_library_has_no_docs_folder(self, tmp_path: Path) -> None:
+        _write(tmp_path, "README.md", "# Readme\n")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert docs.docs_root is None
+        assert docs.overview_path() == "index.md"
+        assert docs.overview_is_readme() is True
+        assert docs.read_page("index.md").markdown == "# Readme\n"
+
+    def test_other_pages_are_still_missing_when_the_library_has_no_docs_folder(self, tmp_path: Path) -> None:
+        _write(tmp_path, "README.md", "# Readme\n")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        with pytest.raises(DocsPageError, match="no docs folder"):
+            docs.read_page("guides/start.md")
+
+    def test_a_readme_inside_the_docs_folder_is_an_ordinary_page_and_not_the_overview(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/README.md", "# Docs readme\n")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert docs.overview_path() is None
+        assert [entry.path for entry in docs.page_entries()] == ["README.md"]
+
+    def test_a_readmes_images_resolve_against_the_folder_it_sits_in(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        _write(tmp_path, "README.md", "![](images/shot.png)\n")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert docs.assets_root("index.md") == tmp_path
+
+    def test_an_index_pages_images_resolve_against_the_docs_folder(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/index.md", "![](images/shot.png)\n")
+        _write(tmp_path, "README.md", "# Readme\n")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert docs.assets_root("index.md") == docs.docs_root
+        assert docs.assets_root("guides/start.md") == docs.docs_root
+
     def test_readme_one_folder_up_stands_in_for_a_manifest_in_a_package_folder(self, tmp_path: Path) -> None:
         package = tmp_path / "my_library"
         (package / "docs").mkdir(parents=True)
@@ -513,6 +568,54 @@ class TestReadingPages:
 
         with pytest.raises(DocsPageError, match="outside"):
             docs.read_page("escape.md")
+
+    def test_a_link_out_of_the_docs_folder_is_left_out_of_the_listing_and_reported(self, tmp_path: Path) -> None:
+        _write(tmp_path, "secret.md", "private")
+        _write(tmp_path, "docs/guide.md", "Text\n")
+        (tmp_path / "docs/escape.md").symlink_to(tmp_path / "secret.md")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert [entry.path for entry in docs.page_entries()] == ["guide.md"]
+        assert [(problem.kind, problem.paths) for problem in docs.problems] == [
+            (DocsProblemKind.LINK_OUTSIDE_DOCS, ["escape.md"])
+        ]
+
+    def test_a_linked_folder_out_of_the_docs_folder_is_left_out(self, tmp_path: Path) -> None:
+        _write(tmp_path, "elsewhere/page.md", "private")
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs/linked").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert docs.page_entries() == []
+        assert [problem.kind for problem in docs.problems] == [DocsProblemKind.LINK_OUTSIDE_DOCS]
+
+    def test_a_link_that_stays_inside_the_docs_folder_is_fine(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/real.md", "Text\n")
+        (tmp_path / "docs/alias.md").symlink_to(tmp_path / "docs/real.md")
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert [entry.path for entry in docs.page_entries()] == ["alias.md", "real.md"]
+        assert docs.problems == []
+
+    def test_a_node_page_that_is_a_link_out_of_the_docs_folder_is_not_read(self, tmp_path: Path) -> None:
+        _write(tmp_path, "secret.md", "---\ntitle: Stolen\n---\nprivate")
+        (tmp_path / "docs/nodes").mkdir(parents=True)
+        (tmp_path / "docs/nodes/LoadAudio.md").symlink_to(tmp_path / "secret.md")
+        docs = LibraryDocs(tmp_path, _schema(nodes=[_node("LoadAudio", "Load Audio")]))
+
+        (entry,) = docs.node_entries()
+
+        assert (entry.has_page, entry.title) == (False, "Load Audio")
+        assert docs.node_page("LoadAudio") is None
+
+    def test_a_skill_that_is_a_link_out_of_the_docs_folder_is_not_listed(self, tmp_path: Path) -> None:
+        _write(tmp_path, "secret/SKILL.md", "---\ndescription: Stolen.\n---\n")
+        (tmp_path / "docs/.agents/skills").mkdir(parents=True)
+        (tmp_path / "docs/.agents/skills/stolen").symlink_to(tmp_path / "secret", target_is_directory=True)
+        docs = LibraryDocs(tmp_path, _schema())
+
+        assert docs.skill_entries() == []
+        assert [problem.kind for problem in docs.problems] == [DocsProblemKind.LINK_OUTSIDE_DOCS]
 
     def test_only_markdown_pages_can_be_read(self, tmp_path: Path) -> None:
         _write(tmp_path, "docs/notes.txt")

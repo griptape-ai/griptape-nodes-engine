@@ -32,7 +32,7 @@ How each one maps to `griptape_nodes_library.json`, plus the skills folders and 
 | n/a              | `.agents/skills/`      | skills for coding agents working on the library, never loaded by the sidebar agent |
 | n/a              | `dev/docs/`            | docs for node developers, in any shape. The engine never reads it                  |
 
-The library's overview page is `docs/index.md`. If there isn't one, the README stands in.
+The library's overview page is `docs/index.md`. If there isn't one, the README stands in. That is the README in the library's folder, or in the folder above it when the manifest sits in a package folder, and it counts whether or not the library has a `docs/` folder. A `docs/README.md` is an ordinary library page. The list response says `overview_is_readme`, so the editor can label the row **README** and not **Overview**, and a README's images resolve against the folder the README sits in.
 
 Docs for people who work on the library, like how to add a model or what a node page should look like, don't go in `docs/`. Everything under `docs/` shows up in the editor, so put contributor docs somewhere else, such as `dev/docs/`. The engine only reads the docs path, so those pages stay out of the editor.
 
@@ -180,10 +180,9 @@ GetNodeDocumentationRequest(node_name: str | None, node_type: str | None, librar
        deprecation: NodeDeprecationMetadata | None,
        parameters: list[ParameterDescription],   # same form as DescribeNodeTypeRequest
        assets_root: str | None,       # absolute docs dir, for resolving images
-       external_url: str | None,      # optional "more docs" link from the manifest (not wired yet)
      )
 ListLibraryDocumentationRequest(library: str)
-  -> overview_path, pages (flat list in display order, folders ahead of their pages),
+  -> overview_path, overview_is_readme, pages (flat list in display order, folders ahead of their pages),
      nodes, templates, skills, tools   # tools: the MCP tools the library exposes (name, description, read_only, input_schema). A library can have tools and no nodes.
                                 # nodes and templates carry page_path (relative to the docs folder, None with no page)
 GetLibraryDocumentationPageRequest(library: str, path: str, offset: int, limit: int | None)
@@ -225,7 +224,7 @@ Agents read the same docs as people, through the same requests.
 - The panel builds its navigation from whatever the library ships. A library with guides or reference pages shows them as a page tree that follows the library's folders, and more pages mean more entries. The library's nodes always appear below, grouped by category. A library with only node docs, or none at all, shows just its nodes. There is no setting for any of this. A node page has a breadcrumb back to its library.
 - Library Management gets a "Documentation" entry that opens the library's home page (`index.md`, or the page tree if there is none). Both work without a network, because the docs come from the installed library.
 - The renderer supports GFM, GitHub alerts, Mermaid, and video. Mermaid loads lazily and runs in strict security mode.
-- GUI PR #3394 becomes the entry point. `documentation_url` stays as an optional "More docs" link at the bottom of the panel. The git-remote parsing is not needed.
+- GUI PR #3394 becomes the entry point. The git-remote parsing is not needed. A "More docs" link from the manifest, such as a `documentation_url` field, is not part of this change and would be a small addition of its own.
 
 ### Authoring loop and docs check
 
@@ -252,7 +251,7 @@ The standard library is the first library to move.
 - The diffusers pages carry content the generated output now replaces, which the script drops: the `Category:` line (the manifest has it), the `Inputs` and `Outputs` tables (the generated table covers names, types, and defaults), and the hand-written node list in the library index (the editor groups nodes by manifest category). Per-parameter notes in those tables move into a `## Parameters` section. The node preview screenshots stay as ordinary images.
 - Pages that mention a workflow template by path, such as "Workflow template: `workflows/templates/ControlnetText2Image.py`", become a `node:` link when the template is a workflow node, and plain text when it is not.
 - The main site's node pages are replaced by a libraries index, and the old URLs redirect to it.
-- `documentation_url` stays supported. A library with no `docs/` folder still gets its "More docs" link, so libraries that host their own docs lose nothing.
+- A library that hosts its own docs elsewhere loses nothing: its pages in the repo still show in the editor, and the panel links to the library's repository.
 - Library docs are not mirrored to the main site, because a build-time copy goes stale between site rebuilds and cannot match the version a user has installed.
 
 ## Phasing
