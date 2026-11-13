@@ -1,6 +1,6 @@
 # Writing Docs for Your Library
 
-A library ships its own docs. Put markdown files in a `docs/` folder next to the library's JSON file, and they show up in the editor's **Docs** panel and are served to agents. You don't host anything, the docs always match the version of the library that is installed, and they work with no network.
+A library ships its own docs. Put markdown files in a `docs/` folder next to the library's JSON file, and they show up in the editor's **Docs** panel and are served to agents.
 
 You can start with no docs at all. Every node gets a page built from its description and its parameters, and every MCP tool gets one built from its description and inputs. Write pages where the built one isn't enough.
 
@@ -13,7 +13,7 @@ Four folders under `docs/` hold one page for each thing the library registers. E
 | `docs/nodes/`          | node in `nodes`               | the node's class name (`LoadAudio.md`), or its display name with underscores (`load_audio.md`) |
 | `docs/workflow_nodes/` | node in `workflow_nodes`      | the node type                                                                                  |
 | `docs/workflows/`      | template in `workflows`       | the template's file name without `.py`                                                         |
-| `docs/tools/`          | MCP tool from `get_mcp_tools` | the tool's request type, such as `SearchDocsRequest.md`                                        |
+| `docs/mcp_tools/`      | MCP tool from `get_mcp_tools` | the tool's request type, such as `SearchDocsRequest.md`                                        |
 
 ```text
 my-library/
@@ -26,7 +26,7 @@ my-library/
       LoadAudio.md            # documents the node LoadAudio
     workflows/
       color_managed_load.md   # documents workflows/templates/color_managed_load.py
-    tools/
+    mcp_tools/
       SearchDocsRequest.md    # documents the MCP tool SearchDocsRequest
     .agents/skills/           # skills for agents that use the library (see below)
 ```
@@ -100,7 +100,7 @@ Without a page, a tool is documented by:
 - **Its fields.** The table of inputs comes from the request's fields. A field's description is the part of the table that explains it, so give each field a description.
 - **Its read-only flag.** `MCPTool(request, read_only=True)` shows "only reads". Without it the panel says the tool can change things.
 
-To say more, add `docs/tools/<RequestType>.md`. Its `title` and `description` replace the generated ones, and the text shows above the inputs table. Spend the words on what a docstring can't carry: a worked example, the order to call tools in, and what comes back.
+To say more, add `docs/mcp_tools/<RequestType>.md`. Its `title` and `description` replace the generated ones, and the text shows above the inputs table. Spend the words on what a docstring can't carry: a worked example, the order to call tools in, and what comes back.
 
 ## Pages for workflow templates
 
