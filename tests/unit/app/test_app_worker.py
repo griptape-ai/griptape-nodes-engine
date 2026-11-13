@@ -135,8 +135,7 @@ def worker_manager() -> WorkerManager:
     # _base_worker_environ builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
     gtn.project_manager.get_pre_project_environ.return_value = {}
-    # Registration answers from the committed pair; a bare MagicMock cannot be unpacked.
-    gtn.project_manager.committed_project.return_value = ("<system-defaults>", 0)
+    gtn.project_manager.committed_project_id = "<system-defaults>"
     # A MagicMock reads as a truthy failure reason and would refuse every spawn.
     gtn.library_manager.environment.execution_env_failure_reason.return_value = None
     # Spawn awaits the library's execution environment before starting the process; a bare
@@ -305,28 +304,27 @@ class TestProjectSwitchWaitsForWorkers:
         assert "nope" in failures[0]
 
     @pytest.mark.asyncio
-    async def test_fan_out_reads_the_committed_pair_rather_than_the_event(self, worker_manager: WorkerManager) -> None:
-        """The id and the generation describing it must come from one read.
-
-        A worker adopts only strictly newer generations, so a fan-out stamped with the default 0
-        makes every switch after the first look stale -- and the worker answers Success, which
-        costs the caller the failure log too. Taking the id from the event and the generation from
-        state separately can pair an older id with a newer switch's generation.
-        """
+    async def test_the_fan_out_names_no_project_so_each_worker_asks(self, worker_manager: WorkerManager) -> None:
+        """A switch overtaken by a newer one cannot leave a worker on its project: the worker reads the newest."""
         worker_manager._workers = {"worker-a": WorkerRegistration(request_topic="t/a", worker_key=None)}
-        worker_manager.engine.project_manager.committed_project.return_value = ("proj-9", 4)  # type: ignore[union-attr]
-        sent: list[tuple[str, int]] = []
+        sent: list[str | None] = []
 
         async def carrying_route(event: EventRequest, _worker_engine_id: str) -> dict:
-            sent.append((event.request.project_id, event.request.generation))  # type: ignore[attr-defined]
+            sent.append(event.request.project_id)  # type: ignore[attr-defined]
             return {"result_type": "ActivateProjectResultSuccess", "result": {}}
 
         worker_manager.route_to_worker = carrying_route  # type: ignore[method-assign]
 
-        # The event's id is deliberately stale here: the fan-out must ignore it.
-        await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-stale"))
+        await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-9"))
 
-        assert sent == [("proj-9", 4)]
+        assert sent == [None]
+
+    def test_a_worker_asking_which_project_gets_the_committed_one(self, worker_manager: WorkerManager) -> None:
+        worker_manager.engine.project_manager.committed_project_id = "proj-9"  # type: ignore[misc]
+
+        result = worker_manager.handle_get_committed_project_request(worker_events.GetCommittedProjectRequest())
+
+        assert result.project_id == "proj-9"
 
 
 class TestAWorkerChannelEndingReleasesWaiters:
@@ -2171,7 +2169,7 @@ def _start_for_artist(
     library_name: str = _LIBRARY, worker_engine_id: str = "w1"
 ) -> worker_events.StartWorkerForEngineRequest:
     return worker_events.StartWorkerForEngineRequest(
-        library_name=library_name, worker_engine_id=worker_engine_id, project_id="proj-1", project_generation=1
+        library_name=library_name, worker_engine_id=worker_engine_id, project_id="proj-1"
     )
 
 

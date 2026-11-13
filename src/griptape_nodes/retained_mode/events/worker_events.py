@@ -173,13 +173,11 @@ class StartWorkerForEngineRequest(RequestPayload):
         worker_engine_id: Names the worker, chosen by the artist's engine so it can recognize the
             worker's reports, and stop it, before this request is answered.
         project_id: The project the artist's engine is on, which the worker starts on.
-        project_generation: The generation of that project's activation on the artist's engine.
     """
 
     library_name: str
     worker_engine_id: str
     project_id: str
-    project_generation: int
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
@@ -462,6 +460,29 @@ class LibraryLoadReport:
 @dataclass
 class GeneralPurposeWorkerReady:
     """That a general-purpose worker has loaded its libraries, as it told its orchestrator."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetCommittedProjectRequest(RequestPayload):
+    """Sent by a library's worker to the engine it works for, to learn which project to be on.
+
+    Answered with the project of that engine's last activation that committed, not one mid-switch.
+    """
+
+    broadcast_result: bool = field(default=False, kw_only=True)
+
+
+@dataclass
+@PayloadRegistry.register
+class GetCommittedProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The project the engine is on.
+
+    Args:
+        project_id: Its opaque id, SYSTEM_DEFAULTS_KEY for system defaults.
+    """
+
+    project_id: str
 
 
 @dataclass

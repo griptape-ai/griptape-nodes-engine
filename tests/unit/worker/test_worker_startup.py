@@ -57,7 +57,7 @@ class _Engine:
         self.said_hello = threading.Event()
         self.channel = channel
         channel.start(on_request=self._on_request, on_notification=lambda _body: None, on_closed=lambda: None)
-        activation = ActivateProjectRequest(project_id=SYSTEM_DEFAULTS_KEY, generation=1)
+        activation = ActivateProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
         channel.notify(event_request_envelope(EventRequest(request=activation)))
 
     async def _on_request(self, body: dict) -> dict:
