@@ -317,7 +317,7 @@ class TestToolPages:
     def test_a_tool_page_is_matched_by_request_type_and_overrides_title_and_description(self, tmp_path: Path) -> None:
         _write(
             tmp_path,
-            "docs/tools/SearchDocsRequest.md",
+            "docs/mcp_tools/SearchDocsRequest.md",
             "---\ntitle: Search the docs\ndescription: Finds pages.\n---\nBody\n",
         )
         docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest", "Other"])
@@ -329,16 +329,26 @@ class TestToolPages:
             "Finds pages.",
             True,
         )
-        assert documented.page_path == "tools/SearchDocsRequest.md"
+        assert documented.page_path == "mcp_tools/SearchDocsRequest.md"
         assert (undocumented.title, undocumented.description, undocumented.has_page) == ("Other", "Generated.", False)
         assert undocumented.page_path is None
 
     def test_a_tool_page_that_matches_no_tool_is_reported_and_not_a_library_page(self, tmp_path: Path) -> None:
-        _write(tmp_path, "docs/tools/Gone.md", "Text\n")
+        _write(tmp_path, "docs/mcp_tools/Gone.md", "Text\n")
         docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest"])
 
         assert [problem.kind for problem in docs.problems] == [DocsProblemKind.ORPHAN_PAGE]
         assert docs.page_entries() == []
+
+    def test_a_folder_called_tools_is_an_ordinary_page_folder(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/tools/preparing-audio.md", "Text\n")
+        docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest"])
+
+        assert [(entry.kind, entry.path) for entry in docs.page_entries()] == [
+            (DocumentationEntryKind.FOLDER, "tools"),
+            (DocumentationEntryKind.PAGE, "tools/preparing-audio.md"),
+        ]
+        assert docs.problems == []
 
     def test_a_library_with_no_docs_folder_still_lists_its_tools(self, tmp_path: Path) -> None:
         docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest"])

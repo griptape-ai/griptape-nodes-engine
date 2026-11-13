@@ -216,7 +216,9 @@ class TestListLibraryDocumentation:
 
     def test_a_tool_with_a_page_lists_it_and_the_page_can_be_read(self, engine: Engine, library_root: Path) -> None:
         _write(
-            library_root, "docs/tools/_ExampleToolRequest.md", "---\ntitle: Find a thing\n---\nHow to find things.\n"
+            library_root,
+            "docs/mcp_tools/_ExampleToolRequest.md",
+            "---\ntitle: Find a thing\n---\nHow to find things.\n",
         )
         library = LibraryRegistry.get_library(name=LIBRARY_NAME)
         library._mcp_tools.append(MCPTool(request_type=_ExampleToolRequest, read_only=True))
@@ -227,9 +229,9 @@ class TestListLibraryDocumentation:
 
         assert isinstance(listed, ListLibraryDocumentationResultSuccess)
         (tool,) = listed.tools
-        assert (tool.title, tool.has_page, tool.page_path) == ("Find a thing", True, "tools/_ExampleToolRequest.md")
+        assert (tool.title, tool.has_page, tool.page_path) == ("Find a thing", True, "mcp_tools/_ExampleToolRequest.md")
         page = engine.library_manager.documentation.get_library_documentation_page_request(
-            GetLibraryDocumentationPageRequest(library=LIBRARY_NAME, path="tools/_ExampleToolRequest.md")
+            GetLibraryDocumentationPageRequest(library=LIBRARY_NAME, path="mcp_tools/_ExampleToolRequest.md")
         )
         assert isinstance(page, GetLibraryDocumentationPageResultSuccess)
         assert "How to find things." in page.markdown

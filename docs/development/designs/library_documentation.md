@@ -18,7 +18,7 @@ Tracking issue: [griptape-ai/internal#222](https://github.com/griptape-ai/intern
 
 Docs live in a `docs/` folder next to `griptape_nodes_library.json`.
 
-Four folders under `docs/` are special: `docs/nodes/` holds one page per node, `docs/workflow_nodes/` one page per workflow node, `docs/workflows/` one page per workflow template, and `docs/tools/` one page per MCP tool the library gives agents. Everything else under `docs/` is about the library as a whole, like a getting-started guide or a file format reference, and the library can name and arrange those however it wants. The `guides/` and `reference/` folders below are just examples. A library can have none of them.
+Four folders under `docs/` are special: `docs/nodes/` holds one page per node, `docs/workflow_nodes/` one page per workflow node, `docs/workflows/` one page per workflow template, and `docs/mcp_tools/` one page per MCP tool the library gives agents. Everything else under `docs/` is about the library as a whole, like a getting-started guide or a file format reference, and the library can name and arrange those however it wants. The `guides/` and `reference/` folders below are just examples. A library can have none of them.
 
 How each one maps to `griptape_nodes_library.json`, plus the skills folders and the folder that sits outside `docs/`:
 
@@ -27,7 +27,7 @@ How each one maps to `griptape_nodes_library.json`, plus the skills folders and 
 | `nodes`          | `docs/nodes/`          | one page per node, named after its `class_name`                                    |
 | `workflow_nodes` | `docs/workflow_nodes/` | one page per workflow node, named after its `node_type`                            |
 | `workflows`      | `docs/workflows/`      | one page per template, named after its filename without `.py`                      |
-| n/a              | `docs/tools/`          | one page per MCP tool, named after its request type. The tools come from the code  |
+| n/a              | `docs/mcp_tools/`      | one page per MCP tool, named after its request type. The tools come from the code  |
 | n/a              | `docs/.agents/skills/` | skills for agents that use the library, one folder per skill                       |
 | n/a              | `.agents/skills/`      | skills for coding agents working on the library, never loaded by the sidebar agent |
 | n/a              | `dev/docs/`            | docs for node developers, in any shape. The engine never reads it                  |
@@ -70,7 +70,7 @@ my-library/
       ShoutText.md            # documents the workflow node ShoutText
     workflows/                # the third fixed folder: one page per workflow template
       color_managed_load.md   # documents workflows/templates/color_managed_load.py
-    tools/                    # the fourth fixed folder: one page per MCP tool
+    mcp_tools/                # the fourth fixed folder: one page per MCP tool
       SearchDocsRequest.md    # documents the MCP tool SearchDocsRequest
     .agents/                  # for the agent that uses the library. A dot-folder is never shown as pages
       skills/
@@ -94,7 +94,7 @@ Node pages:
 
 Library pages:
 
-- Everything under `docs/` outside the top-level `nodes/`, `workflow_nodes/`, `workflows/` and `tools/` folders is a library page. Those four names are reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A folder whose name starts with a dot is never shown as pages. A library page's title follows the title rule under File format.
+- Everything under `docs/` outside the top-level `nodes/`, `workflow_nodes/`, `workflows/` and `mcp_tools/` folders is a library page. Those four names are reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A folder whose name starts with a dot is never shown as pages. A library page's title follows the title rule under File format.
 
 - Navigation is the folder hierarchy. There is no navigation file. The panel shows folders and pages as they sit on disk, so adding a page adds an entry. A folder's title is its name with dashes and underscores turned into spaces and the first letter capitalized, so `color-management/` shows as "Color management".
 
