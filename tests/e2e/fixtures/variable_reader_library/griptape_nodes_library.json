@@ -1,0 +1,10 @@
+{
+ "name": "Variable Reader Library",
+ "library_schema_version": "0.7.0",
+ "metadata": {"author": "Test Fixture", "description": "Nodes for the variable change re-run tests", "library_version": "0.1.0", "engine_version": "0.0.0", "tags": ["test"], "dependencies": {"pip_dependencies": []}},
+ "categories": [{"test": {"title": "test", "description": "Test nodes", "color": "border-gray-500", "icon": "Folder"}}],
+ "nodes": [
+  {"class_name": "VariableReader", "file_path": "variable_reader_nodes.py", "metadata": {"category": "test", "description": "Reads a templated text, optionally waiting on a gate file", "display_name": "Variable Reader"}},
+  {"class_name": "Consumer", "file_path": "variable_reader_nodes.py", "metadata": {"category": "test", "description": "Copies its input to its output", "display_name": "Consumer"}}
+ ]
+}
