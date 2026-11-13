@@ -1,6 +1,7 @@
 """Package for web servers the engine may need to start."""
 
 import socket
+import sys
 
 
 def bind_free_socket(host: str, port: int) -> socket.socket:
@@ -13,7 +14,14 @@ def bind_free_socket(host: str, port: int) -> socket.socket:
     close the socket.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # POSIX only, so a restart is not refused by a socket the previous run left in TIME_WAIT.
+    # Windows reads the same option as permission to take a port from a process still listening
+    # on it, which is the opposite of what a server wants: the bind succeeds, the fallback below
+    # never runs, and two servers advertise one port while only one answers. Windows refuses that
+    # bind with no option set, so the default is what this helper wants there. CPython's asyncio
+    # draws the line in the same place, defaulting reuse_address to POSIX.
+    if sys.platform != "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
     except OSError:
