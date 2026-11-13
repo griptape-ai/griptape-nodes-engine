@@ -210,7 +210,8 @@ class TestListLibraryDocumentation:
         assert (tool.name, tool.read_only) == ("_ExampleToolRequest", True)
         assert tool.description == "Finds a thing by name."
         assert tool.input_schema is not None
-        assert "thing_name" in tool.input_schema["properties"]
+        assert list(tool.input_schema["properties"]) == ["thing_name"]
+        assert tool.input_schema["required"] == ["thing_name"]
         assert (tool.title, tool.has_page, tool.page_path) == ("_ExampleToolRequest", False, None)
 
     def test_a_tool_with_a_page_lists_it_and_the_page_can_be_read(self, engine: Engine, library_root: Path) -> None:

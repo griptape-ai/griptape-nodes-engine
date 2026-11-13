@@ -5,18 +5,20 @@ See docs/development/designs/library_documentation.md.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic.errors import PydanticUserError
 
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     DocumentationToolEntry,
     GetLibraryDocumentationPageRequest,
@@ -246,13 +248,25 @@ class LibraryDocumentation(EngineScoped):
         return docs
 
 
+_BASE_REQUEST_FIELDS = frozenset(field.name for field in dataclasses.fields(RequestPayload))
+
+
+def _without_base_fields(schema: dict[str, Any]) -> dict[str, Any]:
+    """Drop the fields every request carries, such as `request_id`, which say nothing about this tool."""
+    properties = {
+        name: value for name, value in schema.get("properties", {}).items() if name not in _BASE_REQUEST_FIELDS
+    }
+    required = [name for name in schema.get("required", []) if name not in _BASE_REQUEST_FIELDS]
+    return {**schema, "properties": properties, "required": required}
+
+
 def _tool_entries(library_name: str) -> list[DocumentationToolEntry]:
     """Describe the MCP tools a library exposes, so a library with tools and no nodes still documents itself."""
     library = LibraryRegistry.get_library(name=library_name)
     entries: list[DocumentationToolEntry] = []
     for tool in library.get_mcp_tools():
         try:
-            schema = tool.input_schema()
+            schema = _without_base_fields(tool.input_schema())
         except PydanticUserError:
             schema = None
         entries.append(
