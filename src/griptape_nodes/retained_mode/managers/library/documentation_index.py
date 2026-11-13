@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple
@@ -32,22 +32,26 @@ from griptape_nodes.retained_mode.events.library_documentation_events import (
     DocumentationPageEntry,
     DocumentationSkillEntry,
     DocumentationTemplateEntry,
+    DocumentationToolEntry,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from griptape_nodes.node_library.library_registry import LibrarySchema, NodeMetadata
 
 DEFAULT_DOCS_FOLDER = "docs"
 NODES_FOLDER = "nodes"
 WORKFLOW_NODES_FOLDER = "workflow_nodes"
 WORKFLOWS_FOLDER = "workflows"
+TOOLS_FOLDER = "tools"
 SKILLS_FOLDER = ".agents/skills"
 OVERVIEW_PAGE = "index.md"
 SKILL_FILE = "SKILL.md"
 MAX_PAGE_BYTES = 1_048_576
 
 # Folders directly under docs/ that hold per-node and per-template pages, not library pages.
-_RESERVED_TOP_LEVEL_FOLDERS = frozenset({NODES_FOLDER, WORKFLOW_NODES_FOLDER, WORKFLOWS_FOLDER})
+_RESERVED_TOP_LEVEL_FOLDERS = frozenset({NODES_FOLDER, WORKFLOW_NODES_FOLDER, WORKFLOWS_FOLDER, TOOLS_FOLDER})
 _README_NAMES = ("README.md", "readme.md")
 _NUMBER_PREFIX = re.compile(r"^\d+[-_.\s]+")
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
@@ -123,6 +127,7 @@ class _PageIndex:
 
     node_pages: dict[str, Path] = field(default_factory=dict)
     template_pages: dict[str, Path] = field(default_factory=dict)
+    tool_pages: dict[str, Path] = field(default_factory=dict)
     problems: list[DocsProblem] = field(default_factory=list)
 
 
@@ -146,14 +151,15 @@ class LibraryDocs:
     library is loaded again, which builds a new `LibraryDocs`.
     """
 
-    def __init__(self, library_root: Path, schema: LibrarySchema) -> None:
+    def __init__(self, library_root: Path, schema: LibrarySchema, tool_names: Sequence[str] = ()) -> None:
         self._library_root = library_root
         self._schema = schema
+        self._tool_names = list(tool_names)
         self.docs_root: Path | None = self._find_docs_root()
         self._index = _PageIndex()
         self._listings_snapshot: _Listings | None = None
         if self.docs_root is not None:
-            self._index = _PageIndexer(self.docs_root, schema).build()
+            self._index = _PageIndexer(self.docs_root, schema, self._tool_names).build()
 
     @property
     def problems(self) -> list[DocsProblem]:
@@ -167,6 +173,30 @@ class LibraryDocs:
     def template_page(self, name: str) -> Path | None:
         """The page that documents a workflow template, or None when the library ships none."""
         return self._index.template_pages.get(name)
+
+    def tool_page(self, name: str) -> Path | None:
+        """The page that documents an MCP tool, named after its request type, or None when the library ships none."""
+        return self._index.tool_pages.get(name)
+
+    def tool_entries(self, tools: Sequence[DocumentationToolEntry]) -> list[DocumentationToolEntry]:
+        """The tools the engine describes, each with its page when the library ships one.
+
+        A page's title and description replace the generated ones, which come from the request's docstring.
+        """
+        entries: list[DocumentationToolEntry] = []
+        for tool in tools:
+            page_path = self._index.tool_pages.get(tool.name)
+            page = _read_for_listing(page_path)
+            entries.append(
+                replace(
+                    tool,
+                    title=_first_text(page.frontmatter_title if page else None, tool.name),
+                    description=_first_text(page.description if page else None, tool.description),
+                    has_page=page_path is not None,
+                    page_path=self._relative_to_docs(page_path),
+                )
+            )
+        return entries
 
     def overview_path(self) -> str | None:
         """Path of the library's overview page: `index.md`, or the README standing in for it."""
@@ -377,7 +407,8 @@ class LibraryDocs:
 class _PageIndexer:
     """Matches the pages under the reserved docs folders to the nodes and templates they document."""
 
-    def __init__(self, docs_root: Path, schema: LibrarySchema) -> None:
+    def __init__(self, docs_root: Path, schema: LibrarySchema, tool_names: Sequence[str] = ()) -> None:
+        self._tool_names = list(tool_names)
         self._docs_root = docs_root
         self._schema = schema
         self._problems: list[DocsProblem] = []
@@ -394,7 +425,11 @@ class _PageIndexer:
         templates = [_NodeKey(Path(path).stem, None) for path in self._schema.workflows or []]
         template_pages = self._index_folder(WORKFLOWS_FOLDER, templates)
 
-        return _PageIndex(node_pages=node_pages, template_pages=template_pages, problems=self._problems)
+        tool_pages = self._index_folder(TOOLS_FOLDER, [_NodeKey(name, None) for name in self._tool_names])
+
+        return _PageIndex(
+            node_pages=node_pages, template_pages=template_pages, tool_pages=tool_pages, problems=self._problems
+        )
 
     def _index_folder(self, folder_name: str, keys: list[_NodeKey]) -> dict[str, Path]:
         """Match every page under one reserved folder to the node or template it documents."""
@@ -453,8 +488,8 @@ class _PageIndexer:
 
         self._add_problem(
             DocsProblemKind.ORPHAN_PAGE,
-            f"The page '{self._relative(page)}' does not match any node or template in the library, so it is "
-            f"never shown. Rename it after the class name or display name of the node it documents.",
+            f"The page '{self._relative(page)}' does not match any node, template or tool in the library, so "
+            f"it is never shown. Rename it after the class name or display name of the node, or the request type of the tool, it documents.",
             [page],
         )
         return None

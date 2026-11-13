@@ -114,7 +114,12 @@ class DocumentationToolEntry:
 
     Args:
         name: The tool's name, which is its request type
-        description: What the tool does, from the request's docstring. Empty when it has none.
+        description: What the tool does. The page's description when the library ships one, else the
+            request's docstring. Empty when there is neither.
+        title: The page's frontmatter title, or the tool's name
+        has_page: True when the library ships a page for this tool
+        page_path: Path of the tool's page relative to the library's docs folder, using forward
+            slashes. None when there is no page.
         read_only: True when the tool only reads state
         input_schema: JSON schema of the fields an agent fills in to call the tool. None when the
             request's fields can't be described as a schema.
@@ -124,6 +129,9 @@ class DocumentationToolEntry:
     description: str
     read_only: bool
     input_schema: dict[str, Any] | None = None
+    title: str = ""
+    has_page: bool = False
+    page_path: str | None = None
 
 
 @dataclass

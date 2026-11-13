@@ -13,7 +13,10 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
     WorkflowNodeDefinition,
 )
-from griptape_nodes.retained_mode.events.library_documentation_events import DocumentationEntryKind
+from griptape_nodes.retained_mode.events.library_documentation_events import (
+    DocumentationEntryKind,
+    DocumentationToolEntry,
+)
 from griptape_nodes.retained_mode.managers.library.documentation_index import (
     MAX_PAGE_BYTES,
     DocsPageError,
@@ -291,6 +294,45 @@ class TestListings:
         assert docs.overview_path() is None
         assert docs.skill_entries() == []
         assert [entry.has_page for entry in docs.node_entries()] == [False]
+
+
+class TestToolPages:
+    @staticmethod
+    def _tool(name: str, description: str = "Generated.") -> DocumentationToolEntry:
+        return DocumentationToolEntry(name=name, description=description, read_only=True)
+
+    def test_a_tool_page_is_matched_by_request_type_and_overrides_title_and_description(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "docs/tools/SearchDocsRequest.md",
+            "---\ntitle: Search the docs\ndescription: Finds pages.\n---\nBody\n",
+        )
+        docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest", "Other"])
+
+        documented, undocumented = docs.tool_entries([self._tool("SearchDocsRequest"), self._tool("Other")])
+
+        assert (documented.title, documented.description, documented.has_page) == (
+            "Search the docs",
+            "Finds pages.",
+            True,
+        )
+        assert documented.page_path == "tools/SearchDocsRequest.md"
+        assert (undocumented.title, undocumented.description, undocumented.has_page) == ("Other", "Generated.", False)
+        assert undocumented.page_path is None
+
+    def test_a_tool_page_that_matches_no_tool_is_reported_and_not_a_library_page(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/tools/Gone.md", "Text\n")
+        docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest"])
+
+        assert [problem.kind for problem in docs.problems] == [DocsProblemKind.ORPHAN_PAGE]
+        assert docs.page_entries() == []
+
+    def test_a_library_with_no_docs_folder_still_lists_its_tools(self, tmp_path: Path) -> None:
+        docs = LibraryDocs(tmp_path, _schema(), ["SearchDocsRequest"])
+
+        (entry,) = docs.tool_entries([self._tool("SearchDocsRequest")])
+
+        assert (entry.title, entry.has_page) == ("SearchDocsRequest", False)
 
 
 class TestPageTree:

@@ -166,7 +166,7 @@ class LibraryDocumentation(EngineScoped):
             nodes=docs.node_entries(),
             templates=docs.template_entries(),
             skills=docs.skill_entries(),
-            tools=_tool_entries(request.library),
+            tools=docs.tool_entries(_tool_entries(request.library)),
             result_details=details,
         )
 
@@ -240,7 +240,8 @@ class LibraryDocumentation(EngineScoped):
             details = f"Attempted to read the documentation of a Library named '{library_name}'. Failed because the engine does not know where the library is installed."
             return _DocsLookupFailure(details=details)
 
-        docs = LibraryDocs(_library_root(info), library.get_library_data())
+        tool_names = [tool.request_type.__name__ for tool in library.get_mcp_tools()]
+        docs = LibraryDocs(_library_root(info), library.get_library_data(), tool_names)
         self._docs_by_library[library] = docs
         return docs
 
