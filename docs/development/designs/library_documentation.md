@@ -180,6 +180,7 @@ GetNodeDocumentationRequest(node_name: str | None, node_type: str | None, librar
        deprecation: NodeDeprecationMetadata | None,
        parameters: list[ParameterDescription],   # same form as DescribeNodeTypeRequest
        assets_root: str | None,       # absolute docs dir, for resolving images
+       parameters_error: str | None,  # why the type's parameters could not be read, such as a module that won't import
      )
 ListLibraryDocumentationRequest(library: str)
   -> overview_path, overview_is_readme, pages (flat list in display order, folders ahead of their pages),
