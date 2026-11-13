@@ -167,22 +167,27 @@ The engine builds a parameter table for each node: name, type, default, tooltip,
 ### Engine API
 
 ```
-GetNodeDocumentationRequest(library: str, node_type: str, node_name: str | None = None)
+GetNodeDocumentationRequest(node_name: str | None, node_type: str | None, library: str | None, offset: int, limit: int | None)
   -> GetNodeDocumentationResultSuccess(
+       library, node_type, title,
        markdown: str | None,          # author content, None if no file
+       total_chars: int, truncated: bool,
        description: str | None,
        when_to_use: str | None,
-       deprecation: ... | None,
-       parameters: list[ParameterDoc],
+       deprecation: NodeDeprecationMetadata | None,
+       parameters: list[ParameterDescription],   # same form as DescribeNodeTypeRequest
        assets_root: str | None,       # absolute docs dir, for resolving images
-       external_url: str | None,      # optional "more docs" link from the manifest
+       external_url: str | None,      # optional "more docs" link from the manifest (not wired yet)
      )
 ListLibraryDocumentationRequest(library: str)
-  -> page tree: [{title, path, description, when_to_use, kind, children}], plus the node list grouped by category
-GetLibraryDocumentationPageRequest(library: str, path: str)
-  -> markdown, title, assets_root
+  -> overview_path, pages (flat list in display order, folders ahead of their pages),
+     nodes, templates, skills
+GetLibraryDocumentationPageRequest(library: str, path: str, offset: int, limit: int | None)
+  -> title, markdown, total_chars, truncated, description, when_to_use, assets_root
 ```
 
+- A node request names either `node_name` (a node on the canvas) or `node_type`. With `node_name`, the type and library come from the node, and `parameters` are the node's own, so two nodes of the same type can report different parameters. With `node_type`, `parameters` are the type's defaults. If both are given they must agree, and if neither is given the request fails.
+- `offset` and `limit` read a long page in parts. `total_chars` is the whole page and `truncated` says whether the text stops early.
 - The docs are read from the installed library on disk and served by the engine to the editor, so nothing leaves the machine. Reading docs needs no network, which makes them usable in air-gapped environments.
 - Markdown travels in the response, so remote engines work.
 - The engine builds its docs index when a library loads: which node pages exist, the page tree from the folder hierarchy, and the problems described above. Choosing Refresh Libraries (or restarting the engine) loads the libraries again and rebuilds the index, so a new, renamed, or deleted doc file shows up after a refresh. The text of a page is read from disk on each request, so an edit to an existing page shows up the next time the panel opens it, with no refresh.
