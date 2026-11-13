@@ -118,7 +118,7 @@ Pages are plain markdown that reads well on GitHub and in the editor.
 
 ## Skills for agents
 
-An agent that builds workflows with your library reads skills in `docs/.agents/skills/`. Each skill is a folder with a `SKILL.md`.
+An agent that builds workflows with your library reads skills in `docs/.agents/skills/`. Each skill is a folder with a `SKILL.md`. The Docs panel lists them under **Skills**, with each skill's `description`, so an artist can see what ships with the library and read it. Write a skill so a person can follow it too.
 
 ```text
 docs/.agents/skills/color-managed-workflow/SKILL.md
