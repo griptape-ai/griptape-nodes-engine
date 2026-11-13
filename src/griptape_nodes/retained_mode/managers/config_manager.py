@@ -1309,15 +1309,19 @@ class ConfigManager(EngineScoped):
         self._libraries_root_override = None
         self.load_configs()
 
-    def delete_user_workflow(self, workflow_file_name: str) -> None:
+    def delete_user_workflow(self, workflow_file_name: str) -> bool:
+        """Remove a workflow file from the workflows the user config registers. False if the config could not be written."""
         default_workflows = self.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
-        if default_workflows:
-            default_workflows = [
-                saved_workflow
-                for saved_workflow in default_workflows
-                if (saved_workflow.lower() != workflow_file_name.lower())
-            ]
-            self.set_config_value(WORKFLOWS_TO_REGISTER_KEY, default_workflows)
+        if not default_workflows:
+            return True
+        remaining_workflows = [
+            saved_workflow
+            for saved_workflow in default_workflows
+            if (saved_workflow.lower() != workflow_file_name.lower())
+        ]
+        if len(remaining_workflows) == len(default_workflows):
+            return True
+        return self.set_config_value(WORKFLOWS_TO_REGISTER_KEY, remaining_workflows)
 
     def get_full_path(self, relative_path: str) -> Path:
         """Get a full path by combining the base path with a relative path.

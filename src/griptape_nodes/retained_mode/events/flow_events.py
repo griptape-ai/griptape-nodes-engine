@@ -94,13 +94,17 @@ class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin)
     Use when: Reusing workflows as components, creating modular workflows,
     importing workflow templates, building composite workflows.
 
+    Name the imported workflow by `workflow_id`, by `workflow_name`, or by both when they name the
+    same one.
+
     Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
     flow_name: str | None = None  # If None, import into current context flow
     imported_flow_metadata: dict | None = None  # Metadata to apply to the imported flow
     track_as_referenced: bool = True  # If False, the flow serializes as inline content instead of an import command
+    workflow_id: str | None = None
 
 
 @dataclass

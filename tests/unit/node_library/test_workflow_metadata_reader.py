@@ -60,6 +60,48 @@ class TestFindMetadataBlocks:
     def test_no_block_at_all(self) -> None:
         assert find_metadata_blocks("print('hello')\n", "script") == []
 
+    def test_finds_every_block(self) -> None:
+        content = _header() + "print('body')\n" + _header(name='"second"')
+
+        matches = find_metadata_blocks(content, "script")
+
+        assert len(matches) == 2  # noqa: PLR2004
+
+    def test_back_to_back_blocks_are_swallowed_by_the_first(self) -> None:
+        # The body pattern is greedy, so a block directly followed by another swallows it.
+        content = "# /// other\n# a = 1\n# ///\n" + _header()
+
+        matches = find_metadata_blocks(content, "other")
+
+        assert len(matches) == 1
+        assert "# /// script" in matches[0].group("content")
+        assert find_metadata_blocks(content, "script") == []
+
+    def test_ignores_block_nested_in_another_blocks_body(self) -> None:
+        # The "# /// script" line is body text of the outer block, so it is not a block of its own.
+        content = "# /// outer\n# /// script\n# a = 1\n# ///\n"
+
+        assert find_metadata_blocks(content, "script") == []
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("  # /// script\n# a = 1\n# ///\n", id="indented opener"),
+            pytest.param("x = '# /// script'\n# a = 1\n# ///\n", id="opener mid-line"),
+            pytest.param("# /// script\n# a = 1\n", id="no closing line"),
+            pytest.param("#/// script\n# a = 1\n# ///\n", id="no space after hash"),
+        ],
+    )
+    def test_ignores_malformed_openers(self, content: str) -> None:
+        assert find_metadata_blocks(content, "script") == []
+
+    def test_finds_block_before_large_body(self) -> None:
+        content = _header() + "data = '" + "x" * 300_000 + "'\n# not a block\n# /// stray\n"
+
+        matches = find_metadata_blocks(content, "script")
+
+        assert len(matches) == 1
+
 
 class TestReadWorkflowMetadata:
     def test_reads_header_fields(self, tmp_path: Path) -> None:

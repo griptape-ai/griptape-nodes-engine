@@ -18,16 +18,15 @@ from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, DropLo
 from griptape_nodes.exe_types.core_types import ParameterType
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest
 from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.workflow_events import DeleteWorkflowRequest
-from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.resource_manager import LocalObjectEntry
 from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 _SECOND_READ_TIMEOUT_SECONDS = 0.25
 
@@ -494,7 +493,6 @@ class TestWorkflowStateClearReleasesObjects:
         assert manager.drop_all_local_objects() == 0
 
     def test_closing_one_of_two_open_workflows_releases_only_its_objects(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         manager = engine.resource_manager
         released: list[str] = []
         registry = engine.workflow_registry
@@ -541,10 +539,7 @@ class TestWorkflowStateClearReleasesObjects:
         engine.context_manager.push_workflow("wf")
         workflow = engine.current_workflow()
 
-        result = engine.event_manager.handle_request(
-            ClearAllObjectStateRequest(i_know_what_im_doing=True),
-            result_context=ResultContext(open_workflow_id=workflow.workflow_id),
-        )
+        result = engine.event_manager.handle_request(CloseWorkflowRequest(workflow_id=workflow.workflow_id))
 
         assert result.succeeded()
         assert engine.open_workflows.all_open() == []

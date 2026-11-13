@@ -207,3 +207,36 @@ class TestRequestBatchResolution:
             await request_client.request_batch([("R", {}), ("R", {})], timeout_ms=10)
 
         assert request_client.pending_count == 0
+
+
+class TestDefaultResponseTopic:
+    def test_each_client_takes_its_results_on_a_topic_of_its_own(self, fake_client: _FakeClient) -> None:
+        """Not a topic every client shares, so no other client gets this one's results."""
+        first = RequestClient(client=fake_client)  # type: ignore[arg-type]
+        second = RequestClient(client=fake_client)  # type: ignore[arg-type]
+
+        assert first.response_topic_fn() == f"clients/{first.client_id}/response"
+        assert first.response_topic_fn() != second.response_topic_fn()
+
+    def test_its_topic_is_under_its_session_once_it_knows_one(self, fake_client: _FakeClient) -> None:
+        given = RequestClient(client=fake_client, session_id="session-1")  # type: ignore[arg-type]
+        learned = RequestClient(client=fake_client)  # type: ignore[arg-type]
+
+        learned.session_id = "session-2"
+
+        assert given.response_topic_fn() == f"sessions/session-1/clients/{given.client_id}/response"
+        assert learned.response_topic_fn() == f"sessions/session-2/clients/{learned.client_id}/response"
+
+    @pytest.mark.asyncio
+    async def test_subscribes_to_its_own_topic_and_names_it_on_the_request(self, fake_client: _FakeClient) -> None:
+        rc = RequestClient(client=fake_client)  # type: ignore[arg-type]
+        async with rc:
+            with pytest.raises(TimeoutError):
+                await rc.request_batch([("CreateConnectionRequest", {})], timeout_ms=1)
+
+        own_topic = f"clients/{rc.client_id}/response"
+        fake_client.subscribe.assert_awaited_once_with(own_topic)
+        assert fake_client.publish.await_args is not None
+        _, payload, topic = fake_client.publish.await_args.args
+        assert topic == "request"
+        assert payload["requests"][0]["response_topic"] == own_topic

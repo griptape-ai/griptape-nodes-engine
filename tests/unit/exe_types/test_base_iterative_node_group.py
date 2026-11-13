@@ -255,3 +255,45 @@ class TestBaseIterativeNodeGroupRestoreRoundTrip:
         assert len(restored_again.metadata[LEFT_PARAMETERS_KEY]) == len(iterative_group.metadata[LEFT_PARAMETERS_KEY])
         assert set(restored_again.metadata[RIGHT_PARAMETERS_KEY]) == set(iterative_group.metadata[RIGHT_PARAMETERS_KEY])
         assert len(restored_again.metadata[RIGHT_PARAMETERS_KEY]) == len(iterative_group.metadata[RIGHT_PARAMETERS_KEY])
+
+
+class TestFlattenResults:
+    """Tests for the Flatten Results setting on BaseIterativeNodeGroup."""
+
+    def test_results_keep_their_shape_by_default(self, iterative_group: MockIterativeGroup) -> None:
+        iterative_group._results_list = [["a", "b"], ["c"]]
+        iterative_group._output_results_list()
+        assert iterative_group.parameter_output_values["results"] == [["a", "b"], ["c"]]
+
+    def test_flatten_results_flattens_every_level_at_depth_zero(self, iterative_group: MockIterativeGroup) -> None:
+        iterative_group.set_parameter_value("flatten_results", True)
+        iterative_group._results_list = [["a", ["b", ["c"]]], "d", None]
+        iterative_group._output_results_list()
+        assert iterative_group.parameter_output_values["results"] == ["a", "b", "c", "d", None]
+
+    def test_flatten_depth_limits_levels(self, iterative_group: MockIterativeGroup) -> None:
+        iterative_group.set_parameter_value("flatten_results", True)
+        iterative_group.set_parameter_value("flatten_depth", 1)
+        iterative_group._results_list = [["a", ["b"]], ["c"]]
+        iterative_group._output_results_list()
+        assert iterative_group.parameter_output_values["results"] == ["a", ["b"], "c"]
+
+    def test_strings_and_dicts_stay_whole(self, iterative_group: MockIterativeGroup) -> None:
+        iterative_group.set_parameter_value("flatten_results", True)
+        iterative_group._results_list = ["ab", {"k": [1, 2]}, ["cd"]]
+        iterative_group._output_results_list()
+        assert iterative_group.parameter_output_values["results"] == ["ab", {"k": [1, 2]}, "cd"]
+
+    def test_flatten_depth_shows_only_while_flatten_results_is_on(self, iterative_group: MockIterativeGroup) -> None:
+        depth = iterative_group.get_parameter_by_name("flatten_depth")
+        assert depth is not None
+        assert depth.ui_options.get("hide") is True
+        iterative_group.set_parameter_value("flatten_results", True)
+        assert not depth.ui_options.get("hide")
+        iterative_group.set_parameter_value("flatten_results", False)
+        assert depth.ui_options.get("hide") is True
+
+    def test_flatten_settings_are_in_the_group_settings_panel(self, iterative_group: MockIterativeGroup) -> None:
+        settings = iterative_group.metadata["group_settings_params"]
+        assert "flatten_results" in settings
+        assert "flatten_depth" in settings

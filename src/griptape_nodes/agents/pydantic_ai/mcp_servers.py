@@ -83,7 +83,6 @@ GTN_APPROVAL_REQUIRED_REQUESTS: frozenset[str] = frozenset(
     {
         "RunWorkflowWithCurrentStateRequest",
         "ResolveNodeRequest",
-        "ExecuteNodeRequest",
         "StartFlowRequest",
         "StartFlowFromNodeRequest",
     }
