@@ -1,1 +1,1 @@
-- The chat agent can now read library docs, and does so when it is unsure how to use a node.
+- The chat agent can now read library docs.
