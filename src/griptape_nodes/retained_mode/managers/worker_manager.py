@@ -79,7 +79,6 @@ from griptape_nodes.worker.wire import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine
 
-    from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, RequestSender, ResultPayload
     from griptape_nodes.retained_mode.events.worker_events import LibraryLoadReport
@@ -127,8 +126,6 @@ _SENT_TO_REMOTE_WORKERS = frozenset(
 
 # What an engine sends a worker another engine runs for it under a lease: the node to run, alone.
 _RUN_ON_REMOTE_WORKERS = frozenset({ExecuteNodeRequest.__name__})
-
-# The secrets a worker another engine runs for this one is answered with this engine's license session for.
 
 # Why a node's local worker went away, when nothing that stopped it said otherwise.
 _LOCAL_WORKER_STOPPED = "the worker process running it stopped."
@@ -241,15 +238,13 @@ class EngineLease:
 
 @dataclass
 class WorkerRegistration:
-    """Tracks a registered worker's routing topic and optional library key.
+    """Tracks a registered worker and its optional library key.
 
     worker_key is the library_name the worker was spawned for, or None for
     general-purpose workers. A worker this engine runs for another engine's
     session is keyed by that session as well, as "<session_id>/<library_name>".
     """
 
-    # Empty: every worker is reached through `channel`, or through the engine that runs it.
-    request_topic: str
     worker_key: str | None
     # Engine ID of the engine that runs this worker, or None for a local worker.
     host_engine_id: str | None = None
@@ -274,13 +269,11 @@ class _WorkerTransport:
 
     Held separately from WorkerManager so the manager can be constructed up
     front (e.g. by the Engine) and wired to a concrete transport later, once
-    the WebSocket client and request client exist.
+    the WebSocket client exists.
     """
 
+    # Sends this engine's clients, such as the editor, what a worker would have sent them.
     send_message: Callable[[str, str, str | None], Awaitable[None]]
-    subscribe_to_topic: Callable[[str], Awaitable[None]]
-    unsubscribe_from_topic: Callable[[str], Awaitable[None]]
-    request_client: RequestClient
 
 
 class WorkerManager(EngineScoped):
@@ -290,8 +283,8 @@ class WorkerManager(EngineScoped):
     this one is reached through that engine, and one this engine runs for another engine has its
     traffic carried to that engine.
 
-    Transport operations (subscribe, unsubscribe, send message) are injected
-    as callables so this class has no direct dependency on WebSocket plumbing.
+    Sending to this engine's clients is injected as a callable, so this class
+    has no direct dependency on WebSocket plumbing.
     """
 
     # How long a worker may take to load its library (venv creation, installs, imports): the ceiling
@@ -425,25 +418,17 @@ class WorkerManager(EngineScoped):
         self,
         *,
         send_message: Callable[[str, str, str | None], Awaitable[None]],
-        subscribe_to_topic: Callable[[str], Awaitable[None]],
-        unsubscribe_from_topic: Callable[[str], Awaitable[None]],
-        request_client: RequestClient,
         ws_outgoing_queue: asyncio.Queue | None = None,  # noqa: ARG002
     ) -> None:
-        """Bind the transport-layer callables used for WebSocket I/O.
+        """Bind the transport-layer callable used to reach this engine's clients.
 
-        Called once the WebSocket client and RequestClient exist. Until this is
-        called, methods that depend on the transport will raise RuntimeError.
+        Called once the WebSocket client exists. Until this is called, methods
+        that depend on the transport will raise RuntimeError.
 
         `ws_outgoing_queue` is ignored. Accepted so app releases that still pass it keep working.
         TODO(https://github.com/griptape-ai/griptape-nodes-app/issues/254): remove.
         """
-        self._transport = _WorkerTransport(
-            send_message=send_message,
-            subscribe_to_topic=subscribe_to_topic,
-            unsubscribe_from_topic=unsubscribe_from_topic,
-            request_client=request_client,
-        )
+        self._transport = _WorkerTransport(send_message=send_message)
 
     async def _activate_project_on_worker(self, worker_engine_id: str) -> None:
         """Tell one worker which project to be on, as of the last activation that committed.
@@ -483,8 +468,8 @@ class WorkerManager(EngineScoped):
             return True
         return self.get_worker_for_key(worker_key) is not None
 
-    def get_worker_for_key(self, key: str | None) -> tuple[str, str] | None:
-        """Return (worker_engine_id, worker_request_topic) for a worker registered under key, or None.
+    def get_worker_for_key(self, key: str | None) -> str | None:
+        """Return the engine ID of a worker registered under key, or None.
 
         A key of None finds a general-purpose worker, one not tied to any library.
 
@@ -493,7 +478,7 @@ class WorkerManager(EngineScoped):
         """
         for wid, registration in self._own_workers().items():
             if registration.worker_key == key:
-                return wid, registration.request_topic
+                return wid
         return None
 
     def _own_workers(self) -> dict[str, WorkerRegistration]:
@@ -611,9 +596,7 @@ class WorkerManager(EngineScoped):
         if self._managed_worker_processes.get(worker_key) is not proc:
             channel.close()
             return
-        self._workers[worker_id] = WorkerRegistration(
-            request_topic="", worker_key=worker_key, channel=channel, process=proc
-        )
+        self._workers[worker_id] = WorkerRegistration(worker_key=worker_key, channel=channel, process=proc)
         parent_end = ParentEnd(
             self.engine,
             on_hello=functools.partial(self._accept_hello, worker_id),
@@ -1633,9 +1616,7 @@ class WorkerManager(EngineScoped):
                 result_details=f"This engine is not waiting on worker {wid}, so it does not need it."
             )
         del self._starts_asked_of_hosts[wid]
-        self._workers[wid] = WorkerRegistration(
-            request_topic="", worker_key=start.library_name, host_engine_id=start.host_engine_id
-        )
+        self._workers[wid] = WorkerRegistration(worker_key=start.library_name, host_engine_id=start.host_engine_id)
         logger.debug("Worker %s for library '%s' runs on engine %s", wid, start.library_name, start.host_engine_id)
         await self._note_libraries_loaded(start.library_name, request.libraries)
         # It started on the project the start named; a switch since then reaches it only this way.
@@ -1810,7 +1791,7 @@ class WorkerManager(EngineScoped):
         session = self._sessions[session_id]
         # Recorded before anything awaits, so a stop or another start sent meanwhile sees this one.
         served = _ServedFor(owning_engine_id=engine_id, session_id=session_id, library_name=library_name)
-        registration = WorkerRegistration(request_topic="", worker_key=worker_key, serves=served)
+        registration = WorkerRegistration(worker_key=worker_key, serves=served)
         self._workers[worker_engine_id] = registration
 
         def abandon() -> None:

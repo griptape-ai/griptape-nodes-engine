@@ -28,7 +28,6 @@ from griptape_nodes.worker.wire import WorkerHello
 
 _SESSION = "sess-abc"
 _WORKER = "eng-general"
-_WORKER_REQUEST_TOPIC = f"sessions/{_SESSION}/workers/{_WORKER}/request"
 
 
 def _worker_manager() -> WorkerManager:
@@ -41,9 +40,6 @@ def _worker_manager() -> WorkerManager:
     manager = WorkerManager(engine=engine, event_manager=MagicMock())
     manager.attach_transport(
         send_message=AsyncMock(),
-        subscribe_to_topic=AsyncMock(),
-        unsubscribe_from_topic=AsyncMock(),
-        request_client=MagicMock(fail_requests_by_tag=AsyncMock()),
     )
     manager._orchestrator_static_server_base_url = AsyncMock(return_value=None)  # type: ignore[method-assign]
     return manager
@@ -141,7 +137,7 @@ class TestReadiness:
     async def test_the_hello_releases_its_gate(self) -> None:
         manager = _worker_manager()
         manager.expect_worker(None)
-        manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
 
         reply = await manager._accept_hello(
             _WORKER, WorkerHello(engine_version=engine_version, library_names=[], loaded=True, libraries=[])
@@ -168,9 +164,7 @@ class TestLifecycle:
         manager = _worker_manager()
         manager.expect_worker(None)
         proc = _managed_proc()
-        manager._workers[_WORKER] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=None, process=proc
-        )
+        manager._workers[_WORKER] = WorkerRegistration(worker_key=None, process=proc)
         manager._managed_worker_processes[None] = proc
 
         await manager._forget_local_worker(_WORKER)
@@ -241,7 +235,7 @@ class TestStartRequestHandling:
         spawn = AsyncMock()
         manager._spawn_general_purpose_worker = spawn  # type: ignore[method-assign]
         if already == "registered":
-            manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+            manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
         if already == "requested":
             manager._requested_spawns[None] = asyncio.get_running_loop().create_future()  # type: ignore[assignment]
         if already == "running":
@@ -266,7 +260,7 @@ class TestStartRequestHandling:
         manager._spawn_general_purpose_worker = AsyncMock()  # type: ignore[method-assign]
         await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
         await asyncio.sleep(0)
-        manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
         manager._managed_worker_processes[None] = _managed_proc()
 
         await manager.reset_workers()
@@ -296,7 +290,7 @@ class TestRestartWhenLibrariesChange:
         cast("MagicMock", manager._engine).ahandle_request = AsyncMock(side_effect=handle)
         with patch("griptape_nodes.retained_mode.managers.library.workers.is_beta_enabled", return_value=True):
             await manager.workers._start_workers()
-        worker_manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
         worker_manager._managed_worker_processes[None] = _managed_proc()
         worker_manager.note_library_loaded(None)
         cast("MagicMock", manager._engine).ahandle_request.reset_mock()
@@ -390,7 +384,7 @@ class TestRestartWhenLibrariesChange:
         with patch("griptape_nodes.retained_mode.managers.library.workers.is_beta_enabled", return_value=True):
             await manager.workers._start_workers()
         # The new worker is up before the change is looked at, so only its start count can say it is current.
-        worker_manager._workers["eng-new"] = WorkerRegistration(request_topic="sessions/x/new", worker_key=None)
+        worker_manager._workers["eng-new"] = WorkerRegistration(worker_key=None)
         worker_manager._managed_worker_processes[None] = _managed_proc()
         cast("MagicMock", manager._engine).ahandle_request.reset_mock()
 

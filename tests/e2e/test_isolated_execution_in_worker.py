@@ -97,9 +97,7 @@ class _StandInWorker:
         Called once the test's libraries are registered: a real worker starts after the libraries
         load, and one registered before a library change is stale and gets restarted.
         """
-        self.engine.worker_manager._workers[_GENERAL_PURPOSE_WORKER] = WorkerRegistration(
-            request_topic=f"sessions/test/workers/{_GENERAL_PURPOSE_WORKER}/request", worker_key=None
-        )
+        self.engine.worker_manager._workers[_GENERAL_PURPOSE_WORKER] = WorkerRegistration(worker_key=None)
         workers = self.engine.library_manager.workers
         workers._general_purpose_worker_generation = workers._library_set_generation
 

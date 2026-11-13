@@ -592,7 +592,7 @@ class TestWorkflowStateClearReleasesObjects:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock(side_effect=RuntimeError("no broker"))),
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -617,7 +617,7 @@ class TestWorkflowStateClearReleasesObjects:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock()) as fan_out,
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             asyncio.run(worker_manager.broadcast_drop_all_local_objects())
 
@@ -761,7 +761,7 @@ class TestReleaseKeyEverywhere:
         worker_manager = engine.worker_manager
         with (
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             yield
 
@@ -806,7 +806,7 @@ class TestReleaseKeyEverywhere:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock()) as fan_out,
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             asyncio.run(worker_manager.broadcast_pending_local_object_releases())
 
@@ -834,7 +834,7 @@ class TestReleaseKeyEverywhere:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock(side_effect=RuntimeError("no broker"))),
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             asyncio.run(worker_manager.broadcast_pending_local_object_releases())
 

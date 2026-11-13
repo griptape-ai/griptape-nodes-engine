@@ -130,7 +130,7 @@ class TestHello:
 
         worker_id, _ = await _connected(manager, _LIBRARY, pair)
 
-        assert manager.get_worker_for_key(_LIBRARY) == (worker_id, "")
+        assert manager.get_worker_for_key(_LIBRARY) == worker_id
         await _until(lambda: worker.notifications)
         activation = worker.notifications[0]["payload"]
         assert activation["request_type"] == "ActivateProjectRequest"
@@ -252,9 +252,6 @@ class TestRelayedEvents:
         send_message = AsyncMock()
         manager.attach_transport(
             send_message=send_message,
-            subscribe_to_topic=AsyncMock(),
-            unsubscribe_from_topic=AsyncMock(),
-            request_client=MagicMock(),
         )
         _engine(manager).get_session_id.return_value = "session-1"
         payload = {"event_type": "AppEvent", "payload_type": "CurrentProjectChanged", "payload": {"project_id": "p"}}
@@ -396,7 +393,7 @@ class TestStoppingLocalWorkers:
             await manager.stop_worker_for_library(_LIBRARY)
 
             assert manager.get_worker_for_key(_LIBRARY) is None
-            assert manager.get_worker_for_key(_DEPENDENCY) == (f"worker-{_DEPENDENCY}", "")
+            assert manager.get_worker_for_key(_DEPENDENCY) == f"worker-{_DEPENDENCY}"
         finally:
             for pair in listener_pairs:
                 await _close(pair)
@@ -441,9 +438,6 @@ class TestRelayedResults:
         send_message = AsyncMock()
         manager.attach_transport(
             send_message=send_message,
-            subscribe_to_topic=AsyncMock(),
-            unsubscribe_from_topic=AsyncMock(),
-            request_client=MagicMock(),
         )
         await manager._relay_worker_event("EventResult", payload)
 

@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
 
-_WORKER_ID = ("simulated-worker", "")
+_WORKER_ID = "simulated-worker"
 
 
 def through_the_wire[T](payload: T) -> T:
@@ -113,7 +113,7 @@ class SimulatedWorker:
 def simulated_worker(orchestrator: Engine, library_name: str) -> Iterator[SimulatedWorker]:
     """Build a worker engine and route every node of `library_name` that `orchestrator` runs to it."""
 
-    def worker_for(name: str | None) -> tuple[str, str] | None:
+    def worker_for(name: str | None) -> str | None:
         if name == library_name:
             return _WORKER_ID
         return None

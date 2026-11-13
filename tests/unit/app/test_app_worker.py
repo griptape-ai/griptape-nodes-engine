@@ -8,7 +8,6 @@ the route_to_worker / pending-future mechanism.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import os
@@ -20,7 +19,6 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME, LICENSE_SECRET_NAME
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine_transports import (
@@ -66,40 +64,7 @@ if TYPE_CHECKING:
 
 _SESSION = "sess-abc"
 _ENGINE = "eng-xyz"
-_WORKER_REQUEST_TOPIC = f"sessions/{_SESSION}/workers/{_ENGINE}/request"
 _WORKER_RESPONSE_TOPIC = f"sessions/{_SESSION}/workers/{_ENGINE}/response"
-
-
-class _FakeRequestClient:
-    """Minimal RequestClient stand-in for unit tests.
-
-    Implements only the methods WorkerManager calls so tests remain isolated
-    from the real Client/WebSocket machinery.
-    """
-
-    def __init__(self) -> None:
-        self._pending_requests: dict[str, _PendingRequest] = {}
-
-    async def track_request(
-        self, request_id: str, tag: str = "", *, resolve_failures_as_payload: bool = False
-    ) -> concurrent.futures.Future:
-        future: concurrent.futures.Future = concurrent.futures.Future()
-        self._pending_requests[request_id] = _PendingRequest(
-            future, tag, resolve_failures_as_payload=resolve_failures_as_payload
-        )
-        return future
-
-    async def fail_requests_by_tag(self, tag: str, error: Exception) -> None:
-        to_fail = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
-        for rid in to_fail:
-            entry = self._pending_requests.pop(rid)
-            if not entry.future.done():
-                entry.future.set_exception(error)
-
-    def discard_request(self, request_id: str) -> None:
-        entry = self._pending_requests.pop(request_id, None)
-        if entry is not None and not entry.future.done():
-            entry.future.cancel()
 
 
 class _FakeChannel:
@@ -149,9 +114,6 @@ def worker_manager() -> WorkerManager:
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
         send_message=AsyncMock(),
-        subscribe_to_topic=AsyncMock(),
-        unsubscribe_from_topic=AsyncMock(),
-        request_client=_FakeRequestClient(),  # type: ignore[arg-type]
     )
     return wm
 
@@ -177,8 +139,8 @@ class TestProjectSwitchWaitsForWorkers:
         this engine does not read, silently.
         """
         worker_manager._workers = {
-            "worker-a": WorkerRegistration(request_topic="t/a", worker_key=None),
-            "worker-b": WorkerRegistration(request_topic="t/b", worker_key=None),
+            "worker-a": WorkerRegistration(worker_key=None),
+            "worker-b": WorkerRegistration(worker_key=None),
         }
         replies = {
             "worker-a": {"result_type": "ActivateProjectResultSuccess", "result": {}},
@@ -193,7 +155,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
 
         failures = await worker_manager.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+            EventRequest(request=worker_events.StartWorkerRequest(library_name="x"))
         )
 
         # Every worker was awaited, and the one that refused is named rather than swallowed.
@@ -205,8 +167,8 @@ class TestProjectSwitchWaitsForWorkers:
     @pytest.mark.asyncio
     async def test_one_unreachable_worker_does_not_strand_the_others(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers = {
-            "dead": WorkerRegistration(request_topic="t/dead", worker_key=None),
-            "alive": WorkerRegistration(request_topic="t/alive", worker_key=None),
+            "dead": WorkerRegistration(worker_key=None),
+            "alive": WorkerRegistration(worker_key=None),
         }
 
         async def fake_route(_event: object, worker_engine_id: str) -> dict:
@@ -218,7 +180,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
 
         failures = await worker_manager.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+            EventRequest(request=worker_events.StartWorkerRequest(library_name="x"))
         )
 
         assert len(failures) == 1
@@ -232,9 +194,7 @@ class TestProjectSwitchWaitsForWorkers:
         and this is on SetCurrentProjectRequest -- a GUI action someone is sitting in front of.
         """
         worker_count = 4
-        worker_manager._workers = {
-            f"w{i}": WorkerRegistration(request_topic=f"t/w{i}", worker_key=None) for i in range(worker_count)
-        }
+        worker_manager._workers = {f"w{i}": WorkerRegistration(worker_key=None) for i in range(worker_count)}
         peak = 0
         in_flight = 0
 
@@ -249,7 +209,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
 
         failures = await worker_manager.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+            EventRequest(request=worker_events.StartWorkerRequest(library_name="x"))
         )
 
         assert failures == []
@@ -265,7 +225,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker and says nothing about one busy adopting. Unbounded, the switch never returns.
         """
         worker_manager.library_load_timeout_s = 0.05
-        worker_manager._workers = {"stuck": WorkerRegistration(request_topic="t/stuck", worker_key=None)}
+        worker_manager._workers = {"stuck": WorkerRegistration(worker_key=None)}
 
         async def never_answers(_event: object, _worker_engine_id: str) -> dict:
             await asyncio.sleep(30)
@@ -275,7 +235,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.route_to_worker = never_answers  # type: ignore[method-assign]
 
         failures = await worker_manager.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+            EventRequest(request=worker_events.StartWorkerRequest(library_name="x"))
         )
 
         assert len(failures) == 1
@@ -290,7 +250,7 @@ class TestProjectSwitchWaitsForWorkers:
         A substring test read any type merely containing "Success" as one. Result payloads all end
         in ResultSuccess or ResultFailure.
         """
-        worker_manager._workers = {"w": WorkerRegistration(request_topic="t/w", worker_key=None)}
+        worker_manager._workers = {"w": WorkerRegistration(worker_key=None)}
 
         async def odd_reply(_event: object, _worker_engine_id: str) -> dict:
             return {"result_type": "SuccessorLookupResultFailure", "result": {"result_details": "nope"}}
@@ -298,7 +258,7 @@ class TestProjectSwitchWaitsForWorkers:
         worker_manager.route_to_worker = odd_reply  # type: ignore[method-assign]
 
         failures = await worker_manager.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+            EventRequest(request=worker_events.StartWorkerRequest(library_name="x"))
         )
 
         assert len(failures) == 1
@@ -313,7 +273,7 @@ class TestProjectSwitchWaitsForWorkers:
         costs the caller the failure log too. Taking the id from the event and the generation from
         state separately can pair an older id with a newer switch's generation.
         """
-        worker_manager._workers = {"worker-a": WorkerRegistration(request_topic="t/a", worker_key=None)}
+        worker_manager._workers = {"worker-a": WorkerRegistration(worker_key=None)}
         worker_manager.engine.project_manager.committed_project.return_value = ("proj-9", 4)  # type: ignore[union-attr]
         sent: list[tuple[str, int]] = []
 
@@ -335,9 +295,7 @@ class TestAWorkerChannelEndingReleasesWaiters:
     @pytest.mark.asyncio
     async def test_removes_it_from_the_registry_and_its_managed_process(self, worker_manager: WorkerManager) -> None:
         proc = _managed_proc_mock()
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library", process=proc
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="My Library", process=proc)
         worker_manager._managed_worker_processes["My Library"] = proc
 
         await worker_manager._forget_local_worker(_ENGINE)
@@ -355,9 +313,7 @@ class TestAWorkerChannelEndingReleasesWaiters:
     async def test_releases_a_library_whose_worker_left_before_loading_it(self, worker_manager: WorkerManager) -> None:
         """A worker that shuts itself down is not coming back, so waiters must not sit out the load timeout."""
         worker_manager.expect_worker("My Library")
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="My Library")
 
         await worker_manager._forget_local_worker(_ENGINE)
 
@@ -428,13 +384,11 @@ class TestRelayWorkerResultPendingFuture:
 
 class TestGetWorkerForKey:
     def test_returns_worker_for_registered_library(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="My Library")
 
         result = worker_manager.get_worker_for_key("My Library")
 
-        assert result == (_ENGINE, _WORKER_REQUEST_TOPIC)
+        assert result == _ENGINE
 
     def test_returns_none_for_unknown_library(self, worker_manager: WorkerManager) -> None:
         result = worker_manager.get_worker_for_key("Unknown Library")
@@ -442,19 +396,15 @@ class TestGetWorkerForKey:
         assert result is None
 
     def test_none_finds_the_general_purpose_worker_not_a_library_worker(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers["library-engine"] = WorkerRegistration(
-            request_topic="library-topic", worker_key="My Library"
-        )
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._workers["library-engine"] = WorkerRegistration(worker_key="My Library")
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key=None)
 
         result = worker_manager.get_worker_for_key(None)
 
-        assert result == (_ENGINE, _WORKER_REQUEST_TOPIC)
+        assert result == _ENGINE
 
     def test_none_finds_nothing_when_only_library_workers_are_registered(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="My Library")
 
         result = worker_manager.get_worker_for_key(None)
 
@@ -774,7 +724,7 @@ class TestResetWorkers:
     @pytest.mark.asyncio
     async def test_clears_all_tracking_state(self, worker_manager: WorkerManager) -> None:
         worker_manager._managed_worker_processes["Lib A"] = _managed_proc_mock()
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib A")
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="Lib A")
 
         await worker_manager.reset_workers()
 
@@ -835,12 +785,8 @@ class TestStopWorkerForLibrary:
 
     @pytest.mark.asyncio
     async def test_forgets_only_the_registration_of_that_library(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers["eng-a"] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/eng-a/request", worker_key="Lib A"
-        )
-        worker_manager._workers["eng-b"] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/eng-b/request", worker_key="Lib B"
-        )
+        worker_manager._workers["eng-a"] = WorkerRegistration(worker_key="Lib A")
+        worker_manager._workers["eng-b"] = WorkerRegistration(worker_key="Lib B")
 
         await worker_manager.stop_worker_for_library("Lib A")
 
@@ -1124,9 +1070,7 @@ class TestHandleStartWorkerRequest:
 
     @pytest.mark.asyncio
     async def test_a_request_for_a_registered_worker_starts_nothing(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers["eng-1"] = WorkerRegistration(
-            request_topic=f"sessions/{_SESSION}/workers/eng-1/request", worker_key="Lib"
-        )
+        worker_manager._workers["eng-1"] = WorkerRegistration(worker_key="Lib")
 
         with patch.object(worker_manager, "_spawn_library_worker", new=AsyncMock()) as spawn:
             await worker_manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name="Lib"))
@@ -1263,7 +1207,6 @@ class TestForwardEventToWorker:
     async def test_notifies_a_local_workers_channel(self, worker_manager: WorkerManager) -> None:
         channel = _FakeChannel()
         worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic="",
             worker_key=None,
             channel=channel,  # type: ignore[arg-type]
         )
@@ -1333,12 +1276,10 @@ class TestBroadcastToWorkers:
 
         worker_a, worker_b = _FakeChannel(), _FakeChannel()
         worker_manager._workers["eng-a"] = WorkerRegistration(
-            request_topic="",
             worker_key=None,
             channel=worker_a,  # type: ignore[arg-type]
         )
         worker_manager._workers["eng-b"] = WorkerRegistration(
-            request_topic="",
             worker_key=None,
             channel=worker_b,  # type: ignore[arg-type]
         )
@@ -1357,7 +1298,6 @@ class TestScheduleBroadcast:
 
         channel = _FakeChannel()
         worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic="",
             worker_key=None,
             channel=channel,  # type: ignore[arg-type]
         )
@@ -1398,9 +1338,6 @@ class TestWorkerManagerDomainEventListeners:
         wm = WorkerManager(engine=gtn, event_manager=EventManager())
         wm.attach_transport(
             send_message=AsyncMock(),
-            subscribe_to_topic=AsyncMock(),
-            unsubscribe_from_topic=AsyncMock(),
-            request_client=_FakeRequestClient(),  # type: ignore[arg-type]
         )
         return wm
 
@@ -1412,7 +1349,7 @@ class TestWorkerManagerDomainEventListeners:
 
         wm = worker_manager_with_real_events
         channel = _FakeChannel()
-        wm._workers[_ENGINE] = WorkerRegistration(request_topic="", worker_key=None, channel=channel)  # type: ignore[arg-type]
+        wm._workers[_ENGINE] = WorkerRegistration(worker_key=None, channel=channel)  # type: ignore[arg-type]
 
         wm._event_manager.broadcast_app_event(ConfigChanged(key="x.y", old_value=None, new_value="v"))
         await asyncio.sleep(0)
@@ -1994,9 +1931,7 @@ class TestARemoteWorkerRegisters:
     async def test_a_reset_forgets_remote_workers_and_starts(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
         await _start_on_host_engine(worker_manager)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key="Other", host_engine_id=_HOST_ENGINE
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="Other", host_engine_id=_HOST_ENGINE)
 
         await worker_manager.reset_workers()
 
@@ -2040,9 +1975,7 @@ class TestARemoteWorkerExits:
     @pytest.mark.asyncio
     async def test_a_registered_worker_that_exits_is_removed_at_once(self, worker_manager: WorkerManager) -> None:
         _host_engine(worker_manager)
-        registration = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
-        )
+        registration = WorkerRegistration(worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE)
         worker_manager._workers[_ENGINE] = registration
 
         await _sent_by(
@@ -2059,9 +1992,7 @@ class TestARemoteWorkerExits:
         self, worker_manager: WorkerManager
     ) -> None:
         _host_engine(worker_manager)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE)
 
         await _sent_by(
             _FROM_HOST_ENGINE,
@@ -2079,9 +2010,7 @@ class TestARemoteWorkerExits:
     ) -> None:
         """Before a lease, starting it would load the library there while another run holds that engine."""
         _host_engine(worker_manager)
-        worker_manager._workers[_ENGINE] = WorkerRegistration(
-            request_topic=_WORKER_REQUEST_TOPIC, worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE
-        )
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE)
         await _sent_by(
             _FROM_HOST_ENGINE,
             worker_manager.handle_report_worker_exited_request,
@@ -2675,7 +2604,6 @@ def _served(
 ) -> WorkerRegistration:
     """A worker this engine runs for `owning_engine_id`'s session, not yet recorded."""
     return WorkerRegistration(
-        request_topic="",
         worker_key=worker_key,
         channel=channel,
         serves=_ServedFor(owning_engine_id=owning_engine_id, session_id=session_id, library_name=library_name),
@@ -3117,7 +3045,7 @@ class TestSharingThisEngineBetweenRuns:
         """Workers this engine runs for others share a table with its own, which a start must not replace."""
         _host_engine(worker_manager)
         _register_session(worker_manager)
-        own = WorkerRegistration(request_topic="", worker_key=_LIBRARY)
+        own = WorkerRegistration(worker_key=_LIBRARY)
         worker_manager._workers["w1"] = own
 
         with patch.object(worker_manager, "_start_worker_process", new=AsyncMock()) as spawn:

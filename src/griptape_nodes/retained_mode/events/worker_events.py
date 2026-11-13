@@ -14,8 +14,8 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 class WorkerGoneError(Exception):
     """Raised at whatever was awaiting a worker's reply, once that worker will never send one.
 
-    Carries the reason the worker went away, written where it is known -- eviction and a library
-    reload are different stories and only their own call sites can tell them. Raised rather than
+    Carries the reason the worker went away, written where it is known -- a library reload and a
+    process that stopped are different stories and only their own call sites can tell them. Raised rather than
     cancelling the awaiting task, so a CancelledError keeps its single meaning: the flow was
     cancelled.
 
@@ -23,110 +23,6 @@ class WorkerGoneError(Exception):
     the manager that turns it into a node failure import it at runtime, and events are the leaf of
     the import graph.
     """
-
-
-@dataclass
-@PayloadRegistry.register
-class RegisterWorkerRequest(RequestPayload):
-    """Sent by a worker engine to the orchestrator's session topic to announce itself.
-
-    The orchestrator stores the worker's engine_id and subscribes to the worker's
-    dedicated response topic so it can relay results back to the GUI.
-
-    Args:
-        worker_engine_id: The engine_id of the registering worker.
-        engine_version: The griptape_nodes engine version the worker is running.
-            The orchestrator rejects registrations whose engine_version does not
-            match its own; workers and orchestrators must share a version because
-            the wire shape of every event is tied to the engine build.
-        library_name: The library this worker exclusively serves, or None for a
-            general-purpose worker that can handle any request.
-    """
-
-    worker_engine_id: str
-    engine_version: str
-    library_name: str | None = None
-    broadcast_result: bool = field(default=False, kw_only=True)
-
-
-@dataclass
-@PayloadRegistry.register
-class RegisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Worker registration succeeded.
-
-    Carries no project: the orchestrator sends the worker's first activation down the same path a
-    mid-session switch uses, so there is one sender and one adoption path rather than two that have
-    to be ordered against each other.
-
-    Args:
-        worker_engine_id: The engine_id of the worker that was registered.
-    """
-
-    worker_engine_id: str
-
-
-@dataclass
-@PayloadRegistry.register
-class RegisterWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Worker registration failed."""
-
-
-@dataclass
-@PayloadRegistry.register
-class WorkerHeartbeatRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by the orchestrator to a worker to verify it is still alive.
-
-    Uses SkipTheLineMixin so the worker processes it immediately without queuing,
-    identical to SessionHeartbeatRequest and EngineHeartbeatRequest.
-
-    Args:
-        heartbeat_id: Correlation token to match request with response.
-    """
-
-    heartbeat_id: str
-
-
-@dataclass
-@PayloadRegistry.register
-class WorkerHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Worker heartbeat succeeded — worker is alive.
-
-    Args:
-        heartbeat_id: Correlates with the originating WorkerHeartbeatRequest.
-    """
-
-    heartbeat_id: str
-
-
-@dataclass
-@PayloadRegistry.register
-class UnregisterWorkerRequest(RequestPayload):
-    """Sent by a worker to the orchestrator's session topic on graceful shutdown.
-
-    Args:
-        worker_engine_id: The engine_id of the departing worker.
-    """
-
-    worker_engine_id: str
-    broadcast_result: bool = field(default=False, kw_only=True)
-
-
-@dataclass
-@PayloadRegistry.register
-class UnregisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Worker unregistration succeeded.
-
-    Args:
-        worker_engine_id: The engine_id of the worker that was removed.
-    """
-
-    worker_engine_id: str
-
-
-@dataclass
-@PayloadRegistry.register
-class UnregisterWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Worker unregistration failed."""
 
 
 @dataclass
