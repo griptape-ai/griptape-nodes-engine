@@ -12,6 +12,46 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.110.0] - 2026-11-13
+
+### Added
+
+- The chat agent can now read library docs.
+- Libraries can now ship their own docs in a `docs/` folder next to their manifest. See
+  [Writing Docs for Your Library](https://docs.griptapenodes.com/en/stable/development/custom_nodes/library_documentation/).
+
+### Changed
+
+- Scanning workflows (project switch, engine start, registry refresh) now sends at most ten
+  `EngineInitializationProgress` events a second instead of two per workflow. Failures and the
+  final event are still sent, so clients that counted every per-workflow event receive fewer.
+
+### Fixed
+
+- Load 3D's Save Snapshot fills the node's `image` output again: a serialized artifact dict
+  keeps its `metadata` when it's normalized into an artifact.
+  [#6311](https://github.com/griptape-ai/griptape-nodes-engine/issues/6311)
+- `Workflow Node`s that run at the same time, in parallel branches or in a loop set to
+  "Run Group Items All at Once", now each load their workflow into a flow of their own. Before,
+  one node could silently load the same copy of the workflow as another node, or load its copy
+  into the wrong flow, so the run could use another node's workflow without any error.
+  [#5665](https://github.com/griptape-ai/griptape-nodes-engine/issues/5665)
+- Deleting a node while its workflow is running, or deleting two nodes at the same time, no longer
+  lets other requests see the node being deleted as the current node, or mix up which node each
+  delete is working on.
+  [#5665](https://github.com/griptape-ai/griptape-nodes-engine/issues/5665)
+- The editor can again switch projects, open workflows, and create workflows. Requests that name no
+  workflow act on the only open workflow again, instead of failing with "the request names no
+  workflow".
+- End Flow's `result_details` now shows only the current run's `[SUCCEEDED]` or `[FAILED]` status.
+  Before, it added another status line on every run when nothing was connected to it, and saving
+  kept the extra lines in the workflow.
+  [#6304](https://github.com/griptape-ai/griptape-nodes-engine/issues/6304)
+- Running a node again while another node is still running no longer fails with only the node's
+  name as the error. Before, the node also refused every later run until the other node finished,
+  and then ran by itself anyway.
+  [#5562](https://github.com/griptape-ai/griptape-nodes-engine/issues/5562)
+
 ## [0.109.0] - 2026-11-11
 
 ### Added
@@ -1200,7 +1240,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.109.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.110.0...HEAD
+[0.110.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.109.0...v0.110.0
 [0.109.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.0...v0.109.0
 [0.108.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.107.0...v0.108.0
 [0.107.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...v0.107.0
