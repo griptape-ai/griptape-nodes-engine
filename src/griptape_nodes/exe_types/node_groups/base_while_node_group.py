@@ -53,7 +53,9 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
         name: str,
         metadata: dict[Any, Any] | None = None,
     ) -> None:
-        super().__init__(name, metadata)
+        # Done / Continue are this group's inner control inputs and mean stop or retry, so no On Start /
+        # Group Complete: a crossing control wire meets only the entry and exit ports.
+        super().__init__(name, metadata, inner_control_ports=False)
 
         # Initialize loop state
         self._current_iteration = 0

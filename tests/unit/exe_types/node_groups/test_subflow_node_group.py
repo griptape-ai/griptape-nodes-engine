@@ -105,8 +105,8 @@ class TestRegisterSideParameter:
         """A group built from nothing names its own control ports, once each."""
         group = _MiniSubflowGroup(name="fresh")
 
-        expected_left = {"group_exec_in"}
-        expected_right = {"group_exec_out"}
+        expected_left = {"group_exec_in", "on_start"}
+        expected_right = {"group_exec_out", "group_complete"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -136,8 +136,8 @@ class TestRegisterSideParameter:
 
         group = _MiniSubflowGroup(name="restored", metadata=saved_metadata)
 
-        expected_left = {"group_exec_in", "prompt", "seed"}
-        expected_right = {"group_exec_out", "image"}
+        expected_left = {"group_exec_in", "on_start", "prompt", "seed"}
+        expected_right = {"group_exec_out", "group_complete", "image"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -178,8 +178,8 @@ class TestDedupeSideParameters:
 
         group = _MiniSubflowGroup(name="restored", metadata=saved_metadata)
 
-        expected_left = {"group_exec_in", "prompt", "seed"}
-        expected_right = {"group_exec_out", "image"}
+        expected_left = {"group_exec_in", "on_start", "prompt", "seed"}
+        expected_right = {"group_exec_out", "group_complete", "image"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -203,9 +203,9 @@ class TestDedupeSideParameters:
         right_rails = [generation.metadata[RIGHT_PARAMETERS_KEY] for generation in generations]
 
         # Generation 1 is built from nothing, so the subclass's names appear exactly once.
-        assert right_rails[0] == ["group_exec_out", "old_a", "old_b"]
+        assert right_rails[0] == ["group_exec_out", "group_complete", "old_a", "old_b"]
         # Generation 2 normalises what it was given, then the subclass appends its names again.
-        assert right_rails[1] == ["group_exec_out", "old_a", "old_b", "old_a", "old_b"]
+        assert right_rails[1] == ["group_exec_out", "group_complete", "old_a", "old_b", "old_a", "old_b"]
         # From there it is stable: no further copies accumulate.
         assert right_rails[2] == right_rails[1]
         assert right_rails[3] == right_rails[1]
@@ -256,8 +256,8 @@ class TestCreateProxyParameterForConnection:
         )
 
         assert proxy.name == self.PROXY_NAME
-        expected_left = {"group_exec_in", self.PROXY_NAME}
-        expected_right = {"group_exec_out"}
+        expected_left = {"group_exec_in", "on_start", self.PROXY_NAME}
+        expected_right = {"group_exec_out", "group_complete"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -274,8 +274,8 @@ class TestCreateProxyParameterForConnection:
         )
 
         assert proxy.name == self.PROXY_NAME
-        expected_left = {"group_exec_in"}
-        expected_right = {"group_exec_out", self.PROXY_NAME}
+        expected_left = {"group_exec_in", "on_start"}
+        expected_right = {"group_exec_out", "group_complete", self.PROXY_NAME}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
