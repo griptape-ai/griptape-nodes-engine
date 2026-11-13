@@ -424,7 +424,7 @@ async def _serve(side: WorkerSide, library_names: list[str], worker_engine_id: s
             f"which project to run against within {_PROJECT_SETTLE_TIMEOUT_S:.0f} seconds."
         )
         raise WorkerStartupError(msg) from None
-    adopted_project_id, _ = engine.project_manager.committed_project()
+    adopted_project_id = engine.project_manager.committed_project_id
     # Deriving the project from the shared config is what system defaults means; a concrete project
     # is the parent's, and deriving would overwrite it.
     if adopted_project_id == SYSTEM_DEFAULTS_KEY:

@@ -27,6 +27,8 @@ import pytest
 from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
     ActivateProjectRequest,
+    ActivateProjectResultFailure,
+    ActivateProjectResultSuccess,
     DropAllLocalObjectsRequest,
     DropAllLocalObjectsResultFailure,
     DropAllLocalObjectsResultSuccess,
@@ -37,10 +39,12 @@ from griptape_nodes.app.worker_routing import (
     RemoteHandler,
     _handle_drop_all_local_objects,
     _handle_drop_local_objects,
+    _ProjectAdoptions,
     register_broadcast_handlers,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.events.base_events import (
+    EventResultFailure,
     EventResultSuccess,
     RequestPayload,
     ResultPayload,
@@ -59,6 +63,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectResultSuccess,
 )
 from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
+from griptape_nodes.retained_mode.events.worker_events import (
+    GetCommittedProjectRequest,
+    GetCommittedProjectResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope
 
@@ -605,9 +613,6 @@ class _ProjectManagerThatRequestsSynchronously:
         self.adopted_on_thread: str | None = None
         self.probe_succeeded: bool | None = None
 
-    def is_stale_adoption(self, project_id: str, generation: int) -> bool:  # noqa: ARG002
-        return False
-
     async def ensure_project_loaded(self, project_id: str) -> bool:  # noqa: ARG002
         return True
 
@@ -616,9 +621,6 @@ class _ProjectManagerThatRequestsSynchronously:
         probe_result = self._event_manager.handle_request(_ProbeRequest(marker="sync", broadcast_result=False))
         self.probe_succeeded = probe_result.succeeded()
         return SetCurrentProjectResultSuccess(result_details="ok")
-
-    def record_adopted_generation(self, generation: int) -> None:
-        pass
 
 
 def _install_adoption(
@@ -660,7 +662,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         assert handler is not None
         assert not isinstance(handler, ForwardingHandler)
 
-        result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
+        result = await handler(ActivateProjectRequest(project_id="next-project"))
 
         assert result.succeeded()
         assert project_manager.adopted_on_thread == "engine-loop"
@@ -677,11 +679,147 @@ class TestActivateProjectRunsOnTheEngineLoop:
         assert handler is not None
         assert not isinstance(handler, ForwardingHandler)
 
-        result = await handler(ActivateProjectRequest(project_id="next-project", generation=1))
+        result = await handler(ActivateProjectRequest(project_id="next-project"))
 
         assert result.failed()
         assert project_manager.adopted_on_thread is None
         assert not worker_settled.is_set()
+
+
+class _HeldAdoptions:
+    """Stands in for adopting a project, holding each adoption until the test lets it finish."""
+
+    def __init__(self) -> None:
+        self.adopted: list[str | None] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, project_id: str | None) -> ResultPayload:
+        self.adopted.append(project_id)
+        self.started.set()
+        await self.release.wait()
+        return ActivateProjectResultSuccess(result_details=f"adopted {project_id}")
+
+
+class TestProjectAdoptions:
+    """One adoption at a time; whatever arrives meanwhile is answered by one more."""
+
+    @pytest.mark.asyncio
+    async def test_activations_arriving_during_an_adoption_share_the_next_one(self) -> None:
+        adopt = _HeldAdoptions()
+        adoptions = _ProjectAdoptions(adopt)
+
+        first = asyncio.ensure_future(adoptions.adopt(ActivateProjectRequest()))
+        await adopt.started.wait()
+        second = asyncio.ensure_future(adoptions.adopt(ActivateProjectRequest()))
+        third = asyncio.ensure_future(adoptions.adopt(ActivateProjectRequest()))
+        await asyncio.sleep(0)
+        assert adopt.adopted == [None]
+        adopt.release.set()
+        results = await asyncio.gather(first, second, third)
+
+        assert adopt.adopted == [None, None]
+        assert results[1] is results[2]
+
+    @pytest.mark.asyncio
+    async def test_a_named_project_is_adopted_only_when_every_activation_names_one(self) -> None:
+        adopt = _HeldAdoptions()
+        adopt.release.set()
+        adoptions = _ProjectAdoptions(adopt)
+
+        await adoptions.adopt(ActivateProjectRequest(project_id="from-the-start"))
+        await asyncio.gather(
+            adoptions.adopt(ActivateProjectRequest(project_id="from-the-start")),
+            adoptions.adopt(ActivateProjectRequest()),
+        )
+
+        assert adopt.adopted == ["from-the-start", None]
+
+    @pytest.mark.asyncio
+    async def test_an_adoption_that_raises_fails_its_activations_and_the_next_still_runs(self) -> None:
+        calls: list[str | None] = []
+
+        async def adopt(project_id: str | None) -> ResultPayload:
+            calls.append(project_id)
+            if len(calls) == 1:
+                msg = "registry unreadable"
+                raise RuntimeError(msg)
+            return ActivateProjectResultSuccess(result_details="ok")
+
+        adoptions = _ProjectAdoptions(adopt)
+
+        with pytest.raises(RuntimeError, match="registry unreadable"):
+            await adoptions.adopt(ActivateProjectRequest())
+        result = await adoptions.adopt(ActivateProjectRequest())
+
+        assert result.succeeded()
+        assert calls == [None, None]
+
+
+class _RecordingProjectManager:
+    def __init__(self) -> None:
+        self.set_to: list[str] = []
+
+    async def ensure_project_loaded(self, project_id: str) -> bool:  # noqa: ARG002
+        return True
+
+    async def on_set_current_project_request(self, request: SetCurrentProjectRequest) -> SetCurrentProjectResultSuccess:
+        self.set_to.append(cast("str", request.project_id))
+        return SetCurrentProjectResultSuccess(result_details="ok")
+
+
+class TestAdoptingAsksTheOrchestrator:
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_an_activation_naming_no_project_adopts_the_one_the_orchestrator_is_on(
+        self, engine: Engine, engine_loop: asyncio.AbstractEventLoop
+    ) -> None:
+        event_manager = engine.event_manager
+        _bind_queue_to(event_manager, engine_loop)
+        project_manager = _RecordingProjectManager()
+        worker_settled = register_broadcast_handlers(
+            event_manager, config_manager=MagicMock(), project_manager=cast("ProjectManager", project_manager)
+        )
+        request = GetCommittedProjectRequest()
+        answer = EventResultSuccess(
+            request=request,
+            result=GetCommittedProjectResultSuccess(project_id="the-orchestrators", result_details="ok"),
+        )
+        handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
+        assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
+
+        with patch.object(event_manager, "forward_to_orchestrator", return_value=answer) as asked:
+            result = await handler(ActivateProjectRequest())
+
+        assert result.succeeded()
+        assert isinstance(asked.call_args.args[0], GetCommittedProjectRequest)
+        assert project_manager.set_to == ["the-orchestrators"]
+        assert worker_settled.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10, method="thread")
+    async def test_an_orchestrator_that_does_not_say_which_fails_the_adoption(
+        self, engine: Engine, engine_loop: asyncio.AbstractEventLoop
+    ) -> None:
+        event_manager = engine.event_manager
+        _bind_queue_to(event_manager, engine_loop)
+        project_manager = _RecordingProjectManager()
+        register_broadcast_handlers(
+            event_manager, config_manager=MagicMock(), project_manager=cast("ProjectManager", project_manager)
+        )
+        request = GetCommittedProjectRequest()
+        answer = EventResultFailure(request=request, result=ActivateProjectResultFailure(result_details="refused"))
+        handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
+        assert handler is not None
+        assert not isinstance(handler, ForwardingHandler)
+
+        with patch.object(event_manager, "forward_to_orchestrator", return_value=answer):
+            result = await handler(ActivateProjectRequest())
+
+        assert isinstance(result, ActivateProjectResultFailure)
+        assert "refused" in str(result.result_details)
+        assert project_manager.set_to == []
 
 
 class TestSyncDispatchOnTheWebsocketLoop:
