@@ -243,15 +243,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             run_in_order = EXECUTION_MODE_VALUE_LOOKUP.get(value, True)
             self.set_parameter_value("run_in_order", run_in_order)
 
-            # Hide or show skip/break controls based on execution mode
-            # Skip and Break are only supported in sequential mode (run_in_order=True)
+            # Skip works in both modes: a skipped iteration adds nothing to results. Break is only
+            # shown when running in order, since in parallel every iteration has already started.
             if run_in_order:
-                # Show controls when running sequentially
-                self.show_parameter_by_name(self.skip_iteration.name)
                 self.show_parameter_by_name(self.break_loop.name)
             else:
-                # Hide controls when running in parallel (not supported)
-                self.hide_parameter_by_name(self.skip_iteration.name)
                 self.hide_parameter_by_name(self.break_loop.name)
         elif parameter == self.flatten_results:
             if value:
