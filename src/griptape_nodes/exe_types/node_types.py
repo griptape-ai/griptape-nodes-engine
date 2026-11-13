@@ -2799,7 +2799,7 @@ class EndNode(BaseNode):
         else:
             details = status_prefix
 
-        self.status_component.set_execution_result(was_successful=was_successful, result_details=details)
+        self.status_component.set_was_successful(was_successful=was_successful)
 
         # Update all values to use the output value
         for param in self.parameters:
@@ -2808,6 +2808,11 @@ class EndNode(BaseNode):
                 # stays the key it already is instead of being resolved and parked a second time.
                 value = self._get_raw_parameter_value(param.name)
                 self.parameter_output_values[param.name] = value
+
+        # The message is this node's output, which publishing writes. The result_details input keeps
+        # what the flow supplied, so the next run does not read this run's message as its details.
+        self.publish_update_to_parameter("result_details", details)
+
         entry_parameter = self._entry_control_parameter
         # Update which control parameter to flag as the output value.
         if entry_parameter is not None:
