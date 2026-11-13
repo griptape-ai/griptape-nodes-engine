@@ -234,6 +234,7 @@ class LibraryDocs:
                     name=name,
                     title=_first_text(page.frontmatter_title if page else None, name),
                     has_page=page_path is not None,
+                    page_path=self._relative_to_docs(page_path),
                     description=page.description if page else None,
                     when_to_use=page.when_to_use if page else None,
                 )
@@ -339,6 +340,12 @@ class LibraryDocs:
                 )
             )
 
+    def _relative_to_docs(self, page_path: Path | None) -> str | None:
+        """A page's path relative to the docs folder, or None when there is no page."""
+        if page_path is None or self.docs_root is None:
+            return None
+        return page_path.relative_to(self.docs_root).as_posix()
+
     def _node_entry(self, node_type: str, metadata: NodeMetadata) -> DocumentationNodeEntry:
         page_path = self._index.node_pages.get(node_type)
         page = _read_for_listing(page_path)
@@ -347,6 +354,7 @@ class LibraryDocs:
             title=_first_text(page.frontmatter_title if page else None, metadata.display_name),
             category=metadata.category,
             has_page=page_path is not None,
+            page_path=self._relative_to_docs(page_path),
             description=_first_text(page.description if page else None, metadata.description),
             when_to_use=page.when_to_use if page else None,
         )

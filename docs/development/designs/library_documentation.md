@@ -181,12 +181,13 @@ GetNodeDocumentationRequest(node_name: str | None, node_type: str | None, librar
      )
 ListLibraryDocumentationRequest(library: str)
   -> overview_path, pages (flat list in display order, folders ahead of their pages),
-     nodes, templates, skills
+     nodes, templates, skills   # nodes and templates carry page_path (relative to the docs folder, None with no page)
 GetLibraryDocumentationPageRequest(library: str, path: str, offset: int, limit: int | None)
   -> title, markdown, total_chars, truncated, description, when_to_use, assets_root
 ```
 
 - A node request names either `node_name` (a node on the canvas) or `node_type`. With `node_name`, the type and library come from the node, and `parameters` are the node's own, so two nodes of the same type can report different parameters. With `node_type`, `parameters` are the type's defaults. If both are given they must agree, and if neither is given the request fails.
+- `page_path` on a node or template entry is the path of its page relative to the docs folder, in the form the page request takes. A relative link inside a page resolves against the page it sits in, and the editor matches the result against these paths to open the right node or template.
 - `offset` and `limit` read a long page in parts. `total_chars` is the whole page and `truncated` says whether the text stops early.
 - The docs are read from the installed library on disk and served by the engine to the editor, so nothing leaves the machine. Reading docs needs no network, which makes them usable in air-gapped environments.
 - Markdown travels in the response, so remote engines work.

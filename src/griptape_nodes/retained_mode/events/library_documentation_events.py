@@ -65,6 +65,9 @@ class DocumentationNodeEntry:
         category: The node's category in the library manifest
         has_page: True when the library ships a page for this node, False when the
             node falls back to its description and parameter table
+        page_path: Path of the node's page relative to the library's docs folder, using forward
+            slashes, in the form GetLibraryDocumentationPageRequest takes. A relative link in a
+            page resolves to this path. None when there is no page.
         description: The page's description, or the node's manifest description
         when_to_use: The page's `when_to_use` guidance. None when unset.
     """
@@ -73,6 +76,7 @@ class DocumentationNodeEntry:
     title: str
     category: str
     has_page: bool
+    page_path: str | None = None
     description: str | None = None
     when_to_use: str | None = None
 
@@ -85,6 +89,8 @@ class DocumentationTemplateEntry:
         name: The template's filename without `.py`, which is also the name of its page
         title: The page's frontmatter title, or the template's name
         has_page: True when the library ships a page for this template
+        page_path: Path of the template's page relative to the library's docs folder, using forward
+            slashes. None when there is no page.
         description: The page's description. None when unset.
         when_to_use: The page's `when_to_use` guidance. None when unset.
     """
@@ -92,6 +98,7 @@ class DocumentationTemplateEntry:
     name: str
     title: str
     has_page: bool
+    page_path: str | None = None
     description: str | None = None
     when_to_use: str | None = None
 

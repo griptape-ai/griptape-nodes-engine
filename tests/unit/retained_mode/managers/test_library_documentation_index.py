@@ -196,6 +196,8 @@ class TestListings:
         assert documented.description == "Loads a sound file."
         assert documented.when_to_use == "You have a recording."
         assert documented.has_page is True
+        assert documented.page_path == "nodes/LoadAudio.md"
+        assert undocumented.page_path is None
         assert undocumented.title == "Mix Audio"
         assert undocumented.description == "Mix Audio from the manifest"
         assert undocumented.has_page is False
@@ -220,6 +222,8 @@ class TestListings:
         documented, undocumented = docs.template_entries()
 
         assert (documented.name, documented.title, documented.has_page) == ("Text2Image", "Text to image", True)
+        assert documented.page_path == "workflows/Text2Image.md"
+        assert undocumented.page_path is None
         assert (undocumented.name, undocumented.title, undocumented.has_page) == ("Other", "Other", False)
 
     def test_library_with_no_docs_folder_still_lists_its_nodes(self, tmp_path: Path) -> None:
@@ -492,3 +496,34 @@ class TestListingsAreReadOnce:
 
         assert len(docs.page_entries()) == 1
         assert len(docs.node_entries()) == 1
+
+
+class TestNodePagePaths:
+    def test_page_path_is_relative_to_the_docs_folder_wherever_the_page_sits(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/nodes/audio/LoadAudio.md")
+        _write(tmp_path, "docs/nodes/mix_audio.md")
+        _write(tmp_path, "docs/workflow_nodes/ShoutText.md")
+        docs = LibraryDocs(
+            tmp_path,
+            _schema(
+                nodes=[_node("LoadAudio", "Load Audio"), _node("MixAudio", "Mix Audio")],
+                workflow_nodes=[_workflow_node("ShoutText", "Shout Text")],
+            ),
+        )
+
+        paths = {entry.node_type: entry.page_path for entry in docs.node_entries()}
+
+        assert paths == {
+            "LoadAudio": "nodes/audio/LoadAudio.md",
+            "MixAudio": "nodes/mix_audio.md",
+            "ShoutText": "workflow_nodes/ShoutText.md",
+        }
+
+    def test_a_page_path_can_be_read_back_with_read_page(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/nodes/audio/LoadAudio.md", "Body.\n")
+        docs = LibraryDocs(tmp_path, _schema(nodes=[_node("LoadAudio", "Load Audio")]))
+
+        page_path = docs.node_entries()[0].page_path
+
+        assert page_path is not None
+        assert docs.read_page(page_path).markdown == "Body.\n"

@@ -164,6 +164,8 @@ class TestListLibraryDocumentation:
         assert isinstance(result, ListLibraryDocumentationResultSuccess)
         assert result.overview_path == "index.md"
         assert [entry.path for entry in result.pages] == ["index.md", "guides", "guides/getting-started.md"]
+        assert [entry.page_path for entry in result.nodes] == ["nodes/LoadAudio.md", None, None]
+        assert [entry.page_path for entry in result.templates] == ["workflows/Text2Image.md"]
         assert [(entry.node_type, entry.title, entry.has_page) for entry in result.nodes] == [
             ("LoadAudio", "Bring in audio", True),
             ("MixAudio", "Mix Audio", False),
