@@ -42,7 +42,7 @@ A few rules apply to every page:
 
 Everything under `docs/` outside those four folders is a library page. Folders and pages are listed as they sit on disk, alphabetically, with `index.md` first. To choose the order, put a number in front of the filename (`01-getting-started.md`). The number isn't shown. A folder whose name starts with a dot is never shown as pages.
 
-Without an `index.md`, the editor shows the library's README as its overview.
+Without an `index.md`, the editor shows the library's README in its place. The row is labelled **README** instead of **Overview**, since a README is often written for developers. For the **Overview** label, add a `docs/index.md`. A README only stands in when it sits in the docs folder, or at the library root when the library has no `docs/` folder.
 
 ## Frontmatter
 
