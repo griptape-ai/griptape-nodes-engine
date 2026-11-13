@@ -191,6 +191,7 @@ GetLibraryDocumentationPageRequest(library: str, path: str, offset: int, limit: 
 ```
 
 - A node request names either `node_name` (a node on the canvas) or `node_type`. With `node_name`, the type and library come from the node, and `parameters` are the node's own, so two nodes of the same type can report different parameters. With `node_type`, `parameters` are the type's defaults. If both are given they must agree, and if neither is given the request fails.
+- A node entry has a `kind`, `node` or `workflow_node`. The editor lists workflow nodes in their own section, with the same category tree, because a workflow node is a whole saved workflow and not a single step.
 - A tool entry has `title`, `has_page` and `page_path`. Without a page, the editor shows the description from the request's docstring and a table of its fields. A page's `title` and `description` replace those. The manifest does not list tools, so the page name is the only link, the same no-drift rule as nodes.
 - A template entry also carries `image`, the thumbnail from the template file's own metadata, and takes its `description` from that metadata when it has no page.
 - `page_path` on a node or template entry is the path of its page relative to the docs folder, in the form the page request takes. A relative link inside a page resolves against the page it sits in, and the editor matches the result against these paths to open the right node or template.

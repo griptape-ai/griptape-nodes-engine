@@ -29,6 +29,7 @@ from griptape_nodes.node_library.workflow_registry import (
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     DocumentationEntryKind,
     DocumentationNodeEntry,
+    DocumentationNodeKind,
     DocumentationPageEntry,
     DocumentationSkillEntry,
     DocumentationTemplateEntry,
@@ -256,7 +257,7 @@ class LibraryDocs:
     def _build_node_entries(self) -> list[DocumentationNodeEntry]:
         entries = [self._node_entry(node.class_name, node.metadata) for node in self._schema.nodes]
         entries.extend(
-            self._node_entry(workflow_node.node_type, workflow_node.metadata)
+            self._node_entry(workflow_node.node_type, workflow_node.metadata, DocumentationNodeKind.WORKFLOW_NODE)
             for workflow_node in self._schema.workflow_nodes or []
         )
         return entries
@@ -390,7 +391,9 @@ class LibraryDocs:
             return None
         return page_path.relative_to(self.docs_root).as_posix()
 
-    def _node_entry(self, node_type: str, metadata: NodeMetadata) -> DocumentationNodeEntry:
+    def _node_entry(
+        self, node_type: str, metadata: NodeMetadata, kind: DocumentationNodeKind = DocumentationNodeKind.NODE
+    ) -> DocumentationNodeEntry:
         page_path = self._index.node_pages.get(node_type)
         page = _read_for_listing(page_path)
         return DocumentationNodeEntry(
@@ -401,6 +404,7 @@ class LibraryDocs:
             page_path=self._relative_to_docs(page_path),
             description=_first_text(page.description if page else None, metadata.description),
             when_to_use=page.when_to_use if page else None,
+            kind=kind,
         )
 
 

@@ -56,6 +56,13 @@ class DocumentationPageEntry:
     when_to_use: str | None = None
 
 
+class DocumentationNodeKind(StrEnum):
+    """What a node entry is. A workflow node is a saved workflow that behaves like one node."""
+
+    NODE = "node"
+    WORKFLOW_NODE = "workflow_node"
+
+
 @dataclass
 class DocumentationNodeEntry:
     """A node type a library lists, with whether it has a page of its own.
@@ -71,6 +78,8 @@ class DocumentationNodeEntry:
             page resolves to this path. None when there is no page.
         description: The page's description, or the node's manifest description
         when_to_use: The page's `when_to_use` guidance. None when unset.
+        kind: `node` for a node written in code, `workflow_node` for a saved workflow that
+            behaves like one node
     """
 
     node_type: str
@@ -80,6 +89,7 @@ class DocumentationNodeEntry:
     page_path: str | None = None
     description: str | None = None
     when_to_use: str | None = None
+    kind: DocumentationNodeKind = DocumentationNodeKind.NODE
 
 
 @dataclass

@@ -15,6 +15,7 @@ from griptape_nodes.node_library.library_registry import (
 )
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     DocumentationEntryKind,
+    DocumentationNodeKind,
     DocumentationToolEntry,
 )
 from griptape_nodes.retained_mode.managers.library.documentation_index import (
@@ -232,6 +233,18 @@ class TestListings:
         )
 
         assert [entry.node_type for entry in docs.node_entries()] == ["LoadAudio", "ShoutText"]
+
+    def test_a_workflow_node_is_marked_apart_from_a_node(self, tmp_path: Path) -> None:
+        docs = LibraryDocs(
+            tmp_path,
+            _schema(
+                nodes=[_node("LoadAudio", "Load Audio")], workflow_nodes=[_workflow_node("ShoutText", "Shout Text")]
+            ),
+        )
+
+        kinds = {entry.node_type: entry.kind for entry in docs.node_entries()}
+
+        assert kinds == {"LoadAudio": DocumentationNodeKind.NODE, "ShoutText": DocumentationNodeKind.WORKFLOW_NODE}
 
     def test_template_entries(self, tmp_path: Path) -> None:
         _write(tmp_path, "docs/workflows/Text2Image.md", "---\ntitle: Text to image\n---\nText\n")
