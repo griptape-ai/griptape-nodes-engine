@@ -92,7 +92,7 @@ A node with no page is documented by its parameter tooltips, so they matter most
 
 ## Pages for MCP tools
 
-A library can expose request types to agents with `get_mcp_tools` (see [Advanced Libraries](advanced_libraries.md#get_mcp_tools)). The Docs panel lists them under **Agent MCP tools**, whether or not the library has nodes.
+A library can expose request types to agents with `get_mcp_tools` (see [Advanced Libraries](advanced_libraries.md#get_mcp_tools)). The editor offers your library as an MCP server, and the Docs panel lists its tools under **MCP server**, whether or not the library has nodes.
 
 Without a page, a tool is documented by:
 
