@@ -181,7 +181,8 @@ class GetNodeDocumentationRequest(RequestPayload):
         library: Name of the library providing the node type. If omitted and exactly one
             library registers this node type, that library is used; otherwise the request fails.
         offset: Character to start the page text from, to read a long page in parts
-        limit: Most characters of page text to return. None returns the whole page.
+        limit: Most characters of page text to return. None returns the whole page. Over MCP, an unset
+            limit means 64000 characters, and `truncated` tells you to read on with `offset`.
 
     Results: GetNodeDocumentationResultSuccess | GetNodeDocumentationResultFailure (node or node type not found, neither node_name nor node_type given)
     """
@@ -308,7 +309,8 @@ class GetLibraryDocumentationPageRequest(RequestPayload):
         path: Path of the page relative to the library's docs folder, using forward slashes.
             It must stay inside the docs folder.
         offset: Character to start the page text from, to read a long page in parts
-        limit: Most characters of page text to return. None returns the whole page.
+        limit: Most characters of page text to return. None returns the whole page. Over MCP, an unset
+            limit means 64000 characters, and `truncated` tells you to read on with `offset`.
 
     Results: GetLibraryDocumentationPageResultSuccess | GetLibraryDocumentationPageResultFailure (library or page not found, path outside the docs folder)
     """

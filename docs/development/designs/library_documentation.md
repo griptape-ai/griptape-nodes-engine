@@ -212,7 +212,7 @@ Agents read the same docs as people, through the same requests.
 - The list, get-node, and get-page requests are exposed as MCP tools alongside the existing ones.
 - The list response is an `llms.txt`-style index: each page's path, title, `description`, and `when_to_use`. An agent reads the index, then fetches only the pages it needs.
 - Everything returned over MCP is untrusted content, because it comes from the library author. Tool descriptions say so, and an agent treats docs as information and never as instructions to follow.
-- MCP responses are capped at 64 KB, well below the 1 MB page limit. A longer page is cut with a truncation marker, and the tool takes an offset to read the rest.
+- MCP responses are capped at 64,000 characters, well below the 1 MB page limit. The cap applies when the caller leaves `limit` unset, and a caller can ask for more or less. A longer page is cut with a truncation marker, and the tool takes an offset to read the rest.
 - Responses return raw markdown with no editor-specific markup. The generated parameter table is also returned as structured data, so an agent reads names, types, defaults, choices, and ranges without parsing markdown.
 - The sidebar agent can use library docs and skills. It discovers each library's `docs/.agents/skills/` folder in addition to the workspace's `.agents/skills/`, so one loader scans both.
 - Skills are optional. A skill is `docs/.agents/skills/<name>/SKILL.md`. Node pages say what something is, and skills say how to accomplish a task with the library. The list response returns skills flagged as such, with their `description`. The body is fetched on demand.
@@ -272,7 +272,7 @@ The order in which this feature is built. Each phase is a stage of development w
 - No raw HTML, no tabs, and no search request in v1. The engine's only size rule is the 1 MB page limit, and the docs check warns about large files. Frontmatter is limited to `title`, `description` and `when_to_use`.
 - Docs problems are library problems and never stop a library from loading.
 - The manifest has no per-node documentation setting. A node's page is found by its filename, and nothing in the JSON names a doc file. A path in the JSON can drift from the files and go stale, and the convention keeps the format simple for node authors and for agents.
-- MCP responses are capped at 64 KB per call.
+- MCP page reads are capped at 64,000 characters per call unless the caller sets a limit.
 
 ## Open questions
 

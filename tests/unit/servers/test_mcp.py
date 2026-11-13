@@ -22,6 +22,7 @@ from griptape_nodes.servers.mcp import (
     _BATCH_PER_REQUEST_TIMEOUT_MS,
     ENGINE_TOOLS,
     EVENT_REQUEST_BATCH_TOOL_NAME,
+    MCP_DOC_PAGE_LIMIT_CHARS,
     SUPPORTED_REQUEST_EVENTS,
     ToolCallSender,
     _build_batch_requests,
@@ -191,6 +192,70 @@ class TestBuildBatchPairs:
             _build_batch_requests(
                 [{"request_type": "CreateNodeRequest", "request": {"node_type": "X", "bogus_field": 1}}], ENGINE_TOOLS
             )
+
+
+CALLER_LIMIT = 500
+
+
+class TestLibraryDocsTools:
+    def test_the_docs_requests_are_tools_the_agent_can_call(self) -> None:
+        for name in (
+            "GetNodeDocumentationRequest",
+            "ListLibraryDocumentationRequest",
+            "GetLibraryDocumentationPageRequest",
+        ):
+            assert name in SUPPORTED_REQUEST_EVENTS
+            assert name in ENGINE_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_a_page_read_without_a_limit_comes_back_in_a_capped_part(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            seen["payload"] = payload
+            return {"result_type": "GetLibraryDocumentationPageResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            await call_tool(
+                _NO_CONTEXT,
+                CallToolRequestParams(
+                    name="GetLibraryDocumentationPageRequest", arguments={"library": "Lib", "path": "index.md"}
+                ),
+            )
+
+        assert seen["payload"].limit == MCP_DOC_PAGE_LIMIT_CHARS  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_a_limit_the_caller_sets_is_kept(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(payload: object, _sender: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            seen["payload"] = payload
+            return {"result_type": "GetNodeDocumentationResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            await call_tool(
+                _NO_CONTEXT,
+                CallToolRequestParams(
+                    name="GetNodeDocumentationRequest", arguments={"node_type": "Agent", "limit": CALLER_LIMIT}
+                ),
+            )
+
+        assert seen["payload"].limit == CALLER_LIMIT  # type: ignore[attr-defined]
+
+    def test_a_batched_docs_read_gets_the_same_cap(self) -> None:
+        (request,) = _build_batch_requests(
+            [{"request_type": "GetNodeDocumentationRequest", "request": {"node_type": "Agent"}}], ENGINE_TOOLS
+        )
+
+        assert request.limit == MCP_DOC_PAGE_LIMIT_CHARS  # type: ignore[attr-defined]
+
+    def test_the_listing_is_left_alone(self) -> None:
+        (request,) = _build_batch_requests(
+            [{"request_type": "ListLibraryDocumentationRequest", "request": {"library": "Lib"}}], ENGINE_TOOLS
+        )
+
+        assert not hasattr(request, "limit")
 
 
 class TestResolveBatchTimeoutMs:
