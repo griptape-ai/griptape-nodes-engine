@@ -46,6 +46,7 @@ async def test_finished_node_leaves_the_set(monkeypatch: pytest.MonkeyPatch) -> 
     node = MagicMock(spec=BaseNode)
     node.name = "Done"
     node.lock = False
+    node.is_frozen = False
     node.state = NodeResolutionState.RESOLVING
     node.parameter_values = {}
     node.parameter_output_values = {}

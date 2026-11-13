@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -695,6 +695,10 @@ class GetPublishOptionsRequest(RequestPayload):
     workflow_id: str | None = None
     publisher_name: str = field(kw_only=True)
     current_selections: dict | None = None  # current user selections; used for dependent field resolution
+    # The values held by this workflow's Configuration node for the target, read by the engine. None
+    # when the target declares no Configuration node or the workflow doesn't have one yet. Clients
+    # leave it unset; the engine fills it before calling the publisher.
+    configuration: dict[str, Any] | None = None
 
 
 @dataclass
@@ -738,6 +742,12 @@ class PublishWorkflowRegisteredEventData:
         description: Optional short description of the publishing target. When set, the GUI may show
             it alongside the target in the publish menu/dialog (e.g. as a subtitle or tooltip). When
             None, no description is shown, preserving today's behavior.
+        configuration_node_type: Optional node type of this target's Configuration node, a
+            ``ConfigurationNode`` subclass. When set, the engine creates one in the workflow after the
+            first successful publish, reuses it afterwards, passes its values to the publisher as
+            ``configuration`` and writes back the ``configuration`` the publisher returns. When None,
+            the target keeps no Configuration node.
+        configuration_node_library_name: Library that provides the Configuration node type.
         icon: Optional icon identifier for the publishing target. When set, the GUI may render it
             next to the target in the publish menu/dropdown. The value is either a Lucide icon name
             (e.g. "rocket") or a path/URL to an image the frontend renders as-is (e.g.
@@ -753,6 +763,8 @@ class PublishWorkflowRegisteredEventData:
     display_name: str | None = None
     description: str | None = None
     icon: str | None = None
+    configuration_node_type: str | None = None
+    configuration_node_library_name: str | None = None
 
 
 @dataclass
@@ -779,6 +791,10 @@ class PublishWorkflowRequest(RequestPayload):
     # Deprecated and ignored. Flow results always travel as plain data.
     pickle_control_flow_result: bool = False
     metadata: dict | None = None
+    # The values held by this workflow's Configuration node for the target, read by the engine. None
+    # when the target declares no Configuration node or the workflow doesn't have one yet. Clients
+    # leave it unset; the engine fills it before calling the publisher.
+    configuration: dict[str, Any] | None = None
 
 
 @dataclass
@@ -788,11 +804,15 @@ class PublishWorkflowResultSuccess(ResultPayloadSuccess):
 
     Args:
         published_workflow_file_path: Path to the published workflow file
+        configuration: Values for the engine to store in the target's Configuration node, keyed by
+            parameter name, so the next publish dialog and publish start from them. None leaves the
+            node's values unchanged.
     """
 
     published_workflow_file_path: str
     metadata: dict | None = None
     skip_published_workflow_registration: bool = False
+    configuration: dict[str, Any] | None = None
 
 
 @dataclass

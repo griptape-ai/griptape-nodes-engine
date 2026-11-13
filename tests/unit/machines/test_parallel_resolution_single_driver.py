@@ -37,6 +37,7 @@ def _machine_parked_on_a_node_task() -> _ParkedMachine:
     node = MagicMock(spec=BaseNode)
     node.name = "n"
     node.lock = False
+    node.is_frozen = False
     node.state = NodeResolutionState.RESOLVING
 
     graph = DirectedGraph()

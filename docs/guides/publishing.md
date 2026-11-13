@@ -234,6 +234,37 @@ that need to bundle the common ingredients can reuse the engine's
 `WorkflowPackager` (as the Folder and Nuke publishers do) rather than
 reimplementing that logic.
 
+**Remembering a target's settings.** A publisher that wants the next publish to
+start from this one's answers (an install path, a version, a deployed id) ships a
+Configuration node for its target instead of storing them on the Start Flow node.
+Subclass `ConfigurationNode` from `griptape_nodes.exe_types.node_types`, give it a
+PROPERTY parameter per setting, list it in your library JSON with
+`"hidden_from_library": true` and a display name such as "Nuke Configuration",
+and name it in the registration:
+
+```python
+PublishWorkflowRegisteredEventData(
+    ...,
+    configuration_node_type="NukeConfiguration",
+    configuration_node_library_name=library_data.name,
+)
+```
+
+The engine then does the rest:
+
+- Your `get_publish_options` callback and your publish handler receive the
+    node's values as `request.configuration`, or `None` before the first
+    publish. Pre-fill the dialog and pick up saved state from it.
+- Return the values to remember as `PublishWorkflowResultSuccess.configuration`.
+    After a successful publish the engine adds the node to the workflow if it
+    isn't there yet, writes those values into it, and saves the workflow.
+
+A workflow holds one Configuration node per target. It is not part of the flow:
+it has no control ports, a run never executes it, and it isn't one of the
+workflow's inputs or outputs. Values your target supplies when the published
+workflow runs go on OUTPUT parameters, which the user can wire into the flow.
+Copying or duplicating a Configuration node is refused.
+
 **Finding the workflow inside the bundle.** `package_to_folder` returns a
 `PackagedBundle` telling you where it put things. Every path on it is relative to
 the folder you packaged into. Use `entrypoint_workflow_path` — the workflow your

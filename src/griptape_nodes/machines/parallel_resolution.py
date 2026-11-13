@@ -224,7 +224,7 @@ class ExecuteDagState(State):
         context.unresolved_this_run.discard(current_node.name)
 
         # Check if node was already resolved (shouldn't happen)
-        if current_node.state == NodeResolutionState.RESOLVED and not current_node.lock:
+        if current_node.state == NodeResolutionState.RESOLVED and not current_node.is_frozen:
             logger.error(
                 "DUPLICATE COMPLETION DETECTED: Node '%s' was already RESOLVED but handle_done_nodes was called again from network '%s'. This should not happen!",
                 current_node.name,
@@ -414,7 +414,7 @@ class ExecuteDagState(State):
             # Prepare next node for execution
             next_node.prepare_to_run_again()
             # Locked nodes are not becoming the current control node, so they get no event.
-            if not next_node.lock:
+            if not next_node.is_frozen:
                 context.engine.event_manager.put_event(
                     context.workflow.execution_event(CurrentControlNodeEvent(node_name=next_node.name))
                 )
@@ -467,11 +467,11 @@ class ExecuteDagState(State):
 
         dag_node = context.node_to_reference[node_name]
 
-        # A locked node is frozen: it never executes and keeps its existing output values.
-        # Mark it DONE here rather than queueing it, so pop_done_states propagates those frozen
+        # A frozen node (locked, or a configuration node) never executes and keeps its existing
+        # values. Mark it DONE here rather than queueing it, so pop_done_states propagates those frozen
         # outputs and advances control flow. Gating at queue time (rather than at dispatch) is
         # what keeps it out of the priority queue entirely.
-        if dag_node.node_reference.lock:
+        if dag_node.node_reference.is_frozen:
             dag_node.node_state = NodeState.DONE
             return
 
@@ -501,7 +501,7 @@ class ExecuteDagState(State):
         # it would be rejected by the SetParameterValueRequest handler and escalated into a fatal
         # error, so halt propagation into the locked node quietly instead. Mirrors the
         # editor/manual set-parameter path, which already skips locked destination nodes.
-        if current_node.lock:
+        if current_node.is_frozen:
             return
 
         connections = context.workflow.flows.connections
@@ -605,7 +605,7 @@ class ExecuteDagState(State):
                     continue
                 node_state = node_reference.node_state
                 # If the node is locked, mark it as done so it skips execution
-                if node_reference.node_reference.lock or node_state == NodeState.DONE:
+                if node_reference.node_reference.is_frozen or node_state == NodeState.DONE:
                     node_reference.node_state = NodeState.DONE
 
                     # Set initial data successors (control successors will be added in handle_done_nodes).

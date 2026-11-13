@@ -522,16 +522,27 @@ class BaseNode(ABC):
     def parent_group(self, parent_group: BaseNode | None) -> None:
         self._parent_group = parent_group
 
+    @property
+    def is_frozen(self) -> bool:
+        """Whether a run passes through this node without executing it, keeping its current values.
+
+        A run marks a frozen node done instead of queueing it, pushes no upstream values into it,
+        and hands downstream nodes the values it already holds. A locked node is frozen. Subclasses
+        that never execute (see ``ConfigurationNode``) are frozen without being locked, so the
+        engine can still write their values.
+        """
+        return self.lock
+
     def prepare_to_run_again(self) -> None:
         """Clear this node's resolution so it executes again, and tell the editor it did.
 
-        Locked nodes keep the values they were locked with, so they are left alone.
+        Frozen nodes keep the values they hold, so they are left alone.
 
         Unlike a bare ``make_node_unresolved``, the change event fires from every state
         rather than only from the ones that made visible progress: a node that is about to
         run needs its status cleared in the editor even if it already looked unresolved.
         """
-        if self.lock:
+        if self.is_frozen:
             return
 
         self.make_node_unresolved(
@@ -2633,7 +2644,7 @@ class SuccessFailureNode(BaseNode):
         # _set_status_results and reset by _clear_execution_status, both reached via process()).
         # Follow the success path so locking a node to freeze its outputs doesn't route down
         # Failed or dead-end the control flow.
-        if self.lock:
+        if self.is_frozen:
             return self.control_parameter_out
 
         if self._execution_succeeded is None:
@@ -2817,6 +2828,30 @@ class EndNode(BaseNode):
         # Update which control parameter to flag as the output value.
         if entry_parameter is not None:
             self.parameter_output_values[entry_parameter.name] = CONTROL_INPUT_PARAMETER
+
+
+class ConfigurationNode(BaseNode):
+    """Holds one publish target's settings for a workflow. It is not part of the flow and never executes.
+
+    A library ships one subclass per publish target and names it in its
+    ``PublishWorkflowRegisteredEventData.configuration_node_type``. The engine creates the node
+    after the first successful publish to that target, reuses it on later publishes, hands its
+    values to the publisher, and writes back the values the publisher returns. A workflow holds at
+    most one per target.
+
+    Settings the publish dialog asks for or the publisher records are PROPERTY parameters. Values
+    the target supplies when the published workflow runs (for example a webhook payload) are
+    OUTPUT parameters, which the user can wire into the flow. Configuration nodes have no control
+    parameters and are not part of the workflow's inputs or outputs.
+    """
+
+    @property
+    def is_frozen(self) -> bool:
+        """Always frozen: a run reads this node's values but never executes it or clears them."""
+        return True
+
+    def process(self) -> None:
+        pass
 
 
 # StartLoopNode and EndLoopNode have been moved to base_iterative_nodes.py
