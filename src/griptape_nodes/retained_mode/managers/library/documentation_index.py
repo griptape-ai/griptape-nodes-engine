@@ -21,6 +21,11 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.node_library.workflow_registry import (
+    WorkflowMetadata,
+    WorkflowMetadataError,
+    read_workflow_metadata,
+)
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     DocumentationEntryKind,
     DocumentationNodeEntry,
@@ -49,6 +54,9 @@ _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
 _FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(?P<block>.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 _HEADING = re.compile(r"^#[ \t]+(?P<text>.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^[ \t]*(```|~~~)")
+
+
+_URL_PREFIX = re.compile(r"^(https?|data):", re.IGNORECASE)
 
 
 class DocsProblemKind(StrEnum):
@@ -229,14 +237,20 @@ class LibraryDocs:
             name = Path(workflow_path).stem
             page_path = self._index.template_pages.get(name)
             page = _read_for_listing(page_path)
+            file_path = canonicalize_for_identity(workflow_path, base=self._library_root)
+            metadata = _read_template_metadata(file_path)
             entries.append(
                 DocumentationTemplateEntry(
                     name=name,
                     title=_first_text(page.frontmatter_title if page else None, name),
                     has_page=page_path is not None,
                     page_path=self._relative_to_docs(page_path),
-                    description=page.description if page else None,
+                    description=_first_text(
+                        page.description if page else None, metadata.description if metadata else None
+                    )
+                    or None,
                     when_to_use=page.when_to_use if page else None,
+                    image=_template_image(metadata, file_path),
                 )
             )
         return entries
@@ -560,6 +574,26 @@ def _sorted_children(directory: Path, *, is_top_level: bool) -> list[Path]:
         elif child.is_file() and child.suffix == ".md":
             children.append(child)
     return sorted(children, key=lambda child: (child.name != OVERVIEW_PAGE, child.name.lower()))
+
+
+def _read_template_metadata(file_path: Path) -> WorkflowMetadata | None:
+    """The metadata header of a template file, or None when it can't be read. A bad header never blocks docs."""
+    try:
+        return read_workflow_metadata(file_path)
+    except WorkflowMetadataError:
+        return None
+
+
+def _template_image(metadata: WorkflowMetadata | None, file_path: Path) -> str | None:
+    """The template's thumbnail: a URL as written, or the absolute path of a file that exists."""
+    if metadata is None or not metadata.image:
+        return None
+    if _URL_PREFIX.match(metadata.image):
+        return metadata.image
+    candidate = canonicalize_for_identity(metadata.image, base=file_path.parent)
+    if candidate.is_file():
+        return str(candidate)
+    return None
 
 
 def _first_text(*candidates: str | None) -> str:

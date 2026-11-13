@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from griptape_nodes.node_library.library_registry import (
     NodeDeprecationMetadata,
@@ -91,8 +92,11 @@ class DocumentationTemplateEntry:
         has_page: True when the library ships a page for this template
         page_path: Path of the template's page relative to the library's docs folder, using forward
             slashes. None when there is no page.
-        description: The page's description. None when unset.
+        description: The page's description, or the description in the template file's own metadata
+            when the page gives none. None when neither does.
         when_to_use: The page's `when_to_use` guidance. None when unset.
+        image: The thumbnail named in the template file's metadata. A URL as written, or the absolute
+            path of a file in the library. None when the template names none.
     """
 
     name: str
@@ -101,6 +105,25 @@ class DocumentationTemplateEntry:
     page_path: str | None = None
     description: str | None = None
     when_to_use: str | None = None
+    image: str | None = None
+
+
+@dataclass
+class DocumentationToolEntry:
+    """A tool a library exposes to agents on the engine's MCP server.
+
+    Args:
+        name: The tool's name, which is its request type
+        description: What the tool does, from the request's docstring. Empty when it has none.
+        read_only: True when the tool only reads state
+        input_schema: JSON schema of the fields an agent fills in to call the tool. None when the
+            request's fields can't be described as a schema.
+    """
+
+    name: str
+    description: str
+    read_only: bool
+    input_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -233,6 +256,8 @@ class ListLibraryDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPaylo
         nodes: Every node type the library lists, with whether it has a page of its own
         templates: Every workflow template the library lists, with whether it has a page of its own
         skills: Skills the library ships for agents that use it
+        tools: Tools the library exposes to agents on the engine's MCP server. A library can have
+            tools and no nodes.
     """
 
     library: str
@@ -241,6 +266,7 @@ class ListLibraryDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPaylo
     nodes: list[DocumentationNodeEntry] = field(default_factory=list)
     templates: list[DocumentationTemplateEntry] = field(default_factory=list)
     skills: list[DocumentationSkillEntry] = field(default_factory=list)
+    tools: list[DocumentationToolEntry] = field(default_factory=list)
 
 
 @dataclass

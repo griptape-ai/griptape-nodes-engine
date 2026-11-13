@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -9,6 +10,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, DataNode
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
@@ -18,6 +20,7 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
     WorkflowNodeDefinition,
 )
+from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     GetLibraryDocumentationPageRequest,
     GetLibraryDocumentationPageResultFailure,
@@ -76,6 +79,13 @@ def _schema() -> LibrarySchema:
         ],
         workflows=["workflows/templates/Text2Image.py"],
     )
+
+
+@dataclass
+class _ExampleToolRequest(RequestPayload):
+    """Finds a thing by name."""
+
+    thing_name: str
 
 
 def _write(root: Path, relative: str, text: str) -> None:
@@ -185,6 +195,31 @@ class TestListLibraryDocumentation:
         assert result.pages == []
         assert len(result.nodes) == NODE_COUNT
         assert not any(entry.has_page for entry in result.nodes)
+
+    @pytest.mark.usefixtures("library_root")
+    def test_lists_the_tools_a_library_exposes_to_agents(self, engine: Engine) -> None:
+        library = LibraryRegistry.get_library(name=LIBRARY_NAME)
+        library._mcp_tools.append(MCPTool(request_type=_ExampleToolRequest, read_only=True))
+
+        result = engine.library_manager.documentation.list_library_documentation_request(
+            ListLibraryDocumentationRequest(library=LIBRARY_NAME)
+        )
+
+        assert isinstance(result, ListLibraryDocumentationResultSuccess)
+        (tool,) = result.tools
+        assert (tool.name, tool.read_only) == ("_ExampleToolRequest", True)
+        assert tool.description == "Finds a thing by name."
+        assert tool.input_schema is not None
+        assert "thing_name" in tool.input_schema["properties"]
+
+    @pytest.mark.usefixtures("library_root")
+    def test_a_library_with_no_tools_lists_none(self, engine: Engine) -> None:
+        result = engine.library_manager.documentation.list_library_documentation_request(
+            ListLibraryDocumentationRequest(library=LIBRARY_NAME)
+        )
+
+        assert isinstance(result, ListLibraryDocumentationResultSuccess)
+        assert result.tools == []
 
     def test_unknown_library_fails(self, engine: Engine) -> None:
         result = engine.library_manager.documentation.list_library_documentation_request(

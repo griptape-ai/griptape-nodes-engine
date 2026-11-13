@@ -5,16 +5,20 @@ See docs/development/designs/library_documentation.md.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic.errors import PydanticUserError
+
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.library_documentation_events import (
+    DocumentationToolEntry,
     GetLibraryDocumentationPageRequest,
     GetLibraryDocumentationPageResultFailure,
     GetLibraryDocumentationPageResultSuccess,
@@ -162,6 +166,7 @@ class LibraryDocumentation(EngineScoped):
             nodes=docs.node_entries(),
             templates=docs.template_entries(),
             skills=docs.skill_entries(),
+            tools=_tool_entries(request.library),
             result_details=details,
         )
 
@@ -238,6 +243,26 @@ class LibraryDocumentation(EngineScoped):
         docs = LibraryDocs(_library_root(info), library.get_library_data())
         self._docs_by_library[library] = docs
         return docs
+
+
+def _tool_entries(library_name: str) -> list[DocumentationToolEntry]:
+    """Describe the MCP tools a library exposes, so a library with tools and no nodes still documents itself."""
+    library = LibraryRegistry.get_library(name=library_name)
+    entries: list[DocumentationToolEntry] = []
+    for tool in library.get_mcp_tools():
+        try:
+            schema = tool.input_schema()
+        except PydanticUserError:
+            schema = None
+        entries.append(
+            DocumentationToolEntry(
+                name=tool.request_type.__name__,
+                description=inspect.getdoc(tool.request_type) or "",
+                read_only=tool.read_only,
+                input_schema=schema,
+            )
+        )
+    return entries
 
 
 def _find_node_target(

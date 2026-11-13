@@ -75,6 +75,23 @@ def _write(root: Path, relative: str, text: str = "Some text.\n") -> Path:
     return path
 
 
+def _write_template(root: Path, relative: str, description: str | None = None, image: str | None = None) -> None:
+    lines = [
+        "# /// script",
+        "# [tool.griptape-nodes]",
+        '# name = "Template"',
+        '# schema_version = "0.21.0"',
+        '# engine_version_created_with = "0.98.0"',
+        "# node_libraries_referenced = []",
+    ]
+    if description is not None:
+        lines.append(f'# description = "{description}"')
+    if image is not None:
+        lines.append(f'# image = "{image}"')
+    lines.append("# ///")
+    _write(root, relative, "\n".join(lines) + "\n")
+
+
 class TestMatchingPagesToNodes:
     def test_page_named_after_class_name(self, tmp_path: Path) -> None:
         _write(tmp_path, "docs/nodes/LoadAudio.md")
@@ -225,6 +242,46 @@ class TestListings:
         assert documented.page_path == "workflows/Text2Image.md"
         assert undocumented.page_path is None
         assert (undocumented.name, undocumented.title, undocumented.has_page) == ("Other", "Other", False)
+
+    def test_a_template_without_a_page_takes_its_description_and_thumbnail_from_its_own_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        _write_template(tmp_path, "workflows/templates/Poster.py", description="Makes a poster.", image="poster.png")
+        (tmp_path / "workflows/templates/poster.png").write_bytes(b"png")
+        docs = LibraryDocs(tmp_path, _schema(workflows=["workflows/templates/Poster.py"]))
+
+        (entry,) = docs.template_entries()
+
+        assert entry.description == "Makes a poster."
+        assert entry.image == str((tmp_path / "workflows/templates/poster.png").resolve())
+
+    def test_a_pages_description_wins_over_the_templates_metadata(self, tmp_path: Path) -> None:
+        _write_template(tmp_path, "workflows/templates/Poster.py", description="From the file.")
+        _write(tmp_path, "docs/workflows/Poster.md", "---\ndescription: From the page.\n---\nText\n")
+        docs = LibraryDocs(tmp_path, _schema(workflows=["workflows/templates/Poster.py"]))
+
+        (entry,) = docs.template_entries()
+
+        assert entry.description == "From the page."
+
+    def test_a_thumbnail_that_is_a_url_is_kept_and_one_that_is_missing_is_dropped(self, tmp_path: Path) -> None:
+        _write_template(tmp_path, "workflows/templates/Web.py", image="https://example.com/a.png")
+        _write_template(tmp_path, "workflows/templates/Gone.py", image="missing.png")
+        docs = LibraryDocs(tmp_path, _schema(workflows=["workflows/templates/Web.py", "workflows/templates/Gone.py"]))
+
+        web, gone = docs.template_entries()
+
+        assert web.image == "https://example.com/a.png"
+        assert gone.image is None
+
+    def test_a_template_file_with_no_readable_header_is_still_listed(self, tmp_path: Path) -> None:
+        (tmp_path / "workflows/templates").mkdir(parents=True)
+        (tmp_path / "workflows/templates/Broken.py").write_text("print('hi')\n", encoding="utf-8")
+        docs = LibraryDocs(tmp_path, _schema(workflows=["workflows/templates/Broken.py"]))
+
+        (entry,) = docs.template_entries()
+
+        assert (entry.name, entry.description, entry.image) == ("Broken", None, None)
 
     def test_library_with_no_docs_folder_still_lists_its_nodes(self, tmp_path: Path) -> None:
         docs = LibraryDocs(tmp_path, _schema(nodes=[_node("LoadAudio", "Load Audio")]))
