@@ -70,6 +70,7 @@ from griptape_nodes.retained_mode.managers.library.sandbox import (
     LibrarySandbox,
 )
 from griptape_nodes.retained_mode.managers.library.sync import LibrarySync
+from griptape_nodes.retained_mode.managers.library.uninstall import LibraryUninstall
 from griptape_nodes.retained_mode.managers.library.workers import LibraryWorkers
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
@@ -161,6 +162,7 @@ class LibraryManager(EngineScoped):
         self.discovery = LibraryDiscovery(event_manager, engine=engine)
         self.managed_environment = LibraryManagedEnvironment(engine)
         self.reset = LibraryReset(event_manager, engine=engine)
+        self.uninstall = LibraryUninstall(event_manager, engine=engine)
         event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
@@ -214,6 +216,10 @@ class LibraryManager(EngineScoped):
 
     def find_library_info_for_attempted_load(self, library_file_path: str) -> LibraryInfo | None:
         return self._library_file_path_to_info.get(library_file_path)
+
+    def forget_attempted_load(self, library_file_path: str) -> None:
+        """Stop tracking the copy at `library_file_path`, if it is tracked."""
+        self._library_file_path_to_info.pop(library_file_path, None)
 
     def get_library_info_by_library_name(self, library_name: str) -> LibraryInfo | None:
         # A library name can have more than one entry: a duplicate install registers a second
