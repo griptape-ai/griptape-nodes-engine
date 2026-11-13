@@ -56,8 +56,8 @@ when_to_use: When to pick this over something else.
 ---
 ```
 
-- `title` replaces the default. A node page without one uses the node's display name, a tool page uses the request type, and a library page uses its first heading.
-- `description` is the line under the title. On a node or tool page it replaces the description the library registered.
+- `title` replaces the default. A node page without one uses the node's display name, an MCP tool page uses the request type, and a library page uses its first heading.
+- `description` is the line under the title. On a node or MCP tool page it replaces the description the library registered.
 - `when_to_use` is guidance for agents choosing which page to open.
 
 Unknown fields are ignored.
@@ -156,4 +156,4 @@ It defaults to `docs`. Set it when the manifest sits in a package subfolder and 
 
 A page you add shows up after the library is loaded again. A change to the text of a page you already have shows up the next time you open it.
 
-The [library template](https://github.com/griptape-ai/griptape-nodes-library-template) has a working example of every folder above, including a tool page.
+The [library template](https://github.com/griptape-ai/griptape-nodes-library-template) has a working example of every folder above, including an MCP tool page.
