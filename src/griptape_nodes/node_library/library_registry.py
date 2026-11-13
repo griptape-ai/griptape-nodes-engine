@@ -256,8 +256,9 @@ class LibrarySchema(BaseModel):
 
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
     # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
-    # optional beta_features list, which older engines ignore.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.14.0"
+    # optional beta_features list, which older engines ignore. 0.15.0 adds the optional
+    # documentation_path, which older engines ignore.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.15.0"
 
     name: str
     library_schema_version: str
@@ -276,6 +277,10 @@ class LibrarySchema(BaseModel):
     # whole manifest. parse_library_beta_features checks each one, and the load reports the
     # dropped ones as library problems.
     beta_features: list[Any] | None = None
+    # Folder holding the library's docs, relative to the manifest. None means "docs" next to it.
+    # Set it to reach docs outside the manifest's folder, such as "../docs" when the manifest sits
+    # in a package subfolder.
+    documentation_path: str | None = None
 
 
 class LibraryRegistry:

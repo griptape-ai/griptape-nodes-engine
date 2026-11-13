@@ -14,6 +14,7 @@ ONLY_OPEN_UNTIL_CLIENTS_NAME: frozenset[str] = frozenset(
         "EnsureWorkflowAndFlowRequest",
         "ExecuteNodeRequest",
         "ExtractFlowCommandsFromImageMetadataRequest",
+        "GetNodeDocumentationRequest",
         "GetPublishOptionsRequest",
         "GetWorkflowContextRequest",
         "GetTopLevelFlowRequest",
