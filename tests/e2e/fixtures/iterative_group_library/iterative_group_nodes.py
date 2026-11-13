@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import ControlParameterOutput, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.exe_types.node_types import ControlNode, DataNode, EndNode, StartNode
 
@@ -64,6 +64,32 @@ class LoopBodyControlNode(ControlNode):
 
     def process(self) -> None:
         self.parameter_output_values["result"] = str(self.get_parameter_value("text"))
+
+
+class SkipIndexOneControlNode(ControlNode):
+    """A loop filter: sends control out ``drop`` on index 1 and out ``keep`` otherwise."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(ControlParameterOutput(name="keep"))
+        self.add_parameter(ControlParameterOutput(name="drop"))
+        self.add_parameter(
+            Parameter(
+                name="index",
+                tooltip="Index of the item to filter",
+                type="int",
+                default_value=0,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        return None
+
+    def get_next_control_output(self) -> Parameter | None:
+        if self.get_parameter_value("index") == 1:
+            return self.get_parameter_by_name("drop")
+        return self.get_parameter_by_name("keep")
 
 
 class CounterControlNode(ControlNode):

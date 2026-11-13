@@ -11,7 +11,11 @@ from griptape_nodes.exe_types.core_types import (
     ControlParameterInput,
     ControlParameterOutput,
 )
-from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
+from griptape_nodes.exe_types.node_groups.base_iterative_node_group import (
+    EXECUTION_MODE_ALL_AT_ONCE,
+    EXECUTION_MODE_ONE_AT_A_TIME,
+    BaseIterativeNodeGroup,
+)
 from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     LEFT_PARAMETERS_KEY,
     RIGHT_PARAMETERS_KEY,
@@ -297,3 +301,19 @@ class TestFlattenResults:
         settings = iterative_group.metadata["group_settings_params"]
         assert "flatten_results" in settings
         assert "flatten_depth" in settings
+
+
+class TestExecutionModeControlVisibility:
+    def test_skip_stays_visible_when_running_all_at_once(self, iterative_group: MockIterativeGroup) -> None:
+        skip = iterative_group.get_parameter_by_name("skip_iteration")
+        assert skip is not None
+        iterative_group.set_parameter_value("execution_mode", EXECUTION_MODE_ALL_AT_ONCE)
+        assert not skip.ui_options.get("hide")
+
+    def test_break_shows_only_when_running_one_at_a_time(self, iterative_group: MockIterativeGroup) -> None:
+        break_loop = iterative_group.get_parameter_by_name("break_loop")
+        assert break_loop is not None
+        iterative_group.set_parameter_value("execution_mode", EXECUTION_MODE_ALL_AT_ONCE)
+        assert break_loop.ui_options.get("hide") is True
+        iterative_group.set_parameter_value("execution_mode", EXECUTION_MODE_ONE_AT_A_TIME)
+        assert not break_loop.ui_options.get("hide")
