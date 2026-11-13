@@ -73,7 +73,6 @@ class TestGetWorkerForLibrary:
     def test_returns_worker_when_registered(self) -> None:
         mgr = _make_library_manager()
         worker_engine_id = "eng-xyz"
-        worker_request_topic = "sessions/s/workers/eng-xyz/request"
         lib_info = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
             fitness=LibraryManager.LibraryFitness.GOOD,
@@ -83,14 +82,11 @@ class TestGetWorkerForLibrary:
             executes_in_worker=True,
         )
 
-        cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = (
-            worker_engine_id,
-            worker_request_topic,
-        )
+        cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = worker_engine_id
         mgr._library_file_path_to_info["/some/path.json"] = lib_info
         result = mgr.workers.get_worker_for_library("my_lib")
 
-        assert result == (worker_engine_id, worker_request_topic)
+        assert result == worker_engine_id
 
     def test_returns_none_when_no_worker_and_not_required(self) -> None:
         mgr = _make_library_manager()

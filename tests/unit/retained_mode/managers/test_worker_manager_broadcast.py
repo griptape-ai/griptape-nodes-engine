@@ -17,8 +17,8 @@ class TestBroadcastToWorkers:
     async def test_unsendable_event_is_logged_not_raised(self, caplog: pytest.LogCaptureFixture) -> None:
         manager = WorkerManager.__new__(WorkerManager)
         manager._workers = {
-            "worker-1": WorkerRegistration(request_topic="workers/1/request", worker_key=None),
-            "worker-2": WorkerRegistration(request_topic="workers/2/request", worker_key=None),
+            "worker-1": WorkerRegistration(worker_key=None),
+            "worker-2": WorkerRegistration(worker_key=None),
         }
         manager.forward_event_to_worker = AsyncMock(side_effect=EventSerializationError("boom"))
         event = EventRequest(request=ReloadConfigRequest())

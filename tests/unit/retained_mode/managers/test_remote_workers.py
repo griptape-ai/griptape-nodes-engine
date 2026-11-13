@@ -135,9 +135,7 @@ def _start_worker_end(link: WorkerLink, answer: Callable[[dict], dict]) -> None:
 def artist() -> Engine:
     """The artist's engine, which has asked `_SERVING` to run `_WORKER` for it."""
     engine = Engine()
-    engine.worker_manager._workers[_WORKER] = WorkerRegistration(
-        request_topic="", worker_key=_LIBRARY, host_engine_id=_SERVING
-    )
+    engine.worker_manager._workers[_WORKER] = WorkerRegistration(worker_key=_LIBRARY, host_engine_id=_SERVING)
     return engine
 
 
@@ -1045,7 +1043,6 @@ def _host(
 def _served() -> WorkerRegistration:
     """A worker the serving engine runs for `_ARTIST`'s session, not yet recorded."""
     return WorkerRegistration(
-        request_topic="",
         worker_key=f"session/{_LIBRARY}",
         serves=_ServedFor(owning_engine_id=_ARTIST, session_id="session", library_name=_LIBRARY),
     )

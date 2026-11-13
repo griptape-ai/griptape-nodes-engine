@@ -229,7 +229,7 @@ class TestEveryCloseTellsTheWorkers:
 
         with (
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
             patch.object(engine.event_manager, "_event_loop", asyncio.get_running_loop()),
             patch.object(worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all,
         ):
@@ -256,7 +256,7 @@ class TestEveryCloseTellsTheWorkers:
 
         with (
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(request_topic="", worker_key=None)}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
             patch.object(engine.event_manager, "_event_loop", asyncio.get_running_loop()),
             patch.object(worker_manager, "broadcast_drop_all_local_objects", side_effect=drop_all),
         ):

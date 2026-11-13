@@ -951,7 +951,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
 
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
@@ -990,7 +990,7 @@ class TestExecuteNodeWorkerRoute:
         wm.worker_unavailable_reason.return_value = None
         wm.wait_until_executable = AsyncMock(side_effect=lambda *_, **__: calls.append("wait"))
         wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
-        lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or "eng-id"
         wm.route_to_worker = AsyncMock(side_effect=run)
         wm.release_after_node = MagicMock(side_effect=lambda *_: calls.append("release"))
 
@@ -1046,7 +1046,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
 
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
@@ -1076,7 +1076,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
 
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
@@ -1095,7 +1095,7 @@ def _make_orchestrator_library_manager() -> MagicMock:
     lib_mgr = MagicMock()
     lib_mgr.is_worker = False
     lib_mgr._is_worker = False
-    lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+    lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
     return lib_mgr
 
 
@@ -1156,15 +1156,13 @@ class TestExecuteNodeWorkerValues:
 class TestExecuteNodePrivateExecutionRoute:
     """Orchestrator-side routing of a node run inside an Isolated Execution scope to the worker it names."""
 
-    _LIBRARY_WORKER = ("library-eng-id", "library-topic")
-    _PRIVATE_WORKER = ("private-eng-id", "private-topic")
+    _LIBRARY_WORKER = "library-eng-id"
+    _PRIVATE_WORKER = "private-eng-id"
 
     def _make_node(self) -> Any:
         return _make_routed_node(name="test_node", library="some_library")
 
-    def _make_worker_manager(
-        self, private_worker: tuple[str, str] | None, unavailable_reason: str | None = None
-    ) -> MagicMock:
+    def _make_worker_manager(self, private_worker: str | None, unavailable_reason: str | None = None) -> MagicMock:
         wm = MagicMock()
         wm.worker_unavailable_reason.return_value = unavailable_reason
         wm.get_worker_for_key.return_value = private_worker
@@ -1182,7 +1180,7 @@ class TestExecuteNodePrivateExecutionRoute:
         wm: MagicMock,
         *,
         scope_owner: str | None = "My Group",
-        library_worker: tuple[str, str] | None = None,
+        library_worker: str | None = None,
         load_failure: str | None = None,
     ) -> ExecuteNodeResultSuccess | ExecuteNodeResultFailure:
         lib_mgr = _make_mock_library_manager(is_worker=False)
@@ -1219,7 +1217,7 @@ class TestExecuteNodePrivateExecutionRoute:
         assert isinstance(result, ExecuteNodeResultSuccess)
         wm.wait_until_executable.assert_any_await(None)
         wm.get_worker_for_key.assert_called_once_with(None)
-        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER[0]
+        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1230,7 +1228,7 @@ class TestExecuteNodePrivateExecutionRoute:
         result = await self._execute(node, wm, library_worker=self._LIBRARY_WORKER)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
-        assert wm.route_to_worker.await_args.args[1] == self._LIBRARY_WORKER[0]
+        assert wm.route_to_worker.await_args.args[1] == self._LIBRARY_WORKER
         wm.get_worker_for_key.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1303,5 +1301,5 @@ class TestExecuteNodePrivateExecutionRoute:
         result = await self._execute(node, wm)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
-        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER[0]
+        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()

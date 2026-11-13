@@ -208,8 +208,8 @@ class LibraryWorkers(EngineScoped):
             return None
         return None
 
-    def get_worker_for_library(self, library_name: str | None) -> tuple[str, str] | None:
-        """Return (worker_engine_id, worker_request_topic) for the worker serving library_name, or None.
+    def get_worker_for_library(self, library_name: str | None) -> str | None:
+        """Return the engine ID of the worker serving library_name, or None.
 
         Raises RuntimeError if the library requires a dedicated worker but none is registered yet.
         Returns None if no worker is registered and none is required.

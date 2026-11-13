@@ -57,9 +57,6 @@ def _worker_manager() -> WorkerManager:
     manager = WorkerManager(engine=engine, event_manager=MagicMock())
     manager.attach_transport(
         send_message=AsyncMock(),
-        subscribe_to_topic=AsyncMock(),
-        unsubscribe_from_topic=AsyncMock(),
-        request_client=MagicMock(fail_requests_by_tag=AsyncMock()),
     )
     manager._orchestrator_static_server_base_url = AsyncMock(return_value=None)  # type: ignore[method-assign]
     return manager

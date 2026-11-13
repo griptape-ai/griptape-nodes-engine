@@ -73,10 +73,7 @@ from griptape_nodes.retained_mode.events.worker_events import (
     DropLibraryNamedLocalObjectsResultSuccess,
     GetCommittedProjectRequest,
     GetCommittedProjectResultSuccess,
-    RegisterWorkerRequest,
     StartWorkerRequest,
-    UnregisterWorkerRequest,
-    WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
@@ -313,13 +310,6 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         ExecuteNodeRequest,
         # Cancels that execution, so it belongs to the process running it.
         CancelExecuteNodeRequest,
-        # Published to the orchestrator, never dispatched here, so this entry is inert. Listed to keep
-        # the worker wire out of the forwarding path by construction rather than by luck.
-        RegisterWorkerRequest,
-        # Same, on graceful shutdown.
-        UnregisterWorkerRequest,
-        # Liveness challenge addressed to this worker; a forwarded answer would prove nothing about it.
-        WorkerHeartbeatRequest,
         # Orchestrator-internal, issued and handled there, so it never crosses the boundary. Inert here.
         StartWorkerRequest,
         # Addressed to this worker: re-read the config file both processes share. The orchestrator

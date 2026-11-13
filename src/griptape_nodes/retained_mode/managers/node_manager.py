@@ -4005,10 +4005,12 @@ class NodeManager(EngineScoped):
                     if wm.worker_unavailable_reason(library_name) is None:
                         lease = await wm.acquire_lease(library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
-                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                worker_engine_id = (
+                    library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                )
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
-            if worker is None:
+            if worker_engine_id is None:
                 return None
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:
@@ -4016,7 +4018,7 @@ class NodeManager(EngineScoped):
             lease_id = None
             if lease is not None:
                 lease_id = lease.lease_id
-            return await self._execute_node_via_worker(workflow, request, wm, worker, lease_id=lease_id)
+            return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id, lease_id=lease_id)
         finally:
             wm.release_after_node(lease)
 
@@ -4039,22 +4041,22 @@ class NodeManager(EngineScoped):
                 f"Failed because {unavailable} Reload your libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker = wm.get_worker_for_key(scope.worker_key)
-        if worker is None:
+        worker_engine_id = wm.get_worker_for_key(scope.worker_key)
+        if worker_engine_id is None:
             details = (
                 f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
                 "Failed because the background process that runs Isolated Execution is not running. Reload your "
                 "libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        return await self._execute_node_via_worker(workflow, request, wm, worker)
+        return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id)
 
     async def _execute_node_via_worker(
         self,
         workflow: WorkflowRuntime,
         request: ExecuteNodeRequest,
         wm: WorkerManager,
-        worker: tuple[str, str],
+        worker_engine_id: str,
         *,
         lease_id: str | None = None,
     ) -> ResultPayload:
@@ -4074,7 +4076,6 @@ class NodeManager(EngineScoped):
                 f"its input {', '.join(unsendable)} cannot be sent there."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
@@ -4085,11 +4086,7 @@ class NodeManager(EngineScoped):
         target_request_id = request.request_id
         # The same dict is cleared below even if the workflow closes while the node runs.
         orch_worker_requests = workflow.nodes.orch_worker_requests
-        orch_worker_requests[request.node_name] = (
-            target_request_id,
-            worker_engine_id,
-            worker_request_topic,
-        )
+        orch_worker_requests[request.node_name] = (target_request_id, worker_engine_id)
         try:
             event_request = EventRequest(request=request)
             event_request.request_id = target_request_id
@@ -4135,7 +4132,7 @@ class NodeManager(EngineScoped):
         entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
-        target_request_id, worker_engine_id, _worker_request_topic = entry
+        target_request_id, worker_engine_id = entry
         wm = self.engine.worker_manager
         cancel_request = CancelExecuteNodeRequest(target_request_id=target_request_id)
         await wm.forward_event_to_worker(EventRequest(request=cancel_request), worker_engine_id=worker_engine_id)
