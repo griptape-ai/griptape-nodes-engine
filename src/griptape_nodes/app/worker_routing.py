@@ -71,10 +71,13 @@ from griptape_nodes.retained_mode.events.worker_events import (
     DropLibraryNamedLocalObjectsRequest,
     DropLibraryNamedLocalObjectsResultFailure,
     DropLibraryNamedLocalObjectsResultSuccess,
+    GetCommittedProjectRequest,
+    GetCommittedProjectResultSuccess,
     StartWorkerRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
+from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
@@ -183,7 +186,7 @@ class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 @dataclass
 @PayloadRegistry.register
 class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by the orchestrator to each registered worker after it switches projects.
+    """Sent by the orchestrator to a worker as it starts, and to each worker after it switches projects.
 
     The orchestrator is the single source of truth for the current project, but a
     worker is only restarted on a switch that changes library config. A switch that
@@ -192,19 +195,13 @@ class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
     to adopt the orchestrator's new project so env vars, directory macros, and
     situation/path macros resolve against the right project.
 
-    project_id is the opaque id of the new current project (SYSTEM_DEFAULTS_KEY for
-    system defaults). A worker boots like an engine off the same shared on-disk
-    config, so the orchestrator's registry id is already loaded in the worker.
+    It names no project: the worker asks the orchestrator which one it is on
+    (`GetCommittedProjectRequest`) and adopts that, so activations that overlap
+    cannot leave it on an older one.
 
     Uses SkipTheLineMixin so the worker activates the new project immediately, ahead
     of any queued ExecuteNodeRequest that would otherwise run against the stale one.
     """
-
-    project_id: str
-    # Generation of the orchestrator's committed activation. The worker adopts strictly increasing
-    # generations only, so two activations that overlap resolve to the newer one regardless of the
-    # order they arrive or finish in.
-    generation: int = 0
 
 
 @dataclass
@@ -547,9 +544,48 @@ async def _handle_drop_library_named_local_objects(
     return DropLibraryNamedLocalObjectsResultSuccess(result_details=f"Released {dropped} library-named object(s).")
 
 
+class _ProjectAdoptions:
+    """Adopts the orchestrator's project for the activations a worker is sent, one adoption at a time.
+
+    An activation names no project, so an adoption reads the orchestrator's when it starts, and
+    running them one at a time in any order leaves the worker on the newest. Whatever arrives while
+    one runs waits for the next, which answers all of them at once.
+    """
+
+    def __init__(self, adopt: Callable[[], Coroutine[Any, Any, ResultPayload]]) -> None:
+        self._adopt = adopt
+        self._waiting: list[asyncio.Future[ResultPayload]] = []
+        self._arrived = asyncio.Event()
+        self._consumer: asyncio.Task[None] | None = None
+
+    async def adopt(self) -> ResultPayload:
+        """Adopt the orchestrator's project, with the adoption that answers this activation and those beside it."""
+        loop = asyncio.get_running_loop()
+        answered: asyncio.Future[ResultPayload] = loop.create_future()
+        self._waiting.append(answered)
+        self._arrived.set()
+        if self._consumer is None:
+            self._consumer = create_task_bound_to_no_workflow(loop, self._consume())
+        return await answered
+
+    async def _consume(self) -> None:
+        while True:
+            await self._arrived.wait()
+            self._arrived.clear()
+            batch, self._waiting = self._waiting, []
+            try:
+                result = await self._adopt()
+            # Any failure belongs to the activations waiting on it; ending here would leave every later one waiting forever.
+            except Exception as e:
+                for answered in batch:
+                    answered.set_exception(e)
+                continue
+            for answered in batch:
+                answered.set_result(result)
+
+
 async def _adopt_on_engine_loop(
-    request: ActivateProjectRequest,
-    adopt: Callable[[ActivateProjectRequest], Coroutine[Any, Any, ResultPayload]],
+    adopt: Callable[[], Coroutine[Any, Any, ResultPayload]],
     *,
     event_manager: EventManager,
     worker_settled: asyncio.Event,
@@ -563,12 +599,12 @@ async def _adopt_on_engine_loop(
     engine_loop = event_manager.event_loop
     if engine_loop is None:
         details = (
-            f"Attempted to adopt orchestrator project '{request.project_id}'. "
-            f"Failed because this worker's engine event loop is not running."
+            "Attempted to adopt the orchestrator's project. "
+            "Failed because this worker's engine event loop is not running."
         )
         return ActivateProjectResultFailure(result_details=details)
 
-    adoption = asyncio.run_coroutine_threadsafe(adopt(request), engine_loop)
+    adoption = asyncio.run_coroutine_threadsafe(adopt(), engine_loop)
     result = await asyncio.wrap_future(adoption)
 
     # Set on this loop, not the engine loop: worker startup waits on it here, and asyncio.Event is not
@@ -611,58 +647,45 @@ def register_broadcast_handlers(
             return ReloadConfigResultFailure(result_details=details)
         return ReloadConfigResultSuccess(result_details="Reloaded config from disk.")
 
-    # Activation awaits internally, so two arriving close together interleave: the older can pass
-    # the staleness check, suspend, and finish after the newer, leaving the worker on the older
-    # project while both report success. Overlap is a property of the await, not of who sent it. The
-    # staleness check must stay inside the lock -- it reads the generation the previous holder wrote.
-    #
-    # TODO(griptape-ai/internal#266): a single-consumer queue replaces this and the generations,
-    # making the ordering structural rather than a rule every future caller has to remember.
-    adoption_lock = asyncio.Lock()
-
-    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
-        return await _adopt_on_engine_loop(
-            request, _adopt_project, event_manager=event_manager, worker_settled=worker_settled
-        )
-
-    async def _adopt_project(request: ActivateProjectRequest) -> ResultPayload:
+    async def _adopt_project() -> ResultPayload:
         # A concurrent ReloadConfigRequest is safe to interleave with this: _activate_project does
         # clear_project_layers() plus a full re-merge, so a load_configs() landing alongside it only
         # refreshes the user layer idempotently.
-        #
+        asked = await event_manager.forward_to_orchestrator(GetCommittedProjectRequest(), ResultContext())
+        if not isinstance(asked.result, GetCommittedProjectResultSuccess):
+            details = (
+                "Attempted to adopt the orchestrator's project. Failed because it did not say which: "
+                f"{asked.result.result_details}"
+            )
+            return ActivateProjectResultFailure(result_details=details)
+        project_id = asked.result.project_id
         # A worker's project registry is frozen at boot, so a project the orchestrator registered
         # after this worker spawned is absent here. Re-read the shared config and re-run discovery so
         # the worker learns it, and fail loud if the id is still unknown: landing on a stale project
         # while reporting success is the divergence this whole path exists to prevent.
-        async with adoption_lock:
-            if project_manager.is_stale_adoption(request.project_id, request.generation):
-                # Settled, not adopted: a newer activation already landed, so whatever is waiting
-                # on this has the answer it needs.
-                return ActivateProjectResultSuccess(
-                    result_details=(
-                        f"Skipped adopting project '{request.project_id}' (generation "
-                        f"{request.generation}): a newer activation was already adopted."
-                    )
-                )
-            if not await project_manager.ensure_project_loaded(request.project_id):
-                details = (
-                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                    f"Failed because the id is absent from the worker's registry even after "
-                    f"reloading config and re-running registered-project discovery."
-                )
-                return ActivateProjectResultFailure(result_details=details)
-
-            set_result = await project_manager.on_set_current_project_request(
-                SetCurrentProjectRequest(project_id=request.project_id)
+        if not await project_manager.ensure_project_loaded(project_id):
+            details = (
+                f"Attempted to adopt orchestrator project '{project_id}'. "
+                f"Failed because the id is absent from the worker's registry even after "
+                f"reloading config and re-running registered-project discovery."
             )
-            if set_result.failed():
-                details = (
-                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                    f"Failed with result: {set_result.result_details}"
-                )
-                return ActivateProjectResultFailure(result_details=details)
-            project_manager.record_adopted_generation(request.generation)
-        return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
+            return ActivateProjectResultFailure(result_details=details)
+
+        set_result = await project_manager.on_set_current_project_request(
+            SetCurrentProjectRequest(project_id=project_id)
+        )
+        if set_result.failed():
+            details = (
+                f"Attempted to adopt orchestrator project '{project_id}'. "
+                f"Failed with result: {set_result.result_details}"
+            )
+            return ActivateProjectResultFailure(result_details=details)
+        return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {project_id}.")
+
+    adoptions = _ProjectAdoptions(_adopt_project)
+
+    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:  # noqa: ARG001
+        return await _adopt_on_engine_loop(adoptions.adopt, event_manager=event_manager, worker_settled=worker_settled)
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)

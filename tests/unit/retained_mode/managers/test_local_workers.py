@@ -36,7 +36,6 @@ _TIMEOUT_S = 10.0
 _LIBRARY = "Exec Library"
 _DEPENDENCY = "Dependency Library"
 _WORKER_ID = "0b6f3c1e-worker"
-_GENERATION = 3
 
 
 class _Pair(NamedTuple):
@@ -76,7 +75,6 @@ def _worker_manager() -> WorkerManager:
     engine.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=None: (
         default if cast_type is None else cast_type(default)
     )
-    engine.project_manager.committed_project.return_value = ("project-1", _GENERATION)
     engine.library_manager.workers.on_report_library_loaded_request = AsyncMock(
         return_value=ReportLibraryLoadedResultSuccess(result_details="noted")
     )
@@ -124,7 +122,9 @@ def _hello(**overrides: Any) -> WorkerHello:
 
 class TestHello:
     @pytest.mark.asyncio
-    async def test_a_connected_worker_is_told_the_project_and_registered_with_no_topic(self, pair: _Pair) -> None:
+    async def test_a_connected_worker_is_told_to_adopt_the_project_and_registered_with_no_topic(
+        self, pair: _Pair
+    ) -> None:
         manager = _worker_manager()
         worker = _Worker(pair.worker)
 
@@ -134,8 +134,6 @@ class TestHello:
         await _until(lambda: worker.notifications)
         activation = worker.notifications[0]["payload"]
         assert activation["request_type"] == "ActivateProjectRequest"
-        assert activation["request"]["project_id"] == "project-1"
-        assert activation["request"]["generation"] == _GENERATION
 
     @pytest.mark.asyncio
     async def test_every_library_it_loaded_is_noted_and_its_gate_released(self, pair: _Pair) -> None:

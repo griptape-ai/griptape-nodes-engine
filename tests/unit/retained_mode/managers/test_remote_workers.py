@@ -354,6 +354,27 @@ class TestTheArtistsEngineAdmitsTheWorkersRequests:
         assert not result.succeeded()
 
 
+class TestAStartingWorkerAsksTheArtistsEngine:
+    @pytest.mark.asyncio
+    async def test_a_worker_still_starting_is_told_which_project_the_artist_is_on(self) -> None:
+        """The artist's engine answers a worker from the moment it asked for it, before it is ready."""
+        artist = Engine()
+        artist.worker_manager._starts_asked_of_hosts[_WORKER] = _remote_start()
+
+        result = await _from_the_worker(artist, worker_events.GetCommittedProjectRequest())
+
+        assert isinstance(result, worker_events.GetCommittedProjectResultSuccess)
+        assert result.project_id == artist.project_manager.committed_project_id
+
+    @pytest.mark.asyncio
+    async def test_a_worker_the_artist_never_asked_for_is_refused(self) -> None:
+        artist = Engine()
+
+        result = await _from_the_worker(artist, worker_events.GetCommittedProjectRequest())
+
+        assert not result.succeeded()
+
+
 class TestTheRemoteWorkerSecretPolicy:
     @pytest.mark.asyncio
     async def test_a_secret_the_policy_decides_is_answered_with_its_value(self, artist: Engine) -> None:
