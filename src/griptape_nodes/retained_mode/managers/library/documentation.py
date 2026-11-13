@@ -6,12 +6,13 @@ See docs/development/designs/library_documentation.md.
 from __future__ import annotations
 
 import logging
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     GetLibraryDocumentationPageRequest,
@@ -85,6 +86,10 @@ class LibraryDocumentation(EngineScoped):
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
+        # One LibraryDocs per loaded library. Loading a library again registers a new Library object,
+        # which has no entry here, so a refresh rebuilds the index and an unloaded library's entry goes
+        # away on its own.
+        self._docs_by_library: weakref.WeakKeyDictionary[Library, LibraryDocs] = weakref.WeakKeyDictionary()
         event_manager.register_request_handlers(self)
 
     @handles(GetNodeDocumentationRequest)
@@ -199,12 +204,18 @@ class LibraryDocumentation(EngineScoped):
             details = f"Attempted to read the documentation of a Library named '{library_name}'. Failed because no Library with that name was registered."
             return _DocsLookupFailure(details=details)
 
+        cached = self._docs_by_library.get(library)
+        if cached is not None:
+            return cached
+
         info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if info is None:
             details = f"Attempted to read the documentation of a Library named '{library_name}'. Failed because the engine does not know where the library is installed."
             return _DocsLookupFailure(details=details)
 
-        return LibraryDocs(_library_root(info), library.get_library_data())
+        docs = LibraryDocs(_library_root(info), library.get_library_data())
+        self._docs_by_library[library] = docs
+        return docs
 
 
 def _find_node_target(

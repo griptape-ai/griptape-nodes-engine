@@ -193,6 +193,55 @@ class TestListLibraryDocumentation:
         assert "No Such Library" in str(result.result_details)
 
 
+class TestRefresh:
+    def test_a_page_added_after_the_first_listing_shows_up_once_the_library_is_loaded_again(
+        self, engine: Engine, library_root: Path
+    ) -> None:
+        _write(library_root, "docs/first.md", "# First\n")
+        documentation = engine.library_manager.documentation
+        request = ListLibraryDocumentationRequest(library=LIBRARY_NAME)
+
+        first = documentation.list_library_documentation_request(request)
+        _write(library_root, "docs/second.md", "# Second\n")
+        second = documentation.list_library_documentation_request(request)
+
+        LibraryRegistry._clear()
+        LibraryRegistry.generate_new_library(library_data=_schema())
+        after_reload = documentation.list_library_documentation_request(request)
+
+        assert isinstance(first, ListLibraryDocumentationResultSuccess)
+        assert isinstance(second, ListLibraryDocumentationResultSuccess)
+        assert isinstance(after_reload, ListLibraryDocumentationResultSuccess)
+        assert [entry.path for entry in first.pages] == ["first.md"]
+        assert [entry.path for entry in second.pages] == ["first.md"]
+        assert [entry.path for entry in after_reload.pages] == ["first.md", "second.md"]
+
+    def test_an_edit_to_a_page_shows_up_without_loading_the_library_again(
+        self, engine: Engine, library_root: Path
+    ) -> None:
+        _write(library_root, "docs/guide.md", "Old text\n")
+        documentation = engine.library_manager.documentation
+        request = GetLibraryDocumentationPageRequest(library=LIBRARY_NAME, path="guide.md")
+
+        before = documentation.get_library_documentation_page_request(request)
+        _write(library_root, "docs/guide.md", "New text\n")
+        after = documentation.get_library_documentation_page_request(request)
+
+        assert isinstance(before, GetLibraryDocumentationPageResultSuccess)
+        assert isinstance(after, GetLibraryDocumentationPageResultSuccess)
+        assert (before.markdown, after.markdown) == ("Old text\n", "New text\n")
+
+    def test_the_index_is_built_once_per_load(self, engine: Engine, library_root: Path) -> None:
+        _write(library_root, "docs/guide.md", "# Guide\n")
+        documentation = engine.library_manager.documentation
+        request = ListLibraryDocumentationRequest(library=LIBRARY_NAME)
+
+        documentation.list_library_documentation_request(request)
+        documentation.list_library_documentation_request(request)
+
+        assert len(documentation._docs_by_library) == 1
+
+
 class TestGetLibraryDocumentationPage:
     def test_reads_a_page(self, engine: Engine, library_root: Path) -> None:
         _write(library_root, "docs/guides/start.md", "---\ndescription: How to begin.\n---\n# Start here\n\nBody.\n")

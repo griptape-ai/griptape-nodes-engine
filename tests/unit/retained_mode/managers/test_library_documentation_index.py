@@ -460,3 +460,35 @@ class TestParsePage:
         page = parse_page("Intro\n\n---\n\nMore\n")
 
         assert page.markdown == "Intro\n\n---\n\nMore\n"
+
+
+class TestListingsAreReadOnce:
+    def test_a_page_added_after_the_first_listing_waits_for_the_library_to_load_again(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/first.md", "# First\n")
+        docs = LibraryDocs(tmp_path, _schema())
+        assert [entry.path for entry in docs.page_entries()] == ["first.md"]
+
+        _write(tmp_path, "docs/second.md", "# Second\n")
+
+        assert [entry.path for entry in docs.page_entries()] == ["first.md"]
+        assert [entry.path for entry in LibraryDocs(tmp_path, _schema()).page_entries()] == ["first.md", "second.md"]
+
+    def test_an_edited_title_waits_for_the_library_to_load_again_but_page_text_does_not(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/guide.md", "---\ntitle: Old title\n---\nOld text\n")
+        docs = LibraryDocs(tmp_path, _schema())
+        assert docs.page_entries()[0].title == "Old title"
+
+        _write(tmp_path, "docs/guide.md", "---\ntitle: New title\n---\nNew text\n")
+
+        assert docs.page_entries()[0].title == "Old title"
+        assert docs.read_page("guide.md").markdown == "New text\n"
+
+    def test_changing_a_returned_list_does_not_change_the_next_one(self, tmp_path: Path) -> None:
+        _write(tmp_path, "docs/guide.md", "# Guide\n")
+        docs = LibraryDocs(tmp_path, _schema(nodes=[_node("LoadAudio", "Load Audio")]))
+
+        docs.page_entries().clear()
+        docs.node_entries().clear()
+
+        assert len(docs.page_entries()) == 1
+        assert len(docs.node_entries()) == 1

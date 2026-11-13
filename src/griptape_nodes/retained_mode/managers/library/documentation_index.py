@@ -118,14 +118,32 @@ class _PageIndex:
     problems: list[DocsProblem] = field(default_factory=list)
 
 
+@dataclass
+class _Listings:
+    """What a library's docs list, read once so repeated listings cost no file reads."""
+
+    overview_path: str | None
+    pages: list[DocumentationPageEntry]
+    nodes: list[DocumentationNodeEntry]
+    templates: list[DocumentationTemplateEntry]
+    skills: list[DocumentationSkillEntry]
+
+
 class LibraryDocs:
-    """The docs a library ships, found from its manifest and its docs folder."""
+    """The docs a library ships, found from its manifest and its docs folder.
+
+    The docs folder is scanned and every page's frontmatter read the first time a listing is
+    asked for, and the result is kept. A page's text is read from disk each time it is asked for,
+    so an edit to a page shows up at once. A page added, renamed, or removed shows up when the
+    library is loaded again, which builds a new `LibraryDocs`.
+    """
 
     def __init__(self, library_root: Path, schema: LibrarySchema) -> None:
         self._library_root = library_root
         self._schema = schema
         self.docs_root: Path | None = self._find_docs_root()
         self._index = _PageIndex()
+        self._listings_snapshot: _Listings | None = None
         if self.docs_root is not None:
             self._index = _PageIndexer(self.docs_root, schema).build()
 
@@ -144,13 +162,23 @@ class LibraryDocs:
 
     def overview_path(self) -> str | None:
         """Path of the library's overview page: `index.md`, or the README standing in for it."""
-        if self.docs_root is None:
-            return None
-        if (self.docs_root / OVERVIEW_PAGE).is_file():
-            return OVERVIEW_PAGE
-        if self._find_readme() is not None:
-            return OVERVIEW_PAGE
-        return None
+        return self._listings().overview_path
+
+    def page_entries(self) -> list[DocumentationPageEntry]:
+        """The library's pages and folders in display order, leaving out node pages, template pages, and skills."""
+        return list(self._listings().pages)
+
+    def node_entries(self) -> list[DocumentationNodeEntry]:
+        """Every node and workflow node the library lists, with whether it has a page."""
+        return list(self._listings().nodes)
+
+    def template_entries(self) -> list[DocumentationTemplateEntry]:
+        """Every workflow template the library lists, with whether it has a page."""
+        return list(self._listings().templates)
+
+    def skill_entries(self) -> list[DocumentationSkillEntry]:
+        """The skills the library ships for agents that use it."""
+        return list(self._listings().skills)
 
     def read_page(self, path: str) -> ParsedPage:
         """Read a page by its path relative to the docs folder.
@@ -160,16 +188,34 @@ class LibraryDocs:
         """
         return read_markdown_file(self._resolve_page_path(path))
 
-    def page_entries(self) -> list[DocumentationPageEntry]:
-        """The library's pages and folders in display order, leaving out node pages, template pages, and skills."""
+    def _listings(self) -> _Listings:
+        if self._listings_snapshot is None:
+            self._listings_snapshot = _Listings(
+                overview_path=self._build_overview_path(),
+                pages=self._build_page_entries(),
+                nodes=self._build_node_entries(),
+                templates=self._build_template_entries(),
+                skills=self._build_skill_entries(),
+            )
+        return self._listings_snapshot
+
+    def _build_overview_path(self) -> str | None:
+        if self.docs_root is None:
+            return None
+        if (self.docs_root / OVERVIEW_PAGE).is_file():
+            return OVERVIEW_PAGE
+        if self._find_readme() is not None:
+            return OVERVIEW_PAGE
+        return None
+
+    def _build_page_entries(self) -> list[DocumentationPageEntry]:
         if self.docs_root is None:
             return []
         entries: list[DocumentationPageEntry] = []
         self._collect_page_entries(self.docs_root, PurePosixPath(), entries)
         return entries
 
-    def node_entries(self) -> list[DocumentationNodeEntry]:
-        """Every node and workflow node the library lists, with whether it has a page."""
+    def _build_node_entries(self) -> list[DocumentationNodeEntry]:
         entries = [self._node_entry(node.class_name, node.metadata) for node in self._schema.nodes]
         entries.extend(
             self._node_entry(workflow_node.node_type, workflow_node.metadata)
@@ -177,8 +223,7 @@ class LibraryDocs:
         )
         return entries
 
-    def template_entries(self) -> list[DocumentationTemplateEntry]:
-        """Every workflow template the library lists, with whether it has a page."""
+    def _build_template_entries(self) -> list[DocumentationTemplateEntry]:
         entries: list[DocumentationTemplateEntry] = []
         for workflow_path in self._schema.workflows or []:
             name = Path(workflow_path).stem
@@ -195,8 +240,7 @@ class LibraryDocs:
             )
         return entries
 
-    def skill_entries(self) -> list[DocumentationSkillEntry]:
-        """The skills the library ships for agents that use it."""
+    def _build_skill_entries(self) -> list[DocumentationSkillEntry]:
         if self.docs_root is None:
             return []
         skills_root = self.docs_root / SKILLS_FOLDER
