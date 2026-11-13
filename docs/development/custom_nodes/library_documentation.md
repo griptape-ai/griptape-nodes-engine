@@ -1,6 +1,6 @@
 # Writing Docs for Your Library
 
-A library ships its own docs. Put markdown files in a `docs/` folder next to the library's JSON file, and they show up in the editor's **Docs** panel and are served to agents.
+A library can ship its own docs. Add markdown files to a `docs/` folder next to the library's JSON file. The editor's **Docs** panel shows them, and agents can read them.
 
 You can start with no docs at all. Every node gets a page built from its description and its parameters, and every MCP tool gets one built from its description and inputs. Write pages where the built one isn't enough.
 
