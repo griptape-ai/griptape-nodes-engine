@@ -60,20 +60,18 @@ class StartWorkerResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 class StartWorkerForEngineRequest(RequestPayload):
     """Sent by the artist's engine to the engine its distribution settings assign a library to.
 
-    That engine starts the library's worker as its own child process, under `worker_engine_id`, on
-    the artist's engine's project. It carries the worker's traffic to the artist's engine, and
-    reports with `ReportRemoteWorkerReadyRequest` once the worker has loaded the library.
+    That engine starts the library's worker as its own child process, under `worker_engine_id`. It
+    carries the worker's traffic to the artist's engine, and reports with
+    `ReportRemoteWorkerReadyRequest` once the worker has loaded the library.
 
     Args:
         library_name: The library the worker will serve.
         worker_engine_id: Names the worker, chosen by the artist's engine so it can recognize the
             worker's reports, and stop it, before this request is answered.
-        project_id: The project the artist's engine is on, which the worker starts on.
     """
 
     library_name: str
     worker_engine_id: str
-    project_id: str
     broadcast_result: bool = field(default=False, kw_only=True)
 
 

@@ -77,6 +77,7 @@ from griptape_nodes.retained_mode.events.worker_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
+from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
@@ -185,7 +186,7 @@ class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 @dataclass
 @PayloadRegistry.register
 class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by the orchestrator to each registered worker after it switches projects.
+    """Sent by the orchestrator to a worker as it starts, and to each worker after it switches projects.
 
     The orchestrator is the single source of truth for the current project, but a
     worker is only restarted on a switch that changes library config. A switch that
@@ -194,16 +195,13 @@ class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
     to adopt the orchestrator's new project so env vars, directory macros, and
     situation/path macros resolve against the right project.
 
-    With no project_id, the worker asks the orchestrator which project it is on
-    (`GetCommittedProjectRequest`) and adopts that. A project_id is the opaque id to
-    adopt (SYSTEM_DEFAULTS_KEY for system defaults), for the one activation sent before
-    the worker can ask: the serving engine's, from the project its start named.
+    It names no project: the worker asks the orchestrator which one it is on
+    (`GetCommittedProjectRequest`) and adopts that, so activations that overlap
+    cannot leave it on an older one.
 
     Uses SkipTheLineMixin so the worker activates the new project immediately, ahead
     of any queued ExecuteNodeRequest that would otherwise run against the stale one.
     """
-
-    project_id: str | None = None
 
 
 @dataclass
@@ -547,28 +545,27 @@ async def _handle_drop_library_named_local_objects(
 
 
 class _ProjectAdoptions:
-    """Adopts the project activations a worker is sent, one at a time.
+    """Adopts the orchestrator's project for the activations a worker is sent, one adoption at a time.
 
     An activation names no project, so an adoption reads the orchestrator's when it starts, and
     running them one at a time in any order leaves the worker on the newest. Whatever arrives while
     one runs waits for the next, which answers all of them at once.
     """
 
-    def __init__(self, adopt: Callable[[str | None], Coroutine[Any, Any, ResultPayload]]) -> None:
-        # `adopt` gets the project id to adopt, or None to ask the orchestrator which.
+    def __init__(self, adopt: Callable[[], Coroutine[Any, Any, ResultPayload]]) -> None:
         self._adopt = adopt
-        self._waiting: list[tuple[ActivateProjectRequest, asyncio.Future[ResultPayload]]] = []
+        self._waiting: list[asyncio.Future[ResultPayload]] = []
         self._arrived = asyncio.Event()
         self._consumer: asyncio.Task[None] | None = None
 
-    async def adopt(self, request: ActivateProjectRequest) -> ResultPayload:
-        """Adopt the project `request` asks for, with the adoption that answers it and those beside it."""
+    async def adopt(self) -> ResultPayload:
+        """Adopt the orchestrator's project, with the adoption that answers this activation and those beside it."""
         loop = asyncio.get_running_loop()
         answered: asyncio.Future[ResultPayload] = loop.create_future()
-        self._waiting.append((request, answered))
+        self._waiting.append(answered)
         self._arrived.set()
         if self._consumer is None:
-            self._consumer = loop.create_task(self._consume())
+            self._consumer = create_task_bound_to_no_workflow(loop, self._consume())
         return await answered
 
     async def _consume(self) -> None:
@@ -576,24 +573,19 @@ class _ProjectAdoptions:
             await self._arrived.wait()
             self._arrived.clear()
             batch, self._waiting = self._waiting, []
-            # Only the serving engine's first activation names a project, before the worker can ask.
-            # Asking is never older than that, so any activation that names none decides the batch.
-            named = [request.project_id for request, _ in batch if request.project_id is not None]
-            project_id = named[-1] if len(named) == len(batch) else None
             try:
-                result = await self._adopt(project_id)
+                result = await self._adopt()
             # Any failure belongs to the activations waiting on it; ending here would leave every later one waiting forever.
             except Exception as e:
-                for _, answered in batch:
+                for answered in batch:
                     answered.set_exception(e)
                 continue
-            for _, answered in batch:
+            for answered in batch:
                 answered.set_result(result)
 
 
 async def _adopt_on_engine_loop(
-    request: ActivateProjectRequest,
-    adopt: Callable[[ActivateProjectRequest], Coroutine[Any, Any, ResultPayload]],
+    adopt: Callable[[], Coroutine[Any, Any, ResultPayload]],
     *,
     event_manager: EventManager,
     worker_settled: asyncio.Event,
@@ -612,7 +604,7 @@ async def _adopt_on_engine_loop(
         )
         return ActivateProjectResultFailure(result_details=details)
 
-    adoption = asyncio.run_coroutine_threadsafe(adopt(request), engine_loop)
+    adoption = asyncio.run_coroutine_threadsafe(adopt(), engine_loop)
     result = await asyncio.wrap_future(adoption)
 
     # Set on this loop, not the engine loop: worker startup waits on it here, and asyncio.Event is not
@@ -655,19 +647,18 @@ def register_broadcast_handlers(
             return ReloadConfigResultFailure(result_details=details)
         return ReloadConfigResultSuccess(result_details="Reloaded config from disk.")
 
-    async def _adopt_project(project_id: str | None) -> ResultPayload:
+    async def _adopt_project() -> ResultPayload:
         # A concurrent ReloadConfigRequest is safe to interleave with this: _activate_project does
         # clear_project_layers() plus a full re-merge, so a load_configs() landing alongside it only
         # refreshes the user layer idempotently.
-        if project_id is None:
-            asked = await event_manager.forward_to_orchestrator(GetCommittedProjectRequest(), ResultContext())
-            if not isinstance(asked.result, GetCommittedProjectResultSuccess):
-                details = (
-                    "Attempted to adopt the orchestrator's project. Failed because it did not say which: "
-                    f"{asked.result.result_details}"
-                )
-                return ActivateProjectResultFailure(result_details=details)
-            project_id = asked.result.project_id
+        asked = await event_manager.forward_to_orchestrator(GetCommittedProjectRequest(), ResultContext())
+        if not isinstance(asked.result, GetCommittedProjectResultSuccess):
+            details = (
+                "Attempted to adopt the orchestrator's project. Failed because it did not say which: "
+                f"{asked.result.result_details}"
+            )
+            return ActivateProjectResultFailure(result_details=details)
+        project_id = asked.result.project_id
         # A worker's project registry is frozen at boot, so a project the orchestrator registered
         # after this worker spawned is absent here. Re-read the shared config and re-run discovery so
         # the worker learns it, and fail loud if the id is still unknown: landing on a stale project
@@ -693,10 +684,8 @@ def register_broadcast_handlers(
 
     adoptions = _ProjectAdoptions(_adopt_project)
 
-    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
-        return await _adopt_on_engine_loop(
-            request, adoptions.adopt, event_manager=event_manager, worker_settled=worker_settled
-        )
+    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:  # noqa: ARG001
+        return await _adopt_on_engine_loop(adoptions.adopt, event_manager=event_manager, worker_settled=worker_settled)
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)

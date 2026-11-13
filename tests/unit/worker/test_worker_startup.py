@@ -20,6 +20,10 @@ from griptape_nodes.app.worker_routing import ActivateProjectRequest
 from griptape_nodes.retained_mode.engine import reset_root_engine
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
+from griptape_nodes.retained_mode.events.worker_events import (
+    GetCommittedProjectRequest,
+    GetCommittedProjectResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import ENGINE_REQUEST_TIMEOUT_S
 from griptape_nodes.utils.version_utils import engine_version
@@ -57,7 +61,7 @@ class _Engine:
         self.said_hello = threading.Event()
         self.channel = channel
         channel.start(on_request=self._on_request, on_notification=lambda _body: None, on_closed=lambda: None)
-        activation = ActivateProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
+        activation = ActivateProjectRequest()
         channel.notify(event_request_envelope(EventRequest(request=activation)))
 
     async def _on_request(self, body: dict) -> dict:
@@ -80,7 +84,12 @@ class _Engine:
             return result_body(
                 EventResultSuccess(request=event_request.request, result=answer, request_id=event_request.request_id)
             )
-        return request_failure(body, "The test's engine answers only secrets.")
+        if isinstance(event_request.request, GetCommittedProjectRequest):
+            project = GetCommittedProjectResultSuccess(project_id=SYSTEM_DEFAULTS_KEY, result_details="ok")
+            return result_body(
+                EventResultSuccess(request=event_request.request, result=project, request_id=event_request.request_id)
+            )
+        return request_failure(body, "The test's engine answers only secrets and which project it is on.")
 
 
 @pytest.fixture

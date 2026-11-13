@@ -1410,7 +1410,6 @@ class WorkerManager(EngineScoped):
         request = worker_events.StartWorkerForEngineRequest(
             library_name=library_name,
             worker_engine_id=worker_engine_id,
-            project_id=self.engine.project_manager.committed_project_id,
         )
         try:
             result = await self.engine.request(host_engine_id, request, timeout_s=ENGINE_REQUEST_TIMEOUT_S)
@@ -1620,7 +1619,7 @@ class WorkerManager(EngineScoped):
         self._workers[wid] = WorkerRegistration(worker_key=start.library_name, host_engine_id=start.host_engine_id)
         logger.debug("Worker %s for library '%s' runs on engine %s", wid, start.library_name, start.host_engine_id)
         await self._note_libraries_loaded(start.library_name, request.libraries)
-        # It started on the project the start named; a switch since then reaches it only this way.
+        # It asked which project as it started; a switch since then reaches it only this way.
         self._send_notice(self._activate_project_on_worker(wid))
         return worker_events.ReportRemoteWorkerReadyResultSuccess(result_details=f"Took worker {wid} into service.")
 
@@ -1839,7 +1838,7 @@ class WorkerManager(EngineScoped):
             )
         registration.process = proc
         served.started.set()
-        self._watch_and_connect_served_worker(worker_engine_id, registration, proc, pending, request)
+        self._watch_and_connect_served_worker(worker_engine_id, registration, proc, pending)
         return worker_events.StartWorkerForEngineResultSuccess(
             result_details=f"Started worker {worker_engine_id} for library '{library_name}' for another engine."
         )
@@ -1872,7 +1871,6 @@ class WorkerManager(EngineScoped):
         registration: WorkerRegistration,
         proc: asyncio.subprocess.Process,
         pending: PendingWorker,
-        request: worker_events.StartWorkerForEngineRequest,
     ) -> None:
         """Watch a just-started worker this engine runs for another engine, and connect it, each in its own task."""
         loop = asyncio.get_running_loop()
@@ -1883,13 +1881,7 @@ class WorkerManager(EngineScoped):
         watcher.add_done_callback(self._exit_watchers.discard)
         connecting = create_task_bound_to_no_workflow(
             loop,
-            self._connect_served_worker(
-                worker_engine_id,
-                registration,
-                proc,
-                pending,
-                project_id=request.project_id,
-            ),
+            self._connect_served_worker(worker_engine_id, registration, proc, pending),
         )
         self._exit_watchers.add(connecting)
         connecting.add_done_callback(self._exit_watchers.discard)
@@ -1900,10 +1892,8 @@ class WorkerManager(EngineScoped):
         registration: WorkerRegistration,
         proc: asyncio.subprocess.Process,
         pending: PendingWorker,
-        *,
-        project_id: str,
     ) -> None:
-        """Wait for a worker this engine runs for another engine to connect, then carry it, on that engine's project."""
+        """Wait for a worker this engine runs for another engine to connect, then carry it and have it adopt that engine's project."""
         # Lazy import: worker_routing imports this module.
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
@@ -1941,8 +1931,8 @@ class WorkerManager(EngineScoped):
         served.end = end
         end.attach(channel)
         logger.debug("Worker %s for key '%s' (pid %s) connected", worker_engine_id, registration.worker_key, proc.pid)
-        # The worker cannot ask the artist's engine yet: that engine takes it into service only once it is ready.
-        activation = EventRequest(request=ActivateProjectRequest(project_id=project_id))
+        # The artist's engine answers this worker from the moment it asked for it, so the worker can ask already.
+        activation = EventRequest(request=ActivateProjectRequest())
         with contextlib.suppress(ChannelClosedError):
             channel.notify(event_request_envelope(activation))
 
