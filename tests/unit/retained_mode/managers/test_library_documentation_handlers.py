@@ -242,6 +242,39 @@ class TestRefresh:
         assert len(documentation._docs_by_library) == 1
 
 
+class TestUnknownLibraryMessage:
+    @pytest.mark.usefixtures("library_root")
+    def test_the_message_lists_the_registered_library_names(self, engine: Engine) -> None:
+        result = engine.library_manager.documentation.list_library_documentation_request(
+            ListLibraryDocumentationRequest(library="No Such Library")
+        )
+
+        assert isinstance(result, ListLibraryDocumentationResultFailure)
+        assert f"'{LIBRARY_NAME}'" in str(result.result_details)
+
+    def test_a_folder_name_is_pointed_at_the_library_it_holds(self, engine: Engine, library_root: Path) -> None:
+        result = engine.library_manager.documentation.list_library_documentation_request(
+            ListLibraryDocumentationRequest(library=library_root.name)
+        )
+
+        assert isinstance(result, ListLibraryDocumentationResultFailure)
+        assert f"the library named '{LIBRARY_NAME}'" in str(result.result_details)
+
+    @pytest.mark.usefixtures("library_root")
+    def test_a_long_list_of_names_is_cut_short(self, engine: Engine) -> None:
+        for number in range(20):
+            LibraryRegistry.generate_new_library(
+                library_data=_schema().model_copy(update={"name": f"Library {number}"})
+            )
+
+        result = engine.library_manager.documentation.list_library_documentation_request(
+            ListLibraryDocumentationRequest(library="No Such Library")
+        )
+
+        assert isinstance(result, ListLibraryDocumentationResultFailure)
+        assert "and 6 more" in str(result.result_details)
+
+
 class TestGetLibraryDocumentationPage:
     def test_reads_a_page(self, engine: Engine, library_root: Path) -> None:
         _write(library_root, "docs/guides/start.md", "---\ndescription: How to begin.\n---\n# Start here\n\nBody.\n")

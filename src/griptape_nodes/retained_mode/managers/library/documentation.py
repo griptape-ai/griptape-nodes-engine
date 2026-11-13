@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
+_MAX_NAMES_SHOWN = 15
+
 
 @dataclass
 class _TextSlice:
@@ -197,12 +199,32 @@ class LibraryDocumentation(EngineScoped):
             result_details=details,
         )
 
+    def _describe_unknown_library(self, library_name: str) -> str:
+        """Say that no library has this name, and help the person find the name that works."""
+        details = f"Attempted to read the documentation of a Library named '{library_name}'. Failed because no Library with that name was registered."
+
+        registered = sorted(LibraryRegistry.list_libraries())
+        if registered:
+            shown = ", ".join(f"'{name}'" for name in registered[:_MAX_NAMES_SHOWN])
+            more = len(registered) - _MAX_NAMES_SHOWN
+            if more > 0:
+                shown += f", and {more} more"
+            details += f" The registered libraries are: {shown}."
+
+        library_manager = self.engine.library_manager
+        for library_path in library_manager.get_libraries_attempted_to_load():
+            info = library_manager.get_library_info_for_attempted_load(library_path)
+            path = Path(library_path)
+            if info.library_name is not None and library_name in (path.name, path.parent.name):
+                details += f" '{library_name}' is the folder of the library named '{info.library_name}'. Use that name."
+                break
+        return details
+
     def _find_docs(self, library_name: str) -> LibraryDocs | _DocsLookupFailure:
         try:
             library = LibraryRegistry.get_library(name=library_name)
         except KeyError:
-            details = f"Attempted to read the documentation of a Library named '{library_name}'. Failed because no Library with that name was registered."
-            return _DocsLookupFailure(details=details)
+            return _DocsLookupFailure(details=self._describe_unknown_library(library_name))
 
         cached = self._docs_by_library.get(library)
         if cached is not None:
