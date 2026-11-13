@@ -531,19 +531,20 @@ class TestSpawnSkipForUnmetRequirements:
         assert ahandle_request.await_args.args[0].library_name == "Lib"
 
     @pytest.mark.asyncio
-    async def test_starting_one_worker_without_a_session_does_nothing(self) -> None:
-        """Without a session the spawn is left to on_session_started, like every other worker."""
+    async def test_starting_one_worker_needs_no_session(self) -> None:
+        """A worker this engine runs for itself joins no session, so it starts without one."""
         manager = self._manager(unmet=False)
         engine = cast("MagicMock", manager._engine)
         engine.get_session_id.return_value = None
 
         await manager.workers.start_worker_for_library("Lib")
 
-        engine.ahandle_request.assert_not_awaited()
+        engine.ahandle_request.assert_awaited_once()
+        assert engine.ahandle_request.await_args.args[0].library_name == "Lib"
 
 
 class TestALibraryStartsItsWorkerWhenItFinishesRegistering:
-    """A library's worker is requested as the library finishes registering, if a session is active.
+    """A library's worker is requested as the library finishes registering.
 
     A library installed mid-session has no other moment that starts its worker, and one loading at
     startup would otherwise wait for every library registered after it.
@@ -604,8 +605,7 @@ class TestALibraryStartsItsWorkerWhenItFinishesRegistering:
         assert self._start_requests(manager) == []
 
     @pytest.mark.asyncio
-    async def test_a_library_that_loads_before_any_session_waits_for_one(self) -> None:
-        """on_session_started starts it with the rest."""
+    async def test_a_library_that_loads_before_any_session_requests_its_worker(self) -> None:
         manager = self._manager(progression=None)
         cast("MagicMock", manager._engine).get_session_id.return_value = None
 
@@ -613,7 +613,7 @@ class TestALibraryStartsItsWorkerWhenItFinishesRegistering:
             RegisterLibraryFromFileRequest(file_path="/some/path.json")
         )
 
-        assert self._start_requests(manager) == []
+        assert [request.library_name for request in self._start_requests(manager)] == ["Lib"]
 
 
 class TestLibraryDependencyResolution:
