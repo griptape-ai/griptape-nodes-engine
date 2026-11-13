@@ -18,7 +18,7 @@ Tracking issue: [griptape-ai/internal#222](https://github.com/griptape-ai/intern
 
 Docs live in a `docs/` folder next to `griptape_nodes_library.json`.
 
-Three folders under `docs/` are special, one for each list in the manifest: `docs/nodes/` holds one page per node, `docs/workflow_nodes/` one page per workflow node, and `docs/workflows/` one page per workflow template. Everything else under `docs/` is about the library as a whole, like a getting-started guide or a file format reference, and the library can name and arrange those however it wants. The `guides/` and `reference/` folders below are just examples. A library can have none of them.
+Four folders under `docs/` are special: `docs/nodes/` holds one page per node, `docs/workflow_nodes/` one page per workflow node, `docs/workflows/` one page per workflow template, and `docs/mcp_tools/` one page per MCP tool the library gives agents. Everything else under `docs/` is about the library as a whole, like a getting-started guide or a file format reference, and the library can name and arrange those however it wants. The `guides/` and `reference/` folders below are just examples. A library can have none of them.
 
 How each one maps to `griptape_nodes_library.json`, plus the skills folders and the folder that sits outside `docs/`:
 
@@ -27,11 +27,12 @@ How each one maps to `griptape_nodes_library.json`, plus the skills folders and 
 | `nodes`          | `docs/nodes/`          | one page per node, named after its `class_name`                                    |
 | `workflow_nodes` | `docs/workflow_nodes/` | one page per workflow node, named after its `node_type`                            |
 | `workflows`      | `docs/workflows/`      | one page per template, named after its filename without `.py`                      |
+| n/a              | `docs/mcp_tools/`      | one page per MCP tool, named after its request type. The tools come from the code  |
 | n/a              | `docs/.agents/skills/` | skills for agents that use the library, one folder per skill                       |
 | n/a              | `.agents/skills/`      | skills for coding agents working on the library, never loaded by the sidebar agent |
 | n/a              | `dev/docs/`            | docs for node developers, in any shape. The engine never reads it                  |
 
-The library's overview page is `docs/index.md`. If there isn't one, the README stands in.
+The library's overview page is `docs/index.md`. If there isn't one, the README stands in. That is the README in the library's folder, or in the folder above it when the manifest sits in a package folder, and it counts whether or not the library has a `docs/` folder. A `docs/README.md` is an ordinary library page. The list response says `overview_is_readme`, so the editor can label the row **README** and not **Overview**, and a README's images resolve against the folder the README sits in.
 
 Docs for people who work on the library, like how to add a model or what a node page should look like, don't go in `docs/`. Everything under `docs/` shows up in the editor, so put contributor docs somewhere else, such as `dev/docs/`. The engine only reads the docs path, so those pages stay out of the editor.
 
@@ -69,6 +70,8 @@ my-library/
       ShoutText.md            # documents the workflow node ShoutText
     workflows/                # the third fixed folder: one page per workflow template
       color_managed_load.md   # documents workflows/templates/color_managed_load.py
+    mcp_tools/                # the fourth fixed folder: one page per MCP tool
+      SearchDocsRequest.md    # documents the MCP tool SearchDocsRequest
     .agents/                  # for the agent that uses the library. A dot-folder is never shown as pages
       skills/
         color-managed-workflow/
@@ -91,7 +94,7 @@ Node pages:
 
 Library pages:
 
-- Everything under `docs/` outside the top-level `nodes/`, `workflow_nodes/` and `workflows/` folders is a library page. Those three names are reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A folder whose name starts with a dot is never shown as pages. A library page's title follows the title rule under File format.
+- Everything under `docs/` outside the top-level `nodes/`, `workflow_nodes/`, `workflows/` and `mcp_tools/` folders is a library page. Those four names are reserved at the top level only, so `docs/guides/nodes/` is an ordinary page folder. A folder whose name starts with a dot is never shown as pages. A library page's title follows the title rule under File format.
 
 - Navigation is the folder hierarchy. There is no navigation file. The panel shows folders and pages as they sit on disk, so adding a page adds an entry. A folder's title is its name with dashes and underscores turned into spaces and the first letter capitalized, so `color-management/` shows as "Color management".
 
@@ -167,25 +170,34 @@ The engine builds a parameter table for each node: name, type, default, tooltip,
 ### Engine API
 
 ```
-GetNodeDocumentationRequest(library: str, node_type: str, node_name: str | None = None)
+GetNodeDocumentationRequest(node_name: str | None, node_type: str | None, library: str | None, offset: int, limit: int | None)
   -> GetNodeDocumentationResultSuccess(
+       library, node_type, title,
        markdown: str | None,          # author content, None if no file
+       total_chars: int, truncated: bool,
        description: str | None,
        when_to_use: str | None,
-       deprecation: ... | None,
-       parameters: list[ParameterDoc],
+       deprecation: NodeDeprecationMetadata | None,
+       parameters: list[ParameterDescription],   # same form as DescribeNodeTypeRequest
        assets_root: str | None,       # absolute docs dir, for resolving images
-       external_url: str | None,      # optional "more docs" link from the manifest
      )
 ListLibraryDocumentationRequest(library: str)
-  -> page tree: [{title, path, description, when_to_use, kind, children}], plus the node list grouped by category
-GetLibraryDocumentationPageRequest(library: str, path: str)
-  -> markdown, title, assets_root
+  -> overview_path, overview_is_readme, pages (flat list in display order, folders ahead of their pages),
+     nodes, templates, skills, tools   # tools: the MCP tools the library exposes (name, description, read_only, input_schema). A library can have tools and no nodes.
+                                # nodes and templates carry page_path (relative to the docs folder, None with no page)
+GetLibraryDocumentationPageRequest(library: str, path: str, offset: int, limit: int | None)
+  -> title, markdown, total_chars, truncated, description, when_to_use, assets_root
 ```
 
+- A node request names either `node_name` (a node on the canvas) or `node_type`. With `node_name`, the type and library come from the node, and `parameters` are the node's own, so two nodes of the same type can report different parameters. With `node_type`, `parameters` are the type's defaults. If both are given they must agree, and if neither is given the request fails.
+- A node entry has a `kind`, `node` or `workflow_node`. The editor lists workflow nodes in their own section, with the same category tree, because a workflow node is a whole saved workflow and not a single step.
+- A tool entry has `title`, `has_page` and `page_path`. Without a page, the editor shows the description from the request's docstring and a table of its fields. A page's `title` and `description` replace those. The manifest does not list tools, so the page name is the only link, the same no-drift rule as nodes.
+- A template entry also carries `image`, the thumbnail from the template file's own metadata, and takes its `description` from that metadata when it has no page.
+- `page_path` on a node or template entry is the path of its page relative to the docs folder, in the form the page request takes. A relative link inside a page resolves against the page it sits in, and the editor matches the result against these paths to open the right node or template.
+- `offset` and `limit` read a long page in parts. `total_chars` is the whole page and `truncated` says whether the text stops early.
 - The docs are read from the installed library on disk and served by the engine to the editor, so nothing leaves the machine. Reading docs needs no network, which makes them usable in air-gapped environments.
 - Markdown travels in the response, so remote engines work.
-- The engine builds its docs index when a library loads: which node pages exist, the page tree from the folder hierarchy, and the problems described above. Choosing Refresh Libraries (or restarting the engine) loads the libraries again and rebuilds the index, so a new, renamed, or deleted doc file shows up after a refresh. The text of a page is read from disk on each request, so an edit to an existing page shows up the next time the panel opens it, with no refresh.
+- The engine builds its docs index when a library loads: which node pages exist, the page tree from the folder hierarchy, and the problems described above. Choosing Refresh Libraries (or restarting the engine) loads the libraries again and rebuilds the index, so a new, renamed, or deleted doc file shows up after a refresh. The index also holds each page's title and description for the lists, read once per load so that listing a library costs no file reads however many people ask. The text of a page is read from disk on each request, so an edit to a page's text shows up the next time the panel opens it, with no refresh. An edit to a title or description waits for a refresh, because the lists hold it.
 - Paths are canonicalized with `canonicalize_for_identity` and must stay inside the docs folder. A key containing `..` or a separator fails the request.
 - A markdown page over 1 MB is rejected, because the page travels in the response. The engine limits nothing else.
 - Images: the editor mints preview URLs from `assets_root` plus the relative path with `CreateStaticFileDownloadUrlFromPathRequest`, as it does for other files. The engine never stores static URLs. Video is served with range requests so seeking works without loading the whole file.
@@ -199,7 +211,7 @@ Agents read the same docs as people, through the same requests.
 - The list, get-node, and get-page requests are exposed as MCP tools alongside the existing ones.
 - The list response is an `llms.txt`-style index: each page's path, title, `description`, and `when_to_use`. An agent reads the index, then fetches only the pages it needs.
 - Everything returned over MCP is untrusted content, because it comes from the library author. Tool descriptions say so, and an agent treats docs as information and never as instructions to follow.
-- MCP responses are capped at 64 KB, well below the 1 MB page limit. A longer page is cut with a truncation marker, and the tool takes an offset to read the rest.
+- MCP responses are capped at 64,000 characters, well below the 1 MB page limit. The cap applies when the caller leaves `limit` unset, and a caller can ask for more or less. A longer page is cut with a truncation marker, and the tool takes an offset to read the rest.
 - Responses return raw markdown with no editor-specific markup. The generated parameter table is also returned as structured data, so an agent reads names, types, defaults, choices, and ranges without parsing markdown.
 - The sidebar agent can use library docs and skills. It discovers each library's `docs/.agents/skills/` folder in addition to the workspace's `.agents/skills/`, so one loader scans both.
 - Skills are optional. A skill is `docs/.agents/skills/<name>/SKILL.md`. Node pages say what something is, and skills say how to accomplish a task with the library. The list response returns skills flagged as such, with their `description`. The body is fetched on demand.
@@ -212,7 +224,7 @@ Agents read the same docs as people, through the same requests.
 - The panel builds its navigation from whatever the library ships. A library with guides or reference pages shows them as a page tree that follows the library's folders, and more pages mean more entries. The library's nodes always appear below, grouped by category. A library with only node docs, or none at all, shows just its nodes. There is no setting for any of this. A node page has a breadcrumb back to its library.
 - Library Management gets a "Documentation" entry that opens the library's home page (`index.md`, or the page tree if there is none). Both work without a network, because the docs come from the installed library.
 - The renderer supports GFM, GitHub alerts, Mermaid, and video. Mermaid loads lazily and runs in strict security mode.
-- GUI PR #3394 becomes the entry point. `documentation_url` stays as an optional "More docs" link at the bottom of the panel. The git-remote parsing is not needed.
+- GUI PR #3394 becomes the entry point. The git-remote parsing is not needed. A "More docs" link from the manifest, such as a `documentation_url` field, is not part of this change and would be a small addition of its own.
 
 ### Authoring loop and docs check
 
@@ -239,7 +251,7 @@ The standard library is the first library to move.
 - The diffusers pages carry content the generated output now replaces, which the script drops: the `Category:` line (the manifest has it), the `Inputs` and `Outputs` tables (the generated table covers names, types, and defaults), and the hand-written node list in the library index (the editor groups nodes by manifest category). Per-parameter notes in those tables move into a `## Parameters` section. The node preview screenshots stay as ordinary images.
 - Pages that mention a workflow template by path, such as "Workflow template: `workflows/templates/ControlnetText2Image.py`", become a `node:` link when the template is a workflow node, and plain text when it is not.
 - The main site's node pages are replaced by a libraries index, and the old URLs redirect to it.
-- `documentation_url` stays supported. A library with no `docs/` folder still gets its "More docs" link, so libraries that host their own docs lose nothing.
+- A library that hosts its own docs elsewhere loses nothing: its pages in the repo still show in the editor, and the panel links to the library's repository.
 - Library docs are not mirrored to the main site, because a build-time copy goes stale between site rebuilds and cannot match the version a user has installed.
 
 ## Phasing
@@ -259,7 +271,7 @@ The order in which this feature is built. Each phase is a stage of development w
 - No raw HTML, no tabs, and no search request in v1. The engine's only size rule is the 1 MB page limit, and the docs check warns about large files. Frontmatter is limited to `title`, `description` and `when_to_use`.
 - Docs problems are library problems and never stop a library from loading.
 - The manifest has no per-node documentation setting. A node's page is found by its filename, and nothing in the JSON names a doc file. A path in the JSON can drift from the files and go stale, and the convention keeps the format simple for node authors and for agents.
-- MCP responses are capped at 64 KB per call.
+- MCP page reads are capped at 64,000 characters per call unless the caller sets a limit.
 
 ## Open questions
 
