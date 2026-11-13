@@ -587,7 +587,7 @@ Prefer synthesizing definitions anyway, for two reasons:
 
 ## Examples
 
-Three complete, working libraries. Copy any of the folders into your workspace's
+Six complete, working libraries. Copy any of the folders into your workspace's
 `libraries` directory, register it through the editor's library settings, and restart the
 engine.
 
@@ -645,3 +645,134 @@ workflow. The engine log gets a line for each, such as
 `Wait_1 (WaitNode) succeeded in 2.00s`. Put a **Wait** node inside a **ForEach Group** and
 you get a line for every iteration, plus one for the group. To send the timings somewhere
 else, replace the logging call in `_on_finish`; the rest of the library stays the same.
+
+### Example: a library that logs the inputs of every node run
+
+`NodeStartProcessEvent` names the node but carries none of its parameter values. A library
+that needs the model, the prompt, or any other input reads them with requests when the
+event arrives:
+
+- [`griptape_nodes_library.json`](example_node_inputs_library/griptape_nodes_library.json):
+    manifest declaring the advanced library and no nodes of its own
+- [`advanced_library.py`](example_node_inputs_library/advanced_library.py): on each
+    `NodeStartProcessEvent`, lists the node's parameters, keeps the ones that take an input
+    or a property value, reads each value, and writes one JSON object per node run from a
+    background thread
+
+A library with no nodes is valid. Its `nodes` list is empty, and it still loads and
+registers its listener.
+
+Run any workflow. The engine log gets a line for each node that has inputs, such as:
+
+```json
+{"node_name": "Agent", "node_type": "Agent", "execution_id": "cd88...", "inputs": {"model": "claude-sonnet-5", "prompt": "Write a haiku about rain."}}
+```
+
+Things to know about the output:
+
+- **Values are what the node holds when it starts.** A prompt typed on the node and a
+    prompt wired in from an upstream node both appear as text, because the engine has
+    already resolved the wire.
+- **Nodes inside a loop body are not covered.** A loop runs its body as copies of the
+    canvas nodes. The event names the canvas node, which still holds the values from before
+    the loop started. A node in a loop therefore logs the same values on every iteration, not
+    the item that iteration is using. Nodes outside loops are logged correctly.
+- **Long text is cut.** Text over 500 characters is shortened, and the line says how long
+    the original was. Change `MAX_VALUE_CHARS` to adjust.
+- **Objects show only their type.** An image, an audio clip, or a driver appears as its type
+    name, such as `<ImageUrlArtifact>`.
+- **The model parameter is not always named `model`.** Libraries name it `model`,
+    `model_name`, or `model_id`. This example logs all input parameters, so it does not
+    need to know.
+- **Prompts go into the log.** The example writes full inputs to the engine log. Send them
+    to your own store, or leave out parameters that hold secrets, if that matters for your
+    workflows. The `execution_id` matches the one on the `NodeFinishProcessEvent`, so a
+    line can be joined to the timing example's line for the same run.
+
+### Example: a library that cancels a run on blocked terms
+
+A library that checks chosen parameters for chosen words and cancels the flow when it finds
+one:
+
+- [`griptape_nodes_library.json`](example_node_blocked_terms_library/griptape_nodes_library.json):
+    manifest declaring the advanced library and no nodes of its own
+- [`advanced_library.py`](example_node_blocked_terms_library/advanced_library.py): on each
+    `NodeStartProcessEvent`, reads the parameters named in `BLOCKED_TERMS_BY_PARAMETER`, and
+    sends a `CancelFlowRequest` for the node's flow when one contains a blocked term
+
+The terms are set per parameter name:
+
+```python
+BLOCKED_TERMS_BY_PARAMETER = {
+    "prompt": ("CONFIDENTIAL",),
+}
+```
+
+- Each key is a parameter name. `"prompt"` checks every parameter called `prompt`, on any
+    node that has one.
+- The key `"*"` checks every text input on every node.
+- Matching ignores case. Only text values are checked.
+
+Run a workflow whose **Agent** node has `CONFIDENTIAL` in its prompt. The engine log gets a warning
+such as `Agent_1 contains blocked term 'CONFIDENTIAL'. Cancelled flow ControlFlow_1: CancelFlowResultSuccess`, and the flow shows as cancelled in the editor.
+
+Three things in this example are easy to get wrong:
+
+- **The cancel runs on the engine's event loop.** The synchronous
+    `GriptapeNodes.handle_request` runs the handler on a temporary loop, and the cancel then
+    fails with "attached to a different loop". The example schedules
+    `GriptapeNodes.ahandle_request` on the engine's loop with
+    `asyncio.run_coroutine_threadsafe`, which returns at once and so keeps the listener
+    quick.
+- **This cancels the run. It does not stop the node from starting.** A listener is
+    notification-only, and the cancel is requested while the node is starting. The node may
+    already be running when the cancel takes effect, so a prompt may still reach the model
+    provider. If a blocked prompt must never be sent, put a node in front of the model node
+    that raises an error when the text contains the term. A node that raises stops the run
+    before the next node starts.
+- **Nodes inside a loop body are not covered.** The check reads the canvas node, which holds
+    the values from before the loop started. If a **ForEach** feeds each item into an
+    **Agent**'s `prompt`, an item containing the term does not cancel the run. The example
+    does not look inside lists either, so it cannot check the list that feeds the loop. This
+    is a current limitation: a library cannot yet check or stop the items of a loop.
+
+### Example: a library that checks node outputs
+
+`NodeFinishProcessEvent` says how a run ended but carries none of the node's output values.
+A library that needs to look at what a node produced reads the values with requests when
+the event arrives. This is the mirror of the blocked-terms example, which checks inputs
+before a node runs:
+
+- [`griptape_nodes_library.json`](example_node_output_check_library/griptape_nodes_library.json):
+    manifest declaring the advanced library and no nodes of its own
+- [`advanced_library.py`](example_node_output_check_library/advanced_library.py): on each
+    `NodeFinishProcessEvent` for a run that succeeded, reads the parameters named in
+    `FLAGGED_TERMS_BY_PARAMETER` and logs a warning when a text value contains a flagged term
+
+The terms are set per parameter name, the same way as in the blocked-terms example:
+
+```python
+FLAGGED_TERMS_BY_PARAMETER = {
+    "output": ("CONFIDENTIAL",),
+}
+```
+
+Run a workflow whose **Agent** node answers with `CONFIDENTIAL` in its text. The engine log
+gets a warning such as
+`Agent_1 (Agent) output 'output' contains flagged term 'CONFIDENTIAL'. execution_id=cd88...`.
+
+Things to know about this example:
+
+- **It reports. It does not change anything.** The node has already finished, so the
+    output is already on the node and may already be flowing to the next one. To act on a
+    flag, send a `CancelFlowRequest` as the
+    [blocked-terms example](#example-a-library-that-cancels-a-run-on-blocked-terms) does,
+    and expect the next node to start before the cancel lands.
+- **Only successful runs are checked.** A node that failed or was cancelled has no finished
+    output.
+- **The text stays out of the log.** The warning names the node, the parameter and the term.
+    Add the text if you need it, and remember that outputs can be as sensitive as prompts.
+- **Only text is checked.** An image or other object is skipped.
+- **Nodes inside a loop body are not covered.** The event names the canvas node, which only
+    receives the last iteration's outputs once the whole loop has finished. During the loop
+    the check reads stale outputs.

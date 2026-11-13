@@ -1,0 +1,14 @@
+{
+  "name": "Node Inputs Demo",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape",
+    "description": "Demonstrates a library that logs the input parameters, including model and prompt, of every node run.",
+    "library_version": "0.1.0",
+    "engine_version": "0.97.0",
+    "tags": ["demo", "execution-events"]
+  },
+  "categories": [],
+  "advanced_library_path": "advanced_library.py",
+  "nodes": []
+}

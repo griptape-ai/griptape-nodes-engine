@@ -176,6 +176,9 @@ ignore = [
 # use every argument.
 "docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
 "docs/development/custom_nodes/example_node_timing_library/**" = ["INP001", "ARG002"]
+"docs/development/custom_nodes/example_node_inputs_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_node_blocked_terms_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_node_output_check_library/**" = ["INP001", "TID251"]
 "docs/development/custom_nodes/example_request_handler_library/**" = [
   "INP001",
   "TID251",
