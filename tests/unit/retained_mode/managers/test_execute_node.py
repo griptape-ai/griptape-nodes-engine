@@ -32,12 +32,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AlterParameterDetailsRequest,
     SetParameterValueRequest,
 )
-from griptape_nodes.retained_mode.events.worker_events import (
-    CheckLeaseRequest,
-    CheckLeaseResultFailure,
-    CheckLeaseResultSuccess,
-    WorkerGoneError,
-)
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -151,7 +146,6 @@ def _make_node_manager(
     worker_manager = worker_manager or MagicMock()
     worker_manager.wait_until_executable = AsyncMock()
     worker_manager.acquire_lease = AsyncMock(return_value=None)
-    worker_manager.lease_refusal = AsyncMock(return_value=None)
     mock_engine.worker_manager = worker_manager
     return NodeManager(MagicMock(), engine=mock_engine)
 
@@ -824,78 +818,6 @@ def _create_echo_node(engine: Engine, flow_name: str) -> BaseNode:
     return engine.node_manager.get_node_by_name(result.node_name)
 
 
-class TestAWorkerAnotherEngineRuns:
-    """A worker another engine runs asks that engine, before each node, whether the node's lease holds it."""
-
-    @pytest.mark.asyncio
-    async def test_runs_the_node_once_that_engine_says_the_lease_holds_it(self, worker_engine: Engine) -> None:
-        worker_engine.worker_manager._host_engine_id = "gpu-01"
-        held = CheckLeaseResultSuccess(result_details="held")
-        with patch.object(
-            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=held)
-        ) as ask:
-            result = await worker_engine.ahandle_request(
-                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
-            )
-
-        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
-        assert ask.await_args is not None
-        engine_id, check = ask.await_args.args
-        assert engine_id == "gpu-01"
-        assert isinstance(check, CheckLeaseRequest)
-        assert check.lease_id == "lease-1"
-        assert check.worker_engine_id == worker_engine.get_engine_id()
-
-    @pytest.mark.asyncio
-    async def test_refuses_the_node_when_that_engine_says_the_lease_does_not_hold_it(
-        self, worker_engine: Engine
-    ) -> None:
-        worker_engine.worker_manager._host_engine_id = "gpu-01"
-        not_held = CheckLeaseResultFailure(result_details="that engine is not holding itself for your run now.")
-        with patch.object(
-            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(return_value=not_held)
-        ):
-            result = await worker_engine.ahandle_request(
-                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
-            )
-
-        assert isinstance(result, ExecuteNodeResultFailure)
-        assert "not holding itself for your run" in str(result.result_details)
-        for workflow in worker_engine.worker_workflows.all_kept():
-            assert "Echo" not in workflow.nodes.name_to_parent_flow_name
-
-    @pytest.mark.asyncio
-    async def test_refuses_a_node_sent_without_a_lease(self, worker_engine: Engine) -> None:
-        worker_engine.worker_manager._host_engine_id = "gpu-01"
-        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
-            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
-
-        assert isinstance(result, ExecuteNodeResultFailure)
-        assert "without a lease" in str(result.result_details)
-        ask.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_refuses_the_node_when_that_engine_does_not_answer(self, worker_engine: Engine) -> None:
-        worker_engine.worker_manager._host_engine_id = "gpu-01"
-        with patch.object(
-            worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock(side_effect=TimeoutError)
-        ):
-            result = await worker_engine.ahandle_request(
-                _request_for("_EchoNode", parameter_values={"text": "hi"}, lease_id="lease-1")
-            )
-
-        assert isinstance(result, ExecuteNodeResultFailure)
-        assert "did not answer" in str(result.result_details)
-
-    @pytest.mark.asyncio
-    async def test_a_worker_on_this_machine_asks_no_engine(self, worker_engine: Engine) -> None:
-        with patch.object(worker_engine.event_manager, "request_engine_from_worker", new=AsyncMock()) as ask:
-            result = await worker_engine.ahandle_request(_request_for("_EchoNode", parameter_values={"text": "hi"}))
-
-        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
-        ask.assert_not_awaited()
-
-
 class TestPreparingTheRequestForAWorker:
     """What the orchestrator puts in an ExecuteNodeRequest before it forwards it: what a save would write."""
 
@@ -1029,7 +951,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
 
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
@@ -1060,15 +982,15 @@ class TestExecuteNodeWorkerRoute:
         sent: list[str | None] = []
         success = {"result_type": ExecuteNodeResultSuccess.__name__, "result": {"result_details": "ok"}}
 
-        def run(event_request: Any, *_args: Any) -> dict:
+        def run(_event_request: Any, *_args: Any, lease_id: str | None = None) -> dict:
             calls.append("run")
-            sent.append(event_request.request.lease_id)
+            sent.append(lease_id)
             return success
 
         wm.worker_unavailable_reason.return_value = None
         wm.wait_until_executable = AsyncMock(side_effect=lambda *_, **__: calls.append("wait"))
         wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
-        lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or "eng-id"
         wm.route_to_worker = AsyncMock(side_effect=run)
         wm.release_after_node = MagicMock(side_effect=lambda *_: calls.append("release"))
 
@@ -1124,7 +1046,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
 
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
@@ -1154,7 +1076,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
 
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
@@ -1173,7 +1095,7 @@ def _make_orchestrator_library_manager() -> MagicMock:
     lib_mgr = MagicMock()
     lib_mgr.is_worker = False
     lib_mgr._is_worker = False
-    lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+    lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
     return lib_mgr
 
 
@@ -1234,15 +1156,13 @@ class TestExecuteNodeWorkerValues:
 class TestExecuteNodePrivateExecutionRoute:
     """Orchestrator-side routing of a node run inside an Isolated Execution scope to the worker it names."""
 
-    _LIBRARY_WORKER = ("library-eng-id", "library-topic")
-    _PRIVATE_WORKER = ("private-eng-id", "private-topic")
+    _LIBRARY_WORKER = "library-eng-id"
+    _PRIVATE_WORKER = "private-eng-id"
 
     def _make_node(self) -> Any:
         return _make_routed_node(name="test_node", library="some_library")
 
-    def _make_worker_manager(
-        self, private_worker: tuple[str, str] | None, unavailable_reason: str | None = None
-    ) -> MagicMock:
+    def _make_worker_manager(self, private_worker: str | None, unavailable_reason: str | None = None) -> MagicMock:
         wm = MagicMock()
         wm.worker_unavailable_reason.return_value = unavailable_reason
         wm.get_worker_for_key.return_value = private_worker
@@ -1260,7 +1180,7 @@ class TestExecuteNodePrivateExecutionRoute:
         wm: MagicMock,
         *,
         scope_owner: str | None = "My Group",
-        library_worker: tuple[str, str] | None = None,
+        library_worker: str | None = None,
         load_failure: str | None = None,
     ) -> ExecuteNodeResultSuccess | ExecuteNodeResultFailure:
         lib_mgr = _make_mock_library_manager(is_worker=False)
@@ -1297,7 +1217,7 @@ class TestExecuteNodePrivateExecutionRoute:
         assert isinstance(result, ExecuteNodeResultSuccess)
         wm.wait_until_executable.assert_any_await(None)
         wm.get_worker_for_key.assert_called_once_with(None)
-        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1308,7 +1228,7 @@ class TestExecuteNodePrivateExecutionRoute:
         result = await self._execute(node, wm, library_worker=self._LIBRARY_WORKER)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
-        assert wm.route_to_worker.await_args.args[1:] == self._LIBRARY_WORKER
+        assert wm.route_to_worker.await_args.args[1] == self._LIBRARY_WORKER
         wm.get_worker_for_key.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1381,5 +1301,5 @@ class TestExecuteNodePrivateExecutionRoute:
         result = await self._execute(node, wm)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
-        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()

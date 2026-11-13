@@ -1,12 +1,13 @@
 """A library's worker process: an engine that works for the engine that started it, over their channel.
 
-The worker has no engine identity, session, transport, or license of its own. Everything it needs
-answered or authorized goes to its parent:
+The worker has no session, transport, or license of its own, and its engine ID is one its parent
+minted for this spawn. Everything it needs answered or authorized goes to its parent:
 
 - Requests node code sends while a node runs, through the `RemoteHandler`s every worker installs.
 - Every authorization checkpoint, through a hook installed before any library loads. The hook denies
   whenever the parent cannot answer, so the worker never runs on the engine's allow-by-default.
-- Every secret, so a credential its parent did not give it cannot be read from its own environment.
+- Every secret looked up through its engine. The process itself runs in the environment of the
+  machine it runs on.
 
 It exits when the channel closes: the parent stopped it, or the parent is gone.
 """
@@ -28,8 +29,6 @@ from griptape_nodes.retained_mode.engine import WorkerProcess, build_root_engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
-    ReportGeneralPurposeWorkerReadyRequest,
-    ReportLibraryLoadedRequest,
 )
 from griptape_nodes.retained_mode.events.base_events import (
     AppEvent,
@@ -44,6 +43,7 @@ from griptape_nodes.retained_mode.events.execution_events import GriptapeEvent
 from griptape_nodes.retained_mode.events.logger_events import LogHandlerEvent
 from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
+from griptape_nodes.retained_mode.events.worker_events import GeneralPurposeWorkerReady
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointDenial,
@@ -89,12 +89,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# How long the worker waits for its parent to answer a request, a checkpoint, or a secret.
-PARENT_REQUEST_TIMEOUT_S = 30.0
-
-# How long the worker waits for its parent to answer its hello. Longer than the parent may take to
-# report it ready to another engine, which a worker run for another engine's session waits on.
-_HELLO_TIMEOUT_S = ENGINE_REQUEST_TIMEOUT_S + PARENT_REQUEST_TIMEOUT_S
+# How long the worker waits for its parent to answer anything: a request, a checkpoint, a secret, or
+# its hello. A parent that runs the worker for another engine answers by asking that engine, which it
+# waits ENGINE_REQUEST_TIMEOUT_S for, so the worker waits longer and never gives up on a late answer.
+PARENT_REQUEST_TIMEOUT_S = ENGINE_REQUEST_TIMEOUT_S + 30.0
+_HELLO_TIMEOUT_S = PARENT_REQUEST_TIMEOUT_S
 
 # How long the worker waits for the project its parent sends as soon as it connects.
 _PROJECT_SETTLE_TIMEOUT_S = 30.0
@@ -433,9 +432,9 @@ async def _serve(side: WorkerSide, library_names: list[str], worker_engine_id: s
         if isinstance(activation, EventResultFailure):
             logger.error("Workspace project activation failed: %s", activation.result.result_details)
 
-    reports: list[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest] = []
+    reports: list[LibraryLoadReport | GeneralPurposeWorkerReady] = []
 
-    async def record_report(report: ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest) -> None:
+    async def record_report(report: LibraryLoadReport | GeneralPurposeWorkerReady) -> None:
         reports.append(report)
 
     engine.library_manager.register_library_load_reporter(record_report)
@@ -492,7 +491,6 @@ def prepare_worker_engine(engine: Engine, side: WorkerSide) -> asyncio.Event:
     return register_broadcast_handlers(
         event_manager,
         config_manager=engine.config_manager,
-        secrets_manager=engine.secrets_manager,
         project_manager=engine.project_manager,
     )
 
@@ -500,19 +498,13 @@ def prepare_worker_engine(engine: Engine, side: WorkerSide) -> asyncio.Event:
 def _hello(
     engine: Engine,
     library_names: list[str],
-    reports: list[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest],
+    reports: list[LibraryLoadReport | GeneralPurposeWorkerReady],
 ) -> WorkerHello:
     """What this worker tells its parent once its libraries have loaded."""
-    libraries = [
-        LibraryLoadReport(
-            library_name=report.library_name, fitness=report.fitness, problem_details=report.problem_details
-        )
-        for report in reports
-        if isinstance(report, ReportLibraryLoadedRequest)
-    ]
+    libraries = [report for report in reports if isinstance(report, LibraryLoadReport)]
     failure_reason = None
     if not library_names:
-        loaded = any(isinstance(report, ReportGeneralPurposeWorkerReadyRequest) for report in reports)
+        loaded = any(isinstance(report, GeneralPurposeWorkerReady) for report in reports)
         if not loaded:
             failure_reason = "it did not finish loading libraries."
     else:

@@ -914,9 +914,7 @@ class TestEveryEngineHandlerDeclaresAScope:
 
     def test_every_broadcast_handler_a_worker_registers_declares_host_scope(self) -> None:
         event_manager = EventManager()
-        register_broadcast_handlers(
-            event_manager, config_manager=MagicMock(), secrets_manager=MagicMock(), project_manager=MagicMock()
-        )
+        register_broadcast_handlers(event_manager, config_manager=MagicMock(), project_manager=MagicMock())
 
         scopes = {
             request_type.__name__: event_manager.get_scope_for_request_type(request_type)

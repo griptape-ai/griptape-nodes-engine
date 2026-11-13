@@ -11,6 +11,8 @@ import send2trash
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior, SequenceScanOptions
+from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
+from griptape_nodes.files.file_driver import FileDriverRegistry
 from griptape_nodes.files.path_utils import normalize_path_for_platform, resolve_path_safely
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
@@ -2605,3 +2607,30 @@ class TestLaunchExternalViewerRequest:
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
         assert "openexr.viewer_args" in str(result.result_details)
         popen.assert_not_called()
+
+
+class TestCloudFileDriverCredential:
+    @pytest.mark.asyncio
+    async def test_a_read_sends_the_renewed_credential_through_the_same_driver(self, engine: Engine) -> None:
+        """A session credential renews, and the driver this manager registered lives as long as the process."""
+        os_manager = engine.os_manager
+        driver = GriptapeCloudFileDriver(bucket_id="bucket", api_key="the first session token")
+        sent: list[str | None] = []
+
+        async def read(_location: str, **_kwargs: object) -> bytes:
+            sent.append(driver.api_key)
+            return b"content"
+
+        driver.read = read  # type: ignore[method-assign]
+        os_manager._cloud_file_driver = driver
+        location = "https://cloud.griptape.ai/buckets/bucket/assets/a.txt"
+        with (
+            patch.object(FileDriverRegistry, "get_driver", return_value=driver),
+            patch(
+                "griptape_nodes.retained_mode.managers.os_manager.resolve_cloud_credential",
+                return_value="the renewed session token",
+            ),
+        ):
+            await os_manager._read_via_driver(location, ReadFileRequest(file_path=location))
+
+        assert sent == ["the renewed session token"]

@@ -50,6 +50,7 @@ class PublicArtifactUrlParameter:
     supported_artifact_type_names: ClassVar[list[str]] = [cls.__name__ for cls in supported_artifact_types]
     # Process-wide on purpose: keys carry the base URL and credential, so engines never share an entry.
     # Bucket lookup requires a network round trip; cache results across helper instances.
+    # The credential is in the key because a default bucket belongs to the credential's organization.
     _bucket_id_cache: ClassVar[dict[tuple[str, str, str | None], str]] = {}
     # One lock per cache key, so a slow lookup does not hold up other configurations.
     _bucket_id_locks: ClassVar[dict[tuple[str, str, str | None], threading.Lock]] = {}
@@ -78,18 +79,28 @@ class PublicArtifactUrlParameter:
             )
             raise ValueError(msg)
 
-        api_key = resolve_cloud_credential(node.engine.secrets_manager, secret_name=self.API_KEY_NAME)
-        if not api_key:
-            msg = (
-                f"Attempted to make '{artifact_url_parameter.name}' publicly accessible. "
-                f"Failed because {MISSING_CREDENTIAL_MESSAGE}"
-            )
-            raise ValueError(msg)
-
-        self._api_key = api_key
+        self._credential()
         self._base_url = resolve_cloud_base_url()
         # Building the driver resolves the bucket over the network.
         self._storage_driver: GriptapeCloudStorageDriver | None = None
+        # The credential the driver was built with. A different one builds a new driver, since its bucket
+        # belongs to that credential's organization.
+        self._storage_driver_credential: str | None = None
+
+    def _credential(self) -> str:
+        """The Griptape Cloud credential, read for each use: a session credential renews.
+
+        Raises:
+            ValueError: There is none.
+        """
+        api_key = resolve_cloud_credential(self._node.engine.secrets_manager, secret_name=self.API_KEY_NAME)
+        if not api_key:
+            msg = (
+                f"Attempted to make '{self._parameter.name}' publicly accessible. "
+                f"Failed because {MISSING_CREDENTIAL_MESSAGE}"
+            )
+            raise ValueError(msg)
+        return api_key
 
     @classmethod
     def _get_bucket_id(cls, engine: Engine, base_url: str, api_key: str, timeout: float | None = None) -> str:
@@ -117,8 +128,19 @@ class PublicArtifactUrlParameter:
             if cached is not None:
                 return cached
             bucket_id = cls._lookup_bucket_id(configured_bucket_id, base_url, api_key, timeout=timeout)
+            cls._forget_other_credentials(cache_key)
             cls._bucket_id_cache[cache_key] = bucket_id
             return bucket_id
+
+    @classmethod
+    def _forget_other_credentials(cls, cache_key: tuple[str, str, str | None]) -> None:
+        """Drop entries for the same configuration under other credentials: a session token renews often."""
+        base_url, api_key, configured_bucket_id = cache_key
+        with cls._bucket_id_locks_guard:
+            for other_key in list(cls._bucket_id_locks):
+                if other_key[0] == base_url and other_key[2] == configured_bucket_id and other_key[1] != api_key:
+                    cls._bucket_id_locks.pop(other_key, None)
+                    cls._bucket_id_cache.pop(other_key, None)
 
     @classmethod
     def _lookup_bucket_id(cls, bucket_id: str | None, base_url: str, api_key: str, timeout: float | None = None) -> str:
@@ -292,16 +314,18 @@ class PublicArtifactUrlParameter:
         return path
 
     def _get_storage_driver(self) -> GriptapeCloudStorageDriver:
-        if self._storage_driver is not None:
+        credential = self._credential()
+        if self._storage_driver is not None and self._storage_driver_credential == credential:
             return self._storage_driver
-        bucket_id = self._get_bucket_id(self._node.engine, self._base_url, self._api_key, timeout=self._request_timeout)
-        return self._build_storage_driver(bucket_id)
+        bucket_id = self._get_bucket_id(self._node.engine, self._base_url, credential, timeout=self._request_timeout)
+        return self._build_storage_driver(bucket_id, credential)
 
     async def _aget_storage_driver(self) -> GriptapeCloudStorageDriver:
-        if self._storage_driver is not None:
+        credential = self._credential()
+        if self._storage_driver is not None and self._storage_driver_credential == credential:
             return self._storage_driver
         configured_bucket_id = self._read_configured_bucket_id(self._node.engine)
-        cache_key = (self._base_url, self._api_key, configured_bucket_id)
+        cache_key = (self._base_url, credential, configured_bucket_id)
         bucket_id = self._bucket_id_cache.get(cache_key)
         if bucket_id is None:
             bucket_id = await self._run_off_loop(
@@ -309,11 +333,11 @@ class PublicArtifactUrlParameter:
                     self._resolve_bucket_id,
                     configured_bucket_id,
                     self._base_url,
-                    self._api_key,
+                    credential,
                     timeout=self._request_timeout,
                 )
             )
-        return self._build_storage_driver(bucket_id)
+        return self._build_storage_driver(bucket_id, credential)
 
     def _forget_storage_driver_if_bucket_missing(self, driver: GriptapeCloudStorageDriver, error: Exception) -> None:
         """After a 404, drop the cached bucket so the next upload revalidates it.
@@ -328,17 +352,18 @@ class PublicArtifactUrlParameter:
         if self._storage_driver is driver:
             self._storage_driver = None
         for cache_key, bucket_id in list(self._bucket_id_cache.items()):
-            if cache_key[:2] == (self._base_url, self._api_key) and bucket_id == driver.bucket_id:
+            if cache_key[:2] == (self._base_url, self._storage_driver_credential) and bucket_id == driver.bucket_id:
                 self._bucket_id_cache.pop(cache_key, None)
 
-    def _build_storage_driver(self, bucket_id: str) -> GriptapeCloudStorageDriver:
+    def _build_storage_driver(self, bucket_id: str, credential: str) -> GriptapeCloudStorageDriver:
         self._storage_driver = GriptapeCloudStorageDriver(
             self._node.engine.config_manager,
             bucket_id=bucket_id,
-            api_key=self._api_key,
+            api_key=credential,
             base_url=self._base_url,
             request_timeout=self._request_timeout,
         )
+        self._storage_driver_credential = credential
         return self._storage_driver
 
     @classmethod

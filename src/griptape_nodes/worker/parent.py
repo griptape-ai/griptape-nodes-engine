@@ -11,7 +11,7 @@ import asyncio
 import contextvars
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import AppEvent, ExecutionEvent, ExecutionGriptapeNodeEvent
@@ -126,17 +126,7 @@ class ParentEnd:
 
     def answer_checkpoint(self, body: dict[str, Any]) -> dict[str, Any]:
         """Decide a worker's checkpoint with this engine's authorization hooks. Unreadable denies."""
-        try:
-            checkpoint = read_payload(body, AuthorizationCheckpoint)
-        except WireFormatError as e:
-            logger.error("Denied a checkpoint from a library's worker process because %s.", e)
-            detail = f"Attempted to check a permission for a library's worker process. Failed because {e}."
-            denial = CheckpointDenial(failures=(CheckpointFailure(detail=detail),))
-            return {"denial": json.loads(converters.engine.dumps(denial))}
-        denial = self._engine.event_manager.evaluate_authorization_checkpoint(checkpoint)
-        if denial is None:
-            return {"denial": None}
-        return {"denial": json.loads(converters.engine.dumps(denial))}
+        return decide_worker_checkpoint(self._engine, body)
 
     async def _on_request(self, body: dict[str, Any]) -> dict[str, Any]:
         """Answer one gated request."""
@@ -145,10 +135,8 @@ class ParentEnd:
             return self.answer_checkpoint(body)
         if body_type == WORKER_HELLO:
             reply = await self._answer_hello(body)
-            if not reply.get("accepted") and self._channel is not None:
-                # A refused worker ends because its channel does, not because it chooses to: library
-                # code can keep its process alive. Scheduled so the refusal goes out first.
-                asyncio.get_running_loop().call_soon(self._channel.close)
+            if self._channel is not None:
+                end_if_refused(reply, self._channel)
             return reply
         try:
             event_request = read_event_request(body)
@@ -180,36 +168,106 @@ class ParentEnd:
             logger.error("Dropped an event from a library's worker process: %s.", e)
 
     def _accept_notification(self, body: dict[str, Any]) -> None:
-        body_type = body.get("type")
-        if body_type == EXECUTION_EVENT:
-            execution_event = read_payload(body, ExecutionEvent)
-            if not isinstance(execution_event.payload, RELAYED_EXECUTION_PAYLOADS):
-                msg = f"a worker does not send '{type(execution_event.payload).__name__}' events"
-                raise WireFormatError(msg)
-            self._engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=execution_event))
+        notification = read_worker_notification(body)
+        if isinstance(notification, QueuedWorkerEvent):
+            self._engine.event_manager.put_event(notification.event)
             return
-        if body_type in (APP_EVENT, EVENT_RESULT):
-            payload = body.get("payload")
-            if not isinstance(payload, dict):
-                msg = f"a '{body_type}' carried no payload"
-                raise WireFormatError(msg)
-            if body_type == APP_EVENT and payload.get("payload_type") in _QUEUED_APP_PAYLOAD_NAMES:
-                self._engine.event_manager.put_event(read_payload(body, AppEvent))
-                return
-            relay = create_task_bound_to_no_workflow(
-                asyncio.get_running_loop(), self._relay_to_editor(body_type, payload)
-            )
-            self._relays.add(relay)
-            relay.add_done_callback(self._relays.discard)
-            relay.add_done_callback(_log_relay_failure)
-            return
-        msg = f"a '{body_type}' is not something a worker sends"
-        raise WireFormatError(msg)
+        relay = create_task_bound_to_no_workflow(
+            asyncio.get_running_loop(), self._relay_to_editor(notification.event_type, notification.payload)
+        )
+        self._relays.add(relay)
+        relay.add_done_callback(self._relays.discard)
+        relay.add_done_callback(_log_relay_failure)
+
+
+def end_if_refused(hello_reply: dict[str, Any], channel: AsyncChannel) -> None:
+    """Close `channel` once a refusal of its worker's hello has been sent, and only then.
+
+    A refused worker ends because its channel does, not because it chooses to: library code can keep
+    its process alive. Scheduled rather than closed here, so the refusal goes out first.
+    """
+    if hello_reply.get("accepted"):
+        return
+    asyncio.get_running_loop().call_soon(channel.close)
 
 
 async def _bound_to_no_workflow[T](coro: Coroutine[Any, Any, T]) -> T:
     """Await `coro` as work that acts on no workflow."""
     return await create_task_bound_to_no_workflow(asyncio.get_running_loop(), coro)
+
+
+def decide_worker_checkpoint(engine: Engine, body: dict[str, Any]) -> dict[str, Any]:
+    """Decide a worker's checkpoint body with `engine`'s authorization hooks, as the reply the worker reads. Unreadable denies."""
+    try:
+        checkpoint = read_payload(body, AuthorizationCheckpoint)
+    except WireFormatError as e:
+        logger.error("Denied a checkpoint from a library's worker process because %s.", e)
+        detail = f"Attempted to check a permission for a library's worker process. Failed because {e}."
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail=detail),))
+        return {"denial": json.loads(converters.engine.dumps(denial))}
+    denial = engine.event_manager.evaluate_authorization_checkpoint(checkpoint)
+    if denial is None:
+        return {"denial": None}
+    return {"denial": json.loads(converters.engine.dumps(denial))}
+
+
+class QueuedWorkerEvent(NamedTuple):
+    """A worker's event the engine queues as if a node of its own emitted it."""
+
+    event: Any
+
+
+class EditorBoundWorkerEvent(NamedTuple):
+    """A worker's event the engine sends on to the editor without acting on it, by wire `event_type` and payload."""
+
+    event_type: str
+    payload: dict[str, Any]
+
+
+def read_worker_notification(body: dict[str, Any]) -> QueuedWorkerEvent | EditorBoundWorkerEvent:
+    """What the engine a worker works for does with one of the worker's one-way bodies.
+
+    Raises:
+        WireFormatError: The body is not something a worker sends, or does not have its type's shape.
+    """
+    body_type = body.get("type")
+    if body_type == EXECUTION_EVENT:
+        execution_event = read_payload(body, ExecutionEvent)
+        if not isinstance(execution_event.payload, RELAYED_EXECUTION_PAYLOADS):
+            msg = f"a worker does not send '{type(execution_event.payload).__name__}' events"
+            raise WireFormatError(msg)
+        return QueuedWorkerEvent(event=ExecutionGriptapeNodeEvent(wrapped_event=execution_event))
+    if body_type in (APP_EVENT, EVENT_RESULT):
+        payload = body.get("payload")
+        if not isinstance(payload, dict):
+            msg = f"a '{body_type}' carried no payload"
+            raise WireFormatError(msg)
+        if body_type == APP_EVENT and payload.get("payload_type") in _QUEUED_APP_PAYLOAD_NAMES:
+            return QueuedWorkerEvent(event=read_payload(body, AppEvent))
+        return EditorBoundWorkerEvent(event_type=body_type, payload=payload)
+    msg = f"a '{body_type}' is not something a worker sends"
+    raise WireFormatError(msg)
+
+
+async def apply_worker_notifications(
+    engine: Engine,
+    bodies: list[dict[str, Any]],
+    relay_to_editor: Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]],
+) -> None:
+    """On the engine loop, do with each of a worker's one-way bodies, in order, what `ParentEnd` does with them."""
+    for body in bodies:
+        try:
+            notification = read_worker_notification(body)
+        except WireFormatError as e:
+            logger.error("Dropped an event from a library's worker process: %s.", e)
+            continue
+        if isinstance(notification, QueuedWorkerEvent):
+            engine.event_manager.put_event(notification.event)
+            continue
+        try:
+            await relay_to_editor(notification.event_type, notification.payload)
+        except Exception as e:
+            logger.error("Could not send what a library's worker process sent on to the editor: %s", e)
 
 
 def _log_relay_failure(relay: asyncio.Task) -> None:

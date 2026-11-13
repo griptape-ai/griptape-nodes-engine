@@ -9,13 +9,6 @@ import pytest
 from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
 
 
-def _secrets_from_environ() -> Mock:
-    """A secrets manager that answers from the process environment, as an engine's does with no .env files."""
-    secrets_manager = Mock()
-    secrets_manager.get_secret.side_effect = lambda name, should_error_on_not_found=True: os.environ.get(name)  # noqa: ARG005
-    return secrets_manager
-
-
 class TestGriptapeCloudFileDriver:
     """Tests for GriptapeCloudFileDriver class."""
 
@@ -43,15 +36,10 @@ class TestGriptapeCloudFileDriver:
 
     def test_create_from_env_with_credentials(self) -> None:
         """Test creating driver from environment variables."""
-        # clear=True so a Griptape license in the developer's own environment (or
-        # hydrated from their .env by SecretsManager) can't win credential
-        # resolution and fail this test on behavior it isn't covering.
         with patch.dict(
-            os.environ,
-            {"GT_CLOUD_BUCKET_ID": "env-bucket", "GT_CLOUD_API_KEY": "env-key", "GT_CLOUD_BASE_URL": "https://test.ai"},
-            clear=True,
+            os.environ, {"GT_CLOUD_BUCKET_ID": "env-bucket", "GT_CLOUD_BASE_URL": "https://test.ai"}, clear=True
         ):
-            driver = GriptapeCloudFileDriver.create_from_env(_secrets_from_environ())
+            driver = GriptapeCloudFileDriver.create_from_env("env-key")
             assert driver is not None
             assert driver.bucket_id == "env-bucket"
             assert driver.api_key == "env-key"
@@ -59,14 +47,14 @@ class TestGriptapeCloudFileDriver:
 
     def test_create_from_env_without_credentials(self) -> None:
         """Test creating driver from env returns None when credentials missing."""
-        with patch.dict(os.environ, {}, clear=True):
-            driver = GriptapeCloudFileDriver.create_from_env(_secrets_from_environ())
+        with patch.dict(os.environ, {"GT_CLOUD_BUCKET_ID": "bucket"}, clear=True):
+            driver = GriptapeCloudFileDriver.create_from_env(None)
             assert driver is None
 
     def test_create_from_env_default_base_url(self) -> None:
         """Test creating driver uses default base URL when not provided."""
-        with patch.dict(os.environ, {"GT_CLOUD_BUCKET_ID": "bucket", "GT_CLOUD_API_KEY": "key"}, clear=True):
-            driver = GriptapeCloudFileDriver.create_from_env(_secrets_from_environ())
+        with patch.dict(os.environ, {"GT_CLOUD_BUCKET_ID": "bucket"}, clear=True):
+            driver = GriptapeCloudFileDriver.create_from_env("key")
             assert driver is not None
             assert driver.base_url == "https://cloud.griptape.ai"
 
@@ -275,3 +263,29 @@ class TestGriptapeCloudFileDriverBaseUrlPath:
 
         args, _ = mock_client.post.call_args
         assert args[0] == "https://example.com/prefix/api/buckets/123/asset-urls/test.txt"
+
+    @pytest.mark.asyncio
+    async def test_the_next_request_sends_the_credential_its_owner_set(self) -> None:
+        """A session credential renews, and the driver lives as long as its engine."""
+        driver = GriptapeCloudFileDriver(bucket_id="test-bucket-123", api_key="the first session token")
+        mock_api_response = Mock()
+        mock_api_response.json = Mock(return_value={"url": "https://signed.url/file.txt"})
+        mock_api_response.raise_for_status = Mock()
+        mock_download_response = Mock()
+        mock_download_response.content = b"cloud file content"
+        mock_download_response.raise_for_status = Mock()
+
+        with patch("httpx2.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_api_response)
+            mock_client.get = AsyncMock(return_value=mock_download_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            await driver.read("https://cloud.griptape.ai/buckets/123/assets/test.txt", timeout=30.0)
+            driver.api_key = "the renewed session token"
+            await driver.read("https://cloud.griptape.ai/buckets/123/assets/test.txt", timeout=30.0)
+
+        sent = [call.kwargs["headers"]["Authorization"] for call in mock_client.post.call_args_list]
+        assert sent == ["Bearer the first session token", "Bearer the renewed session token"]

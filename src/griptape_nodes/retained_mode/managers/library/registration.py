@@ -23,9 +23,6 @@ from griptape_nodes.retained_mode.beta_features import (
     library_config_slug,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.app_events import (
-    ReportLibraryLoadedRequest,
-)
 
 # Runtime imports for ResultDetails since it's used at runtime
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
@@ -56,6 +53,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultFailure,
     UnloadLibraryFromRegistryResultSuccess,
 )
+from griptape_nodes.retained_mode.events.worker_events import LibraryLoadReport
 from griptape_nodes.retained_mode.managers.external_environment import LIBRARY_PATHS_ENV_VAR
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
@@ -827,7 +825,7 @@ class LibraryRegistrar(EngineScoped):
                             and library_info.library_name
                         ):
                             await self.engine.library_manager.workers.report_library_loaded(
-                                ReportLibraryLoadedRequest(
+                                LibraryLoadReport(
                                     library_name=library_info.library_name,
                                     fitness=library_info.fitness,
                                     problem_details=self.engine.library_manager.catalog.collate_problems_for_lib_info(

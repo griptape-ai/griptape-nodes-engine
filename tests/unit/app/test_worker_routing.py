@@ -286,7 +286,6 @@ class TestInstallRemoteHandlersSwap:
         register_broadcast_handlers(
             probe,
             config_manager=MagicMock(),
-            secrets_manager=MagicMock(),
             project_manager=MagicMock(),
         )
         installed = set(probe.registered_request_types()) - before
@@ -628,7 +627,6 @@ def _install_adoption(
     return register_broadcast_handlers(
         event_manager,
         config_manager=MagicMock(),
-        secrets_manager=MagicMock(),
         project_manager=cast("ProjectManager", project_manager),
     )
 
