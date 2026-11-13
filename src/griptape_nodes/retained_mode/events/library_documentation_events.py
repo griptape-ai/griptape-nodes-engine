@@ -2,7 +2,7 @@
 
 A library keeps its docs in a `docs/` folder next to its manifest. These requests read them
 through the engine, so the editor and agents get the same text from the installed library,
-with no network. See docs/development/designs/library_documentation.md.
+with no network. See docs/development/custom_nodes/library_documentation.md.
 """
 
 from __future__ import annotations

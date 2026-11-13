@@ -1,11 +1,12 @@
 """Find and read the documentation a node library ships.
 
 A library keeps its docs in a `docs/` folder next to its manifest. `docs/nodes/` holds one page per
-node, `docs/workflow_nodes/` one page per workflow node, and `docs/workflows/` one page per workflow
-template. Every other page under `docs/` is about the library as a whole.
+node, `docs/workflow_nodes/` one page per workflow node, `docs/workflows/` one page per workflow
+template, and `docs/mcp_tools/` one page per MCP tool. Every other page under `docs/` is about the
+library as a whole.
 
 Nothing here touches the engine. `LibraryDocs` takes a library's root folder and its manifest, so it
-can be tested against a folder of files. See docs/development/designs/library_documentation.md.
+can be tested against a folder of files. See docs/development/custom_nodes/library_documentation.md.
 """
 
 from __future__ import annotations

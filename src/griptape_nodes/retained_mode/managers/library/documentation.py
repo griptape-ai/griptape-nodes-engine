@@ -1,6 +1,6 @@
 """Answer requests for the documentation a library ships.
 
-See docs/development/designs/library_documentation.md.
+See docs/development/custom_nodes/library_documentation.md.
 """
 
 from __future__ import annotations
