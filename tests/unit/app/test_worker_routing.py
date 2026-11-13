@@ -69,6 +69,7 @@ from griptape_nodes.retained_mode.events.worker_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler, RequestScope
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -605,6 +606,12 @@ def _route_probe_through_a_remote_handler(event_manager: EventManager) -> None:
     )
 
 
+def _orchestrator_on(project_id: str) -> EventResultSuccess:
+    """The orchestrator's answer to a worker asking which project it is on."""
+    answer = GetCommittedProjectResultSuccess(project_id=project_id, result_details="ok")
+    return EventResultSuccess(request=GetCommittedProjectRequest(), result=answer)
+
+
 class _ProjectManagerThatRequestsSynchronously:
     """Adopts by sending a request through sync `handle_request`, as workflow registration does."""
 
@@ -662,7 +669,8 @@ class TestActivateProjectRunsOnTheEngineLoop:
         assert handler is not None
         assert not isinstance(handler, ForwardingHandler)
 
-        result = await handler(ActivateProjectRequest(project_id="next-project"))
+        with patch.object(event_manager, "forward_to_orchestrator", return_value=_orchestrator_on("next-project")):
+            result = await handler(ActivateProjectRequest())
 
         assert result.succeeded()
         assert project_manager.adopted_on_thread == "engine-loop"
@@ -679,7 +687,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         assert handler is not None
         assert not isinstance(handler, ForwardingHandler)
 
-        result = await handler(ActivateProjectRequest(project_id="next-project"))
+        result = await handler(ActivateProjectRequest())
 
         assert result.failed()
         assert project_manager.adopted_on_thread is None
@@ -687,18 +695,18 @@ class TestActivateProjectRunsOnTheEngineLoop:
 
 
 class _HeldAdoptions:
-    """Stands in for adopting a project, holding each adoption until the test lets it finish."""
+    """Stands in for adopting the orchestrator's project, holding each adoption until the test lets it finish."""
 
     def __init__(self) -> None:
-        self.adopted: list[str | None] = []
+        self.count = 0
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def __call__(self, project_id: str | None) -> ResultPayload:
-        self.adopted.append(project_id)
+    async def __call__(self) -> ResultPayload:
+        self.count += 1
         self.started.set()
         await self.release.wait()
-        return ActivateProjectResultSuccess(result_details=f"adopted {project_id}")
+        return ActivateProjectResultSuccess(result_details=f"adoption {self.count}")
 
 
 class TestProjectAdoptions:
@@ -709,51 +717,57 @@ class TestProjectAdoptions:
         adopt = _HeldAdoptions()
         adoptions = _ProjectAdoptions(adopt)
 
-        first = asyncio.ensure_future(adoptions.adopt(ActivateProjectRequest()))
+        first = asyncio.ensure_future(adoptions.adopt())
         await adopt.started.wait()
-        second = asyncio.ensure_future(adoptions.adopt(ActivateProjectRequest()))
-        third = asyncio.ensure_future(adoptions.adopt(ActivateProjectRequest()))
+        second = asyncio.ensure_future(adoptions.adopt())
+        third = asyncio.ensure_future(adoptions.adopt())
         await asyncio.sleep(0)
-        assert adopt.adopted == [None]
+        adoptions_while_the_first_ran = adopt.count
         adopt.release.set()
         results = await asyncio.gather(first, second, third)
 
-        assert adopt.adopted == [None, None]
+        assert adoptions_while_the_first_ran == 1
+        assert results[0] is not results[1]
         assert results[1] is results[2]
 
     @pytest.mark.asyncio
-    async def test_a_named_project_is_adopted_only_when_every_activation_names_one(self) -> None:
-        adopt = _HeldAdoptions()
-        adopt.release.set()
-        adoptions = _ProjectAdoptions(adopt)
-
-        await adoptions.adopt(ActivateProjectRequest(project_id="from-the-start"))
-        await asyncio.gather(
-            adoptions.adopt(ActivateProjectRequest(project_id="from-the-start")),
-            adoptions.adopt(ActivateProjectRequest()),
-        )
-
-        assert adopt.adopted == ["from-the-start", None]
-
-    @pytest.mark.asyncio
     async def test_an_adoption_that_raises_fails_its_activations_and_the_next_still_runs(self) -> None:
-        calls: list[str | None] = []
+        outcomes: list[str] = []
 
-        async def adopt(project_id: str | None) -> ResultPayload:
-            calls.append(project_id)
-            if len(calls) == 1:
+        async def adopt() -> ResultPayload:
+            if not outcomes:
+                outcomes.append("raised")
                 msg = "registry unreadable"
                 raise RuntimeError(msg)
+            outcomes.append("adopted")
             return ActivateProjectResultSuccess(result_details="ok")
 
         adoptions = _ProjectAdoptions(adopt)
 
         with pytest.raises(RuntimeError, match="registry unreadable"):
-            await adoptions.adopt(ActivateProjectRequest())
-        result = await adoptions.adopt(ActivateProjectRequest())
+            await adoptions.adopt()
+        result = await adoptions.adopt()
 
         assert result.succeeded()
-        assert calls == [None, None]
+        assert outcomes == ["raised", "adopted"]
+
+    @pytest.mark.asyncio
+    async def test_the_consumer_acts_on_no_workflow_whatever_its_first_activation_was_bound_to(self) -> None:
+        """It outlives the activation that starts it, so it must not keep that request's workflow."""
+        bound_during_adoption: list[object] = []
+
+        async def adopt() -> ResultPayload:
+            bound_during_adoption.append(bound_workflow.get())
+            return ActivateProjectResultSuccess(result_details="ok")
+
+        adoptions = _ProjectAdoptions(adopt)
+        token = bound_workflow.set(cast("Any", object()))
+        try:
+            await adoptions.adopt()
+        finally:
+            bound_workflow.reset(token)
+
+        assert bound_during_adoption == [NO_WORKFLOW]
 
 
 class _RecordingProjectManager:
@@ -780,11 +794,7 @@ class TestAdoptingAsksTheOrchestrator:
         worker_settled = register_broadcast_handlers(
             event_manager, config_manager=MagicMock(), project_manager=cast("ProjectManager", project_manager)
         )
-        request = GetCommittedProjectRequest()
-        answer = EventResultSuccess(
-            request=request,
-            result=GetCommittedProjectResultSuccess(project_id="the-orchestrators", result_details="ok"),
-        )
+        answer = _orchestrator_on("the-orchestrators")
         handler = event_manager.get_manager_for_request_type(ActivateProjectRequest)
         assert handler is not None
         assert not isinstance(handler, ForwardingHandler)

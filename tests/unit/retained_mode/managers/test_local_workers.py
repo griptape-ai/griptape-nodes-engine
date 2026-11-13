@@ -134,7 +134,6 @@ class TestHello:
         await _until(lambda: worker.notifications)
         activation = worker.notifications[0]["payload"]
         assert activation["request_type"] == "ActivateProjectRequest"
-        assert activation["request"]["project_id"] is None
 
     @pytest.mark.asyncio
     async def test_every_library_it_loaded_is_noted_and_its_gate_released(self, pair: _Pair) -> None:

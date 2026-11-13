@@ -19,6 +19,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from griptape_nodes.app.worker_routing import ActivateProjectRequest
 from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME, LICENSE_SECRET_NAME
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine_transports import (
@@ -264,20 +265,20 @@ class TestProjectSwitchWaitsForWorkers:
         assert "nope" in failures[0]
 
     @pytest.mark.asyncio
-    async def test_the_fan_out_names_no_project_so_each_worker_asks(self, worker_manager: WorkerManager) -> None:
-        """A switch overtaken by a newer one cannot leave a worker on its project: the worker reads the newest."""
+    async def test_a_project_switch_tells_each_worker_to_adopt_the_project(self, worker_manager: WorkerManager) -> None:
+        """The activation names no project: each worker asks which, so one overtaken by a newer switch reads the newest."""
         worker_manager._workers = {"worker-a": WorkerRegistration(worker_key=None)}
-        sent: list[str | None] = []
+        sent: list[RequestPayload] = []
 
         async def carrying_route(event: EventRequest, _worker_engine_id: str) -> dict:
-            sent.append(event.request.project_id)  # type: ignore[attr-defined]
+            sent.append(event.request)
             return {"result_type": "ActivateProjectResultSuccess", "result": {}}
 
         worker_manager.route_to_worker = carrying_route  # type: ignore[method-assign]
 
         await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-9"))
 
-        assert sent == [None]
+        assert sent == [ActivateProjectRequest()]
 
     def test_a_worker_asking_which_project_gets_the_committed_one(self, worker_manager: WorkerManager) -> None:
         worker_manager.engine.project_manager.committed_project_id = "proj-9"  # type: ignore[misc]
@@ -2097,9 +2098,7 @@ def _register_session(worker_manager: WorkerManager, **overrides: object) -> obj
 def _start_for_artist(
     library_name: str = _LIBRARY, worker_engine_id: str = "w1"
 ) -> worker_events.StartWorkerForEngineRequest:
-    return worker_events.StartWorkerForEngineRequest(
-        library_name=library_name, worker_engine_id=worker_engine_id, project_id="proj-1"
-    )
+    return worker_events.StartWorkerForEngineRequest(library_name=library_name, worker_engine_id=worker_engine_id)
 
 
 async def _skip_connecting(
