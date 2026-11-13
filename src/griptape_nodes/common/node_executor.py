@@ -420,6 +420,12 @@ class NodeExecutor(EngineScoped):
             # a worker would answer from an empty context and silently degrade the paths its node
             # writes to. Harmless on the local route, where these are this process's own values.
             workflow_context = self.engine.project_manager.workflow_context_for_dispatch(workflow)
+            variables = self._resolve_variables_for_node(workflow, node.name)
+            # `{}` means substitution is off here, which renders templates as written, not as `{}` would.
+            if VariableResolver.is_substitution_enabled(self.engine, workflow):
+                node.record_templates_for_run(variables)
+            else:
+                node.record_templates_for_run(None)
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
@@ -427,7 +433,7 @@ class NodeExecutor(EngineScoped):
                 ExecuteNodeRequest(
                     node_name=node.name,
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
-                    variables=self._resolve_variables_for_node(workflow, node.name),
+                    variables=variables,
                     local_object_source=node.local_object_source,
                     orchestrator_workflow_id=workflow_context.workflow_id,
                     workflow_name=workflow_context.name,

@@ -123,6 +123,16 @@ already-resolved node downstream that references the variable, so changing
 a variable mid-editing correctly invalidates anything that was computed
 from its old value.
 
+A node whose text holds a `{name}` token keeps its result from one run to
+the next for as long as that text would read the same. Before each run, the
+engine checks what the text reads now against what it read the last time
+the node ran. If it differs, the node and everything downstream of it run
+again. That covers every way the text can change: a variable is set,
+created, renamed, or deleted, you switch projects, a project variable is
+changed from another open workflow, a **Set Variable** node writes it while
+the workflow runs, or inline substitution is switched off. A node that has
+not run since the workflow was opened runs the first time either way.
+
 For inline substitution, one more layer sits on top of the plain variable
 lookup: when a node runs, the engine resolves every `{name}` token in its
 parameter values against a merged set of **your workflow variables plus the
