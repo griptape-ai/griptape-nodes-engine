@@ -18,7 +18,7 @@ from pydantic.errors import PydanticUserError
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     DocumentationToolEntry,
     GetLibraryDocumentationPageRequest,
@@ -136,9 +136,23 @@ class LibraryDocumentation(EngineScoped):
             assets_root = str(docs.docs_root)
 
         metadata = described.metadata
-        details = (
+        success_message = (
             f"Successfully read the documentation for node type '{target.node_type}' in Library '{described.library}'."
         )
+        # A node type whose parameters could not be read still describes successfully, with a warning and
+        # no parameters. Say so, so a broken node is not taken for one that has none. A node on the canvas
+        # gives its own parameters, so the warning about the type does not apply to it.
+        warnings: list[str] = []
+        if target.live_parameters is None:
+            warnings = _warnings_of(described.result_details)
+        parameters_error = None
+        details = success_message
+        if warnings:
+            parameters_error = " ".join(warnings)
+            details = ResultDetails(
+                ResultDetail(level=logging.INFO, message=success_message),
+                *(ResultDetail(level=logging.WARNING, message=warning) for warning in warnings),
+            )
         return GetNodeDocumentationResultSuccess(
             library=described.library,
             node_type=target.node_type,
@@ -151,6 +165,7 @@ class LibraryDocumentation(EngineScoped):
             deprecation=metadata.deprecation,
             parameters=parameters,
             assets_root=assets_root,
+            parameters_error=parameters_error,
             result_details=details,
         )
 
@@ -260,6 +275,13 @@ def _without_base_fields(schema: dict[str, Any]) -> dict[str, Any]:
     }
     required = [name for name in schema.get("required", []) if name not in _BASE_REQUEST_FIELDS]
     return {**schema, "properties": properties, "required": required}
+
+
+def _warnings_of(details: ResultDetails | str) -> list[str]:
+    """The messages of a result's warnings and anything worse. A plain string has none."""
+    if isinstance(details, str):
+        return []
+    return [detail.message for detail in details.result_details if detail.level >= logging.WARNING]
 
 
 def _tool_entries(library_name: str) -> list[DocumentationToolEntry]:

@@ -214,6 +214,10 @@ class GetNodeDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
             For a request that named a node on the canvas, these are that node's current parameters.
         assets_root: Absolute path of the library's docs folder, which relative image paths in the page
             resolve against. None when the library ships no docs folder.
+        parameters_error: Why the node type's parameters could not be read, such as its module failing to
+            import. `parameters` is empty then, which is not the same as a node with no parameters. None
+            when they were read, and always None for a request that named a node on the canvas, because
+            that node's own parameters are read from the node.
     """
 
     library: str
@@ -227,6 +231,7 @@ class GetNodeDocumentationResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
     deprecation: NodeDeprecationMetadata | None = None
     parameters: list[ParameterDescription] = field(default_factory=list)
     assets_root: str | None = None
+    parameters_error: str | None = None
 
 
 @dataclass

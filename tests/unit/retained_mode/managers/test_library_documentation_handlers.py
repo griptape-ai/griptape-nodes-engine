@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -20,7 +21,7 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
     WorkflowNodeDefinition,
 )
-from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.library_documentation_events import (
     GetLibraryDocumentationPageRequest,
     GetLibraryDocumentationPageResultFailure,
@@ -120,6 +121,23 @@ def library_root(engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     )
     monkeypatch.setitem(engine.library_manager._library_file_path_to_info, str(manifest), info)
     return root
+
+
+BROKEN_WARNING = "Node module failed to import: No module named 'missing_dependency'"
+
+
+def _describe_broken(node_type: str, metadata: NodeMetadata) -> DescribeNodeTypeResultSuccess:
+    """What the engine says for a node type whose parameters could not be read: a success with a warning."""
+    return DescribeNodeTypeResultSuccess(
+        library=LIBRARY_NAME,
+        node_type=node_type,
+        metadata=metadata,
+        parameters=[],
+        result_details=ResultDetails(
+            ResultDetail(level=logging.INFO, message="Described without its parameters."),
+            ResultDetail(level=logging.WARNING, message=BROKEN_WARNING),
+        ),
+    )
 
 
 def _describe_success(node_type: str, metadata: NodeMetadata) -> DescribeNodeTypeResultSuccess:
@@ -492,6 +510,64 @@ class TestGetNodeDocumentation:
         assert result.deprecation is not None
         assert result.deprecation.removal_version == "2.0.0"
         assert result.assets_root == str((library_root / "docs").resolve())
+
+    @pytest.mark.usefixtures("library_root")
+    def test_a_node_whose_parameters_could_not_be_read_says_so_and_is_not_taken_for_one_with_none(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            engine.library_manager.catalog,
+            "describe_node_type_request",
+            lambda _request: _describe_broken("LoadAudio", AUDIO_METADATA),
+        )
+
+        result = engine.library_manager.documentation.get_node_documentation_request(
+            GetNodeDocumentationRequest(node_type="LoadAudio")
+        )
+
+        assert isinstance(result, GetNodeDocumentationResultSuccess)
+        assert result.parameters == []
+        assert result.parameters_error == BROKEN_WARNING
+        assert BROKEN_WARNING in str(result.result_details)
+        assert "Successfully read the documentation" in str(result.result_details)
+
+    @pytest.mark.usefixtures("library_root")
+    def test_a_node_whose_parameters_were_read_reports_no_error(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            engine.library_manager.catalog,
+            "describe_node_type_request",
+            lambda _request: _describe_success("LoadAudio", AUDIO_METADATA),
+        )
+
+        result = engine.library_manager.documentation.get_node_documentation_request(
+            GetNodeDocumentationRequest(node_type="LoadAudio")
+        )
+
+        assert isinstance(result, GetNodeDocumentationResultSuccess)
+        assert result.parameters_error is None
+        assert isinstance(result.result_details, ResultDetails)
+        assert [detail.level for detail in result.result_details.result_details] == [logging.DEBUG]
+
+    @pytest.mark.usefixtures("library_root")
+    def test_a_node_on_the_canvas_gives_its_own_parameters_so_the_types_warning_does_not_apply(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            engine.library_manager.catalog,
+            "describe_node_type_request",
+            lambda _request: _describe_broken("LoadAudio", AUDIO_METADATA),
+        )
+        workflow = _workflow_with(_canvas_node("audio_1"))
+
+        result = engine.library_manager.documentation.get_node_documentation_request(
+            GetNodeDocumentationRequest(node_name="audio_1"), workflow
+        )
+
+        assert isinstance(result, GetNodeDocumentationResultSuccess)
+        assert result.parameters_error is None
+        assert [parameter.name for parameter in result.parameters] != []
 
     def test_a_frontmatter_title_replaces_the_display_name(
         self, engine: Engine, library_root: Path, monkeypatch: pytest.MonkeyPatch
