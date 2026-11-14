@@ -141,7 +141,7 @@ To shape how an Agent behaves in a workflow, use **Rulesets** (or a plain **Text
 
 !!! note "Skills are not supported in the Agent node"
 
-    The `.agents/skills` folder used by the [chat sidebar](../../guides/agent/skills.md) does not apply to Agent nodes in workflows. Use a **Ruleset node** or a **TextInput** connected to the Agent's `Behaviors (Rulesets)` input to control agentic behavior instead.
+    The [skills](../../guides/agent/skills.md) used by the chat sidebar do not apply to Agent nodes in workflows. Use a **Ruleset node** or a **TextInput** connected to the Agent's `Behaviors (Rulesets)` input to control agentic behavior instead.
 
 ## Common Issues
 

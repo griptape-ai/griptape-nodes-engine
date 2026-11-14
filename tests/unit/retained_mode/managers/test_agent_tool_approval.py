@@ -63,6 +63,11 @@ async def _no_attribution(_request: object) -> GetAttributionContextResultFailur
     return GetAttributionContextResultFailure(result_details="no project")
 
 
+async def _no_skills() -> list[Path]:
+    """Offer a run no skills."""
+    return []
+
+
 class _Harness:
     """An `AgentManager` wired to one runner on real thread storage."""
 
@@ -129,6 +134,7 @@ def _manager_on(
         library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
         only_open_workflow_or_none=lambda: None,
     )
+    monkeypatch.setattr(manager, "_offered_skill_folders", _no_skills)
     return manager
 
 

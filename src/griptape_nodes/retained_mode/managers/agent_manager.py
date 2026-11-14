@@ -48,7 +48,6 @@ from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
     MCPToolsetLease,
 )
 from griptape_nodes.agents.pydantic_ai.runner import (
-    DEFAULT_SKILLS_DIRECTORY,
     AgentRunResult,
     PydanticAgentRunner,
     RunEvent,
@@ -62,6 +61,16 @@ from griptape_nodes.agents.pydantic_ai.tool_approval import (
     TOOL_DENIED_BY_USER_MESSAGE,
     ToolApprovalDeps,
     pending_tool_calls,
+)
+from griptape_nodes.agents.skills import (
+    DiscoveredSkill,
+    SkillWriteError,
+    add_skill,
+    compose_skill_file,
+    discover_skills,
+    remove_skill,
+    resolve_skills_directories,
+    select_skills,
 )
 from griptape_nodes.drivers.cloud_credentials import (
     MISSING_CREDENTIAL_MESSAGE,
@@ -87,6 +96,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     TOOL_APPROVAL_APPROVE_FOR_CONVERSATION,
     TOOL_APPROVAL_DECISIONS,
     TOOL_APPROVAL_DENY,
+    AgentSkill,
     AgentStreamEvent,
     AgentThinkingEvent,
     AgentToolCallEvent,
@@ -106,12 +116,18 @@ from griptape_nodes.retained_mode.events.agent_events import (
     CreateAgentProviderRequest,
     CreateAgentProviderResultFailure,
     CreateAgentProviderResultSuccess,
+    CreateAgentSkillRequest,
+    CreateAgentSkillResultFailure,
+    CreateAgentSkillResultSuccess,
     CreateThreadRequest,
     CreateThreadResultFailure,
     CreateThreadResultSuccess,
     DeleteAgentProviderRequest,
     DeleteAgentProviderResultFailure,
     DeleteAgentProviderResultSuccess,
+    DeleteAgentSkillRequest,
+    DeleteAgentSkillResultFailure,
+    DeleteAgentSkillResultSuccess,
     DeleteThreadRequest,
     DeleteThreadResultFailure,
     DeleteThreadResultSuccess,
@@ -123,10 +139,15 @@ from griptape_nodes.retained_mode.events.agent_events import (
     GetThreadMetadataRequest,
     GetThreadMetadataResultFailure,
     GetThreadMetadataResultSuccess,
+    ImportAgentSkillRequest,
+    ImportAgentSkillResultFailure,
+    ImportAgentSkillResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
     ListAgentProvidersResultSuccess,
+    ListAgentSkillsRequest,
+    ListAgentSkillsResultSuccess,
     ListProviderModelsRequest,
     ListProviderModelsResultFailure,
     ListProviderModelsResultSuccess,
@@ -144,6 +165,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentResultFailure,
     RunAgentResultSuccess,
     RunRecord,
+    SetAgentSkillEnabledRequest,
+    SetAgentSkillEnabledResultFailure,
+    SetAgentSkillEnabledResultSuccess,
     ToolApprovalDecision,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
@@ -178,6 +202,11 @@ from griptape_nodes.retained_mode.events.mcp_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.retained_mode.managers.settings import (
+    AGENT_DISABLED_SKILLS_KEY,
+    AGENT_SKILLS_DIRECTORIES_KEY,
+    DEFAULT_AGENT_SKILLS_DIRECTORY,
+)
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import (
@@ -547,15 +576,15 @@ _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
 # empty message (which some providers reject).
 _UNAVAILABLE_IMAGE_PLACEHOLDER = "[An image attached to this earlier message is no longer available.]"
 
-# Written into the workspace skills directory the first time a runner is
-# built, so users discovering the folder know what belongs in it.
+# Written into the first skills folder the first time it is created, so users
+# discovering the folder know what belongs in it.
 _SKILLS_README = """\
 # Agent Skills
 
-Skills placed in this directory are loaded automatically by the Griptape Nodes
-agent. Each skill lives in its own subdirectory containing a `SKILL.md` file:
+Skills placed in this folder are loaded automatically by the Griptape Nodes
+agent. Each skill lives in its own subfolder containing a `SKILL.md` file:
 
-    .agents/skills/
+    skills/
         my-skill/
             SKILL.md
 
@@ -569,11 +598,24 @@ directory name) and `description`, followed by the skill's instructions:
 
     Step-by-step guidance for the agent goes here.
 
-The agent re-scans this directory before each run, so new or edited skills
-take effect without restarting the engine.
+The agent re-scans this folder before each run, so new or edited skills
+take effect without restarting the engine. To see, add, or turn off skills,
+open Settings and go to Agent > Skills.
 
 Skills here follow the Agent Skills specification: https://agentskills.io
 """
+
+
+def _agent_skill(skill: DiscoveredSkill, disabled: set[str]) -> AgentSkill:
+    return AgentSkill(
+        name=skill.name,
+        description=skill.description,
+        directory=str(skill.library),
+        path=str(skill.folder),
+        enabled=skill.name not in disabled,
+        problem=skill.problem,
+        model_invocable=skill.model_invocable,
+    )
 
 
 @dataclass
@@ -929,6 +971,7 @@ class AgentManager(EngineScoped):
         )
         attribution_headers = await self._attribution_headers(provider_name)
         workflow_context = await self._workflow_context(workflow)
+        skill_folders = await self._offered_skill_folders()
 
         event_manager = self.engine.event_manager
 
@@ -961,6 +1004,7 @@ class AgentManager(EngineScoped):
                 extra_headers=attribution_headers,
                 approval=approval,
                 deferred_tool_results=deferred_tool_results,
+                skill_folders=skill_folders,
             )
 
     async def _workflow_context(self, workflow: WorkflowRuntime | None) -> _WorkflowContext:
@@ -1495,7 +1539,6 @@ class AgentManager(EngineScoped):
             return cached
 
         workspace_root = Path(config_manager.workspace_path)
-        self._ensure_skills_directory(workspace_root)
         runner = PydanticAgentRunner(
             model_name=model_name,
             provider=provider_type,
@@ -1522,16 +1565,11 @@ class AgentManager(EngineScoped):
             workflow_id = workflow.workflow_id
         return streamable_http_local(f"http://localhost:{self._mcp_server_port}/mcp/", workflow_id=workflow_id)
 
-    def _ensure_skills_directory(self, workspace_root: Path) -> None:
-        """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
+    def _ensure_skills_directory(self, skills_dir: Path) -> None:
+        """Create the first skills folder, where new skills go, so the user can open it.
 
-        Called before every runner construction: the runner builds its skills
-        capability from this directory on each run, so creating it here means a
-        skill added mid-session is picked up without an engine restart. Seeds a
-        README the first time so users discovering the folder know what belongs
-        in it. Failure to scaffold is logged but never blocks building the agent.
+        Failure is logged but never blocks the agent.
         """
-        skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
         try:
             skills_dir.mkdir(parents=True, exist_ok=True)
             readme = skills_dir / "README.md"
@@ -1539,6 +1577,132 @@ class AgentManager(EngineScoped):
                 readme.write_text(_SKILLS_README, encoding="utf-8")
         except OSError as e:
             logger.warning("Attempted to scaffold skills directory at %s. Failed because of: %s", skills_dir, e)
+
+    def _skills_directories(self) -> list[Path]:
+        """The skills folders from `agent.skills_directories`, the first created if missing."""
+        config = self.engine.config_manager
+        configured = config.get_config_value(AGENT_SKILLS_DIRECTORIES_KEY, default=[DEFAULT_AGENT_SKILLS_DIRECTORY])
+        if not isinstance(configured, list):
+            logger.warning(
+                "Ignored the %s setting because it is not a list of folders. Using %s.",
+                AGENT_SKILLS_DIRECTORIES_KEY,
+                DEFAULT_AGENT_SKILLS_DIRECTORY,
+            )
+            configured = [DEFAULT_AGENT_SKILLS_DIRECTORY]
+        directories = resolve_skills_directories([str(entry) for entry in configured], config.workspace_path)
+        if directories:
+            self._ensure_skills_directory(directories[0])
+        return directories
+
+    def _disabled_skills(self) -> list[str]:
+        configured = self.engine.config_manager.get_config_value(AGENT_DISABLED_SKILLS_KEY, default=[])
+        if not isinstance(configured, list):
+            return []
+        return [str(name) for name in configured]
+
+    def _write_disabled_skills(self, names: list[str]) -> str | None:
+        """Store `names` as `agent.disabled_skills`. Returns why that didn't take effect, or None when it did."""
+        config = self.engine.config_manager
+        # Checked first: a higher layer keeps winning the merge, so the user's copy would be saved but unused.
+        shadow = config.shadowed_by(AGENT_DISABLED_SKILLS_KEY)
+        if shadow is not None:
+            location = shadow.env_var or shadow.path or f"the {shadow.layer} settings"
+            return f"{AGENT_DISABLED_SKILLS_KEY} is set by {location}, which the editor can't change"
+        if not config.set_config_value(AGENT_DISABLED_SKILLS_KEY, names):
+            return "the settings file could not be saved"
+        return None
+
+    async def _offered_skill_folders(self) -> list[Path]:
+        """The folders of the skills this run offers the model, read fresh so edits land on the next message."""
+        skills = await discover_skills(self._skills_directories())
+        return [skill.folder for skill in select_skills(skills, set(self._disabled_skills()))]
+
+    @handles(ListAgentSkillsRequest)
+    async def on_handle_list_agent_skills_request(self, _: ListAgentSkillsRequest) -> ResultPayload:
+        directories = self._skills_directories()
+        disabled = set(self._disabled_skills())
+        skills = [_agent_skill(skill, disabled) for skill in await discover_skills(directories)]
+        return ListAgentSkillsResultSuccess(
+            skills=skills,
+            directories=[str(directory) for directory in directories],
+            result_details=f"Found {len(skills)} agent skill(s).",
+        )
+
+    @handles(SetAgentSkillEnabledRequest)
+    async def on_handle_set_agent_skill_enabled_request(self, request: SetAgentSkillEnabledRequest) -> ResultPayload:
+        name = request.name.strip()
+        disabled = self._disabled_skills()
+        # Turning a skill back on needs no skill to exist, so a name left behind by a removed skill can be cleared.
+        known = await discover_skills(self._skills_directories())
+        if not request.enabled and not any(skill.name == name for skill in known):
+            return SetAgentSkillEnabledResultFailure(
+                result_details=f"Attempted to turn off skill '{name}'. Failed because no skill with that name is in the skills folders."
+            )
+        state = "on" if request.enabled else "off"
+        updated = [entry for entry in disabled if entry != name]
+        if not request.enabled:
+            updated.append(name)
+        problem = self._write_disabled_skills(sorted(updated))
+        if problem is not None:
+            return SetAgentSkillEnabledResultFailure(
+                result_details=f"Attempted to turn skill '{name}' {state}. Failed because {problem}."
+            )
+        return SetAgentSkillEnabledResultSuccess(result_details=f"Turned skill '{name}' {state}.")
+
+    @handles(CreateAgentSkillRequest)
+    async def on_handle_create_agent_skill_request(self, request: CreateAgentSkillRequest) -> ResultPayload:
+        name = request.name.strip()
+        content = compose_skill_file(name, request.description, request.instructions)
+        try:
+            skill = await add_skill(self._skills_directories(), content)
+        except SkillWriteError as e:
+            return CreateAgentSkillResultFailure(result_details=f"Attempted to create skill '{name}'. {e}")
+        return CreateAgentSkillResultSuccess(
+            skill=_agent_skill(skill, set(self._disabled_skills())),
+            result_details=f"Created skill '{skill.name}' in {skill.library}.",
+        )
+
+    @handles(ImportAgentSkillRequest)
+    async def on_handle_import_agent_skill_request(self, request: ImportAgentSkillRequest) -> ResultPayload:
+        try:
+            skill = await add_skill(self._skills_directories(), request.content)
+        except SkillWriteError as e:
+            return ImportAgentSkillResultFailure(result_details=f"Attempted to import a skill. {e}")
+        return ImportAgentSkillResultSuccess(
+            skill=_agent_skill(skill, set(self._disabled_skills())),
+            result_details=f"Imported skill '{skill.name}' into {skill.library}.",
+        )
+
+    @handles(DeleteAgentSkillRequest)
+    async def on_handle_delete_agent_skill_request(self, request: DeleteAgentSkillRequest) -> ResultPayload:
+        name = request.name.strip()
+        directories = self._skills_directories()
+        matches = [skill for skill in await discover_skills(directories) if skill.name == name]
+        if not matches:
+            return DeleteAgentSkillResultFailure(
+                result_details=f"Attempted to delete skill '{name}'. Failed because no skill with that name is in the skills folders."
+            )
+        own = [skill for skill in matches if skill.library == directories[0]]
+        if not own:
+            return DeleteAgentSkillResultFailure(
+                result_details=(
+                    f"Attempted to delete skill '{name}'. Failed because it is in the shared folder {matches[0].library}. "
+                    "Remove it from that folder instead."
+                )
+            )
+        try:
+            remove_skill(own[0].folder)
+        except SkillWriteError as e:
+            return DeleteAgentSkillResultFailure(result_details=f"Attempted to delete skill '{name}'. {e}")
+        disabled = self._disabled_skills()
+        # A copy in another folder takes over the name, and stays off if the user turned the name off.
+        if name in disabled and len(matches) == 1:
+            problem = self._write_disabled_skills([entry for entry in disabled if entry != name])
+            if problem is not None:
+                logger.warning(
+                    "Deleted skill '%s' but left it in %s, because %s.", name, AGENT_DISABLED_SKILLS_KEY, problem
+                )
+        return DeleteAgentSkillResultSuccess(result_details=f"Deleted skill '{name}' from {own[0].library}.")
 
     @handles(ListAgentProvidersRequest)
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:

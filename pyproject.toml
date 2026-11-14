@@ -44,6 +44,7 @@ dependencies = [
   "fileseq>=3.2.0",
   "pydantic-ai-slim[mcp,openai]>=2.58",
   "pydantic-ai-harness[skills]>=0.58",
+  "pyyaml>=6.0.2",
 ]
 
 [project.optional-dependencies]

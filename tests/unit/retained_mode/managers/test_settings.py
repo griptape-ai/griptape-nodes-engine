@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.settings import (
+    AgentSettings,
     AppInitializationComplete,
     DistributedExecutionSettings,
     LibraryDependencyInstallBehavior,
@@ -171,6 +172,25 @@ class TestRefreshPreviewsMaxFiles:
 
         with pytest.raises(ValidationError, match="refresh_previews_max_files must be a whole number"):
             Settings.model_validate({"refresh_previews_max_files": value}, context={FROM_ENV_CONTEXT: True})
+
+
+class TestAgentSkillSettings:
+    """Both skills list settings read a JSON list from the environment."""
+
+    @pytest.mark.parametrize("key", ["skills_directories", "disabled_skills"])
+    def test_an_environment_value_is_a_json_list(self, key: str) -> None:
+        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
+
+        result = AgentSettings.model_validate({key: '["a", "b"]'}, context={FROM_ENV_CONTEXT: True})
+
+        assert getattr(result, key) == ["a", "b"]
+
+    @pytest.mark.parametrize("key", ["skills_directories", "disabled_skills"])
+    def test_an_environment_value_that_is_not_json_is_reported(self, key: str) -> None:
+        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
+
+        with pytest.raises(ValidationError, match=f"agent.{key} must be a JSON list of strings"):
+            AgentSettings.model_validate({key: "a, b"}, context={FROM_ENV_CONTEXT: True})
 
 
 class TestDistributedExecutionMaxWorkers:
