@@ -235,7 +235,9 @@ class TestImageSavePaths:
 @pytest.mark.usefixtures("project")
 class TestVideoSavePaths:
     @pytest.mark.asyncio
-    async def test_the_vet_and_the_media_read_share_one_staged_copy(self, engine: Engine, tmp_path: Path) -> None:
+    async def test_the_vet_and_the_media_read_share_one_staged_copy_and_one_probe(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
         try:
             ffmpeg_path, _ = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
         except Exception:
@@ -258,12 +260,16 @@ class TestVideoSavePaths:
         )
         writer = engine.os_manager.writer
 
-        with patch.object(writer, "_stage_bytes_at_temp", wraps=writer._stage_bytes_at_temp) as stage:
+        with (
+            patch.object(writer, "_stage_bytes_at_temp", wraps=writer._stage_bytes_at_temp) as stage,
+            patch.object(VideoArtifactProvider, "_run_ffprobe", wraps=VideoArtifactProvider._run_ffprobe) as probe,
+        ):
             result = await _write(
                 engine, "{outputs}/clip_{media.width}x{media.height}_{media.fps}fps.mp4", video.read_bytes()
             )
 
         assert _written_name(result) == "clip_320x240_24fps.mp4"
+        assert probe.call_count == 1
         assert stage.call_count == 1
 
 

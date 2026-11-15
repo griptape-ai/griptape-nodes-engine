@@ -90,6 +90,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseGeneratorParameters,
     ImageArtifactProvider,
     ProviderRegistry,
+    StagedWriteInspection,
     VideoArtifactProvider,
     WriteVettingPolicy,
 )
@@ -276,17 +277,25 @@ class ArtifactManager(EngineScoped):
     def get_media_info(self, source_path: str, detected_format: str) -> MediaInfo:
         """Read the media properties save-path macros use from the file at ``source_path``.
 
-        Uses the format's provider and its ``get_artifact_metadata``. Returns an empty
-        ``MediaInfo`` when no provider handles the format or it could not read the file. Runs on
-        the calling thread, and video providers run ffprobe.
+        Uses the format's provider. Returns an empty ``MediaInfo`` when no provider handles the
+        format or it could not read the file. Runs on the calling thread, and video providers run
+        ffprobe.
         """
         provider = self._provider_for_format(detected_format)
         if provider is None:
             return MediaInfo()
-        metadata = provider.get_artifact_metadata(source_path)
-        if metadata is None:
-            return MediaInfo()
-        return metadata.to_media_info()
+        return provider.get_media_info(source_path)
+
+    def inspect_staged_write(self, source_path: str, detected_format: str) -> StagedWriteInspection:
+        """Route a from-path vet that also reads media properties through the format's provider.
+
+        Called by OSManager instead of ``check_write_format_from_path`` when the path template
+        uses ``media.*`` values, so the provider can read the staged file once for both.
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return StagedWriteInspection()
+        return provider.inspect_staged_write(source_path, detected_format)
 
     def check_write_format_from_path(
         self,

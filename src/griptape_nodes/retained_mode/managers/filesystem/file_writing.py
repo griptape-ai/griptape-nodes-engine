@@ -908,7 +908,8 @@ class FileWriter(EngineScoped):
 
         `media.*` values are read only when the path template uses one, through the provider's
         ``get_artifact_metadata``, which reads a file. One copy staged at the SAVE_TEMP_FILE path
-        serves both the vet and the media read, so a large video is written to disk once. It is
+        serves both the vet and the media read, so a large video is written to disk once. When
+        both are needed, ``inspect_staged_write`` lets the provider read that copy once too. It is
         truncated and deleted in a ``finally`` regardless of outcome. Staging failure is treated
         as fail-closed: bytes that cannot be staged cannot be verified or read.
 
@@ -965,9 +966,14 @@ class FileWriter(EngineScoped):
                     result_details=f"Cannot save '{file_name}': staging for verification failed ({exc}).",
                 )
             try:
-                if vets_from_path:
+                if vets_from_path and reads_media:
+                    # One call, so a provider can read the file once for both (video's ffprobe).
+                    inspection = artifact_manager.inspect_staged_write(outcome.staged_path, sniffed_ext)
+                    denial = inspection.denial
+                    media_info = inspection.media_info
+                elif vets_from_path:
                     denial = artifact_manager.check_write_format_from_path(outcome.staged_path, sniffed_ext)
-                if denial is None and reads_media:
+                else:
                     media_info = artifact_manager.get_media_info(outcome.staged_path, sniffed_ext)
             finally:
                 self._truncate_and_delete_staged(outcome.staged_path)
