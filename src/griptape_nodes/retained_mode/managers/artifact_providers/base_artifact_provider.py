@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
@@ -41,6 +42,10 @@ class BaseArtifactMetadata(BaseModel):
 
     Subclass and add fields for each artifact type (e.g. ImageArtifactMetadata).
     """
+
+    def to_media_info(self) -> MediaInfo:
+        """Map this metadata onto the names save-path macros use. Override per artifact type."""
+        return MediaInfo()
 
 
 class BaseArtifactProvider(EngineScoped, ABC):

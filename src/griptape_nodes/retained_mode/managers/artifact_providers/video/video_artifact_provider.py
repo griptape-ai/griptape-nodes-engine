@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from static_ffmpeg import run as static_ffmpeg_run
 
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
     BaseArtifactProvider,
@@ -43,6 +44,19 @@ class VideoArtifactMetadata(BaseArtifactMetadata):
     codec: str
     frame_rate: float
     file_size: int
+
+    def to_media_info(self) -> MediaInfo:
+        """Map ffprobe's fields. ffprobe gives 0 or "unknown" for what it could not read; those stay unset."""
+        codec = None
+        if self.codec != "unknown":
+            codec = self.codec
+        return MediaInfo(
+            width=self.width or None,
+            height=self.height or None,
+            fps=self.frame_rate or None,
+            duration=self.duration_seconds or None,
+            codec=codec,
+        )
 
 
 class VideoArtifactProvider(BaseArtifactProvider):

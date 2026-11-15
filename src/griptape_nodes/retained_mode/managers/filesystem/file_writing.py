@@ -5,7 +5,7 @@ import errno
 import logging
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -21,6 +21,12 @@ from griptape_nodes.common.macro_parser import (
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.file import canonical_extension
+from griptape_nodes.files.media_variables import (
+    MediaInfo,
+    is_media_variable,
+    references_media_variables,
+    reserved_variables_in,
+)
 from griptape_nodes.files.path_utils import (
     normalize_path_for_platform,
     sanitize_path_string,
@@ -177,15 +183,14 @@ class FileWriter(EngineScoped):
         steps that touch no engine state and take seconds for a large file are handed to a worker
         thread: re-encoding image bytes with workflow metadata, and writing the bytes to disk.
         """
-        target = self._resolve_write_target(request, workflow)
-        if isinstance(target, WriteFileResultFailure):
-            return target
-        path_display = target.path_display
+        reserved_failure = self._reserved_variables_failure(request)
+        if reserved_failure is not None:
+            return reserved_failure
 
-        # Sniff bytes ONCE up front. The sniffed format drives two independent
-        # decisions -- the codec-permission vet (which must run even for
-        # extension-less destinations) and the extension-coercion planner
-        # (only relevant when there IS a destination extension to reconcile).
+        # Sniff bytes ONCE up front. The sniffed format drives the codec-permission
+        # vet (which must run even for extension-less destinations), the `media.*`
+        # path variables, and the extension-coercion planner (only relevant when
+        # there IS a destination extension to reconcile).
         # ``sniff_extension`` returns None for non-bytes content, so a non-None
         # sniffed_ext also implies ``request.content`` is bytes; downstream code
         # relies on that.
@@ -195,23 +200,23 @@ class FileWriter(EngineScoped):
             else None
         )
 
-        # Write vet. Runs BEFORE extension coercion so an extension-less
-        # destination (e.g. "movie") does not silently bypass the gate --
-        # sniff on bytes is independent of the destination suffix. Appends
-        # skip the vet: the tail alone has no container header to classify.
+        # Write vet and `media.*` read. Both run BEFORE the destination path
+        # resolves: the path can use values read from the bytes, and an
+        # extension-less destination (e.g. "movie") does not silently bypass the
+        # gate -- sniff on bytes is independent of the destination suffix. Appends
+        # skip both: the tail alone has no container header to classify.
         # Whether the vet actually does any work is the provider's call:
-        # opting out is a single ``None`` return in ``get_write_vetting_policy``,
-        # short-circuited inside ``_run_write_vet``.
+        # opting out is a single ``None`` return in ``get_write_vetting_policy``.
         if sniffed_ext is not None and not request.append:
-            vet_failure = self._run_write_vet(
-                workflow,
-                content=request.content,  # type: ignore[arg-type]
-                sniffed_ext=sniffed_ext,
-                file_path=target.file_path,
-                caller_variables=request.file_path.variables if isinstance(request.file_path, MacroPath) else None,
-            )
-            if vet_failure is not None:
-                return vet_failure
+            media_variables = self._vet_and_read_media(request, sniffed_ext, workflow)
+            if isinstance(media_variables, WriteFileResultFailure):
+                return media_variables
+            request = self._bind_media_variables(request, media_variables)
+
+        target = self._resolve_write_target(request, workflow)
+        if isinstance(target, WriteFileResultFailure):
+            return target
+        path_display = target.path_display
 
         # Align the destination suffix to the sniffed format before any scan,
         # write, or candidate generation runs. Without this, the scan globs
@@ -317,7 +322,43 @@ class FileWriter(EngineScoped):
             sidecar_variables = file_metadata.situation.variables
             if sidecar_variables is not None and "file_extension" in sidecar_variables:
                 sidecar_variables["file_extension"] = swapped_ext
+        # Record the `media.*` values the path was resolved with, so the sidecar's macro and
+        # variables still reproduce the path. Callers cannot supply `media.*` variables, so
+        # every one in the request was read from the bytes.
+        if file_metadata.situation is not None and isinstance(request.file_path, MacroPath):
+            media_variables = {
+                name: str(value) for name, value in request.file_path.variables.items() if is_media_variable(name)
+            }
+            if media_variables:
+                file_metadata.situation.variables = {**(file_metadata.situation.variables or {}), **media_variables}
         write_sidecar(file_path, file_metadata, self.engine, workflow)
+
+    def _reserved_variables_failure(self, request: WriteFileRequest) -> WriteFileResultFailure | None:
+        """Refuse a macro path whose caller-supplied variables use the reserved `media.` prefix."""
+        if not isinstance(request.file_path, MacroPath):
+            return None
+        reserved = reserved_variables_in(request.file_path.variables)
+        if not reserved:
+            return None
+        return WriteFileResultFailure(
+            failure_reason=FileIOFailureReason.INVALID_PATH,
+            result_details=(
+                f"Attempted to write to file '{request.file_path.parsed_macro.template}'. "
+                f"Failed because the variables {', '.join(reserved)} start with 'media.', "
+                f"which is reserved for values the engine reads from the file itself."
+            ),
+        )
+
+    def _bind_media_variables(self, request: WriteFileRequest, media_variables: dict[str, str]) -> WriteFileRequest:
+        """Return `request` with `media_variables` bound into its macro path.
+
+        Target resolution, the seed-and-retry, the CREATE_NEW index walk and the sidecar all read the
+        path from the request, so binding here means they all see the same values.
+        """
+        if not media_variables or not isinstance(request.file_path, MacroPath):
+            return request
+        bound_path = MacroPath(request.file_path.parsed_macro, {**request.file_path.variables, **media_variables})
+        return replace(request, file_path=bound_path)
 
     def _resolve_write_target(
         self, request: WriteFileRequest, workflow: "WorkflowRuntime | None"
@@ -837,74 +878,89 @@ class FileWriter(EngineScoped):
                 delete_result.result_details,
             )
 
-    def _run_write_vet(
-        self,
-        workflow: "WorkflowRuntime | None",
-        *,
-        content: bytes,
-        sniffed_ext: str,
-        file_path: Path,
-        caller_variables: MacroVariables | None,
-    ) -> WriteFileResultFailure | None:
-        """Ask the format's provider to vet the pending write.
+    def _vet_and_read_media(
+        self, request: WriteFileRequest, sniffed_ext: str, workflow: "WorkflowRuntime | None"
+    ) -> "dict[str, str] | WriteFileResultFailure":
+        """Ask the format's provider to vet the pending write, and read the `media.*` values its path uses.
 
-        Reads the provider's declared ``WriteVettingPolicy`` and dispatches
-        accordingly:
+        The vet follows the provider's declared ``WriteVettingPolicy``:
 
-        - ``None`` -- provider opts out. No staging, no dispatch, no cost.
+        - ``None`` -- provider opts out. No dispatch, no cost.
         - ``FROM_BYTES`` -- hand the raw bytes to the provider directly.
-        - ``FROM_PATH`` -- stage bytes at the SAVE_TEMP_FILE path, hand the
-          resulting path to the provider, and truncate + delete the staged
-          file in a ``finally`` regardless of outcome. Staging failure is
-          treated as fail-closed: an unstageable vet cannot verify the write.
+        - ``FROM_PATH`` -- hand the provider a staged copy of the bytes.
 
-        Returns a ``WriteFileResultFailure`` when the vet refuses (or fails
-        closed), or ``None`` when the write is permitted.
+        `media.*` values are read only when the path template uses one, through the provider's
+        ``get_artifact_metadata``, which reads a file. One copy staged at the SAVE_TEMP_FILE path
+        serves both the vet and the media read, so a large video is written to disk once. It is
+        truncated and deleted in a ``finally`` regardless of outcome. Staging failure is treated
+        as fail-closed: bytes that cannot be staged cannot be verified or read.
+
+        Returns a ``WriteFileResultFailure`` when the vet refuses (or fails closed), otherwise the
+        `media.*` variables for the path, which is empty when the template uses none.
 
         An unrecognized ``WriteVettingPolicy`` raises loudly: silently
         falling through would let a policy variant added without updating
         this switch bless every write that reached it.
         """
         artifact_manager = self.engine.artifact_manager
+        # The caller only vets bytes content.
+        content: bytes = request.content  # type: ignore[assignment]
+        file_name = self._pending_file_name(request, sniffed_ext)
         policy = artifact_manager.get_write_vetting_policy(sniffed_ext)
-        denial: CheckpointDenial | None = None
+        reads_media = isinstance(request.file_path, MacroPath) and references_media_variables(
+            request.file_path.parsed_macro
+        )
 
+        denial: CheckpointDenial | None = None
         match policy:
-            case None:
-                return None
+            case None | WriteVettingPolicy.FROM_PATH:
+                pass
             case WriteVettingPolicy.FROM_BYTES:
                 denial = artifact_manager.check_write_format_from_bytes(content, sniffed_ext)
-            case WriteVettingPolicy.FROM_PATH:
-                staging_variables: MacroVariables = dict(caller_variables) if caller_variables else {}
-                # Vet's required overrides sit on top of caller variables --
-                # ``file_name_base`` must be a uuid to keep concurrent vet
-                # stagings from colliding under SAVE_TEMP_FILE's OVERWRITE
-                # policy; ``file_extension`` must match the sniffed container
-                # so ffprobe's extension-based demuxer dispatch picks correctly.
-                staging_variables["file_name_base"] = uuid.uuid4().hex
-                staging_variables["file_extension"] = sniffed_ext
-
-                try:
-                    outcome = self._stage_bytes_at_temp(content, staging_variables, workflow)
-                except StagingFailedError as exc:
-                    return WriteFileResultFailure(
-                        failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
-                        result_details=(f"Cannot save '{file_path.name}': staging for verification failed ({exc})."),
-                    )
-                try:
-                    denial = artifact_manager.check_write_format_from_path(outcome.staged_path, sniffed_ext)
-                finally:
-                    self._truncate_and_delete_staged(outcome.staged_path)
             case _:
                 msg = f"Unrecognized WriteVettingPolicy '{policy}' returned by provider for format '{sniffed_ext}'."
                 raise RuntimeError(msg)
+        vets_from_path = policy is WriteVettingPolicy.FROM_PATH
 
-        if denial is None:
-            return None
-        return WriteFileResultFailure(
-            failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
-            result_details=f"Cannot save '{file_path.name}': {denial.reason()}",
-        )
+        media_info = MediaInfo()
+        if denial is None and (vets_from_path or reads_media):
+            staging_variables: MacroVariables = {}
+            if isinstance(request.file_path, MacroPath):
+                staging_variables = dict(request.file_path.variables)
+            # Required overrides sit on top of caller variables --
+            # ``file_name_base`` must be a uuid to keep concurrent
+            # stagings from colliding under SAVE_TEMP_FILE's OVERWRITE
+            # policy; ``file_extension`` must match the sniffed container
+            # so ffprobe's extension-based demuxer dispatch picks correctly.
+            staging_variables["file_name_base"] = uuid.uuid4().hex
+            staging_variables["file_extension"] = sniffed_ext
+
+            try:
+                outcome = self._stage_bytes_at_temp(content, staging_variables, workflow)
+            except StagingFailedError as exc:
+                # Only the vet makes this a codec refusal. A copy staged just to read media
+                # values reports why the staging failed.
+                failure_reason = exc.failure_reason
+                if vets_from_path:
+                    failure_reason = FileIOFailureReason.CODEC_NOT_PERMITTED
+                return WriteFileResultFailure(
+                    failure_reason=failure_reason,
+                    result_details=f"Cannot save '{file_name}': staging for verification failed ({exc}).",
+                )
+            try:
+                if vets_from_path:
+                    denial = artifact_manager.check_write_format_from_path(outcome.staged_path, sniffed_ext)
+                if denial is None and reads_media:
+                    media_info = artifact_manager.get_media_info(outcome.staged_path, sniffed_ext)
+            finally:
+                self._truncate_and_delete_staged(outcome.staged_path)
+
+        if denial is not None:
+            return WriteFileResultFailure(
+                failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                result_details=f"Cannot save '{file_name}': {denial.reason()}",
+            )
+        return media_info.to_macro_variables()
 
     def _apply_extension_coercion(
         self,
@@ -1321,3 +1377,17 @@ class FileWriter(EngineScoped):
         if padded_index_var.info.is_required:
             return 2
         return 1
+
+    @staticmethod
+    def _pending_file_name(request: WriteFileRequest, sniffed_ext: str) -> str:
+        """Name the file in messages written before its path resolves.
+
+        A plain path names its file. A macro path names the caller's `file_name_base` with the
+        detected format, or the template when there is no base name.
+        """
+        if not isinstance(request.file_path, MacroPath):
+            return Path(sanitize_path_string(request.file_path)).name
+        file_name_base = request.file_path.variables.get("file_name_base")
+        if isinstance(file_name_base, str) and file_name_base:
+            return f"{file_name_base}.{sniffed_ext}"
+        return request.file_path.parsed_macro.template
