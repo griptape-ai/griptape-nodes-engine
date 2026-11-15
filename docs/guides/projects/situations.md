@@ -263,11 +263,13 @@ For example, this macro saves a 1920x1080 image as `render_1920x1080.png`:
 macro: "{outputs}/{file_name_base}_{media.width}x{media.height}.{file_extension}"
 ```
 
-A variable has no value when it doesn't apply to the file, such as `{media.fps}` on an image or any `media.` variable on a text file. Mark it optional with `?` so it drops out instead of stopping the save. This macro adds the frame rate only for video:
+A variable has no value when it doesn't apply to the file, such as `{media.fps}` on an image or any `media.` variable on a text file. Mark it optional with `?` so it drops out instead of stopping the save. Put the text around it inside the variable, after a colon, so that text drops out too: `^_` adds `_` before the value, and `fps` adds `fps` after it. This macro adds the size for images and video and the frame rate only for video:
 
 ```yaml
-macro: "{outputs}/{file_name_base}_{media.width?}x{media.height?}{media.fps?:^_}.{file_extension}"
+macro: "{outputs}/{file_name_base}{media.width?:^_}{media.height?:^x}{media.fps?:fps:^_}.{file_extension}"
 ```
+
+It saves `render_1920x1080.png`, `render_1920x1080_24fps.mp4`, and `render.txt`. Text typed outside the braces always stays, so `{file_name_base}_{media.width?}x{media.height?}` would save a text file as `render_x.txt`.
 
 Things to know:
 

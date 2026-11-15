@@ -123,6 +123,25 @@ class TestImageSavePaths:
 
         assert _written_name(result) == "render_8.png"
 
+    @pytest.mark.parametrize(
+        ("content", "extension", "expected"),
+        [(_png_bytes(64, 32), "png", "render_64x32.png"), (b"just text", "txt", "render.txt")],
+    )
+    @pytest.mark.asyncio
+    async def test_the_documented_optional_macro_drops_out_cleanly(
+        self, engine: Engine, content: bytes, extension: str, expected: str
+    ) -> None:
+        # The optional example in docs/guides/projects/situations.md.
+        template = "{outputs}/{file_name_base}{media.width?:^_}{media.height?:^x}{media.fps?:fps:^_}.{file_extension}"
+        request = WriteFileRequest(
+            file_path=MacroPath(ParsedMacro(template), {"file_name_base": "render", "file_extension": extension}),
+            content=content,
+        )
+
+        result = await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
+
+        assert _written_name(result) == expected
+
     @pytest.mark.asyncio
     async def test_a_required_value_fails_for_content_that_is_not_media(self, engine: Engine) -> None:
         result = await _write(engine, "{outputs}/notes_{media.width}.txt", "just text")
