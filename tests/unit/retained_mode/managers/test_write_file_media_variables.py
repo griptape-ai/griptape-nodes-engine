@@ -186,6 +186,32 @@ class TestImageSavePaths:
             "media.color_space": "RGB",
         }
 
+    @pytest.mark.asyncio
+    async def test_reused_sidecar_metadata_does_not_carry_values_into_the_next_save(self, engine: Engine) -> None:
+        template = "{outputs}/render{media.width?:^_}.{file_extension}"
+        metadata = SidecarContent(
+            situation=SituationMetadata(name="custom", macro=template, variables={"file_extension": "png"})
+        )
+        with patch("griptape_nodes.retained_mode.managers.filesystem.file_writing.write_sidecar") as write_sidecar:
+            request = WriteFileRequest(
+                file_path=MacroPath(ParsedMacro(template), {"file_extension": "png"}),
+                content=_png_bytes(12, 5),
+                file_metadata=metadata,
+            )
+            await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
+            request = WriteFileRequest(
+                file_path=MacroPath(ParsedMacro(template), {"file_extension": "txt"}),
+                content="just text",
+                file_metadata=metadata,
+            )
+            await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
+
+        image_sidecar, text_sidecar = (call.args[1] for call in write_sidecar.call_args_list)
+        assert image_sidecar.situation.variables["media.width"] == "12"
+        assert text_sidecar.situation.variables == {"file_extension": "png"}
+        assert metadata.situation is not None
+        assert metadata.situation.variables == {"file_extension": "png"}
+
 
 @pytest.mark.usefixtures("project")
 class TestVideoSavePaths:

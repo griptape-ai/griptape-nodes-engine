@@ -308,30 +308,47 @@ class FileWriter(EngineScoped):
         swapped_ext: str | None,
         workflow: "WorkflowRuntime | None",
     ) -> None:
-        """Write the sidecar metadata file the caller opted into by providing `file_metadata`."""
+        """Write the sidecar metadata file the caller opted into by providing `file_metadata`.
+
+        The caller's `file_metadata` is left untouched. A destination can hand the same object to
+        several writes, and each sidecar must describe only its own write.
+        """
         file_metadata = request.file_metadata
         if file_metadata is None:
             return
+        if file_metadata.situation is not None:
+            variables = self._sidecar_variables(request, file_metadata.situation.variables, swapped_ext)
+            situation = file_metadata.situation.model_copy(update={"variables": variables})
+            file_metadata = file_metadata.model_copy(update={"situation": situation})
+        write_sidecar(file_path, file_metadata, self.engine, workflow)
+
+    def _sidecar_variables(
+        self, request: WriteFileRequest, variables: dict[str, str] | None, swapped_ext: str | None
+    ) -> dict[str, str] | None:
+        """Return this write's sidecar situation variables as a new dict, or None when there are none."""
+        # Callers cannot supply `media.*` variables, so every one in the request was read from
+        # this write's bytes.
+        media_variables: dict[str, str] = {}
+        if isinstance(request.file_path, MacroPath):
+            media_variables = {
+                name: str(value) for name, value in request.file_path.variables.items() if is_media_variable(name)
+            }
+        if variables is None and not media_variables:
+            return None
+
+        sidecar_variables = dict(variables or {})
         # Sidecar provenance must reflect the on-disk extension, not the requested one.
         # The reconciliation already happened in the sniff-and-swap; this just keeps the
         # sidecar's file_extension variable (when present) consistent with what the bytes
         # turned out to be. ``swapped_ext`` is non-None only when a genuine swap happened:
         # for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the file lands at the caller's
         # requested suffix, and the sidecar's ``file_extension`` stays what the caller supplied.
-        if swapped_ext is not None and file_metadata.situation is not None:
-            sidecar_variables = file_metadata.situation.variables
-            if sidecar_variables is not None and "file_extension" in sidecar_variables:
-                sidecar_variables["file_extension"] = swapped_ext
+        if swapped_ext is not None and "file_extension" in sidecar_variables:
+            sidecar_variables["file_extension"] = swapped_ext
         # Record the `media.*` values the path was resolved with, so the sidecar's macro and
-        # variables still reproduce the path. Callers cannot supply `media.*` variables, so
-        # every one in the request was read from the bytes.
-        if file_metadata.situation is not None and isinstance(request.file_path, MacroPath):
-            media_variables = {
-                name: str(value) for name, value in request.file_path.variables.items() if is_media_variable(name)
-            }
-            if media_variables:
-                file_metadata.situation.variables = {**(file_metadata.situation.variables or {}), **media_variables}
-        write_sidecar(file_path, file_metadata, self.engine, workflow)
+        # variables still reproduce the path.
+        sidecar_variables.update(media_variables)
+        return sidecar_variables
 
     def _reserved_variables_failure(self, request: WriteFileRequest) -> WriteFileResultFailure | None:
         """Refuse a macro path whose caller-supplied variables use the reserved `media.` prefix."""

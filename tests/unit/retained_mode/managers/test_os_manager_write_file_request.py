@@ -949,15 +949,15 @@ class TestExtensionCoercion:
             content=_jpeg_bytes(),
             file_metadata=file_metadata,
         )
-        result = os_manager.engine.handle_request(request)
+        with patch("griptape_nodes.retained_mode.managers.filesystem.file_writing.write_sidecar") as write_sidecar:
+            result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        # The mutation happens before write_sidecar runs, so the in-memory metadata
-        # passed in should be updated. Verify by checking the request's metadata.
-        assert request.file_metadata is not None
-        assert request.file_metadata.situation is not None
-        assert request.file_metadata.situation.variables is not None
-        assert request.file_metadata.situation.variables["file_extension"] == "jpg"
+        recorded = write_sidecar.call_args.args[1]
+        assert recorded.situation.variables["file_extension"] == "jpg"
+        # The caller's metadata is left as it was, so a reused destination doesn't carry it over.
+        assert file_metadata.situation is not None
+        assert file_metadata.situation.variables == {"file_name_base": "image", "file_extension": "png"}
 
     def test_coerce_skipped_for_text_content(self, engine: Engine, temp_dir: Path) -> None:
         """Text writes should never trigger sniffing/rename."""
