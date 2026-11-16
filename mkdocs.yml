@@ -1,5 +1,5 @@
 site_name: Documentation
-site_url: https://docs.griptapenodes.com/
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "https://docs.griptapenodes.com/en/stable/"]
 
 plugins:
   - search
