@@ -131,6 +131,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         # the same wire meets control_in / control_out (see _connect_control_wire_through_group).
         self.inner_entry: ControlParameterOutput | None = None
         self.inner_exit: ControlParameterInput | None = None
+        # Which member's inner leg the outer control_in / control_out wire was drawn for, as
+        # (member_node_name, member_param_name), or None when the port carries no such wire (either
+        # nothing has crossed the boundary yet, or the port is a loop's own Start Loop / On Complete,
+        # wired directly by the artist rather than by _connect_control_wire_through_group). Release and
+        # absorb read this to decide whether the outer wire is theirs to move; a group's own permanent
+        # port is never touched based on wire count alone. See _connect_control_wire_through_group.
+        self._entry_wire_owner: tuple[str, str] | None = None
+        self._exit_wire_owner: tuple[str, str] | None = None
         if inner_control_ports:
             self.inner_entry = ControlParameterOutput(
                 name="on_start",
@@ -464,7 +472,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         Outside, the wire meets the group's own entry or exit port. Inside, it runs from inner_entry to
         the member, or from the member to inner_exit. Each port carries one direction, so the inner leg
         records which member the wire belongs to. A group without inner control ports gets the outer
-        leg only.
+        leg only. Drawing the inner leg here is also what makes the outer leg this member's: release
+        and absorb only ever move the outer wire for the member recorded in _entry_wire_owner /
+        _exit_wire_owner, which this is the one place that sets.
 
         Args:
             old_connection: The member's connection that crossed the boundary, already deleted
@@ -486,6 +496,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     target_parameter_name=old_connection.target_parameter.name,
                     is_node_group_internal=True,
                 )
+                self._entry_wire_owner = (old_connection.target_node.name, old_connection.target_parameter.name)
         else:
             outer = CreateConnectionRequest(
                 source_node_name=self.name,
@@ -502,6 +513,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     target_parameter_name=self.inner_exit.name,
                     is_node_group_internal=True,
                 )
+                self._exit_wire_owner = (old_connection.source_node.name, old_connection.source_parameter.name)
         for request in (outer, inner):
             if request is not None:
                 self._handle_request_in_workflow(request)
@@ -535,14 +547,18 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             raise RuntimeError(msg)
 
     def _release_control_entry(self, member: BaseNode, member_param: str, connections: Connections) -> None:
-        """A member leaves: drop its On Start leg, and wire it straight to the group's caller if unambiguous.
+        """A member leaves: drop its On Start leg, and wire it straight to the group's caller if it owned it.
 
-        Unambiguous means exactly one wire comes into the group's entry port, so it can only have been
-        this member's. Otherwise that wire stays with the group.
+        The group's entry port is only the departing member's to take if this is the member
+        _connect_control_wire_through_group drew it for — never from how many wires happen to sit on
+        the port, which on a loop is the loop's own trigger and has nothing to do with any one member.
         """
         if self.inner_entry is None:
             return
         self._delete_connection(self.name, self.inner_entry.name, member.name, member_param)
+        if self._entry_wire_owner != (member.name, member_param):
+            return
+        self._entry_wire_owner = None
         outer = connections.get_incoming_connections_to_parameter(self, self.control_in)
         if len(outer) != 1:
             return
@@ -551,14 +567,19 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._create_connection(caller.source_node.name, caller.source_parameter.name, member.name, member_param)
 
     def _release_control_exit(self, member: BaseNode, member_param: str, connections: Connections) -> None:
-        """A member leaves: drop its Group Complete leg, and wire it straight to the group's successor if unambiguous.
+        """A member leaves: drop its Group Complete leg, and wire it straight to the group's successor if it owned it.
 
-        Unambiguous means this member is the only one wired into the inner exit and the group's exit
-        port has a successor. Otherwise that wire stays with the group.
+        The group's exit port is only the departing member's to take if this is the member
+        _connect_control_wire_through_group drew it for — never from how many wires happen to sit on
+        the port, which on a loop is the loop's own completion signal and has nothing to do with any
+        one member.
         """
         if self.inner_exit is None:
             return
         self._delete_connection(member.name, member_param, self.name, self.inner_exit.name)
+        if self._exit_wire_owner != (member.name, member_param):
+            return
+        self._exit_wire_owner = None
         if connections.get_incoming_connections_to_parameter(self, self.inner_exit):
             return
         outer = connections.get_outgoing_connections_from_parameter(self, self.control_out)
@@ -571,9 +592,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._create_connection(member.name, member_param, successor.target_node.name, successor.target_parameter.name)
 
     def _absorb_control_entry(self, node: BaseNode, node_param: str, connections: Connections) -> None:
-        """The group's caller joins it: its wire into the entry port now goes straight to the member it led to."""
+        """The group's caller joins it: its wire into the entry port now goes straight to the member it led to.
+
+        Only the owned inner leg moves: an unowned one is the artist's own wiring of a loop's Start
+        Loop / On Each, not a pass-through this method is free to rewrite.
+        """
         entered = []
-        if self.inner_entry is not None:
+        if self.inner_entry is not None and self._entry_wire_owner is not None:
             entered = connections.get_outgoing_connections_from_parameter(self, self.inner_entry)
         self._delete_connection(node.name, node_param, self.name, self.control_in.name)
         if connections.get_incoming_connections_to_parameter(self, self.control_in):
@@ -586,18 +611,31 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 self.name, leg.source_parameter.name, leg.target_node.name, leg.target_parameter.name
             )
             self._create_connection(node.name, node_param, leg.target_node.name, leg.target_parameter.name)
+        if entered:
+            self._entry_wire_owner = None
 
     def _absorb_control_exit(self, node: BaseNode, node_param: str, connections: Connections) -> None:
-        """The group's successor joins it: the members that led to the exit port now go straight to it."""
+        """The group's successor joins it: the member that led to the exit port now goes straight to it.
+
+        Only the owned inner leg moves: inner_exit can carry other members' own wires too, and an
+        unowned leg is the artist's own wiring of a loop's Loop Complete, not a pass-through this
+        method is free to rewrite.
+        """
         exited = []
-        if self.inner_exit is not None:
-            exited = connections.get_incoming_connections_to_parameter(self, self.inner_exit)
+        if self.inner_exit is not None and self._exit_wire_owner is not None:
+            exited = [
+                connection
+                for connection in connections.get_incoming_connections_to_parameter(self, self.inner_exit)
+                if (connection.source_node.name, connection.source_parameter.name) == self._exit_wire_owner
+            ]
         self._delete_connection(self.name, self.control_out.name, node.name, node_param)
         for leg in exited:
             self._delete_connection(
                 leg.source_node.name, leg.source_parameter.name, self.name, leg.target_parameter.name
             )
             self._create_connection(leg.source_node.name, leg.source_parameter.name, node.name, node_param)
+        if exited:
+            self._exit_wire_owner = None
 
     def get_all_nodes(self) -> dict[str, BaseNode]:
         """Collect this group's members and every node nested beneath them, at any depth.

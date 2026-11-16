@@ -293,6 +293,40 @@ class TestLoopGroup:
         assert isinstance(run_result, StartFlowResultSuccess), run_result
         assert _state(engine, "Down") == NodeResolutionState.RESOLVED
 
+    def test_ungrouping_a_body_member_leaves_the_loops_own_wires_untouched(
+        self, tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
+    ) -> None:
+        """Start Loop / On Complete are wired directly by the artist here, not drawn by grouping.
+
+        Ungrouping a body member must never touch them on that basis alone, however many wires
+        happen to sit on the port at the time: On Each and Loop Complete are a loop's own
+        user-facing controls, not minted proxies.
+        """
+        _start(engine, materialize_library, tmp_path, LOOP_LIBRARY)
+        _node(engine, "StartFlow", "Up", LOOP_LIBRARY)
+        _node(engine, "EndFlow", "Down", LOOP_LIBRARY)
+        _node(engine, "ProbeForEachGroupNode", "G", LOOP_LIBRARY)
+        _connect(engine, "Up", "exec_out", "G", "exec_in")
+        _connect(engine, "G", "exec_out", "Down", "exec_in")
+        _node(engine, "CounterControlNode", "Body1", LOOP_LIBRARY)
+        _node(engine, "CounterControlNode", "Body2", LOOP_LIBRARY)
+        add_result = engine.handle_request(
+            AddNodesToNodeGroupRequest(node_names=["Body1", "Body2"], node_group_name="G")
+        )
+        assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
+        _connect(engine, "G", "on_each", "Body1", "exec_in")
+        _connect(engine, "Body2", "exec_out", "G", "loop_complete")
+
+        remove_body1 = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Body1"], node_group_name="G"))
+        assert isinstance(remove_body1, RemoveNodeFromNodeGroupResultSuccess), remove_body1
+        assert _edges(engine, "Up", control_only=True) == {"Up.exec_out->G.exec_in"}
+        assert "Up.exec_out->Body1.exec_in" not in _edges(engine, "Body1", control_only=True)
+
+        remove_body2 = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Body2"], node_group_name="G"))
+        assert isinstance(remove_body2, RemoveNodeFromNodeGroupResultSuccess), remove_body2
+        assert _edges(engine, "Down", control_only=True) == {"G.exec_out->Down.exec_in"}
+        assert "Body2.exec_out->Down.exec_in" not in _edges(engine, "Body2", control_only=True)
+
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
 class TestDataWiresAreUnchanged:
