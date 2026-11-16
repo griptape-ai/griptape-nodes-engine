@@ -141,13 +141,22 @@ def worker_manager() -> WorkerManager:
 
 
 def _managed_proc_mock() -> MagicMock:
-    """Build a mock worker process whose ``wait()`` is awaitable.
+    """Build a mock worker process whose ``wait()`` returns once it is terminated or killed.
 
     ``_terminate_managed_process`` awaits ``proc.wait()`` after SIGTERM; a bare
-    MagicMock returns a non-awaitable, so stand in an AsyncMock for ``wait``.
+    MagicMock returns a non-awaitable, so stand in an AsyncMock for ``wait``. It must
+    not return sooner: the exit watcher would read that as the worker crashing.
     """
     proc = MagicMock()
-    proc.wait = AsyncMock()
+    exited = asyncio.Event()
+    proc.terminate.side_effect = exited.set
+    proc.kill.side_effect = exited.set
+
+    async def wait() -> int:
+        await exited.wait()
+        return -15
+
+    proc.wait = AsyncMock(side_effect=wait)
     return proc
 
 
