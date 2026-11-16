@@ -129,7 +129,7 @@ class TestSpawn:
             seen["watcher"] = bound_workflow.get()
 
         manager._spawn_general_purpose_worker_when_session_ready = spawn  # type: ignore[method-assign]
-        manager._settle_when_worker_exits_early = settle  # type: ignore[method-assign]
+        manager._settle_when_worker_exits = settle  # type: ignore[method-assign]
         token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
         try:
             await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))

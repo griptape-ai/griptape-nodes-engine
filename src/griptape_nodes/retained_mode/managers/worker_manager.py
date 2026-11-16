@@ -189,6 +189,45 @@ class _EngineRunSpec(RunSpec):
         self.manager.refuse_engine_run(self.engine_run, details)
 
 
+# A fixed table rather than the signal module, which lacks SIGKILL on Windows.
+_SIGNAL_CAUSES = {
+    6: "it aborted",
+    9: "the system killed it, which usually means it ran out of memory",
+    11: "it crashed",
+    15: "something asked it to stop",
+}
+_NTSTATUS_CAUSES = {
+    0xC0000005: "it crashed",
+    0xC0000017: "it ran out of memory",
+    0xC00000FD: "it crashed with a stack overflow",
+    0xC0000409: "it crashed",
+}
+_NTSTATUS_MIN = 0xC0000000
+_SHELL_SIGNAL_BASE = 128
+_MAX_SIGNAL = 64
+
+
+def describe_exit_code(exit_code: int) -> str:
+    """Name a worker process's exit code and, for a known one, its likely cause.
+
+    Decoded by range rather than by this engine's OS, because a hosted worker's code comes from
+    another machine: negative is a POSIX signal, 128+N a signal reported through a shell, and
+    0xC0000000 and up a Windows NTSTATUS.
+    """
+    if exit_code < 0:
+        label = f"signal {-exit_code}"
+        cause = _SIGNAL_CAUSES.get(-exit_code)
+    elif exit_code >= _NTSTATUS_MIN:
+        label = f"exit code 0x{exit_code:08X}"
+        cause = _NTSTATUS_CAUSES.get(exit_code)
+    elif _SHELL_SIGNAL_BASE < exit_code <= _SHELL_SIGNAL_BASE + _MAX_SIGNAL:
+        label = f"exit code {exit_code}, signal {exit_code - _SHELL_SIGNAL_BASE}"
+        cause = _SIGNAL_CAUSES.get(exit_code - _SHELL_SIGNAL_BASE)
+    else:
+        return f"exit code {exit_code}"
+    return label if cause is None else f"{label}: {cause}"
+
+
 @dataclass
 class EngineLease:
     """A lease this engine holds, or waits for, on the engine that runs a library's worker, until it is released."""
@@ -786,7 +825,7 @@ class WorkerManager(EngineScoped):
             self._managed_worker_processes[worker_key] = proc
             # Started on this loop, the only one that may await proc.wait().
             watcher = create_task_bound_to_no_workflow(
-                self._spawn_loop, self._settle_when_worker_exits_early(worker_key, proc)
+                self._spawn_loop, self._settle_when_worker_exits(worker_key, proc)
             )
             self._exit_watchers.add(watcher)
             watcher.add_done_callback(self._exit_watchers.discard)
@@ -800,36 +839,47 @@ class WorkerManager(EngineScoped):
             claim.set()
         logger.debug("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
-    async def _settle_when_worker_exits_early(self, worker_key: str | None, proc: asyncio.subprocess.Process) -> None:
-        """Release the runs waiting on `worker_key` if its process exits before it has loaded.
+    async def _settle_when_worker_exits(self, worker_key: str | None, proc: asyncio.subprocess.Process) -> None:
+        """Release the runs waiting on `worker_key` when its process exits on its own, with the exit code.
 
-        Every other way a worker ends is noticed through the registry: it unregisters, or it stops
-        answering heartbeats and is evicted. A worker that dies while starting up -- refused a
-        license session, a crash on import -- never registered, so neither happens, and the runs
-        waiting on it would wait out the whole load timeout before blaming a load that never began.
-        The process exiting is the fact itself, so it is read from the process.
+        A worker that dies while starting up -- refused a license session, a crash on import --
+        never registered, so it is never evicted, and the runs waiting on it would wait out the
+        whole load timeout. One that dies after loading would be evicted only once it missed its
+        heartbeats, blamed for not responding rather than for how it ended. The process exiting is
+        the fact itself, so it is read from the process.
         """
         returncode = await proc.wait()
         # A process this manager stopped itself was dropped from the records first, and whoever
         # stopped it records the reason.
         if self._managed_worker_processes.get(worker_key) is not proc:
             return
-        # Loaded, then exited: the heartbeat loop evicts it and says so.
-        if self.has_settled(worker_key):
-            return
         del self._managed_worker_processes[worker_key]
+        exit_description = describe_exit_code(returncode)
+        if not self.has_settled(worker_key):
+            logger.error(
+                "Worker for key '%s' (pid %s) exited before it finished loading (%s). Its own log lines above say why.",
+                worker_key,
+                proc.pid,
+                exit_description,
+            )
+            self.note_worker_unavailable(
+                worker_key,
+                f"the worker process that runs it stopped while starting up ({exit_description}). "
+                "The engine log has the details.",
+            )
+            return
         logger.error(
-            "Worker for key '%s' (pid %s) exited with code %s before it finished loading. Its own log "
-            "lines above say why.",
+            "Worker for key '%s' (pid %s) exited unexpectedly (%s). Its own log lines above may say why.",
             worker_key,
             proc.pid,
-            returncode,
+            exit_description,
         )
-        self.note_worker_unavailable(
-            worker_key,
-            f"the worker process that runs it stopped while starting up (exit code {returncode}). "
-            "The engine log has the details.",
-        )
+        what_happened = f"exited unexpectedly ({exit_description})"
+        worker = self.get_worker_for_key(worker_key)
+        if worker is None:
+            self.note_worker_unavailable(worker_key, f"the worker process that runs it {what_happened}.")
+            return
+        await self._remove_worker(worker[0], what_happened)
 
     async def reset_workers(self) -> None:
         """Terminate all managed worker processes, unsubscribe response topics, clear state.
@@ -1181,7 +1231,14 @@ class WorkerManager(EngineScoped):
         return None
 
     async def evict_worker(self, worker_engine_id: str) -> None:
-        """Remove a worker from the registry and unsubscribe from its response topic."""
+        """Remove a worker that stopped answering heartbeats, and shut it down."""
+        await self._remove_worker(worker_engine_id, "stopped responding and was shut down")
+
+    async def _remove_worker(self, worker_engine_id: str, what_happened: str) -> None:
+        """Remove a worker from the registry, stop its process, and fail everything waiting on it.
+
+        `what_happened` completes "worker '<id>' ..." and "the worker process that runs it ...".
+        """
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(worker_engine_id, None)
         lib_name = registration.worker_key if registration else None
@@ -1190,7 +1247,7 @@ class WorkerManager(EngineScoped):
         # A hung worker cannot shut itself down, so the engine that runs it is told to stop it.
         if registration is not None and registration.host_engine_id is not None:
             self._schedule_remote_stop(worker_engine_id, registration.host_engine_id)
-        logger.warning("Worker evicted: %s", worker_engine_id)
+        logger.warning("Worker removed: %s %s", worker_engine_id, what_happened)
         # Terminate the managed subprocess for this worker, if any.
         if registration is not None:
             proc = self._managed_worker_processes.pop(lib_name, None)
@@ -1200,15 +1257,13 @@ class WorkerManager(EngineScoped):
         # than inferring it from a bare cancellation.
         await self._tx.request_client.fail_requests_by_tag(
             worker_engine_id,
-            worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
+            worker_events.WorkerGoneError(f"worker '{worker_engine_id}' {what_happened}"),
         )
-        # Eviction is terminal -- nothing respawns the worker -- so anything still waiting on this
+        # Removal is terminal -- nothing respawns the worker -- so anything still waiting on this
         # library would wait forever, and the next run would report a worker that "may still be
         # starting up" for the rest of the session.
         if registration is not None:
-            self.note_worker_unavailable(
-                lib_name, "the worker process that runs it stopped responding and was shut down."
-            )
+            self.note_worker_unavailable(lib_name, f"the worker process that runs it {what_happened}.")
 
     async def _terminate_via_spawn_loop(self, library_name: str | None, proc: asyncio.subprocess.Process) -> None:
         """Terminate a managed worker on the loop that owns its subprocess.
@@ -1633,13 +1688,13 @@ class WorkerManager(EngineScoped):
             reason = f"{host_engine_id} stopped the worker process that runs it."
         elif not registered:
             reason = (
-                f"the worker process that runs it on {host_engine_id} stopped while starting up (exit code "
-                f"{request.exit_code}). That engine's log has the details."
+                f"the worker process that runs it on {host_engine_id} stopped while starting up "
+                f"({describe_exit_code(request.exit_code)}). That engine's log has the details."
             )
         else:
             reason = (
-                f"the worker process that runs it on {host_engine_id} stopped (exit code {request.exit_code}). "
-                "That engine's log has the details."
+                f"the worker process that runs it on {host_engine_id} stopped "
+                f"({describe_exit_code(request.exit_code)}). That engine's log has the details."
             )
         logger.warning("Worker %s for library '%s' on %s %s.", wid, library_name, host_engine_id, request.reason)
         if registered:

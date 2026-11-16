@@ -1,22 +1,24 @@
-"""A worker process that exits before it has loaded settles the runs waiting on it.
+"""A worker process that exits on its own settles the runs waiting on it, with its exit code.
 
-Such a worker never registered -- refused a license session, a crash on import -- so it never
-unregisters and is never evicted. Without the orchestrator watching the process itself, a node
-waiting on it would wait out the whole load timeout.
+One that exits before loading never registered -- refused a license session, a crash on import --
+so it never unregisters and is never evicted. Without the orchestrator watching the process itself,
+a node waiting on it would wait out the whole load timeout.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
+from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration, describe_exit_code
 
 _LIBRARY = "My Library"
 _ARGS = ["/usr/bin/gtn", "engine"]
+_WORKER = "worker-1"
 
 
 class _FakeProc:
@@ -102,16 +104,46 @@ async def test_a_process_this_manager_stopped_is_not_a_death() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_exit_after_loading_is_left_to_the_heartbeat() -> None:
-    """A loaded worker that dies is evicted when it stops answering, and that eviction says so."""
+async def test_an_exit_after_loading_removes_the_worker_with_its_exit_code() -> None:
+    """A loaded worker that dies is removed at once, blamed on how it ended rather than on missed heartbeats."""
     manager = _worker_manager()
     manager.expect_worker(_LIBRARY)
     proc = _FakeProc()
     await _spawn(manager, proc)
+    manager._workers[_WORKER] = WorkerRegistration(request_topic="worker-topic", worker_key=_LIBRARY)
     manager.note_library_loaded(_LIBRARY)
 
-    proc.exit(1)
+    proc.exit(-9)
     await asyncio.sleep(0)
 
-    assert manager.worker_unavailable_reason(_LIBRARY) is None
-    assert manager._managed_worker_processes[_LIBRARY] is proc
+    assert _WORKER not in manager._workers
+    assert _LIBRARY not in manager._managed_worker_processes
+    fail = cast("AsyncMock", manager._tx.request_client.fail_requests_by_tag)
+    fail.assert_awaited_once()
+    assert fail.await_args is not None
+    tag, error = fail.await_args.args
+    assert tag == _WORKER
+    assert isinstance(error, WorkerGoneError)
+    assert "exited unexpectedly (signal 9: the system killed it" in str(error)
+    reason = manager.worker_unavailable_reason(_LIBRARY)
+    assert reason is not None
+    assert "exited unexpectedly (signal 9" in reason
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "description"),
+    [
+        (0, "exit code 0"),
+        (1, "exit code 1"),
+        (-9, "signal 9: the system killed it, which usually means it ran out of memory"),
+        (-11, "signal 11: it crashed"),
+        (-7, "signal 7"),
+        (137, "exit code 137, signal 9: the system killed it, which usually means it ran out of memory"),
+        (0xC0000005, "exit code 0xC0000005: it crashed"),
+        (0xC0000017, "exit code 0xC0000017: it ran out of memory"),
+        (0xC0000135, "exit code 0xC0000135"),
+    ],
+)
+def test_describe_exit_code(exit_code: int, description: str) -> None:
+    """An exit code is decoded by its range, so a code from another OS still reads right."""
+    assert describe_exit_code(exit_code) == description
