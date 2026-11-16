@@ -134,7 +134,7 @@ class TestSpawn:
         try:
             await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
             with patch("asyncio.create_subprocess_exec", return_value=_managed_proc()):
-                await manager.spawn_worker(["gtn", "engine"], None)
+                await manager._spawn_watched_worker(["gtn", "engine"], None)
         finally:
             bound_workflow.reset(token)
         await asyncio.sleep(0)

@@ -3455,6 +3455,25 @@ class TestServingAnotherEnginesSession:
         assert worker_manager._hosted_workers == {}
 
     @pytest.mark.asyncio
+    async def test_a_worker_spawned_for_another_engine_that_crashes_is_reported_exited_with_its_code(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """Through the real spawn, so only the hosted watcher reads the exit; another would report it as a stop."""
+        links = _host_engine(worker_manager)
+        _register_session(worker_manager)
+        worker_manager.engine.library_manager.environment.execution_site_packages.return_value = None  # type: ignore[union-attr]
+
+        with (
+            patch.object(worker_manager, "_orchestrator_static_server_base_url", new=AsyncMock(return_value=None)),
+            patch("asyncio.create_subprocess_exec", return_value=_worker_proc_mock(-9)),
+        ):
+            await _sent_by(_ARTIST, worker_manager.handle_start_worker_for_engine_request, _start_for_artist())
+        await asyncio.gather(*worker_manager._exit_watchers)
+
+        (report,) = links.sent_of(worker_events.ReportWorkerExitedRequest)
+        assert report == worker_events.ReportWorkerExitedRequest(worker_engine_id="w1", exit_code=-9, reason="exited")
+
+    @pytest.mark.asyncio
     async def test_a_worker_this_engine_stops_is_reported_stopped(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
         _register_session(worker_manager)

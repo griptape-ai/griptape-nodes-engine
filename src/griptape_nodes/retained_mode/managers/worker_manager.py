@@ -726,8 +726,8 @@ class WorkerManager(EngineScoped):
         library_name: str | None = None,
         worker_engine_id: str | None = None,
         environ_overrides: dict[str, str] | None = None,
-    ) -> None:
-        """Spawn a worker subprocess using the given command args.
+    ) -> asyncio.subprocess.Process | None:
+        """Spawn a worker subprocess using the given command args, returning it, or None if one is already spawning.
 
         worker_key is an opaque identifier used to track the process and prevent
         duplicate spawns, None for the general-purpose worker. Callers are responsible
@@ -735,10 +735,13 @@ class WorkerManager(EngineScoped):
         library_name is the library whose execution environment the worker imports from, when the
         key is not that name. worker_engine_id is the id the worker takes, when the caller needs it
         before the worker starts. environ_overrides are set in the worker's environment last.
+
+        Watches nothing: the caller decides what the process exiting means, through
+        `_spawn_watched_worker` for a worker that serves this engine.
         """
         if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
-            return
+            return None
         # Claimed in the same step as the check above, so no await separates them. The registry
         # entry cannot serve as this guard: it is written only once the subprocess exists, and the
         # work in between suspends. A second fork for one library leaves one of the two processes
@@ -823,12 +826,6 @@ class WorkerManager(EngineScoped):
             # All spawns run on the engine event-queue loop, so this is idempotent.
             self._spawn_loop = asyncio.get_running_loop()
             self._managed_worker_processes[worker_key] = proc
-            # Started on this loop, the only one that may await proc.wait().
-            watcher = create_task_bound_to_no_workflow(
-                self._spawn_loop, self._settle_when_worker_exits(worker_key, proc)
-            )
-            self._exit_watchers.add(watcher)
-            watcher.add_done_callback(self._exit_watchers.discard)
         finally:
             # Released even when the fork raises, or the claim would silently refuse every later
             # attempt for this library -- but only while this attempt still holds it. A reset drops
@@ -838,6 +835,19 @@ class WorkerManager(EngineScoped):
                 del self._spawns_in_flight[worker_key]
             claim.set()
         logger.debug("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
+        return proc
+
+    async def _spawn_watched_worker(self, args: list[str], worker_key: str | None) -> None:
+        """Spawn a worker that serves this engine, and settle `worker_key` when its process exits."""
+        proc = await self.spawn_worker(args, worker_key)
+        if proc is None:
+            return
+        # Started on the spawning loop, the only one that may await proc.wait().
+        watcher = create_task_bound_to_no_workflow(
+            asyncio.get_running_loop(), self._settle_when_worker_exits(worker_key, proc)
+        )
+        self._exit_watchers.add(watcher)
+        watcher.add_done_callback(self._exit_watchers.discard)
 
     async def _settle_when_worker_exits(self, worker_key: str | None, proc: asyncio.subprocess.Process) -> None:
         """Release the runs waiting on `worker_key` when its process exits on its own, with the exit code.
@@ -1467,7 +1477,7 @@ class WorkerManager(EngineScoped):
             logger.error("Not starting a worker for library '%s': %s", library_name, resolved.reason)
             self.note_worker_unavailable(library_name, resolved.reason)
             return
-        await self.spawn_worker(resolved.args, library_name)
+        await self._spawn_watched_worker(resolved.args, library_name)
 
     async def _start_worker_on_engine(self, library_name: str, host_engine_id: str) -> None:
         """Wait for an active session, then ask the engine `host_engine_id` to start the library's worker.
@@ -2390,7 +2400,7 @@ class WorkerManager(EngineScoped):
             "--session-id",
             session_id,
         ]
-        await self.spawn_worker(command, None)
+        await self._spawn_watched_worker(command, None)
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str | None) -> None:
         """Record a spawn that raised before producing a worker.

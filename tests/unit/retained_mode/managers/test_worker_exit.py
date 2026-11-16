@@ -65,7 +65,7 @@ def _worker_manager() -> WorkerManager:
 
 async def _spawn(manager: WorkerManager, proc: Any) -> None:
     with patch("asyncio.create_subprocess_exec", return_value=proc):
-        await manager.spawn_worker(_ARGS, _LIBRARY)
+        await manager._spawn_watched_worker(_ARGS, _LIBRARY)
 
 
 @pytest.mark.asyncio
