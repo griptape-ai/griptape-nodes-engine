@@ -10,20 +10,25 @@ The parent calls `listen_for_worker()`, hands the worker its address and token t
 environment variables (`PendingWorker.child_environment`), and `accept()`s the worker's single
 connection. The worker calls `connect_to_parent` to get its end. Both ends then share the same
 `AsyncChannel` API: `request`/`request_async` for a call that waits for a reply, `notify` for a
-one-way message, and a single gated dispatch point for incoming requests. `WorkerLink` runs an
-`AsyncChannel` on its own I/O loop thread so a worker's synchronous code can call it without
-deadlocking.
+one-way message, and a single gated dispatch point for incoming requests. A channel's streams
+belong to the loop that opened them, and a call from any other loop or thread runs on that one.
+`WorkerLink` runs an `AsyncChannel` on its own I/O loop thread so a worker's synchronous code can
+call it without deadlocking.
 
-Loopback is reachable by any process on the same machine, so the worker's first frame carries a
-per-connection token, compared with `hmac.compare_digest`; anything else closes that connection
-without touching the real one. Frame bodies are opaque dicts; this module only moves them, in
-order, as JSON, never pickle.
+Loopback is reachable by any process on the same machine, so before anything else each end proves
+to the other that it holds the per-connection token: each sends a random challenge and answers the
+other's with an HMAC of it, compared with `hmac.compare_digest`. The token itself never crosses the
+wire. A connection to the parent that cannot prove it is closed without touching the real one, and
+a worker refuses a listener that cannot, such as a process that bound the port after the parent
+stopped listening. Frame bodies are opaque dicts; this module only moves them, in order, as JSON,
+never pickle.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import hmac
 import json
 import logging
@@ -44,8 +49,8 @@ CHANNEL_ADDRESS_ENV = "GTN_WORKER_CHANNEL_ADDRESS"
 CHANNEL_TOKEN_ENV = "GTN_WORKER_CHANNEL_TOKEN"  # noqa: S105 - a secret's env var name, not a secret
 
 _HANDSHAKE_TIMEOUT_S = 5.0
-# The hello frame is ~80 bytes (one token). An unauthenticated peer must not be able to make the
-# parent buffer an attacker-chosen amount of memory before the token is even checked.
+# Each handshake frame is under 200 bytes. A peer not yet proven must not be able to make either end
+# buffer an amount of memory it chooses.
 _HELLO_MAX_LENGTH = 4096
 _HEADER = struct.Struct(">I")
 _FRAME_TYPES = ("request", "result", "notification")
@@ -54,6 +59,10 @@ _CLOSED_MSG = "The worker channel is closed."
 
 class ChannelClosedError(Exception):
     """Raised for a request in flight, or a new request or notification, once the channel ends."""
+
+
+class ChannelHandshakeError(ConnectionError):
+    """Raised by `connect_to_parent` when what it reached did not prove it holds the channel's token."""
 
 
 class ChannelRequestError(Exception):
@@ -74,6 +83,26 @@ class GateDecision(NamedTuple):
 
     dispatch: dict | None
     reply: dict | None
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _proof(token: str, challenge: str) -> str:
+    """What the holder of `token` answers `challenge` with."""
+    return hmac.new(token.encode("utf-8"), challenge.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _proves(offered: object, token: str, challenge: str) -> bool:
+    """Whether `offered` is the answer to `challenge` that only the holder of `token` can give."""
+    if not isinstance(offered, str):
+        return False
+    # Compared as bytes: `compare_digest` raises on a str that is not ASCII, which a peer can send.
+    return hmac.compare_digest(offered.encode("utf-8"), _proof(token, challenge).encode("utf-8"))
 
 
 def _encode_frame(frame: dict) -> bytes:
@@ -151,9 +180,15 @@ def _default_on_closed() -> None:
 
 
 class AsyncChannel:
-    """Either end of a connected channel. Every method runs on the loop that owns its streams."""
+    """Either end of a connected channel.
+
+    Its streams belong to the loop that opened them, which must be running when it is built.
+    `request`, `notify` and `close` may be called from any loop or thread and run on that loop;
+    asyncio streams are not safe to use from another one.
+    """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._loop = asyncio.get_running_loop()
         self._reader = reader
         self._writer = writer
         self._pending: dict[str, asyncio.Future[dict]] = {}
@@ -187,6 +222,10 @@ class AsyncChannel:
         Raises `ChannelRequestError` if the peer's `on_request` handler failed, or
         `ChannelClosedError` once the channel has ended.
         """
+        if asyncio.get_running_loop() is not self._loop:
+            # A reply resolves its future on this channel's loop, which would never wake the caller's.
+            sent = asyncio.run_coroutine_threadsafe(self.request(body, timeout_s), self._loop)
+            return await asyncio.wrap_future(sent)
         if self._closed:
             raise ChannelClosedError(_CLOSED_MSG)
         request_id = uuid.uuid4().hex
@@ -204,12 +243,23 @@ class AsyncChannel:
             self._pending.pop(request_id, None)
 
     def notify(self, body: dict) -> None:
-        """Send a one-way notification. Raises `ChannelClosedError` once the channel has ended."""
-        self._send_frame({"frame": "notification", "body": body})
+        """Send a one-way notification, from any thread, without blocking.
+
+        Raises `ChannelClosedError` once the channel has ended, or `TypeError` if `body` cannot be
+        encoded as JSON, both on the calling thread, before the write is scheduled.
+        """
+        encoded = self._prepare_frame({"frame": "notification", "body": body})
+        if _running_loop() is self._loop:
+            self._write_encoded(encoded)
+            return
+        self._loop.call_soon_threadsafe(self._write_encoded, encoded)
 
     def close(self) -> None:
-        """End this side of the channel, which the peer observes as EOF. Idempotent."""
-        self._writer.close()
+        """End this side of the channel, from any thread, which the peer observes as EOF. Idempotent."""
+        if _running_loop() is self._loop:
+            self._writer.close()
+            return
+        self._loop.call_soon_threadsafe(self._writer.close)
 
     def _send_frame(self, frame: dict) -> None:
         self._write_encoded(self._prepare_frame(frame))
@@ -217,9 +267,9 @@ class AsyncChannel:
     def _prepare_frame(self, frame: dict) -> bytes:
         """Encode a frame, raising `ChannelClosedError` if already closed. Safe from any thread.
 
-        `WorkerLink.notify` calls this from the caller's own thread, ahead of scheduling the
-        write, so `ChannelClosedError` and an unencodable body's `TypeError` reach that caller
-        directly instead of only reaching asyncio's default exception logging.
+        `notify` calls this on the caller's own thread, ahead of scheduling the write, so
+        `ChannelClosedError` and an unencodable body's `TypeError` reach that caller directly
+        instead of only reaching asyncio's default exception logging.
         """
         if self._closed or self._writer.is_closing():
             raise ChannelClosedError(_CLOSED_MSG)
@@ -375,27 +425,31 @@ class PendingWorker:
 
 
 async def listen_for_worker() -> PendingWorker:
-    """Parent side: bind a loopback port and wait for one worker that offers the right token."""
+    """Parent side: bind a loopback port and wait for one worker that proves it holds the token."""
     token = secrets.token_hex(32)
     connected: asyncio.Future[AsyncChannel] = asyncio.get_running_loop().create_future()
 
     async def _on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        challenge = secrets.token_hex(32)
+        writer.write(_encode_frame({"challenge": challenge}))
         try:
-            hello = await asyncio.wait_for(_read_json_frame(reader, max_length=_HELLO_MAX_LENGTH), _HANDSHAKE_TIMEOUT_S)
+            answer = await asyncio.wait_for(
+                _read_json_frame(reader, max_length=_HELLO_MAX_LENGTH), _HANDSHAKE_TIMEOUT_S
+            )
         except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
             logger.error("Worker channel handshake rejected a connection: %s: %s", type(exc).__name__, exc)
             writer.close()
             return
-        offered = hello.get("token")
         if connected.done():
             logger.error("Worker channel handshake rejected a connection: a worker already connected.")
             writer.close()
             return
-        # Compared as bytes: `compare_digest` raises on a str that is not ASCII, which a peer can send.
-        if not isinstance(offered, str) or not hmac.compare_digest(offered.encode("utf-8"), token.encode("utf-8")):
-            logger.error("Worker channel handshake rejected a connection: wrong token.")
+        worker_challenge = answer.get("challenge")
+        if not _proves(answer.get("proof"), token, challenge) or not isinstance(worker_challenge, str):
+            logger.error("Worker channel handshake rejected a connection: it did not prove it holds the token.")
             writer.close()
             return
+        writer.write(_encode_frame({"proof": _proof(token, worker_challenge)}))
         connected.set_result(AsyncChannel(reader, writer))
 
     server = await asyncio.start_server(_on_connect, host="127.0.0.1", port=0)
@@ -403,11 +457,35 @@ async def listen_for_worker() -> PendingWorker:
 
 
 async def connect_to_parent(environ: Mapping[str, str]) -> AsyncChannel:
-    """Worker side: connect to the parent named by `environ` and send the handshake token."""
+    """Worker side: connect to the parent named by `environ`, and prove to each other that both hold its token.
+
+    Raises:
+        ChannelHandshakeError: What listens there did not prove it holds the token.
+    """
     host, port = environ[CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    token = environ[CHANNEL_TOKEN_ENV]
     reader, writer = await asyncio.open_connection(host, int(port))
-    writer.write(_encode_frame({"token": environ[CHANNEL_TOKEN_ENV]}))
+    challenge = secrets.token_hex(32)
+    try:
+        parent_challenge = (await _read_handshake_frame(reader)).get("challenge")
+        if not isinstance(parent_challenge, str):
+            msg = "it sent no challenge"
+            raise ValueError(msg)  # noqa: TRY004, TRY301 - caught below, with every other way the handshake fails
+        writer.write(_encode_frame({"proof": _proof(token, parent_challenge), "challenge": challenge}))
+        answer = await _read_handshake_frame(reader)
+        if not _proves(answer.get("proof"), token, challenge):
+            msg = "it did not prove it holds the token"
+            raise ValueError(msg)  # noqa: TRY301 - caught below, with every other way the handshake fails
+    except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
+        writer.close()
+        msg = f"The process at the worker channel's address is not the engine that started this worker: {exc}"
+        raise ChannelHandshakeError(msg) from exc
     return AsyncChannel(reader, writer)
+
+
+async def _read_handshake_frame(reader: asyncio.StreamReader) -> dict:
+    """Read one handshake frame from a peer not yet proven, bounded in size and time."""
+    return await asyncio.wait_for(_read_json_frame(reader, max_length=_HELLO_MAX_LENGTH), _HANDSHAKE_TIMEOUT_S)
 
 
 class WorkerLink:
@@ -446,19 +524,16 @@ class WorkerLink:
 
     async def request_async(self, body: dict, timeout_s: float | None) -> dict:
         """Await a reply from another event loop without blocking it."""
-        future = asyncio.run_coroutine_threadsafe(self.channel.request(body, timeout_s), self._loop)
-        return await asyncio.wrap_future(future)
+        return await self.channel.request(body, timeout_s)
 
     def notify(self, body: dict) -> None:
         """Send a one-way notification. Thread-safe; never blocks, even from the I/O thread itself.
 
         Raises `ChannelClosedError` once the channel has ended, or `TypeError` if `body` cannot
-        be encoded as JSON: both checked on the calling thread, before the write is scheduled,
-        so the caller sees them directly rather than only asyncio's default exception logging.
+        be encoded as JSON, both on the calling thread.
         """
-        encoded = self.channel._prepare_frame({"frame": "notification", "body": body})
-        self._loop.call_soon_threadsafe(self.channel._write_encoded, encoded)
+        self.channel.notify(body)
 
     def close(self) -> None:
         """End this side of the channel, which the peer observes as EOF. Idempotent."""
-        self._loop.call_soon_threadsafe(self.channel.close)
+        self.channel.close()
