@@ -396,11 +396,11 @@ class ArtifactManager(EngineScoped):
         """
         # Move ffmpeg's lock file and downloaded binaries out of `static_ffmpeg`'s own package
         # directory, which is read-only when the engine runs from a packaged app (notably the
-        # Linux AppImage's FUSE mount), and use ffmpeg on PATH before downloading it. Lives here rather than in engine boot because the video
-        # artifact provider is what depends on `static_ffmpeg`, and every process that can run
-        # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
-        # installed once; later broadcasts (and later engines)
-        # no-op. See utils/ffmpeg_cache.py.
+        # Linux AppImage's FUSE mount), and use ffmpeg on PATH before downloading it. Lives here
+        # rather than in engine boot because the video artifact provider is what depends on
+        # `static_ffmpeg`, and every process that can run nodes broadcasts
+        # AppInitializationComplete before executing them. Process-wide and installed once;
+        # later broadcasts (and later engines) no-op. See utils/ffmpeg_cache.py.
         install_ffmpeg_resolution(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
 
         # Register default providers (order matters: Image, Video, Audio)

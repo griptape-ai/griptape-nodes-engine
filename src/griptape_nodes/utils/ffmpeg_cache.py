@@ -1,8 +1,5 @@
 r"""Control where `static_ffmpeg` finds ffmpeg/ffprobe: PATH first, then a writable cache or download.
 
-Cache redirect
---------------
-
 `static_ffmpeg` resolves ffmpeg/ffprobe by writing next to its own installed package
 files, with no environment variable or public setter to move them:
 
@@ -29,8 +26,6 @@ boot (`artifact_manager` -> `VideoArtifactProvider`), so `sys.modules["static_ff
 is pinned to the engine's own copy and every node library that imports `static_ffmpeg`
 receives that same module object -- including libraries whose venvs live elsewhere.
 
-System ffmpeg
--------------
 `get_or_fetch_platform_executables_else_raise()` never looks at PATH: it downloads unless
 the cache holds a completed install. That breaks networks that block the download even
 when ffmpeg is installed system-wide. The same module-object pinning lets one replacement
@@ -162,9 +157,6 @@ def get_or_find_platform_executables(
     which it replaces. A caller that passes `download_dir` asked for that directory
     specifically, so it skips the PATH lookup.
 
-    Returns:
-        The ffmpeg and ffprobe executable paths. A tuple, because that is the contract of
-        the function this replaces.
     """
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
