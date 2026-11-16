@@ -416,7 +416,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             is_incoming: True if this is an incoming connection to the group
 
         Returns:
-            The newly created proxy parameter
+            A newly created proxy parameter for a data wire. For a control wire this is instead
+            self.control_in / self.control_out, the group's own pre-existing port -- every caller
+            must check for that (see the two call sites below) before treating the result as a
+            disposable proxy it owns a refcount on.
         """
         # A control wire crossing the boundary moves onto the group's own entry or exit port: the
         # executor enters the group through control_in and continues from control_out, so a separate
@@ -700,6 +703,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             target_node_name=old_connection.target_node.name,
             is_node_group_internal=is_incoming,
         )
+        # _create_proxy_parameter_for_connection returns the group's own control_in / control_out for
+        # a control wire, not a disposable proxy: a future caller that skips this check would count
+        # the port as a proxy below, and _cleanup_proxy_parameter would delete it off the node once
+        # the count it never really had hit zero.
         if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
             self._connect_control_wire_through_group(old_connection, is_incoming=is_incoming)
             return
@@ -1520,6 +1527,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             is_node_group_internal=is_incoming,
         )
 
+        # Same check as in create_connections_for_proxy above, and for the same reason: this proxy
+        # may actually be the group's own control_in / control_out, which must never be tracked
+        # as a disposable proxy below.
         if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
             self._connect_control_wire_through_group(old_connection, is_incoming=is_incoming)
             return
