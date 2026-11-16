@@ -18,17 +18,16 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
-    ReportGeneralPurposeWorkerReadyRequest,
-    ReportGeneralPurposeWorkerReadyResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from griptape_nodes.utils.version_utils import engine_version
+from griptape_nodes.worker.wire import WorkerHello
 
 _SESSION = "sess-abc"
 _WORKER = "eng-general"
-_WORKER_REQUEST_TOPIC = f"sessions/{_SESSION}/workers/{_WORKER}/request"
 
 
 def _worker_manager() -> WorkerManager:
@@ -41,9 +40,6 @@ def _worker_manager() -> WorkerManager:
     manager = WorkerManager(engine=engine, event_manager=MagicMock())
     manager.attach_transport(
         send_message=AsyncMock(),
-        subscribe_to_topic=AsyncMock(),
-        unsubscribe_from_topic=AsyncMock(),
-        request_client=MagicMock(fail_requests_by_tag=AsyncMock()),
     )
     manager._orchestrator_static_server_base_url = AsyncMock(return_value=None)  # type: ignore[method-assign]
     return manager
@@ -94,11 +90,10 @@ class TestSpawn:
         manager = _worker_manager()
         environment = cast("MagicMock", manager._engine).library_manager.environment
 
-        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as create:
-            await manager.spawn_worker(["gtn", "engine"], None)
+        worker_environ = await manager._base_worker_environ(None, None)
 
         environment.execution_site_packages.assert_not_called()
-        assert "PYTHONPATH" not in create.call_args.kwargs["env"]
+        assert "PYTHONPATH" not in worker_environ
 
     @pytest.mark.asyncio
     async def test_the_start_request_without_a_library_spawns_it(self) -> None:
@@ -113,7 +108,7 @@ class TestSpawn:
         manager._spawn_library_worker.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_start_task_and_the_exit_watcher_act_on_no_workflow(self) -> None:
+    async def test_the_start_task_and_the_forget_task_act_on_no_workflow(self) -> None:
         """They outlive the request that starts them, so they must not act on the workflow it was bound to."""
         manager = _worker_manager()
         seen: dict[str, object] = {}
@@ -121,31 +116,34 @@ class TestSpawn:
         async def spawn() -> None:
             seen["start"] = bound_workflow.get()
 
-        async def settle(_worker_key: str | None, _proc: object) -> None:
-            seen["watcher"] = bound_workflow.get()
+        async def forget(_worker_id: str) -> None:
+            seen["forget"] = bound_workflow.get()
 
         manager._spawn_general_purpose_worker = spawn  # type: ignore[method-assign]
-        manager._settle_when_worker_exits_early = settle  # type: ignore[method-assign]
+        manager._forget_local_worker = forget  # type: ignore[method-assign]
         token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
         try:
             await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
-            with patch("asyncio.create_subprocess_exec", return_value=_managed_proc()):
-                await manager.spawn_worker(["gtn", "engine"], None)
+            manager._start_forget_local_worker(_WORKER)
         finally:
             bound_workflow.reset(token)
         await asyncio.sleep(0)
 
-        assert seen == {"start": NO_WORKFLOW, "watcher": NO_WORKFLOW}
+        assert seen == {"start": NO_WORKFLOW, "forget": NO_WORKFLOW}
 
 
 class TestReadiness:
-    def test_the_ready_report_releases_its_gate(self) -> None:
+    @pytest.mark.asyncio
+    async def test_the_hello_releases_its_gate(self) -> None:
         manager = _worker_manager()
         manager.expect_worker(None)
+        manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
 
-        result = manager.handle_report_general_purpose_worker_ready_request(ReportGeneralPurposeWorkerReadyRequest())
+        reply = await manager._accept_hello(
+            _WORKER, WorkerHello(engine_version=engine_version, library_names=[], loaded=True, libraries=[])
+        )
 
-        assert isinstance(result, ReportGeneralPurposeWorkerReadyResultSuccess)
+        assert reply["accepted"] is True
         assert manager.has_settled(None)
         assert manager.worker_unavailable_reason(None) is None
 
@@ -162,33 +160,19 @@ class TestLifecycle:
     """A key of None is a worker like any other: it is terminated, and what waits on it is released."""
 
     @pytest.mark.asyncio
-    async def test_unregister_drops_its_process_and_releases_a_waiter(self) -> None:
-        manager = _worker_manager()
-        manager.expect_worker(None)
-        manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        manager._managed_worker_processes[None] = _managed_proc()
-
-        await manager.handle_unregister_worker_request(worker_events.UnregisterWorkerRequest(worker_engine_id=_WORKER))
-
-        assert None not in manager._managed_worker_processes
-        assert manager.has_settled(None)
-        assert manager.worker_unavailable_reason(None) is not None
-
-    @pytest.mark.asyncio
-    async def test_evict_terminates_its_process_and_records_why(self) -> None:
+    async def test_a_channel_ending_drops_its_process_and_releases_a_waiter(self) -> None:
         manager = _worker_manager()
         manager.expect_worker(None)
         proc = _managed_proc()
-        manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        manager._workers[_WORKER] = WorkerRegistration(worker_key=None, process=proc)
         manager._managed_worker_processes[None] = proc
 
-        await manager.evict_worker(_WORKER)
+        await manager._forget_local_worker(_WORKER)
 
         proc.terminate.assert_called_once()
         assert None not in manager._managed_worker_processes
-        reason = manager.worker_unavailable_reason(None)
-        assert reason is not None
-        assert "stopped responding" in reason
+        assert manager.has_settled(None)
+        assert manager.worker_unavailable_reason(None) is not None
 
     @pytest.mark.asyncio
     async def test_reset_terminates_it(self) -> None:
@@ -251,7 +235,7 @@ class TestStartRequestHandling:
         spawn = AsyncMock()
         manager._spawn_general_purpose_worker = spawn  # type: ignore[method-assign]
         if already == "registered":
-            manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+            manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
         if already == "requested":
             manager._requested_spawns[None] = asyncio.get_running_loop().create_future()  # type: ignore[assignment]
         if already == "running":
@@ -276,7 +260,7 @@ class TestStartRequestHandling:
         manager._spawn_general_purpose_worker = AsyncMock()  # type: ignore[method-assign]
         await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
         await asyncio.sleep(0)
-        manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
         manager._managed_worker_processes[None] = _managed_proc()
 
         await manager.reset_workers()
@@ -306,7 +290,7 @@ class TestRestartWhenLibrariesChange:
         cast("MagicMock", manager._engine).ahandle_request = AsyncMock(side_effect=handle)
         with patch("griptape_nodes.retained_mode.managers.library.workers.is_beta_enabled", return_value=True):
             await manager.workers._start_workers()
-        worker_manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._workers[_WORKER] = WorkerRegistration(worker_key=None)
         worker_manager._managed_worker_processes[None] = _managed_proc()
         worker_manager.note_library_loaded(None)
         cast("MagicMock", manager._engine).ahandle_request.reset_mock()
@@ -400,7 +384,7 @@ class TestRestartWhenLibrariesChange:
         with patch("griptape_nodes.retained_mode.managers.library.workers.is_beta_enabled", return_value=True):
             await manager.workers._start_workers()
         # The new worker is up before the change is looked at, so only its start count can say it is current.
-        worker_manager._workers["eng-new"] = WorkerRegistration(request_topic="sessions/x/new", worker_key=None)
+        worker_manager._workers["eng-new"] = WorkerRegistration(worker_key=None)
         worker_manager._managed_worker_processes[None] = _managed_proc()
         cast("MagicMock", manager._engine).ahandle_request.reset_mock()
 
@@ -489,4 +473,4 @@ class TestWorkerSideLoading:
 
         await manager.workers.report_general_purpose_worker_ready()
 
-        reporter.assert_awaited_once_with(ReportGeneralPurposeWorkerReadyRequest())
+        reporter.assert_awaited_once_with(worker_events.GeneralPurposeWorkerReady())

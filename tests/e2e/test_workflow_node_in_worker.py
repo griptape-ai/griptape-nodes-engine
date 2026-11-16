@@ -150,8 +150,8 @@ class _WorkflowNodeInWorkerBase:
     ) -> Callable[..., Awaitable[dict[str, Any]]]:
         """Wrap `simulated.route_to_worker` so each node result it returns is noted in `node_results`."""
 
-        async def route_to_worker(event_request: EventRequest, *worker_id: Any) -> dict[str, Any]:
-            raw = await simulated.route_to_worker(event_request, *worker_id)
+        async def route_to_worker(event_request: EventRequest, *worker_id: Any, **lease: Any) -> dict[str, Any]:
+            raw = await simulated.route_to_worker(event_request, *worker_id, **lease)
             result_type = (
                 ExecuteNodeResultSuccess
                 if raw["result_type"] == "ExecuteNodeResultSuccess"

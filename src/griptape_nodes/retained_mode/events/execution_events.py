@@ -803,9 +803,6 @@ class ExecuteNodeRequest(RequestPayload):
             worker's registry entry for the workflow answers. The worker builds its copy of the
             node in that workflow, so a request with no orchestrator_workflow_id fails rather than
             running without one.
-        lease_id: The lease, on the engine that runs the worker, that the node is sent under. A worker
-            another engine runs asks that engine whether the lease holds it before running the node,
-            and refuses a node sent under none. None for a worker on this machine.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -823,7 +820,6 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
-    lease_id: str | None = None
 
 
 @dataclass

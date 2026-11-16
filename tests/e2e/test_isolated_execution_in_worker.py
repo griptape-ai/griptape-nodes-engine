@@ -83,11 +83,13 @@ class _StandInWorker:
     worker: SimulatedWorker
     received: list[tuple[str, IsolatedExecutionScope | None]] = field(default_factory=list)
 
-    async def route_to_worker(self, event_request: EventRequest, *worker_id: Any) -> dict[str, Any]:
+    async def route_to_worker(
+        self, event_request: EventRequest, *worker_id: Any, lease_id: str | None = None
+    ) -> dict[str, Any]:
         """Record the node the orchestrator sends, with the scope it was sent in, and have the worker run it."""
         request = cast("ExecuteNodeRequest", event_request.request)
         self.received.append((request.node_name, current_isolated_execution_scope.get()))
-        return await self.worker.route_to_worker(event_request, *worker_id)
+        return await self.worker.route_to_worker(event_request, *worker_id, lease_id=lease_id)
 
     def start(self) -> None:
         """Register it as up, at the library count it would have loaded.
@@ -95,9 +97,7 @@ class _StandInWorker:
         Called once the test's libraries are registered: a real worker starts after the libraries
         load, and one registered before a library change is stale and gets restarted.
         """
-        self.engine.worker_manager._workers[_GENERAL_PURPOSE_WORKER] = WorkerRegistration(
-            request_topic=f"sessions/test/workers/{_GENERAL_PURPOSE_WORKER}/request", worker_key=None
-        )
+        self.engine.worker_manager._workers[_GENERAL_PURPOSE_WORKER] = WorkerRegistration(worker_key=None)
         workers = self.engine.library_manager.workers
         workers._general_purpose_worker_generation = workers._library_set_generation
 

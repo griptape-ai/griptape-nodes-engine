@@ -20,8 +20,6 @@ PROJECTS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.projects_t
 REQUIRES_ENGINE_KEY = "app_events.on_app_initialization_complete.requires_engine"
 PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
-WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
-WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
@@ -383,24 +381,6 @@ class AppEvents(BaseModel):
 
 
 class WorkerSettings(BaseModel):
-    heartbeat_interval_s: float = Field(
-        default=5.0,
-        description=(
-            "Interval in seconds between heartbeat challenges sent to a worker that runs on another "
-            "computer's engine. A worker this engine starts for itself is not challenged: the engine "
-            "knows the moment it stops."
-        ),
-    )
-    heartbeat_timeout_s: float = Field(
-        default=15.0,
-        description=(
-            "Seconds without a heartbeat response before a worker that runs on another computer's "
-            "engine is evicted. Such a worker also shuts itself down after this much orchestrator "
-            "silence, but never sooner than 30 seconds, so that an orchestrator too busy to challenge "
-            "is not mistaken for one that exited. Does not apply to a worker this engine starts for "
-            "itself."
-        ),
-    )
     library_load_timeout_s: float = Field(
         default=600.0,
         description=(
@@ -408,7 +388,7 @@ class WorkerSettings(BaseModel):
             "starts may take to connect to it, how long running a node waits for its library's "
             "worker to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
-            "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
+            "two minutes."
         ),
     )
     command_prefix: list[str] = Field(

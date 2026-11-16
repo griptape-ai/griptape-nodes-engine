@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.engine import reset_root_engine
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+from griptape_nodes.retained_mode.managers.worker_manager import ENGINE_REQUEST_TIMEOUT_S
 from griptape_nodes.utils.version_utils import engine_version
 from griptape_nodes.worker import runtime
 from griptape_nodes.worker.__main__ import main
@@ -224,6 +225,12 @@ def test_started_without_its_engine_the_entry_point_exits_non_zero(monkeypatch: 
         assert main(["--library-name", "Some Library"]) == 1
     finally:
         signal.signal(signal.SIGINT, sigint)
+
+
+def test_a_worker_waits_longer_than_its_parent_waits_on_another_engine() -> None:
+    """A parent running the worker for another engine answers by asking it, so the worker must outwait that."""
+    assert runtime.PARENT_REQUEST_TIMEOUT_S > ENGINE_REQUEST_TIMEOUT_S
+    assert runtime._HELLO_TIMEOUT_S > ENGINE_REQUEST_TIMEOUT_S
 
 
 def test_every_library_named_is_the_workers(mocker: Any) -> None:

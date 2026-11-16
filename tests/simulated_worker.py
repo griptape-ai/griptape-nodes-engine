@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
 
-_WORKER_ID = ("simulated-worker", "")
+_WORKER_ID = "simulated-worker"
 
 
 def through_the_wire[T](payload: T) -> T:
@@ -75,8 +75,17 @@ class SimulatedWorker:
     received: list[ExecuteNodeRequest] = field(default_factory=list)
     forwarded: list[RequestPayload] = field(default_factory=list)
 
-    async def route_to_worker(self, event_request: EventRequest, *_worker: Any) -> dict[str, Any]:
-        """Stands in for `WorkerManager.route_to_worker`, returning the raw result the worker's channel end replies with."""
+    async def route_to_worker(
+        self,
+        event_request: EventRequest,
+        *_worker: Any,
+        lease_id: str | None = None,  # noqa: ARG002
+    ) -> dict[str, Any]:
+        """Stands in for `WorkerManager.route_to_worker`, returning the raw result the worker's channel end replies with.
+
+        `lease_id` is accepted to match the real signature; this single-process stand-in has no engine
+        to check a lease against, so it is unused.
+        """
         sent = read_event_request(event_request_envelope(event_request))
         self.received.append(cast("ExecuteNodeRequest", sent.request))
         return await _in_own_context(answer_event_request(self.engine, sent))
@@ -106,7 +115,7 @@ class SimulatedWorker:
 def simulated_worker(orchestrator: Engine, library_name: str) -> Iterator[SimulatedWorker]:
     """Build a worker engine and route every node of `library_name` that `orchestrator` runs to it."""
 
-    def worker_for(name: str | None) -> tuple[str, str] | None:
+    def worker_for(name: str | None) -> str | None:
         if name == library_name:
             return _WORKER_ID
         return None
@@ -123,7 +132,7 @@ def simulated_worker(orchestrator: Engine, library_name: str) -> Iterator[Simula
 def host_libraries_on_simulated_worker(engine: Engine, monkeypatch: pytest.MonkeyPatch, *library_names: str) -> None:
     """Send every node of the named libraries to the simulated worker, until the monkeypatch is undone."""
 
-    def worker_for(name: str | None) -> tuple[str, str] | None:
+    def worker_for(name: str | None) -> str | None:
         if name in library_names:
             return _WORKER_ID
         return None

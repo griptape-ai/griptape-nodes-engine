@@ -498,7 +498,7 @@ class TestNodesAndFlowsOnTheRuntime:
         runtime = engine.current_workflow()
         tracked_while_running: list[str] = []
 
-        async def close_while_running(*_: object) -> dict:
+        async def close_while_running(*_args: object, **_kwargs: object) -> dict:
             tracked_while_running.extend(runtime.nodes.orch_worker_requests)
             engine.context_manager.pop_workflow()
             msg = "The worker went away."
@@ -507,7 +507,7 @@ class TestNodesAndFlowsOnTheRuntime:
         worker_manager = MagicMock()
         worker_manager.route_to_worker = AsyncMock(side_effect=close_while_running)
         result = await engine.node_manager._execute_node_via_worker(
-            runtime, ExecuteNodeRequest(node_name="node", parameter_values={}), worker_manager, ("worker", "topic")
+            runtime, ExecuteNodeRequest(node_name="node", parameter_values={}), worker_manager, "worker"
         )
 
         assert isinstance(result, ExecuteNodeResultFailure)

@@ -27,8 +27,6 @@ import pytest_asyncio
 from griptape_nodes.retained_mode.engine import Engine, WorkerProcess
 from griptape_nodes.retained_mode.events.app_events import (
     CurrentProjectChanged,
-    ReportGeneralPurposeWorkerReadyRequest,
-    ReportLibraryLoadedRequest,
 )
 from griptape_nodes.retained_mode.events.base_events import (
     AppEvent,
@@ -51,6 +49,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     GetSecretValueResultFailure,
     GetSecretValueResultSuccess,
 )
+from griptape_nodes.retained_mode.events.worker_events import GeneralPurposeWorkerReady, LibraryLoadReport
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -735,8 +734,8 @@ class TestAWorkersHelloCoversEveryLibrary:
     def test_one_library_not_loading_fails_the_hello_and_names_it(self) -> None:
         engine = MagicMock()
         engine.library_manager.get_library_info_by_library_name.return_value = None
-        reports: list[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest] = [
-            ReportLibraryLoadedRequest(library_name="First Library", fitness="GOOD")
+        reports: list[LibraryLoadReport | GeneralPurposeWorkerReady] = [
+            LibraryLoadReport(library_name="First Library", fitness="GOOD")
         ]
 
         hello = runtime_module._hello(engine, ["First Library", "Second Library"], reports)

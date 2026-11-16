@@ -37,22 +37,24 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Args:
             config_manager: Reports the current workspace directory.
             bucket_id: The ID of the bucket to use. Required.
-            api_key: The credential for authentication. If not provided, it is resolved through the engine's
-                secrets from the Griptape Nodes License, then "GT_CLOUD_API_KEY".
+            api_key: The credential for authentication. If not provided, it is resolved from the Griptape Nodes License, then "GT_CLOUD_API_KEY".
             static_files_directory: The directory path prefix for static files. If provided, file names will be prefixed with this path.
             **kwargs: Additional keyword arguments including base_url and headers.
         """
         super().__init__(config_manager)
 
         self.base_url = kwargs.get("base_url") or resolve_cloud_base_url()
-        # Through the secrets manager, never the bare environment: a library's worker process is
-        # started without the license and API key, and reads them from the engine it works for.
-        self.api_key = (
-            api_key if api_key is not None else resolve_cloud_credential(config_manager.engine.secrets_manager)
-        )
-        self.headers = kwargs.get("headers") or {"Authorization": f"Bearer {self.api_key}"}
+        self.api_key = api_key if api_key is not None else resolve_cloud_credential()
+        self._headers: dict[str, str] | None = kwargs.get("headers")
         self.request_timeout = kwargs.get("request_timeout")
         self.bucket_id = bucket_id
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """The headers the next request sends: the ones given, else ones carrying the current `api_key`."""
+        if self._headers is not None:
+            return self._headers
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     @retry_on_transient_error
     def _request(self, method: str, url: str, **kwargs) -> httpx2.Response:

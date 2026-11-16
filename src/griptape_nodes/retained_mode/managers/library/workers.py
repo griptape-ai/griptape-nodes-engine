@@ -13,12 +13,10 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppSessionStartedEvent,
     LibraryLoadedNotification,
-    ReportGeneralPurposeWorkerReadyRequest,
-    ReportLibraryLoadedRequest,
     ReportLibraryLoadedResultFailure,
     ReportLibraryLoadedResultSuccess,
 )
-from griptape_nodes.retained_mode.events.worker_events import StartWorkerRequest
+from griptape_nodes.retained_mode.events.worker_events import GeneralPurposeWorkerReady, StartWorkerRequest
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DependencyInstallationFailedProblem,
     IncompatibleRequirementsProblem,
@@ -28,7 +26,6 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
     LibraryRegistration,
 )
-from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.utils.library_utils import extract_library_path
 
@@ -39,6 +36,7 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.library_registry import LibraryMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.events.worker_events import LibraryLoadReport
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
@@ -59,9 +57,7 @@ class LibraryWorkers(EngineScoped):
     # How a worker reaches the orchestrator to report a load. Registered by whatever owns the
     # transport, because this manager has no way to send a request to another process. Stays None
     # on the orchestrator and on a single-process engine, where there is nobody to report to.
-    _library_load_reporter: (
-        Callable[[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest], Awaitable[None]] | None
-    ) = None
+    _library_load_reporter: Callable[[LibraryLoadReport | GeneralPurposeWorkerReady], Awaitable[None]] | None = None
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -75,7 +71,7 @@ class LibraryWorkers(EngineScoped):
 
     def register_library_load_reporter(
         self,
-        reporter: Callable[[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest], Awaitable[None]],
+        reporter: Callable[[LibraryLoadReport | GeneralPurposeWorkerReady], Awaitable[None]],
     ) -> None:
         """Register how this worker reports a library load to the orchestrator.
 
@@ -86,16 +82,16 @@ class LibraryWorkers(EngineScoped):
         """
         self._library_load_reporter = reporter
 
-    async def report_library_loaded(self, request: ReportLibraryLoadedRequest) -> None:
+    async def report_library_loaded(self, report: LibraryLoadReport) -> None:
         """Tell the orchestrator how a library loaded here, or say why it never heard."""
         if self._library_load_reporter is None:
             logger.error(
                 "No load reporter is registered, so the orchestrator will not learn that library "
                 "'%s' loaded here and will wait out its startup grace before giving up on it.",
-                request.library_name,
+                report.library_name,
             )
             return
-        await self._library_load_reporter(request)
+        await self._library_load_reporter(report)
 
     async def report_general_purpose_worker_ready(self) -> None:
         """Tell the orchestrator this general-purpose worker has loaded its libraries."""
@@ -105,10 +101,9 @@ class LibraryWorkers(EngineScoped):
                 "general-purpose worker is ready and will wait out its startup grace before giving up on it."
             )
             return
-        await self._library_load_reporter(ReportGeneralPurposeWorkerReadyRequest())
+        await self._library_load_reporter(GeneralPurposeWorkerReady())
 
-    @handles(ReportLibraryLoadedRequest)
-    async def on_report_library_loaded_request(self, request: ReportLibraryLoadedRequest) -> ResultPayload:
+    async def on_report_library_loaded_request(self, report: LibraryLoadReport) -> ResultPayload:
         """Note that a library loaded in the worker that executes its nodes.
 
         The report does not displace the orchestrator's own fitness verdict, which came from
@@ -120,29 +115,29 @@ class LibraryWorkers(EngineScoped):
         listener, so the GUI hears about a worker's library from the orchestrator accepting the
         report rather than from a relayed event.
         """
-        library_info = self.engine.library_manager.get_library_info_by_library_name(request.library_name)
+        library_info = self.engine.library_manager.get_library_info_by_library_name(report.library_name)
         if library_info is None:
-            details = f"Received a library load report for unknown library '{request.library_name}'."
+            details = f"Received a library load report for unknown library '{report.library_name}'."
             return ReportLibraryLoadedResultFailure(result_details=details)
-        if request.problem_details:
+        if report.problem_details:
             logger.warning(
                 "Worker reported problems loading library '%s': %s",
-                request.library_name,
-                request.problem_details,
+                report.library_name,
+                report.problem_details,
             )
         # Whoever is waiting to route execution here is waiting on WorkerManager, which owns
         # whether a process is available; this is only the news that it loaded.
-        self.engine.library_manager._worker_manager.note_library_loaded(request.library_name)
+        self.engine.library_manager._worker_manager.note_library_loaded(report.library_name)
         await self.engine.abroadcast_app_event(
             LibraryLoadedNotification(
-                library_name=request.library_name,
-                fitness=request.fitness,
-                problem_details=request.problem_details,
+                library_name=report.library_name,
+                fitness=report.fitness,
+                problem_details=report.problem_details,
             )
         )
         return ReportLibraryLoadedResultSuccess(
             result_details=(
-                f"Noted the worker's load of library '{request.library_name}' as {request.fitness}; "
+                f"Noted the worker's load of library '{report.library_name}' as {report.fitness}; "
                 f"the orchestrator keeps its own fitness verdict."
             )
         )
@@ -213,8 +208,8 @@ class LibraryWorkers(EngineScoped):
             return None
         return None
 
-    def get_worker_for_library(self, library_name: str | None) -> tuple[str, str] | None:
-        """Return (worker_engine_id, worker_request_topic) for the worker serving library_name, or None.
+    def get_worker_for_library(self, library_name: str | None) -> str | None:
+        """Return the engine ID of the worker serving library_name, or None.
 
         Raises RuntimeError if the library requires a dedicated worker but none is registered yet.
         Returns None if no worker is registered and none is required.
