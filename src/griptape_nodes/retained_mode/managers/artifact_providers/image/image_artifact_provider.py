@@ -12,6 +12,7 @@ from PIL import Image, ImageOps
 from griptape_nodes.drivers.image_metadata.image_metadata_driver_registry import (
     ImageMetadataDriverRegistry,
 )
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import collect_workflow_metadata
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
@@ -38,6 +39,14 @@ class ImageArtifactMetadata(BaseArtifactMetadata):
     channels: int
     color_space: str
     file_size: int
+
+    def to_media_info(self) -> MediaInfo:
+        return MediaInfo(
+            width=self.width,
+            height=self.height,
+            channels=self.channels,
+            color_space=self.color_space,
+        )
 
 
 class ImageArtifactProvider(BaseArtifactProvider):

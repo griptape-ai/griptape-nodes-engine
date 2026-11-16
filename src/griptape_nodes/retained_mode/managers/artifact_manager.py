@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
@@ -89,6 +90,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseGeneratorParameters,
     ImageArtifactProvider,
     ProviderRegistry,
+    StagedWriteInspection,
     VideoArtifactProvider,
     WriteVettingPolicy,
 )
@@ -271,6 +273,29 @@ class ArtifactManager(EngineScoped):
         if provider is None:
             return None
         return provider.check_write_format_from_bytes(data, detected_format)
+
+    def get_media_info(self, source_path: str, detected_format: str) -> MediaInfo:
+        """Read the media properties save-path macros use from the file at ``source_path``.
+
+        Uses the format's provider. Returns an empty ``MediaInfo`` when no provider handles the
+        format or it could not read the file. Runs on the calling thread, and video providers run
+        ffprobe.
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return MediaInfo()
+        return provider.get_media_info(source_path)
+
+    def inspect_staged_write(self, source_path: str, detected_format: str) -> StagedWriteInspection:
+        """Route a from-path vet that also reads media properties through the format's provider.
+
+        Called by OSManager instead of ``check_write_format_from_path`` when the path template
+        uses ``media.*`` values, so the provider can read the staged file once for both.
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return StagedWriteInspection()
+        return provider.inspect_staged_write(source_path, detected_format)
 
     def check_write_format_from_path(
         self,

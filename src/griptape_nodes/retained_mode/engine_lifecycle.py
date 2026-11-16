@@ -101,9 +101,7 @@ class EngineLifecycle:
         library_manager = engine.library_manager
         await library_manager.load_libraries_for_startup(payload)
 
-        # When the orchestrator restarts into an already-active session, the GUI will not
-        # send AppStartSessionRequest again, so workers must be started here.
-        await library_manager.workers.maybe_start_workers_for_existing_session()
+        await library_manager.workers.start_workers_after_loading()
 
         # Register all secrets now that libraries are loaded and settings are merged
         engine.secrets_manager.register_all_secrets()

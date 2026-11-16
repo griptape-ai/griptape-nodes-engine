@@ -18,8 +18,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     InitializationPhase,
     InitializationStatus,
     LibraryLoadStatus,
-    ReportGeneralPurposeWorkerReadyRequest,
-    ReportLibraryLoadedRequest,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
@@ -82,6 +80,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import Payload, RequestPayload, ResultPayload
+    from griptape_nodes.retained_mode.events.worker_events import GeneralPurposeWorkerReady, LibraryLoadReport
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 
@@ -349,7 +348,7 @@ class LibraryManager(EngineScoped):
 
     def register_library_load_reporter(
         self,
-        reporter: Callable[[ReportLibraryLoadedRequest | ReportGeneralPurposeWorkerReadyRequest], Awaitable[None]],
+        reporter: Callable[[LibraryLoadReport | GeneralPurposeWorkerReady], Awaitable[None]],
     ) -> None:
         """Kept for the app that calls it. See `LibraryWorkers.register_library_load_reporter`."""
         self.workers.register_library_load_reporter(reporter)
@@ -606,7 +605,7 @@ class LibraryManager(EngineScoped):
                 self._libraries_loading_complete.set()
 
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
-        await self.workers.maybe_start_workers_for_existing_session()
+        await self.workers.start_workers_after_loading()
 
         # Signal readiness again so the app re-renders the library status table against the
         # reloaded set. is_initial_start=False so the app refreshes the table without

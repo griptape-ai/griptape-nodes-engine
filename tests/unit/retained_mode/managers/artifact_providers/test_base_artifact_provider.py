@@ -10,10 +10,12 @@ loudly instead of silently consuming an empty sentinel value.
 
 import pytest
 
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
     BaseArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
 
 class _NonPreviewProvider(BaseArtifactProvider):
@@ -79,3 +81,46 @@ class TestBaseProviderPermissionDefaults:
     def test_check_read_permission_default_allows(self) -> None:
         provider = _NonPreviewProvider(registry=None)  # type: ignore[arg-type]
         assert provider.check_read_permission("/some/path.bin") is None
+
+
+class _SizedMetadata(BaseArtifactMetadata):
+    width: int
+
+    def to_media_info(self) -> MediaInfo:
+        return MediaInfo(width=self.width)
+
+
+class _VettingProvider(_NonPreviewProvider):
+    """Vets from a path and has metadata, so the default ``inspect_staged_write`` has both to combine."""
+
+    denial: CheckpointDenial | None = None
+    metadata_reads = 0
+
+    def check_write_format_from_path(self, source_path: str, detected_format: str) -> CheckpointDenial | None:  # noqa: ARG002
+        return self.denial
+
+    @classmethod
+    def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+        cls.metadata_reads += 1
+        return _SizedMetadata(width=7)
+
+
+class TestInspectStagedWriteDefault:
+    def test_an_allowed_write_returns_the_media_info(self) -> None:
+        provider = _VettingProvider(registry=None)  # type: ignore[arg-type]
+
+        inspection = provider.inspect_staged_write("/some/path.bin", "bin")
+
+        assert inspection.denial is None
+        assert inspection.media_info == MediaInfo(width=7)
+
+    def test_a_refused_write_skips_the_metadata_read(self) -> None:
+        provider = _VettingProvider(registry=None)  # type: ignore[arg-type]
+        provider.denial = CheckpointDenial(failures=(CheckpointFailure(detail="not allowed"),))
+        _VettingProvider.metadata_reads = 0
+
+        inspection = provider.inspect_staged_write("/some/path.bin", "bin")
+
+        assert inspection.denial is provider.denial
+        assert inspection.media_info == MediaInfo()
+        assert _VettingProvider.metadata_reads == 0

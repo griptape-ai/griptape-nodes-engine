@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.111.0"
+version = "0.112.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.16"
@@ -103,6 +103,7 @@ core = "sysmon"
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 pythonpath = ["libraries/griptape_nodes_library"]
+markers = ["worker_processes: the test starts real library worker processes (see tests/worker_processes.py)"]
 
 [tool.ruff]
 line-length = 120
