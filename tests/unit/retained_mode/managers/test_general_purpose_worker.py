@@ -71,25 +71,21 @@ def _library_manager() -> LibraryManager:
 
 class TestSpawn:
     @pytest.mark.asyncio
+    @pytest.mark.worker_processes
     async def test_starts_without_a_library_or_the_command_prefix(self) -> None:
         """The prefix prepares an environment for one library, and this worker serves none."""
         manager = _worker_manager()
         resolve = MagicMock()
 
+        manager._await_worker_connection = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
         with (
             patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as create,
             patch("griptape_nodes.retained_mode.managers.worker_manager.resolve_worker_command", resolve),
         ):
-            await manager._spawn_general_purpose_worker_when_session_ready()
+            await manager._spawn_general_purpose_worker()
 
-        assert list(create.call_args.args) == [
-            sys.executable,
-            "-m",
-            "griptape_nodes_app",
-            "engine",
-            "--session-id",
-            _SESSION,
-        ]
+        assert list(create.call_args.args) == [sys.executable, "-m", "griptape_nodes.worker"]
         resolve.assert_not_called()
         assert None in manager._managed_worker_processes
 
@@ -107,14 +103,14 @@ class TestSpawn:
     @pytest.mark.asyncio
     async def test_the_start_request_without_a_library_spawns_it(self) -> None:
         manager = _worker_manager()
-        manager._spawn_general_purpose_worker_when_session_ready = AsyncMock()  # type: ignore[method-assign]
-        manager._spawn_when_session_ready = AsyncMock()  # type: ignore[method-assign]
+        manager._spawn_general_purpose_worker = AsyncMock()  # type: ignore[method-assign]
+        manager._spawn_library_worker = AsyncMock()  # type: ignore[method-assign]
 
         await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
         await asyncio.sleep(0)
 
-        manager._spawn_general_purpose_worker_when_session_ready.assert_awaited_once()
-        manager._spawn_when_session_ready.assert_not_awaited()
+        manager._spawn_general_purpose_worker.assert_awaited_once()
+        manager._spawn_library_worker.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_the_start_task_and_the_exit_watcher_act_on_no_workflow(self) -> None:
@@ -128,7 +124,7 @@ class TestSpawn:
         async def settle(_worker_key: str | None, _proc: object) -> None:
             seen["watcher"] = bound_workflow.get()
 
-        manager._spawn_general_purpose_worker_when_session_ready = spawn  # type: ignore[method-assign]
+        manager._spawn_general_purpose_worker = spawn  # type: ignore[method-assign]
         manager._settle_when_worker_exits_early = settle  # type: ignore[method-assign]
         token = bound_workflow.set(WorkflowRuntime("the-requests-workflow", MagicMock()))
         try:
@@ -240,7 +236,7 @@ class TestStartRequestHandling:
     @pytest.mark.asyncio
     async def test_a_request_declares_it_coming(self) -> None:
         manager = _worker_manager()
-        manager._spawn_general_purpose_worker_when_session_ready = AsyncMock()  # type: ignore[method-assign]
+        manager._spawn_general_purpose_worker = AsyncMock()  # type: ignore[method-assign]
 
         await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
 
@@ -253,7 +249,7 @@ class TestStartRequestHandling:
         """Declaring it again would reset the gate a run may already be waiting on."""
         manager = _worker_manager()
         spawn = AsyncMock()
-        manager._spawn_general_purpose_worker_when_session_ready = spawn  # type: ignore[method-assign]
+        manager._spawn_general_purpose_worker = spawn  # type: ignore[method-assign]
         if already == "registered":
             manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
         if already == "requested":
@@ -277,7 +273,7 @@ class TestStartRequestHandling:
         the rest of the session.
         """
         manager = _worker_manager()
-        manager._spawn_general_purpose_worker_when_session_ready = AsyncMock()  # type: ignore[method-assign]
+        manager._spawn_general_purpose_worker = AsyncMock()  # type: ignore[method-assign]
         await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
         await asyncio.sleep(0)
         manager._workers[_WORKER] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
@@ -285,11 +281,11 @@ class TestStartRequestHandling:
 
         await manager.reset_workers()
         assert not manager.has_settled(None), "the premise: a reload leaves this gate unsettled"
-        manager._spawn_general_purpose_worker_when_session_ready.reset_mock()
+        manager._spawn_general_purpose_worker.reset_mock()
         await manager.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=None))
         await asyncio.sleep(0)
 
-        manager._spawn_general_purpose_worker_when_session_ready.assert_awaited_once()
+        manager._spawn_general_purpose_worker.assert_awaited_once()
 
 
 class TestRestartWhenLibrariesChange:
@@ -300,7 +296,7 @@ class TestRestartWhenLibrariesChange:
         worker_manager = _worker_manager()
         manager._worker_manager = worker_manager
         # Start requests reach the real handler, which declares the worker coming; only the process is stubbed.
-        worker_manager._spawn_general_purpose_worker_when_session_ready = AsyncMock()  # type: ignore[method-assign]
+        worker_manager._spawn_general_purpose_worker = AsyncMock()  # type: ignore[method-assign]
 
         async def handle(request: Any) -> Any:
             if isinstance(request, worker_events.StartWorkerRequest):

@@ -9,6 +9,13 @@ import pytest
 from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
 
 
+def _secrets_from_environ() -> Mock:
+    """A secrets manager that answers from the process environment, as an engine's does with no .env files."""
+    secrets_manager = Mock()
+    secrets_manager.get_secret.side_effect = lambda name, should_error_on_not_found=True: os.environ.get(name)  # noqa: ARG005
+    return secrets_manager
+
+
 class TestGriptapeCloudFileDriver:
     """Tests for GriptapeCloudFileDriver class."""
 
@@ -44,7 +51,7 @@ class TestGriptapeCloudFileDriver:
             {"GT_CLOUD_BUCKET_ID": "env-bucket", "GT_CLOUD_API_KEY": "env-key", "GT_CLOUD_BASE_URL": "https://test.ai"},
             clear=True,
         ):
-            driver = GriptapeCloudFileDriver.create_from_env()
+            driver = GriptapeCloudFileDriver.create_from_env(_secrets_from_environ())
             assert driver is not None
             assert driver.bucket_id == "env-bucket"
             assert driver.api_key == "env-key"
@@ -53,13 +60,13 @@ class TestGriptapeCloudFileDriver:
     def test_create_from_env_without_credentials(self) -> None:
         """Test creating driver from env returns None when credentials missing."""
         with patch.dict(os.environ, {}, clear=True):
-            driver = GriptapeCloudFileDriver.create_from_env()
+            driver = GriptapeCloudFileDriver.create_from_env(_secrets_from_environ())
             assert driver is None
 
     def test_create_from_env_default_base_url(self) -> None:
         """Test creating driver uses default base URL when not provided."""
         with patch.dict(os.environ, {"GT_CLOUD_BUCKET_ID": "bucket", "GT_CLOUD_API_KEY": "key"}, clear=True):
-            driver = GriptapeCloudFileDriver.create_from_env()
+            driver = GriptapeCloudFileDriver.create_from_env(_secrets_from_environ())
             assert driver is not None
             assert driver.base_url == "https://cloud.griptape.ai"
 

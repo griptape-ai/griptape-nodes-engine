@@ -261,9 +261,9 @@ class LibraryWorkers(EngineScoped):
         """Spawn workers for all libraries that require one now that a session is active.
 
         Two cases:
-        1. Fresh start: libraries finished loading before a session existed, so their
-           worker spawns were blocked on _session_ready_event. WorkerManager.set_session_ready()
-           unblocks them, but _start_workers() catches any that slipped through.
+        1. Fresh start: a library run by another engine waits for a session before its worker is
+           asked for there. WorkerManager.set_session_ready() unblocks it, but _start_workers()
+           catches any that slipped through.
         2. Session restart: workers were terminated by AppEndSession and need to be
            re-spawned now that a new session is available.
         """
@@ -271,20 +271,21 @@ class LibraryWorkers(EngineScoped):
             return
         await self._start_workers()
 
-    async def maybe_start_workers_for_existing_session(self) -> None:
-        """Start workers if the orchestrator restarted into an already-active session.
+    async def start_workers_after_loading(self) -> None:
+        """Start the workers the loaded libraries need, at the end of startup or of a reload.
 
-        In a normal fresh start the GUI sends AppStartSessionRequest which triggers worker
-        spawning via on_session_started. When the engine restarts mid-session the GUI does
-        not send that request, so this method handles the case at the end of library
-        initialization.
+        Workers this engine runs for itself start at once, with or without a session. A session
+        already active also releases starts that wait for one, which a library run by another engine
+        needs: when the engine restarts mid-session the GUI does not send AppStartSessionRequest again.
         """
-        if self.engine.library_manager.is_worker or not self.engine.get_session_id():
+        if self.engine.library_manager.is_worker:
             return
         worker_manager = self.engine.library_manager._worker_manager
-        if worker_manager is not None:
+        if worker_manager is None:
+            return
+        if self.engine.get_session_id():
             worker_manager.set_session_ready()
-            await self._start_workers()
+        await self._start_workers()
 
     async def stop_worker_for_library(self, library_name: str) -> None:
         """Stop the worker for one library, including one whose spawn is still under way."""
@@ -294,18 +295,16 @@ class LibraryWorkers(EngineScoped):
         """Start the worker for one library, if it executes in one, leaving every other library alone.
 
         Called as the library finishes registering, so its worker need not wait for every other
-        library to load. Without an active session nothing starts here: `on_session_started` starts
-        it with the rest.
+        library to load.
         """
-        if self.engine.library_manager.is_worker or not self.engine.get_session_id():
+        if self.engine.library_manager.is_worker:
             return
         await self._start_workers(only_library_name=library_name)
 
     async def _start_workers(self, only_library_name: str | None = None) -> None:
         """Issue StartWorkerRequest for every library whose nodes execute in a worker.
 
-        Asks WorkerManager to spawn a subprocess. Used on session start (both initial and
-        subsequent) so that worker creation is always tied to an active session.
+        Asks WorkerManager to spawn a subprocess. Used once libraries load and on session start.
 
         Args:
             only_library_name: Consider only this library, for a caller starting one library's worker.

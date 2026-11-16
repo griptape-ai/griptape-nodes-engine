@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, C
 from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileRequest
 from griptape_nodes.retained_mode.managers import config_manager as config_manager_module
 from griptape_nodes.retained_mode.managers import secrets_manager as secrets_manager_module
+from tests.worker_processes import no_local_worker_processes  # noqa: F401 (an autouse fixture)
 
 
 @pytest.fixture(autouse=True)
