@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from queue import Queue
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,9 @@ class WorkflowFlows:
         self.driving = False
         # True while cancel_all_runs_in awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self.cancelling_all = False
+        # Held while the run in progress is marked with how it ends and its flow is stopped, so a second
+        # stop (a Cancel during a failed step's teardown) waits and then sees the state the first left.
+        self.stopping_run = asyncio.Lock()
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event about a run here, naming the workflow it belongs to, or none."""

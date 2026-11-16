@@ -2126,10 +2126,15 @@ class FlowManager(EngineScoped):
             with self._continuing_run_in_progress(workflow.flows):
                 await self.single_execution_step(workflow, flow, change_debug_mode)
         except Exception as e:
+            flows = workflow.flows
+            run = flows.run_in_progress
             # We REALLY don't want to fail here, else we'll take the whole engine down
             try:
-                if self._flow_is_running(workflow.flows):
-                    await self._cancel_run(workflow.flows)
+                if run is not None and run.state is RunState.PAUSED:
+                    # The step failed, so its run ends failed, not as its teardown would read.
+                    await self._stop_run_in_progress(flows, run, RunState.FAILED)
+                elif self._flow_is_running(flows):
+                    await self._cancel_run(flows)
             except Exception as e_inner:
                 details = f"Could not cancel flow execution. Exception: {e_inner}"
 
@@ -2457,10 +2462,7 @@ class FlowManager(EngineScoped):
         run = flows.run_in_progress
         if run is None or run.run_id != run_id:
             return False
-        run.state = RunState.CANCELLED
-        # A run whose flow has not started stops itself before starting it.
-        if self._flow_is_running(flows):
-            await self._cancel_run(flows)
+        await self._stop_run_in_progress(flows, run, RunState.CANCELLED)
         return True
 
     async def cancel_all_runs_in(self, workflow: WorkflowRuntime) -> None:
@@ -2468,16 +2470,48 @@ class FlowManager(EngineScoped):
         flows = workflow.flows
         # The waiting runs go first: cancelling the run in progress would otherwise start the next one.
         self._turn_away(flows, flows.run_queue.snapshot(), "it was cancelled.")
-        if flows.run_in_progress is not None:
-            flows.run_in_progress.state = RunState.CANCELLED
         flows.cancelling_all = True
         try:
-            if self._flow_is_running(flows):
+            run = flows.run_in_progress
+            if run is not None:
+                await self._stop_run_in_progress(flows, run, RunState.CANCELLED)
+            elif self._flow_is_running(flows):
+                # A flow running outside any run still stops.
                 await self._cancel_run(flows)
         finally:
             flows.cancelling_all = False
         # Runs submitted while the cancel awaited were held, so they go too.
         self._turn_away(flows, flows.run_queue.snapshot(), "it was cancelled.")
+
+    async def _stop_run_in_progress(self, flows: WorkflowFlows, run: Run, mark: RunState) -> None:
+        """Mark `run`, the run in progress in `flows`, with how it ends (CANCELLED or FAILED), then stop its flow.
+
+        The mark goes on first: a run whose flow hasn't started stops itself when it sees CANCELLED,
+        and the driver won't record a marked run as finished. If stopping the flow fails, the run goes
+        on, so it loses the mark.
+
+        Stops are one at a time, so a second one waits for the first and starts from the state it left:
+        the run back as it was if the first failed, or no longer in progress if it succeeded.
+        """
+        async with flows.stopping_run:
+            if flows.run_in_progress is not run:
+                return
+            previous_state = run.state
+            run.state = mark
+            if not self._flow_is_running(flows):
+                return
+            try:
+                await self._cancel_run(flows)
+            except BaseException:
+                # A run that ended while its flow was being stopped keeps the state its driver left it in.
+                # One still in progress goes back to what it was, except that a running one whose request
+                # returned meanwhile is now paused.
+                if flows.run_in_progress is run:
+                    if previous_state is RunState.RUNNING and run.outcome.done():
+                        run.state = RunState.PAUSED
+                    else:
+                        run.state = previous_state
+                raise
 
     def current_run(self) -> Run | None:
         """The run in progress, if the code executing now belongs to it, or None."""
@@ -2579,6 +2613,7 @@ class FlowManager(EngineScoped):
             result = await run.spec.execute(self.engine)
         except asyncio.CancelledError:
             run.outcome.cancel()
+            run.state = RunState.CANCELLED
             flows.driving = False
             self._finish_run(run)
             raise
@@ -2592,7 +2627,9 @@ class FlowManager(EngineScoped):
         run.outcome.set_result(self._of_run(result, run.run_id))
         flows.driving = False
         if self._flow_is_running(flows):
-            run.state = RunState.PAUSED
+            # A stop in progress keeps its mark; one that then fails restores the pause.
+            if run.state is RunState.RUNNING:
+                run.state = RunState.PAUSED
             return
         if run.state is RunState.RUNNING:
             if result.succeeded():
@@ -2614,8 +2651,23 @@ class FlowManager(EngineScoped):
         if run is None or flows.driving or self._run_is_advancing(flows) or self._flow_is_running(flows):
             return
         if run.state is RunState.PAUSED:
-            run.state = RunState.FINISHED
+            # A paused run's state stays PAUSED through the steps and continues that finish it, so how it
+            # ended comes from the machine: a node that raised means it failed. A run cancelled, or whose
+            # step failed, keeps that mark once its flow is torn down; if the teardown failed, it was put
+            # back to PAUSED and ends here as its flow does.
+            if self._paused_run_failed(flows):
+                run.state = RunState.FAILED
+            else:
+                run.state = RunState.FINISHED
         self._finish_run(run)
+
+    @staticmethod
+    def _paused_run_failed(flows: WorkflowFlows) -> bool:
+        """True if the paused run's flow in `flows` stopped because a node failed after a step or continue."""
+        machine = flows.global_control_flow_machine
+        if machine is None:
+            return False
+        return machine.resolution_machine.is_errored()
 
     def _finish_run(self, run: Run) -> None:
         """End `run`, the run in progress in its workflow, and start that workflow's next. The only place a run ends."""
@@ -2734,9 +2786,15 @@ class FlowManager(EngineScoped):
             # Read before the reset below clears the run's start time.
             run_seconds = machine.context.seconds_since_run_started()
 
-        # Reset control flow machine
-        if flows.global_control_flow_machine is not None:
-            flows.global_control_flow_machine.reset_machine(cancel=True)
+        # The run may have ended while its nodes were stopping, and the next run started on a machine
+        # of its own. The shared DAG builder, the single-node flag and the editor's involved nodes are
+        # that run's now, and the editor reads a cancelled event as that run stopping, so a cancel
+        # whose machine has been replaced leaves all of it alone.
+        if machine is not flows.global_control_flow_machine:
+            logger.debug("Flow run ended before its cancel finished; leaving the next run's state alone")
+            return
+        if machine is not None:
+            machine.reset_machine(cancel=True)
         flows.global_single_node_resolution = False
         flows.global_dag_builder.clear()
         logger.debug("Cancelling flow run")
@@ -2805,7 +2863,11 @@ class FlowManager(EngineScoped):
         self._connections.connections.clear()
         self._connections.outgoing_index.clear()
         self._connections.incoming_index.clear()
-        self._finish_run_if_over(self._current_flows())
+        flows = self._current_flows()
+        # The workflow is being torn down, so a run still in progress, one whose cancel failed, ends cancelled.
+        if flows.run_in_progress is not None:
+            flows.run_in_progress.state = RunState.CANCELLED
+        self._finish_run_if_over(flows)
 
         logger.debug("Reset global execution state")
 
