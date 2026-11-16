@@ -23,7 +23,11 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.app.worker_routing import register_broadcast_handlers, register_remote_handlers
+from griptape_nodes.app.worker_routing import (
+    WorkerSettleError,
+    register_broadcast_handlers,
+    register_remote_handlers,
+)
 from griptape_nodes.common.node_executor import current_executing_node_name
 from griptape_nodes.retained_mode.engine import WorkerProcess, build_root_engine
 from griptape_nodes.retained_mode.events import converters
@@ -89,14 +93,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# How long the worker waits for its parent to answer anything: a request, a checkpoint, a secret, or
-# its hello. A parent that runs the worker for another engine answers by asking that engine, which it
+# How long a worker its parent has accepted waits for the parent to answer a request, a checkpoint, or
+# a secret. A parent that runs the worker for another engine answers by asking that engine, which it
 # waits ENGINE_REQUEST_TIMEOUT_S for, so the worker waits longer and never gives up on a late answer.
 PARENT_REQUEST_TIMEOUT_S = ENGINE_REQUEST_TIMEOUT_S + 30.0
-_HELLO_TIMEOUT_S = PARENT_REQUEST_TIMEOUT_S
-
-# How long the worker waits for the project its parent sends as soon as it connects.
-_PROJECT_SETTLE_TIMEOUT_S = 30.0
 
 # Longest log message sent on to the editor, as the editor's own engine log handler cuts it.
 _LOG_MESSAGE_MAX_LENGTH = 500
@@ -127,6 +127,9 @@ class WorkerSide:
         self._on_parent_gone = on_parent_gone
         self._engine: Engine | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # No bound until the parent accepts this worker: an open channel is what says the parent is
+        # alive, and a parent can be busy for longer than any bound while the worker starts.
+        self._parent_timeout_s: float | None = None
         # Held until `arm`, which comes once the engine can handle them: the parent sends the project
         # as soon as the worker connects, and the worker reads secrets over the channel while its
         # engine is still being built.
@@ -139,6 +142,15 @@ class WorkerSide:
     @property
     def link(self) -> WorkerLink:
         return self._link
+
+    @property
+    def parent_timeout_s(self) -> float | None:
+        """How long this worker waits for its parent to answer, or None while it is still starting."""
+        return self._parent_timeout_s
+
+    def begin_serving(self) -> None:
+        """Bound every later wait on the parent. Call once the parent has accepted this worker."""
+        self._parent_timeout_s = PARENT_REQUEST_TIMEOUT_S
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start the channel. `loop` is the engine loop this worker handles its parent's requests on."""
@@ -166,7 +178,7 @@ class WorkerSide:
             request=GetSecretValueRequest(key=name, should_error_on_not_found=False)
         )
         try:
-            reply = self._link.request(event_request_envelope(event_request), timeout_s=PARENT_REQUEST_TIMEOUT_S)
+            reply = self._link.request(event_request_envelope(event_request), timeout_s=self._parent_timeout_s)
         except (ChannelClosedError, ChannelRequestError) as e:
             msg = f"Attempted to read the secret '{name}' from the engine this worker works for. Failed because {e}"
             raise RuntimeError(msg) from e
@@ -191,7 +203,7 @@ class WorkerSide:
         # run outside its parent's license policy.
         try:
             body = event_body(AUTHORIZATION_CHECKPOINT, checkpoint)
-            reply = self._link.request(body, timeout_s=PARENT_REQUEST_TIMEOUT_S)
+            reply = self._link.request(body, timeout_s=self._parent_timeout_s)
             return _read_checkpoint_reply(reply)
         except Exception as e:
             logger.error(
@@ -337,20 +349,18 @@ class WorkerSide:
 class _ChannelRequestSender:
     """Sends the requests `RemoteHandler` forwards over the channel, as the wire envelope a client's request is."""
 
-    def __init__(self, link: WorkerLink) -> None:
-        self._link = link
+    def __init__(self, side: WorkerSide) -> None:
+        self._side = side
 
     async def request_from_worker(
         self,
         event_request: EventRequest,
         request_topic: str,
         worker_response_topic: str,  # noqa: ARG002 (the channel carries the reply)
-        timeout_ms: int | None = None,
+        timeout_ms: int | None = None,  # noqa: ARG002 (the worker's side says how long, by whether it is starting)
     ) -> dict[str, Any]:
-        timeout_s = None
-        if timeout_ms:
-            timeout_s = timeout_ms / 1000
-        return await self._link.request_async(event_request_envelope(event_request, request_topic), timeout_s)
+        envelope = event_request_envelope(event_request, request_topic)
+        return await self._side.link.request_async(envelope, self._side.parent_timeout_s)
 
 
 class _EditorLogHandler(logging.Handler):
@@ -417,13 +427,13 @@ async def _serve(side: WorkerSide, library_names: list[str], worker_engine_id: s
     drain = asyncio.create_task(side.drain_events())
 
     try:
-        await asyncio.wait_for(worker_settled.wait(), timeout=_PROJECT_SETTLE_TIMEOUT_S)
-    except TimeoutError:
+        await asyncio.wrap_future(worker_settled)
+    except WorkerSettleError as e:
         msg = (
-            "Attempted to start a library worker process. Failed because the engine that started it did not say "
-            f"which project to run against within {_PROJECT_SETTLE_TIMEOUT_S:.0f} seconds."
+            "Attempted to start a library worker process. Failed because it could not take on the project of "
+            f"the engine that started it: {e}"
         )
-        raise WorkerStartupError(msg) from None
+        raise WorkerStartupError(msg) from e
     adopted_project_id = engine.project_manager.committed_project_id
     # Deriving the project from the shared config is what system defaults means; a concrete project
     # is the parent's, and deriving would overwrite it.
@@ -446,26 +456,28 @@ async def _serve(side: WorkerSide, library_names: list[str], worker_engine_id: s
     )
     hello = _hello(engine, library_names, reports)
     try:
-        reply = await side.link.request_async(event_body(WORKER_HELLO, hello), _HELLO_TIMEOUT_S)
-    except (TimeoutError, ChannelRequestError, ChannelClosedError) as e:
+        reply = await side.link.request_async(event_body(WORKER_HELLO, hello), side.parent_timeout_s)
+    except (ChannelRequestError, ChannelClosedError) as e:
         msg = (
             "Attempted to start a library worker process. Failed because the engine that started it did not "
-            f"answer its hello: {str(e) or type(e).__name__}"
+            f"answer its hello: {e}"
         )
         raise WorkerStartupError(msg) from e
     if not reply.get("accepted"):
         msg = f"The engine that started this worker refused it: {reply.get('details', reply)}"
         raise WorkerStartupError(msg)
+    side.begin_serving()
     logger.debug("Worker accepted: %s", reply.get("details"))
     await drain
     return 0
 
 
-def prepare_worker_engine(engine: Engine, side: WorkerSide) -> asyncio.Event:
+def prepare_worker_engine(engine: Engine, side: WorkerSide) -> Future[None]:
     """Install what makes `engine` a worker for the parent `side` talks to, before any library loads.
 
     Returns:
-        Set once the worker is on the project its parent sent, after which it may load libraries.
+        Done once the worker is on the project its parent sent, after which it may load libraries, or
+        holding a `WorkerSettleError` that says why it could not get there.
 
     Raises:
         WorkerStartupError: The checkpoint hook did not install, so the worker would run on the engine's
@@ -481,11 +493,10 @@ def prepare_worker_engine(engine: Engine, side: WorkerSide) -> asyncio.Event:
         )
         raise WorkerStartupError(msg)
     event_manager.configure_worker_forwarding(
-        request_client=_ChannelRequestSender(side.link),
+        request_client=_ChannelRequestSender(side),
         orchestrator_request_topic=CHANNEL_REQUEST_TOPIC,
         worker_response_topic=_CHANNEL_RESPONSE_TOPIC,
         websocket_event_loop=_start_forwarding_loop(),
-        timeout_ms=int(PARENT_REQUEST_TIMEOUT_S * 1000),
     )
     register_remote_handlers(event_manager)
     return register_broadcast_handlers(

@@ -28,7 +28,9 @@ routing metadata.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
@@ -544,6 +546,10 @@ async def _handle_drop_library_named_local_objects(
     return DropLibraryNamedLocalObjectsResultSuccess(result_details=f"Released {dropped} library-named object(s).")
 
 
+class WorkerSettleError(Exception):
+    """A starting worker could not take on the startup state its orchestrator sent, for the reason given."""
+
+
 class _ProjectAdoptions:
     """Adopts the orchestrator's project for the activations a worker is sent, one adoption at a time.
 
@@ -588,9 +594,9 @@ async def _adopt_on_engine_loop(
     adopt: Callable[[], Coroutine[Any, Any, ResultPayload]],
     *,
     event_manager: EventManager,
-    worker_settled: asyncio.Event,
+    worker_settled: Future[None],
 ) -> ResultPayload:
-    """Run `adopt` on the engine loop, and settle the worker once it succeeds.
+    """Run `adopt` on the engine loop, and settle the worker with how it ends.
 
     ActivateProjectRequest can be handled on a loop other than the engine's. Adoption is a whole
     project switch, with file I/O and synchronous requests that block the loop they run on, so it runs
@@ -602,16 +608,41 @@ async def _adopt_on_engine_loop(
             "Attempted to adopt the orchestrator's project. "
             "Failed because this worker's engine event loop is not running."
         )
+        _settle(worker_settled, failure=details)
         return ActivateProjectResultFailure(result_details=details)
 
     adoption = asyncio.run_coroutine_threadsafe(adopt(), engine_loop)
-    result = await asyncio.wrap_future(adoption)
+    adoption.add_done_callback(functools.partial(_settle_with_adoption, worker_settled))
+    return await asyncio.wrap_future(adoption)
 
-    # Set on this loop, not the engine loop: worker startup waits on it here, and asyncio.Event is not
-    # safe to set from another thread.
-    if result.succeeded():
-        worker_settled.set()
-    return result
+
+def _settle_with_adoption(worker_settled: Future[None], adoption: Future[ResultPayload]) -> None:
+    """Settle the worker with how `adoption` ended. A failed one ends the wait too, with its reason.
+
+    A starting worker waits on nothing but this, for as long as its channel is open, so an adoption
+    that failed without ending the wait would leave it waiting on an orchestrator with nothing more to send.
+    """
+    if adoption.cancelled():
+        return
+    error = adoption.exception()
+    if error is not None:
+        _settle(worker_settled, failure=f"{type(error).__name__}: {error}")
+        return
+    result = adoption.result()
+    if result.failed():
+        _settle(worker_settled, failure=str(result.result_details))
+        return
+    _settle(worker_settled, failure=None)
+
+
+def _settle(worker_settled: Future[None], *, failure: str | None) -> None:
+    """End what a starting worker waits on, once: whatever settles it first stands."""
+    if worker_settled.done():
+        return
+    if failure is not None:
+        worker_settled.set_exception(WorkerSettleError(failure))
+        return
+    worker_settled.set_result(None)
 
 
 def register_broadcast_handlers(
@@ -619,7 +650,7 @@ def register_broadcast_handlers(
     *,
     config_manager: ConfigManager,
     project_manager: ProjectManager,
-) -> asyncio.Event:
+) -> Future[None]:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
     Workers receive ``ReloadConfigRequest`` / ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
@@ -628,16 +659,16 @@ def register_broadcast_handlers(
     in the manager and routing decisions stay here.
 
     Returns:
-        An event set once this worker has settled the startup state the orchestrator sent it, and
-        may begin loading libraries. Today that state is the project, settled either by adopting an
-        activation or by finding it already stale -- libraries resolve against the workspace a
-        project decides, and the orchestrator sends the activation rather than answering
-        registration with it, so nothing else orders the two.
+        A future done once this worker has settled the startup state the orchestrator sent it, and
+        may begin loading libraries, or holding a `WorkerSettleError` once it has failed to. Today
+        that state is the project, settled by the first activation it adopts -- libraries resolve
+        against the workspace a project decides, and the orchestrator sends the activation rather
+        than answering registration with it, so nothing else orders the two.
 
         Deliberately named for the worker rather than the project: a second piece of startup state
-        should gate this same event rather than introduce a second one for the caller to wait on.
+        should gate this same future rather than introduce a second one for the caller to wait on.
     """
-    worker_settled = asyncio.Event()
+    worker_settled: Future[None] = Future()
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
         try:
