@@ -17,7 +17,8 @@ from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.utils import ffmpeg_cache
 from griptape_nodes.utils.ffmpeg_cache import (
-    install_ffmpeg_cache_redirect,
+    get_or_find_platform_executables,
+    install_ffmpeg_resolution,
     redirect_ffmpeg_cache,
     resolve_ffmpeg_directory,
 )
@@ -31,14 +32,19 @@ LOCK_TIMEOUT_SECONDS = 5
 def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restore `static_ffmpeg`'s module globals and the install-once flag after each test.
 
-    `redirect_ffmpeg_cache` mutates process-wide state. Leaking it would change where
-    unrelated tests in the same session look for ffmpeg. `_redirect_installed` is forced
+    `redirect_ffmpeg_cache` and `prefer_system_ffmpeg` mutate process-wide state. Leaking it would change where
+    unrelated tests in the same session look for ffmpeg. `_resolution_installed` is forced
     to `False` so every test starts from an uninstalled state, even when an engine built
     elsewhere in the session already performed the process-wide install.
     """
     monkeypatch.setattr(static_ffmpeg.run, "SELF_DIR", static_ffmpeg.run.SELF_DIR)
     monkeypatch.setattr(static_ffmpeg.run, "LOCK_FILE", static_ffmpeg.run.LOCK_FILE)
-    monkeypatch.setattr(ffmpeg_cache, "_redirect_installed", False)
+    monkeypatch.setattr(
+        static_ffmpeg.run,
+        "get_or_fetch_platform_executables_else_raise",
+        static_ffmpeg.run.get_or_fetch_platform_executables_else_raise,
+    )
+    monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
 
 
 class TestResolveFfmpegDirectory:
@@ -133,11 +139,17 @@ class TestRedirectFfmpegCache:
         redirect_ffmpeg_cache(tmp_path / "read-only")
 
 
-class TestInstallFfmpegCacheRedirect:
+class TestInstallFfmpegResolution:
     def test_first_call_redirects(self, tmp_path: Path) -> None:
-        install_ffmpeg_cache_redirect(str(tmp_path))
+        install_ffmpeg_resolution(str(tmp_path))
 
         assert str(tmp_path) == static_ffmpeg.run.SELF_DIR
+
+    def test_first_call_prefers_system_ffmpeg(self, tmp_path: Path) -> None:
+        """Every caller looks the function up on `static_ffmpeg.run`, so replacing it there covers them all."""
+        install_ffmpeg_resolution(str(tmp_path))
+
+        assert static_ffmpeg.run.get_or_fetch_platform_executables_else_raise is get_or_find_platform_executables
 
     def test_second_call_is_a_noop(self, tmp_path: Path) -> None:
         """The redirect is installed once per process; a later engine must not move the cache.
@@ -146,12 +158,68 @@ class TestInstallFfmpegCacheRedirect:
         guard specifically: the second call's differing directory is ignored, and nothing
         is created for it.
         """
-        install_ffmpeg_cache_redirect(str(tmp_path / "first"))
+        install_ffmpeg_resolution(str(tmp_path / "first"))
 
-        install_ffmpeg_cache_redirect(str(tmp_path / "second"))
+        install_ffmpeg_resolution(str(tmp_path / "second"))
 
         assert str(tmp_path / "first") == static_ffmpeg.run.SELF_DIR
         assert not (tmp_path / "second").exists()
+
+
+class TestGetOrFindPlatformExecutables:
+    """ffmpeg and ffprobe on PATH win; `static_ffmpeg`'s cache or download is the fallback."""
+
+    @pytest.fixture
+    def fetched(self, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+        """Record calls to `static_ffmpeg`'s own lookup instead of downloading."""
+        calls: list[dict] = []
+
+        def _fake_fetch(fix_permissions: bool = True, download_dir: str | None = None) -> tuple[str, str]:  # noqa: FBT001, FBT002
+            calls.append({"fix_permissions": fix_permissions, "download_dir": download_dir})
+            return "cached/ffmpeg", "cached/ffprobe"
+
+        monkeypatch.setattr(ffmpeg_cache, "_fetch_platform_executables", _fake_fetch)
+        return calls
+
+    @pytest.fixture
+    def system_bin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A PATH holding only a directory the test fills with fake executables."""
+        bin_dir = tmp_path / "system-bin"
+        bin_dir.mkdir()
+        monkeypatch.setenv("PATH", str(bin_dir))
+        return bin_dir
+
+    def test_uses_path(self, system_bin: Path, fetched: list[dict]) -> None:
+        ffmpeg_path = _make_executable(system_bin, "ffmpeg")
+        ffprobe_path = _make_executable(system_bin, "ffprobe")
+
+        assert get_or_find_platform_executables() == (ffmpeg_path, ffprobe_path)
+        assert fetched == []
+
+    def test_falls_back_when_path_lacks_ffprobe(self, system_bin: Path, fetched: list[dict]) -> None:
+        """Callers need both binaries from one install, so half a system install is not used."""
+        _make_executable(system_bin, "ffmpeg")
+
+        assert get_or_find_platform_executables() == ("cached/ffmpeg", "cached/ffprobe")
+        assert len(fetched) == 1
+
+    def test_explicit_download_dir_skips_path(self, tmp_path: Path, system_bin: Path, fetched: list[dict]) -> None:
+        _make_executable(system_bin, "ffmpeg")
+        _make_executable(system_bin, "ffprobe")
+
+        get_or_find_platform_executables(fix_permissions=False, download_dir=str(tmp_path))
+
+        assert fetched == [{"fix_permissions": False, "download_dir": str(tmp_path)}]
+
+
+def _make_executable(directory: Path, name: str) -> str:
+    """Create an executable file that `shutil.which` finds, and return the path it reports."""
+    if os.name == "nt":
+        name = f"{name}.exe"
+    executable = directory / name
+    executable.touch()
+    executable.chmod(0o755)
+    return str(executable)
 
 
 class TestPackageDirectoryIsNeverWritten:

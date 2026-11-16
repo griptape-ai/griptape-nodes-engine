@@ -111,7 +111,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import Check
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.async_utils import to_thread
-from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
+from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_resolution
 from griptape_nodes.utils.file_utils import mtimes_match
 from griptape_nodes.utils.keyed_mutex import KeyedMutex
 
@@ -388,7 +388,7 @@ class ArtifactManager(EngineScoped):
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
 
-        Installs the process-wide ffmpeg cache redirect, then registers default artifact
+        Installs the process-wide ffmpeg resolution, then registers default artifact
         providers, after the system is fully initialized.
 
         Args:
@@ -396,12 +396,12 @@ class ArtifactManager(EngineScoped):
         """
         # Move ffmpeg's lock file and downloaded binaries out of `static_ffmpeg`'s own package
         # directory, which is read-only when the engine runs from a packaged app (notably the
-        # Linux AppImage's FUSE mount). Lives here rather than in engine boot because the video
+        # Linux AppImage's FUSE mount), and use ffmpeg on PATH before downloading it. Lives here rather than in engine boot because the video
         # artifact provider is what depends on `static_ffmpeg`, and every process that can run
         # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
         # installed once; later broadcasts (and later engines)
         # no-op. See utils/ffmpeg_cache.py.
-        install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
+        install_ffmpeg_resolution(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
 
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()

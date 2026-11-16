@@ -1,4 +1,7 @@
-r"""Redirect `static_ffmpeg`'s lock and download directory to a writable location.
+r"""Control where `static_ffmpeg` finds ffmpeg/ffprobe: PATH first, then a writable cache or download.
+
+Cache redirect
+--------------
 
 `static_ffmpeg` resolves ffmpeg/ffprobe by writing next to its own installed package
 files, with no environment variable or public setter to move them:
@@ -25,9 +28,19 @@ One redirect covers every caller in the process. The engine imports `static_ffmp
 boot (`artifact_manager` -> `VideoArtifactProvider`), so `sys.modules["static_ffmpeg"]`
 is pinned to the engine's own copy and every node library that imports `static_ffmpeg`
 receives that same module object -- including libraries whose venvs live elsewhere.
+
+System ffmpeg
+-------------
+`get_or_fetch_platform_executables_else_raise()` never looks at PATH: it downloads unless
+the cache holds a completed install. That breaks networks that block the download even
+when ffmpeg is installed system-wide. The same module-object pinning lets one replacement
+of that function cover every caller, since all of them look it up on `static_ffmpeg.run`
+at call time. The replacement uses ffmpeg and ffprobe from PATH when both are there, and
+otherwise leaves `static_ffmpeg` to use its cache or download.
 """
 
 import logging
+import shutil
 from pathlib import Path
 
 import static_ffmpeg.run
@@ -36,13 +49,16 @@ from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 logger = logging.getLogger("griptape_nodes")
 
-_redirect_installed = False
+_resolution_installed = False
+
+# Captured at import, before `prefer_system_ffmpeg` replaces the module attribute.
+_fetch_platform_executables = static_ffmpeg.run.get_or_fetch_platform_executables_else_raise
 
 
-def install_ffmpeg_cache_redirect(configured_directory: str) -> None:
-    """Redirect `static_ffmpeg`'s cache to the configured (or default) directory, once per process.
+def install_ffmpeg_resolution(configured_directory: str) -> None:
+    """Redirect `static_ffmpeg`'s cache and let it fall back to ffmpeg on PATH, once per process.
 
-    The redirect mutates process-wide state, so it is
+    Both changes mutate process-wide state, so they are
     installed once and subsequent calls are no-ops. The first caller's configuration wins;
     building further engines in the same process must not move the cache out from under
     callers that already resolved ffmpeg.
@@ -51,14 +67,15 @@ def install_ffmpeg_cache_redirect(configured_directory: str) -> None:
         configured_directory: The `ffmpeg_directory` config value; see
             `resolve_ffmpeg_directory`.
     """
-    global _redirect_installed  # noqa: PLW0603
+    global _resolution_installed  # noqa: PLW0603
 
-    if _redirect_installed:
-        logger.debug("ffmpeg cache redirect already installed, skipping")
+    if _resolution_installed:
+        logger.debug("ffmpeg resolution already installed, skipping")
         return
 
     redirect_ffmpeg_cache(resolve_ffmpeg_directory(configured_directory))
-    _redirect_installed = True
+    prefer_system_ffmpeg()
+    _resolution_installed = True
 
 
 def resolve_ffmpeg_directory(configured_directory: str) -> Path:
@@ -125,3 +142,34 @@ def redirect_ffmpeg_cache(directory: Path) -> None:
     static_ffmpeg.run.LOCK_FILE = str(directory / "lock.file")
 
     logger.debug("Redirected ffmpeg cache to %s", directory)
+
+
+def prefer_system_ffmpeg() -> None:
+    """Make `static_ffmpeg` use ffmpeg and ffprobe from PATH instead of downloading them.
+
+    Safe to call repeatedly; the replacement always wraps the original function.
+    """
+    static_ffmpeg.run.get_or_fetch_platform_executables_else_raise = get_or_find_platform_executables
+
+
+def get_or_find_platform_executables(
+    fix_permissions: bool = True,  # noqa: FBT001, FBT002
+    download_dir: str | None = None,
+) -> tuple[str, str]:
+    """Return ffmpeg and ffprobe from PATH, falling back to `static_ffmpeg`'s cache or download.
+
+    Same signature as `static_ffmpeg.run.get_or_fetch_platform_executables_else_raise`,
+    which it replaces. A caller that passes `download_dir` asked for that directory
+    specifically, so it skips the PATH lookup.
+
+    Returns:
+        The ffmpeg and ffprobe executable paths. A tuple, because that is the contract of
+        the function this replaces.
+    """
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    if download_dir is not None or ffmpeg_path is None or ffprobe_path is None:
+        return _fetch_platform_executables(fix_permissions=fix_permissions, download_dir=download_dir)
+
+    logger.debug("Using ffmpeg '%s' and ffprobe '%s' from PATH", ffmpeg_path, ffprobe_path)
+    return ffmpeg_path, ffprobe_path
