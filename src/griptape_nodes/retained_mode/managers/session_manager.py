@@ -72,16 +72,25 @@ class SessionManager:
         self,
         engine_identity_manager: EngineIdentityManager,
         event_manager: EventManager | None = None,
+        *,
+        worker: bool = False,
     ) -> None:
         """Initialize the SessionManager.
 
         Args:
             engine_identity_manager: The EngineIdentityManager instance to use for engine ID operations.
             event_manager: The EventManager instance to use for event handling.
+            worker: Set in a library's worker process, which joins no session: it reads no saved
+                sessions, saves none, and has no active session.
         """
         self._engine_identity_manager = engine_identity_manager
-        self._sessions_data = self._load_sessions_data()
-        self._active_session_id = self._get_or_initialize_active_session()
+        self._worker = worker
+        if worker:
+            self._sessions_data = SessionsStorage(sessions=[])
+            self._active_session_id = None
+        else:
+            self._sessions_data = self._load_sessions_data()
+            self._active_session_id = self._get_or_initialize_active_session()
         # In memory only: a client's connection does not outlive the engine process, so
         # persisting it next to the session would resurrect it on restart.
         self._clients: dict[str, SessionClient] = {}
@@ -290,6 +299,9 @@ class SessionManager:
             sessions_data: Sessions data structure to save
             engine_id: Optional engine ID to save engine-specific sessions
         """
+        if self._worker:
+            self._sessions_data = sessions_data
+            return
         session_state_dir = self._get_session_state_dir(engine_id)
         session_state_dir.mkdir(parents=True, exist_ok=True)
 

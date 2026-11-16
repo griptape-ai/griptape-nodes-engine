@@ -192,7 +192,7 @@ class StaticFilesManager(EngineScoped):
                     logger.warning(
                         "GT_CLOUD_BUCKET_ID secret is not available, falling back to local storage. Run `gtn init` to set it up."
                     )
-                    self.storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
+                    self._storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
                 elif not cloud_credential:
                     # Without this the driver would send "Bearer None" and every
                     # upload would fail with an opaque 401 instead of naming the
@@ -201,19 +201,19 @@ class StaticFilesManager(EngineScoped):
                         "Falling back to local storage because %s",
                         MISSING_CREDENTIAL_MESSAGE,
                     )
-                    self.storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
+                    self._storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
                 else:
                     static_files_directory = config_manager.get_config_value(
                         "static_files_directory", default="staticfiles"
                     )
-                    self.storage_driver = GriptapeCloudStorageDriver(
+                    self._storage_driver = GriptapeCloudStorageDriver(
                         config_manager,
                         bucket_id=bucket_id,
                         api_key=cloud_credential,
                         static_files_directory=static_files_directory,
                     )
             case StorageBackend.LOCAL:
-                self.storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
+                self._storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
             case _:
                 msg = f"Invalid storage backend: {self.storage_backend}"
                 raise ValueError(msg)
@@ -225,6 +225,18 @@ class StaticFilesManager(EngineScoped):
                 self.on_app_initialization_complete,
             )
             event_manager.add_listener_to_app_event(ConfigChanged, self._on_config_changed)
+
+    @property
+    def storage_driver(self) -> LocalStorageDriver | GriptapeCloudStorageDriver:
+        """The storage driver, carrying the current Griptape Cloud credential when it uses one: a session credential renews."""
+        driver = self._storage_driver
+        if isinstance(driver, GriptapeCloudStorageDriver):
+            driver.api_key = resolve_cloud_credential(self.secrets_manager)
+        return driver
+
+    @storage_driver.setter
+    def storage_driver(self, driver: LocalStorageDriver | GriptapeCloudStorageDriver) -> None:
+        self._storage_driver = driver
 
     @property
     def static_server_base_url(self) -> str:
@@ -384,8 +396,9 @@ class StaticFilesManager(EngineScoped):
             msg = f"Attempted to create upload URL for '{file_name}'. Failed because {resolved.reason}."
             return CreateStaticFileUploadUrlResultFailure(error=msg, result_details=msg)
 
+        driver = self.storage_driver
         try:
-            response = self.storage_driver.create_signed_upload_url(resolved.path, file_metadata=resolved.file_metadata)
+            response = driver.create_signed_upload_url(resolved.path, file_metadata=resolved.file_metadata)
         except Exception as e:
             msg = f"Failed to create presigned URL for file {file_name}: {e}"
             return CreateStaticFileUploadUrlResultFailure(error=msg, result_details=msg)
@@ -394,7 +407,7 @@ class StaticFilesManager(EngineScoped):
             url=response["url"],
             headers=response["headers"],
             method=response["method"],
-            file_url=self.storage_driver.get_asset_url(Path(response["file_path"])),
+            file_url=driver.get_asset_url(Path(response["file_path"])),
             result_details="Successfully created static file upload URL",
         )
 
@@ -419,15 +432,16 @@ class StaticFilesManager(EngineScoped):
             msg = f"Attempted to create download URL for '{request.file_name}'. Failed because {resolved.reason}."
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
+        driver = self.storage_driver
         try:
-            url = self.storage_driver.create_signed_download_url(resolved.path)
+            url = driver.create_signed_download_url(resolved.path)
         except Exception as e:
             msg = f"Failed to create presigned URL for file {request.file_name}: {e}"
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         return CreateStaticFileDownloadUrlResultSuccess(
             url=url,
-            file_url=self.storage_driver.get_asset_url(resolved.path),
+            file_url=driver.get_asset_url(resolved.path),
             result_details="Successfully created static file download URL",
         )
 
@@ -631,7 +645,7 @@ class StaticFilesManager(EngineScoped):
             file_path: The path handed to the storage driver, possibly workspace-relative.
         """
         # Under cloud storage, the client's URL points at the uploaded copy, not this file.
-        if not isinstance(self.storage_driver, LocalStorageDriver):
+        if not isinstance(self._storage_driver, LocalStorageDriver):
             return None
         # Workers mint URLs for their own nodes. The orchestrator is the process the editor talks to.
         if self.engine.library_manager.is_worker:
@@ -688,7 +702,7 @@ class StaticFilesManager(EngineScoped):
             self._base_url_settled.set()
 
     def _resolve_static_server(self, payload: AppInitializationComplete) -> None:
-        if not isinstance(self.storage_driver, LocalStorageDriver):
+        if not isinstance(self._storage_driver, LocalStorageDriver):
             return
 
         # The env var outranks the payload: a parent that set it serves the shared workspace on a
@@ -719,7 +733,7 @@ class StaticFilesManager(EngineScoped):
                 self._static_server_base_url = configured_base_url
             logger.debug("No host reported a static server; assuming %s", self._static_server_base_url)
 
-        self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
+        self._storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
 
     def _configured_base_url(self) -> str | None:
         """Return the configured static server base URL, normalized, or None when unset.
@@ -843,8 +857,9 @@ class StaticFilesManager(EngineScoped):
             FileExistsError: When existing_file_policy is FAIL and file already exists.
             RuntimeError: If the file write fails.
         """
+        driver = self.storage_driver
         try:
-            saved_path = self.storage_driver.save_file(
+            saved_path = driver.save_file(
                 file_path,
                 data,
                 existing_file_policy,
@@ -856,7 +871,7 @@ class StaticFilesManager(EngineScoped):
         except Exception as e:
             msg = f"Failed to save static file {file_path.name}: {e}"
             raise RuntimeError(msg) from e
-        return self.storage_driver.create_signed_download_url(Path(saved_path))
+        return driver.create_signed_download_url(Path(saved_path))
 
     def _resolve_static_file_path(
         self,

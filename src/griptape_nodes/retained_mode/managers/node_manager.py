@@ -65,6 +65,7 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.files.directory import DirectoryDestinationProvider
 from griptape_nodes.files.file import FileDestinationProvider
 from griptape_nodes.files.file_sequence import FileSequenceDestinationProvider
@@ -3641,7 +3642,7 @@ class NodeManager(EngineScoped):
         return ResolveNodeResultSuccess(result_details=details)
 
     @handles(ExecuteNodeRequest)
-    async def on_execute_node_request(  # noqa: C901
+    async def on_execute_node_request(
         self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
@@ -3657,13 +3658,17 @@ class NodeManager(EngineScoped):
         the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values. A worker another engine runs first asks that engine
-        whether the lease the node was sent under holds it, and refuses the
-        node if not. A worker opens no workflow, so it is handed none: it loads
+        parameter values. A worker opens no workflow, so it is handed none: it loads
         the copy into the runtime it keeps for the orchestrator's workflow.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
+
+        Like node groups and loops, a Workflow node is the exception and stays in this
+        process: it imports, starts and reads its subflow from this process's flows. The
+        nodes inside its subflow are still routed to their own workers. The check sits here
+        rather than in `NodeExecutor._run_node` beside the group and loop checks, so the
+        node keeps the request path's hydration and failure reporting.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3671,9 +3676,6 @@ class NodeManager(EngineScoped):
         node = None
         if is_worker:
             library_name = (request.node_metadata or {}).get("library")
-            lease_refusal = await self.engine.worker_manager.lease_refusal(request.node_name, request.lease_id)
-            if lease_refusal is not None:
-                return ExecuteNodeResultFailure(result_details=lease_refusal)
         else:
             if workflow is not None:
                 node = workflow.objects.get_as_type(request.node_name, BaseNode)
@@ -3686,7 +3688,9 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node. The orchestrator found
         # its node in `workflow` above.
-        if node is not None and workflow is not None:
+        #
+        # Workflow nodes stay in this process; see the docstring.
+        if node is not None and workflow is not None and not isinstance(node, WorkflowNode):
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that
@@ -4010,17 +4014,20 @@ class NodeManager(EngineScoped):
                     if wm.worker_unavailable_reason(library_name) is None:
                         lease = await wm.acquire_lease(library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
-                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                worker_engine_id = (
+                    library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                )
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
-            if worker is None:
+            if worker_engine_id is None:
                 return None
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:
                 return preparation_failure
+            lease_id = None
             if lease is not None:
-                request.lease_id = lease.lease_id
-            return await self._execute_node_via_worker(workflow, request, wm, worker)
+                lease_id = lease.lease_id
+            return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id, lease_id=lease_id)
         finally:
             wm.release_after_node(lease)
 
@@ -4043,24 +4050,26 @@ class NodeManager(EngineScoped):
                 f"Failed because {unavailable} Reload your libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker = wm.get_worker_for_key(scope.worker_key)
-        if worker is None:
+        worker_engine_id = wm.get_worker_for_key(scope.worker_key)
+        if worker_engine_id is None:
             details = (
                 f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
                 "Failed because the background process that runs Isolated Execution is not running. Reload your "
                 "libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        return await self._execute_node_via_worker(workflow, request, wm, worker)
+        return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id)
 
     async def _execute_node_via_worker(
         self,
         workflow: WorkflowRuntime,
         request: ExecuteNodeRequest,
         wm: WorkerManager,
-        worker: tuple[str, str],
+        worker_engine_id: str,
+        *,
+        lease_id: str | None = None,
     ) -> ResultPayload:
-        """Dispatch ExecuteNodeRequest to a worker and return its result.
+        """Dispatch ExecuteNodeRequest to a worker, under `lease_id` for one another engine runs, and return its result.
 
         The worker loads a copy of the node from the request on every call and
         discards it after aprocess returns; ExecuteNodeRequest is a pure RPC
@@ -4076,7 +4085,6 @@ class NodeManager(EngineScoped):
                 f"its input {', '.join(unsendable)} cannot be sent there."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
@@ -4087,19 +4095,11 @@ class NodeManager(EngineScoped):
         target_request_id = request.request_id
         # The same dict is cleared below even if the workflow closes while the node runs.
         orch_worker_requests = workflow.nodes.orch_worker_requests
-        orch_worker_requests[request.node_name] = (
-            target_request_id,
-            worker_engine_id,
-            worker_request_topic,
-        )
+        orch_worker_requests[request.node_name] = (target_request_id, worker_engine_id)
         try:
             event_request = EventRequest(request=request)
             event_request.request_id = target_request_id
-            execute_raw = await wm.route_to_worker(
-                event_request,
-                worker_engine_id,
-                worker_request_topic,
-            )
+            execute_raw = await wm.route_to_worker(event_request, worker_engine_id, lease_id=lease_id)
         except WorkerGoneError as err:
             # A failure, not a cancellation: the resolution machine reaps cancellations as CANCELED,
             # emitting no NodeErrorEvent and logging one unnamed line, so the node would come back
@@ -4141,14 +4141,10 @@ class NodeManager(EngineScoped):
         entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
-        target_request_id, worker_engine_id, worker_request_topic = entry
+        target_request_id, worker_engine_id = entry
         wm = self.engine.worker_manager
         cancel_request = CancelExecuteNodeRequest(target_request_id=target_request_id)
-        await wm.forward_event_to_worker(
-            EventRequest(request=cancel_request),
-            worker_engine_id=worker_engine_id,
-            worker_request_topic=worker_request_topic,
-        )
+        await wm.forward_event_to_worker(EventRequest(request=cancel_request), worker_engine_id=worker_engine_id)
 
     @staticmethod
     def _orchestrator_node_missing(request: ExecuteNodeRequest, workflow: WorkflowRuntime | None) -> str:
