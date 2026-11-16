@@ -72,6 +72,11 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListFlowsInCurrentContextRequest,
     ListNodesInFlowRequest,
 )
+from griptape_nodes.retained_mode.events.library_documentation_events import (
+    GetLibraryDocumentationPageRequest,
+    GetNodeDocumentationRequest,
+    ListLibraryDocumentationRequest,
+)
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     GetEngineSourceInfoRequest,
@@ -131,6 +136,10 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "ListCategoriesInLibraryRequest": ListCategoriesInLibraryRequest,
     "RegisterSandboxNodeFromSourceRequest": RegisterSandboxNodeFromSourceRequest,
     "DescribeNodeTypeRequest": DescribeNodeTypeRequest,
+    # Library docs (read-only): what a node is for, what a library ships, and the pages it wrote
+    "GetNodeDocumentationRequest": GetNodeDocumentationRequest,
+    "ListLibraryDocumentationRequest": ListLibraryDocumentationRequest,
+    "GetLibraryDocumentationPageRequest": GetLibraryDocumentationPageRequest,
     # Configuration
     "GetConfigValueRequest": GetConfigValueRequest,
     "GetWorkspaceRequest": GetWorkspaceRequest,
@@ -298,6 +307,19 @@ def _summarize_result_details(result_details: object) -> str | list[dict] | None
     return result_details  # type: ignore[return-value]
 
 
+# Docs pages can run to a megabyte, which would fill an agent's context in one call. Over MCP a page
+# comes back in parts this size unless the caller sets its own limit. The response says `truncated`
+# and gives `total_chars`, and the caller reads on with `offset`.
+MCP_DOC_PAGE_LIMIT_CHARS = 64_000
+
+
+def _with_agent_limits(request: RequestPayload) -> RequestPayload:
+    """Give a docs request that left `limit` unset a default one, so a long page arrives in parts."""
+    if isinstance(request, (GetNodeDocumentationRequest, GetLibraryDocumentationPageRequest)) and request.limit is None:
+        request.limit = MCP_DOC_PAGE_LIMIT_CHARS
+    return request
+
+
 def _trim_response(result: dict) -> dict:
     """Strip envelope noise from an engine response before we hand it back to the MCP client.
 
@@ -393,7 +415,7 @@ def _build_batch_requests(raw_requests: object, tools: dict[str, MCPTool]) -> li
 
         payload_cls = tools[request_type].request_type
         try:
-            payload_obj = payload_cls(**inner)
+            payload_obj = _with_agent_limits(payload_cls(**inner))
         except TypeError as exc:
             msg = (
                 f"Attempted to construct {request_type} for EventRequestBatch entry {index}. "
@@ -610,7 +632,7 @@ async def _call_tool_payload(
         msg = f"Unsupported tool: {name}"
         raise ValueError(msg)
 
-    request_payload = tools[name].request_type(**arguments)
+    request_payload = _with_agent_limits(tools[name].request_type(**arguments))
     result = await _dispatch_to_engine(request_payload, sender, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
     mcp_server_logger.debug("Got result: %s", result)
     return json.dumps(_trim_response(result))

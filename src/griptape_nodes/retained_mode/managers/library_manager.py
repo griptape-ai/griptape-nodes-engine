@@ -54,6 +54,7 @@ from griptape_nodes.retained_mode.managers.library.discovery import (
     LibraryDiscovery,
     ResolvedDiscoveryPath,
 )
+from griptape_nodes.retained_mode.managers.library.documentation import LibraryDocumentation
 from griptape_nodes.retained_mode.managers.library.environment import LibraryEnvironment
 from griptape_nodes.retained_mode.managers.library.git_operations import LibraryGitOperations
 from griptape_nodes.retained_mode.managers.library.managed_environment import LibraryManagedEnvironment
@@ -148,6 +149,7 @@ class LibraryManager(EngineScoped):
         self.module_loading = LibraryModuleLoading(engine)
         self.workers = LibraryWorkers(event_manager, engine=engine)
         self.catalog = LibraryCatalog(event_manager, engine=engine)
+        self.documentation = LibraryDocumentation(event_manager, engine=engine)
         self.metadata_loading = LibraryMetadataLoading(event_manager, engine=engine)
         self.sandbox = LibrarySandbox(event_manager, engine=engine)
         self.registration = LibraryRegistrar(event_manager, engine=engine)

@@ -2156,3 +2156,19 @@ class TestEmitProgress:
         queued = queue.get_nowait()
         assert isinstance(queued.wrapped_event.payload, PublishWorkflowProgressEvent)
         assert queued.wrapped_event.open_workflow_id == publishing.workflow_id
+
+
+class TestCopyTree:
+    @pytest.mark.parametrize("env_dir", [".venv", ".venv-exec", ".venv-dev"])
+    def test_default_exclusions_skip_library_envs(self, engine: Engine, tmp_path: Path, env_dir: str) -> None:  # noqa: ARG002
+        """A library's environment directories stay out of the bundle; its source is copied."""
+        source = tmp_path / "library"
+        (source / env_dir / "lib").mkdir(parents=True)
+        (source / env_dir / "lib" / "pkg.py").write_text("", encoding="utf-8")
+        (source / "node.py").write_text("", encoding="utf-8")
+        destination = tmp_path / "bundle"
+
+        WorkflowPackager.copy_tree(source, destination)
+
+        assert (destination / "node.py").is_file()
+        assert not (destination / env_dir).exists()
