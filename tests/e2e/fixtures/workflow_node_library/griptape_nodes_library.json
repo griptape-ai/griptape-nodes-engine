@@ -33,6 +33,21 @@
       "metadata": {"category": "test", "description": "uppercases text", "display_name": "Shout"}
     },
     {
+      "class_name": "CountdownNode",
+      "file_path": "workflow_node_nodes.py",
+      "metadata": {"category": "test", "description": "branches while text is left", "display_name": "Countdown"}
+    },
+    {
+      "class_name": "FailingNode",
+      "file_path": "workflow_node_nodes.py",
+      "metadata": {"category": "test", "description": "always fails", "display_name": "Failing"}
+    },
+    {
+      "class_name": "FixtureGroupNode",
+      "file_path": "workflow_node_nodes.py",
+      "metadata": {"category": "test", "description": "runs its members", "display_name": "Fixture Group"}
+    },
+    {
       "class_name": "TextEndNode",
       "file_path": "workflow_node_nodes.py",
       "metadata": {"category": "test", "description": "workflow text output", "display_name": "Text End"}

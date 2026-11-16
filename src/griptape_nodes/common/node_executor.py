@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import uuid
 from contextlib import AbstractContextManager, nullcontext
@@ -46,6 +47,11 @@ from griptape_nodes.exe_types.node_types import (
     StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
+from griptape_nodes.exe_types.workflow_node_errors import (
+    NestedWorkflowNodeError,
+    SubflowNodeFailedError,
+    next_failure_link,
+)
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
@@ -56,6 +62,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ForwardedException,
     ProgressEvent,
     ResultPayload,
+    ResultPayloadFailure,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
@@ -183,6 +190,8 @@ class IterationFailure:
 
     iteration_index: int
     detail: str
+    exception: Exception | None = None
+    """The failure the iteration's subflow reported, when it reported one."""
 
 
 @dataclass(frozen=True)
@@ -197,6 +206,8 @@ class IterationOutcome:
     iteration_index: int
     succeeded: bool
     detail: str
+    exception: Exception | None = None
+    """The failure the iteration's subflow reported, when it reported one."""
 
 
 # How many distinct failure reasons a loop error message names before deferring to the log.
@@ -585,6 +596,105 @@ class NodeExecutor(EngineScoped):
         return (
             f"Node '{node_name}' execution failed: {type_prefix}{getattr(result, 'result_details', result)}{tb_suffix}"
         )
+
+    @staticmethod
+    def _loop_failure_error(
+        loop_name: str,
+        total_iterations: int,
+        iteration_failures: list[IterationFailure],
+    ) -> RuntimeError:
+        """Build the error for a loop that lost iterations, chained from the failure that explains it.
+
+        The chain lets a Workflow node around the loop report the failing node once
+        instead of embedding this loop's whole message in its own.
+        """
+        error = RuntimeError(
+            NodeExecutor._format_loop_failure_message(
+                loop_name=loop_name,
+                total_iterations=total_iterations,
+                iteration_failures=iteration_failures,
+            )
+        )
+        for iteration_failure in iteration_failures:
+            if iteration_failure.exception is not None:
+                error.__cause__ = iteration_failure.exception
+                break
+        return error
+
+    @staticmethod
+    def _iteration_failure_exception(result: ResultPayload, reverse_node_mapping: dict[str, str]) -> Exception | None:
+        """The failure a failed iteration's subflow reported, or None when it reported none.
+
+        The iteration flow runs copies of the loop body, so every failing node on the
+        chain, including those of loops inside the body, is renamed to the original the
+        artist sees.
+        """
+        if not isinstance(result, ResultPayloadFailure):
+            return None
+        failure = result.exception
+        if failure is None:
+            return None
+        return NodeExecutor._rename_failure_chain(failure, reverse_node_mapping)
+
+    @staticmethod
+    def _rename_failure_chain(failure: Exception, reverse_node_mapping: dict[str, str]) -> Exception:
+        """Rebuild a failure chain with each subflow node name mapped back to its original.
+
+        A nested Workflow node failure already names the nested workflow's own nodes, so
+        it and everything below it stay as they are.
+        """
+        if isinstance(failure, NestedWorkflowNodeError):
+            return failure
+        if isinstance(failure, SubflowNodeFailedError):
+            # The error carries the copied node's name, so rebuild it with the original's. If nothing
+            # changed, return the same object so callers holding it keep it.
+            cause = failure.__cause__
+            if isinstance(cause, Exception):
+                cause = NodeExecutor._rename_failure_chain(cause, reverse_node_mapping)
+            node_name = reverse_node_mapping.get(failure.node_name, failure.node_name)
+            if node_name == failure.node_name and cause is failure.__cause__:
+                return failure
+            return SubflowNodeFailedError(node_name, failure.details, cause)
+        failure_cause = failure.__cause__
+        if not isinstance(failure_cause, Exception) or next_failure_link(failure_cause) is None:
+            # No subflow failure in the cause chain, so there is nothing to rename.
+            return failure
+        renamed_cause = NodeExecutor._rename_failure_chain(failure_cause, reverse_node_mapping)
+        if renamed_cause is failure_cause:
+            # Nothing below was renamed, so this exception is still accurate.
+            return failure
+        # Copy rather than set `__cause__`, because other code may still hold the original.
+        return NodeExecutor._copy_exception_and_rewrite_cause(failure, renamed_cause)
+
+    @staticmethod
+    def _copy_exception_and_rewrite_cause(failure: Exception, cause: Exception) -> Exception:
+        """Copy a plain exception that re-raises a failure (a loop or group error) onto a new cause.
+
+        The original, which other code may still hold, keeps its chain.
+        """
+        # An exception whose constructor needs arguments beyond `args` can't be copied; an
+        # unrenamed path is better than losing the error.
+        try:
+            copied = copy.copy(failure)
+        except TypeError:
+            return failure
+        copied.__cause__ = cause
+        copied.__context__ = failure.__context__
+        copied.__traceback__ = failure.__traceback__
+        return copied
+
+    @staticmethod
+    def _iteration_failure_detail(result: ResultPayload) -> str:
+        """Describe a failed iteration, by the nested Workflow node failure's own message when it has one.
+
+        That message names the node that failed and how far down it was, without the
+        wrapper each level of nesting would otherwise add to the text.
+        """
+        if isinstance(result, ResultPayloadFailure):
+            failure = result.exception
+            if isinstance(failure, SubflowNodeFailedError) and isinstance(failure.__cause__, NestedWorkflowNodeError):
+                return str(failure.__cause__)
+        return str(result.result_details)
 
     @staticmethod
     def _format_loop_failure_message(
@@ -1584,12 +1694,12 @@ class NodeExecutor(EngineScoped):
                     )
                     # Don't immediately store None - try to extract results first in case there are partial results
                     # (e.g., nested loop that had some failures but still produced output)
-                    iteration_failures.append(
-                        IterationFailure(
-                            iteration_index=iteration_index,
-                            detail=str(start_subflow_result.result_details),
-                        )
+                    iteration_failure = IterationFailure(
+                        iteration_index=iteration_index,
+                        detail=self._iteration_failure_detail(start_subflow_result),
+                        exception=self._iteration_failure_exception(start_subflow_result, reverse_node_mapping),
                     )
+                    iteration_failures.append(iteration_failure)
                 else:
                     successful_iterations.append(iteration_index)
 
@@ -1766,12 +1876,11 @@ class NodeExecutor(EngineScoped):
         # Only the local sequential path reports per-iteration failures; private and cloud loops
         # leave this empty and fall through to the short-count branch below.
         elif iteration_failures:
-            msg = self._format_loop_failure_message(
+            raise self._loop_failure_error(
                 loop_name=end_node.name,
                 total_iterations=total_iterations,
                 iteration_failures=iteration_failures,
             )
-            raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
             logger.debug(
                 "Loop execution stopped early at %d of %d iterations",
@@ -2809,12 +2918,11 @@ class NodeExecutor(EngineScoped):
         # Only the local sequential path reports per-iteration failures; private and cloud loops
         # leave this empty and fall through to the short-count branch below.
         elif iteration_failures:
-            msg = self._format_loop_failure_message(
+            raise self._loop_failure_error(
                 loop_name=node.name,
                 total_iterations=total_iterations,
                 iteration_failures=iteration_failures,
             )
-            raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
             logger.debug(
                 "Iterative group execution stopped early at %d of %d iterations",
@@ -3572,7 +3680,11 @@ class NodeExecutor(EngineScoped):
                 concurrency_gate = self._parallel_iteration_gate(total_iterations)
 
                 async def run_single_iteration(
-                    flow_name: str, iteration_index: int, start_node_name: str, loop_body_scope: LoopBodyScope
+                    flow_name: str,
+                    iteration_index: int,
+                    start_node_name: str,
+                    loop_body_scope: LoopBodyScope,
+                    reverse_node_mapping: dict[str, str],
                 ) -> IterationOutcome:
                     """Run a single iteration flow and report whether it finished, and why not."""
                     async with concurrency_gate:
@@ -3589,7 +3701,8 @@ class NodeExecutor(EngineScoped):
                             return IterationOutcome(
                                 iteration_index=iteration_index,
                                 succeeded=False,
-                                detail=str(start_subflow_result.result_details),
+                                detail=self._iteration_failure_detail(start_subflow_result),
+                                exception=self._iteration_failure_exception(start_subflow_result, reverse_node_mapping),
                             )
 
                 # Step 3: Set input values on start nodes for each iteration
@@ -3648,6 +3761,10 @@ class NodeExecutor(EngineScoped):
                             iteration_index,
                             node_name_mappings.get(packaged_start_node_name),
                             self._loop_body_scope(package_result, node_name_mappings),
+                            {
+                                packaged_name: original_name
+                                for original_name, packaged_name in node_name_mappings.items()
+                            },
                         )
                     )
                     for iteration_index, flow_name, node_name_mappings in deserialized_flows
@@ -3682,6 +3799,7 @@ class NodeExecutor(EngineScoped):
                                 IterationFailure(
                                     iteration_index=result.iteration_index,
                                     detail=result.detail or "The iteration reported failure without a reason.",
+                                    exception=result.exception,
                                 )
                             )
 
