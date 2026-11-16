@@ -1566,8 +1566,9 @@ class WorkerManager(EngineScoped):
         """Settle a worker another engine ran for this engine, now that that engine reports it exited.
 
         Handled like a local worker's exit: a start whose worker never loaded settles the library with
-        the reason, and a worker in service is removed at once. "exited" leaves the library unavailable
-        with the reason; "stopped" leaves it free to be started again.
+        the reason, and a worker in service is removed at once. A worker that crashed after loading leaves
+        the library to be started again by its next node; one that never loaded or was refused leaves it
+        unavailable with the reason; "stopped" leaves it free to be started again.
         """
         wid = request.worker_engine_id
         start = self._starts_asked_of_hosts.get(wid)
@@ -1601,14 +1602,14 @@ class WorkerManager(EngineScoped):
                 "That engine's log has the details."
             )
         logger.warning("Worker %s for library '%s' on %s %s.", wid, library_name, host_engine_id, request.reason)
-        # The local rules: a worker that crashed after loading is started again by its library's next node.
+        # A worker that crashed after loading is started again by its library's next node.
         retryable = registered and request.reason == "exited" and request.details is None
         if retryable:
             reason += _RESTARTED_BY_NEXT_NODE
         if registered:
             self._release_worker(wid, reason)
-        # The local rules: a worker that ended on its own leaves its library unavailable, and one that
-        # was stopped does so only if it never loaded, so whatever waits on it hears why.
+        # As for a local worker, one that ended on its own records why, and one that was stopped does
+        # so only if it never loaded, so whatever waits on it hears why.
         if request.reason == "exited" or not self.has_settled(library_name):
             self.note_worker_unavailable(library_name, reason, retryable=retryable)
         return worker_events.ReportWorkerExitedResultSuccess(result_details=f"Recorded that worker {wid} exited.")
@@ -2785,7 +2786,7 @@ class WorkerManager(EngineScoped):
             # or its worker is started when the library loads.
             unavailable = self._worker_unavailable.get(library_name)
             return unavailable is not None and unavailable.retryable
-        # A worker that ended on its own left a reason, which stays until the library is reset.
+        # One that ended on its own left a reason, which only a crash after loading leaves retryable.
         return self.may_start_worker(library_name)
 
     def get_topics_to_subscribe(self) -> list[str]:
