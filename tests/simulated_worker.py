@@ -43,6 +43,8 @@ from griptape_nodes.worker.wire import (
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Iterator
 
+    import pytest
+
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
 
@@ -125,6 +127,17 @@ def simulated_worker(orchestrator: Engine, library_name: str) -> Iterator[Simula
         patch.object(orchestrator.worker_manager, "route_to_worker", side_effect=worker.route_to_worker),
     ):
         yield worker
+
+
+def host_libraries_on_simulated_worker(engine: Engine, monkeypatch: pytest.MonkeyPatch, *library_names: str) -> None:
+    """Send every node of the named libraries to the simulated worker, until the monkeypatch is undone."""
+
+    def worker_for(name: str | None) -> tuple[str, str] | None:
+        if name in library_names:
+            return _WORKER_ID
+        return None
+
+    monkeypatch.setattr(engine.library_manager.workers, "get_worker_for_library", worker_for)
 
 
 @contextmanager
