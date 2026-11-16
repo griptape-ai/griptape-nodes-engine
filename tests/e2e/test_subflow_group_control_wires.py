@@ -15,7 +15,7 @@ Data wires are untouched: they still get a proxy parameter each.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.events.parameter_events import SetParameterVal
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
     from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
@@ -326,6 +327,50 @@ class TestLoopGroup:
         assert isinstance(remove_body2, RemoveNodeFromNodeGroupResultSuccess), remove_body2
         assert _edges(engine, "Down", control_only=True) == {"G.exec_out->Down.exec_in"}
         assert "Body2.exec_out->Down.exec_in" not in _edges(engine, "Body2", control_only=True)
+
+
+@pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
+class TestOnStartEntryResolution:
+    """NodeExecutor._resolve_on_each_entry reads On Start on any group, not just a loop's On Each.
+
+    This is the helper a group's non-local execution path asks for its entry node; it used to
+    answer (None, None) for anything that was not a BaseIterativeNodeGroup, so a plain group's
+    explicit On Start wiring was silently ignored in favor of implicit child-discovery.
+    """
+
+    def test_a_plain_groups_on_start_resolves_to_its_wired_target(self, engine: Engine, flow: str) -> None:
+        """On Start wired to a non-default (not first-in-chain) member resolves to that member."""
+        _ = flow
+        for name in ("Child1", "Child2", "Child3"):
+            _node(engine, "EchoNode", name)
+            assert engine.handle_request(
+                SetParameterValueRequest(parameter_name="text", node_name=name, value=name)
+            ).succeeded()
+        _connect(engine, "Child1", "exec_out", "Child2", "exec_in")
+        _connect(engine, "Child2", "exec_out", "Child3", "exec_in")
+        _group(engine, ["Child1", "Child2", "Child3"])
+        # Child1 is first in the internal chain and has no incoming control wire, so implicit
+        # child-discovery would pick it; On Start explicitly names Child2 instead.
+        _connect(engine, "G", "on_start", "Child2", "exec_in")
+
+        group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
+        entry = engine.flow_manager.node_executor._resolve_on_each_entry(group)
+
+        assert entry == ("Child2", "exec_in")
+
+    def test_an_unwired_on_start_still_falls_back_to_none(self, engine: Engine, flow: str) -> None:
+        """Leaving On Start unwired keeps today's fallback to implicit child-discovery."""
+        _ = flow
+        _node(engine, "EchoNode", "Child")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Child", value="Child")
+        ).succeeded()
+        _group(engine, ["Child"])
+
+        group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
+        entry = engine.flow_manager.node_executor._resolve_on_each_entry(group)
+
+        assert entry == (None, None)
 
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")

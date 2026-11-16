@@ -2500,15 +2500,20 @@ class NodeExecutor(EngineScoped):
         return sources
 
     def _resolve_on_each_entry(self, node: SubflowNodeGroup) -> tuple[str | None, str | None]:
-        """Return (entry_node_name, entry_param_name) from on_each connection, or (None, None)."""
+        """Return (entry_node_name, entry_param_name) from the inner entry's connection, or (None, None).
+
+        The inner entry is On Each on a loop, On Start on a plain group, or nothing at all on a
+        group whose inner control inputs mean something else (a while-group's Done / Continue):
+        node.inner_entry is None there, and this falls back to implicit child-discovery the same way
+        an unconnected inner entry does.
+        """
         workflow = node._require_workflow()
-        # on_each only exists on iterative groups; non-iterative subflows fall back to implicit child-discovery.
-        if not isinstance(node, BaseIterativeNodeGroup):
+        if node.inner_entry is None:
             return None, None
         connections = workflow.flows.connections
-        # Use node.on_each.name instead of a literal so renames stay in sync.
+        # Use node.inner_entry.name instead of a literal so renames stay in sync.
         # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
-        on_each_conns = connections.outgoing_index.get(node.name, {}).get(node.on_each.name, [])
+        on_each_conns = connections.outgoing_index.get(node.name, {}).get(node.inner_entry.name, [])
         if not on_each_conns:
             return None, None
         first_conn = connections.connections[on_each_conns[0]]
