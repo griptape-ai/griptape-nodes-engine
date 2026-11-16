@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, _active_request_sender
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
+from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _REPORT_ATTEMPTS,
@@ -1718,6 +1719,30 @@ class TestStartingAWorkerOnAnotherEngine:
 
         start.assert_not_awaited()
         assert worker_manager.worker_unavailable_reason(_LIBRARY) == "the connection to gpu-01 was lost."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("at_capacity", "asked_again"), [(True, True), (False, False)])
+    async def test_a_node_after_a_refused_start_leases_and_starts_only_when_the_refusal_may_pass(
+        self, worker_manager: WorkerManager, *, at_capacity: bool, asked_again: bool
+    ) -> None:
+        """The node's own sequence: a capacity refusal is leased and started again, any other refusal is not."""
+        _host_engine(worker_manager)
+        refused = worker_events.StartWorkerForEngineResultFailure(result_details="no room", at_capacity=at_capacity)
+        with patch.object(worker_manager, "_ask_engine_to_start_worker", new=AsyncMock(return_value=refused)):
+            await _start_on_host_engine(worker_manager)
+        node_manager = MagicMock()
+        node_manager.engine.library_manager.workers.get_worker_for_library.return_value = None
+
+        with (
+            patch.object(worker_manager, "acquire_lease", new=AsyncMock(return_value=None)) as lease,
+            patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start,
+        ):
+            await NodeManager._execute_node_in_library_worker(
+                node_manager, MagicMock(), MagicMock(), MagicMock(), worker_manager, _LIBRARY
+            )
+
+        assert lease.await_count == int(asked_again)
+        assert start.await_count == int(asked_again)
 
     @pytest.mark.asyncio
     async def test_a_start_refused_for_another_reason_is_not_asked_again(self, worker_manager: WorkerManager) -> None:

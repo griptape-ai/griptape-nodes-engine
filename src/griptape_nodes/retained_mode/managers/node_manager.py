@@ -4010,8 +4010,9 @@ class NodeManager(EngineScoped):
                     # A worker that engine stopped starts again only once the lease holds it.
                     await wm.wait_until_executable(library_name, start_stopped=False)
                     # A worker that could not be started there leaves nothing to lease, and an engine
-                    # that never answered the start would never answer the lease either.
-                    if wm.worker_unavailable_reason(library_name) is None:
+                    # that never answered the start would never answer the lease either. One refused for
+                    # a reason that may pass, such as capacity, is leased and started again.
+                    if wm.may_start_worker(library_name):
                         lease = await wm.acquire_lease(library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
                 worker_engine_id = (

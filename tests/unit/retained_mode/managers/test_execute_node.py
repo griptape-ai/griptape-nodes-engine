@@ -1053,6 +1053,7 @@ class TestExecuteNodeWorkerRoute:
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
         wm.wait_until_executable = AsyncMock()
         wm.worker_unavailable_reason.return_value = "engine eng-2 did not answer."
+        wm.may_start_worker.return_value = False
         wm.acquire_lease = AsyncMock()
         lib_mgr.workers.get_worker_for_library.return_value = None
 
