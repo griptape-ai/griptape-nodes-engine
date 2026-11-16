@@ -455,7 +455,7 @@ class TestExecuteNodeForwardedToAWorker:
 
         with (
             patch.object(engine.worker_manager, "wait_until_executable", AsyncMock()),
-            patch.object(engine.library_manager.workers, "get_worker_for_library", return_value=("worker", "topic")),
+            patch.object(engine.library_manager.workers, "get_worker_for_library", return_value="worker"),
             patch.object(engine.worker_manager, "route_to_worker", route_to_worker),
         ):
             await engine.event_manager.ahandle_request(

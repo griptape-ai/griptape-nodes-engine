@@ -98,6 +98,10 @@ def process(self) -> None:
 `put` under a key you already used releases what was there first, unless it is the
 same object — so rebuilding under an unchanged hash does not strand the old one.
 
+`drop` and `drop_all` free the object right away, even in the middle of a run, so you
+can release one model before loading the next. Only drop what no running node still
+uses: the engine cannot tell.
+
 ## Freeing what the object holds
 
 Dropping the last Python reference does not free VRAM. Pass `on_local_object_drop`

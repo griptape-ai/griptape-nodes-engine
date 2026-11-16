@@ -57,7 +57,7 @@ class TestWorkerWorkflows:
         assert not engine.context_manager.has_current_workflow()
         assert engine.current_workflow_or_none() is None
         # The heartbeat reports what is open.
-        assert engine._get_current_workflow_info()["current_workflow_id"] is None
+        assert engine._get_current_workflow_info()["open_workflows"] == []
         with engine.run_in_worker_workflow(workflow):
             assert engine.context_manager.get_current_workflow_id() == PEER_ID
             with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):

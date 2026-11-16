@@ -48,6 +48,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
     DeleteFlowRequest,
+    DeleteFlowResultSuccess,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
@@ -1033,6 +1034,61 @@ class TestDeleteIterationFlows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None
 
 
+class TestDeleteFlowByName:
+    """Deleting a flow by name leaves no reference to it in the current context."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_current_flow_by_name_leaves_it_current_no_longer(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("delete_by_name_wf")
+        created = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
+        )
+        assert isinstance(created, CreateFlowResultSuccess)
+
+        result = engine.handle_request(DeleteFlowRequest(flow_name=created.flow_name))
+
+        assert isinstance(result, DeleteFlowResultSuccess)
+        assert not engine.current_workflow().context.has_current_flow()
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_a_flow_by_name_leaves_the_current_flow_current(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("delete_other_by_name_wf")
+        canvas = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
+        )
+        assert isinstance(canvas, CreateFlowResultSuccess)
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=canvas.flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        result = engine.handle_request(DeleteFlowRequest(flow_name=child.flow_name))
+
+        assert isinstance(result, DeleteFlowResultSuccess)
+        assert engine.current_workflow().context.get_current_flow().name == canvas.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_a_flow_with_children_leaves_the_current_flow_current(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("delete_parent_by_name_wf")
+        canvas = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="canvas", set_as_new_context=True)
+        )
+        assert isinstance(canvas, CreateFlowResultSuccess)
+        parent = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=canvas.flow_name, flow_name="parent", set_as_new_context=False)
+        )
+        assert isinstance(parent, CreateFlowResultSuccess)
+        grandchild = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="grandchild", set_as_new_context=False)
+        )
+        assert isinstance(grandchild, CreateFlowResultSuccess)
+
+        result = engine.handle_request(DeleteFlowRequest(flow_name=parent.flow_name))
+
+        assert isinstance(result, DeleteFlowResultSuccess)
+        assert engine.current_workflow().context.get_current_flow().name == canvas.flow_name
+
+
 class TestReparentFlow:
     """Moving a Flow under a new parent, which is how a nested group's subflow finds its home.
 
@@ -1971,3 +2027,48 @@ class TestConnectingToParameterList:
 
         assert isinstance(result, CreateConnectionResultFailure)
         assert "AddParameterToNodeRequest" not in str(result.result_details)
+
+
+class TestTaskLocalFlowCreationRecord:
+    """`task_local_flow_creation_record` collects the flows the current task creates, and nothing else."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_records_only_flows_created_inside_the_block(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("record_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+
+        with engine.flow_manager.task_local_flow_creation_record() as recorded:
+            inside = engine.handle_request(
+                CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="inside", set_as_new_context=False)
+            )
+        assert isinstance(inside, CreateFlowResultSuccess)
+        outside = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="outside", set_as_new_context=False)
+        )
+        assert isinstance(outside, CreateFlowResultSuccess)
+
+        assert recorded == [inside.flow_name]
+
+    @pytest.mark.usefixtures("clean_object_state")
+    @pytest.mark.asyncio
+    async def test_concurrent_recorders_do_not_see_each_others_flows(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("record_concurrent_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        both_recording = {"a": asyncio.Event(), "b": asyncio.Event()}
+        recorded_by_task: dict[str, list[str]] = {}
+
+        async def record(own: str, other: str) -> None:
+            with engine.flow_manager.task_local_flow_creation_record() as recorded:
+                both_recording[own].set()
+                await asyncio.wait_for(both_recording[other].wait(), 5)
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name=top.flow_name, flow_name=f"flow_{own}", set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+            recorded_by_task[own] = list(recorded)
+
+        await asyncio.gather(record("a", "b"), record("b", "a"))
+
+        assert recorded_by_task == {"a": ["flow_a"], "b": ["flow_b"]}

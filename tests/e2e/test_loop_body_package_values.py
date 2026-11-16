@@ -1,10 +1,12 @@
-"""A packaged loop body does not carry values its own connections will supply.
+"""A packaged loop body is a clone of the canvas nodes: structure and every stored value.
 
 A loop runs its body as a rebuilt copy of the canvas nodes, built from a snapshot that is replayed
-through the normal set-value path, validators included. A connected input in that snapshot is dead
-on arrival: the copy's connections feed it before its node runs. Replaying it only adds a way to
-fail, and it did (engine issue #5889): a node whose hard slider was narrowed after its value was set
-holds a value its validator rejects, and rebuilding the body aborted on it before iteration 0.
+through the normal set-value path. The copy keeps every value the canvas node holds, connected inputs
+included, because a node's parameter structure derives from its values (engine issue #6104). A value
+the copy refuses on a connected input is logged and skipped rather than failing the rebuild (engine
+issue #5889): a node whose hard slider was narrowed after its value was set holds a value its validator
+rejects, and that value is replaced by its connection before the node runs anyway. A refused value on
+an input nothing feeds has no replacement, so it fails the rebuild.
 
 The stand-in node narrows the slider on ``left`` whenever ``image_width`` is set. The canvas state
 these tests build is: ``left`` restored to 80 by a workflow load while the slider allowed 100, then
@@ -14,6 +16,7 @@ a width of 50 arriving the way the next run's upstream value would.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +25,8 @@ import pytest
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
+    DeleteConnectionRequest,
+    DeleteConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest, StartFlowResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -30,6 +35,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
     DeserializeFlowFromCommandsRequest,
     DeserializeFlowFromCommandsResultFailure,
+    DeserializeFlowFromCommandsResultSuccess,
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
     SerializedFlowCommands,
@@ -44,7 +50,6 @@ from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
     SerializedNodeCommands,
-    SetLockNodeStateRequest,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
@@ -195,8 +200,8 @@ def loop_flow(tmp_path: Path, engine: Engine, materialize_library: Callable[...,
     return flow.flow_name
 
 
-def test_package_leaves_out_values_its_connections_supply(engine: Engine, loop_flow: str) -> None:
-    """A body input fed by a connection, from inside the group or across its boundary, is not replayed."""
+def test_package_keeps_every_value_the_canvas_node_holds(engine: Engine, loop_flow: str) -> None:
+    """A body input fed by a connection, from inside the group or across its boundary, is cloned like any other."""
     with engine.context_manager.flow(loop_flow):
         result = engine.handle_request(
             PackageNodesAsSerializedFlowRequest(node_names=[SOURCE, TARGET], node_group_name=GROUP)
@@ -205,31 +210,13 @@ def test_package_leaves_out_values_its_connections_supply(engine: Engine, loop_f
     commands = result.serialized_flow_commands
 
     target_values = _find_node(commands, TARGET).set_values_by_parameter()
-    assert "left" not in target_values, "Target.left is fed by Source.result inside the body"
-    assert target_values["note"] == "kept", "an unconnected value is still restored"
+    assert target_values["left"] == STALE_LEFT, "Target.left is fed by Source.result inside the body, and still cloned"
+    assert target_values["note"] == "kept"
     assert target_values["image_width"] == NARROW
 
-    source_values = _find_node(commands, SOURCE).set_values_by_parameter()
-    assert "left" not in source_values, "Source.left is fed from the group boundary through the Start node"
 
-
-def test_package_keeps_a_locked_nodes_connected_values(engine: Engine, loop_flow: str) -> None:
-    """A locked body node never runs, so nothing would feed its inputs; its frozen values travel with it."""
-    locked = engine.handle_request(SetLockNodeStateRequest(node_name=TARGET, lock=True))
-    assert not locked.failed(), locked
-
-    with engine.context_manager.flow(loop_flow):
-        result = engine.handle_request(
-            PackageNodesAsSerializedFlowRequest(node_names=[SOURCE, TARGET], node_group_name=GROUP)
-        )
-    assert isinstance(result, PackageNodesAsSerializedFlowResultSuccess), result
-
-    target_values = _find_node(result.serialized_flow_commands, TARGET).set_values_by_parameter()
-    assert target_values["left"] == STALE_LEFT
-
-
-def test_saving_the_workflow_still_keeps_connected_values(engine: Engine, loop_flow: str) -> None:
-    """Only the package changes. A saved workflow keeps the last value a connected input saw."""
+def test_saving_the_workflow_keeps_connected_values(engine: Engine, loop_flow: str) -> None:
+    """A saved workflow keeps the last value a connected input saw, the same as the package."""
     result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=loop_flow))
     assert isinstance(result, SerializeFlowToCommandsResultSuccess), result
     commands = result.serialized_flow_commands
@@ -256,8 +243,67 @@ async def test_loop_runs_when_a_connected_input_holds_a_stale_value(
     assert group.parameter_output_values.get("results") == ["10", "20"]
 
 
-def test_restore_failure_says_why(engine: Engine, loop_flow: str) -> None:
-    """When a saved value is refused on restore, the error carries the validator's reason."""
+def test_refused_value_is_skipped_and_the_rebuild_completes(
+    engine: Engine, loop_flow: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When a saved value is refused on restore, the node is still rebuilt and the log carries the reason."""
+    saved = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=loop_flow))
+    assert isinstance(saved, SerializeFlowToCommandsResultSuccess), saved
+    deleted = engine.handle_request(DeleteFlowRequest(flow_name=loop_flow))
+    assert not deleted.failed(), deleted
+
+    with caplog.at_level(logging.WARNING):
+        restored = engine.handle_request(
+            DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved.serialized_flow_commands)
+        )
+    assert isinstance(restored, DeserializeFlowFromCommandsResultSuccess), restored
+    target = engine.node_manager.get_node_by_name(TARGET)
+    assert target.get_parameter_value("left") == 0, "the refused value is skipped, the parameter keeps its default"
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if f"parameter 'left' on node '{TARGET}'" in record.getMessage()
+    )
+    assert f"must be between 0 and {NARROW}" in warning
+
+
+def test_refused_value_on_an_input_fed_from_outside_the_group_is_skipped(
+    engine: Engine, loop_flow: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Source.left is fed from the group's current_item, an edge the group's subflow does not record.
+
+    Such an edge is held by the parent flow only, so the skip has to be decided from the rebuilt graph
+    rather than from the subflow's own serialized connections.
+    """
+    _set(engine, SOURCE, "image_width", WIDE)
+    _set(engine, SOURCE, "left", STALE_LEFT, initial_setup=True)
+    _set(engine, SOURCE, "image_width", NARROW)
+    saved = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=loop_flow))
+    assert isinstance(saved, SerializeFlowToCommandsResultSuccess), saved
+    deleted = engine.handle_request(DeleteFlowRequest(flow_name=loop_flow))
+    assert not deleted.failed(), deleted
+
+    with caplog.at_level(logging.WARNING):
+        restored = engine.handle_request(
+            DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved.serialized_flow_commands)
+        )
+    assert isinstance(restored, DeserializeFlowFromCommandsResultSuccess), restored.result_details
+    source = engine.node_manager.get_node_by_name(SOURCE)
+    assert source.get_parameter_value("left") == 0, "the refused value is skipped, the parameter keeps its default"
+    assert any(f"parameter 'left' on node '{SOURCE}'" in record.getMessage() for record in caplog.records)
+
+
+def test_refused_value_on_an_unconnected_input_fails_the_rebuild(engine: Engine, loop_flow: str) -> None:
+    """With nothing wired into Target.left, a refused saved value has no replacement, so the rebuild fails."""
+    disconnected = engine.handle_request(
+        DeleteConnectionRequest(
+            source_node_name=SOURCE,
+            source_parameter_name="result",
+            target_node_name=TARGET,
+            target_parameter_name="left",
+        )
+    )
+    assert isinstance(disconnected, DeleteConnectionResultSuccess), disconnected
     saved = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=loop_flow))
     assert isinstance(saved, SerializeFlowToCommandsResultSuccess), saved
     deleted = engine.handle_request(DeleteFlowRequest(flow_name=loop_flow))
@@ -267,9 +313,8 @@ def test_restore_failure_says_why(engine: Engine, loop_flow: str) -> None:
         DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved.serialized_flow_commands)
     )
     assert isinstance(restored, DeserializeFlowFromCommandsResultFailure), restored
-    details = str(restored.result_details)
-    assert f"'{TARGET}.left'" in details
-    assert f"must be between 0 and {NARROW}" in details
+    assert f"'{TARGET}.left'" in str(restored.result_details)
+    assert f"must be between 0 and {NARROW}" in str(restored.result_details)
 
 
 @pytest.fixture

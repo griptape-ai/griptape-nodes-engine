@@ -1,5 +1,13 @@
 # Unreleased
 
+## Execution events name their workflow in `open_workflow_id`
+
+**Request API clients.** `ExecutionEvent` and streamed `ProgressEvent` carried the open workflow
+they belong to in `workflow_id` in 0.107.0 and 0.108.0. They now carry it in `open_workflow_id`,
+the same field a result's envelope uses. Read `open_workflow_id` instead. `workflow_id` is no
+longer sent on these events. `open_workflow_id` is `null` for an event that belongs to no
+workflow, as `workflow_id` was.
+
 ## `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
 
 Rename the key in any config file or environment that sets it; the environment variable is

@@ -58,6 +58,8 @@ from griptape_nodes.utils.budget_refusal import (
 from griptape_nodes.utils.http_utils import is_retryable_httpx_error, request_with_retry
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -71,6 +73,9 @@ SPEND_PATH = "/api/spend"
 CHECK_TIMEOUT_SECONDS = 5.0
 REPORT_TIMEOUT_SECONDS = 10.0
 REPORT_MAX_ATTEMPTS = 3
+# The report thread exits after this long with nothing queued, so it never outlives its engine
+# for long. The next report starts another.
+REPORT_THREAD_IDLE_SECONDS = 30.0
 
 # Cloud's length caps on the free-text descriptors. A value over its cap is left out rather than
 # sent, so one long name cannot get the whole report rejected.
@@ -109,6 +114,59 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
+class _ReportQueue:
+    """Queues usage reports for one thread that posts them in order.
+
+    The thread runs only while there are reports to post: it starts with a report and exits once
+    the queue has sat empty for `idle_seconds`. A thread that never exits would keep its manager,
+    and so its engine, alive for the rest of the process.
+
+    A daemon thread, so engine exit never waits on queued reports. Not an asyncio task: a sync
+    `handle_request` runs the handler on a short-lived loop that would cancel it.
+    """
+
+    def __init__(
+        self, send: Callable[[dict[str, Any]], None], *, idle_seconds: float = REPORT_THREAD_IDLE_SECONDS
+    ) -> None:
+        self._send = send
+        self._idle_seconds = idle_seconds
+        self._queue: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        # Guards `_thread`, and the enqueue with it, so a report never lands after the thread has
+        # decided to exit and before a new one starts.
+        self._lock = threading.Lock()
+
+    @property
+    def thread(self) -> threading.Thread | None:
+        return self._thread
+
+    def put(self, body: dict[str, Any]) -> None:
+        with self._lock:
+            self._queue.put(body)
+            if self._thread is None:
+                thread = threading.Thread(target=self._post_reports, name="budget-report", daemon=True)
+                thread.start()
+                self._thread = thread
+
+    def _post_reports(self) -> None:
+        """Post queued reports one at a time until the queue has been idle for `idle_seconds`."""
+        while True:
+            try:
+                body = self._queue.get(timeout=self._idle_seconds)
+            except queue.Empty:
+                with self._lock:
+                    if self._queue.empty():
+                        self._thread = None
+                        return
+                continue
+            # One report failing in a way nothing anticipated must not end the thread and
+            # silently drop every report after it.
+            try:
+                self._send(body)
+            except Exception:
+                logger.exception("A usage report failed unexpectedly and was dropped.")
+
+
 class BudgetManager(EngineScoped):
     """Attributes credit-consuming calls, and checks and reports direct provider spend with Cloud."""
 
@@ -120,10 +178,7 @@ class BudgetManager(EngineScoped):
             engine: The owning Engine, used to resolve peer managers.
         """
         super().__init__(engine)
-        # A daemon thread, so engine exit never waits on queued reports. Not an asyncio task: a
-        # sync `handle_request` runs the handler on a short-lived loop that would cancel it.
-        self._reports: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
-        threading.Thread(target=self._post_reports, name="budget-report", daemon=True).start()
+        self._reports = _ReportQueue(self._send_report)
         event_manager.register_request_handlers(self)
 
     @handles(GetAttributionContextRequest)
@@ -328,17 +383,6 @@ class BudgetManager(EngineScoped):
             url=join_cloud_url(resolve_cloud_base_url(secrets_manager), path),
             headers={"Authorization": f"Bearer {credential}"},
         )
-
-    def _post_reports(self) -> None:
-        """Post queued reports one at a time, for as long as the engine runs."""
-        while True:
-            body = self._reports.get()
-            # One report failing in a way nothing anticipated must not end the thread and
-            # silently drop every report after it.
-            try:
-                self._send_report(body)
-            except Exception:
-                logger.exception("A usage report failed unexpectedly and was dropped.")
 
     def _send_report(self, body: dict[str, Any]) -> None:
         """Post a usage report with bounded retries; log and drop it if Cloud cannot take it."""

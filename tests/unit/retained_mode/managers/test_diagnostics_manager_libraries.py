@@ -65,7 +65,7 @@ def _entry(
     engine.library_manager.catalog.collate_problems_for_lib_info.return_value = None
     engine.worker_manager.worker_unavailable_reason.return_value = worker_unavailable_reason
     if worker_registered:
-        engine.worker_manager.get_worker_for_key.return_value = ("worker-1", "worker-1-requests")
+        engine.worker_manager.get_worker_for_key.return_value = "worker-1"
     else:
         engine.worker_manager.get_worker_for_key.return_value = None
 

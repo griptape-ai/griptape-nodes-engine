@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -232,6 +233,7 @@ class QueueItem(NamedTuple):
 
 class FlowManager(EngineScoped):
     _node_executor: NodeExecutor
+    _task_local_flow_creation_record: ContextVar[list[str] | None]
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -241,6 +243,8 @@ class FlowManager(EngineScoped):
         # The properties below need a current workflow and raise without one. Lookups that can run with
         # no workflow open use `_current_flows_or_none()`, and a run uses the flows it captured at its start.
         self._node_executor = NodeExecutor(self.engine)
+        # Per instance, and task-local, so concurrent recorders each see only their own flows.
+        self._task_local_flow_creation_record = ContextVar("flow_creation_record", default=None)
 
         self.packaging = FlowPackaging(event_manager, engine=engine)
         self.serialization = FlowSerialization(event_manager, engine=engine)
@@ -302,6 +306,19 @@ class FlowManager(EngineScoped):
         """Get the connections instance."""
         return self._connections
 
+    @contextmanager
+    def task_local_flow_creation_record(self) -> Iterator[list[str]]:
+        """Collect the names of flows created by the current task during the `with` block.
+
+        Flows created by other tasks running at the same time are not collected.
+        """
+        created: list[str] = []
+        token = self._task_local_flow_creation_record.set(created)
+        try:
+            yield created
+        finally:
+            self._task_local_flow_creation_record.reset(token)
+
     def _current_flows(self) -> WorkflowFlows:
         """The current workflow's flows, for changes and runs, which need a workflow to hold them.
 
@@ -316,6 +333,12 @@ class FlowManager(EngineScoped):
         if workflow is None:
             return None
         return workflow.flows
+
+    def _note_created_flow(self, flow_name: str) -> None:
+        """Add a newly created flow to the current task's creation record, if one is active."""
+        creation_record = self._task_local_flow_creation_record.get()
+        if creation_record is not None:
+            creation_record.append(flow_name)
 
     def _cleanup_flow_on_failed_deserialization(
         self, workflow: WorkflowRuntime, flow_name: str, *, pushed_flow_context: bool
@@ -665,6 +688,7 @@ class FlowManager(EngineScoped):
         self.engine.object_manager.add_object_by_name_in(workflow, final_flow_name, flow)
         flows = workflow.flows
         flows.name_to_parent_name[final_flow_name] = parent_name
+        self._note_created_flow(final_flow_name)
 
         # Track referenced workflow if this flow was created within a referenced workflow context
         if workflow_manager.has_current_referenced_workflow():
@@ -750,14 +774,13 @@ class FlowManager(EngineScoped):
                     )
                     result = DeleteFlowResultFailure(result_details=details)
                     return result
-                with workflow.context.flow(child_flow):
-                    # Delete them.
-                    delete_flow_request = DeleteFlowRequest(flow_name=child_flow_name)
-                    delete_flow_result = workflow.handle_request(delete_flow_request)
-                    if isinstance(delete_flow_result, DeleteFlowResultFailure):
-                        details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Flow '{child_flow.name}'."
-                        result = DeleteFlowResultFailure(result_details=details)
-                        return result
+                # Delete them.
+                delete_flow_request = DeleteFlowRequest(flow_name=child_flow_name)
+                delete_flow_result = workflow.handle_request(delete_flow_request)
+                if isinstance(delete_flow_result, DeleteFlowResultFailure):
+                    details = f"Attempted to delete Flow '{flow.name}', but failed while attempting to delete child Flow '{child_flow.name}'."
+                    result = DeleteFlowResultFailure(result_details=details)
+                    return result
             # Delete all child nodes in this Flow.
             list_nodes_request = ListNodesInFlowRequest()
             list_nodes_result = workflow.handle_request(list_nodes_request)
@@ -787,6 +810,14 @@ class FlowManager(EngineScoped):
                 workflow.flows.global_control_flow_machine = None
                 workflow.flows.global_dag_builder.clear()
                 self._finish_run_if_over(flows)
+
+        # A flow deleted by name can still be the Current Context. Leave it, as deleting without a name does.
+        if (
+            flow_name is not None
+            and workflow.context.has_current_flow()
+            and workflow.context.get_current_flow() is flow
+        ):
+            workflow.context.pop_flow()
 
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)

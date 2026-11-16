@@ -62,15 +62,26 @@ class EngineIdentityManager:
 
     _ENGINE_DATA_FILE = "engines.json"
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, worker_engine_id: str | None = None) -> None:
         """Initialize the EngineIdentityManager.
 
         Args:
             event_manager: The EventManager instance to use for event handling.
+            worker_engine_id: Set in a library's worker process, to the ID the engine that started it
+                minted for this spawn. Held in memory only: a worker's identity ends with its process,
+                so it is never written to the engines file nor read from it.
         """
+        self._worker = worker_engine_id is not None
         self._active_engine_id: str | None = None
-        self._engines_data = self._load_engines_data()
-        self._current_engine_data = self._get_or_initialize_engine_data()
+        if worker_engine_id is None:
+            self._engines_data = self._load_engines_data()
+            self._current_engine_data = self._get_or_initialize_engine_data()
+        else:
+            self._engines_data = EnginesStorage(engines=[], default_engine_id=None)
+            self._current_engine_data = EngineData(
+                id=worker_engine_id, name=generate_engine_name(), created_at=datetime.now(tz=UTC).isoformat()
+            )
+            self._active_engine_id = worker_engine_id
 
         if event_manager is not None:
             event_manager.register_request_handlers(self)
@@ -213,6 +224,8 @@ class EngineIdentityManager:
         Args:
             engine_data: The engine data to add or update
         """
+        if self._worker:
+            return
         # Find existing engine
         existing_engine = self._find_engine_by_id(self._engines_data, engine_data.id)
 

@@ -7,7 +7,7 @@ import json
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 from uuid import uuid4
 
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
@@ -20,7 +20,7 @@ from griptape_nodes.common.strict_mode import (
 from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
@@ -65,6 +65,10 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
+from griptape_nodes.files.directory import DirectoryDestinationProvider
+from griptape_nodes.files.file import FileDestinationProvider
+from griptape_nodes.files.file_sequence import FileSequenceDestinationProvider
 from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
@@ -96,6 +100,17 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultFailure,
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
+)
+from griptape_nodes.retained_mode.events.destination_events import (
+    GetConnectedDirectoryDestinationRequest,
+    GetConnectedDirectoryDestinationResultFailure,
+    GetConnectedDirectoryDestinationResultSuccess,
+    GetConnectedFileDestinationRequest,
+    GetConnectedFileDestinationResultFailure,
+    GetConnectedFileDestinationResultSuccess,
+    GetConnectedFileSequenceDestinationRequest,
+    GetConnectedFileSequenceDestinationResultFailure,
+    GetConnectedFileSequenceDestinationResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
@@ -320,6 +335,22 @@ class _FlowCancelOutcome:
 
     failure: ResultPayload | None = None
     cancelled_for_node_name: str | None = None
+
+
+class _ConvertsToSpec[SpecT](Protocol):
+    def to_spec(self) -> SpecT: ...
+
+
+@dataclass
+class _ConnectedDestination[SpecT]:
+    """The destination a settings node connected to a parameter supplies; ``spec`` is None when none is connected."""
+
+    spec: SpecT | None
+    details: str
+
+
+class _ConnectedDestinationError(Exception):
+    """A connected destination could not be read; the message is the request's failure details."""
 
 
 @dataclass
@@ -1473,18 +1504,20 @@ class NodeManager(EngineScoped):
         # affect it.
         releasable_handle_keys = self._cached_objects_owned_by(node)
 
+        parent_flow_name = workflow.nodes.name_to_parent_flow_name[node_name]
+        try:
+            parent_flow = self.engine.flow_manager.get_flow_by_name_in(workflow, parent_flow_name)
+        except KeyError as err:
+            details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
+            return DeleteNodeResultFailure(result_details=details)
+
+        # Awaited outside the node context: the context stack is shared, so holding the node on it
+        # across an await lets another task see it as current and pair its pops with another delete's.
+        cancel_outcome = await self.cancel_conditionally(workflow, parent_flow, parent_flow_name, node)
+        if cancel_outcome.failure is not None:
+            return cancel_outcome.failure
+
         with workflow.context.node(node):
-            parent_flow_name = workflow.nodes.name_to_parent_flow_name[node_name]
-            try:
-                parent_flow = self.engine.flow_manager.get_flow_by_name_in(workflow, parent_flow_name)
-            except KeyError as err:
-                details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
-                return DeleteNodeResultFailure(result_details=details)
-
-            cancel_outcome = await self.cancel_conditionally(workflow, parent_flow, parent_flow_name, node)
-            if cancel_outcome.failure is not None:
-                return cancel_outcome.failure
-
             # The node is leaving, so the live DAG has to stop naming it: it is published to the
             # editor as an involved node, iterated on cancel, and checked before a node is allowed
             # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
@@ -1934,6 +1967,119 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
         return result
+
+    @handles(GetConnectedFileDestinationRequest)
+    def on_get_connected_file_destination_request(
+        self, request: GetConnectedFileDestinationRequest, workflow: WorkflowRuntime
+    ) -> GetConnectedFileDestinationResultSuccess | GetConnectedFileDestinationResultFailure:
+        try:
+            found = self._read_connected_destination(
+                workflow,
+                request.node_name,
+                request.parameter_name,
+                FileDestinationProvider,
+                lambda provider: provider.file_destination,
+            )
+        except _ConnectedDestinationError as err:
+            return GetConnectedFileDestinationResultFailure(result_details=str(err))
+        return GetConnectedFileDestinationResultSuccess(destination=found.spec, result_details=found.details)
+
+    @handles(GetConnectedDirectoryDestinationRequest)
+    def on_get_connected_directory_destination_request(
+        self, request: GetConnectedDirectoryDestinationRequest, workflow: WorkflowRuntime
+    ) -> GetConnectedDirectoryDestinationResultSuccess | GetConnectedDirectoryDestinationResultFailure:
+        try:
+            found = self._read_connected_destination(
+                workflow,
+                request.node_name,
+                request.parameter_name,
+                DirectoryDestinationProvider,
+                lambda provider: provider.directory_destination,
+            )
+        except _ConnectedDestinationError as err:
+            return GetConnectedDirectoryDestinationResultFailure(result_details=str(err))
+        return GetConnectedDirectoryDestinationResultSuccess(destination=found.spec, result_details=found.details)
+
+    @handles(GetConnectedFileSequenceDestinationRequest)
+    def on_get_connected_file_sequence_destination_request(
+        self, request: GetConnectedFileSequenceDestinationRequest, workflow: WorkflowRuntime
+    ) -> GetConnectedFileSequenceDestinationResultSuccess | GetConnectedFileSequenceDestinationResultFailure:
+        try:
+            found = self._read_connected_destination(
+                workflow,
+                request.node_name,
+                request.parameter_name,
+                FileSequenceDestinationProvider,
+                lambda provider: provider.file_sequence_destination,
+            )
+        except _ConnectedDestinationError as err:
+            return GetConnectedFileSequenceDestinationResultFailure(result_details=str(err))
+        return GetConnectedFileSequenceDestinationResultSuccess(destination=found.spec, result_details=found.details)
+
+    def _read_connected_destination[ProviderT, SpecT](
+        self,
+        workflow: WorkflowRuntime,
+        node_name: str,
+        parameter_name: str,
+        provider_type: type[ProviderT],
+        read_destination: Callable[[ProviderT], _ConvertsToSpec[SpecT] | None],
+    ) -> _ConnectedDestination[SpecT]:
+        """Read the destination the first node connected to ``node_name.parameter_name`` implementing ``provider_type`` supplies.
+
+        Raises:
+            _ConnectedDestinationError: If the node or parameter doesn't exist, or the connected
+                settings node has no destination set.
+        """
+        target = f"'{node_name}.{parameter_name}'"
+        node = workflow.objects.get_as_type(node_name, BaseNode)
+        if node is None:
+            msg = (
+                f"Attempted to read the output settings connected to {target}. "
+                f"Failed because no node named '{node_name}' exists."
+            )
+            raise _ConnectedDestinationError(msg)
+        parameter = node.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            msg = (
+                f"Attempted to read the output settings connected to {target}. "
+                f"Failed because '{node_name}' has no parameter named '{parameter_name}'."
+            )
+            raise _ConnectedDestinationError(msg)
+
+        sources = self._sources_through_group_proxies(workflow, node, parameter)
+        provider = next((source for source in sources if isinstance(source, provider_type)), None)
+        if provider is None:
+            return _ConnectedDestination(spec=None, details=f"No output settings are connected to {target}.")
+        provider_name = cast("BaseNode", provider).name
+        destination = read_destination(provider)
+        if destination is None:
+            msg = (
+                f"Attempted to read the output settings connected to {target}. "
+                f"Failed because '{provider_name}' has no destination set (likely missing a filename or path)."
+            )
+            raise _ConnectedDestinationError(msg)
+        return _ConnectedDestination(
+            spec=destination.to_spec(), details=f"Read the destination '{provider_name}' supplies to {target}."
+        )
+
+    def _sources_through_group_proxies(
+        self, workflow: WorkflowRuntime, node: BaseNode, parameter: Parameter
+    ) -> list[BaseNode]:
+        """The nodes feeding ``node.parameter``, looking through group proxy parameters.
+
+        A wire that crosses a group's boundary, into it or out of it, runs through a proxy parameter on the
+        group, so the source a node sees can be the group. Following what feeds that proxy finds the node
+        at the other end.
+        """
+        sources: list[BaseNode] = []
+        for connection in workflow.flows.connections.get_incoming_connections_to_parameter(node, parameter):
+            if isinstance(connection.source_node, SubflowNodeGroup):
+                sources.extend(
+                    self._sources_through_group_proxies(workflow, connection.source_node, connection.source_parameter)
+                )
+            else:
+                sources.append(connection.source_node)
+        return sources
 
     @handles(ListParametersOnNodeRequest)
     def on_list_parameters_on_node_request(
@@ -3496,7 +3642,7 @@ class NodeManager(EngineScoped):
         return ResolveNodeResultSuccess(result_details=details)
 
     @handles(ExecuteNodeRequest)
-    async def on_execute_node_request(  # noqa: C901
+    async def on_execute_node_request(
         self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
@@ -3512,13 +3658,17 @@ class NodeManager(EngineScoped):
         the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values. A worker another engine runs first asks that engine
-        whether the lease the node was sent under holds it, and refuses the
-        node if not. A worker opens no workflow, so it is handed none: it loads
+        parameter values. A worker opens no workflow, so it is handed none: it loads
         the copy into the runtime it keeps for the orchestrator's workflow.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
+
+        Like node groups and loops, a Workflow node is the exception and stays in this
+        process: it imports, starts and reads its subflow from this process's flows. The
+        nodes inside its subflow are still routed to their own workers. The check sits here
+        rather than in `NodeExecutor._run_node` beside the group and loop checks, so the
+        node keeps the request path's hydration and failure reporting.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3526,9 +3676,6 @@ class NodeManager(EngineScoped):
         node = None
         if is_worker:
             library_name = (request.node_metadata or {}).get("library")
-            lease_refusal = await self.engine.worker_manager.lease_refusal(request.node_name, request.lease_id)
-            if lease_refusal is not None:
-                return ExecuteNodeResultFailure(result_details=lease_refusal)
         else:
             if workflow is not None:
                 node = workflow.objects.get_as_type(request.node_name, BaseNode)
@@ -3541,7 +3688,9 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node. The orchestrator found
         # its node in `workflow` above.
-        if node is not None and workflow is not None:
+        #
+        # Workflow nodes stay in this process; see the docstring.
+        if node is not None and workflow is not None and not isinstance(node, WorkflowNode):
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that
@@ -3865,17 +4014,20 @@ class NodeManager(EngineScoped):
                     if wm.worker_unavailable_reason(library_name) is None:
                         lease = await wm.acquire_lease(library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
-                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                worker_engine_id = (
+                    library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                )
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
-            if worker is None:
+            if worker_engine_id is None:
                 return None
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:
                 return preparation_failure
+            lease_id = None
             if lease is not None:
-                request.lease_id = lease.lease_id
-            return await self._execute_node_via_worker(workflow, request, wm, worker)
+                lease_id = lease.lease_id
+            return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id, lease_id=lease_id)
         finally:
             wm.release_after_node(lease)
 
@@ -3898,24 +4050,26 @@ class NodeManager(EngineScoped):
                 f"Failed because {unavailable} Reload your libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker = wm.get_worker_for_key(scope.worker_key)
-        if worker is None:
+        worker_engine_id = wm.get_worker_for_key(scope.worker_key)
+        if worker_engine_id is None:
             details = (
                 f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
                 "Failed because the background process that runs Isolated Execution is not running. Reload your "
                 "libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        return await self._execute_node_via_worker(workflow, request, wm, worker)
+        return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id)
 
     async def _execute_node_via_worker(
         self,
         workflow: WorkflowRuntime,
         request: ExecuteNodeRequest,
         wm: WorkerManager,
-        worker: tuple[str, str],
+        worker_engine_id: str,
+        *,
+        lease_id: str | None = None,
     ) -> ResultPayload:
-        """Dispatch ExecuteNodeRequest to a worker and return its result.
+        """Dispatch ExecuteNodeRequest to a worker, under `lease_id` for one another engine runs, and return its result.
 
         The worker loads a copy of the node from the request on every call and
         discards it after aprocess returns; ExecuteNodeRequest is a pure RPC
@@ -3931,7 +4085,6 @@ class NodeManager(EngineScoped):
                 f"its input {', '.join(unsendable)} cannot be sent there."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
@@ -3942,19 +4095,11 @@ class NodeManager(EngineScoped):
         target_request_id = request.request_id
         # The same dict is cleared below even if the workflow closes while the node runs.
         orch_worker_requests = workflow.nodes.orch_worker_requests
-        orch_worker_requests[request.node_name] = (
-            target_request_id,
-            worker_engine_id,
-            worker_request_topic,
-        )
+        orch_worker_requests[request.node_name] = (target_request_id, worker_engine_id)
         try:
             event_request = EventRequest(request=request)
             event_request.request_id = target_request_id
-            execute_raw = await wm.route_to_worker(
-                event_request,
-                worker_engine_id,
-                worker_request_topic,
-            )
+            execute_raw = await wm.route_to_worker(event_request, worker_engine_id, lease_id=lease_id)
         except WorkerGoneError as err:
             # A failure, not a cancellation: the resolution machine reaps cancellations as CANCELED,
             # emitting no NodeErrorEvent and logging one unnamed line, so the node would come back
@@ -3996,14 +4141,10 @@ class NodeManager(EngineScoped):
         entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
-        target_request_id, worker_engine_id, worker_request_topic = entry
+        target_request_id, worker_engine_id = entry
         wm = self.engine.worker_manager
         cancel_request = CancelExecuteNodeRequest(target_request_id=target_request_id)
-        await wm.forward_event_to_worker(
-            EventRequest(request=cancel_request),
-            worker_engine_id=worker_engine_id,
-            worker_request_topic=worker_request_topic,
-        )
+        await wm.forward_event_to_worker(EventRequest(request=cancel_request), worker_engine_id=worker_engine_id)
 
     @staticmethod
     def _orchestrator_node_missing(request: ExecuteNodeRequest, workflow: WorkflowRuntime | None) -> str:
@@ -4588,7 +4729,6 @@ class NodeManager(EngineScoped):
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
-                    value_supplied_by_connection=parameter.name in request.values_supplied_by_connections,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -5503,7 +5643,6 @@ class NodeManager(EngineScoped):
         create_node_request: CreateNodeRequest,
         *,
         serialize_all_parameter_values: bool = False,
-        value_supplied_by_connection: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -5522,7 +5661,6 @@ class NodeManager(EngineScoped):
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
-            value_supplied_by_connection (bool): If True, leave out the set value: a connection in the destination flow supplies it. The output value is still saved.
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
@@ -5546,11 +5684,7 @@ class NodeManager(EngineScoped):
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
         # If serialize_all_parameter_values is True, save all parameter values regardless.
-        # A value a connection will supply is not saved at all: replaying it would only have it
-        # validated against the parameter's current rules, and then overwritten by the connection.
-        if value_supplied_by_connection:
-            internal_value = None
-        elif (
+        if (
             serialize_all_parameter_values
             or parameter.name in node.parameter_values
             or (parameter.default_value is not None and effective_value == parameter.default_value)

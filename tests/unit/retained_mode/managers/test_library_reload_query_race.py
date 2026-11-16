@@ -180,7 +180,7 @@ class TestQueriesDuringLibraryReload:
             patch.object(
                 library_manager, "load_all_libraries_from_config", side_effect=spy_load_all_libraries_from_config
             ),
-            patch.object(library_manager.workers, "maybe_start_workers_for_existing_session", AsyncMock()),
+            patch.object(library_manager.workers, "start_workers_after_loading", AsyncMock()),
         ):
             await library_manager._run_reload_libraries(ReloadAllLibrariesRequest())
 

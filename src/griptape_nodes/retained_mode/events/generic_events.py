@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
 from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     WorkflowNotAlteredMixin,
@@ -27,9 +28,14 @@ class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """The request's envelope named a workflow the engine doesn't have open, so it was not handled.
 
     The one failure for every request whose envelope `open_workflow_id` names no open workflow,
-    whatever the request, so a client can tell it apart and reopen the workflow or refresh what is
-    open. HOST requests (`RequestScope`) ignore the id, so they never fail with it.
+    whatever the request, so a client can tell it apart and reopen the workflow or pick another.
+    HOST requests (`RequestScope`) ignore the id, so they never fail with it.
+
+    Args:
+        open_workflows: Every workflow the engine has open, as ListOpenWorkflowsRequest lists them.
     """
+
+    open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)
 
 
 @dataclass

@@ -175,7 +175,7 @@ class WorkflowPackager:
     # -- Progress events --
 
     def emit_progress(self, additional: float, message: str) -> None:
-        """Emit a publish progress event."""
+        """Emit a publish progress event, named by the workflow being published when the publish runs bound to it."""
         self._progress = min(self._progress + additional, 100.0)
         event = ExecutionGriptapeNodeEvent(
             wrapped_event=ExecutionEvent(payload=PublishWorkflowProgressEvent(progress=self._progress, message=message))
@@ -206,7 +206,7 @@ class WorkflowPackager:
         default exclusions.
         """
         if ignore_patterns is None:
-            ignore_patterns = [".venv", ".venv-exec", "__pycache__", ".git"]
+            ignore_patterns = [".venv", ".venv-exec", ".venv-dev", "__pycache__", ".git"]
         result = GriptapeNodes.handle_request(
             CopyTreeRequest(
                 source_path=str(source_path),

@@ -38,7 +38,14 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
-from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeInstance
+from griptape_nodes.retained_mode.managers.resource_types.compute_resource import (
+    ComputeBackend,
+    ComputeInstance,
+    ComputeResourceType,
+    detect_compute_capabilities,
+)
+from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType, detect_cpu_capabilities
+from griptape_nodes.retained_mode.managers.resource_types.os_resource import OSResourceType, detect_os_capabilities
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 
@@ -130,6 +137,29 @@ class ResourceManager(EngineScoped):
 
         # Register event handlers
         event_manager.register_request_handlers(self)
+
+        # Libraries check their requirements against these as they load.
+        self._register_system_resources()
+
+    def _register_system_resources(self) -> None:
+        """Register this machine's OS, CPU, and compute resources."""
+        system_resources: list[tuple[ResourceType, dict[str, Any]]] = [
+            (OSResourceType(), detect_os_capabilities()),
+            (CPUResourceType(), detect_cpu_capabilities()),
+            (ComputeResourceType(), detect_compute_capabilities()),
+        ]
+        for resource_type, capabilities in system_resources:
+            type_name = type(resource_type).__name__
+            self.on_register_resource_type_request(RegisterResourceTypeRequest(resource_type=resource_type))
+            result = self.on_create_resource_instance_request(
+                CreateResourceInstanceRequest(resource_type_name=type_name, capabilities=capabilities)
+            )
+            if not isinstance(result, CreateResourceInstanceResultSuccess):
+                logger.error(
+                    "Attempted to create the system %s resource instance. Failed due to: %s",
+                    type_name,
+                    result.result_details,
+                )
 
     # Public Event Handlers
     @handles(ListRegisteredResourceTypesRequest)
@@ -508,11 +538,14 @@ class ResourceManager(EngineScoped):
             return default
         return entry.value
 
-    def drop_local_object(self, key: str, *, owner: str | None = None) -> bool:
+    def drop_local_object(self, key: str, *, owner: str | None = None, defer_during_execution: bool = True) -> bool:
         """Release one held object. Returns whether it was released.
 
         Pass `owner` to refuse a key belonging to someone else: releasing it would run their teardown
         under them and leave their still-valid keys reporting the object as gone.
+
+        `defer_during_execution=False` runs the release hook now even while nodes are running, for a caller
+        that knows no running node still uses the object.
         """
         with self._local_objects_lock:
             entry = self._local_objects.get(key)
@@ -530,7 +563,7 @@ class ResourceManager(EngineScoped):
             survives = self._value_still_held_locked(entry.value)
 
         if not survives:
-            self._invoke_hooks_once_per_object({key: entry})
+            self._invoke_hooks_once_per_object({key: entry}, defer_during_execution=defer_during_execution)
         return True
 
     def release_parked_key(self, key: str, *, owner: str) -> bool:
@@ -688,10 +721,11 @@ class ResourceManager(EngineScoped):
         self._invoke_hooks_once_per_object(to_release)
         return len(doomed)
 
-    def drop_objects_for_group(self, group: str | None) -> int:
+    def drop_objects_for_group(self, group: str | None, *, defer_during_execution: bool = True) -> int:
         """Release everything one group parked in this process, leaving its co-tenants' objects alone.
 
         The namespace is the owner, so a group sharing an owner with others cannot be found by owner alone.
+        `defer_during_execution` is as for `drop_local_object`.
         """
         with self._local_objects_lock:
             doomed = {key: entry for key, entry in self._local_objects.items() if entry.group == group}
@@ -701,7 +735,7 @@ class ResourceManager(EngineScoped):
             # so one group's release must not tear down what another is still handing out.
             to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
 
-        self._invoke_hooks_once_per_object(to_release)
+        self._invoke_hooks_once_per_object(to_release, defer_during_execution=defer_during_execution)
         return len(doomed)
 
     def _current_workflow_id(self) -> str | None:

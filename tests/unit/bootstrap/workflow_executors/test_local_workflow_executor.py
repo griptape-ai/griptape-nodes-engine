@@ -1,18 +1,26 @@
-"""Unit tests for LocalWorkflowExecutor._load_project."""
+"""Unit tests for LocalWorkflowExecutor project activation, CLI arguments, and flow input."""
 
+import os
 from argparse import ArgumentParser
+from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest  # type: ignore[reportMissingImports]
 
 from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import (
+    STORAGE_BACKEND_ENV_VAR,
     LocalExecutorError,
     LocalWorkflowExecutor,
 )
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import StartNode
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.project_events import (
+    ActivateWorkspaceProjectRequest,
+    ActivateWorkspaceProjectResultFailure,
+    ActivateWorkspaceProjectResultSuccess,
+    LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
 )
@@ -127,6 +135,111 @@ class TestLoadProject:
         assert set_request.project_id == opaque_id
 
 
+class TestEnterActivatesProject:
+    """`__aenter__` activates a project before broadcasting AppInitializationComplete (#6214)."""
+
+    @staticmethod
+    def _executor(project_file_path: Path | None = None) -> LocalWorkflowExecutor:
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._project_file_path = project_file_path
+        executor._skip_library_loading = True
+        executor._workflows_to_register = []
+        return executor
+
+    @staticmethod
+    def _broadcasts(mock_gn: MagicMock) -> list[object]:
+        return [call.args[0] for call in mock_gn.EventManager.return_value.abroadcast_app_event.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_activates_configured_project_before_app_initialization(self) -> None:
+        """Without --project-file-path, the configured project is activated before boot completes."""
+        order: list[str] = []
+        activated = ActivateWorkspaceProjectResultSuccess(result_details="Activated workspace project: p")
+
+        async def handle_request(request: object) -> object:
+            order.append(type(request).__name__)
+            return activated
+
+        async def broadcast(event: object) -> None:
+            order.append(type(event).__name__)
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(side_effect=handle_request)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock(side_effect=broadcast)
+
+            await self._executor().__aenter__()
+
+        assert order == [ActivateWorkspaceProjectRequest.__name__, AppInitializationComplete.__name__]
+
+    @pytest.mark.asyncio
+    async def test_activation_fails_if_project_file_missing(self) -> None:
+        """The executor asks for a missing project_file to fail rather than fall back to the workspace project."""
+        activated = ActivateWorkspaceProjectResultSuccess(result_details="Activated workspace project: p")
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(return_value=activated)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            await self._executor().__aenter__()
+
+        request = mock_gn.ahandle_request.call_args.args[0]
+        assert isinstance(request, ActivateWorkspaceProjectRequest)
+        assert request.fail_if_project_file_missing is True
+
+    @pytest.mark.asyncio
+    async def test_configured_project_that_fails_to_activate_fails_the_run(self) -> None:
+        """A configured project that is denied or broken raises instead of falling back to system defaults."""
+        denied = ActivateWorkspaceProjectResultFailure(
+            result_details="Attempted to activate workspace project at '/p/griptape-nodes-project.yml'. "
+            "Failed because Denied by the license policy."
+        )
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(return_value=denied)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            with pytest.raises(LocalExecutorError, match="Denied by the license policy"):
+                await self._executor().__aenter__()
+
+            assert self._broadcasts(mock_gn) == []
+
+    @pytest.mark.asyncio
+    async def test_no_configured_project_stays_on_system_defaults(self) -> None:
+        """With nothing configured the activation is a no-op success and the run proceeds."""
+        no_project = ActivateWorkspaceProjectResultSuccess(
+            result_details="No workspace project found; system defaults remain active"
+        )
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(return_value=no_project)
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            executor = self._executor()
+            assert await executor.__aenter__() is executor
+
+            broadcasts = self._broadcasts(mock_gn)
+            assert len(broadcasts) == 1
+            assert isinstance(broadcasts[0], AppInitializationComplete)
+
+    @pytest.mark.asyncio
+    async def test_explicit_project_file_path_skips_workspace_activation(self) -> None:
+        """--project-file-path is loaded directly; the configured project is not consulted."""
+        mock_load_result = MagicMock(spec=LoadProjectTemplateResultSuccess)
+        mock_load_result.project_id = "proj-123"
+        mock_set_result = MagicMock(spec=SetCurrentProjectResultSuccess)
+        mock_set_result.failed.return_value = False
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(side_effect=[mock_load_result, mock_set_result])
+            mock_gn.EventManager.return_value.abroadcast_app_event = AsyncMock()
+
+            await self._executor(Path("/some/project.yaml")).__aenter__()
+
+        requests = [call.args[0] for call in mock_gn.ahandle_request.call_args_list]
+        assert isinstance(requests[0], LoadProjectTemplateRequest)
+        assert not any(isinstance(request, ActivateWorkspaceProjectRequest) for request in requests)
+
+
 class TestPrepareWorkflowForRunStorageBackend:
     """Regression tests for issue #4828.
 
@@ -189,6 +302,47 @@ class TestPrepareWorkflowForRunStorageBackend:
         assert "storage_backend" not in await_args.kwargs
 
 
+class TestSetStorageBackend:
+    """The executor applies a storage backend through the environment, never the user's config file."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_storage_backend_env_var(self) -> Iterator[None]:
+        # patch.dict restores os.environ afterwards, removing the variable the executor sets.
+        # monkeypatch.delenv would not: it records nothing to undo when the variable is absent.
+        with patch.dict(os.environ):
+            os.environ.pop(STORAGE_BACKEND_ENV_VAR, None)
+            yield
+
+    def test_explicit_backend_sets_env_var(self) -> None:
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=False):
+            LocalWorkflowExecutor(storage_backend=StorageBackend.GTC)
+
+        assert os.environ[STORAGE_BACKEND_ENV_VAR] == StorageBackend.GTC.value
+
+    def test_no_backend_leaves_env_var_unset(self) -> None:
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=False):
+            LocalWorkflowExecutor()
+
+        assert STORAGE_BACKEND_ENV_VAR not in os.environ
+
+    def test_no_backend_keeps_a_user_set_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(STORAGE_BACKEND_ENV_VAR, StorageBackend.GTC.value)
+
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=False):
+            LocalWorkflowExecutor()
+
+        assert os.environ[STORAGE_BACKEND_ENV_VAR] == StorageBackend.GTC.value
+
+    def test_backend_is_ignored_once_an_engine_exists(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The running engine already picked its storage driver; setting the variable now would
+        # only reach workers it spawns later, putting them on a different backend.
+        with patch(f"{MODULE_PATH}.has_current_engine", return_value=True):
+            LocalWorkflowExecutor(storage_backend=StorageBackend.GTC)
+
+        assert STORAGE_BACKEND_ENV_VAR not in os.environ
+        assert "Ignored because the engine had already started" in caplog.text
+
+
 class TestLocalWorkflowExecutorCli:
     """Tests for LocalWorkflowExecutor's CLI surface (issue #4599)."""
 
@@ -199,7 +353,7 @@ class TestLocalWorkflowExecutorCli:
         args = parser.parse_args([])
 
         # Base-class flags carry through.
-        assert args.storage_backend == StorageBackend.LOCAL.value
+        assert args.storage_backend is None
         assert args.project_file_path is None
 
     def test_save_on_failure_absent_is_none(self) -> None:
@@ -239,14 +393,15 @@ class TestLocalWorkflowExecutorCli:
 
         assert kwargs["save_on_failure_path"] == "/var/dump.py"
 
-    def test_cli_constructor_kwargs_storage_backend_default_is_local_enum(self) -> None:
+    def test_cli_constructor_kwargs_storage_backend_default_is_none(self) -> None:
+        # None keeps the configured storage backend instead of forcing local.
         parser = ArgumentParser()
         LocalWorkflowExecutor.add_cli_arguments(parser)
         args = parser.parse_args([])
 
         kwargs = LocalWorkflowExecutor._cli_constructor_kwargs(args)
 
-        assert kwargs["storage_backend"] == StorageBackend.LOCAL
+        assert kwargs["storage_backend"] is None
 
     def test_cli_constructor_kwargs_with_gtc_storage_backend(self) -> None:
         parser = ArgumentParser()

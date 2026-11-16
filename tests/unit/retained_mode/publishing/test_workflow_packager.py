@@ -1,5 +1,6 @@
 """Tests for WorkflowPackager: library dependency resolution and clean-rebuild publishing."""
 
+import asyncio
 import json
 import logging
 import re
@@ -36,6 +37,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesRequest,
     GetAllSecretValuesResultSuccess,
 )
+from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowProgressEvent
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.publishing import workflow_packager
@@ -2140,3 +2142,33 @@ def _make_packageable_workflow(name: str, file_path: str) -> Workflow:
     # The registry form `file_path` reports, set as the registry would when it registers the entry.
     workflow._keys = workflow._keys._replace(file_path=file_path)
     return workflow
+
+
+class TestEmitProgress:
+    def test_progress_names_the_workflow_being_published(self, engine: Engine) -> None:
+        publishing = engine.open_workflow(engine.workflow_registry.register_unsaved("published").workflow_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+
+        with engine.bind_workflow(publishing):
+            WorkflowPackager("published").emit_progress(10.0, "Packaging")
+
+        queued = queue.get_nowait()
+        assert isinstance(queued.wrapped_event.payload, PublishWorkflowProgressEvent)
+        assert queued.wrapped_event.open_workflow_id == publishing.workflow_id
+
+
+class TestCopyTree:
+    @pytest.mark.parametrize("env_dir", [".venv", ".venv-exec", ".venv-dev"])
+    def test_default_exclusions_skip_library_envs(self, engine: Engine, tmp_path: Path, env_dir: str) -> None:  # noqa: ARG002
+        """A library's environment directories stay out of the bundle; its source is copied."""
+        source = tmp_path / "library"
+        (source / env_dir / "lib").mkdir(parents=True)
+        (source / env_dir / "lib" / "pkg.py").write_text("", encoding="utf-8")
+        (source / "node.py").write_text("", encoding="utf-8")
+        destination = tmp_path / "bundle"
+
+        WorkflowPackager.copy_tree(source, destination)
+
+        assert (destination / "node.py").is_file()
+        assert not (destination / env_dir).exists()

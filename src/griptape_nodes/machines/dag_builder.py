@@ -121,6 +121,9 @@ class DagBuilder:
         if graph is None:
             graph = DirectedGraph()
             self.graphs[graph_name] = graph
+        # Checked on its own: cleanup_empty_graph_nodes drops a graph's node set but keeps the
+        # emptied graph, so a graph existing does not mean its node set does.
+        if graph_name not in self.graph_to_nodes:
             self.graph_to_nodes[graph_name] = set()
 
         def _add_node_recursive(current_node: BaseNode, visited: set[str], graph: DirectedGraph) -> None:
@@ -203,6 +206,10 @@ class DagBuilder:
         if not upstream_connection:
             return None
         upstream_node, _ = upstream_connection
+        # A node wired to itself (a group's own current_item feeding its own new_item_to_add) supplies
+        # that value while it runs. It is not something to run first, and a self-edge would never clear.
+        if upstream_node is node:
+            return None
         if upstream_node.name in nodes_to_exclude:
             return None
         if upstream_node.state == NodeResolutionState.RESOLVED:

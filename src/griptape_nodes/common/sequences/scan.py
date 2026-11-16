@@ -6,7 +6,7 @@ lists the resolved directory via `ListDirectoryRequest`, hands the filenames
 to `fileseq.findSequencesInList`, applies subset clipping and the chosen
 missing-item policy, and returns a `ScanOutcome` carrying the inferred
 sequences plus diagnostic flags. The intended caller is
-`OSManager.on_scan_sequences_request`; other callers are welcome but should
+`FileSequences.on_scan_sequences_request`; other callers are welcome but should
 prefer dispatching the bus request unless they have a strong reason to
 bypass the worker-thread / async-dispatch path.
 

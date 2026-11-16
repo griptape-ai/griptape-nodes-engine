@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.topics import REQUEST_TOPIC, client_response_topic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -65,17 +66,26 @@ class RequestClient:
         client: Client,
         request_topic_fn: Callable[[], str] | None = None,
         response_topic_fn: Callable[[], str] | None = None,
+        *,
+        session_id: str | None = None,
     ) -> None:
         """Initialize request/response client.
 
         Args:
             client: Client instance to use for communication
             request_topic_fn: Function to determine request topic (defaults to "request")
-            response_topic_fn: Function to determine response topic (defaults to "response")
+            response_topic_fn: Function to determine response topic (defaults to this client's own
+                reply topic, so no other client gets its results:
+                `sessions/<session_id>/clients/<client_id>/response`, or `clients/<client_id>/response`
+                while `session_id` is None)
+            session_id: The session this client works in, which puts its reply topic under the
+                session. Set `session_id` once the client learns it, such as after `AppStartSessionRequest`.
         """
         self.client = client
-        self.request_topic_fn = request_topic_fn or (lambda: "request")
-        self.response_topic_fn = response_topic_fn or (lambda: "response")
+        self.client_id = uuid.uuid4().hex
+        self.session_id = session_id
+        self.request_topic_fn = request_topic_fn or (lambda: REQUEST_TOPIC)
+        self.response_topic_fn = response_topic_fn or (lambda: client_response_topic(self.session_id, self.client_id))
 
         # Map of request_id -> pending request where tag identifies the originating worker/caller
         self._pending_requests: dict[str, _PendingRequest] = {}

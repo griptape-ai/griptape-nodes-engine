@@ -437,6 +437,44 @@ class TestReleasingWhileANodeRuns:
         assert released == ["first"]
 
 
+class TestALibraryReleasingItsOwnObjectWhileANodeRuns:
+    """A library drops a model to free its memory before loading the next one, inside a running node.
+
+    Deferring that release would leave both models resident until the run ends, so a library's own drop
+    runs its hook now. The library is trusted not to drop what a running node still uses.
+    """
+
+    def test_a_drop_frees_the_object_now(self) -> None:
+        node = _node()
+        released: list[str] = []
+        key = node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+
+        with node.local_objects._manager().engine.event_manager.node_execution_scope():
+            assert node.local_objects.drop(key) is True
+            assert released == ["first"]
+
+    def test_clearing_the_library_frees_its_objects_now(self) -> None:
+        node = _node()
+        released: list[str] = []
+        node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+
+        with node.local_objects._manager().engine.event_manager.node_execution_scope():
+            assert node.local_objects.drop_all() == 1
+            assert released == ["first"]
+
+    def test_nothing_is_left_for_the_drain(self) -> None:
+        node = _node()
+        released: list[str] = []
+        key = node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+        manager = node.local_objects._manager()
+
+        with manager.engine.event_manager.node_execution_scope():
+            node.local_objects.drop(key)
+
+        assert manager.drain_deferred_releases() == 0
+        assert released == ["first"]
+
+
 class TestReadingTheDictDirectly:
     """A node body that indexes `parameter_values` gets the object, not the reference standing for it.
 

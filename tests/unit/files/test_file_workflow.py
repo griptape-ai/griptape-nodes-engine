@@ -21,7 +21,7 @@ from griptape_nodes.files.directory import Directory, DirectoryDestination
 from griptape_nodes.files.file import File, FileDestination
 from griptape_nodes.files.file_sequence import FileSequence, FileSequenceDestination
 from griptape_nodes.files.project_file import ProjectFileDestination
-from griptape_nodes.retained_mode.events import connection_events
+from griptape_nodes.retained_mode.events import destination_events
 from griptape_nodes.retained_mode.events.os_events import (
     GetNextVersionIndexRequest,
     GetNextVersionIndexResultSuccess,
@@ -199,18 +199,30 @@ class TestAHandleBuiltWhereNoneIsBound:
         assert file.workflow is None
 
 
-def _saver_node(
-    engine: Engine, workflow: _RecordingWorkflow, *incoming: connection_events.IncomingConnection
-) -> mock.MagicMock:
+_CONNECTED_DESTINATION_RESULTS: dict[type[RequestPayload], Any] = {
+    destination_events.GetConnectedFileDestinationRequest: destination_events.GetConnectedFileDestinationResultSuccess,
+    destination_events.GetConnectedDirectoryDestinationRequest: (
+        destination_events.GetConnectedDirectoryDestinationResultSuccess
+    ),
+    destination_events.GetConnectedFileSequenceDestinationRequest: (
+        destination_events.GetConnectedFileSequenceDestinationResultSuccess
+    ),
+}
+
+
+def _saver_node(engine: Engine, workflow: _RecordingWorkflow, *, connected: object | None = None) -> mock.MagicMock:
+    """A node in `workflow` whose output parameter has the settings `connected` supplies, or none."""
     node = mock.MagicMock()
     node.name = "Saver"
     node.engine = engine
     node.workflow = workflow.runtime
     node._require_workflow.return_value = workflow.runtime
     node.get_parameter_value.return_value = "out.png"
-    node._handle_request_in_workflow.return_value = connection_events.ListConnectionsForNodeResultSuccess(
-        result_details="ok", incoming_connections=list(incoming), outgoing_connections=[]
-    )
+
+    def answer(request: RequestPayload) -> ResultPayload:
+        return _CONNECTED_DESTINATION_RESULTS[type(request)](destination=connected, result_details="ok")
+
+    node._handle_request_in_workflow.side_effect = answer
     return node
 
 
@@ -226,22 +238,8 @@ class TestBuildFile:
 
     def test_an_upstream_destination_built_on_a_raw_thread_writes_in_the_nodes_workflow(self, engine: Engine) -> None:
         a = _RecordingWorkflow("/a/out.png")
-
-        class _Settings:
-            @property
-            def file_destination(self) -> FileDestination:
-                return FileDestination("{outputs}/out.png")
-
-        node = _saver_node(
-            engine,
-            a,
-            connection_events.IncomingConnection(
-                source_node_name="Settings",
-                source_parameter_name="file_destination",
-                target_parameter_name="output_file",
-            ),
-        )
-        a.objects.get.return_value = _Settings()
+        settings_spec = FileDestination("{outputs}/out.png").to_spec()
+        node = _saver_node(engine, a, connected=settings_spec)
         parameter = ProjectFileParameter(node, "output_file", default_filename="out.png")
 
         destination = _in_raw_thread(parameter.build_file)

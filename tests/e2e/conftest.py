@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.utils.version_utils import engine_version
+from tests.worker_processes import no_local_worker_processes  # noqa: F401 (an autouse fixture)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence

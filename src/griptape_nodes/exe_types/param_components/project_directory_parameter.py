@@ -14,7 +14,7 @@ from griptape_nodes.common.project_templates import situation as situation_mod
 from griptape_nodes.exe_types.param_components import project_output_parameter
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import path_utils, situation_resolver
-from griptape_nodes.retained_mode.events import os_events, project_events
+from griptape_nodes.retained_mode.events import destination_events, os_events, project_events
 from griptape_nodes.traits import file_system_picker
 
 if typing.TYPE_CHECKING:
@@ -94,8 +94,8 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
     def build_directory(self, **extra_vars: str | int) -> directory_mod.DirectoryDestination:
         """Build a DirectoryDestination from the parameter's current value.
 
-        If an upstream node implements ``DirectoryDestinationProvider``, its
-        ``DirectoryDestination`` is retrieved directly. Otherwise the parameter's
+        If a node implementing ``DirectoryDestinationProvider`` is connected to this
+        parameter, its ``DirectoryDestination`` is used. Otherwise the parameter's
         string value is used as the directory name, combined with the situation macro.
 
         Args:
@@ -108,12 +108,14 @@ class ProjectDirectoryParameter(project_output_parameter.ProjectOutputParameter)
         built and used from any thread.
 
         Raises:
-            ValueError: If an upstream DirectoryDestinationProvider is connected but returns None.
+            ValueError: If the connected settings node can't be read or has no destination set.
         """
         upstream = self._get_upstream_destination(
-            directory_mod.DirectoryDestinationProvider,
-            lambda provider: provider.directory_destination,
-            "DirectoryDestination",
+            destination_events.GetConnectedDirectoryDestinationRequest(
+                node_name=self._node.name, parameter_name=self._name
+            ),
+            destination_events.GetConnectedDirectoryDestinationResultSuccess,
+            directory_mod.DirectoryDestination.from_spec,
         )
         if upstream is not None:
             return upstream
@@ -155,10 +157,14 @@ def _build_directory_destination_from_situation(
     explicit_path = _explicit_directory_path(dirname)
     if explicit_path is not None:
         # The user named the destination, so use it as given rather than nesting it inside the
-        # situation's directory. It is not versioned: the user chose this exact location.
+        # situation's directory. Only a `{###}` slot versions it; without one the user chose this
+        # exact location. OVERWRITE on a slotted path would resolve with the slot unbound and fail.
+        existing_dir_policy = os_events.ExistingFilePolicy.OVERWRITE
+        if _has_version_slot(explicit_path):
+            existing_dir_policy = os_events.ExistingFilePolicy.CREATE_NEW
         return directory_mod.DirectoryDestination(
             explicit_path,
-            existing_dir_policy=os_events.ExistingFilePolicy.OVERWRITE,
+            existing_dir_policy=existing_dir_policy,
             create_parents=True,
             workflow=workflow,
         )
@@ -175,6 +181,15 @@ def _build_directory_destination_from_situation(
         create_parents=resolved.create_parents,
         workflow=workflow,
     )
+
+
+def _has_version_slot(path: str) -> bool:
+    """Return True if `path` contains a `{###}` version slot."""
+    try:
+        variables = macro_parser.ParsedMacro(path).get_variables()
+    except macro_parser.MacroSyntaxError:
+        return False
+    return any(variable.name == macro_parser.SEQUENCE_VARIABLE_NAME for variable in variables)
 
 
 def _explicit_directory_path(dirname: str) -> str | None:

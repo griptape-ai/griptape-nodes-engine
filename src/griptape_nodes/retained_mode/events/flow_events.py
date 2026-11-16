@@ -94,13 +94,17 @@ class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin)
     Use when: Reusing workflows as components, creating modular workflows,
     importing workflow templates, building composite workflows.
 
+    Name the imported workflow by `workflow_id`, by `workflow_name`, or by both when they name the
+    same one.
+
     Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
     """
 
-    workflow_name: str
+    workflow_name: str | None = None
     flow_name: str | None = None  # If None, import into current context flow
     imported_flow_metadata: dict | None = None  # Metadata to apply to the imported flow
     track_as_referenced: bool = True  # If False, the flow serializes as inline content instead of an import command
+    workflow_id: str | None = None
 
 
 @dataclass
@@ -709,6 +713,23 @@ class OriginalNodeParameter(NamedTuple):
     parameter_name: OriginalParameterName
 
 
+class PassthroughConnection(NamedTuple):
+    """A data connection whose source and target both stay outside the package.
+
+    Neither end is a packaged node, so the connection analysis never sees it. The packaged flow
+    carries its value instead: the StartFlow node gets a parameter for the target, mapped to
+    (target_node_name, target_parameter_name) like any other incoming boundary connection; the
+    EndFlow node gets a parameter for the source, mapped to (source_node_name,
+    source_parameter_name) like any other outgoing one; and the two are connected inside the flow.
+    A loop uses this for a wire from its start node straight into its end node.
+    """
+
+    source_node_name: OriginalNodeName
+    source_parameter_name: OriginalParameterName
+    target_node_name: OriginalNodeName
+    target_parameter_name: OriginalParameterName
+
+
 class PackagedNodeParameterMapping(NamedTuple):
     """Parameter mappings for a packaged node (Start or End)."""
 
@@ -746,6 +767,8 @@ class PackageNodesAsSerializedFlowRequest(RequestPayload, GraphAccessMixin):
         entry_control_node_name: Name of the node that should receive the control flow entry (required if entry_control_parameter_name specified)
         entry_control_parameter_name: Name of the control parameter on the entry node (None for auto-detection of first available control parameter)
         output_parameter_prefix: Prefix for parameter names on the generated end node to avoid collisions (defaults to "packaged_node_")
+        node_group_name: Name of the SubflowNodeGroup being packaged, if any
+        passthrough_connections: Data connections whose source and target are both outside the package. Each is carried from the StartFlow node to the EndFlow node inside the packaged flow.
 
     Results: PackageNodesAsSerializedFlowResultSuccess (with serialized flow and node name mapping) | PackageNodesAsSerializedFlowResultFailure
     """
@@ -760,6 +783,8 @@ class PackageNodesAsSerializedFlowRequest(RequestPayload, GraphAccessMixin):
     entry_control_parameter_name: str | None = None
     output_parameter_prefix: str = "packaged_node_"
     node_group_name: str | None = None  # Name of the SubflowNodeGroup if packaging a group
+    # Data connections with both ends outside the package, carried StartFlow -> EndFlow inside it
+    passthrough_connections: list[PassthroughConnection] = field(default_factory=list)
 
 
 @dataclass

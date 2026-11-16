@@ -10,7 +10,7 @@ import typing
 
 from griptape_nodes.common import macro_parser
 from griptape_nodes.files import project_file, workflow_requests
-from griptape_nodes.retained_mode.events import os_events, project_events
+from griptape_nodes.retained_mode.events import destination_events, os_events, project_events
 
 if typing.TYPE_CHECKING:
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -172,6 +172,14 @@ class DirectoryDestination:
                 msg = f"Unsupported existing directory policy: {self._existing_dir_policy!r}"
                 raise DirectoryError(msg)
 
+    def to_spec(self) -> destination_events.DirectoryDestinationSpec:
+        """Return this destination as plain data that can be sent to another process."""
+        return destination_events.DirectoryDestinationSpec(
+            dir_path=self._directory._dir_path,
+            existing_dir_policy=self._existing_dir_policy,
+            create_parents=self._create_parents,
+        )
+
     def _create_with_versioning(self) -> Directory:
         """Use GetNextVersionIndexRequest to find an available version slot, then create it.
 
@@ -245,6 +253,18 @@ class DirectoryDestination:
 
         return _map_to_macro_directory(resolved, self._directory._dir_path, workflow)
 
+    @classmethod
+    def from_spec(
+        cls, spec: destination_events.DirectoryDestinationSpec, workflow: WorkflowRuntime | None = None
+    ) -> DirectoryDestination:
+        """Rebuild a destination from ``to_spec`` output, creating it in ``workflow`` (see ``__init__``)."""
+        return cls(
+            spec.dir_path,
+            existing_dir_policy=spec.existing_dir_policy,
+            create_parents=spec.create_parents,
+            workflow=workflow,
+        )
+
 
 def _resolve_dir_path(dir_path: str | project_events.MacroPath, workflow: WorkflowRuntime | None) -> str:
     """Resolve a directory path, handling MacroPath resolution if needed.
@@ -300,7 +320,11 @@ def _map_to_macro_directory(
 
 @typing.runtime_checkable
 class DirectoryDestinationProvider(typing.Protocol):
-    """Protocol for nodes that provide a DirectoryDestination without serializing it over the wire."""
+    """Protocol for nodes that provide a DirectoryDestination to a connected output parameter.
+
+    The engine reads the property where the node lives and sends the destination as plain data, so
+    a node running in a worker receives it too.
+    """
 
     @property
     def directory_destination(self) -> DirectoryDestination | None:

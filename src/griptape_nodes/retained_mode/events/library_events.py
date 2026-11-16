@@ -20,6 +20,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue
+from griptape_nodes.traits.options import Options
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
@@ -232,15 +233,20 @@ class ParameterDescription:
         input_types: Accepted input types when used as an input
         output_type: Type produced when used as an output
         default_value: Default value for the parameter (may be None)
-        tooltip: General tooltip text (string or structured list)
-        tooltip_as_input/property/output: Mode-specific tooltips (None if unset)
+        tooltip: General tooltip text (string or structured list). None when the request left
+            tooltips out.
+        tooltip_as_input/property/output: Mode-specific tooltips (None if unset, or when the
+            request left tooltips out)
         mode_allowed_input/property/output: Whether the parameter supports each mode
         settable: Whether the parameter can be set directly by the user
-        ui_options: UI configuration options (includes display_name when set)
+        ui_options: UI configuration options (includes display_name when set). None when the
+            request left ui_options out.
         parent_container_name: Name of the parent ParameterGroup, if any
         element_type: Element class name, e.g. "Parameter", "ParameterString", or "ParameterList".
             "ParameterList" marks a multi-input that accepts several incoming connections, one per item.
         max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
+        options: The choices a dropdown or multi-select offers, or None when the parameter is
+            neither. Read from ui_options, but kept when ui_options are left out.
     """
 
     name: str
@@ -248,7 +254,7 @@ class ParameterDescription:
     input_types: list[str]
     output_type: str
     default_value: DisplayValue
-    tooltip: str | list[dict]
+    tooltip: str | list[dict] | None
     tooltip_as_input: str | list[dict] | None
     tooltip_as_property: str | list[dict] | None
     tooltip_as_output: str | list[dict] | None
@@ -260,6 +266,7 @@ class ParameterDescription:
     parent_container_name: str | None
     element_type: str
     max_items: int | None
+    options: list[DisplayValue] | None = None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -289,7 +296,26 @@ class ParameterDescription:
             parent_container_name=param_dict["parent_container_name"],
             element_type=param_dict["element_type"],
             max_items=max_items,
+            options=_choices_from_ui_options(param_dict["ui_options"]),
         )
+
+
+def _choices_from_ui_options(ui_options: dict | None) -> list | None:
+    """The choices a dropdown or multi-select offers, or None when the parameter is neither.
+
+    ui_options carries the choices of an attached Options or MultiOptions trait, as well as ones a
+    library wrote into ui_options directly.
+    """
+    if not ui_options:
+        return None
+    for choices_key in Options.CHOICES_KEYS:
+        choices = ui_options.get(choices_key)
+        if isinstance(choices, list):
+            return list(choices)
+    multi_options = ui_options.get("multi_options")
+    if isinstance(multi_options, dict) and isinstance(multi_options.get("choices"), list):
+        return list(multi_options["choices"])
+    return None
 
 
 @dataclass
@@ -304,16 +330,29 @@ class DescribeNodeTypeRequest(RequestPayload):
     Note: the engine instantiates a throwaway node to read its parameters. Node types whose
     __init__ performs network or disk I/O will incur that cost here as well.
 
+    To plan a workflow, describe each node type with every include_* set to False, in one
+    EventRequestBatch: that keeps names, types, modes, defaults and dropdown `options`, which is
+    what wiring and setting values needs.
+
     Args:
         node_type: Name of the node type to describe
         library: Name of the library providing the node type. If omitted and exactly one
             library registers this node type, that library is used; otherwise the request fails.
+        include_metadata: Return the node type's library metadata (category, description,
+            display_name, ...). Listing the node types with ListNodeTypesInLibraryRequest and
+            include_metadata already gives it.
+        include_tooltips: Return each parameter's tooltips.
+        include_ui_options: Return each parameter's ui_options. Dropdown choices stay available
+            in `options` either way.
 
     Results: DescribeNodeTypeResultSuccess | DescribeNodeTypeResultFailure
     """
 
     node_type: str
     library: str | None = None
+    include_metadata: bool = True
+    include_tooltips: bool = True
+    include_ui_options: bool = True
 
 
 @dataclass
@@ -324,7 +363,8 @@ class DescribeNodeTypeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
     Args:
         library: Library that provided the node type
         node_type: Name of the node type
-        metadata: Library-level node metadata (category, description, display_name, tags, icon, color, group)
+        metadata: Library-level node metadata (category, description, display_name, tags, icon,
+            color, group). None when the request left it out.
         parameters: Parameter schemas in declaration order. Empty when the engine could not
             instantiate the probe node used to read parameter declarations (typically because the
             node's `__init__` performed I/O that failed). When that happens, the node-level
@@ -335,7 +375,7 @@ class DescribeNodeTypeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
 
     library: str
     node_type: str
-    metadata: NodeMetadata
+    metadata: NodeMetadata | None
     parameters: list[ParameterDescription] = field(default_factory=list)
 
 
