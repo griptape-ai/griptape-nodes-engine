@@ -37,6 +37,7 @@ from griptape_nodes.app.worker_routing import (
     DropLocalObjectsResultSuccess,
     ReloadAllLibrariesRequest,
     RemoteHandler,
+    WorkerSettleError,
     _handle_drop_all_local_objects,
     _handle_drop_local_objects,
     _ProjectAdoptions,
@@ -73,6 +74,7 @@ from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_work
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from concurrent.futures import Future
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
@@ -632,7 +634,7 @@ class _ProjectManagerThatRequestsSynchronously:
 
 def _install_adoption(
     event_manager: EventManager, project_manager: _ProjectManagerThatRequestsSynchronously
-) -> asyncio.Event:
+) -> Future[None]:
     return register_broadcast_handlers(
         event_manager,
         config_manager=MagicMock(),
@@ -675,7 +677,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
         assert result.succeeded()
         assert project_manager.adopted_on_thread == "engine-loop"
         assert project_manager.probe_succeeded is True
-        assert worker_settled.is_set()
+        assert worker_settled.result(timeout=0) is None
 
     @pytest.mark.asyncio
     async def test_without_an_engine_loop_adoption_is_refused(self, engine: Engine) -> None:
@@ -691,7 +693,7 @@ class TestActivateProjectRunsOnTheEngineLoop:
 
         assert result.failed()
         assert project_manager.adopted_on_thread is None
-        assert not worker_settled.is_set()
+        assert isinstance(worker_settled.exception(timeout=0), WorkerSettleError)
 
 
 class _HeldAdoptions:
@@ -805,7 +807,7 @@ class TestAdoptingAsksTheOrchestrator:
         assert result.succeeded()
         assert isinstance(asked.call_args.args[0], GetCommittedProjectRequest)
         assert project_manager.set_to == ["the-orchestrators"]
-        assert worker_settled.is_set()
+        assert worker_settled.result(timeout=0) is None
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(10, method="thread")
@@ -815,7 +817,7 @@ class TestAdoptingAsksTheOrchestrator:
         event_manager = engine.event_manager
         _bind_queue_to(event_manager, engine_loop)
         project_manager = _RecordingProjectManager()
-        register_broadcast_handlers(
+        worker_settled = register_broadcast_handlers(
             event_manager, config_manager=MagicMock(), project_manager=cast("ProjectManager", project_manager)
         )
         request = GetCommittedProjectRequest()
@@ -830,6 +832,8 @@ class TestAdoptingAsksTheOrchestrator:
         assert isinstance(result, ActivateProjectResultFailure)
         assert "refused" in str(result.result_details)
         assert project_manager.set_to == []
+        # A starting worker waits on this alone, so the failure ends that wait with its reason.
+        assert "refused" in str(worker_settled.exception(timeout=0))
 
 
 class TestSyncDispatchOnTheWebsocketLoop:

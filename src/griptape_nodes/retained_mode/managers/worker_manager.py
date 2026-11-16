@@ -435,8 +435,8 @@ class WorkerManager(EngineScoped):
 
         Sent without awaiting a reply: registration must not depend on a round trip back into the
         worker, which would make answering it hostage to a worker that is merely slow. The worker
-        blocks on having applied an activation before it loads a library instead, which is a wait it
-        can bound locally.
+        blocks on having applied an activation before it loads a library instead, a wait that ends
+        with that adoption, however long this engine takes to answer what it asks.
         """
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 

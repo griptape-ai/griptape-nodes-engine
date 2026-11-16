@@ -13,6 +13,7 @@ import os
 import signal
 import threading
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -47,14 +48,22 @@ if TYPE_CHECKING:
 _TIMEOUT_S = 60.0
 # An engine that takes a worker's hello and never answers it.
 _NEVER_ANSWERS = "never answers"
+# Longer than the bound the slow-engine test gives an accepted worker's waits, and short enough to wait out.
+_SLOW_ANSWER_S = 0.5
+_BOUND_SHORTER_THAN_A_SLOW_ANSWER_S = 0.05
 _WORKER_ID = "the-workers-own-id"
 
 
 class _Engine:
     """The engine the worker works for: answers it, and records what it asked."""
 
-    def __init__(self, channel: AsyncChannel, *, accept: bool | str | None) -> None:
+    def __init__(
+        self, channel: AsyncChannel, *, accept: bool | str | None, answers_after_s: float, knows_project: bool
+    ) -> None:
         self._accept = accept
+        self._answers_after_s = answers_after_s
+        self._knows_project = knows_project
+        self._held: set[str] = set()
         self.hellos: list[dict] = []
         self.secrets: list[str] = []
         self.checkpoints: list[dict] = []
@@ -73,23 +82,35 @@ class _Engine:
                 raise RuntimeError(msg)
             if self._accept == _NEVER_ANSWERS:
                 await asyncio.Event().wait()
+            await self._hold_first("hello")
             return {"accepted": self._accept, "details": "the test's engine decided."}
         if body["type"] == AUTHORIZATION_CHECKPOINT:
             self.checkpoints.append(body["payload"])
             return {"denial": None}
         event_request = read_event_request(body)
         if isinstance(event_request.request, GetSecretValueRequest):
+            await self._hold_first("secret")
             self.secrets.append(event_request.request.key)
             answer = GetSecretValueResultSuccess(value=None, result_details="No such secret.")
             return result_body(
                 EventResultSuccess(request=event_request.request, result=answer, request_id=event_request.request_id)
             )
         if isinstance(event_request.request, GetCommittedProjectRequest):
+            await self._hold_first("project")
+            if not self._knows_project:
+                return request_failure(body, "the test's engine cannot say which project it is on.")
             project = GetCommittedProjectResultSuccess(project_id=SYSTEM_DEFAULTS_KEY, result_details="ok")
             return result_body(
                 EventResultSuccess(request=event_request.request, result=project, request_id=event_request.request_id)
             )
         return request_failure(body, "The test's engine answers only secrets and which project it is on.")
+
+    async def _hold_first(self, kind: str) -> None:
+        """Answer the first question of each kind late, as an engine busy with something else does."""
+        if kind in self._held:
+            return
+        self._held.add(kind)
+        await asyncio.sleep(self._answers_after_s)
 
 
 @pytest.fixture
@@ -110,11 +131,13 @@ def worker_process_state() -> Iterator[None]:
 class _EngineThread:
     """Plays the engine on a loop of its own: listens, and answers the worker once it connects."""
 
-    def __init__(self, *, accept: bool | str | None) -> None:
+    def __init__(self, *, accept: bool | str | None, answers_after_s: float, knows_project: bool) -> None:
         self._loop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, daemon=True).start()
         self._pending = asyncio.run_coroutine_threadsafe(listen_for_worker(), self._loop).result(_TIMEOUT_S)
-        self._accepted = asyncio.run_coroutine_threadsafe(self._accept(accept=accept), self._loop)
+        self._accepted = asyncio.run_coroutine_threadsafe(
+            self._accept(accept=accept, answers_after_s=answers_after_s, knows_project=knows_project), self._loop
+        )
 
     @property
     def child_environment(self) -> dict[str, str]:
@@ -123,13 +146,24 @@ class _EngineThread:
     def engine(self) -> _Engine:
         return self._accepted.result(_TIMEOUT_S)
 
+    def hang_up_once_greeted(self) -> None:
+        """Close the engine's end once the worker has said hello, as an engine that stops mid-answer does."""
+
+        def hang_up() -> None:
+            engine = self.engine()
+            engine.said_hello.wait(_TIMEOUT_S)
+            self._loop.call_soon_threadsafe(engine.channel.close)
+
+        threading.Thread(target=hang_up, daemon=True).start()
+
     def stop(self) -> None:
         """Close the engine's end and let it finish reading, then stop its loop."""
         asyncio.run_coroutine_threadsafe(self._close(), self._loop).result(_TIMEOUT_S)
         self._loop.call_soon_threadsafe(self._loop.stop)
 
-    async def _accept(self, *, accept: bool | str | None) -> _Engine:
-        return _Engine(await self._pending.accept(_TIMEOUT_S), accept=accept)
+    async def _accept(self, *, accept: bool | str | None, answers_after_s: float, knows_project: bool) -> _Engine:
+        channel = await self._pending.accept(_TIMEOUT_S)
+        return _Engine(channel, accept=accept, answers_after_s=answers_after_s, knows_project=knows_project)
 
     async def _close(self) -> None:
         if not self._accepted.done():
@@ -142,9 +176,15 @@ class _EngineThread:
         await asyncio.gather(*channel._tasks, return_exceptions=True)
 
 
-def _listen(monkeypatch: pytest.MonkeyPatch, *, accept: bool | str | None) -> _EngineThread:
+def _listen(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    accept: bool | str | None,
+    answers_after_s: float = 0.0,
+    knows_project: bool = True,
+) -> _EngineThread:
     """Point this process's environment at an engine played by the test."""
-    engine_thread = _EngineThread(accept=accept)
+    engine_thread = _EngineThread(accept=accept, answers_after_s=answers_after_s, knows_project=knows_project)
     for name, value in engine_thread.child_environment.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv(WORKER_ENGINE_ID_ENV, _WORKER_ID)
@@ -189,13 +229,13 @@ def test_a_worker_whose_hello_goes_unanswered_exits_saying_why(
 
 
 @pytest.mark.usefixtures("worker_process_state")
-def test_a_worker_whose_hello_times_out_exits_naming_the_timeout(
+def test_a_worker_whose_engine_goes_away_before_answering_its_hello_exits_saying_why(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A timeout's own message is empty, so the reason names what happened instead."""
+    """An unanswered hello is waited on for as long as the channel is open, and ends when it closes."""
     engine_thread = _listen(monkeypatch, accept=_NEVER_ANSWERS)
     monkeypatch.setattr(runtime, "_exit_now", lambda: None)
-    monkeypatch.setattr(runtime, "_HELLO_TIMEOUT_S", 0.5)
+    engine_thread.hang_up_once_greeted()
 
     try:
         exit_code = run_worker([])
@@ -203,7 +243,48 @@ def test_a_worker_whose_hello_times_out_exits_naming_the_timeout(
         engine_thread.stop()
 
     assert exit_code == 1
-    assert "did not answer its hello: TimeoutError" in caplog.text
+    assert "did not answer its hello: The worker channel is closed." in caplog.text
+
+
+@pytest.mark.usefixtures("worker_process_state")
+def test_a_starting_worker_outwaits_an_engine_slower_than_an_accepted_workers_bound(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A busy engine answers a secret, which project it is on, and the hello late; the worker hears each one."""
+    monkeypatch.setattr(runtime, "PARENT_REQUEST_TIMEOUT_S", _BOUND_SHORTER_THAN_A_SLOW_ANSWER_S)
+    engine_thread = _listen(monkeypatch, accept=False, answers_after_s=_SLOW_ANSWER_S)
+    monkeypatch.setattr(runtime, "_exit_now", lambda: None)
+
+    try:
+        exit_code = run_worker([])
+        engine = engine_thread.engine()
+    finally:
+        engine_thread.stop()
+
+    # Refused, which is the engine's late answer to the hello: giving up on any wait would have ended it sooner.
+    assert exit_code == 1
+    assert len(engine.hellos) == 1
+    assert "refused it: the test's engine decided." in caplog.text
+
+
+@pytest.mark.usefixtures("worker_process_state")
+def test_a_worker_that_cannot_adopt_its_engines_project_exits_saying_why(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The failed adoption ends startup with its own reason, and no library loads against the wrong project."""
+    engine_thread = _listen(monkeypatch, accept=True, knows_project=False)
+    monkeypatch.setattr(runtime, "_exit_now", lambda: None)
+
+    try:
+        exit_code = run_worker([])
+        engine = engine_thread.engine()
+    finally:
+        engine_thread.stop()
+
+    assert exit_code == 1
+    assert engine.hellos == []
+    assert "could not take on the project of the engine that started it" in caplog.text
+    assert "the test's engine cannot say which project it is on." in caplog.text
 
 
 @pytest.mark.usefixtures("worker_process_state")
@@ -239,7 +320,23 @@ def test_started_without_its_engine_the_entry_point_exits_non_zero(monkeypatch: 
 def test_a_worker_waits_longer_than_its_parent_waits_on_another_engine() -> None:
     """A parent running the worker for another engine answers by asking it, so the worker must outwait that."""
     assert runtime.PARENT_REQUEST_TIMEOUT_S > ENGINE_REQUEST_TIMEOUT_S
-    assert runtime._HELLO_TIMEOUT_S > ENGINE_REQUEST_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_a_worker_bounds_what_it_forwards_to_its_engine_only_once_accepted() -> None:
+    """Starting, a forwarded request waits for as long as the channel is open, whatever bound its sender names."""
+    link = MagicMock()
+    link.request_async = AsyncMock(return_value={})
+    side = WorkerSide(link, on_parent_gone=lambda: None)
+    sender = runtime._ChannelRequestSender(side)
+    asked = EventRequest(request=GetCommittedProjectRequest())
+
+    await sender.request_from_worker(asked, "request-topic", "response-topic", timeout_ms=1)
+    side.begin_serving()
+    await sender.request_from_worker(asked, "request-topic", "response-topic", timeout_ms=1)
+
+    waited = [call.args[1] for call in link.request_async.call_args_list]
+    assert waited == [None, runtime.PARENT_REQUEST_TIMEOUT_S]
 
 
 def test_every_library_named_is_the_workers(mocker: Any) -> None:
