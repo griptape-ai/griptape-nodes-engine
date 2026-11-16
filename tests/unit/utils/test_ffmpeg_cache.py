@@ -34,8 +34,8 @@ LOCK_TIMEOUT_SECONDS = 5
 def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restore `static_ffmpeg`'s module globals and the install-once flag after each test.
 
-    `redirect_ffmpeg_cache` and `prefer_system_ffmpeg` mutate process-wide state. Leaking it would change where
-    unrelated tests in the same session look for ffmpeg. `_resolution_installed` is forced
+    `redirect_ffmpeg_cache` and `prefer_system_ffmpeg` mutate process-wide state. Leaking it
+    would change where unrelated tests in the same session look for ffmpeg. `_resolution_installed` is forced
     to `False` so every test starts from an uninstalled state, even when an engine built
     elsewhere in the session already performed the process-wide install.
     """
@@ -52,6 +52,8 @@ def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
         static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise,  # pyright: ignore[reportPrivateImportUsage]
     )
     monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
+    monkeypatch.setattr(ffmpeg_cache, "_configured_install_wins", False)
+    monkeypatch.setattr(ffmpeg_cache, "_logged_source", None)
 
 
 class TestResolveFfmpegDirectory:
@@ -158,6 +160,16 @@ class TestInstallFfmpegResolution:
 
         assert static_ffmpeg.run.get_or_fetch_platform_executables_else_raise is get_or_find_platform_executables
 
+    def test_configured_directory_lets_its_install_win(self, tmp_path: Path) -> None:
+        install_ffmpeg_resolution(str(tmp_path))
+
+        assert ffmpeg_cache._configured_install_wins
+
+    def test_default_directory_does_not_beat_path(self) -> None:
+        install_ffmpeg_resolution("")
+
+        assert not ffmpeg_cache._configured_install_wins
+
     def test_first_call_covers_add_paths(self, tmp_path: Path) -> None:
         """`add_paths` bound the function at import, so its module needs the replacement too."""
         install_ffmpeg_resolution(str(tmp_path))
@@ -180,7 +192,7 @@ class TestInstallFfmpegResolution:
 
 
 class TestGetOrFindPlatformExecutables:
-    """ffmpeg and ffprobe on PATH win; `static_ffmpeg`'s cache or download is the fallback."""
+    """An install in a configured `ffmpeg_directory` wins, then PATH, then `static_ffmpeg`'s cache or download."""
 
     @pytest.fixture
     def fetched(self, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
@@ -223,6 +235,61 @@ class TestGetOrFindPlatformExecutables:
         get_or_find_platform_executables(fix_permissions=False, download_dir=str(tmp_path))
 
         assert fetched == [{"fix_permissions": False, "download_dir": str(tmp_path)}]
+
+    def test_configured_install_wins_over_path(
+        self, tmp_path: Path, system_bin: Path, fetched: list[dict], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A user who set `ffmpeg_directory` chose those binaries; PATH is ambient."""
+        monkeypatch.setattr(ffmpeg_cache, "_configured_install_wins", True)
+        _make_cached_install(tmp_path, monkeypatch)
+        _make_executable(system_bin, "ffmpeg")
+        _make_executable(system_bin, "ffprobe")
+
+        assert get_or_find_platform_executables() == ("cached/ffmpeg", "cached/ffprobe")
+        assert len(fetched) == 1
+
+    def test_configured_directory_without_install_uses_path(
+        self, tmp_path: Path, system_bin: Path, fetched: list[dict], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Setting `ffmpeg_directory` only to move downloads must not force one."""
+        monkeypatch.setattr(ffmpeg_cache, "_configured_install_wins", True)
+        monkeypatch.setattr(static_ffmpeg.run, "SELF_DIR", str(tmp_path / "empty-cache"))
+        ffmpeg_path = _make_executable(system_bin, "ffmpeg")
+        ffprobe_path = _make_executable(system_bin, "ffprobe")
+
+        assert get_or_find_platform_executables() == (ffmpeg_path, ffprobe_path)
+        assert fetched == []
+
+    def test_default_cache_install_loses_to_path(
+        self, tmp_path: Path, system_bin: Path, fetched: list[dict], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _make_cached_install(tmp_path, monkeypatch)
+        ffmpeg_path = _make_executable(system_bin, "ffmpeg")
+        ffprobe_path = _make_executable(system_bin, "ffprobe")
+
+        assert get_or_find_platform_executables() == (ffmpeg_path, ffprobe_path)
+        assert fetched == []
+
+    def test_logs_the_choice_once_at_info(self, system_bin: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Which binary runs depends on the launch environment, so problem reports need it at INFO."""
+        _make_executable(system_bin, "ffmpeg")
+        _make_executable(system_bin, "ffprobe")
+
+        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
+            get_or_find_platform_executables()
+            get_or_find_platform_executables()
+
+        messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert len(messages) == 1
+        assert "from PATH" in messages[0]
+
+
+def _make_cached_install(cache_directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point `static_ffmpeg` at `cache_directory` and mark a completed install there."""
+    monkeypatch.setattr(static_ffmpeg.run, "SELF_DIR", str(cache_directory))
+    platform_dir = Path(static_ffmpeg.run.get_platform_dir())
+    platform_dir.mkdir(parents=True)
+    (platform_dir / "installed.crumb").touch()
 
 
 def _make_executable(directory: Path, name: str) -> str:

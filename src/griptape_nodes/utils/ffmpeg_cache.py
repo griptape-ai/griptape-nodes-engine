@@ -31,8 +31,8 @@ the cache holds a completed install. That breaks networks that block the downloa
 when ffmpeg is installed system-wide. The same module-object pinning lets one replacement
 of that function cover every caller: node libraries look it up on `static_ffmpeg.run` at
 call time, and `static_ffmpeg._add_paths` bound its own copy at import, so both names are
-replaced. The replacement uses ffmpeg and ffprobe from PATH when both are there, and
-otherwise leaves `static_ffmpeg` to use its cache or download.
+replaced. The replacement prefers, in order: a completed install in an explicitly set
+`ffmpeg_directory`, ffmpeg and ffprobe on PATH, then `static_ffmpeg`'s cache or download.
 """
 
 import logging
@@ -47,6 +47,8 @@ from griptape_nodes.utils.engine_dirs import engine_data_dir
 logger = logging.getLogger("griptape_nodes")
 
 _resolution_installed = False
+_configured_install_wins = False
+_logged_source: str | None = None
 
 # Captured at import, before `prefer_system_ffmpeg` replaces the module attribute.
 _fetch_platform_executables = static_ffmpeg.run.get_or_fetch_platform_executables_else_raise
@@ -70,8 +72,9 @@ def install_ffmpeg_resolution(configured_directory: str) -> None:
         logger.debug("ffmpeg resolution already installed, skipping")
         return
 
-    redirect_ffmpeg_cache(resolve_ffmpeg_directory(configured_directory))
-    prefer_system_ffmpeg()
+    directory = resolve_ffmpeg_directory(configured_directory)
+    redirect_ffmpeg_cache(directory)
+    prefer_system_ffmpeg(configured_install_wins=directory != engine_data_dir() / "ffmpeg")
     _resolution_installed = True
 
 
@@ -141,11 +144,19 @@ def redirect_ffmpeg_cache(directory: Path) -> None:
     logger.debug("Redirected ffmpeg cache to %s", directory)
 
 
-def prefer_system_ffmpeg() -> None:
+def prefer_system_ffmpeg(*, configured_install_wins: bool) -> None:
     """Make `static_ffmpeg` use ffmpeg and ffprobe from PATH instead of downloading them.
 
     Safe to call repeatedly; the replacement always wraps the original function.
+
+    Args:
+        configured_install_wins: Whether a completed install in the cache directory beats
+            PATH. True when the user set `ffmpeg_directory`, since that is an explicit choice
+            of binaries and PATH is ambient.
     """
+    global _configured_install_wins  # noqa: PLW0603
+
+    _configured_install_wins = configured_install_wins
     static_ffmpeg.run.get_or_fetch_platform_executables_else_raise = get_or_find_platform_executables
     static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise = get_or_find_platform_executables  # pyright: ignore[reportPrivateImportUsage]
 
@@ -154,16 +165,47 @@ def get_or_find_platform_executables(
     fix_permissions: bool = True,  # noqa: FBT001, FBT002
     download_dir: str | None = None,
 ) -> tuple[str, str]:
-    """Return ffmpeg and ffprobe from PATH, falling back to `static_ffmpeg`'s cache or download.
+    """Return ffmpeg and ffprobe paths, downloading them only when no local copy exists.
 
     Same signature as `static_ffmpeg.run.get_or_fetch_platform_executables_else_raise`,
     which it replaces. A caller that passes `download_dir` asked for that directory
     specifically, so it skips the PATH lookup.
     """
-    ffmpeg_path = shutil.which("ffmpeg")
-    ffprobe_path = shutil.which("ffprobe")
-    if download_dir is not None or ffmpeg_path is None or ffprobe_path is None:
+    if download_dir is not None:
         return _fetch_platform_executables(fix_permissions=fix_permissions, download_dir=download_dir)
 
-    logger.debug("Using ffmpeg '%s' and ffprobe '%s' from PATH", ffmpeg_path, ffprobe_path)
+    if _configured_install_wins and _has_cached_install():
+        _log_source(f"Using ffmpeg from the 'ffmpeg_directory' setting: {static_ffmpeg.run.get_platform_dir()}")
+        return _fetch_platform_executables(fix_permissions=fix_permissions)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    if ffmpeg_path is None or ffprobe_path is None:
+        _log_source(
+            f"ffmpeg and ffprobe are not both on PATH. Using the copy in '{static_ffmpeg.run.SELF_DIR}', "
+            "downloading it first if it is missing."
+        )
+        return _fetch_platform_executables(fix_permissions=fix_permissions)
+
+    _log_source(f"Using ffmpeg '{ffmpeg_path}' and ffprobe '{ffprobe_path}' from PATH")
     return ffmpeg_path, ffprobe_path
+
+
+def _has_cached_install() -> bool:
+    """Whether the `static_ffmpeg` cache holds a completed install for this platform."""
+    try:
+        platform_dir = static_ffmpeg.run.get_platform_dir()
+    except OSError:
+        # `static_ffmpeg` has no build for this platform, so there is nothing cached.
+        return False
+    return (Path(platform_dir) / "installed.crumb").exists()
+
+
+def _log_source(message: str) -> None:
+    """Log which ffmpeg is used at INFO, once per change, since callers resolve it on every run."""
+    global _logged_source  # noqa: PLW0603
+
+    if message == _logged_source:
+        return
+    _logged_source = message
+    logger.info(message)
