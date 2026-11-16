@@ -132,7 +132,7 @@ def simulated_worker(orchestrator: Engine, library_name: str) -> Iterator[Simula
 def host_libraries_on_simulated_worker(engine: Engine, monkeypatch: pytest.MonkeyPatch, *library_names: str) -> None:
     """Send every node of the named libraries to the simulated worker, until the monkeypatch is undone."""
 
-    def worker_for(name: str | None) -> tuple[str, str] | None:
+    def worker_for(name: str | None) -> str | None:
         if name in library_names:
             return _WORKER_ID
         return None

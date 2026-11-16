@@ -1084,7 +1084,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr.workers = MagicMock(spec=LibraryWorkers)
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.workers.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.workers.get_worker_for_library.return_value = "eng-id"
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
 
         request = ExecuteNodeRequest(
@@ -1344,7 +1344,7 @@ class TestExecuteNodePrivateExecutionRoute:
         result = await self._execute(node, wm)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
-        assert wm.route_to_worker.await_args.args[1:] == self._PRIVATE_WORKER
+        assert wm.route_to_worker.await_args.args[1] == self._PRIVATE_WORKER
         node.aprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
