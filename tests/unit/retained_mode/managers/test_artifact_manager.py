@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import anyio
 import pytest
+import static_ffmpeg._add_paths
 import static_ffmpeg.run
 from PIL import Image
 from pydantic import ValidationError
@@ -2088,6 +2089,11 @@ class TestFfmpegCacheRedirect:
             static_ffmpeg.run,
             "get_or_fetch_platform_executables_else_raise",
             static_ffmpeg.run.get_or_fetch_platform_executables_else_raise,
+        )
+        monkeypatch.setattr(
+            static_ffmpeg._add_paths,
+            "get_or_fetch_platform_executables_else_raise",
+            static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise,  # pyright: ignore[reportPrivateImportUsage]
         )
         monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
 

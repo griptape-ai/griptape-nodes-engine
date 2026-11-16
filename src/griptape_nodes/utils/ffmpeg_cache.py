@@ -29,8 +29,9 @@ receives that same module object -- including libraries whose venvs live elsewhe
 `get_or_fetch_platform_executables_else_raise()` never looks at PATH: it downloads unless
 the cache holds a completed install. That breaks networks that block the download even
 when ffmpeg is installed system-wide. The same module-object pinning lets one replacement
-of that function cover every caller, since all of them look it up on `static_ffmpeg.run`
-at call time. The replacement uses ffmpeg and ffprobe from PATH when both are there, and
+of that function cover every caller: node libraries look it up on `static_ffmpeg.run` at
+call time, and `static_ffmpeg._add_paths` bound its own copy at import, so both names are
+replaced. The replacement uses ffmpeg and ffprobe from PATH when both are there, and
 otherwise leaves `static_ffmpeg` to use its cache or download.
 """
 
@@ -38,6 +39,7 @@ import logging
 import shutil
 from pathlib import Path
 
+import static_ffmpeg._add_paths
 import static_ffmpeg.run
 
 from griptape_nodes.utils.engine_dirs import engine_data_dir
@@ -145,6 +147,7 @@ def prefer_system_ffmpeg() -> None:
     Safe to call repeatedly; the replacement always wraps the original function.
     """
     static_ffmpeg.run.get_or_fetch_platform_executables_else_raise = get_or_find_platform_executables
+    static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise = get_or_find_platform_executables  # pyright: ignore[reportPrivateImportUsage]
 
 
 def get_or_find_platform_executables(

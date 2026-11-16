@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from pathlib import Path
 
 import pytest
+import static_ffmpeg._add_paths
 import static_ffmpeg.run
 
 # The lock class `get_or_fetch_platform_executables_else_raise` constructs at
@@ -43,6 +45,11 @@ def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
         static_ffmpeg.run,
         "get_or_fetch_platform_executables_else_raise",
         static_ffmpeg.run.get_or_fetch_platform_executables_else_raise,
+    )
+    monkeypatch.setattr(
+        static_ffmpeg._add_paths,
+        "get_or_fetch_platform_executables_else_raise",
+        static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise,  # pyright: ignore[reportPrivateImportUsage]
     )
     monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
 
@@ -151,6 +158,12 @@ class TestInstallFfmpegResolution:
 
         assert static_ffmpeg.run.get_or_fetch_platform_executables_else_raise is get_or_find_platform_executables
 
+    def test_first_call_covers_add_paths(self, tmp_path: Path) -> None:
+        """`add_paths` bound the function at import, so its module needs the replacement too."""
+        install_ffmpeg_resolution(str(tmp_path))
+
+        assert static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise is get_or_find_platform_executables  # pyright: ignore[reportPrivateImportUsage]
+
     def test_second_call_is_a_noop(self, tmp_path: Path) -> None:
         """The redirect is installed once per process; a later engine must not move the cache.
 
@@ -219,7 +232,10 @@ def _make_executable(directory: Path, name: str) -> str:
     executable = directory / name
     executable.touch()
     executable.chmod(0o755)
-    return str(executable)
+    # `shutil.which` spells the extension the way PATHEXT does (`.EXE` on Windows).
+    found = shutil.which(executable.stem, path=str(directory))
+    assert found is not None
+    return found
 
 
 class TestPackageDirectoryIsNeverWritten:
