@@ -15,6 +15,7 @@ import ast
 import asyncio
 import logging
 import os
+import secrets
 import shutil
 import struct
 import sys
@@ -722,8 +723,8 @@ async def test_oversized_handshake_frame_is_rejected_without_reading_the_body() 
 
 
 @pytest.mark.asyncio
-async def test_a_non_ascii_token_is_rejected_without_an_unhandled_error(caplog: pytest.LogCaptureFixture) -> None:
-    """A token that is not ASCII is a wrong token: the connection closes, and a real worker still connects."""
+async def test_a_non_ascii_proof_is_rejected_without_an_unhandled_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A proof that is not ASCII is a wrong proof: the connection closes unproven, and a real worker still connects."""
     unhandled: list[dict] = []
     asyncio.get_running_loop().set_exception_handler(lambda _loop, context: unhandled.append(context))
     pending = await listen_for_worker()
@@ -731,9 +732,10 @@ async def test_a_non_ascii_token_is_rejected_without_an_unhandled_error(caplog: 
     bad_reader, bad_writer = await asyncio.open_connection(host, int(port_str))
 
     with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
-        bad_writer.write(channel_module._encode_frame({"token": "\u00e9" * 64}))
+        bad_writer.write(channel_module._encode_frame({"proof": "\u00e9" * 64, "challenge": "x"}))
         await bad_writer.drain()
-        assert await asyncio.wait_for(bad_reader.read(), REQUEST_TIMEOUT_S) == b""
+        sent_to_the_bad_peer = await asyncio.wait_for(bad_reader.read(), REQUEST_TIMEOUT_S)
+        assert b'"proof"' not in sent_to_the_bad_peer
         child = await connect_to_parent(pending.child_environment)
         parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
     rec_parent = _Recorder()
@@ -753,19 +755,19 @@ async def test_a_non_ascii_token_is_rejected_without_an_unhandled_error(caplog: 
         asyncio.get_running_loop().set_exception_handler(None)
 
     assert unhandled == []
-    assert any("wrong token" in record.getMessage() for record in caplog.records)
+    assert any("did not prove it holds the token" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_bad_and_silent_peers_do_not_block_a_real_worker() -> None:
-    """A silent peer, a wrong token, and garbage bytes are each rejected without affecting accept()."""
+    """A silent peer, a wrong proof, and garbage bytes are each rejected without affecting accept()."""
     pending = await listen_for_worker()
     host, port_str = pending.child_environment[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
     port = int(port_str)
 
     _silent_reader, silent_writer = await asyncio.open_connection(host, port)  # connects, sends nothing
     _wrong_reader, wrong_writer = await asyncio.open_connection(host, port)
-    wrong_writer.write(channel_module._encode_frame({"token": "0" * 64}))
+    wrong_writer.write(channel_module._encode_frame({"proof": "0" * 64, "challenge": "x"}))
     _garbage_reader, garbage_writer = await asyncio.open_connection(host, port)
     garbage_writer.write(b"\xff\xff\xff\xff not json")
 
@@ -790,10 +792,105 @@ async def test_bad_and_silent_peers_do_not_block_a_real_worker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_worker_refuses_a_listener_that_cannot_prove_it_holds_the_token() -> None:
+    """A process that took the port answers the worker's challenge wrongly, and learns nothing reusable."""
+    received: list[dict] = []
+
+    async def impostor(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.write(channel_module._encode_frame({"challenge": "the impostor's"}))
+        received.append(await channel_module._read_json_frame(reader))
+        writer.write(channel_module._encode_frame({"proof": "0" * 64}))
+        await writer.drain()
+
+    server = await asyncio.start_server(impostor, host="127.0.0.1", port=0)
+    host, port = server.sockets[0].getsockname()[:2]
+    token = secrets.token_hex(32)
+    environ = {channel_module.CHANNEL_ADDRESS_ENV: f"{host}:{port}", channel_module.CHANNEL_TOKEN_ENV: token}
+    try:
+        with pytest.raises(channel_module.ChannelHandshakeError, match="did not prove it holds the token"):
+            await connect_to_parent(environ)
+    finally:
+        server.close()
+
+    assert token not in str(received)
+
+
+@pytest.mark.asyncio
+async def test_a_worker_refuses_a_listener_that_closes_without_a_challenge() -> None:
+    """Nothing proven, nothing trusted: a listener that says nothing is refused, not waited on forever."""
+
+    async def closes_at_once(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+
+    server = await asyncio.start_server(closes_at_once, host="127.0.0.1", port=0)
+    host, port = server.sockets[0].getsockname()[:2]
+    environ = {channel_module.CHANNEL_ADDRESS_ENV: f"{host}:{port}", channel_module.CHANNEL_TOKEN_ENV: "token"}
+    try:
+        with pytest.raises(channel_module.ChannelHandshakeError):
+            await connect_to_parent(environ)
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_request_notify_and_close_from_another_loop_run_on_the_channels_own() -> None:
+    """A side loop's request is answered without waiting on a timer, and its notify and close arrive."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    replies: list[dict] = []
+
+    async def from_a_side_loop() -> None:
+        # No timeout: a reply that never wakes this loop would leave it waiting for good.
+        replies.append(await pair.parent.request({"op": "echo"}, timeout_s=None))
+        pair.parent.notify({"n": 1})
+        pair.parent.close()
+
+    side = threading.Thread(target=asyncio.run, args=(from_a_side_loop(),))
+    side.start()
+    await asyncio.to_thread(side.join, REQUEST_TIMEOUT_S)
+
+    assert not side.is_alive()
+    assert replies == [{"op": "echo"}]
+    await asyncio.wait_for(rec_child.closed.wait(), REQUEST_TIMEOUT_S)
+    assert rec_child.notifications == [{"n": 1}]
+
+
+@pytest.mark.asyncio
+async def test_notify_from_a_thread_with_no_loop_arrives() -> None:
+    """A notify from plain code on another thread is written on the channel's own loop."""
+    pair = await _connected_pair()
+    rec_parent = _Recorder()
+    pair.parent.start(
+        on_request=rec_parent.on_request, on_notification=rec_parent.on_notification, on_closed=rec_parent.on_closed
+    )
+    rec_child = _Recorder()
+    pair.child.start(
+        on_request=rec_child.on_request, on_notification=rec_child.on_notification, on_closed=rec_child.on_closed
+    )
+    try:
+        await asyncio.to_thread(pair.parent.notify, {"n": 1})
+        # A request after it in order: its reply means the notification was applied first.
+        assert await pair.child.request({"op": "echo"}, timeout_s=REQUEST_TIMEOUT_S) == {"op": "echo"}
+        await pair.parent.request({"op": "echo"}, timeout_s=REQUEST_TIMEOUT_S)
+        assert rec_child.notifications == [{"n": 1}]
+    finally:
+        pair.parent.close()
+        pair.child.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_link_request_from_the_io_thread_raises_runtime_error() -> None:
     """WorkerLink.request() called from an on_request handler (the I/O thread) raises RuntimeError."""
     pending = await listen_for_worker()
-    link = WorkerLink(pending.child_environment)
+    # Built off this loop: the handshake it waits for is answered on this loop.
+    link = await asyncio.to_thread(WorkerLink, pending.child_environment)
     parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
     rec_parent = _Recorder()
     parent_channel.start(
@@ -823,7 +920,8 @@ async def test_worker_link_request_from_the_io_thread_raises_runtime_error() -> 
 async def test_worker_link_notify_after_close_raises_channel_closed_error() -> None:
     """WorkerLink.notify() after the channel ends raises to the caller, not just asyncio's log."""
     pending = await listen_for_worker()
-    link = WorkerLink(pending.child_environment)
+    # Built off this loop: the handshake it waits for is answered on this loop.
+    link = await asyncio.to_thread(WorkerLink, pending.child_environment)
     parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
     # The worker's own on_closed, not the parent's: it only fires after link.channel's _closed
     # flag is actually set, on the I/O thread link.notify() needs to see it from.
@@ -843,7 +941,8 @@ async def test_worker_link_notify_after_close_raises_channel_closed_error() -> N
 async def test_worker_link_notify_with_unencodable_body_raises_type_error() -> None:
     """WorkerLink.notify() with a body that will not encode raises to the caller, nothing is sent."""
     pending = await listen_for_worker()
-    link = WorkerLink(pending.child_environment)
+    # Built off this loop: the handshake it waits for is answered on this loop.
+    link = await asyncio.to_thread(WorkerLink, pending.child_environment)
     parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
     link.start(on_request=_empty_response, on_notification=lambda _b: None, on_closed=lambda: None)
     notified = asyncio.Event()
@@ -868,7 +967,8 @@ async def test_worker_link_notify_with_unencodable_body_raises_type_error() -> N
 async def test_worker_link_sync_request_from_inside_a_running_loop_on_another_thread() -> None:
     """A blocking link.request() call made from inside another thread's own asyncio.run() must not deadlock."""
     pending = await listen_for_worker()
-    link = WorkerLink(pending.child_environment)
+    # Built off this loop: the handshake it waits for is answered on this loop.
+    link = await asyncio.to_thread(WorkerLink, pending.child_environment)
     parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
     rec_parent = _Recorder(on_request=lambda body: {"sum": body["x"] + body["y"]})
     parent_channel.start(
