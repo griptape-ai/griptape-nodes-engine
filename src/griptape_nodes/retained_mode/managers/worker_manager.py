@@ -1954,7 +1954,9 @@ class WorkerManager(EngineScoped):
             worker_engine_id=worker_engine_id, libraries=hello.libraries
         )
         try:
-            result = await self.engine.request(served.owning_engine_id, ready, timeout_s=ENGINE_REQUEST_TIMEOUT_S)
+            # Unbounded, as everything the worker asks before its hello is accepted: the link to that
+            # engine failing is what ends the wait, and a busy engine is not a failed one.
+            result = await self.engine.request(served.owning_engine_id, ready, timeout_s=None)
         except EngineNotFoundError as e:
             return {
                 "accepted": False,

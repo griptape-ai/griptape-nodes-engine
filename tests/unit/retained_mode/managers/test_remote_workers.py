@@ -67,6 +67,7 @@ from griptape_nodes.retained_mode.managers.worker_manager import (
     _ServedFor,
     _StartAskedOfHost,
 )
+from griptape_nodes.utils.version_utils import engine_version
 from griptape_nodes.worker.channel import AsyncChannel, WorkerLink, listen_for_worker
 from griptape_nodes.worker.remote import RemoteWorkerEnd, _EventBatches
 from griptape_nodes.worker.runtime import WorkerSide
@@ -623,6 +624,78 @@ class TestEventBatches:
 
         assert sent == [[1]]
         assert "the link broke mid-send" in caplog.text
+
+
+class TestAServedWorkerStillStartingWaitsOnTheArtist:
+    """A worker that has not been accepted is starting, and the artist's engine may be busy for any length of time."""
+
+    @pytest.mark.asyncio
+    async def test_its_questions_wait_without_a_bound_until_its_hello_is_accepted_and_with_one_after(
+        self, pair: _Pair, serving: Engine, artist: Engine
+    ) -> None:
+        def allow(envelope: dict) -> WorkerRequestGateDecision:
+            return WorkerRequestGateDecision(forward=envelope, denials=[])
+
+        artist.event_manager.assign_manager_to_request_type(RemoteProbeRequest, _answer_as("artist"))
+        artist.event_manager.add_worker_request_gate(allow)
+        to_the_artist = _link(artist, sender_engine_id=_SERVING)
+        waited: list[tuple[str, float | None]] = []
+
+        async def recording(engine_id: str, request: RequestPayload, *, timeout_s: float | None, **kwargs: Any) -> Any:
+            waited.append((type(request).__name__, timeout_s))
+            return await to_the_artist(engine_id, request, timeout_s=timeout_s, **kwargs)
+
+        async def accept(_hello: WorkerHello) -> dict[str, Any]:
+            return {"accepted": True, "details": "The test's serving engine took it."}
+
+        serving.request = recording  # type: ignore[method-assign]
+        end = RemoteWorkerEnd(
+            serving,
+            worker_engine_id=_WORKER,
+            artist_engine_id=_ARTIST,
+            request_timeout_s=_TIMEOUT_S,
+            on_hello=accept,
+            on_closed=lambda: None,
+        )
+        end.attach(pair.serving)
+        side = _start_worker(pair.worker)
+
+        async def ask_and_check() -> None:
+            probe = event_request_envelope(EventRequest(request=RemoteProbeRequest()))
+            await asyncio.to_thread(pair.worker.request, probe, _TIMEOUT_S)
+            await asyncio.to_thread(side.authorize_with_parent, _checkpoint("AllowedNode"))
+
+        await ask_and_check()
+        hello = WorkerHello(engine_version=engine_version, library_names=[_LIBRARY], loaded=True)
+        reply = await asyncio.to_thread(pair.worker.request, event_body(WORKER_HELLO, hello), _TIMEOUT_S)
+        await ask_and_check()
+
+        assert reply["accepted"] is True
+        assert waited == [
+            ("RemoteProbeRequest", None),
+            ("DecideWorkerCheckpointRequest", None),
+            ("RemoteProbeRequest", _TIMEOUT_S),
+            ("DecideWorkerCheckpointRequest", _TIMEOUT_S),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_it_is_reported_ready_to_the_artist_without_a_bound(self, serving: Engine) -> None:
+        """Reporting ready is the last thing before the hello is answered, so it waits as the rest of startup does."""
+        waited: list[float | None] = []
+
+        async def ready(_engine_id: str, _request: RequestPayload, *, timeout_s: float | None, **_kwargs: Any) -> Any:
+            waited.append(timeout_s)
+            return worker_events.ReportRemoteWorkerReadyResultSuccess(result_details="The artist took it.")
+
+        serving.request = ready  # type: ignore[method-assign]
+        serving.worker_manager._workers[_WORKER] = _served()
+
+        reply = await serving.worker_manager._accept_served_hello(
+            _WORKER, WorkerHello(engine_version=engine_version, library_names=[_LIBRARY], loaded=True)
+        )
+
+        assert reply["accepted"] is True
+        assert waited == [None]
 
 
 class TestARefusedRemoteWorker:
